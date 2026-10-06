@@ -8,11 +8,16 @@
 //! global scheduler or dynamic system registry.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../core/math.zig");
+const logging = @import("../core/logging.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("data_system.zig").DataSystem;
+const hotStoreCapacity = @import("data_system.zig").hotStoreCapacity;
+const PopulationRowCounts = @import("data_system.zig").PopulationRowCounts;
+const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const EntityId = @import("data_system.zig").EntityId;
 const Faction = @import("data_system.zig").Faction;
 const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
@@ -42,6 +47,7 @@ const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
+const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
 const MovementStats = @import("systems/movement.zig").MovementStats;
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
@@ -370,10 +376,11 @@ comptime {
 /// Construction policy for the state-owned simulation pipeline.
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
 pub const SimulationPipelineConfig = struct {
-    steering_agent_capacity: usize = 0,
     contact_capacity: usize = 0,
-    /// Movement-body count the scope system pre-sizes its gather/tier scratch to,
-    /// so the per-step scope passes are allocation-free after init.
+    /// Initial population size for every population-sized capacity (scope, spatial
+    /// index, collision, steering, cognition gathers, plane scratch, event shares).
+    /// `init` raises it to the committed `DataSystem` rows; afterwards only
+    /// `SimulationPipeline.syncPopulationCapacity` grows it (Slice 72 C3).
     movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
     nav_cell_size: f32 = 32.0,
@@ -607,6 +614,25 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
+/// The population seam's geometric growth target: 1.5x plus one 16-row alignment
+/// block, hot-store aligned (e.g. 12 -> 48, 37 -> 80, 7 -> 32).
+pub fn grownPopulationCapacity(rows: usize) usize {
+    return hotStoreCapacity(rows + rows / 2 + movement_range_alignment_items);
+}
+
+/// What one `syncPopulationCapacity` call did. All-false on the O(1) fast path.
+pub const PopulationSyncStats = struct {
+    /// A tracked population/responder capacity grew this call.
+    grew: bool = false,
+    /// The pathfinding agent ceiling needed a raise the nav-memory gate refused.
+    agent_budget_raise_refused: bool = false,
+
+    pub fn recordTo(self: PopulationSyncStats, perf: runtime_perf_log.Context) void {
+        perf.recordMetric(.population_capacity_grows, @intFromBool(self.grew));
+        perf.recordMetric(.path_agent_budget_raise_refused, @intFromBool(self.agent_budget_raise_refused));
+    }
+};
+
 fn eventBudgetInputs(config: SimulationPipelineConfig) EventBudgetInputs {
     return .{
         .perception_max_events_per_step = config.perception_max_events_per_step,
@@ -654,7 +680,15 @@ pub const SimulationPipeline = struct {
     destructible: DestructibleController,
     audio_controller: AudioController,
     nav_cell_size: f32,
+    /// Tracked logical population capacity: every population-sized pipeline capacity is
+    /// reserved to it. Grown only by `syncPopulationCapacity` at the commit seam.
     movement_body_capacity: usize,
+    /// Tracked collision-response rows the steering static snapshot was sized against.
+    responder_capacity: usize,
+    /// Telemetry: population seam growths (perf metric `population_capacity_grows`).
+    population_capacity_grows: u64 = 0,
+    /// Once-only flag for the first-growth log.
+    population_growth_logged: bool = false,
     /// See `SimulationPipelineConfig.perception_max_events_per_step`.
     perception_max_events_per_step: usize,
     /// See `SimulationPipelineConfig.affect_max_events_per_step`.
@@ -678,11 +712,15 @@ pub const SimulationPipeline = struct {
         bounds_height: f32,
         config: SimulationPipelineConfig,
     ) !SimulationPipeline {
+        // `data` at init is authoritative: the tracked capacities start at least at
+        // the committed rows, so `tracked >= rows` holds from construction.
+        const rows = data.populationRowCounts();
+        const population = @max(config.movement_body_capacity, rows.population());
         var ai = AiSystem.init(allocator);
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
         errdefer steering.deinit();
-        try steering.reserveForCapacity(config.steering_agent_capacity, SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()));
+        try steering.reserveForCapacity(population, SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()));
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
@@ -692,17 +730,17 @@ pub const SimulationPipeline = struct {
         var collision_response = CollisionResponseSystem.init(allocator);
         errdefer collision_response.deinit();
         try collision_response.reserveForContacts(config.contact_capacity);
-        try collision.reserve(config.movement_body_capacity);
+        try collision.reserve(population);
         var scope = SimulationScopeSystem.init(allocator);
         errdefer scope.deinit();
-        try scope.reserve(config.movement_body_capacity);
+        try scope.reserve(population);
         var spatial_index = SpatialIndexSystem.init(allocator);
         errdefer spatial_index.deinit();
         const spatial_geometry: SpatialIndexDenseWindowGeometry = if (config.navigation_world) |world|
             .{ .chunk_size_tiles = world.chunk_size_tiles, .tile_size = world.tile_size }
         else
             .{};
-        try spatial_index.reserve(config.movement_body_capacity, spatial_geometry);
+        try spatial_index.reserve(population, spatial_geometry);
         // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
@@ -723,12 +761,14 @@ pub const SimulationPipeline = struct {
         errdefer dig.deinit();
         // The ramp dig predicts nav interior link-slot assignment from the built graph.
         dig.nav_link_geometry = pathfinding.graph.linkSlotGeometry();
-        const event_budgets = eventBudgetInputs(config);
+        var population_config = config;
+        population_config.movement_body_capacity = population;
+        const event_budgets = eventBudgetInputs(population_config);
         try dig.reservePlaneScratch(allocator, maxEventsPerStep(.plane_traversal, event_budgets));
-        try ai.reserve(config.movement_body_capacity);
-        try perception.reserve(config.movement_body_capacity);
-        try ai_memory.reserve(config.movement_body_capacity);
-        try affect.reserve(config.movement_body_capacity);
+        try ai.reserve(population);
+        try perception.reserve(population);
+        try ai_memory.reserve(population);
+        try affect.reserve(population);
 
         return .{
             .movement = MovementSystem.init(),
@@ -746,7 +786,8 @@ pub const SimulationPipeline = struct {
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
-            .movement_body_capacity = config.movement_body_capacity,
+            .movement_body_capacity = population,
+            .responder_capacity = rows.collision_responses,
             .perception_max_events_per_step = config.perception_max_events_per_step,
             .affect_max_events_per_step = config.affect_max_events_per_step,
             .structural_headroom = config.structural_headroom,
@@ -789,6 +830,105 @@ pub const SimulationPipeline = struct {
             .movement_body_capacity = self.movement_body_capacity,
             .structural_headroom = self.structural_headroom,
         });
+    }
+
+    /// Population growth seam (Slice 72 C3). Main thread, `merge_outputs`, right after
+    /// the structural commit and before the post-commit reactions. O(1) fast path; on
+    /// growth, re-reserves every population-sized pipeline capacity, the frame streams
+    /// and event bound, and the pathfinding elastic pools. The only population growth
+    /// point: the fixed-step stages stay allocation-free between seams. Grow-only; the
+    /// trigger and the grown sizes are pure functions of committed row counts, so
+    /// capacity never changes behavior. After an error the tracked values are restored
+    /// and the next seam retries (every reserve is idempotent).
+    pub fn syncPopulationCapacity(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        data: *const DataSystem,
+        world: *const WorldSystem,
+    ) !PopulationSyncStats {
+        const rows = data.populationRowCounts();
+        const population = rows.population();
+        if (population <= self.movement_body_capacity and
+            rows.collision_responses <= self.responder_capacity and
+            self.pathfinding.coversAgentCount(rows.steering_agents))
+        {
+            return .{};
+        }
+        return self.growPopulationCapacity(frame, data, world, rows);
+    }
+
+    fn growPopulationCapacity(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        data: *const DataSystem,
+        world: *const WorldSystem,
+        rows: PopulationRowCounts,
+    ) !PopulationSyncStats {
+        @branchHint(.cold);
+        var stats: PopulationSyncStats = .{};
+        const population = rows.population();
+        const old_body = self.movement_body_capacity;
+        const old_responders = self.responder_capacity;
+        const body = if (population > old_body) grownPopulationCapacity(population) else old_body;
+        const responders_grew = rows.collision_responses > old_responders;
+        const responders = if (responders_grew) grownPopulationCapacity(rows.collision_responses) else old_responders;
+        errdefer {
+            self.movement_body_capacity = old_body;
+            self.responder_capacity = old_responders;
+        }
+
+        const body_grew = body != old_body;
+        if (body_grew) {
+            try self.scope.reserve(body);
+            try self.spatial_index.reserveRows(body);
+            try self.collision.reserve(body);
+            try self.collision_response.reserveForContacts(CollisionSystem.estimateContactCapacity(body));
+            try self.dig.ensurePlaneScratchReserve(body + 1);
+        }
+        // A statics count of 0 is a no-op for the grow-only obstacle ensures.
+        const statics = if (responders_grew) SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()) else 0;
+        try self.steering.reserveForCapacity(body, statics);
+
+        self.movement_body_capacity = body;
+        self.responder_capacity = responders;
+
+        if (body_grew) {
+            // The event bound now includes the grown plane-traversal and structural arms.
+            const range_count = self.eventCapacitySum();
+            const contact_capacity = CollisionSystem.estimateContactCapacity(body);
+            try frame.navigation_intents.reserve(range_count, body);
+            try frame.intents.reserve(range_count, body);
+            try frame.contacts.reserve(range_count, contact_capacity);
+            try frame.collision_triggers.reserve(range_count, estimateTriggerCapacity(contact_capacity));
+            try frame.structural_commands.reserve(range_count, body + self.structural_headroom);
+            try frame.reservePathRequests(1, body);
+            // Raises the event limit and re-runs the cognition reserves (and every
+            // reserve later slices attach to `reserve`).
+            try self.reserve(frame, body);
+        }
+
+        if (!self.pathfinding.coversAgentCount(rows.steering_agents)) {
+            if (rows.steering_agents > self.pathfinding.agentBudget()) {
+                stats.agent_budget_raise_refused = !self.pathfinding.raiseAgentBudget(
+                    grownPopulationCapacity(rows.steering_agents),
+                    world.levelLinkLimit(),
+                );
+            }
+            try self.pathfinding.growForAgentCount(rows.steering_agents);
+        }
+
+        if (body_grew or responders_grew) {
+            stats.grew = true;
+            self.population_capacity_grows += 1;
+            if (!self.population_growth_logged) {
+                self.population_growth_logged = true;
+                if (comptime logging.enabled(.info) and !builtin.is_test) logging.game.info(
+                    "population seam grew pipeline capacity to {d} bodies",
+                    .{body},
+                );
+            }
+        }
+        return stats;
     }
 
     /// Releases owned processor/controller state. Borrowed gameplay data and
@@ -1447,7 +1587,6 @@ test "pipeline updates full active player-only state through serial path" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -1770,7 +1909,6 @@ test "pipeline resamples AI wander direction across fixed steps" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -1880,7 +2018,6 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -1962,7 +2099,6 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2039,7 +2175,6 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2353,7 +2488,6 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2624,7 +2758,6 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2739,7 +2872,6 @@ fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 512, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 8,
         .pathfinding = .{
             .max_frame_requests = 4,
@@ -2891,7 +3023,6 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2985,7 +3116,6 @@ test "pipeline perception events truncate instead of throwing when the shared ev
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -4453,7 +4583,6 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -4552,7 +4681,6 @@ test "pipeline.update reports action_intents_dropped after capture soft-drop" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -4876,4 +5004,424 @@ test "player-dug ramp is routable by an underground NPC the same step" {
         }
     }
     try std.testing.expect(resolved);
+}
+
+/// Swaps every pipeline, frame-stream, data, pathfinding, and dig allocator to one
+/// failing allocator for a zero-allocation proof (the world allocator stays real:
+/// dense tile edits). Test-only local fixture.
+const TestAllocatorSwap = struct {
+    frame: std.mem.Allocator = undefined,
+    events: std.mem.Allocator = undefined,
+    navigation_intents: std.mem.Allocator = undefined,
+    action_intents: std.mem.Allocator = undefined,
+    intents: std.mem.Allocator = undefined,
+    path_requests: std.mem.Allocator = undefined,
+    contacts: std.mem.Allocator = undefined,
+    collision_triggers: std.mem.Allocator = undefined,
+    structural_commands: std.mem.Allocator = undefined,
+    stimuli: std.mem.Allocator = undefined,
+    data: std.mem.Allocator = undefined,
+    collision: std.mem.Allocator = undefined,
+    collision_response: std.mem.Allocator = undefined,
+    ai: std.mem.Allocator = undefined,
+    steering: std.mem.Allocator = undefined,
+    pathfinding: std.mem.Allocator = undefined,
+    graph: std.mem.Allocator = undefined,
+    scope: std.mem.Allocator = undefined,
+    spatial_index: std.mem.Allocator = undefined,
+    perception: std.mem.Allocator = undefined,
+    ai_memory: std.mem.Allocator = undefined,
+    affect: std.mem.Allocator = undefined,
+    dig: ?std.mem.Allocator = null,
+    threads: std.mem.Allocator = undefined,
+
+    fn install(self: *TestAllocatorSwap, pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, threads: *ThreadSystem, fail: std.mem.Allocator) void {
+        self.* = .{
+            .frame = frame.allocator,
+            .events = frame.events.stream.allocator,
+            .navigation_intents = frame.navigation_intents.allocator,
+            .action_intents = frame.action_intents.allocator,
+            .intents = frame.intents.allocator,
+            .path_requests = frame.path_requests.allocator,
+            .contacts = frame.contacts.allocator,
+            .collision_triggers = frame.collision_triggers.allocator,
+            .structural_commands = frame.structural_commands.allocator,
+            .stimuli = frame.stimuli.allocator,
+            .data = data.allocator,
+            .collision = pipeline.collision.allocator,
+            .collision_response = pipeline.collision_response.allocator,
+            .ai = pipeline.ai.allocator,
+            .steering = pipeline.steering.allocator,
+            .pathfinding = pipeline.pathfinding.allocator,
+            .graph = pipeline.pathfinding.graph.allocator,
+            .scope = pipeline.scope.allocator,
+            .spatial_index = pipeline.spatial_index.allocator,
+            .perception = pipeline.perception.allocator,
+            .ai_memory = pipeline.ai_memory.allocator,
+            .affect = pipeline.affect.allocator,
+            .dig = pipeline.dig.scratch_allocator,
+            .threads = threads.allocator,
+        };
+        setAll(pipeline, frame, data, threads, .{
+            .frame = fail,
+            .events = fail,
+            .navigation_intents = fail,
+            .action_intents = fail,
+            .intents = fail,
+            .path_requests = fail,
+            .contacts = fail,
+            .collision_triggers = fail,
+            .structural_commands = fail,
+            .stimuli = fail,
+            .data = fail,
+            .collision = fail,
+            .collision_response = fail,
+            .ai = fail,
+            .steering = fail,
+            .pathfinding = fail,
+            .graph = fail,
+            .scope = fail,
+            .spatial_index = fail,
+            .perception = fail,
+            .ai_memory = fail,
+            .affect = fail,
+            .dig = fail,
+            .threads = fail,
+        });
+    }
+
+    fn restore(self: *const TestAllocatorSwap, pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, threads: *ThreadSystem) void {
+        setAll(pipeline, frame, data, threads, self.*);
+    }
+
+    fn setAll(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, threads: *ThreadSystem, to: TestAllocatorSwap) void {
+        frame.allocator = to.frame;
+        frame.events.stream.allocator = to.events;
+        frame.navigation_intents.allocator = to.navigation_intents;
+        frame.action_intents.allocator = to.action_intents;
+        frame.intents.allocator = to.intents;
+        frame.path_requests.allocator = to.path_requests;
+        frame.contacts.allocator = to.contacts;
+        frame.collision_triggers.allocator = to.collision_triggers;
+        frame.structural_commands.allocator = to.structural_commands;
+        frame.stimuli.allocator = to.stimuli;
+        data.allocator = to.data;
+        pipeline.collision.allocator = to.collision;
+        pipeline.collision_response.allocator = to.collision_response;
+        pipeline.ai.allocator = to.ai;
+        pipeline.steering.allocator = to.steering;
+        pipeline.pathfinding.allocator = to.pathfinding;
+        pipeline.pathfinding.graph.allocator = to.graph;
+        pipeline.scope.allocator = to.scope;
+        pipeline.spatial_index.allocator = to.spatial_index;
+        pipeline.perception.allocator = to.perception;
+        pipeline.ai_memory.allocator = to.ai_memory;
+        pipeline.affect.allocator = to.affect;
+        pipeline.dig.scratch_allocator = to.dig;
+        threads.allocator = to.threads;
+    }
+};
+
+/// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: commit with the
+/// nav-reaction slot reserved, run the population seam, then the post-commit reactions.
+fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
+    const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
+        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame) or
+        pipeline.hasPendingNavLinks(world);
+    const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
+    _ = try frame.applyStructuralCommandsWithExtraEvents(data, extra_event_count);
+    const sync = try pipeline.syncPopulationCapacity(frame, data, world);
+    _ = try pipeline.reactToPostCommitNavEvents(frame, data, world, null);
+    try pipeline.reactToPostCommitPerceptionEvents(frame, world);
+    pipeline.reactToPostCommitSteeringEvents(frame);
+    return sync;
+}
+
+fn writeStructuralCommands(frame: *SimulationFrame, commands: []const StructuralCommand) !void {
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, commands.len);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    for (commands) |command| writer.write(command);
+    writer.finish();
+    frame.structural_commands.finishWrite();
+}
+
+fn cellBody(cell: [2]u16) MovementBody {
+    const position = math.Vec2{ .x = @as(f32, @floatFromInt(cell[0])) * 32, .y = @as(f32, @floatFromInt(cell[1])) * 32 };
+    return .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 };
+}
+
+const growth_npc_visual: PrimitiveVisual = .{
+    .size = .{ .x = 32, .y = 32 },
+    .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+};
+
+fn growthNpcTemplate(cell: [2]u16) StructuralCommand {
+    return .{ .create_entity = .{
+        .movement_body = cellBody(cell),
+        .primitive_visual = growth_npc_visual,
+        .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+        .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        .ai_agent = .{ .active_behavior = .wander, .gain_pursue = 0 },
+        .world_level = 0,
+    } };
+}
+
+fn growthSteeringTemplate(cell: [2]u16) StructuralCommand {
+    return .{ .create_entity = .{
+        .movement_body = cellBody(cell),
+        .steering_agent = .{
+            .agent_radius = 8,
+            .waypoint_tolerance = 4,
+            .avoidance_radius = 48,
+            .avoidance_weight = 1.5,
+            .max_neighbor_samples = 8,
+            .stuck_step_threshold = 3,
+            .replan_cooldown_steps = 4,
+            .unavailable_backoff_steps = 12,
+        },
+        .world_level = 0,
+    } };
+}
+
+const GrowthScenarioResult = struct {
+    positions: [24][2]f32 = undefined,
+    world_tile_changed: usize = 0,
+};
+
+/// Builds a minimal 3-level world at population 4, grows it to 37 rows through
+/// structural creates and the population seam, then runs one step where all 24 NPCs
+/// fall through dug holes. With `prove_zero_alloc` that step runs with every
+/// allocator failing.
+fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool) !GrowthScenarioResult {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try testMinimalMultiLevelWorld(&meta);
+    defer world.deinit();
+    // 24 holes on the surface: rows 0..5 at x in {1, 3, 5, 7}. Each NPC starts on the
+    // hole's west neighbor (x in {0, 2, 4, 6}).
+    const floor0 = world.denseFloorLayerForLevel(0).?;
+    var start_cells: [24][2]u16 = undefined;
+    for (0..6) |row| {
+        for (0..4) |column| {
+            const hole_x: u16 = @intCast(column * 2 + 1);
+            _ = try world.clearDenseTile(floor0, hole_x, @intCast(row));
+            start_cells[row * 4 + column] = .{ hole_x - 1, @intCast(row) };
+        }
+    }
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    placePlayerFlush(&data, player, .{ 1, 7 });
+    for (start_cells[0..3]) |cell| {
+        const npc = try data.createEntity();
+        try data.setMovementBody(npc, cellBody(cell));
+        try data.setPrimitiveVisual(npc, growth_npc_visual);
+        try data.setCollisionBounds(npc, .{ .size = .{ .x = 16, .y = 16 } });
+        try data.setCollisionResponse(npc, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+        try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+        try data.setWorldLevel(npc, 0);
+    }
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .movement_body_capacity = 4,
+        .structural_headroom = 200,
+        .navigation_world = &world,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1 },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + 200);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    try std.testing.expectEqual(@as(usize, 4), pipeline.movement_body_capacity);
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 256,
+        .bounds_height = 256,
+    };
+    // Warm step at the initial population.
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    // Growth: 21 NPCs (7 commit events each) + 12 steering-only agents parked on rows
+    // 6-7 (4 events each) = 195 events against the 275 limit.
+    var commands: [33]StructuralCommand = undefined;
+    for (start_cells[3..], 0..) |cell, index| commands[index] = growthNpcTemplate(cell);
+    for (0..12) |index| {
+        const cell = [2]u16{ @intCast(index % 8), @intCast(6 + index / 8) };
+        commands[21 + index] = growthSteeringTemplate(cell);
+    }
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expect(sync.grew);
+    try std.testing.expect(!sync.agent_budget_raise_refused);
+
+    // Every tracked capacity followed the committed rows.
+    try std.testing.expectEqual(@as(usize, 37), data.populationRowCounts().population());
+    try std.testing.expectEqual(grownPopulationCapacity(37), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
+    try std.testing.expect(maxEventsPerStep(.plane_traversal, pipeline.eventBudgets()) >= 25);
+    try std.testing.expect(pipeline.pathfinding.effective_agent_capacity >= 12);
+    try std.testing.expect(pipeline.population_capacity_grows >= 1);
+
+    // All 24 NPCs step east into their hole this step.
+    const ai_entities = data.aiAgentSliceConst().entities;
+    try std.testing.expectEqual(@as(usize, 24), ai_entities.len);
+    for (ai_entities) |npc| {
+        try data.setSimulationTier(npc, .locomotion);
+        const body = data.movementBodyPtr(npc).?;
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    if (prove_zero_alloc) swap.install(&pipeline, &frame, &data, &threads, failing.allocator());
+    const result = pipeline.update(context);
+    if (prove_zero_alloc) swap.restore(&pipeline, &frame, &data, &threads);
+    _ = try result;
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
+    try std.testing.expectEqual(@as(usize, 24), frame.events.stats.world_tile_changed);
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    var out: GrowthScenarioResult = .{ .world_tile_changed = frame.events.stats.world_tile_changed };
+    for (ai_entities, 0..) |npc, index| {
+        try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
+        const position = data.movementBodyConst(npc).?.position;
+        const cell = world.cellContaining(position.x + 16, position.y + 16).?;
+        try std.testing.expect(!world.denseTileBlocksMovement(floor1, cell.x, cell.y));
+        out.positions[index] = .{ position.x, position.y };
+    }
+    try std.testing.expectEqual(@as(u64, 0), pipeline.dig.plane_scratch_grown);
+    try std.testing.expectEqual(@as(u64, 0), pipeline.steering.static_snapshot_grown_total);
+    return out;
+}
+
+test "population seam grows every pipeline capacity so the next step allocates nothing" {
+    _ = try runPopulationGrowthScenario(0, true);
+}
+
+test "population growth scenario is identical on the serial and multi-worker paths" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const serial = try runPopulationGrowthScenario(0, false);
+    const threaded = try runPopulationGrowthScenario(2, false);
+    try std.testing.expectEqual(serial.world_tile_changed, threaded.world_tile_changed);
+    for (serial.positions, threaded.positions) |a, b| {
+        try std.testing.expectEqual(a[0], b[0]);
+        try std.testing.expectEqual(a[1], b[1]);
+    }
+}
+
+fn minimalSyncWorld() !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    errdefer world.deinit();
+    _ = try world.addLevel(0);
+    return world;
+}
+
+const sync_test_pathfinding: PathfindingCapacity = .{ .max_group_fields = 1, .worker_participant_count = 1 };
+
+test "population sync at an unchanged population allocates nothing and never re-memsets the spatial window" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try pipeline.reserve(&frame, 4);
+
+    // Rows added directly (test-only path), past the initial reserve.
+    for (0..30) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+
+    const lookup = &pipeline.spatial_index.dense_lookup;
+    const starts_ptr = lookup.starts.items.ptr;
+    const capacity_cells_x = lookup.capacity_cells_x;
+    lookup.starts.items[0] = 7;
+    const grown = try pipeline.syncPopulationCapacity(&frame, &data, &world);
+    try std.testing.expect(grown.grew);
+    try std.testing.expectEqual(grownPopulationCapacity(30), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(starts_ptr, lookup.starts.items.ptr);
+    try std.testing.expectEqual(capacity_cells_x, lookup.capacity_cells_x);
+    try std.testing.expectEqual(@as(u32, 7), lookup.starts.items[0]);
+    lookup.starts.items[0] = 0;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(&pipeline, &frame, &data, &threads, failing.allocator());
+    const unchanged = pipeline.syncPopulationCapacity(&frame, &data, &world);
+    swap.restore(&pipeline, &frame, &data, &threads);
+    try std.testing.expect(!(try unchanged).grew);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "population sync raises the pathfinding agent budget when the nav-memory gate admits it" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pathfinding = sync_test_pathfinding;
+    pathfinding.max_agent_budget = 8;
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{ .pathfinding = pathfinding });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 0, 0, 0, 0);
+    try pipeline.reserve(&frame, 0);
+
+    for (0..12) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    const stats = try pipeline.syncPopulationCapacity(&frame, &data, &world);
+    try std.testing.expect(!stats.agent_budget_raise_refused);
+    try std.testing.expectEqual(grownPopulationCapacity(12), pipeline.pathfinding.agentBudget());
+    try std.testing.expectEqual(@as(usize, 48), pipeline.pathfinding.agentBudget());
+    // max(12, 2 x the floor 8).
+    try std.testing.expectEqual(@as(usize, 16), pipeline.pathfinding.effective_agent_capacity);
+    try std.testing.expectEqual(@as(u64, 0), pipeline.pathfinding.agent_budget_raise_refused);
+    try std.testing.expect(pipeline.pathfinding.coversAgentCount(12));
 }

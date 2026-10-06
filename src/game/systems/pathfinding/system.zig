@@ -164,6 +164,14 @@ pub const PathfindingSystem = struct {
     // acceptRequests overwrites the step stats; folded into stats.dropped_requests in
     // beginUpdate and then cleared.
     resize_dropped: usize = 0,
+    /// Telemetry: `raiseAgentBudget` calls the nav-memory gate refused (Slice 72 C3).
+    agent_budget_raise_refused: u64 = 0,
+    /// The `agentBudget()` ceiling at which a raise was refused (0 = none). A refused
+    /// ceiling is not retried: `coversAgentCount` treats it as final and the pending
+    /// backpressure applies. Behavior-affecting history (future intake depends on it).
+    agent_budget_raise_refused_at: usize = 0,
+    /// Once-only flag for the refused-raise warn.
+    agent_budget_raise_warned: bool = false,
 
     const SolvedPath = struct {
         key: PathQueryKey,
@@ -240,10 +248,28 @@ pub const PathfindingSystem = struct {
     // and shrink-and-free; the open-addressed caches are re-reserved (which wipes them —
     // reconstructable, and resizes are rare under hysteresis). The caller is responsible
     // for preserving any live cross-step state across the wipe.
+    //
+    // The logical limits (`self.capacity`, `effective_agent_capacity`) are committed only
+    // after every pool fits them. On a mid-resize OOM each pool still holds its old or its
+    // new storage (the resize helpers never free before the replacement exists), so the
+    // limits fall back to the smaller of the two derivations, which every pool fits: an
+    // intake gate can never `appendAssumeCapacity` past a pool's real capacity.
     fn applyDerivedCapacity(self: *PathfindingSystem, base: PathfindingCapacity, agent_count: usize) !void {
         const capacity = deriveCapacity(base, agent_count);
-        self.capacity = capacity;
-        self.effective_agent_capacity = capacity.max_pending_requests;
+        errdefer {
+            const previous_agents = self.effective_agent_capacity;
+            var fallback = deriveCapacity(base, @min(agent_count, previous_agents));
+            if (previous_agents == 0) {
+                // Never reserved: nothing is guaranteed to fit, so admit nothing.
+                fallback.max_frame_requests = 0;
+                fallback.max_pending_requests = 0;
+                fallback.max_cached_results = 0;
+                fallback.max_solved_requests_per_step = 0;
+                fallback.max_fallback_requests_per_step = 0;
+            }
+            self.capacity = fallback;
+            self.effective_agent_capacity = fallback.max_pending_requests;
+        }
         try resizeArrayList(PendingRequest, &self.pending, self.allocator, capacity.max_pending_requests);
         try resizeArrayList(PreparedRequest, &self.prepared_requests, self.allocator, capacity.max_frame_requests);
         try resizeArrayList(PathSolveResult, &self.solve_results, self.allocator, capacity.max_solved_requests_per_step);
@@ -293,6 +319,64 @@ pub const PathfindingSystem = struct {
         try resizeFilledArrayList(u32, &self.worker_path_pool, self.allocator, pool_cells, no_cell);
         const pool_stitched = capacity.max_solved_requests_per_step * capacity.max_stitched_path_cells;
         try resizeFilledArrayList(StitchedCell, &self.worker_stitched_pool, self.allocator, pool_stitched, .{ .level = 0, .cell = no_cell });
+        self.capacity = capacity;
+        self.effective_agent_capacity = capacity.max_pending_requests;
+    }
+
+    /// The live agent ceiling: `max_agent_budget`, floored at `min_capacity_floor`.
+    pub fn agentBudget(self: *const PathfindingSystem) usize {
+        return @max(min_capacity_floor, self.capacity.max_agent_budget);
+    }
+
+    /// O(1): true when the live pools already cover `agent_count` steering agents (or
+    /// the ceiling below it was refused and is final), so the population seam has no
+    /// pathfinding growth to do.
+    pub fn coversAgentCount(self: *const PathfindingSystem, agent_count: usize) bool {
+        if (self.effective_agent_capacity == 0) return true;
+        const budget = self.agentBudget();
+        if (agent_count > budget and self.agent_budget_raise_refused_at != budget) return false;
+        return deriveCapacity(self.capacity, agent_count).max_pending_requests <= self.effective_agent_capacity;
+    }
+
+    /// Raises `max_agent_budget` to `requested` when the nav-memory gate admits the
+    /// raised ceiling (same `budgetForCapacity` the build gate uses, charged against the
+    /// live reserved link limit). A refusal keeps the old ceiling, is counted, warns once,
+    /// and is final for that ceiling (see `coversAgentCount`). Main thread, population seam.
+    pub fn raiseAgentBudget(self: *PathfindingSystem, requested: usize, link_count: usize) bool {
+        const budget = self.agentBudget();
+        if (requested <= budget) return true;
+        var raised = self.capacity;
+        raised.max_agent_budget = requested;
+        const memory_budget = nav_memory.budgetForCapacity(raised, @max(@as(usize, 1), self.graph.levelCount()), link_count);
+        memory_budget.check(self.graph.width, self.graph.height) catch {
+            self.agent_budget_raise_refused += 1;
+            self.agent_budget_raise_refused_at = budget;
+            if (!self.agent_budget_raise_warned) {
+                self.agent_budget_raise_warned = true;
+                if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
+                    "pathfinding: agent budget raise to {d} refused ({d} bytes needed, max_nav_memory_bytes {d}); keeping {d}",
+                    .{ requested, memory_budget.requiredBytes(self.graph.width, self.graph.height), memory_budget.max_bytes, budget },
+                );
+            }
+            return false;
+        };
+        self.capacity.max_agent_budget = requested;
+        return true;
+    }
+
+    /// Grow half of the elastic resize: when `agent_count` derives more than the live
+    /// capacity, grows (at least 2x, clamped to `agentBudget()`) preserving live state.
+    /// Called from the pipeline's population seam and from `beginUpdate`'s safety net.
+    pub fn growForAgentCount(self: *PathfindingSystem, agent_count: usize) !void {
+        if (self.effective_agent_capacity == 0) return; // not reserved yet
+        const target = deriveCapacity(self.capacity, agent_count).max_pending_requests;
+        const current = self.effective_agent_capacity;
+        if (target <= current) return;
+        self.low_load_steps = 0;
+        // Amortized grow: at least double, clamped to the ceiling, so one realloc
+        // covers many future spawns.
+        const grown = @min(@max(target, current *| 2), self.agentBudget());
+        try self.resizePreservingLiveState(grown);
     }
 
     // Adjusts the live capacity toward the agent count at the pre-dispatch safe
@@ -316,14 +400,7 @@ pub const PathfindingSystem = struct {
         if (self.effective_agent_capacity == 0) return; // not reserved yet
         const target = deriveCapacity(self.capacity, agent_count).max_pending_requests;
         const current = self.effective_agent_capacity;
-        if (target > current) {
-            self.low_load_steps = 0;
-            // Amortized grow: at least double, clamped to the ceiling, so one realloc
-            // covers many future spawns.
-            const grown = @min(@max(target, current *| 2), @max(min_capacity_floor, self.capacity.max_agent_budget));
-            try self.resizePreservingLiveState(grown);
-            return;
-        }
+        if (target > current) return self.growForAgentCount(agent_count);
         // Shrink only after the agent count stays below half capacity for the window.
         if (agent_count * 2 < current) {
             self.low_load_steps +|= 1;
@@ -348,8 +425,15 @@ pub const PathfindingSystem = struct {
         try self.resize_group_snapshot.ensureTotalCapacity(self.allocator, self.group_requests.items.len);
         self.resize_group_snapshot.appendSliceAssumeCapacity(self.group_requests.items);
 
+        // A failed resize still restores the live state, clamped to the fallback limits
+        // `applyDerivedCapacity` installs on error, so accepted work and its dedup keys
+        // stay consistent after a recovered OOM.
+        errdefer self.restoreLiveStateAfterResize();
         try self.applyDerivedCapacity(self.capacity, agent_count);
+        self.restoreLiveStateAfterResize();
+    }
 
+    fn restoreLiveStateAfterResize(self: *PathfindingSystem) void {
         // Restore live deferred work (dropping any beyond the new, smaller capacity),
         // rebuild pending_keys to match, and restore the surviving group tally. Clamped to
         // the LOGICAL caps applyDerivedCapacity just installed (self.capacity.*), not the
@@ -4612,6 +4696,156 @@ test "pathfinding intake drop count is independent of world size" {
     try std.testing.expectEqual(@as(usize, 5), small_stats.dropped_requests);
     try std.testing.expectEqual(small_stats.dropped_requests, large_stats.dropped_requests);
     try std.testing.expectEqual(small_stats.accepted_requests, large_stats.accepted_requests);
+}
+
+/// Every pool the intake/solve/publish paths `appendAssumeCapacity` into fits the
+/// committed logical limits.
+fn expectPoolsFitLogicalCaps(system: *const PathfindingSystem) !void {
+    const cap = system.capacity;
+    try std.testing.expect(system.pending.capacity >= cap.max_pending_requests);
+    try std.testing.expect(system.prepared_requests.capacity >= cap.max_frame_requests);
+    try std.testing.expect(system.solve_results.capacity >= cap.max_solved_requests_per_step);
+    try std.testing.expect(system.fallback_indices.capacity >= cap.max_solved_requests_per_step);
+    try std.testing.expect(system.solved_paths.capacity >= cap.max_solved_requests_per_step);
+    try std.testing.expect(system.rotate_back_scratch.capacity >= cap.max_solved_requests_per_step);
+    try std.testing.expect(system.group_requests.capacity >= cap.max_solved_requests_per_step);
+    try std.testing.expect(system.worker_path_pool.items.len >= cap.max_solved_requests_per_step * cap.max_stored_path_cells);
+    try std.testing.expect(system.worker_stitched_pool.items.len >= cap.max_solved_requests_per_step * cap.max_stitched_path_cells);
+    try std.testing.expectEqual(cap.max_pending_requests, system.effective_agent_capacity);
+}
+
+/// Submits `count` requests with distinct goals (one goal cell each), fallback budget 0.
+fn submitDistinctGoalBurst(system: *PathfindingSystem, requesters: []const EntityId, count: usize, agent_count: usize) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(count, count);
+    for (requesters[0..count], 0..) |entity, i| {
+        try appendPathRequest(&stream, .{
+            .entity = entity,
+            .start = .{ .x = 8, .y = 8 },
+            .goal = .{ .x = 8.0 + @as(f32, @floatFromInt(i + 1)) * 32.0, .y = 200 },
+        });
+    }
+    return system.updateSerial(&stream, agent_count, .{ .max_fallback_requests_per_step = 0 });
+}
+
+test "growForAgentCount grows at least 2x from the floor and keeps the shrink path" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var system = try intakeTestSystem(&data, 512);
+    defer system.deinit();
+    try std.testing.expectEqual(min_capacity_floor, system.effective_agent_capacity);
+
+    try system.growForAgentCount(12);
+    try std.testing.expectEqual(@as(usize, 16), system.effective_agent_capacity);
+    try expectPoolsFitLogicalCaps(&system);
+    // Already covered: no further growth.
+    try system.growForAgentCount(12);
+    try std.testing.expectEqual(@as(usize, 16), system.effective_agent_capacity);
+}
+
+test "coversAgentCount compares the live pools and the ceiling" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var unreserved = PathfindingSystem.init(std.testing.allocator);
+    defer unreserved.deinit();
+    try std.testing.expect(unreserved.coversAgentCount(1000));
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 8;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+    try std.testing.expect(system.coversAgentCount(0));
+    try std.testing.expect(system.coversAgentCount(8));
+    // Past the ceiling and never refused: the seam must try a raise.
+    try std.testing.expect(!system.coversAgentCount(9));
+    // A refused ceiling is final: the floor pools cover everything they can.
+    system.agent_budget_raise_refused_at = system.agentBudget();
+    try std.testing.expect(system.coversAgentCount(9));
+
+    system.agent_budget_raise_refused_at = 0;
+    try std.testing.expect(system.raiseAgentBudget(64, 0));
+    try std.testing.expectEqual(@as(usize, 64), system.agentBudget());
+    try std.testing.expect(!system.coversAgentCount(9));
+    try system.growForAgentCount(9);
+    try std.testing.expect(system.coversAgentCount(9));
+    try std.testing.expect(system.coversAgentCount(16));
+    try std.testing.expect(!system.coversAgentCount(17));
+}
+
+test "a refused agent budget raise keeps the ceiling, counts once, and drops past it" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var requesters: [12]EntityId = undefined;
+    for (&requesters, 0..) |*slot, i| {
+        slot.* = try addNavBody(&data, .{ .x = @floatFromInt(i * 32), .y = 400 }, .{ .x = 8, .y = 8 }, false);
+    }
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 8;
+    // Exactly the bytes the 8-agent ceiling needs on this 16x16-cell, 1-level grid.
+    capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(capacity, 1, 0).requiredBytes(16, 16);
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+
+    try std.testing.expect(!system.raiseAgentBudget(48, 0));
+    try std.testing.expectEqual(@as(usize, 8), system.agentBudget());
+    try std.testing.expectEqual(@as(u64, 1), system.agent_budget_raise_refused);
+    try std.testing.expectEqual(@as(usize, 8), system.agent_budget_raise_refused_at);
+    try std.testing.expect(system.agent_budget_raise_warned);
+    try std.testing.expect(system.coversAgentCount(12));
+    // The seam never retries a refused ceiling; a direct second call is refused again.
+    try std.testing.expect(!system.raiseAgentBudget(48, 0));
+    try std.testing.expectEqual(@as(u64, 2), system.agent_budget_raise_refused);
+
+    // 12 distinct requests against the 8-request logical intake cap.
+    const stats = try submitDistinctGoalBurst(&system, &requesters, requesters.len, requesters.len);
+    try std.testing.expectEqual(@as(usize, 4), stats.dropped_requests);
+    try std.testing.expectEqual(@as(usize, 8), stats.accepted_requests);
+}
+
+test "a grow that runs out of memory mid-resize keeps logical limits within every pool" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var requesters: [12]EntityId = undefined;
+    for (&requesters, 0..) |*slot, i| {
+        slot.* = try addNavBody(&data, .{ .x = @floatFromInt(i * 32), .y = 400 }, .{ .x = 8, .y = 8 }, false);
+    }
+
+    // Sweep the failure point across every allocation of the 8 -> 40 grow.
+    var failed_grows: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        var system = try intakeTestSystem(&data, 512);
+        defer system.deinit();
+        const real_allocator = system.allocator;
+        var failing = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        system.allocator = failing.allocator();
+        const result = system.growForAgentCount(40);
+        system.allocator = real_allocator;
+        if (result) |_| {
+            try std.testing.expectEqual(@as(usize, 40), system.effective_agent_capacity);
+            try expectPoolsFitLogicalCaps(&system);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failed_grows += 1;
+            // Falls back to the pre-grow limits, which every pool still fits.
+            try std.testing.expectEqual(min_capacity_floor, system.effective_agent_capacity);
+            try std.testing.expectEqual(min_capacity_floor, system.capacity.max_frame_requests);
+            try expectPoolsFitLogicalCaps(&system);
+            // The next update runs safely at the old limits (no grow at 8 agents).
+            const stats = try submitDistinctGoalBurst(&system, &requesters, requesters.len, min_capacity_floor);
+            try std.testing.expectEqual(@as(usize, 4), stats.dropped_requests);
+        }
+    }
+    try std.testing.expect(failed_grows > 1);
 }
 
 test "group-field threshold is independent of world size" {

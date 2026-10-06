@@ -157,9 +157,14 @@ pub const DenseCellLookup = struct {
     capacity_cells_x: u32 = 0,
     capacity_cells_y: u32 = 0,
 
-    fn reserve(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32, population_capacity: usize) !void {
-        const total = @as(usize, width) * @as(usize, height);
+    /// Grow-only `touched` reserve (population-sized). Preserves the last build's
+    /// touched indices, so a population growth never re-memsets the window.
+    fn reserveTouched(self: *DenseCellLookup, allocator: std.mem.Allocator, population_capacity: usize) !void {
         try self.touched.ensureTotalCapacity(allocator, population_capacity);
+    }
+
+    fn reserveWindow(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32) !void {
+        const total = @as(usize, width) * @as(usize, height);
 
         // Re-entrant: a second call with the same grid size must not append
         // another full window of zeros (would desync len from capacity and
@@ -499,16 +504,31 @@ pub const SpatialIndexSystem = struct {
     /// `max_dense_window_side_cells`'s doc comment for the headroom this
     /// leaves and the assumption it rests on.
     pub fn reserve(self: *SpatialIndexSystem, capacity: usize, geometry: DenseWindowGeometry) !void {
+        try self.reserveRows(capacity);
+        try self.reserveWindow(geometry);
+    }
+
+    /// Population-sized half of `reserve`: `rows`/`entries`/`ranges`/the dense
+    /// lookup's `touched` list, plus gather slot 0 (the single-range path; slots >= 1
+    /// warm on the first multi-range step). Grow-only and never touches the dense
+    /// window, so the pipeline's population seam re-runs it without a re-memset.
+    pub fn reserveRows(self: *SpatialIndexSystem, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
         try self.ranges.ensureTotalCapacity(self.allocator, capacity);
+        try self.dense_lookup.reserveTouched(self.allocator, capacity);
+        if (capacity > 0) try prepareRowRangeBuffers(self.allocator, &self.gather_ranges, capacity, capacity, 1);
+    }
 
+    /// World-geometry half of `reserve`: sizes the dense lookup window (idempotent
+    /// for an unchanged window).
+    pub fn reserveWindow(self: *SpatialIndexSystem, geometry: DenseWindowGeometry) !void {
         const halo_world_units = 2.0 * @as(f32, @floatFromInt(cognition_halo_chunks)) *
             @as(f32, @floatFromInt(geometry.chunk_size_tiles)) * geometry.tile_size;
         const margin_cells: u32 = @intFromFloat(@ceil(halo_world_units / geometry.cell_size));
         const window_side = @min(margin_cells + max_expected_visible_window_cells, max_dense_window_side_cells);
 
-        try self.dense_lookup.reserve(self.allocator, window_side, window_side, capacity);
+        try self.dense_lookup.reserveWindow(self.allocator, window_side, window_side);
     }
 
     /// Read-only snapshot of the most recently built index.
@@ -1525,7 +1545,8 @@ test "buildEntriesAndRanges clamps the dense window and skips out-of-window cell
     defer sys.deinit();
     // Bypass reserve()'s own sizing (which would comfortably cover this case)
     // to directly force the undersized-window path this test targets.
-    try sys.dense_lookup.reserve(testing.allocator, 4, 4, 2);
+    try sys.dense_lookup.reserveTouched(testing.allocator, 2);
+    try sys.dense_lookup.reserveWindow(testing.allocator, 4, 4);
     sys.cell_size = 32.0;
 
     const ai_slice = data.aiAgentSliceConst();
@@ -1548,4 +1569,39 @@ test "buildEntriesAndRanges clamps the dense window and skips out-of-window cell
     var visitor = RecordingVisitor{};
     _ = view.queryNeighbors(0, 0, null, 1, .{ .radius = 10.0, .max_candidate_checks = 8 }, &visitor, RecordingVisitor.record);
     try testing.expectEqual(@as(usize, 1), visitor.count);
+}
+
+test "reserveRows grows population storage without touching the dense window" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander });
+
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.reserve(4, .{});
+    _ = try sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{});
+    const touched_len = sys.dense_lookup.touched.items.len;
+    try testing.expect(touched_len > 0);
+
+    const starts_ptr = sys.dense_lookup.starts.items.ptr;
+    const starts_len = sys.dense_lookup.starts.items.len;
+    const capacity_cells_x = sys.dense_lookup.capacity_cells_x;
+    // Sentinel in an untouched window slot: a re-memset would wipe it.
+    const sentinel_index = starts_len - 1;
+    sys.dense_lookup.starts.items[sentinel_index] = 7;
+
+    try sys.reserveRows(200);
+
+    try testing.expectEqual(starts_ptr, sys.dense_lookup.starts.items.ptr);
+    try testing.expectEqual(starts_len, sys.dense_lookup.starts.items.len);
+    try testing.expectEqual(capacity_cells_x, sys.dense_lookup.capacity_cells_x);
+    try testing.expectEqual(@as(u32, 7), sys.dense_lookup.starts.items[sentinel_index]);
+    try testing.expectEqual(touched_len, sys.dense_lookup.touched.items.len);
+    try testing.expect(sys.entries.capacity >= 200);
+    try testing.expect(sys.dense_lookup.touched.capacity >= 200);
+    try testing.expect(sys.gather_ranges.items.len >= 1);
+    try testing.expect(sys.gather_ranges.items[0].buffer.rows.capacity >= 200);
+    sys.dense_lookup.starts.items[sentinel_index] = 0;
 }

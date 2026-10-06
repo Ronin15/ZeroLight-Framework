@@ -247,14 +247,17 @@ same change):
 | `sensory` | hashed | `SensoryBus.hashSimulationState`: `deferred_stimulus_count` + live entries; `sticky_count` + live entries + `sticky_remaining[0..sticky_count]`; `config` and `hearing_stimuli_scratch` excluded |
 | `dig` | hashed | `DigController.hashSimulationState`: three latches + `player_last_cell` (optional fold); `ramp_tile`, `tunnel_tile`, `plane_tile_changes`, `scratch_allocator`, 64E's `ramp_refused_link_slots` telemetry + `nav_link_geometry` config, and 72's `plane_scratch_grown` telemetry excluded |
 | `ai` | hashed | `AiSystem.hashSimulationState`: `snapped_goal` (x, y), `snapped_goal_initialized`; `allocator`, `rows`, `candidates`, both tuners excluded |
-| `steering` | hashed | `SteeringSystem.hashSimulationState`: `runtime_rows` in list order, every `RuntimeRow` field folded per field (`entity` raw, `f32` NaN-canonical, `bool` fold, `u16`/`u32` raw); all other fields: scratch, derived (`steering_movement_index*`), cache (obstacle snapshot + index, `steering.zig:1911`), tuner |
+| `steering` | hashed | `SteeringSystem.hashSimulationState`: `runtime_rows` in list order, every `RuntimeRow` field folded per field (`entity` raw, `f32` NaN-canonical, `bool` fold, `u16`/`u32` raw); all other fields: scratch, derived (`steering_movement_index*`), cache (obstacle snapshot + index, `steering.zig:1911`), tuner; 72's `static_snapshot_grown_total`/`static_snapshot_grow_warned` telemetry excluded |
 | `pathfinding` | normalized | lifecycle, caches, group fields, dirty marks, 64E's `nav_links_processed` cursor, 65B's deferred state, 71B.3's prewarm fields, and the nav graph (B5). Not `cache`: cache warmth changes simulation results (B5 tests) |
 | `perception` | cache | `level_blocked`/`step_counter` (`perception.zig:2576-2793`), including each level slot's `pending_dirty` list and `full_rebuild_pending` flag (load-reserved and bounded; Checklist "B3 perception cache bound"); rows/candidates/ranges scratch; tuner |
 | `scope` | excluded | `step_count` is hashed in `"header"`; indices/ranges scratch; tuners; `stagger_skips`, `chunk_filtered_entities` telemetry |
 | `movement`, `collision`, `collision_response`, `spatial_index`, `ai_memory`, `affect` | excluded | per-step scratch + tuners |
 | `destructible` | excluded | no fields |
 | `audio_controller` | excluded | presentation (never feeds simulation) |
-| `nav_cell_size`, `structural_headroom`, `movement_body_capacity`, `perception_max_events_per_step`, `affect_max_events_per_step` | excluded | config |
+| `nav_cell_size`, `structural_headroom`, `perception_max_events_per_step`, `affect_max_events_per_step` | excluded | config |
+| `movement_body_capacity`, `responder_capacity` | excluded | derived capacity (grown only at the commit seam, Slice 72 C3; output-transparent) |
+| `population_capacity_grows`, `population_growth_logged` | excluded | telemetry |
+| `pathfinding.capacity.max_agent_budget` (seam-raised) and `agent_budget_raise_refused_at` (72 C3) | hashed | history-dependent ceiling that changes future request intake; not derivable from `DataSystem` |
 | `action_intents_dropped_step` | excluded | telemetry, reset each update |
 | `seed` (49) | excluded | `seed.root` is in `"header"` |
 | `ai_intent_seed` (49) | excluded | derived from `seed` |

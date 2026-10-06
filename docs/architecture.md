@@ -442,12 +442,14 @@ The current gameplay fixed-step pipeline is:
    `tier_policy` (deferred `set_simulation_tier` commands).
 4. Queue contact audio, emit/update transient particles, and merge outputs.
 5. Update the state-owned follow camera and visible world chunks.
-6. Commit deferred structural commands to `DataSystem`, then run the
-   pipeline's post-commit reactions
-   (`SimulationPipeline.reactToPostCommitNavEvents` and
-   `.reactToPostCommitPerceptionEvents`, both independent side effects on
-   disjoint state reacting to the same committed event stream) so nav and
-   perception caches patch from this step's world edits.
+6. Commit deferred structural commands to `DataSystem`, run
+   `SimulationPipeline.syncPopulationCapacity` (the population growth seam),
+   then run the pipeline's post-commit reactions (nav, perception, steering:
+   `SimulationPipeline.reactToPostCommitNavEvents`,
+   `.reactToPostCommitPerceptionEvents`, and `.reactToPostCommitSteeringEvents`,
+   independent side effects on disjoint state reacting to the same committed
+   event stream) so nav and perception caches patch from this step's world
+   edits.
 7. Render current `WorldSystem`, `DataSystem`, and particle state with
    interpolation.
 

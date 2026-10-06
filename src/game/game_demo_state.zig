@@ -52,6 +52,7 @@ const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
+const PopulationSyncStats = @import("simulation_pipeline.zig").PopulationSyncStats;
 const sim_view_overscan_chunks = @import("simulation_pipeline.zig").sim_view_overscan_chunks;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
@@ -279,6 +280,8 @@ pub const GameDemoState = struct {
     ai_overlay: AiDebugOverlay = .{},
     // Last incremental nav-update batch diagnostics, recorded into perf metrics.
     last_nav_update_stats: NavUpdateStats = .{},
+    // Last population-seam result (Slice 72 C3), recorded into perf metrics.
+    last_population_sync: PopulationSyncStats = .{},
     camera_previous: Camera2D = .{},
     camera_current: Camera2D = .{},
     viewport_width: f32 = 800,
@@ -440,7 +443,6 @@ pub const GameDemoState = struct {
         // both range slots and value slots to the fixed live ceiling.
         try simulation_frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
-            .steering_agent_capacity = pop_cap.mover_count,
             .contact_capacity = pop_cap.contact_capacity,
             .movement_body_capacity = pop_cap.mover_count + obstacle_count + 1,
             // 512x512 tiles at a 32px nav cell = one nav cell per tile, full
@@ -571,6 +573,7 @@ pub const GameDemoState = struct {
             structural_stats.recordTo(context.perf);
             self.simulation_frame.events.stats.recordTo(context.perf);
             self.last_nav_update_stats.recordTo(context.perf);
+            self.last_population_sync.recordTo(context.perf);
         }
     }
 
@@ -691,6 +694,9 @@ pub const GameDemoState = struct {
             self.pipeline.hasPendingNavLinks(&self.world);
         const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
+        // Population growth seam: the post-commit reactions and the next step see grown
+        // capacities. O(1) when the committed rows fit the tracked capacities.
+        self.last_population_sync = try self.pipeline.syncPopulationCapacity(&self.simulation_frame, &self.data, &self.world);
         self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);
         try self.pipeline.reactToPostCommitPerceptionEvents(&self.simulation_frame, &self.world);
         self.pipeline.reactToPostCommitSteeringEvents(&self.simulation_frame);
@@ -2320,4 +2326,43 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
         }
     }
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.nav_region_invalidated);
+}
+
+test "demo commit seam grows pipeline capacity" {
+    var demo = try initDemoForTest(std.testing.allocator);
+    defer demo.deinit();
+    try std.testing.expectEqual(@as(usize, 37), demo.pipeline.movement_body_capacity);
+
+    // Three creates (movement, bounds, response: 4 commit events each) push the
+    // population past the init reserve.
+    var commands: [3]StructuralCommand = undefined;
+    for (&commands, 0..) |*command, index| {
+        const x: f32 = 360 + @as(f32, @floatFromInt(index)) * 64;
+        command.* = .{ .create_entity = .{
+            .movement_body = .{ .position = .{ .x = x, .y = 180 }, .previous_position = .{ .x = x, .y = 180 }, .velocity = .{}, .speed = 0 },
+            .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+            .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        } };
+    }
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, commands.len);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    for (commands) |command| writer.write(command);
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
+
+    // 40 bodies -> 40 + 20 + 16 = 76, hot-store aligned to 80. The bound follows:
+    // dig 1 + perception 24 + affect 48 + plane (80 + 1) + action_react 64 +
+    // structural (80 + 80) + nav 1 = 379.
+    try std.testing.expect(demo.last_population_sync.grew);
+    try std.testing.expectEqual(@as(usize, 80), demo.pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 379), demo.pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(?usize, 379), demo.simulation_frame.events.capacity_limit);
+
+    demo.simulation_frame.beginStep();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
+    try std.testing.expect(!demo.last_population_sync.grew);
 }

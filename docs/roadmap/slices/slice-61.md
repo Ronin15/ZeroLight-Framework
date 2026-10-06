@@ -175,7 +175,7 @@ invalidation with no new nav code. It is mutually exclusive with `destructible`
   collision broadphase as static proxies. The demo's body count used for
   contact, trigger, and intent capacity (`game_demo_state.zig:127-135`) and the
   pipeline's `movement_body_capacity` and spatial-index reserves add the term
-  `resource_node_capacity`.
+  `resource_node_capacity` (an initial size only; `syncPopulationCapacity` is the growth point — Slice 72 C3).
 - **Slice 49 checksum classification (and the matching Slice 46 save
   section):** `ResourceNodeStore` is hashed (`?Faction` folds as an enum).
   `ResourceNodeIndex` is excluded (commit-derived, owned by
@@ -499,7 +499,7 @@ as Slice 57 world items, and NPC↔merchant selling of harvested goods (a future
 
 - [ ] `ResourceNode` component (one appended tag) + MAL store + structural/template/capacity/slot wiring + validation; store `FailingAllocator` append proof.
 - [ ] World-sized `resource_node_capacity` (the load path's node count, computed in `GameDemoState.initWithWorld` before the first commit; `u32` dense-row ceiling): store, index, and rebuild scratch reserved to it at load; refusal only at the `u32` ceiling, counted as `resource_node_creates_refused`. Test: the derived capacity equals the placed count on a minimal fixture. `FailingAllocator` proof: after the load reserve, creating exactly `resource_node_capacity` nodes, committing them, and rebuilding the index allocate nothing.
-- [ ] Collider capacity: add `resource_node_capacity` to the demo body count feeding contact, trigger, and intent capacity (`game_demo_state.zig:127-135`) and to the pipeline's `movement_body_capacity` and spatial-index reserves.
+- [ ] Collider capacity: add `resource_node_capacity` to the demo body count feeding contact, trigger, and intent capacity (`game_demo_state.zig:127-135`) and to the pipeline's `movement_body_capacity` and spatial-index reserves (an initial size only; `syncPopulationCapacity` is the growth point — Slice 72 C3).
 - [ ] Slice 49 checksum classification + Slice 46 save section: `ResourceNodeStore` hashed; `ResourceNodeIndex` excluded (rebuilt after load).
 - [ ] `src/game/simulation_seed.zig`: append `SeedDomain.harvest = 7` (Slice 49 reserved value); `harvest_seed` derived once at pipeline init.
 - [ ] Content: `berries`, `wood`, `stone` in Slice 57's `items.json` with `grim_items` icons (atlas workflow); `zig build assets-lint` passes.

@@ -230,7 +230,9 @@ Ammo consumption lands in Slice 68C (`requires_ammo`, `TransferBatch.consume`).
       array-length asserts still passing.
 - [ ] Event budget and enumerated structural headroom; collision
       contact/trigger and `movement_body_capacity` body count includes
-      `projectile_live_capacity`; counters `projectiles_spawned` / `_refused` /
+      `projectile_live_capacity` (initial sizes only;
+      `SimulationPipeline.syncPopulationCapacity` grows every
+      population-sized pipeline capacity at the commit seam — Slice 72 C3); counters `projectiles_spawned` / `_refused` /
       `_hits` / `_expired` / `_out_of_world`.
 - [ ] Docs: `docs/simulation-tiers-and-pipeline.md` and
       `docs/architecture.md` (including the documented 12 px tunnel limit).

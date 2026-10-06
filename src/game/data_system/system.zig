@@ -155,6 +155,19 @@ pub const DataSystem = struct {
         self.* = init(self.allocator);
     }
 
+    /// O(1): each population-sized store's committed row count.
+    pub fn populationRowCounts(self: *const DataSystem) types.PopulationRowCounts {
+        return .{
+            .movement_bodies = self.movement_bodies.len(),
+            .steering_agents = self.steering_agents.len(),
+            .ai_agents = self.ai_agents.len(),
+            .collision_bounds = self.collision_bounds.len(),
+            .collision_responses = self.collision_responses.len(),
+            .ai_perceptions = self.ai_perceptions.len(),
+            .ai_affects = self.ai_affects.len(),
+        };
+    }
+
     pub fn createEntity(self: *DataSystem) !EntityId {
         if (self.first_free_slot) |index| {
             const slot = &self.slots.items[@intCast(index)];

@@ -899,19 +899,32 @@ pub fn shouldShrinkCapacity(current_capacity: usize, target_capacity: usize) boo
 // Grows (amortized) or shrinks-and-frees a per-step scratch list's backing capacity
 // to `capacity`, leaving it empty. Used for lists the update repopulates each step,
 // so no contents need to survive the resize. Shrinking frees memory back.
+//
+// Failure-atomic: a shrink allocates the smaller buffer before freeing the old one, so
+// an OOM leaves the old (larger) storage in place, never an empty list behind a logical
+// limit that still admits writes.
 pub fn resizeArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize) !void {
     if (shouldShrinkCapacity(list.capacity, capacity)) {
-        list.clearRetainingCapacity();
-        list.shrinkAndFree(allocator, 0);
+        var replacement: std.ArrayList(T) = .empty;
+        try replacement.ensureTotalCapacity(allocator, capacity);
+        list.deinit(allocator);
+        list.* = replacement;
+        return;
     }
     try list.ensureTotalCapacity(allocator, capacity);
     list.clearRetainingCapacity();
 }
 
 // Like resizeArrayList but for a pool sized to exactly `capacity` and memset to a
-// fill value (the disjoint worker path/stitched stripes). Shrinking frees memory.
+// fill value (the disjoint worker path/stitched stripes). Shrinking frees memory;
+// failure-atomic the same way.
 pub fn resizeFilledArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize, fill: T) !void {
-    if (shouldShrinkCapacity(list.capacity, capacity)) list.shrinkAndFree(allocator, 0);
+    if (shouldShrinkCapacity(list.capacity, capacity)) {
+        var replacement: std.ArrayList(T) = .empty;
+        try replacement.ensureTotalCapacity(allocator, capacity);
+        list.deinit(allocator);
+        list.* = replacement;
+    }
     try list.ensureTotalCapacity(allocator, capacity);
     list.items.len = capacity;
     @memset(list.items, fill);

@@ -155,12 +155,19 @@ pub const SimulationScopeSystem = struct {
 
     /// Pre-sizes the per-step scratch index/command lists to `capacity` movement
     /// bodies so the serial gathers and tier policy are allocation-free after init.
-    /// The threaded per-range slot buffers still warm on their first threaded step.
+    /// Slot 0 of each per-range list (the single-range path: serial, 0-worker, or
+    /// tuner-inline runs the whole population as one range) is reserved too; slots
+    /// >= 1 warm on the first multi-range step. Grow-only; re-run by the pipeline's
+    /// population seam.
     pub fn reserve(self: *SimulationScopeSystem, capacity: usize) !void {
         try self.collision_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.ai_halo_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
+        if (capacity == 0) return;
+        try prepareIndexRangeBuffers(self.allocator, &self.collision_gather_ranges, capacity, capacity, 1);
+        try prepareIndexRangeBuffers(self.allocator, &self.ai_gather_ranges, capacity, capacity, 1);
+        try prepareCommandRangeBuffers(self.allocator, &self.tier_command_ranges, capacity, capacity, 1);
     }
 
     /// Increment the step counter. Call once at the top of each fixed step.
@@ -1633,4 +1640,61 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
     try std.testing.expectEqualSlices(u32, warm_ai.cognition, ai_result.cognition);
     _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, .{});
     try std.testing.expect(stream.mergedItems().len > 0);
+}
+
+test "scope reserve makes the first single-range threaded gathers and tier policy allocation-free" {
+    const allocator = std.testing.allocator;
+
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    // Same rotating-tier shape as the warmed proof above, so every pass leaves its
+    // full-active fast path, at a population that is not a range multiple.
+    const population: usize = 40;
+    for (0..population) |index| {
+        const e = try data.createEntity();
+        try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
+        try data.setAiAgent(e, .{ .active_behavior = .wander });
+        try data.setSimulationMetadata(e, .{
+            .tier = @fromBackingInt(@intCast(index % 4)),
+            .chunk = .{ .x = @intCast(index % 20), .y = 0 },
+            .level = @intCast(index % 5),
+            .stagger_phase = 0,
+        });
+    }
+
+    // 0 workers: the whole population runs as one inline range (slot 0).
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    try sys.reserve(population);
+    var stream = RangeOutputStream(StructuralCommand).init(allocator);
+    defer stream.deinit();
+    try stream.reserve(1, population);
+
+    const ai_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    var visible_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 2, .y = 8 });
+    visible_region.level = 0;
+
+    const original_sys_allocator = sys.allocator;
+    const original_thread_allocator = threads.allocator;
+    const original_stream_allocator = stream.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    sys.allocator = failing_allocator.allocator();
+    threads.allocator = failing_allocator.allocator();
+    stream.allocator = failing_allocator.allocator();
+    defer {
+        sys.allocator = original_sys_allocator;
+        threads.allocator = original_thread_allocator;
+        stream.allocator = original_stream_allocator;
+    }
+
+    const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
+    try std.testing.expect(collision.indices != null);
+    const ai_result = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, .{});
+    try std.testing.expect(ai_result.halo.len > 0);
+    _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, .{});
+    try std.testing.expect(stream.mergedItems().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }

@@ -14,6 +14,8 @@
 pub const Faction = @import("data_system/types.zig").Faction;
 pub const hot_soa_column_alignment = @import("data_system/types.zig").hot_soa_column_alignment;
 pub const movement_range_alignment_items = @import("data_system/types.zig").movement_range_alignment_items;
+pub const hotStoreCapacity = @import("data_system/types.zig").hotStoreCapacity;
+pub const PopulationRowCounts = @import("data_system/types.zig").PopulationRowCounts;
 pub const HotF32Slice = @import("data_system/types.zig").HotF32Slice;
 pub const ConstHotF32Slice = @import("data_system/types.zig").ConstHotF32Slice;
 pub const HotI32Slice = @import("data_system/types.zig").HotI32Slice;

@@ -338,6 +338,14 @@ pub const DigController = struct {
         try self.plane_tile_changes.ensureTotalCapacity(allocator, capacity);
     }
 
+    /// Grow-only re-reserve from the pipeline's population seam (Slice 72 C3), using the
+    /// allocator `reservePlaneScratch` set. Not a shortfall: `plane_scratch_grown` is
+    /// not counted.
+    pub fn ensurePlaneScratchReserve(self: *DigController, capacity: usize) !void {
+        const allocator = self.scratch_allocator orelse return error.PlaneScratchUnreserved;
+        try self.plane_tile_changes.ensureTotalCapacity(allocator, capacity);
+    }
+
     /// Cold growth of the landing-carve scratch to `needed`, taken on the main thread
     /// before any world mutation. Counts the growth only after it succeeds; the first
     /// growth warns once (release-visible, compiled out of tests).

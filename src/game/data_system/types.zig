@@ -30,6 +30,26 @@ pub fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, movement_range_alignment_items);
 }
 
+/// Committed row counts of the component stores whose pipeline scratch, event
+/// shares, and pathfinding pools are population-sized. Read by the pipeline's
+/// population growth seam (`SimulationPipeline.syncPopulationCapacity`).
+pub const PopulationRowCounts = struct {
+    movement_bodies: usize,
+    steering_agents: usize,
+    ai_agents: usize,
+    collision_bounds: usize,
+    collision_responses: usize,
+    ai_perceptions: usize,
+    ai_affects: usize,
+
+    /// Rows of every store whose pipeline scratch is sized by `movement_body_capacity`.
+    /// DataSystem enforces no component dependency (`setSteeringAgent`/`setAiAgent`/
+    /// `setCollisionBounds` attach independently), so this is the max, not one store.
+    pub fn population(self: PopulationRowCounts) usize {
+        return @max(@max(self.movement_bodies, self.steering_agents), @max(self.ai_agents, self.collision_bounds));
+    }
+};
+
 /// Stable entity handle. The index points at an entity slot and the generation
 /// changes whenever that slot is retired, so stale IDs cannot resolve after
 /// free-list reuse.

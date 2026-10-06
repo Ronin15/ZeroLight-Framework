@@ -377,15 +377,22 @@ Commit behavior:
   structural events.
 - Extra required event capacity can be preflighted before side effects that
   need domain-reaction events in the same step.
+- After publication the state calls `SimulationPipeline.syncPopulationCapacity`
+  (main thread, outside `stage_order`). It is an O(1) compare of committed row
+  counts against tracked logical capacities, and on growth a geometric
+  (`rows + rows/2 + 16`, hot-store aligned) re-reserve of every
+  population-sized pipeline capacity, frame stream, the event bound, and the
+  pathfinding elastic pools. It is the only population growth point.
 
 This keeps partial structural mutations from leaking when validation or event
 capacity fails.
 
 ## Post-Commit Reactions
 
-After structural commit and event publication, `GameDemoState` calls two
+After structural commit and event publication, `GameDemoState` calls three
 independent `SimulationPipeline` reactions against the same committed event
-stream:
+stream. The reactions run after `syncPopulationCapacity`, so they see grown
+capacities.
 
 - `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, interpreting
   nav-invalidating committed events (`world_tile_changed`,
@@ -396,8 +403,11 @@ stream:
   recording localized dirty rects from the same `world_tile_changed`/
   `world_obstacle_changed` events to incrementally patch its per-level
   LOS-blocked bitmap cache. It emits no event of its own.
+- `reactToPostCommitSteeringEvents` delegates to `SteeringSystem`, marking its
+  static-obstacle snapshot and steering-to-movement index cache stale when
+  committed events change static obstacles or renumber dense rows.
 
-Both reactions are side effects on fully disjoint state, so call order
+The reactions are side effects on fully disjoint state, so call order
 between them does not matter.
 
 ## Current Integration
