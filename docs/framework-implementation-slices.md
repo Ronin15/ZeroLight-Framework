@@ -222,6 +222,22 @@ self-hosted perf runner.
 Sequencing hints only — **does not replace slice Checklists**. When in doubt,
 follow **Suggested Order** and the open items in the target slice file.
 
+**Next up (owner, 2026-10-05): capacity audit under the three-way budget
+rule.** CLAUDE.md now separates per-step work budgets (stay fixed),
+data-structure capacities (sized from the loaded world/content at init/load),
+and thresholds (from the gated operation's cost). Audit every open slice file
+and `tracks/voidlight-port.md` for constants the old all-fixed rule forced
+fixed — e.g. 61's 4096 resource nodes, 62's 256 spawn anchors / 512 population
+cap, 57's slot arena, 59's 2048 weather particle pool, 53A's label pool,
+56/56B hit/projectile arrays, 68C's drop FIFO, 71B static index sizes, 64E's 8
+interior slots per chunk, and the 1024 group-field threshold (71B). Classify
+each as budget / capacity / threshold (format- or index-bound constants stay
+fixed), then edit each owning slice's Architecture notes and Checklist with
+the sizing formula and `FailingAllocator` proof. Also list live `src/` fixed
+capacities the rule changes, each as a Checklist bullet in its owning slice.
+Run zig-design-specialist (audit) → zig-specialist (apply) → review; remove
+this note when done.
+
 **Locomotion emergence is closed** (archive 26–32, 39, 41, 47, 48; frontier residual 33
 visual only). Multi-source investigate (stimuli + world markers + memory) and
 table-driven affect→behavior are in place. Open work grows *beside* that loop.
