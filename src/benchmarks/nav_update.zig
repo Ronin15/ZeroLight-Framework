@@ -22,6 +22,12 @@
 //! not depend on thread config); every other row measures the NEW path across that case's
 //! threading config, so each row's vs_serial column reads directly as localized-vs-whole-level
 //! speedup.
+//!
+//! A fourth group, `nav-update-links`, measures the runtime LevelLink reaction (Slice 64E): a
+//! batch of `item_count` new ramp links (one per distinct chunk, interior cell, levels 1<->0)
+//! folded in through the link cursor (fixed interior slot + both endpoint levels dirtied) and the
+//! buffered incremental apply. The 8-link row is the same dirty-footprint order as the scattered
+//! group's 16-chunk row (8 chunks on each of 2 levels).
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -171,6 +177,8 @@ pub fn deinitCaches() void {
     }
     if (entity_obstacle_fixture) |*fixture| fixture.deinit();
     entity_obstacle_fixture = null;
+    if (links_fixture) |*fixture| fixture.deinit();
+    links_fixture = null;
 }
 
 // Returns the variant's reusable fixture, building it once (world + nav sized for the maximum
@@ -644,6 +652,152 @@ pub fn runEntityObstacleCase(allocator: std.mem.Allocator, io: std.Io, options: 
     } else {
         stats.candidate_pairs = (try timeOldPathDestroy(fixture, io, n, null)).chunks_patched;
         stats.output_count = last_chunks_patched;
+    }
+    return stats;
+}
+// ----------------------------------------------------------------------------
+// Runtime LevelLink reaction (Slice 64E): link cursor + buffered incremental apply.
+// ----------------------------------------------------------------------------
+
+// Links added per batch: one (a single player ramp) and the full per-step cursor budget.
+const link_counts = [_]usize{ 1, 8 };
+
+pub const links_group = suite.BenchmarkGroup{
+    .name = "nav-update-links",
+    .defaultItemCounts = linkItemCounts,
+    .runCase = runLinksCase,
+};
+
+pub fn linkItemCounts(profile: suite.Profile) []const usize {
+    _ = profile;
+    return &link_counts;
+}
+
+// Same world shape as the tile-edit fixture (256x256 tiles, 32 px cells, default 16-tile nav
+// chunks) with an open grass level 1 under the surface, so every ramp link joins two open levels.
+const LinksFixture = struct {
+    // Stored at build time — see Fixture's matching field for why.
+    allocator: std.mem.Allocator,
+    data: DataSystem,
+    world: WorldSystem,
+    system: PathfindingSystem,
+
+    fn deinit(self: *LinksFixture) void {
+        self.system.deinit();
+        self.world.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+// OWNERSHIP: mirrors shared_fixtures above — freed by deinitCaches.
+var links_fixture: ?LinksFixture = null;
+
+fn sharedLinksFixture(allocator: std.mem.Allocator, io: std.Io) !*LinksFixture {
+    if (links_fixture == null) {
+        var probe = try ThreadSystem.init(allocator, io, .{});
+        const max_participants = probe.participantSlotCount();
+        probe.deinit();
+        links_fixture = try buildLinksFixture(allocator, io, max_participants);
+    }
+    return &links_fixture.?;
+}
+
+fn buildLinksFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usize) !LinksFixture {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+
+    const asset_store = AssetStore.init(allocator, io, "assets");
+    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const grass = try requireTile(&meta, "grass");
+
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_bounds, world_bounds);
+    errdefer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    // The world owns link storage; reserve the largest batch so the timed loop never grows it.
+    try world.ensureLevelLinkCapacity(link_counts[link_counts.len - 1]);
+
+    var system = PathfindingSystem.init(allocator);
+    errdefer system.deinit();
+    try system.reserve(.{ .worker_participant_count = @max(@as(usize, 1), participant_count) });
+    try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size, null);
+
+    return .{ .allocator = allocator, .data = data, .world = world, .system = system };
+}
+
+// Times one batch: adds `n` ramp links (chunk-center interior cells of the first `n` chunks,
+// row-major, levels 1<->0; untimed), then times the link cursor + buffered incremental apply,
+// exactly the post-commit reaction's link work. Afterwards (untimed) it returns the world and
+// cursor to the zero-link baseline so the per-iteration cost never drifts with an ever-growing
+// link set (links are append-only in production; this reset is bench-only). The interior slot
+// table keeps the same `n` cells, and re-adding the identical links reuses those exact slots, so
+// every iteration assigns, dirties, and patches the same footprint as the first.
+fn timeLinkBatch(fixture: *LinksFixture, io: std.Io, n: usize, thread_system: ?*ThreadSystem) !u64 {
+    for (0..n) |i| {
+        const x: u16 = @intCast((i % chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2);
+        const y: u16 = @intCast((i / chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2);
+        try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = x, .y = y }, .level_b = 0, .cell_b = .{ .x = x, .y = y }, .traversal_cost = 1, .bidirectional = true });
+    }
+    fixture.system.clearNavDirty();
+    const t0 = suite.nowNs(io);
+    _ = try fixture.system.markNewNavLinksDirty(&fixture.world);
+    _ = try fixture.system.applyBufferedNavUpdates(&fixture.data, &fixture.world, thread_system);
+    const ns = suite.elapsedNs(t0, suite.nowNs(io));
+    fixture.world.level_links.clearRetainingCapacity();
+    fixture.system.nav_links_processed = 0;
+    return ns;
+}
+
+pub fn runLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
+    const fixture = try sharedLinksFixture(allocator, io);
+    // Within the per-step cursor budget and the world's reserved link storage.
+    const n = @min(item_count, link_counts[link_counts.len - 1]);
+
+    if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
+        fixture.system.nav_remask_tuner = tuner;
+        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
+    } else {
+        fixture.system.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
+        fixture.system.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
+    }
+    fixture.system.nav_thread_adaptive = case.adaptive;
+    fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
+
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try timeLinkBatch(fixture, io, n, thread_ptr);
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while ((!fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try timeLinkBatch(fixture, io, n, thread_ptr);
+        }
+    }
+    const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
+    const patch_settled = if (case.adaptive) fixture.system.nav_patch_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(n);
+    for (0..options.iterations) |_| {
+        accumulator.record(try timeLinkBatch(fixture, io, n, thread_ptr), suite.serialBatch(n, 1));
+    }
+    var stats = accumulator.finish();
+    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_patch_tuner.report(), patch_settled);
     }
     return stats;
 }

@@ -69,6 +69,7 @@ const deriveCapacity = types.deriveCapacity;
 const default_cells_per_group_agent = types.default_cells_per_group_agent;
 const group_field_threshold_floor = types.group_field_threshold_floor;
 const default_goal_projection_radius = types.default_goal_projection_radius;
+const nav_new_links_per_step_max = types.nav_new_links_per_step_max;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
 
 pub const PathfindingSystem = struct {
@@ -126,6 +127,12 @@ pub const PathfindingSystem = struct {
     // localized to a cell — e.g. a destroyed/toggled static obstacle whose nav cell is no
     // longer resolvable from the entity — so the whole level is re-derived from the world.
     nav_dirty_levels: std.ArrayList(u16) = .empty,
+    // Cursor into the world's append-only `levelLinks()`: links before it are folded into the
+    // nav graph's interior slot table and patched on both endpoint levels. Set to
+    // `levelLinks().len` by every full build (which assigns the whole link set); advanced by
+    // the post-commit reaction (markNewNavLinksDirty) by at most nav_new_links_per_step_max per
+    // step. World-derived, so a non-blocking-flip ramp dig still patches the graph.
+    nav_links_processed: usize = 0,
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -415,6 +422,8 @@ pub const PathfindingSystem = struct {
         // Pre-reserve the per-level affected-flag scratch so a steady-path
         // applyNavUpdates allocates nothing per edit.
         try setLen(&self.affected_levels, self.allocator, self.graph.levelCount());
+        // The full build assigned every current link's endpoint slots and patched every chunk.
+        self.nav_links_processed = link_count;
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
@@ -587,6 +596,49 @@ pub const PathfindingSystem = struct {
         return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_cell_spans.items.len != 0 or self.nav_dirty_levels.items.len != 0;
     }
 
+    // Whether `world` holds LevelLinks the nav graph has not folded in yet. The post-commit
+    // reaction processes them (and appends nav_region_invalidated), so callers that reserve
+    // that event slot before mutation must consult this alongside the event filter.
+    pub fn hasPendingNavLinks(self: *const PathfindingSystem, world: *const WorldSystem) bool {
+        return self.nav_links_processed < world.levelLinks().len;
+    }
+
+    pub const NavLinkCursorStats = struct {
+        // New links folded in this call (<= nav_new_links_per_step_max).
+        processed: usize = 0,
+        // New links left for a later call (deterministic, link order).
+        deferred: usize = 0,
+        // Endpoint cells of the processed links left unslotted by the K cap (inert).
+        unslotted: usize = 0,
+    };
+
+    // Folds up to nav_new_links_per_step_max new LevelLinks (in link order, from the
+    // nav_links_processed cursor) into the nav graph: assigns their interior endpoint slots with
+    // the same rule a full build uses, then marks BOTH endpoint cells dirty on their own levels
+    // so the next buffered apply patches each endpoint's chunk (plus border neighbors) and
+    // rebuilds the link edges. Links past the budget defer to the next call. Per-call work is
+    // bounded by the fixed budget: 2 dirty cells per link, independent of world size.
+    //
+    // The cursor advances only after every mark succeeded (a failed mark leaves it, so the next
+    // call re-marks; slot assignment is idempotent and a duplicate dirty cell is harmless). Main
+    // thread only, before the patch dispatch. Allocation-free while the dirty buffers stay within
+    // their reserved capacity (they grow rather than drop, like every other markNavDirty).
+    pub fn markNewNavLinksDirty(self: *PathfindingSystem, world: *const WorldSystem) !NavLinkCursorStats {
+        if (!self.graph.valid()) return .{};
+        const links = world.levelLinks();
+        // Links are append-only; clamp anyway so a stale cursor can never slice out of bounds.
+        const first = @min(self.nav_links_processed, links.len);
+        const end = @min(links.len, first + nav_new_links_per_step_max);
+        if (first == end) return .{};
+        const unslotted = self.graph.assignLinkEndpointSlots(links[0..end], first, .cursor);
+        for (links[first..end]) |link| {
+            try self.markNavDirty(link.level_a, link.cell_a.x, link.cell_a.y);
+            try self.markNavDirty(link.level_b, link.cell_b.x, link.cell_b.y);
+        }
+        self.nav_links_processed = end;
+        return .{ .processed = end - first, .deferred = links.len - end, .unslotted = unslotted };
+    }
+
     // Applies the buffered dirty nav cells, obstacle rects, and whole-level requests as one
     // incremental update, then clears the buffers. Returns zero stats when nothing is
     // buffered. A non-null thread_system lets the chunk patch thread (tuner-gated); null keeps
@@ -604,7 +656,9 @@ pub const PathfindingSystem = struct {
     // only), and emits one nav_region_invalidated domain-reaction event when the graph actually
     // changed. Cell-localizable tile/obstacle edits forward one dirty cell each; entity-driven
     // changes resolve their carried world-space rect to a nav-cell span and patch only the
-    // affected chunks, same as tile edits. Returns the batch stats (zero when nothing was pending).
+    // affected chunks, same as tile edits. New world LevelLinks are folded in through the link
+    // cursor (markNewNavLinksDirty: fixed interior slot, both endpoint levels dirtied, at most
+    // nav_new_links_per_step_max per step). Returns the batch stats (zero when nothing was pending).
     //
     // Deliberately does NOT clear the dirty buffers at entry: applyBufferedNavUpdates only
     // clears them after a successful apply (see its doc comment), so an error here (e.g. this
@@ -658,10 +712,21 @@ pub const PathfindingSystem = struct {
                 else => {},
             }
         }
+        // New world links (e.g. a ramp dug this step) are a separate, world-derived trigger: a
+        // ramp on an already-walkable cell flips no blocking state and so emits no
+        // nav-invalidating event, yet its link must still join the graph on both levels.
+        const link_stats = try self.markNewNavLinksDirty(world);
 
         if (!self.hasPendingNavUpdates()) return .{};
         try frame.events.ensureCanAppend(1);
-        const stats = try self.applyBufferedNavUpdates(data, world, thread_system);
+        var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
+        stats.links_deferred = link_stats.deferred;
+        stats.link_endpoints_unslotted = link_stats.unslotted;
+        // A full relabel / edge-cap fallback rebuilds the abstract graph from the whole link set
+        // (computePortalGeometry assigns from index 0) but deliberately leaves the cursor alone:
+        // deferred links are still visited by later steps' cursor (idempotent assignment plus
+        // a redundant bounded patch), so per-step link accounting and the warn-once rule do not
+        // depend on whether a fallback happened to fire.
         // Only signal invalidation when the batch actually changed the graph: an incremental dig
         // keeps nav_version stable, so gate on real work too, not just a full-rebuild version bump.
         if (stats.version_bumps == 0 and stats.incremental_rebuilds == 0) return stats;

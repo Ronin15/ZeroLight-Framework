@@ -449,6 +449,8 @@ pub const SimulationPipelineStats = struct {
     destructibles_destroyed: usize = 0,
     /// Destructible entities hit but not destroyed this step.
     destructibles_hit: usize = 0,
+    /// Ramp digs refused this step because the nav chunk's fixed interior link slots were full.
+    dig_ramp_refused_link_slots: usize = 0,
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -564,6 +566,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.action_intents_dropped, metric(self.action_intents_dropped));
         perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
         perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
+        perf.recordMetric(.dig_ramp_refused_link_slots, metric(self.dig_ramp_refused_link_slots));
     }
 };
 
@@ -684,6 +687,8 @@ pub const SimulationPipeline = struct {
         errdefer affect.deinit();
         var dig = DigController.init(config.dig);
         errdefer dig.deinit();
+        // The ramp dig predicts nav interior link-slot assignment from the built graph.
+        dig.nav_link_geometry = pathfinding.graph.linkSlotGeometry();
         const event_budgets = eventBudgetInputs(config);
         try dig.reservePlaneScratch(allocator, maxEventsPerStep(.plane_traversal, event_budgets));
         try ai.reserve(config.movement_body_capacity);
@@ -768,6 +773,7 @@ pub const SimulationPipeline = struct {
         bounds_height: f32,
     ) !void {
         try self.pathfinding.rebuildStaticNavGrid(data, bounds_width, bounds_height, self.nav_cell_size);
+        self.dig.nav_link_geometry = self.pathfinding.graph.linkSlotGeometry();
     }
 
     pub fn rebuildStaticNavigationWithWorld(
@@ -778,6 +784,7 @@ pub const SimulationPipeline = struct {
         bounds_height: f32,
     ) !void {
         try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size, null);
+        self.dig.nav_link_geometry = self.pathfinding.graph.linkSlotGeometry();
     }
 
     /// Clears the pathfinding system's dirty nav-cell buffer. Call once before a step's
@@ -866,6 +873,14 @@ pub const SimulationPipeline = struct {
         return PathfindingSystem.pendingEventsMayInvalidateNavigation(frame);
     }
 
+    /// Whether `world` holds LevelLinks (e.g. a ramp dug this step) the nav graph has not
+    /// folded in yet. The post-commit nav reaction processes them and appends the
+    /// invalidation event even when no event flipped blocking, so the caller's event
+    /// reservation must consult this too.
+    pub fn hasPendingNavLinks(self: *const SimulationPipeline, world: *const WorldSystem) bool {
+        return self.pathfinding.hasPendingNavLinks(world);
+    }
+
     /// Queues ambient audio (music + movement-gated jet loop) through the owned
     /// audio controller. Buffer/input/data are borrowed; the controller owns the
     /// audio-policy runtime state.
@@ -941,6 +956,7 @@ pub const SimulationPipeline = struct {
         stimuli_sticky_dropped: usize = 0,
         stimuli_promoted: usize = 0,
         action_intents_dropped: usize = 0,
+        dig_ramp_refused_link_slots: usize = 0,
         cognition_region: ?ActiveRegion = null,
         ai_halo_indices: []const u32 = &[_]u32{},
         ai_cognition_indices: []const u32 = &[_]u32{},
@@ -998,6 +1014,7 @@ pub const SimulationPipeline = struct {
                 .action_intents_dropped = self.action_intents_dropped,
                 .destructibles_destroyed = self.destructible.destroyed,
                 .destructibles_hit = self.destructible.hits,
+                .dig_ramp_refused_link_slots = self.dig_ramp_refused_link_slots,
             };
         }
     };
@@ -1042,7 +1059,9 @@ pub const SimulationPipeline = struct {
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         // Player-authored world edit. Its world_tile_changed event is deferred and
         // re-masks navigation in merge_outputs regardless of order.
+        const refused_before = self.dig.ramp_refused_link_slots;
         try self.dig.process(context.world, context.data, context.player.*, context.frame);
+        step.dig_ramp_refused_link_slots = @intCast(self.dig.ramp_refused_link_slots - refused_before);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
@@ -4510,4 +4529,108 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     try std.testing.expect(data.aiPerceptionConst(observer_phase3).?.heard_stimulus);
     try std.testing.expectApproxEqAbs(dig_stimulus_x, data.aiPerceptionConst(observer_phase3).?.heard_stimulus_x, 1.0);
     try std.testing.expectApproxEqAbs(dig_stimulus_y, data.aiPerceptionConst(observer_phase3).?.heard_stimulus_y, 1.0);
+}
+
+// Feeds one cross-level path request straight to the pipeline's pathfinding system and
+// solves it serially (the request half of what steering + the pathfinding stage do).
+fn requestCrossLevelPath(pipeline: *SimulationPipeline, requester: EntityId, start_level: u16, start: math.Vec2, goal_level: u16, goal: math.Vec2) !PathfindingStats {
+    const PathRequest = @import("simulation.zig").PathRequest;
+    var stream = @import("simulation.zig").RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    const range_base = try stream.appendRangeCounts(1);
+    stream.addCount(range_base, 1);
+    try stream.prefixAppendedRanges(range_base);
+    var writer = stream.rangeWriter(range_base);
+    writer.write(.{ .entity = requester, .start_level = start_level, .goal_level = goal_level, .start = start, .goal = goal });
+    writer.finish();
+    stream.finishWrite();
+    return pipeline.pathfinding.updateSerial(&stream, 8, .{});
+}
+
+test "player-dug ramp is routable by an underground NPC the same step" {
+    // Slice 64E end to end: a ramp dug at an INTERIOR nav cell through the real dig_ramp
+    // intent joins the abstract nav tier in that step's post-commit reaction (link cursor:
+    // fixed interior slot + both levels dirtied), so an underground NPC's surface-bound
+    // request resolves `available` without any save/load or full rebuild.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    // Level 1 is solid dirt except the player's cell (3,3) and the NPC's cell (3,4).
+    var world = try gateTestWorld(&meta, &.{ .{ 3, 3 }, .{ 3, 4 } });
+    defer world.deinit();
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, cognition_halo_chunks);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 1;
+    try data.setWorldLevel(player.entity, 1);
+    placePlayerFlush(&data, player, .{ 3, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+    const npc = try data.createEntity();
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .movement_body_capacity = 4,
+        .navigation_world = &world,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+    try std.testing.expect(pipeline.dig.nav_link_geometry.isResolved());
+
+    const npc_pos: math.Vec2 = .{ .x = 3 * 32 + 16, .y = 4 * 32 + 16 };
+    const goal: math.Vec2 = .{ .x = 6 * 32 + 16, .y = 6 * 32 + 16 };
+    // No ramp yet: the underground NPC's surface-bound request is unavailable.
+    try std.testing.expectEqual(@as(usize, 1), (try requestCrossLevelPath(&pipeline, npc, 1, npc_pos, 0, goal)).unavailable_results);
+
+    const ctx = SimulationPipelineUpdateContext{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 256,
+        .bounds_height = 256,
+    };
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    _ = try pipeline.update(ctx);
+    try std.testing.expectEqual(@as(usize, 1), world.levelLinks().len);
+    try std.testing.expectEqual(@as(u16, 4), world.levelLinks()[0].cell_a.x);
+    // The caller's event reservation sees the pending link even if no event flipped blocking.
+    try std.testing.expect(pipeline.hasPendingNavLinks(&world));
+    const nav_stats = try pipeline.reactToPostCommitNavEvents(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
+    try std.testing.expect(!pipeline.hasPendingNavLinks(&world));
+
+    // Within the next 2 steps the NPC's surface-bound request resolves available.
+    var resolved = false;
+    for (0..2) |_| {
+        _ = try requestCrossLevelPath(&pipeline, npc, 1, npc_pos, 0, goal);
+        if (pipeline.pathfinding.statusForWorld(1, npc_pos, 0, goal, .default, null).status == .available) {
+            resolved = true;
+            break;
+        }
+    }
+    try std.testing.expect(resolved);
 }

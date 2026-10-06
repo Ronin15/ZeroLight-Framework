@@ -128,6 +128,21 @@ pub const default_goal_projection_radius: i32 = 16;
 // Side length (in nav cells) of one abstract chunk. The chunk-portal graph is the
 // structure that bounds per-query work independent of total cell count.
 pub const default_nav_chunk_tiles: u16 = 16;
+// Fixed interior LevelLink-endpoint slots per abstract nav chunk (beyond its 4*ct perimeter
+// slots). The slot table is shared by every level and deduped by cell, so this bounds the
+// DISTINCT interior link-endpoint cells per chunk across all levels. A fixed constant,
+// independent of world size, link count, and level count: the slot layout is a pure function
+// of the grid dimensions, so adding a link at runtime never renumbers a slot and the
+// incremental and full builds share one layout. 8 is one eighth of a 16-tile chunk's 64
+// perimeter slots (slot arrays grow by at most 12.5%). The runtime producer
+// (DigController's ramp) refuses a dig that would exceed it; an endpoint authored past it
+// stays unslotted (inert, like a blocked endpoint).
+pub const nav_interior_link_slots_per_chunk: u32 = 8;
+// Fixed per-step budget of NEW LevelLinks the post-commit nav reaction folds into the graph
+// (PathfindingSystem.nav_links_processed cursor). Links past it defer, in link order, to the
+// next step's reaction. Covers every current producer (DigController makes at most one ramp
+// per step); never derived from world size or link count.
+pub const nav_new_links_per_step_max: usize = 8;
 // Slack multiplier applied to a chunk's measured init edge count to size its fixed edge
 // window, so an in-place dig that adds a few edges stays within the window instead of
 // triggering the loud full-rebuild fallback.
@@ -299,6 +314,12 @@ pub const NavUpdateStats = struct {
     // per-chunk edge window, forcing a loud full abstract-graph rebuild with more
     // slack (a genuine topology blow-up); else 0.
     edge_cap_fallback: usize = 0,
+    // New LevelLinks left for a later step's reaction because this step already folded
+    // nav_new_links_per_step_max of them (deterministic, link-order deferral).
+    links_deferred: usize = 0,
+    // Link endpoint cells the cursor visited this step that found their nav chunk's fixed
+    // interior link slots full, so they stay inert (unslotted).
+    link_endpoints_unslotted: usize = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -307,6 +328,8 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_version_bumps, metric(self.version_bumps));
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
         perf.recordMetric(.nav_edge_cap_fallback, metric(self.edge_cap_fallback));
+        perf.recordMetric(.pathfinding_links_deferred, metric(self.links_deferred));
+        perf.recordMetric(.pathfinding_link_endpoints_unslotted, metric(self.link_endpoints_unslotted));
     }
 };
 

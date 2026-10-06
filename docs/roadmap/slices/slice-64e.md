@@ -2,13 +2,37 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** No open prerequisite. This is a live gameplay defect
-(confirmed below), so it lands independently of 49–64D and **before 46 and
-65B**. 65B's lane rebuild runs the same chunk patch and inherits this fix (see
-Checklist additions). It touches `src/game/systems/pathfinding/`, the
-`.ramp` refusal in `dig_controller.zig`, the geometry wiring in
-`simulation_pipeline.zig`, and one reservation call in
+**Status: implemented (2026-10-05)**, except the display-gated manual
+acceptance check (not run: no display in the implementing session). Every
+code, test, doc, and bench item below is checked. No open prerequisite. This
+was a live gameplay defect (confirmed below), so it landed independently of
+49–64D and **before 46 and 65B**. 65B's lane rebuild runs the same chunk patch
+and inherits this fix (see Checklist additions). It touches
+`src/game/systems/pathfinding/`, the `.ramp` refusal in `dig_controller.zig`,
+the geometry wiring in `simulation_pipeline.zig`, and one reservation call in
 `game_demo_state.zig`.
+
+Bench record (2026-10-05, ReleaseFast, `serial-direct`, 5 interleaved
+before/after repetitions of adjacent builds, medians):
+
+| group | items | before | after | delta |
+|---|---|---|---|---|
+| `nav-update-scattered` | 16 | 201.45 us | 199.76 us | -0.8% |
+| `nav-update-scattered` | 32 | 398.70 us | 411.51 us | +3.2% (runs spread 391–420 us) |
+| `nav-update-scattered` | 64 | 803.86 us | 825.61 us | +2.7% |
+| `nav-update-scattered` | 128 | 1.63 ms | 1.62 ms | -0.6% |
+| `nav-update-scattered` | 256 | 3.22 ms | 3.24 ms | +0.6% |
+| `nav-update-multichunk` | 256 | 55.43 us | 56.23 us | +1.4% |
+| `nav-update-multichunk` | 1024 | 62.32 us | 63.20 us | +1.4% |
+| `nav-update-multichunk` | 4096 | 243.33 us | 252.36 us | +3.7% (after runs spread 241–261 us) |
+| `nav-update-multichunk` | 8192 | 531.84 us | 548.78 us | +3.2% (before runs spread 526–546 us) |
+| `nav-update-multichunk` | 16384 | 967.71 us | 975.55 us | +0.8% |
+| `pathfinding` | 512 | 3.38 ms | 3.26 ms | -3.6% |
+| `nav-update-links` (new) | 1 | n/a | 26.24 us | n/a |
+| `nav-update-links` (new) | 8 | n/a | 210.76 us | 1.06x the scattered-16 mean (gate: ≤ 2x) |
+
+Every delta is within max(3%, run-to-run noise). Debug and ReleaseFast
+`zig build test` pass, and `zig build verify` passes.
 
 **Owner decision: a new 64E, not 65B bullets.** 65B moves *large*
 patches/relabels onto the background lane. This defect is in the patch
@@ -213,19 +237,30 @@ multi-worker patch path and the serial one.
 
 ### Checklist
 
-- [ ] **E1.** `nav_interior_link_slots_per_chunk`, fixed geometry,
+- [x] **E1.** `nav_interior_link_slots_per_chunk`, fixed geometry,
       fixed-stride run table, `assignLinkEndpointSlots`, linear
       `linkTailIndex`, the warn-once-on-cursor rule, and the rewritten
       `tryLinkPortal` comment.
-- [ ] **E1 producer refusal.** `NavLinkSlotGeometry`,
+      (2026-10-05: `types.zig` constant; `nav_graph.zig`
+      `computePortalGeometry`, `assignLinkEndpointSlots(links, first, source)`
+      with `source = .full_build | .cursor` (warn only in `.cursor`), fixed-stride
+      `chunk_link_cells`, `chunk_link_base` deleted, linear `linkTailIndex`.
+      A ramp's two endpoints share one cell and count once. Full builds record
+      their count in `NavGraph.full_build_link_endpoints_unslotted`.)
+- [x] **E1 producer refusal.** `NavLinkSlotGeometry`,
       `interiorLinkSlotsAvailable`, `DigController.nav_link_geometry` +
       `ramp_refused_link_slots`, the pipeline wiring that sets the geometry,
       and the `dig_ramp_refused_link_slots` metric. Tests:
-  - [ ] `interiorLinkSlotsAvailable` unit cases: perimeter cell always true;
+      (2026-10-05: `DigController.process` now takes `*DigController`. The
+      geometry defaults to `NavLinkSlotGeometry.unresolved`, and a ramp dig with
+      it unresolved returns `error.UnresolvedNavLinkGeometry` before any mutate,
+      mirroring `UnresolvedDigTiles`. The metric is recorded through
+      `SimulationPipelineStats.dig_ramp_refused_link_slots`, a per-step delta.)
+  - [x] `interiorLinkSlotsAvailable` unit cases: perimeter cell always true;
         an already-present interior endpoint true at a full chunk; a ninth
         distinct interior cell false; links on two different levels at the
         same cell count once;
-  - [ ] in `dig_controller.zig`, `test "a ninth interior ramp in one nav
+  - [x] in `dig_controller.zig`, `test "a ninth interior ramp in one nav
         chunk is refused"`: on a 2-level 8×8-tile fixture with an 8-tile nav
         geometry (36 interior cells; a 4-tile chunk has only 4 and could
         never reach K = 8), pre-author 8 distinct interior endpoints in
@@ -233,30 +268,41 @@ multi-worker patch path and the serial one.
         interior cell of that chunk → no tile change, no event,
         `levelLinks().len` unchanged, `ramp_refused_link_slots == 1`; a ramp
         at a perimeter cell of the same chunk still digs.
-- [ ] **E2.** `nav_links_processed` cursor (reset by full builds),
+- [x] **E2.** `nav_links_processed` cursor (reset by full builds),
       `nav_new_links_per_step_max`, endpoint dirtying on both levels,
       `links_deferred`/`link_endpoints_unslotted` stats (perf metric names
       `pathfinding_links_deferred`, `pathfinding_link_endpoints_unslotted`),
       `hasPendingNavLinks`, and the reservation wiring.
-- [ ] **E3.** Memory-gate slot formula and its test.
-- [ ] Tests (tiny fixtures: `abstractCapacity()` 4-tile chunks on the
+      (2026-10-05: `PathfindingSystem.markNewNavLinksDirty` advances the cursor
+      only after both marks succeed. The cursor is reset by
+      `rebuildStaticNavGridWithWorld`. It is deliberately NOT jumped by an
+      in-update edge-cap fallback, so per-step accounting and the warn-once rule
+      do not depend on whether a fallback fired; the cursor still visits deferred
+      links (idempotent assignment). `SimulationPipeline.hasPendingNavLinks` is
+      ORed into `game_demo_state.zig`'s extra-event reservation.)
+- [x] **E3.** Memory-gate slot formula and its test.
+      (2026-10-05: `abstractGraphBytes` and the per-participant patch-scratch
+      bound both use `4*ct + K`. `link_count` now sizes an explicit
+      `link_edges`/`link_edge_refs` term. Test: `"abstract slot term is levels *
+      chunks * (4*ct + K) and links add only the link_edges term"`.)
+- [x] Tests (tiny fixtures: `abstractCapacity()` 4-tile chunks on the
       384×384 px two-level world used by `nav_graph.zig:2223`, except where
       a test names an 8-tile chunk; a 4-tile chunk has only (4−2)² = 4
       interior cells, `isPerimeterCell` `nav_graph.zig:1074-1078`):
-  - [ ] Replace the `:2223` deferral test with `test "runtime interior ramp
+  - [x] Replace the `:2223` deferral test with `test "runtime interior ramp
         link is slotted and live after the incremental patch"`. Add a runtime
         link at interior (2,2) on levels 1↔0 and run the post-commit
         reaction. A cross-level request from level 1 to level 0 then returns
         `available` with `cross_level_solves == 1`. This test fails on
         today's code.
-  - [ ] `test "runtime link patch matches a full rebuild"`, covering four
+  - [x] `test "runtime link patch matches a full rebuild"`, covering four
         cases: an interior endpoint, a perimeter endpoint, a ramp on an
         already-walkable cell (no blocking flip), and links added across two
         steps. In each case, compare the incremental graph to a fresh full
         rebuild over the same world: `portals` and `cell_to_portal`
         byte-identical per level, per-portal edge sets equal (`:1840`
         helper), and `link_edges`/`link_edge_refs` equal.
-  - [ ] `test "a ninth authored interior link endpoint in one chunk stays
+  - [x] `test "a ninth authored interior link endpoint in one chunk stays
         unslotted in incremental and full builds"` (authored links only;
         the runtime producer refuses this case): use an **8-tile nav
         chunk** (36 interior cells) on the same 384×384 px two-level world,
@@ -267,14 +313,14 @@ multi-worker patch path and the serial one.
         full-rebuild test), and `link_endpoints_unslotted == 1` in both
         builds' stats. (The warn-once-on-cursor rule is a review item: the
         `warn` call sits only in the cursor branch.)
-  - [ ] `test "new links beyond the per-step budget defer in link order"`:
+  - [x] `test "new links beyond the per-step budget defer in link order"`:
         10 links in one step. Step 1 processes links 0–7 (`links_deferred ==
         2`) and step 2 processes 8–9. After step 2 the graph matches a full
         rebuild.
-  - [ ] `test "runtime link patch touches a constant chunk set independent of
+  - [x] `test "runtime link patch touches a constant chunk set independent of
         world size"`: mirror `:2763`'s two world sizes. The patched-chunk
         count is equal.
-  - [ ] `test "incremental runtime link assignment is allocation-free after
+  - [x] `test "incremental runtime link assignment is allocation-free after
         warmup"`: warm one link reaction (one interior and one perimeter
         link processed through the cursor, so the dirty buffers and patch
         scratch reach their steady capacity); install
@@ -287,13 +333,13 @@ multi-worker patch path and the serial one.
         times and match a full rebuild. The dirty-buffer appends (which grow
         rather than drop) stay within the capacity the warm cycle reached,
         which is what this test pins.
-  - [ ] End to end in `simulation_pipeline.zig`, on the sticky-dig fixture
+  - [x] End to end in `simulation_pipeline.zig`, on the sticky-dig fixture
         `testMinimalMultiLevelWorld`: `test "player-dug ramp is routable by
         an underground NPC the same step"`. Dig a ramp with the `dig_ramp`
         intent at an interior cell. After that step's post-commit reaction,
         `pathfinding.statusForWorld(lower, npc_pos, upper, goal, ...)`
         resolves to `available` within the next 2 steps.
-- [ ] Docs:
+- [x] Docs:
   - `docs/architecture.md` / pathfinding docs: runtime links patch both
     levels, the fixed interior link slots, the per-step link budget, and
     deferral;
@@ -302,13 +348,13 @@ multi-worker patch path and the serial one.
 
 ### Acceptance checks
 
-- [ ] `zig build verify` passes. All E tests pass in Debug and ReleaseFast.
+- [x] `zig build verify` passes. All E tests pass in Debug and ReleaseFast.
       The replaced deferral test is gone (`grep -n "deferred by the
       incremental patch" src/` is empty).
 - [ ] Manual (display, procedural demo): dig a ramp at a non-border cell on
       level 1. NPCs on level 1 path up it within a second, with no
       save/load or restart.
-- [ ] Bench gate (ReleaseFast, 5 interleaved repetitions, medians, adjacent
+- [x] Bench gate (ReleaseFast, 5 interleaved repetitions, medians, adjacent
       commits):
   - new group `nav-update-links` (`src/benchmarks/nav_update.zig`
     `links_group`, registered in `runner.zig`; items = links added per batch
