@@ -133,6 +133,13 @@ sprite-batch capacity before relying on allocation-free render frames. The
 warmed path avoids per-frame allocation only inside the currently reserved
 ordered-command, prepared-command, vertex, and draw-group capacity.
 
+`drawSprite` never refuses. A submit past the batch's physical capacity grows the
+command list geometrically on the main thread. In a frame reserved through
+`Renderer.reserveSpriteCommands` that growth is counted
+(`SpriteBatch.command_overflow_grows`, perf metric `sprite_command_overflow_grows`)
+and warned through `logging.render`, so a short reservation formula shows up as a
+counter instead of exiting the app.
+
 ## GPU-Driven Tilemap
 
 Dense world tiles are not emitted as per-tile vertices. Every dense layer's tile ids

@@ -71,9 +71,10 @@ pub fn main(init: std.process.Init) !void {
     const tile_data = try renderer.createTileDataBuffer(&packed_tiles, tile_params);
 
     // Sprite submit is reserve-first for allocation-free frames (see
-    // Renderer.reserveSpriteCommands). Without this, the first rect still
-    // works via the grow fallback in ensureFrameBatchCapacity, but the smoke
-    // path should exercise the reserved production contract.
+    // Renderer.reserveSpriteCommands). The capacity is grow-only and survives
+    // `beginFrame` below. Without it the first rect still works: `drawSprite`
+    // grows the command list and `ensureFrameBatchCapacity` grows the
+    // prepared/vertex storage and GPU streams.
     try renderer.reserveSpriteCommands(1);
 
     try renderer.reserveStaticGeometry(6, 1);

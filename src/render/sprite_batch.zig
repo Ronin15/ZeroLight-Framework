@@ -20,6 +20,7 @@ const sprite_prep_adaptive_tuner_config = AdaptiveWorkTunerConfig{
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
+const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const resources = @import("resources.zig");
@@ -255,6 +256,8 @@ pub const SpritePrepStats = struct {
     skipped_invalid_count: usize = 0,
     vertex_count: usize = 0,
     draw_group_count: usize = 0,
+    /// Command-list growths this frame while the frame was reserved (reservation drift).
+    command_overflow_grows: usize = 0,
     batch: BatchStats = .{},
 };
 
@@ -268,7 +271,16 @@ pub const SpriteBatch = struct {
     uvs: std.ArrayList(Uv) = .empty,
     colors: std.ArrayList(VertexColor) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,
+    /// Set by `Renderer.reserveSpriteCommands`, cleared by `beginFrame`. Diagnostics only:
+    /// a submit past capacity always grows; in a reserved frame that growth means the
+    /// caller's reservation is short, so it is counted and warned.
     frame_reserved: bool = false,
+    /// Lifetime count of command-list growths in reserved frames (perf metric
+    /// `sprite_command_overflow_grows`); zero under a correct reservation.
+    command_overflow_grows: u64 = 0,
+    /// This frame's share of `command_overflow_grows`; reset by `beginFrame`, reported by
+    /// `finishPrepStats`.
+    frame_command_overflow_grows: usize = 0,
     camera: Camera2D = .{},
     last_order: ?RenderOrder = null,
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(sprite_prep_adaptive_tuner_config),
@@ -299,6 +311,7 @@ pub const SpriteBatch = struct {
         self.draw_groups.clearRetainingCapacity();
         self.prepared_commands.clearRetainingCapacity();
         self.frame_reserved = false;
+        self.frame_command_overflow_grows = 0;
         self.last_order = null;
         self.last_prep_stats = .{};
     }
@@ -309,13 +322,25 @@ pub const SpriteBatch = struct {
         }
         // Ordered submission keeps the renderer cheap: grouping can preserve
         // stream order instead of sorting every frame.
-        if (self.frame_reserved) {
-            if (self.commands.items.len >= self.commands.capacity) return error.SpriteCommandOverflow;
-            self.commands.appendAssumeCapacity(.{ .sprite = sprite });
-        } else {
-            try self.commands.append(self.allocator, .{ .sprite = sprite });
-        }
+        if (self.commands.items.len == self.commands.capacity) try self.growCommands();
+        self.commands.appendAssumeCapacity(.{ .sprite = sprite });
         self.last_order = sprite.order;
+    }
+
+    /// Cold geometric growth of the command list for one more submit (the same policy
+    /// as a growing `append`), so the outcome never depends on growth history. In a
+    /// reserved frame the growth is reservation drift: counted only after it succeeds
+    /// (an OOM leaves the stream and the counters unchanged) and warned per growth event,
+    /// which geometric growth bounds to about log1.5(peak / reserve).
+    fn growCommands(self: *SpriteBatch) !void {
+        @branchHint(.cold);
+        const len = self.commands.items.len;
+        try self.commands.ensureTotalCapacity(self.allocator, len + 1);
+        if (!self.frame_reserved) return;
+        self.command_overflow_grows += 1;
+        self.frame_command_overflow_grows += 1;
+        if (comptime logging.enabled(.warn) and !builtin.is_test)
+            logging.render.warn("sprite commands exceeded the frame reservation; grew {d} -> {d} (reserveSpriteCommands bound is short)", .{ len, self.commands.capacity });
     }
 
     pub fn setCamera(self: *SpriteBatch, camera: Camera2D) void {
@@ -491,6 +516,7 @@ pub const SpriteBatch = struct {
             .skipped_invalid_count = self.commands.items.len - self.prepared_commands.items.len,
             .vertex_count = self.positions.items.len,
             .draw_group_count = self.draw_groups.items.len,
+            .command_overflow_grows = self.frame_command_overflow_grows,
             .batch = batch,
         };
         return self.last_prep_stats;
@@ -1631,32 +1657,71 @@ test "draw sprite stays allocation-free after reserve" {
     try std.testing.expectEqual(command_capacity, batch.commands.items.len);
 }
 
-test "draw sprite returns overflow error once reserved capacity is exhausted" {
-    const allocator = std.testing.allocator;
-    var batch = SpriteBatch.init(allocator);
-    defer batch.deinit();
-
+/// Reserves 8 commands, marks the frame reserved, and fills the command list to its
+/// physical capacity (which `ensureTotalCapacity` may round past 8). Returns that capacity.
+fn fillReservedCommandsToCapacity(batch: *SpriteBatch) !usize {
     const command_capacity: usize = 8;
     try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
     batch.frame_reserved = true;
-    // ensureTotalCapacity may round up past the requested count, so fill to
-    // the real capacity rather than assuming it equals command_capacity.
-    const capacity_before = batch.commands.capacity;
+    const capacity = batch.commands.capacity;
+    for (0..capacity) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(capacity, batch.commands.items.len);
+    try std.testing.expectEqual(capacity, batch.commands.capacity);
+    return capacity;
+}
 
-    const texture = TextureId.init(0, 1) catch unreachable;
-    for (0..capacity_before) |i| {
-        try batch.drawSprite(.{
-            .texture = texture,
-            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
-            .order = RenderOrder.world(@intCast(i)),
-        });
-    }
-    try std.testing.expectEqual(capacity_before, batch.commands.items.len);
-
-    const result = batch.drawSprite(.{
+fn testOrderedSprite(i: usize) !Sprite {
+    const texture = try TextureId.init(0, 1);
+    return .{
         .texture = texture,
-        .dest = .{ .x = @floatFromInt(capacity_before), .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intCast(capacity_before)),
-    });
-    try std.testing.expectError(error.SpriteCommandOverflow, result);
+        .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(@intCast(i)),
+    };
+}
+
+test "draw sprite past a reserved frame's capacity grows in order and counts the overflow" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    const capacity = try fillReservedCommandsToCapacity(&batch);
+
+    try batch.drawSprite(try testOrderedSprite(capacity));
+
+    try std.testing.expectEqual(capacity + 1, batch.commands.items.len);
+    try std.testing.expect(batch.commands.capacity > capacity);
+    for (batch.commands.items, 0..) |command, i| {
+        try std.testing.expectEqual(@as(f32, @floatFromInt(i)), command.sprite.dest.x);
+    }
+    try std.testing.expectEqual(@as(u64, 1), batch.command_overflow_grows);
+    try std.testing.expectEqual(@as(usize, 1), batch.finishPrepStats(.{}).command_overflow_grows);
+
+    // The per-frame share resets; the lifetime count stays.
+    batch.beginFrame();
+    try std.testing.expectEqual(@as(usize, 0), batch.frame_command_overflow_grows);
+    try std.testing.expectEqual(@as(u64, 1), batch.command_overflow_grows);
+}
+
+test "draw sprite growth OOM leaves the reserved stream unchanged" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    const capacity = try fillReservedCommandsToCapacity(&batch);
+
+    const original = batch.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    batch.allocator = failing.allocator();
+    defer batch.allocator = original;
+
+    try std.testing.expectError(error.OutOfMemory, batch.drawSprite(try testOrderedSprite(capacity)));
+    try std.testing.expectEqual(capacity, batch.commands.items.len);
+    try std.testing.expectEqual(capacity, batch.commands.capacity);
+    try std.testing.expectEqual(@as(u64, 0), batch.command_overflow_grows);
+}
+
+test "draw sprite growth outside a reserved frame is not counted" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+
+    try batch.drawSprite(try testOrderedSprite(0));
+
+    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
+    try std.testing.expectEqual(@as(u64, 0), batch.command_overflow_grows);
 }

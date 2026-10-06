@@ -52,6 +52,7 @@ pub const Metric = enum {
     sprite_skipped_invalid,
     sprite_vertices,
     sprite_draw_groups,
+    sprite_command_overflow_grows,
     ai_entities,
     ai_intents,
     ai_navigation_intents,
@@ -387,6 +388,7 @@ const EnabledRuntimePerfLog = struct {
         self.recordMetric(.sprite_skipped_invalid, stats.skipped_invalid_count);
         self.recordMetric(.sprite_vertices, stats.vertex_count);
         self.recordMetric(.sprite_draw_groups, stats.draw_group_count);
+        self.recordMetric(.sprite_command_overflow_grows, stats.command_overflow_grows);
         self.recordBatch(.sprite_prep, stats.batch);
     }
 
@@ -582,7 +584,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={}",
+            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={} overflow_grows={}",
             .{
                 elapsed_s,
                 self.metricValue(.state_updates),
@@ -599,6 +601,7 @@ const EnabledRuntimePerfLog = struct {
                 averagePer(self.metricValue(.sprite_commands), rendered_frame_count),
                 self.metricValue(.sprite_vertices),
                 self.metricValue(.sprite_draw_groups),
+                self.metricValue(.sprite_command_overflow_grows),
             },
         );
         log.debug(

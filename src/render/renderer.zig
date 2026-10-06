@@ -435,7 +435,9 @@ pub const Renderer = struct {
 
     /// Grows batch storage to hold `command_capacity` ordered sprite commands.
     /// Setup-time and grow-only (never shrinks); call before relying on
-    /// allocation-free render frames.
+    /// allocation-free render frames. Marks the frame reserved, so a submit past the
+    /// batch's capacity is counted as reservation drift
+    /// (`SpriteBatch.command_overflow_grows`); it still grows.
     pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
         if (command_capacity > self.command_high_water) {
             const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
@@ -1236,12 +1238,12 @@ pub const Renderer = struct {
     fn ensureFrameBatchCapacity(self: *Renderer) !void {
         const command_count = self.batch.commands.items.len;
         if (command_count == 0) return;
-        // Over-submission beyond the reserved `command_high_water` is owned by the
-        // grow fallback below, identically in Debug and ReleaseFast. `drawSprite`'s
-        // `SpriteCommandOverflow` guard (against the ArrayList's physical capacity)
-        // is the only hard bound; a Debug-only assert against `command_high_water`
-        // would panic on over-reservations that the frame path otherwise regrows,
-        // making the two modes disagree and leaving this fallback dead in Debug.
+        // Over-submission beyond the reserved `command_high_water` is handled the same
+        // way in Debug and ReleaseFast. `drawSprite` already grew the command list
+        // (counted when the frame was reserved); this fallback grows prepared/vertex/group
+        // storage and the GPU streams before the threaded emit. There is no hard submit
+        // bound. A Debug-only assert against `command_high_water` would panic where
+        // ReleaseFast regrows.
         if (command_count <= self.command_high_water) return;
 
         const needed_vertices = try std.math.mul(usize, command_count, 6);
@@ -2439,6 +2441,49 @@ test "engine overlay top-up after stacked UI fully consumes its headroom stays a
         order += 1;
     }
     try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
+}
+
+test "reserved sprite frame submits allocation-free with no overflow growth (FailingAllocator)" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.draw_list.deinit(allocator);
+
+    const reserved: usize = 8;
+    try renderer.reserveSpriteCommands(reserved);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const real_renderer_allocator = renderer.allocator;
+    const real_batch_allocator = renderer.batch.allocator;
+    renderer.allocator = failing.allocator();
+    renderer.batch.allocator = failing.allocator();
+    defer {
+        renderer.allocator = real_renderer_allocator;
+        renderer.batch.allocator = real_batch_allocator;
+    }
+
+    // Exactly the declared reservation, not the list's (possibly rounded-up) physical capacity.
+    const white = try TextureId.init(0, 1);
+    for (0..reserved) |i| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+    try std.testing.expectEqual(reserved, renderer.spriteCommandCount());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(u64, 0), renderer.batch.command_overflow_grows);
 }
 
 test "linear merge matches stable sort for pre-sorted static and dynamic groups" {

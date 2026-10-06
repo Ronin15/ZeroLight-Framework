@@ -553,16 +553,22 @@ test "loading state render failure leaves rendered_once false" {
 
     var renderer = try headlessRendererForTest(std.testing.allocator);
     defer deinitHeadlessRenderer(&renderer, std.testing.allocator);
-    // Frame-reserved with zero capacity: the first sprite submit overflows and
-    // aborts before the latch, proving a partial draw cannot unlock world build.
+    // Frame-reserved with zero capacity: the first sprite submit must grow, and the
+    // failing allocator makes that growth fail, aborting before the latch. Proves a
+    // partial draw cannot unlock world build.
     renderer.batch.frame_reserved = true;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const real_batch_allocator = renderer.batch.allocator;
+    renderer.batch.allocator = failing.allocator();
+    // Declared after the renderer deinit defer, so the real allocator is restored first.
+    defer renderer.batch.allocator = real_batch_allocator;
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var dummy_text: TextService = undefined;
 
-    try std.testing.expectError(error.SpriteCommandOverflow, loading.render(.{
+    try std.testing.expectError(error.OutOfMemory, loading.render(.{
         .renderer = &renderer,
         .runtime_assets = &runtime_assets,
         .text_service = &dummy_text,
