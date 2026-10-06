@@ -288,22 +288,25 @@ fn removeProjectedComponents(component_mask: ComponentMask, projection: *Structu
     }
 }
 
+/// Most `.structural_commit` events one `create_entity` emits: one `entity_created`
+/// plus one `component_changed` per template component. Derived from `EntityTemplate`,
+/// so a new template component widens it automatically.
+pub const max_structural_events_per_create: usize = 1 + @typeInfo(EntityTemplate).@"struct".field_names.len;
+
+comptime {
+    // `templateComponentCount` counts every field, so each one must be an optional
+    // component slot.
+    const info = @typeInfo(EntityTemplate).@"struct";
+    for (info.field_names, info.field_types) |name, field_type| {
+        if (@typeInfo(field_type) != .optional) @compileError("EntityTemplate." ++ name ++ " must be optional");
+    }
+}
+
 fn templateComponentCount(template: EntityTemplate) usize {
     var count: usize = 0;
-    if (template.movement_body != null) count += 1;
-    if (template.facing != null) count += 1;
-    if (template.primitive_visual != null) count += 1;
-    if (template.asset_reference != null) count += 1;
-    if (template.collision_bounds != null) count += 1;
-    if (template.collision_response != null) count += 1;
-    if (template.ai_agent != null) count += 1;
-    if (template.steering_agent != null) count += 1;
-    if (template.world_level != null) count += 1;
-    if (template.faction != null) count += 1;
-    if (template.ai_perception != null) count += 1;
-    if (template.ai_memory != null) count += 1;
-    if (template.ai_affect != null) count += 1;
-    if (template.destructible != null) count += 1;
+    inline for (comptime @typeInfo(EntityTemplate).@"struct".field_names) |name| {
+        if (@field(template, name) != null) count += 1;
+    }
     return count;
 }
 

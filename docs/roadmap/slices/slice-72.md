@@ -282,7 +282,7 @@ Out of scope (each item has a named owner):
   - A forgotten demo term causes an `EventCapacityExceeded` exit.
 - **Change:**
   - (a) The `EventProducerId` table gains two arms:
-    - `.structural_commit => budgets.movement_body_capacity + budgets.structural_headroom`, with one tier change per body plus a burst/destroy headroom. The new field is `SimulationPipelineConfig.structural_headroom`; the demo passes `16 + action_intent_live_capacity`. Because of the per-body term the share follows C3.
+    - `.structural_commit => budgets.structural_headroom`, a fixed per-step share sized in events with `structuralEventHeadroom(creates, destroys + component sets)` (a create costs up to `max_structural_events_per_create` = 1 + the `EntityTemplate` component count; `set_simulation_tier` emits no event, so tier changes take no share and the share never follows population). The new field is `SimulationPipelineConfig.structural_headroom`; the demo passes `structuralEventHeadroom(1, action_intent_live_capacity)` = 79. The budgeted commit (`SimulationPipeline.structuralCommitBudget` → `StructuralCommitPreparer`) enforces the share on its own before any mutation, so an over-share burst fails with `EventCapacityExceeded` whatever other producers appended that step (final-review fix M2; the original arm `movement_body_capacity + structural_headroom` let bursts borrow idle perception/affect shares).
     - `.nav_reaction => 1`, the post-commit `nav_region_invalidated`.
   - (b) Add `pub fn eventCapacitySum(self) usize`, the exhaustive sum. `reserve` uses it, as does the demo's shared `range_count`.
   - (c) The demo init order becomes:

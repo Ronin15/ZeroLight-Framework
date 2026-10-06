@@ -48,6 +48,7 @@ const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const EventProducerId = @import("simulation.zig").EventProducerId;
 const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
+const structuralEventHeadroom = @import("simulation.zig").structuralEventHeadroom;
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
@@ -139,9 +140,14 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     };
 }
 
-/// Structural-commit events beyond one tier change per body: 16 dig/create burst
-/// events plus one `entity_destroyed` per destructible action intent (Slice 45).
-const demo_structural_headroom: usize = 16 + action_intent_live_capacity;
+/// Full-template creates the demo budgets per step. Spawns happen at init outside the
+/// step; this is the one runtime create-burst slot.
+const demo_creates_per_step: usize = 1;
+
+/// The demo's `.structural_commit` event share: `demo_creates_per_step` full creates
+/// plus one `entity_destroyed`/`set_destructible` per destructible action intent
+/// (Slice 45). Tier changes emit no structural event.
+const demo_structural_headroom: usize = structuralEventHeadroom(demo_creates_per_step, action_intent_live_capacity);
 
 /// Per-step audio bound for demo tests: movers can emit collision SFX alongside
 /// ambient music, listener, and the player jet loop. Not scaled 1:1 with mover count —
@@ -668,7 +674,7 @@ pub const GameDemoState = struct {
             SimulationPipeline.pendingEventsMayInvalidateNavigation(&self.simulation_frame) or
             self.pipeline.hasPendingNavLinks(&self.world);
         const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
-        const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
+        const stats = try self.simulation_frame.applyStructuralCommandsBudgeted(&self.data, self.pipeline.structuralCommitBudget(extra_event_count));
         // Population growth seam: the post-commit reactions and the next step see grown
         // capacities. O(1) when the committed rows fit the tracked capacities.
         self.last_population_sync = try self.pipeline.syncPopulationCapacity(&self.simulation_frame, &self.data, &self.world);
@@ -2122,8 +2128,8 @@ test "demo event bound is the pinned exhaustive producer sum" {
     // Hand-pinned, not re-derived: a formula drift on either side must fail here.
     // 37 movement bodies (player + 32 movers + 4 obstacles), 12 cognition agents:
     // dig 1 + perception 24 + affect 48 + plane (37 + 1) + action_react 64 +
-    // structural (37 + 80) + nav 1 = 293.
-    const pinned_event_bound: usize = 293;
+    // structural (1 create x 15 + 64) + nav 1 = 255.
+    const pinned_event_bound: usize = 255;
     try std.testing.expectEqual(@as(?usize, pinned_event_bound), demo.simulation_frame.events.capacity_limit);
     try std.testing.expectEqual(pinned_event_bound, demo.pipeline.eventCapacitySum());
 }
@@ -2166,7 +2172,7 @@ test "every producer budget fits the demo event bound allocation-free in one ste
 
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.dropped);
-    try std.testing.expectEqual(@as(usize, 293), appended);
+    try std.testing.expectEqual(@as(usize, 255), appended);
     try std.testing.expectEqual(appended, demo.simulation_frame.events.mergedItems().len);
     try std.testing.expectError(error.EventCapacityExceeded, demo.simulation_frame.events.appendRequired(event));
 }
@@ -2327,11 +2333,11 @@ test "demo commit seam grows pipeline capacity" {
 
     // 40 bodies -> 40 + 20 + 16 = 76, hot-store aligned to 80. The bound follows:
     // dig 1 + perception 24 + affect 48 + plane (80 + 1) + action_react 64 +
-    // structural (80 + 80) + nav 1 = 379.
+    // structural 79 (fixed) + nav 1 = 298.
     try std.testing.expect(demo.last_population_sync.grew);
     try std.testing.expectEqual(@as(usize, 80), demo.pipeline.movement_body_capacity);
-    try std.testing.expectEqual(@as(usize, 379), demo.pipeline.eventCapacitySum());
-    try std.testing.expectEqual(@as(?usize, 379), demo.simulation_frame.events.capacity_limit);
+    try std.testing.expectEqual(@as(usize, 298), demo.pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(?usize, 298), demo.simulation_frame.events.capacity_limit);
 
     demo.simulation_frame.beginStep();
     _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);

@@ -63,6 +63,9 @@ const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const EventBudgetInputs = @import("simulation.zig").EventBudgetInputs;
+const StructuralCommitBudget = @import("simulation.zig").StructuralCommitBudget;
+const SimulationEvent = @import("simulation.zig").SimulationEvent;
+const structuralEventHeadroom = @import("simulation.zig").structuralEventHeadroom;
 const EventProducerId = @import("simulation.zig").EventProducerId;
 const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
 const perception_events_per_observer_max = @import("simulation.zig").perception_events_per_observer_max;
@@ -391,8 +394,12 @@ pub const SimulationPipelineConfig = struct {
     /// When set, the one-time static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
-    /// Structural-commit events beyond one tier change per body: dig/create bursts
-    /// and destroys. A create costs `1 + templateComponentCount` events.
+    /// The per-step `.structural_commit` event share, in events: size it with
+    /// `structuralEventHeadroom(creates, destroys + component sets)` from fixed
+    /// per-step producer budgets (a create costs up to
+    /// `max_structural_events_per_create`; tier changes cost none). Enforced on its own
+    /// at the commit (`structuralCommitBudget`), never borrowed from other producers.
+    /// Also sizes the structural-command stream beyond one tier command per body.
     structural_headroom: usize = 0,
     stimuli: StimulusConfig = .{},
 };
@@ -808,6 +815,15 @@ pub const SimulationPipeline = struct {
             sum += maxEventsPerStep(producer, budgets);
         }
         return sum;
+    }
+
+    /// The budget for this step's structural commit: this pipeline's own
+    /// `.structural_commit` share, plus `extra_required_events` preflighted for after it.
+    pub fn structuralCommitBudget(self: *const SimulationPipeline, extra_required_events: usize) StructuralCommitBudget {
+        return .{
+            .extra_required_events = extra_required_events,
+            .structural_event_share = maxEventsPerStep(.structural_commit, self.eventBudgets()),
+        };
     }
 
     pub fn eventBudgets(self: *const SimulationPipeline) EventBudgetInputs {
@@ -1879,8 +1895,8 @@ test "eventCapacitySum equals capacity_limit after reserve" {
     try pipeline.reserve(&frame, 8);
 
     // dig 1 + perception 0 + affect 0 (no AiPerception/AiAffect rows) + plane (8 + 1) +
-    // action_react 64 + structural (8 + 4) + nav 1.
-    try std.testing.expectEqual(@as(usize, 87), pipeline.eventCapacitySum());
+    // action_react 64 + structural 4 + nav 1.
+    try std.testing.expectEqual(@as(usize, 79), pipeline.eventCapacitySum());
     try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
 }
 
@@ -5281,7 +5297,7 @@ fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame,
         SimulationPipeline.pendingEventsMayInvalidateNavigation(frame) or
         pipeline.hasPendingNavLinks(world);
     const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
-    _ = try frame.applyStructuralCommandsWithExtraEvents(data, extra_event_count);
+    _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     const sync = try pipeline.syncPopulationCapacity(frame, data, world);
     _ = try pipeline.reactToPostCommitNavEvents(frame, data, world, null);
     try pipeline.reactToPostCommitPerceptionEvents(frame, world);
@@ -5417,7 +5433,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
 
     // Growth: 21 NPCs (7 commit events each) + 12 steering-only agents parked on rows
-    // 6-7 (4 events each) = 195 events against the 275 limit.
+    // 6-7 (4 events each) = 195 events within the 200-event structural share.
     var commands: [33]StructuralCommand = undefined;
     for (start_cells[3..], 0..) |cell, index| commands[index] = growthNpcTemplate(cell);
     for (0..12) |index| {
@@ -5653,4 +5669,109 @@ test "statics committed within the responder headroom never grow the steering sn
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(u64, 0), pipeline.steering.static_snapshot_grown_total);
     try std.testing.expectEqual(@as(usize, 21), pipeline.steering.obstacleSnapshotSliceConst().min_x.len);
+}
+
+const StructuralBurstOutcome = struct {
+    failed: bool,
+    bodies: usize,
+};
+
+/// Commits `create_count` 4-event creates against a 15-event structural share
+/// (`structuralEventHeadroom(1, 0)`) on a minimal pipeline with 2 perception/affect
+/// observers. With `saturate_other_producers`, every other producer's share is filled
+/// first, so only the structural share is left in the shared bound.
+fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !StructuralBurstOutcome {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var observers: [2]EntityId = undefined;
+    for (&observers, 0..) |*observer, index| {
+        observer.* = try data.createEntity();
+        try data.setMovementBody(observer.*, .{ .position = .{ .x = @floatFromInt(index * 64), .y = 64 } });
+        try data.setAiPerception(observer.*, .{});
+        try data.setAiAffect(observer.*, .{});
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const headroom = structuralEventHeadroom(1, 0);
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 4096, 128, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = headroom,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + headroom);
+    try pipeline.reserve(&frame, 4);
+    const structural_share = maxEventsPerStep(.structural_commit, pipeline.eventBudgets());
+    try std.testing.expectEqual(@as(usize, 15), structural_share);
+    try std.testing.expect(pipeline.perception_max_events_per_step > 0 and pipeline.affect_max_events_per_step > 0);
+
+    frame.beginStep();
+    if (saturate_other_producers) {
+        const filler: SimulationEvent = .{
+            .stage = .domain_reaction,
+            .payload = .{ .affect_threshold_crossed = .{ .entity = observers[0], .drive = .fear, .rising = true } },
+        };
+        for (0..pipeline.eventCapacitySum() - structural_share) |_| try frame.events.appendRequired(filler);
+    }
+    var commands: [4]StructuralCommand = undefined;
+    for (commands[0..create_count], 0..) |*command, index| command.* = responderTemplate(index, .dynamic);
+    try writeStructuralCommands(&frame, commands[0..create_count]);
+    const events_before = frame.events.mergedItems().len;
+    const bodies_before = data.movementBodySliceConst().entities.len;
+
+    _ = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world) catch |err| {
+        try std.testing.expectEqual(error.EventCapacityExceeded, err);
+        // Rejected before mutation: no rows, no events.
+        try std.testing.expectEqual(bodies_before, data.movementBodySliceConst().entities.len);
+        try std.testing.expectEqual(events_before, frame.events.mergedItems().len);
+        return .{ .failed = true, .bodies = data.movementBodySliceConst().entities.len };
+    };
+    return .{ .failed = false, .bodies = data.movementBodySliceConst().entities.len };
+}
+
+test "a structural burst over its own event share fails the same whether other producers are idle or saturated" {
+    // 4 creates x 4 events = 16 > 15: rejected at the structural boundary in both cases,
+    // never admitted by borrowing idle perception/affect/action shares.
+    const over_idle = try commitStructuralBurst(4, false);
+    const over_saturated = try commitStructuralBurst(4, true);
+    try std.testing.expect(over_idle.failed);
+    try std.testing.expectEqual(over_idle, over_saturated);
+
+    // 3 creates x 4 events = 12 <= 15 commits in both cases.
+    const within_idle = try commitStructuralBurst(3, false);
+    const within_saturated = try commitStructuralBurst(3, true);
+    try std.testing.expect(!within_idle.failed);
+    try std.testing.expectEqual(@as(usize, 5), within_idle.bodies);
+    try std.testing.expectEqual(within_idle, within_saturated);
+}
+
+test "a full-template create costs max_structural_events_per_create events" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const position = math.Vec2{ .x = 0, .y = 0 };
+    try writeStructuralCommands(&frame, &.{.{ .create_entity = .{
+        .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 },
+        .facing = .{ .direction = .down },
+        .primitive_visual = growth_npc_visual,
+        .asset_reference = .{ .sprite = .demo_tile },
+        .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+        .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        .ai_agent = .{ .active_behavior = .wander },
+        .steering_agent = .{ .agent_radius = 4 },
+        .world_level = 0,
+        .faction = .hostile,
+        .ai_perception = .{},
+        .ai_memory = .{},
+        .ai_affect = .{},
+        .destructible = .{},
+    } }});
+    // Exactly the per-create share: one more event would not fit.
+    const share = structuralEventHeadroom(1, 0);
+    try std.testing.expectError(error.EventCapacityExceeded, frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share - 1 }));
+    _ = try frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share });
+    try std.testing.expectEqual(share, frame.events.mergedItems().len);
 }

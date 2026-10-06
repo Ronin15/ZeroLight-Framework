@@ -23,6 +23,7 @@ const ObstacleWorldRect = @import("data_system.zig").ObstacleWorldRect;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
 const AiAffectDrive = @import("data_system.zig").AiAffectDrive;
+const max_structural_events_per_create = @import("data_system.zig").max_structural_events_per_create;
 
 pub const SimulationPhase = enum {
     idle,
@@ -68,10 +69,19 @@ pub const EventBudgetInputs = struct {
     perception_max_events_per_step: usize = 0,
     affect_max_events_per_step: usize = 0,
     movement_body_capacity: usize = 0,
-    /// Structural-commit events beyond one tier change per body (dig/create bursts,
-    /// destroys). See `SimulationPipelineConfig.structural_headroom`.
+    /// The `.structural_commit` event share, in events (`structuralEventHeadroom`).
+    /// See `SimulationPipelineConfig.structural_headroom`.
     structural_headroom: usize = 0,
 };
+
+/// Sizes a `.structural_commit` event share from fixed per-step producer budgets: a
+/// `create_entity` emits up to `max_structural_events_per_create` events (one
+/// `entity_created` plus one `component_changed` per template component); a
+/// `destroy_entity` or `set_*` command emits one. `set_simulation_tier` emits none, so
+/// tier changes need no share.
+pub fn structuralEventHeadroom(creates_per_step: usize, single_event_commands_per_step: usize) usize {
+    return creates_per_step * max_structural_events_per_create + single_event_commands_per_step;
+}
 
 pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) usize {
     return switch (producer) {
@@ -80,8 +90,10 @@ pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) u
         .affect_update => budgets.affect_max_events_per_step,
         .plane_traversal => budgets.movement_body_capacity + 1,
         .action_react => action_intent_live_capacity,
-        // One `set_simulation_tier` per body plus the burst/destroy headroom.
-        .structural_commit => budgets.movement_body_capacity + budgets.structural_headroom,
+        // A fixed per-step share sized in events; tier changes emit no structural
+        // event, so the share never follows population. Enforced on its own by the
+        // budgeted commit (`StructuralCommitBudget`).
+        .structural_commit => budgets.structural_headroom,
         // The single post-commit `nav_region_invalidated`.
         .nav_reaction => 1,
     };
@@ -429,15 +441,33 @@ const StructuralChangeSink = struct {
     }
 };
 
+/// Event budget for one structural commit.
+pub const StructuralCommitBudget = struct {
+    /// Events appended after the commit in the same step (the post-commit nav
+    /// reaction's slot), preflighted with the commit.
+    extra_required_events: usize = 0,
+    /// The commit's own `.structural_commit` share
+    /// (`maxEventsPerStep(.structural_commit, ...)`). A commit needing more fails
+    /// before mutation, whatever other producers appended this step. Null checks only
+    /// the shared `capacity_limit`.
+    structural_event_share: ?usize = null,
+};
+
 const StructuralCommitPreparer = struct {
     frame: *SimulationFrame,
     changes: *std.ArrayList(StructuralChange),
-    extra_required_events: usize,
+    budget: StructuralCommitBudget,
     structural_event_count: usize = 0,
 
     pub fn prepare(self: *StructuralCommitPreparer, structural_event_count: usize) !void {
         self.structural_event_count = structural_event_count;
-        const required_event_count = try std.math.add(usize, structural_event_count, self.extra_required_events);
+        // The structural share is enforced on its own first, so an overrun fails at
+        // this boundary deterministically instead of borrowing other producers' idle
+        // shares through the shared bound.
+        if (self.budget.structural_event_share) |share| {
+            if (structural_event_count > share) return error.EventCapacityExceeded;
+        }
+        const required_event_count = try std.math.add(usize, structural_event_count, self.budget.extra_required_events);
         try self.frame.events.ensureCanAppend(required_event_count);
         try self.frame.reserveStructuralEvents(required_event_count);
         try self.changes.ensureTotalCapacity(self.frame.events.stream.allocator, structural_event_count);
@@ -810,13 +840,15 @@ pub const SimulationFrame = struct {
     }
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
-        return try self.applyStructuralCommandsWithExtraEvents(data, 0);
+        return try self.applyStructuralCommandsBudgeted(data, .{});
     }
 
-    pub fn applyStructuralCommandsWithExtraEvents(
+    /// Commits the merged structural commands all-or-fail against `budget`: the
+    /// preflight rejects an over-share or over-limit commit before any mutation.
+    pub fn applyStructuralCommandsBudgeted(
         self: *SimulationFrame,
         data: *DataSystem,
-        extra_required_events: usize,
+        budget: StructuralCommitBudget,
     ) !StructuralCommitStats {
         self.phase = .commit_structural;
         const commands = self.structural_commands.mergedItems();
@@ -825,7 +857,7 @@ pub const SimulationFrame = struct {
         var preparer = StructuralCommitPreparer{
             .frame = self,
             .changes = changes,
-            .extra_required_events = extra_required_events,
+            .budget = budget,
         };
         var sink = StructuralChangeSink{ .changes = changes };
         const stats = try data.applyStructuralCommandsPrepared(commands, &self.structural_plan_scratch, &preparer, &sink);

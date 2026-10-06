@@ -107,6 +107,7 @@ pub const StructuralEntityDestroyedChange = @import("data_system/types.zig").Str
 pub const StructuralComponentChangedChange = @import("data_system/types.zig").StructuralComponentChangedChange;
 pub const StructuralChange = @import("data_system/types.zig").StructuralChange;
 pub const StructuralPlanScratch = @import("data_system/structural.zig").StructuralPlanScratch;
+pub const max_structural_events_per_create = @import("data_system/structural.zig").max_structural_events_per_create;
 pub const DataSystem = @import("data_system/system.zig").DataSystem;
 
 test {
