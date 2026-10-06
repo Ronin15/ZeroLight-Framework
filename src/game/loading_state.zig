@@ -556,7 +556,7 @@ test "loading state render failure leaves rendered_once false" {
     // Frame-reserved with zero capacity: the first sprite submit must grow, and the
     // failing allocator makes that growth fail, aborting before the latch. Proves a
     // partial draw cannot unlock world build.
-    renderer.batch.frame_reserved = true;
+    renderer.batch.markFrameReserved(0);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const real_batch_allocator = renderer.batch.allocator;
     renderer.batch.allocator = failing.allocator();

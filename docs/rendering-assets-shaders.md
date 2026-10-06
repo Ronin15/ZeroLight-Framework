@@ -134,11 +134,16 @@ warmed path avoids per-frame allocation only inside the currently reserved
 ordered-command, prepared-command, vertex, and draw-group capacity.
 
 `drawSprite` never refuses. A submit past the batch's physical capacity grows the
-command list geometrically on the main thread. In a frame reserved through
-`Renderer.reserveSpriteCommands` that growth is counted
+command list geometrically on the main thread. `Renderer.reserveSpriteCommands`
+marks the frame reserved at its grow-only `command_high_water`; a reserved frame
+whose submits exceed that reservation is counted once
 (`SpriteBatch.command_overflow_grows`, perf metric `sprite_command_overflow_grows`)
-and warned through `logging.render`, so a short reservation formula shows up as a
-counter instead of exiting the app.
+and warned through `logging.render` (1st, 2nd, 4th, ... drifting frame), whether or
+not the command list's rounded-up capacity absorbed the overshoot. The comparison is
+against the reservation because that is the bound past which
+`ensureFrameBatchCapacity` grows prepared/vertex/group storage and the GPU streams
+(a possible GPU-idle stall). A short reservation formula shows up as a counter
+instead of exiting the app.
 
 ## GPU-Driven Tilemap
 

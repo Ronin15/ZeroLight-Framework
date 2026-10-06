@@ -256,7 +256,8 @@ pub const SpritePrepStats = struct {
     skipped_invalid_count: usize = 0,
     vertex_count: usize = 0,
     draw_group_count: usize = 0,
-    /// Command-list growths this frame while the frame was reserved (reservation drift).
+    /// 1 when this reserved frame's submits exceeded its command reservation
+    /// (reservation drift), else 0.
     command_overflow_grows: usize = 0,
     batch: BatchStats = .{},
 };
@@ -271,15 +272,20 @@ pub const SpriteBatch = struct {
     uvs: std.ArrayList(Uv) = .empty,
     colors: std.ArrayList(VertexColor) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,
-    /// Set by `Renderer.reserveSpriteCommands`, cleared by `beginFrame`. Diagnostics only:
-    /// a submit past capacity always grows; in a reserved frame that growth means the
-    /// caller's reservation is short, so it is counted and warned.
-    frame_reserved: bool = false,
-    /// Lifetime count of command-list growths in reserved frames (perf metric
-    /// `sprite_command_overflow_grows`); zero under a correct reservation.
+    /// This frame's command reservation (`Renderer.command_high_water`), set by
+    /// `markFrameReserved` and cleared by `beginFrame`; null in an unreserved frame.
+    /// Diagnostics only: a submit past capacity always grows. A reserved frame whose
+    /// submits exceed the RESERVATION (not the list's physical capacity, which
+    /// `ensureTotalCapacity` rounds past it) is reservation drift: it makes
+    /// `Renderer.ensureFrameBatchCapacity` grow prepared/vertex/group storage (and possibly
+    /// the GPU streams, a GPU-idle stall) even when the command list itself had slack.
+    frame_command_reservation: ?usize = null,
+    /// Lifetime count of reserved frames whose submits exceeded the frame's command
+    /// reservation (perf metric `sprite_command_overflow_grows`); zero under a correct
+    /// reservation.
     command_overflow_grows: u64 = 0,
-    /// This frame's share of `command_overflow_grows`; reset by `beginFrame`, reported by
-    /// `finishPrepStats`.
+    /// This frame's share of `command_overflow_grows` (0 or 1); reset by `beginFrame`,
+    /// reported by `finishPrepStats`.
     frame_command_overflow_grows: usize = 0,
     camera: Camera2D = .{},
     last_order: ?RenderOrder = null,
@@ -310,7 +316,7 @@ pub const SpriteBatch = struct {
         self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
         self.prepared_commands.clearRetainingCapacity();
-        self.frame_reserved = false;
+        self.frame_command_reservation = null;
         self.frame_command_overflow_grows = 0;
         self.last_order = null;
         self.last_prep_stats = .{};
@@ -322,25 +328,51 @@ pub const SpriteBatch = struct {
         }
         // Ordered submission keeps the renderer cheap: grouping can preserve
         // stream order instead of sorting every frame.
-        if (self.commands.items.len == self.commands.capacity) try self.growCommands();
+        const len = self.commands.items.len;
+        if (len == self.commands.capacity) try self.growCommands();
         self.commands.appendAssumeCapacity(.{ .sprite = sprite });
         self.last_order = sprite.order;
+        // Counted only after the append succeeded (an OOM leaves the stream and the
+        // counters unchanged), at the one submit that crosses the reservation.
+        if (self.frame_command_reservation) |reservation| {
+            if (len == reservation) self.noteReservationExceeded(len + 1, reservation);
+        }
+    }
+
+    /// Marks this frame reserved for `command_reservation` commands. Called by
+    /// `Renderer.reserveSpriteCommands` with its grow-only high water, possibly more than
+    /// once per frame (the engine's overlay top-up); a frame already past the new
+    /// reservation counts as drift now.
+    pub fn markFrameReserved(self: *SpriteBatch, command_reservation: usize) void {
+        self.frame_command_reservation = command_reservation;
+        const len = self.commands.items.len;
+        if (len > command_reservation) self.noteReservationExceeded(len, command_reservation);
+    }
+
+    pub fn frameReserved(self: *const SpriteBatch) bool {
+        return self.frame_command_reservation != null;
     }
 
     /// Cold geometric growth of the command list for one more submit (the same policy
-    /// as a growing `append`), so the outcome never depends on growth history. In a
-    /// reserved frame the growth is reservation drift: counted only after it succeeds
-    /// (an OOM leaves the stream and the counters unchanged) and warned per growth event,
-    /// which geometric growth bounds to about log1.5(peak / reserve).
+    /// as a growing `append`), so the outcome never depends on growth history. Whether
+    /// the growth is drift is decided against the reservation in `drawSprite`.
     fn growCommands(self: *SpriteBatch) !void {
         @branchHint(.cold);
-        const len = self.commands.items.len;
-        try self.commands.ensureTotalCapacity(self.allocator, len + 1);
-        if (!self.frame_reserved) return;
+        try self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1);
+    }
+
+    /// Counts one reserved frame whose submits exceeded its reservation (at most once
+    /// per frame). Warns on the 1st, 2nd, 4th, 8th, ... drifting frame so a chronically
+    /// short reservation stays visible without logging every frame.
+    fn noteReservationExceeded(self: *SpriteBatch, count: usize, reservation: usize) void {
+        @branchHint(.cold);
+        if (self.frame_command_overflow_grows != 0) return;
+        self.frame_command_overflow_grows = 1;
         self.command_overflow_grows += 1;
-        self.frame_command_overflow_grows += 1;
-        if (comptime logging.enabled(.warn) and !builtin.is_test)
-            logging.render.warn("sprite commands exceeded the frame reservation; grew {d} -> {d} (reserveSpriteCommands bound is short)", .{ len, self.commands.capacity });
+        if (comptime logging.enabled(.warn) and !builtin.is_test) {
+            if (std.math.isPowerOfTwo(self.command_overflow_grows))
+                logging.render.warn("sprite commands exceeded the frame reservation ({d} > {d}; {d} frames so far); reserveSpriteCommands bound is short", .{ count, reservation, self.command_overflow_grows });
+        }
     }
 
     pub fn setCamera(self: *SpriteBatch, camera: Camera2D) void {
@@ -1143,7 +1175,7 @@ test "reserveStorage grow failure preserves prior capacity" {
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
 
     // Prior reserved capacity is still usable for submit + prep.
-    batch.frame_reserved = true;
+    batch.markFrameReserved(commands_capacity);
     try batch.drawSprite(.{
         .texture = texture,
         .dest = .{ .x = 1, .y = 0, .w = 1, .h = 1 },
@@ -1191,7 +1223,7 @@ test "reserveStorage mid-list grow failure preserves prior data and capacity" {
     try std.testing.expectEqual(draw_groups_capacity, batch.draw_groups.capacity);
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
 
-    batch.frame_reserved = true;
+    batch.markFrameReserved(commands_capacity);
     try batch.drawSprite(.{
         .texture = texture,
         .dest = .{ .x = 1, .y = 0, .w = 1, .h = 1 },
@@ -1641,7 +1673,7 @@ test "draw sprite stays allocation-free after reserve" {
 
     const command_capacity: usize = 8;
     try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
-    batch.frame_reserved = true;
+    batch.markFrameReserved(command_capacity);
     const capacity_before = batch.commands.capacity;
 
     const texture = TextureId.init(0, 1) catch unreachable;
@@ -1657,12 +1689,12 @@ test "draw sprite stays allocation-free after reserve" {
     try std.testing.expectEqual(command_capacity, batch.commands.items.len);
 }
 
-/// Reserves 8 commands, marks the frame reserved, and fills the command list to its
-/// physical capacity (which `ensureTotalCapacity` may round past 8). Returns that capacity.
+/// Reserves 8 commands, marks the frame reserved at the list's physical capacity (which
+/// `ensureTotalCapacity` may round past 8), and fills it to that capacity. Returns it.
 fn fillReservedCommandsToCapacity(batch: *SpriteBatch) !usize {
     const command_capacity: usize = 8;
     try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
-    batch.frame_reserved = true;
+    batch.markFrameReserved(batch.commands.capacity);
     const capacity = batch.commands.capacity;
     for (0..capacity) |i| try batch.drawSprite(try testOrderedSprite(i));
     try std.testing.expectEqual(capacity, batch.commands.items.len);
@@ -1697,6 +1729,47 @@ test "draw sprite past a reserved frame's capacity grows in order and counts the
     // The per-frame share resets; the lifetime count stays.
     batch.beginFrame();
     try std.testing.expectEqual(@as(usize, 0), batch.frame_command_overflow_grows);
+    try std.testing.expectEqual(@as(u64, 1), batch.command_overflow_grows);
+}
+
+test "submits past the reservation are drift even inside the physical slack" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    try batch.reserveStorage(16, 16 * 6, 16);
+    const capacity = batch.commands.capacity;
+    const reservation: usize = 4;
+
+    batch.markFrameReserved(reservation);
+    for (0..reservation) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(@as(u64, 0), batch.command_overflow_grows);
+
+    // Past the reservation, well inside the physical capacity: no growth, still drift.
+    // Counted once for the frame however far it overshoots, and re-marking the frame at
+    // the same reservation (the engine's top-up) does not count it again.
+    for (reservation..reservation + 3) |i| try batch.drawSprite(try testOrderedSprite(i));
+    batch.markFrameReserved(reservation);
+    try std.testing.expectEqual(capacity, batch.commands.capacity);
+    try std.testing.expectEqual(@as(u64, 1), batch.command_overflow_grows);
+    try std.testing.expectEqual(@as(usize, 1), batch.finishPrepStats(.{}).command_overflow_grows);
+
+    // Every drifting frame counts.
+    batch.beginFrame();
+    try std.testing.expect(!batch.frameReserved());
+    batch.markFrameReserved(reservation);
+    for (0..reservation + 1) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(@as(u64, 2), batch.command_overflow_grows);
+}
+
+test "marking a frame reserved below its submitted count counts the drift" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    try batch.reserveStorage(16, 16 * 6, 16);
+    for (0..5) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(@as(u64, 0), batch.command_overflow_grows);
+
+    batch.markFrameReserved(4);
+    try std.testing.expectEqual(@as(u64, 1), batch.command_overflow_grows);
+    try batch.drawSprite(try testOrderedSprite(5));
     try std.testing.expectEqual(@as(u64, 1), batch.command_overflow_grows);
 }
 
