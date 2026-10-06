@@ -730,11 +730,25 @@ pub const WorldSystem = struct {
         return visible_dense_cells + visible_sparse_tiles;
     }
 
-    pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16) void {
-        if (self.chunks.len == 0) {
-            self.visible_sparse_count = 0;
-            return;
-        }
+    /// Inclusive tile and chunk bounds of a world rect; see `chunkWindowForWorldRect`.
+    const ChunkWindow = struct {
+        min_tile_x: u16,
+        min_tile_y: u16,
+        max_tile_x: u16,
+        max_tile_y: u16,
+        min_chunk_x: u16,
+        min_chunk_y: u16,
+        max_chunk_x: u16,
+        max_chunk_y: u16,
+    };
+
+    /// Tile bounds of `rect` clamped to the world, and chunk bounds widened by
+    /// `overscan_chunks` and clamped to the chunk grid. The one chunk-math source
+    /// shared by the render visibility window (`setVisibleChunksForWorldRect`)
+    /// and the pure simulation scope region (`chunkRegionForWorldRect`), so the
+    /// two cannot drift apart. Requires at least one chunk.
+    fn chunkWindowForWorldRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16) ChunkWindow {
+        std.debug.assert(self.chunks.len > 0);
         const chunks_x = self.chunksX();
         const chunks_y = self.chunksY();
         const tile_size = self.tile_size;
@@ -742,10 +756,63 @@ pub const WorldSystem = struct {
         const min_tile_y = floorTileClamped(rect.y, tile_size, self.height);
         const max_tile_x = floorTileClamped(visibleMaxCoord(rect.x, rect.w), tile_size, self.width);
         const max_tile_y = floorTileClamped(visibleMaxCoord(rect.y, rect.h), tile_size, self.height);
-        const min_chunk_x = saturatingSubU16(min_tile_x / self.chunk_size_tiles, overscan_chunks);
-        const min_chunk_y = saturatingSubU16(min_tile_y / self.chunk_size_tiles, overscan_chunks);
-        const max_chunk_x = @min(chunks_x - 1, max_tile_x / self.chunk_size_tiles + overscan_chunks);
-        const max_chunk_y = @min(chunks_y - 1, max_tile_y / self.chunk_size_tiles + overscan_chunks);
+        return .{
+            .min_tile_x = min_tile_x,
+            .min_tile_y = min_tile_y,
+            .max_tile_x = max_tile_x,
+            .max_tile_y = max_tile_y,
+            .min_chunk_x = saturatingSubU16(min_tile_x / self.chunk_size_tiles, overscan_chunks),
+            .min_chunk_y = saturatingSubU16(min_tile_y / self.chunk_size_tiles, overscan_chunks),
+            .max_chunk_x = @min(chunks_x - 1, max_tile_x / self.chunk_size_tiles + overscan_chunks),
+            .max_chunk_y = @min(chunks_y - 1, max_tile_y / self.chunk_size_tiles + overscan_chunks),
+        };
+    }
+
+    /// Chunk rectangle covering `rect` plus `overscan_chunks`, clamped to the
+    /// world, as an ActiveRegion (level 0). Pure: reads no render visibility
+    /// state, so fixed-step simulation scope can derive from a fixed-step view
+    /// rect. Returns null when the world has no chunks.
+    pub fn chunkRegionForWorldRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16) ?ActiveRegion {
+        if (self.chunks.len == 0) return null;
+        const window = self.chunkWindowForWorldRect(rect, overscan_chunks);
+        std.debug.assert(window.max_chunk_x >= window.min_chunk_x);
+        std.debug.assert(window.max_chunk_y >= window.min_chunk_y);
+        return .{
+            .min = .{ .x = @intCast(window.min_chunk_x), .y = @intCast(window.min_chunk_y) },
+            .max_exclusive = .{
+                .x = @as(i32, window.max_chunk_x) + 1,
+                .y = @as(i32, window.max_chunk_y) + 1,
+            },
+        };
+    }
+
+    /// `chunkRegionForWorldRect(rect, overscan_chunks)` expanded by `halo` chunks
+    /// on every side (unclamped) — the simulation cognition active region.
+    /// Entities outside it drop to .locomotion. Returns null when the world has
+    /// no chunks.
+    pub fn cognitionRegionForWorldRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16, halo: u16) ?ActiveRegion {
+        const view = self.chunkRegionForWorldRect(rect, overscan_chunks) orelse return null;
+        const h: i32 = halo;
+        return .{
+            .min = .{ .x = view.min.x - h, .y = view.min.y - h },
+            .max_exclusive = .{ .x = view.max_exclusive.x + h, .y = view.max_exclusive.y + h },
+        };
+    }
+
+    pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16) void {
+        if (self.chunks.len == 0) {
+            self.visible_sparse_count = 0;
+            return;
+        }
+        const window = self.chunkWindowForWorldRect(rect, overscan_chunks);
+        const min_tile_x = window.min_tile_x;
+        const min_tile_y = window.min_tile_y;
+        const max_tile_x = window.max_tile_x;
+        const max_tile_y = window.max_tile_y;
+        const min_chunk_x = window.min_chunk_x;
+        const min_chunk_y = window.min_chunk_y;
+        const max_chunk_x = window.max_chunk_x;
+        const max_chunk_y = window.max_chunk_y;
 
         // Early-out when the visible window is unchanged: chunk_visible and the
         // sparse count are fully determined by these bounds, so a still camera or a
@@ -1573,6 +1640,9 @@ pub const WorldSystem = struct {
 
     /// Camera-visible chunk rectangle as an ActiveRegion. Returns null when no
     /// visibility window has been set yet (e.g. before the first render frame).
+    /// Render-only: the window follows the interpolated render camera, so no
+    /// simulation path may read it — fixed-step scope uses
+    /// `chunkRegionForWorldRect` / `cognitionRegionForWorldRect` instead.
     pub fn visibleChunkRegion(self: *const WorldSystem) ?ActiveRegion {
         if (!self.visibility_window_valid or self.chunks.len == 0) return null;
         std.debug.assert(self.last_max_chunk_x >= self.last_min_chunk_x);
@@ -1583,18 +1653,6 @@ pub const WorldSystem = struct {
                 .x = @as(i32, self.last_max_chunk_x) + 1,
                 .y = @as(i32, self.last_max_chunk_y) + 1,
             },
-        };
-    }
-
-    /// Camera-visible chunks expanded by `halo` on every side — the simulation
-    /// cognition active region. Entities outside this region drop to .locomotion.
-    /// Returns null when no visibility window has been set yet.
-    pub fn cognitionActiveRegion(self: *const WorldSystem, halo: u16) ?ActiveRegion {
-        const visible = self.visibleChunkRegion() orelse return null;
-        const h: i32 = @intCast(halo);
-        return .{
-            .min = .{ .x = visible.min.x - h, .y = visible.min.y - h },
-            .max_exclusive = .{ .x = visible.max_exclusive.x + h, .y = visible.max_exclusive.y + h },
         };
     }
 
@@ -3305,7 +3363,7 @@ test "visibleChunkRegion returns correct half-open bounds after setVisibleChunks
     try std.testing.expect(!region.containsChunk(.{ .x = 1, .y = 0 }));
 }
 
-test "cognitionActiveRegion expands by halo on all sides" {
+test "cognitionRegionForWorldRect expands the rect's chunk region by halo on all sides" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     const tile_size = meta.tileSize();
@@ -3323,27 +3381,60 @@ test "cognitionActiveRegion expands by halo on all sides" {
     const grass = try world.requireTileByName(&meta, "grass");
     _ = try world.addDenseLayer(0, 0, .floor, grass);
 
-    // Show chunks (1,1)–(2,2) (2×2 chunk region in the middle).
+    // Rect covering chunks (1,1)–(2,2) (2×2 chunk region in the middle).
     const chunk_pixels = @as(f32, @floatFromInt(2)) * tile_size;
-    world.setVisibleChunksForWorldRect(.{
-        .x = chunk_pixels,
-        .y = chunk_pixels,
-        .w = chunk_pixels * 2,
-        .h = chunk_pixels * 2,
-    }, 0);
+    const rect = Rect{ .x = chunk_pixels, .y = chunk_pixels, .w = chunk_pixels * 2, .h = chunk_pixels * 2 };
 
-    const visible = world.visibleChunkRegion() orelse return error.ExpectedRegion;
-    const cognition = world.cognitionActiveRegion(4) orelse return error.ExpectedRegion;
+    const view = world.chunkRegionForWorldRect(rect, 0) orelse return error.ExpectedRegion;
+    try std.testing.expectEqual(@as(i32, 1), view.min.x);
+    try std.testing.expectEqual(@as(i32, 1), view.min.y);
+    try std.testing.expectEqual(@as(i32, 3), view.max_exclusive.x);
+    try std.testing.expectEqual(@as(i32, 3), view.max_exclusive.y);
+    const cognition = world.cognitionRegionForWorldRect(rect, 0, 4) orelse return error.ExpectedRegion;
 
     // Halo of 4 expands each side by 4 chunks.
-    try std.testing.expectEqual(visible.min.x - 4, cognition.min.x);
-    try std.testing.expectEqual(visible.min.y - 4, cognition.min.y);
-    try std.testing.expectEqual(visible.max_exclusive.x + 4, cognition.max_exclusive.x);
-    try std.testing.expectEqual(visible.max_exclusive.y + 4, cognition.max_exclusive.y);
-    // Chunks within visible region are inside cognition region.
+    try std.testing.expectEqual(view.min.x - 4, cognition.min.x);
+    try std.testing.expectEqual(view.min.y - 4, cognition.min.y);
+    try std.testing.expectEqual(view.max_exclusive.x + 4, cognition.max_exclusive.x);
+    try std.testing.expectEqual(view.max_exclusive.y + 4, cognition.max_exclusive.y);
+    // Chunks within the view are inside the cognition region.
     try std.testing.expect(cognition.containsChunk(.{ .x = 1, .y = 1 }));
-    // Chunk well outside visible but within halo is still included.
+    // Chunk well outside the view but within the halo is still included.
     try std.testing.expect(cognition.containsChunk(.{ .x = -1, .y = -1 }));
+    // Pure: deriving a scope region never sets the render visibility window.
+    try std.testing.expect(world.visibleChunkRegion() == null);
+}
+
+test "chunkRegionForWorldRect matches the render visibility window for the same rect and overscan" {
+    // 8×8 tiles, chunk_size_tiles=2 → 4×4 chunk grid. Render and sim share one
+    // chunk-math helper; this pins that they agree, including overscan clamping.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    // No levels yet → no chunks → no region.
+    try std.testing.expect(world.chunkRegionForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 1) == null);
+    _ = try world.addLevel(0);
+
+    const rects = [_]Rect{
+        .{ .x = 0, .y = 0, .w = 64, .h = 64 },
+        .{ .x = 70, .y = 130, .w = 50, .h = 90 },
+        .{ .x = -500, .y = 900, .w = 20, .h = 20 },
+    };
+    for (rects) |rect| {
+        for ([_]u16{ 0, 1, 3 }) |overscan| {
+            world.setVisibleChunksForWorldRect(rect, overscan);
+            const visible = world.visibleChunkRegion() orelse return error.ExpectedRegion;
+            const region = world.chunkRegionForWorldRect(rect, overscan) orelse return error.ExpectedRegion;
+            try std.testing.expectEqual(visible, region);
+            try std.testing.expect(region.min.x >= 0 and region.min.y >= 0);
+            try std.testing.expect(region.max_exclusive.x <= 4 and region.max_exclusive.y <= 4);
+        }
+    }
 }
 
 test "chunkCoordForWorldPos clamps out-of-range and non-finite positions" {

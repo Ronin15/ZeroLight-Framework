@@ -243,7 +243,12 @@ of truth for the composite-draw/shader-loop detail) and archive
 
 Simulation LOD and render visibility are separate policies: tier, halos, and scope
 gathers control fixed-step processor participation; camera chunk window, pixel
-AABB, and render overscan control draw-record construction. Scope pin metadata
+AABB, and render overscan control draw-record construction. Simulation scope
+comes only from the fixed-step camera (`GameDemoState.simViewRect()` passed as
+`SimulationPipelineUpdateContext.sim_view`, read through the pipeline's
+`simViewRegion` / `WorldSystem.cognitionRegionForWorldRect`), never from the
+render visibility window, which follows the interpolated render camera and so
+depends on frame pacing. Scope pin metadata
 may keep an entity in a higher sim band off-camera; it must not bypass render
 visibility. Open scaling gaps (collect scan cost, dense-floor layer quads,
 movement contiguous-path vs dormant rows, per-entity depth alignment, component

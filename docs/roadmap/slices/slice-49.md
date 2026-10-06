@@ -2,7 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** No open prerequisite. Land first among the new
+**Status: in progress.** Render→sim scope decoupling (defect 1) landed
+2026-10-05; seed, checksum, and replay work remain open. No open prerequisite. Land first among the new
 gameplay slices: every later one derives its seed and its scope band from this
 slice's contracts.
 - Prerequisite for **51**: its first lane consumer streams this slice's replay
@@ -791,7 +792,9 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
   - `LoadingState.init` derives `world_build_config.seed` and asserts the
     incoming seed is the default;
   - existing loading and demo tests compile and pass.
-- [ ] Render→sim decoupling:
+- [x] Render→sim decoupling: (done 2026-10-05; sim-view rule also added to
+  `docs/simulation-tiers-and-pipeline.md` and `docs/architecture.md` — the
+  slice's broader Docs item stays open)
   - `WorldSystem.chunkRegionForWorldRect` and `cognitionRegionForWorldRect`,
     sharing one chunk-math helper with `setVisibleChunksForWorldRect`;
   - `cognitionActiveRegion` removed;
@@ -810,6 +813,12 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
     `sim_view`. Between them, set the render window to a far rect in run A and
     leave it alone in run B. Movement/AI columns and queued tier commands must
     be identical.
+    (Landed as a 4-step run: run A rewrites the render window before each step
+    with varying rects/call counts — including none and a far rect — and run B
+    never sets it, so the old coupling would also flip the null-window
+    full-active fallback; also compares per-step cognition region, think-set
+    size, and stagger skips. `GameDemoState`'s camera test pins
+    `simViewRect()` to `camera_current` across interpolation alphas.)
 - [ ] `src/core/state_hash.zig` plus tests:
   - swapping two rows changes the hash;
   - moving a row between sections changes it;

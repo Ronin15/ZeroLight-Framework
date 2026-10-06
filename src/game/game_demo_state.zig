@@ -48,6 +48,7 @@ const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
+const sim_view_overscan_chunks = @import("simulation_pipeline.zig").sim_view_overscan_chunks;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
 const RenderContext = @import("../app/state.zig").RenderContext;
@@ -244,6 +245,13 @@ fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_cou
 }
 /// Chunk + pixel AABB margin for dynamic collect and sparse visibility (Slice 24B).
 const world_render_overscan_chunks: u16 = 1;
+
+comptime {
+    // The fixed-step sim view uses the same overscan as the render window, so
+    // the simulation scope region equals the render window at interpolation
+    // alpha 1 (Slice 49 render→sim decoupling kept the region unchanged).
+    std.debug.assert(sim_view_overscan_chunks == world_render_overscan_chunks);
+}
 
 const StageTimer = runtime_perf_log.StageTimer;
 
@@ -534,6 +542,7 @@ pub const GameDemoState = struct {
             .bounds_height = self.bounds_height,
             .perf = context.perf,
             .particles = &self.particles,
+            .sim_view = self.simViewRect(),
         });
 
         var collision_audio_timer = StageTimer.start();
@@ -572,6 +581,8 @@ pub const GameDemoState = struct {
             .w = self.viewport_width / camera.zoom,
             .h = self.viewport_height / camera.zoom,
         };
+        // Draw culling only: the simulation never reads this window (its scope
+        // comes from `simViewRect()` in `update`).
         self.world.setVisibleChunksForWorldRect(camera_rect, world_render_overscan_chunks);
         const scene = self.gameplayScene();
         // Always reserve the fixed AI-overlay headroom alongside the gameplay
@@ -627,6 +638,20 @@ pub const GameDemoState = struct {
     fn updateCamera(self: *GameDemoState) void {
         self.camera_previous = self.camera_current;
         self.camera_current = self.cameraForPlayer();
+    }
+
+    /// Fixed-step camera rect the simulation derives scope from: `camera_current`
+    /// (computed by `updateCamera` at the end of the previous step) over the
+    /// viewport / zoom. Deterministic — never the interpolated render camera.
+    /// The only sim-view source; Slice 60 replaces just this body with its
+    /// camera-rig anchor.
+    fn simViewRect(self: *const GameDemoState) Rect {
+        return .{
+            .x = self.camera_current.position.x,
+            .y = self.camera_current.position.y,
+            .w = self.viewport_width / self.camera_current.zoom,
+            .h = self.viewport_height / self.camera_current.zoom,
+        };
     }
 
     fn interpolatedCamera(self: *const GameDemoState, interpolation_alpha: f32) Camera2D {
@@ -1464,6 +1489,25 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
     try std.testing.expect(camera.position.x > 0);
     try std.testing.expect(camera.position.y > 0);
     try std.testing.expect(camera.position.x != @floor(camera.position.x));
+
+    // The simulation's scope rect is the fixed-step camera, not the lerped
+    // render camera, and render-window writes at any alpha never move it.
+    const sim_view = demo.simViewRect();
+    try std.testing.expectEqual(demo.camera_current.position.x, sim_view.x);
+    try std.testing.expectEqual(demo.camera_current.position.y, sim_view.y);
+    try std.testing.expectEqual(demo.viewport_width / demo.camera_current.zoom, sim_view.w);
+    try std.testing.expectEqual(demo.viewport_height / demo.camera_current.zoom, sim_view.h);
+    try std.testing.expect(sim_view.x != camera.position.x);
+    for ([_]f32{ 0, 0.25, 0.5, 1 }) |alpha| {
+        const render_camera = demo.interpolatedCamera(alpha);
+        demo.world.setVisibleChunksForWorldRect(.{
+            .x = render_camera.position.x,
+            .y = render_camera.position.y,
+            .w = demo.viewport_width / render_camera.zoom,
+            .h = demo.viewport_height / render_camera.zoom,
+        }, world_render_overscan_chunks);
+        try std.testing.expectEqual(sim_view, demo.simViewRect());
+    }
 }
 
 test "demo init rejects missing character atlas metadata" {
