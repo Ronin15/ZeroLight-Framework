@@ -14,6 +14,8 @@ const logging = @import("../core/logging.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
 const DataSystem = @import("data_system.zig").DataSystem;
 const hotStoreCapacity = @import("data_system.zig").hotStoreCapacity;
 const PopulationRowCounts = @import("data_system.zig").PopulationRowCounts;
@@ -5174,9 +5176,11 @@ test "player-dug ramp is routable by an underground NPC the same step" {
     try std.testing.expect(resolved);
 }
 
-/// Swaps every pipeline, frame-stream, data, pathfinding, and dig allocator to one
-/// failing allocator for a zero-allocation proof (the world allocator stays real:
-/// dense tile edits). Test-only local fixture.
+/// The allocators of everything a pipeline step can reach: frame streams, data, world,
+/// pipeline systems, pathfinding, dig scratch, and the thread system. `install` swaps
+/// them all (to one failing allocator for a zero-allocation proof, or per-owner
+/// counters to see which owner allocated) and returns the originals for `restore`.
+/// Test-only local fixture.
 const TestAllocatorSwap = struct {
     frame: std.mem.Allocator = undefined,
     events: std.mem.Allocator = undefined,
@@ -5189,6 +5193,7 @@ const TestAllocatorSwap = struct {
     structural_commands: std.mem.Allocator = undefined,
     stimuli: std.mem.Allocator = undefined,
     data: std.mem.Allocator = undefined,
+    world: std.mem.Allocator = undefined,
     collision: std.mem.Allocator = undefined,
     collision_response: std.mem.Allocator = undefined,
     ai: std.mem.Allocator = undefined,
@@ -5203,90 +5208,175 @@ const TestAllocatorSwap = struct {
     dig: ?std.mem.Allocator = null,
     threads: std.mem.Allocator = undefined,
 
-    fn install(self: *TestAllocatorSwap, pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, threads: *ThreadSystem, fail: std.mem.Allocator) void {
-        self.* = .{
-            .frame = frame.allocator,
-            .events = frame.events.stream.allocator,
-            .navigation_intents = frame.navigation_intents.allocator,
-            .action_intents = frame.action_intents.allocator,
-            .intents = frame.intents.allocator,
-            .path_requests = frame.path_requests.allocator,
-            .contacts = frame.contacts.allocator,
-            .collision_triggers = frame.collision_triggers.allocator,
-            .structural_commands = frame.structural_commands.allocator,
-            .stimuli = frame.stimuli.allocator,
-            .data = data.allocator,
-            .collision = pipeline.collision.allocator,
-            .collision_response = pipeline.collision_response.allocator,
-            .ai = pipeline.ai.allocator,
-            .steering = pipeline.steering.allocator,
-            .pathfinding = pipeline.pathfinding.allocator,
-            .graph = pipeline.pathfinding.graph.allocator,
-            .scope = pipeline.scope.allocator,
-            .spatial_index = pipeline.spatial_index.allocator,
-            .perception = pipeline.perception.allocator,
-            .ai_memory = pipeline.ai_memory.allocator,
-            .affect = pipeline.affect.allocator,
-            .dig = pipeline.dig.scratch_allocator,
-            .threads = threads.allocator,
+    const Targets = struct {
+        pipeline: *SimulationPipeline,
+        frame: *SimulationFrame,
+        data: *DataSystem,
+        world: *WorldSystem,
+        threads: *ThreadSystem,
+    };
+
+    const owner_names = @typeInfo(TestAllocatorSwap).@"struct".field_names;
+    const owner_count = owner_names.len;
+
+    /// Every owner set to `allocator`.
+    fn uniform(allocator: std.mem.Allocator) TestAllocatorSwap {
+        var out: TestAllocatorSwap = .{};
+        inline for (owner_names) |name| @field(out, name) = allocator;
+        return out;
+    }
+
+    fn install(self: *TestAllocatorSwap, targets: Targets, to: TestAllocatorSwap) void {
+        self.* = get(targets);
+        set(targets, to);
+    }
+
+    fn restore(self: *const TestAllocatorSwap, targets: Targets) void {
+        set(targets, self.*);
+    }
+
+    fn get(t: Targets) TestAllocatorSwap {
+        return .{
+            .frame = t.frame.allocator,
+            .events = t.frame.events.stream.allocator,
+            .navigation_intents = t.frame.navigation_intents.allocator,
+            .action_intents = t.frame.action_intents.allocator,
+            .intents = t.frame.intents.allocator,
+            .path_requests = t.frame.path_requests.allocator,
+            .contacts = t.frame.contacts.allocator,
+            .collision_triggers = t.frame.collision_triggers.allocator,
+            .structural_commands = t.frame.structural_commands.allocator,
+            .stimuli = t.frame.stimuli.allocator,
+            .data = t.data.allocator,
+            .world = t.world.allocator,
+            .collision = t.pipeline.collision.allocator,
+            .collision_response = t.pipeline.collision_response.allocator,
+            .ai = t.pipeline.ai.allocator,
+            .steering = t.pipeline.steering.allocator,
+            .pathfinding = t.pipeline.pathfinding.allocator,
+            .graph = t.pipeline.pathfinding.graph.allocator,
+            .scope = t.pipeline.scope.allocator,
+            .spatial_index = t.pipeline.spatial_index.allocator,
+            .perception = t.pipeline.perception.allocator,
+            .ai_memory = t.pipeline.ai_memory.allocator,
+            .affect = t.pipeline.affect.allocator,
+            .dig = t.pipeline.dig.scratch_allocator,
+            .threads = t.threads.allocator,
         };
-        setAll(pipeline, frame, data, threads, .{
-            .frame = fail,
-            .events = fail,
-            .navigation_intents = fail,
-            .action_intents = fail,
-            .intents = fail,
-            .path_requests = fail,
-            .contacts = fail,
-            .collision_triggers = fail,
-            .structural_commands = fail,
-            .stimuli = fail,
-            .data = fail,
-            .collision = fail,
-            .collision_response = fail,
-            .ai = fail,
-            .steering = fail,
-            .pathfinding = fail,
-            .graph = fail,
-            .scope = fail,
-            .spatial_index = fail,
-            .perception = fail,
-            .ai_memory = fail,
-            .affect = fail,
-            .dig = fail,
-            .threads = fail,
-        });
     }
 
-    fn restore(self: *const TestAllocatorSwap, pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, threads: *ThreadSystem) void {
-        setAll(pipeline, frame, data, threads, self.*);
+    fn set(t: Targets, to: TestAllocatorSwap) void {
+        t.frame.allocator = to.frame;
+        t.frame.events.stream.allocator = to.events;
+        t.frame.navigation_intents.allocator = to.navigation_intents;
+        t.frame.action_intents.allocator = to.action_intents;
+        t.frame.intents.allocator = to.intents;
+        t.frame.path_requests.allocator = to.path_requests;
+        t.frame.contacts.allocator = to.contacts;
+        t.frame.collision_triggers.allocator = to.collision_triggers;
+        t.frame.structural_commands.allocator = to.structural_commands;
+        t.frame.stimuli.allocator = to.stimuli;
+        t.data.allocator = to.data;
+        t.world.allocator = to.world;
+        t.pipeline.collision.allocator = to.collision;
+        t.pipeline.collision_response.allocator = to.collision_response;
+        t.pipeline.ai.allocator = to.ai;
+        t.pipeline.steering.allocator = to.steering;
+        t.pipeline.pathfinding.allocator = to.pathfinding;
+        t.pipeline.pathfinding.graph.allocator = to.graph;
+        t.pipeline.scope.allocator = to.scope;
+        t.pipeline.spatial_index.allocator = to.spatial_index;
+        t.pipeline.perception.allocator = to.perception;
+        t.pipeline.ai_memory.allocator = to.ai_memory;
+        t.pipeline.affect.allocator = to.affect;
+        // Dig scratch stays unset (null) until the plane scratch is reserved.
+        if (t.pipeline.dig.scratch_allocator != null) t.pipeline.dig.scratch_allocator = to.dig;
+        t.threads.allocator = to.threads;
+    }
+};
+
+/// Pins every pipeline batch tuner to one settled threaded `profile` that never
+/// re-probes, demotes, or resets on item-count drift, so the multi-worker path runs a
+/// deterministic multi-range partition. The tuners would otherwise keep this small
+/// test workload inline (below `threaded_batch_ns`). Test-only local fixture.
+fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveWorkProfile) void {
+    const tuners = [_]*AdaptiveWorkTuner{
+        &pipeline.movement.adaptive_tuner,
+        &pipeline.collision.broadphase_tuner,
+        &pipeline.collision.narrowphase_tuner,
+        &pipeline.ai.separation_tuner,
+        &pipeline.ai.intent_tuner,
+        &pipeline.steering.adaptive_tuner,
+        &pipeline.pathfinding.fallback_tuner,
+        &pipeline.pathfinding.nav_remask_tuner,
+        &pipeline.pathfinding.nav_patch_tuner,
+        &pipeline.scope.chunk_derive_tuner,
+        &pipeline.scope.collision_gather_tuner,
+        &pipeline.scope.ai_gather_tuner,
+        &pipeline.scope.tier_policy_tuner,
+        &pipeline.spatial_index.build_tuner,
+        &pipeline.perception.compute_tuner,
+        &pipeline.ai_memory.decay_tuner,
+        &pipeline.affect.compute_tuner,
+    };
+    for (tuners) |tuner| {
+        tuner.config.threaded_batch_ns = 0;
+        tuner.config.retune_after_settled_windows = std.math.maxInt(usize);
+        tuner.config.item_count_reset_percent = std.math.maxInt(u8);
+        tuner.phase = .settled;
+        tuner.has_threaded_profile = true;
+        tuner.current_profile = profile;
+        tuner.best_profile = profile;
+        tuner.candidate_profile = null;
+        // Forget the pre-pin item count so the first pinned batch does not reset.
+        tuner.last_item_count = 0;
+    }
+}
+
+/// One non-failing counting allocator per `TestAllocatorSwap` owner, to see which
+/// owners allocate during a step. Counts fresh allocations plus in-place
+/// resizes/remaps (a grown list can remap without a fresh allocation). Test-only
+/// local fixture.
+const TestAllocatorCounters = struct {
+    counters: [TestAllocatorSwap.owner_count]std.testing.FailingAllocator,
+
+    fn init() TestAllocatorCounters {
+        var self: TestAllocatorCounters = undefined;
+        for (&self.counters) |*counter| counter.* = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        return self;
     }
 
-    fn setAll(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, threads: *ThreadSystem, to: TestAllocatorSwap) void {
-        frame.allocator = to.frame;
-        frame.events.stream.allocator = to.events;
-        frame.navigation_intents.allocator = to.navigation_intents;
-        frame.action_intents.allocator = to.action_intents;
-        frame.intents.allocator = to.intents;
-        frame.path_requests.allocator = to.path_requests;
-        frame.contacts.allocator = to.contacts;
-        frame.collision_triggers.allocator = to.collision_triggers;
-        frame.structural_commands.allocator = to.structural_commands;
-        frame.stimuli.allocator = to.stimuli;
-        data.allocator = to.data;
-        pipeline.collision.allocator = to.collision;
-        pipeline.collision_response.allocator = to.collision_response;
-        pipeline.ai.allocator = to.ai;
-        pipeline.steering.allocator = to.steering;
-        pipeline.pathfinding.allocator = to.pathfinding;
-        pipeline.pathfinding.graph.allocator = to.graph;
-        pipeline.scope.allocator = to.scope;
-        pipeline.spatial_index.allocator = to.spatial_index;
-        pipeline.perception.allocator = to.perception;
-        pipeline.ai_memory.allocator = to.ai_memory;
-        pipeline.affect.allocator = to.affect;
-        pipeline.dig.scratch_allocator = to.dig;
-        threads.allocator = to.threads;
+    fn allocators(self: *TestAllocatorCounters) TestAllocatorSwap {
+        var out: TestAllocatorSwap = .{};
+        inline for (TestAllocatorSwap.owner_names, 0..) |name, index| @field(out, name) = self.counters[index].allocator();
+        return out;
+    }
+
+    fn countAt(self: *const TestAllocatorCounters, index: usize) usize {
+        return self.counters[index].allocations + self.counters[index].resize_index;
+    }
+
+    fn allocationsOf(self: *const TestAllocatorCounters, comptime owner: []const u8) usize {
+        inline for (TestAllocatorSwap.owner_names, 0..) |name, index| {
+            if (comptime std.mem.eql(u8, name, owner)) return self.countAt(index);
+        }
+        @compileError("no allocator owner " ++ owner);
+    }
+
+    /// Fails naming the first owner outside `allowed` that allocated.
+    fn expectOnlyOwnersAllocated(self: *const TestAllocatorCounters, comptime allowed: []const []const u8) !void {
+        inline for (TestAllocatorSwap.owner_names, 0..) |name, index| {
+            const is_allowed = comptime blk: {
+                for (allowed) |owner| {
+                    if (std.mem.eql(u8, owner, name)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_allowed and self.countAt(index) != 0) {
+                std.debug.print("unexpected allocations on owner '{s}': {d}\n", .{ name, self.countAt(index) });
+                return error.TestUnexpectedResult;
+            }
+        }
     }
 };
 
@@ -5360,9 +5450,12 @@ const GrowthScenarioResult = struct {
 };
 
 /// Builds a minimal 3-level world at population 4, grows it to 37 rows through
-/// structural creates and the population seam, then runs one step where all 24 NPCs
-/// fall through dug holes. With `prove_zero_alloc` that step runs with every
-/// allocator failing.
+/// structural creates and the population seam, runs one stationary step, then one
+/// step where all 24 NPCs fall through dug holes. `max_worker_threads > 0` pins a
+/// multi-range partition. With `prove_zero_alloc`, the first step counts allocations
+/// per owner (none serially; on the multi-worker path only the documented slot >= 1
+/// warm-up) and the falling step runs with every allocator, the world's included,
+/// failing.
 fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool) !GrowthScenarioResult {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -5455,6 +5548,39 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     try std.testing.expect(pipeline.pathfinding.effective_agent_capacity >= 12);
     try std.testing.expect(pipeline.population_capacity_grows >= 1);
 
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    // Multi-worker runs pin a 2-worker, 16-item partition (3 movement ranges at 37
+    // bodies); the tuners would keep this small workload inline.
+    if (max_worker_threads > 0) pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+
+    // First post-growth step, stationary. Every run takes it, so serial and
+    // multi-worker runs stay step-for-step identical.
+    frame.beginStep();
+    var counters = TestAllocatorCounters.init();
+    var counting_swap: TestAllocatorSwap = .{};
+    if (prove_zero_alloc) counting_swap.install(targets, counters.allocators());
+    const first_result = pipeline.update(context);
+    if (prove_zero_alloc) counting_swap.restore(targets);
+    const first_stats = try first_result;
+    if (max_worker_threads > 0) {
+        try std.testing.expect(!first_stats.movement.batch.ran_inline);
+        try std.testing.expectEqual(@as(usize, 3), first_stats.movement.batch.range_count);
+    }
+    if (prove_zero_alloc) {
+        if (max_worker_threads == 0) {
+            // The seam reserved every slot-0 / single-range capacity.
+            try counters.expectOnlyOwnersAllocated(&.{});
+        } else {
+            // Documented (`CollisionSystem.reserve`, `SimulationScopeSystem.reserve`,
+            // `SpatialIndexSystem.reserveRows`): the seam reserves range slot 0, and
+            // slots >= 1 warm on the first multi-range step, on these owners only.
+            try counters.expectOnlyOwnersAllocated(&.{ "collision", "scope", "spatial_index" });
+            try std.testing.expect(counters.allocationsOf("collision") > 0);
+            try std.testing.expect(counters.allocationsOf("scope") > 0);
+            try std.testing.expect(counters.allocationsOf("spatial_index") > 0);
+        }
+    }
+
     // All 24 NPCs step east into their hole this step.
     const ai_entities = data.aiAgentSliceConst().entities;
     try std.testing.expectEqual(@as(usize, 24), ai_entities.len);
@@ -5468,9 +5594,9 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     frame.beginStep();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     var swap: TestAllocatorSwap = .{};
-    if (prove_zero_alloc) swap.install(&pipeline, &frame, &data, &threads, failing.allocator());
+    if (prove_zero_alloc) swap.install(targets, .uniform(failing.allocator()));
     const result = pipeline.update(context);
-    if (prove_zero_alloc) swap.restore(&pipeline, &frame, &data, &threads);
+    if (prove_zero_alloc) swap.restore(targets);
     _ = try result;
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -5492,6 +5618,11 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
 
 test "population seam grows every pipeline capacity so the next step allocates nothing" {
     _ = try runPopulationGrowthScenario(0, true);
+}
+
+test "population growth on the multi-worker path warms only the documented range slots, then allocates nothing" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    _ = try runPopulationGrowthScenario(2, true);
 }
 
 test "population growth scenario is identical on the serial and multi-worker paths" {
@@ -5558,9 +5689,9 @@ test "population sync at an unchanged population allocates nothing and never re-
     defer threads.deinit();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     var swap: TestAllocatorSwap = .{};
-    swap.install(&pipeline, &frame, &data, &threads, failing.allocator());
+    swap.install(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads }, .uniform(failing.allocator()));
     const unchanged = pipeline.syncPopulationCapacity(&frame, &data, &world);
-    swap.restore(&pipeline, &frame, &data, &threads);
+    swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
     try std.testing.expect(!(try unchanged).grew);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
@@ -5662,9 +5793,9 @@ test "statics committed within the responder headroom never grow the steering sn
     frame.beginStep();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     var swap: TestAllocatorSwap = .{};
-    swap.install(&pipeline, &frame, &data, &threads, failing.allocator());
+    swap.install(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads }, .uniform(failing.allocator()));
     const result = pipeline.update(context);
-    swap.restore(&pipeline, &frame, &data, &threads);
+    swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
     _ = try result;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(u64, 0), pipeline.steering.static_snapshot_grown_total);
