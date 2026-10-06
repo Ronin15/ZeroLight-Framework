@@ -2,7 +2,46 @@
 
 ## Slice 72: Live Capacity Sizing Pass
 
-**Status: in progress — Batch A.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
+**Status: in progress — Batch A landed (A1–A4); Batches M and B–K not started.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
+
+**Batch A bench record (2026-10-06).** `zig build -Doptimize=ReleaseFast bench -- --group <name> --details`, 5 interleaved before/after repetitions (odd reps before first, even reps after first). Before = `c648f61` (the commit preceding A1), after = A1–A4 together. Medians of each case's mean; run spread = the larger of the before/after (max − min) / median. Every case of every group (8 per item count) was gated against max(3%, spread): **no breach**. The table lists the serial baseline and the production `thread-adaptive-tuned-range` row; the worst positive delta over all cases was `render-prep` 4096 `thread-fixed-2` +27.9% inside its 55.8% spread. On every pathfinding group the `workload` column (requests, results, deferrals, evictions) is identical before and after, so A3 and A4 are behavior-neutral on the bench shapes (`pathfinding-escalated-detour` also asserts `available_results == 1` internally).
+
+| item | group | items | case | before (median mean) | after (median mean) | delta | run spread | extra |
+|---|---|---|---|---|---|---|---|---|
+| A2 | `render-prep` | 1024 | serial-direct | 31.65 us | 23.71 us | -25.1% | 9.6% | `ordered_submit` 14.77 us → 6.73 us |
+| A2 | `render-prep` | 1024 | thread-adaptive-tuned-range | 31.64 us | 23.68 us | -25.2% | 3.2% | `ordered_submit` 14.72 us → 6.71 us |
+| A2 | `render-prep` | 4096 | serial-direct | 126.40 us | 94.84 us | -25.0% | 2.4% | `ordered_submit` 59.63 us → 27.02 us |
+| A2 | `render-prep` | 4096 | thread-adaptive-tuned-range | 126.81 us | 94.48 us | -25.5% | 3.3% | `ordered_submit` 59.16 us → 26.95 us |
+| A2 | `render-prep` | 10000 | serial-direct | 309.60 us | 232.13 us | -25.0% | 2.0% | `ordered_submit` 145.01 us → 65.95 us |
+| A2 | `render-prep` | 10000 | thread-adaptive-tuned-range | 310.60 us | 230.09 us | -25.9% | 2.1% | `ordered_submit` 145.20 us → 65.92 us |
+| A2 | `render-game-prep` | 1024 | serial-direct | 54.10 us | 41.78 us | -22.8% | 34.2% | `merge` 239 ns → 248 ns |
+| A2 | `render-game-prep` | 1024 | thread-adaptive-tuned-range | 54.25 us | 42.17 us | -22.3% | 32.4% | `merge` 230 ns → 209 ns |
+| A2 | `render-game-prep` | 4096 | serial-direct | 225.64 us | 178.07 us | -21.1% | 31.2% | `merge` 276 ns → 288 ns |
+| A2 | `render-game-prep` | 4096 | thread-adaptive-tuned-range | 225.30 us | 177.16 us | -21.4% | 32.5% | `merge` 280 ns → 291 ns |
+| A2 | `render-game-prep` | 10000 | serial-direct | 582.62 us | 472.83 us | -18.8% | 29.3% | `merge` 277 ns → 290 ns |
+| A2 | `render-game-prep` | 10000 | thread-adaptive-tuned-range | 583.22 us | 470.82 us | -19.3% | 30.0% | `merge` 310 ns → 310 ns |
+| A3 A4 | `pathfinding` | 512 | serial-direct | 3.33 ms | 3.40 ms | +2.1% | 13.2% | workload/output identical |
+| A3 A4 | `pathfinding` | 512 | thread-adaptive-tuned-range | 786.37 us | 472.06 us | -40.0% | 26.7% | workload/output identical |
+| A3 | `pathfinding-drain` | 1024 | serial-direct | 3.08 ms | 3.06 ms | -0.6% | 12.7% | workload/output identical |
+| A3 | `pathfinding-drain` | 1024 | thread-adaptive-tuned-range | 770.50 us | 459.66 us | -40.3% | 20.4% | workload/output identical |
+| A4 | `pathfinding-hard-fallback` | 16 | serial-direct | 92.26 us | 91.22 us | -1.1% | 42.4% | workload/output identical |
+| A4 | `pathfinding-hard-fallback` | 16 | thread-adaptive-tuned-range | 91.75 us | 89.30 us | -2.7% | 4.9% | workload/output identical |
+| A4 | `pathfinding-hard-fallback` | 64 | serial-direct | 351.18 us | 342.14 us | -2.6% | 8.0% | workload/output identical |
+| A4 | `pathfinding-hard-fallback` | 64 | thread-adaptive-tuned-range | 187.57 us | 135.30 us | -27.9% | 44.7% | workload/output identical |
+| A4 | `pathfinding-hard-fallback` | 128 | serial-direct | 663.34 us | 656.51 us | -1.0% | 7.5% | workload/output identical |
+| A4 | `pathfinding-hard-fallback` | 128 | thread-adaptive-tuned-range | 271.06 us | 185.07 us | -31.7% | 14.1% | workload/output identical |
+| A4 | `pathfinding-hard-fallback-budget` | 16 | serial-direct | 91.11 us | 93.49 us | +2.6% | 10.7% | workload/output identical |
+| A4 | `pathfinding-hard-fallback-budget` | 16 | thread-adaptive-tuned-range | 89.23 us | 91.35 us | +2.4% | 11.0% | workload/output identical |
+| A4 | `pathfinding-hard-fallback-budget` | 64 | serial-direct | 344.45 us | 341.84 us | -0.8% | 23.1% | workload/output identical |
+| A4 | `pathfinding-hard-fallback-budget` | 64 | thread-adaptive-tuned-range | 185.87 us | 144.26 us | -22.4% | 66.2% | workload/output identical |
+| A4 | `pathfinding-hard-fallback-budget` | 128 | serial-direct | 656.19 us | 655.45 us | -0.1% | 7.6% | workload/output identical |
+| A4 | `pathfinding-hard-fallback-budget` | 128 | thread-adaptive-tuned-range | 284.47 us | 190.28 us | -33.1% | 37.0% | workload/output identical |
+| A4 | `pathfinding-escalated-detour` | 1 | serial-direct | 15.42 us | 14.67 us | -4.9% | 49.5% | workload/output identical |
+| A4 | `pathfinding-escalated-detour` | 1 | thread-adaptive-tuned-range | 13.14 us | 14.06 us | +7.0% | 9.9% | workload/output identical |
+
+- A2: `ordered_submit` roughly halves because `drawSprite` is now one capacity compare plus `appendAssumeCapacity` instead of a growing `append` (the bench frames are not reserved); `render-game-prep` gains the same in its entity-collect phase.
+- A4: the first A4 measurement regressed the threaded pathfinding cases (`pathfinding` `thread-adaptive-tuned-range` about +25–38% over 5–20 reps, serial unchanged). The three new limit fields shifted the size of the contiguous per-participant `SearchScratch` slots, which already false-shared hot counters across adjacent workers. A4 therefore also cache-line aligns `SearchScratch` (`generation: u32 align(std.atomic.cache_line)`, so every slot is whole lines), which turns the regression into the gains above; a layout test pins it.
+- Debug and ReleaseFast `zig build test` pass; `zig build verify` passes.
 
 **Goal.** The 2026-10-06 capacity audit sized the *planned* slices. This slice applies the same engine practice to every capacity in the *live* `src/` tree. For each data structure, the question is what an experienced engine programmer would do and why. The default answer is to keep it. A change lands only when its concrete benefit outweighs its cost and risk.
 
@@ -296,8 +335,9 @@ Out of scope (each item has a named owner):
 - **Change:**
   - At reserve, store `SearchScratch.open_limit = max(16, max_explored_nodes * open_heap_headroom_factor)`, the matching `AbstractScratch.open_limit`, and `AbstractScratch.corridor_limit = max_abstract_nodes`.
   - Compare `items.len` against those limits, and assert `capacity >= limit` at reserve.
+- **Also (bench-driven):** `SearchScratch` is cache-line aligned so the contiguous per-participant slots never share a line; the new fields otherwise shifted slot boundaries onto hot counters and regressed threaded solves (see the Batch A bench record).
 - **Benefit:** the spill point equals the documented budget on every worker.
-- **Cost:** one field load per check.
+- **Cost:** one field load per check; slots pad to whole cache lines (≤ one line per participant).
 - **Determinism:** removes a latent dependence on which worker ran the request.
 
 **E3. Negative cache with TTL and eviction** (pathfinding-10). Medium priority, Batch E (after E2).
@@ -709,7 +749,7 @@ Out of scope (each item has a named owner):
     - the existing FailingAllocator test (`:549`) still passes;
     - with a `FailingAllocator` installed after reserve, a step with `pending_carves ≤ reserve` allocates zero times.
   - Bench: none. No group isolates the dig stage, and the cost is one compare per step.
-- [ ] **A2 · `drawSprite` growth** (§A2).
+- [x] **A2 · `drawSprite` growth** (§A2).
   - Tests:
     - `sprite_batch.zig:1634` is split in two:
       - (a) submitting past capacity grows, the stream stays ordered, and `command_overflow_grows == 1`;
@@ -719,15 +759,16 @@ Out of scope (each item has a named owner):
     - `sprite_batch.zig:1611` and `renderer.zig:2316`, `:2360` are unchanged;
     - `grep -rn SpriteCommandOverflow src/` is empty.
   - Bench: `render-prep`, `render-game-prep` (no regression).
-- [ ] **A3 · Logical intake limit** (§A3).
+- [x] **A3 · Logical intake limit** (§A3).
   - Tests in `system.zig`:
     - grow 8 → 40 agents directly (plus forced physical slack on `prepared_requests`), and separately grow 8 → 128 then hold 40 agents for `capacity_shrink_window` steps so it shrinks to logical 40 (physical > logical on both; "grow to 64, shrink to 40" is unreachable: a shrink needs `agent_count * 2 < current`, and the target is `deriveCapacity(agent_count)`); submitting `max_frame_requests + 5` same-goal requests drops exactly 5 on both, and both accept the same request;
     - the same request stream on a 1-chunk and a 4-chunk minimal world gives an equal `dropped_requests`, independent of world size.
   - Bench: `pathfinding`, `pathfinding-drain`.
-- [ ] **A4 · Logical search limits** (§A4).
+- [x] **A4 · Logical search limits** (§A4).
   - Tests in `scratch.zig` and `solve.zig`:
-    - after reserve, inflate `scratch.open` and `abstract.open` with `ensureTotalCapacity` to 4× the limit; a search that exhausts `open_limit` still returns `budget_exhausted` (or abstract `.saturated`) at the same expansion count;
+    - a search cannot exhaust the reserved `open_limit` naturally on a small fixture (the heap limit is 4× the node budget and every new-cell push first spends one budget unit, so the node budget binds first), so the tests lower `open_limit` / `corridor_limit` (and `node_budget` for the corridor case) on both scratches as a local fixture, then inflate one scratch's physical capacity well past the limit: local A* still returns `budget_exhausted` at the same expansion count and heap length, abstract relax saturates at the same push, and `buildCorridor` truncates at the same corridor length on both;
     - `open_limit` and `corridor_limit` are equal on a 1-chunk and a 4-chunk world;
+    - re-reserving a smaller budget lowers the logical limits while the grow-only physical capacity stays;
     - the wraparound tests at `scratch.zig:276`, `:299` are unchanged.
   - Bench: `pathfinding`, `pathfinding-hard-fallback`, `pathfinding-hard-fallback-budget`, `pathfinding-escalated-detour`.
 - [ ] **B1 · Production event bound** (§B1).
@@ -950,7 +991,7 @@ Out of scope (each item has a named owner):
 - [ ] `zig build verify` passes, and `zig build test` passes in Debug and ReleaseFast.
 - [ ] Grep gates are empty:
   - `SpriteCommandOverflow`, `destructible_cell_scan_budget`, `los_max_cells`, `event_reserve`, `perception_event_reserve`, `affect_event_reserve` and `demoCognitionAgentCount` under `src/`;
-  - `grep -rnE "items\.len >= [a-z_.]*\.capacity" src/game/systems/pathfinding/`;
+  - `grep -rnE "items\.len >= [a-z_.]*\.capacity([^._a-zA-Z0-9]|$)" src/game/systems/pathfinding/` (the trailing class excludes the correct logical gate `self.pending.items.len >= self.capacity.max_pending_requests`, the K2 site, which the unanchored regex also matched; the remaining physical `.capacity` reads in the package, `system.zig`'s append-or-grow choice, the `effectiveSolveLimit` clamp and `reconstructLocalPath`'s Debug assert, are not behavior gates);
   - `std.debug.assert(pending_carves`.
 - [ ] Every capacity-dependent-behavior site is either fixed or justified at its site:
   - A1, A2, A3, A4, B1, C3, C4, D1, D2, D3, E1–E5, J1 are fixed;

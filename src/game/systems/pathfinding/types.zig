@@ -42,6 +42,15 @@ pub const default_max_explored_nodes: usize = 4096;
 // distinct-cell budget (paired with lazy pop-skip of superseded entries) keeps a search
 // that is still under the distinct-cell budget from false-spilling on a full heap.
 pub const open_heap_headroom_factor: usize = 4;
+
+/// Logical open-heap limit for a search whose distinct-node budget is `node_budget`:
+/// `open_heap_headroom_factor` entries per budgeted node (lazy-deletion duplicates),
+/// floored at 16. Search gates compare the heap length against this, never the list's
+/// physical capacity, so the spill point matches on every participant slot regardless
+/// of reserve history. The nav memory gate charges the same value.
+pub fn openHeapLimit(node_budget: usize) usize {
+    return @max(@as(usize, 16), node_budget *| open_heap_headroom_factor);
+}
 // Cap on the stored path length per cached individual result. Longer paths are
 // downsampled by stride so a moving agent can still derive a forward waypoint.
 pub const default_max_stored_path_cells: usize = 512;

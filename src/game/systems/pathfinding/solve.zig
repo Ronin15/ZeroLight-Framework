@@ -330,7 +330,7 @@ fn relaxAbstractNode(
     abstract.slot_g[slot] = candidate;
     abstract.slot_parent[slot] = parent_ref;
     abstract.slot_via_link[slot] = via_link;
-    if (abstract.open.items.len >= abstract.open.capacity) return false;
+    if (abstract.open.items.len >= abstract.open_limit) return false;
     abstract.open.appendAssumeCapacity(.{ .index = neighbor_ref, .f = candidate +| h, .h = h });
     siftUp(abstract.open.items, abstract.open.items.len - 1);
     return true;
@@ -395,7 +395,7 @@ fn abstractCorridor(
         abstract_g[slot] = g;
         abstract_parent[slot] = no_ref;
         abstract_via_link[slot] = false;
-        if (abstract.open.items.len >= abstract.open.capacity) return .saturated;
+        if (abstract.open.items.len >= abstract.open_limit) return .saturated;
         // Only the goal level has a cell coordinate comparable to the goal; off-level seed
         // portals use h=0 to keep the heuristic admissible (matches the relax paths below).
         const h = if (start_level == goal_level)
@@ -489,8 +489,9 @@ fn abstractCorridor(
 const CorridorBuild = enum {
     // Full chain root->goal rebuilt and rooted on the start level.
     ok,
-    // The parent chain filled corridor.capacity before reaching the seed root: a budget
-    // truncation, not an unreachable goal. Spill and retry rather than declare negative.
+    // The parent chain filled corridor_limit (max_abstract_nodes) before reaching the
+    // seed root: a budget truncation, not an unreachable goal. Spill and retry rather
+    // than declare negative.
     truncated,
     // Empty, or the chain rooted off the start level: a genuine missing corridor.
     none,
@@ -507,7 +508,7 @@ fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) 
     var node = goal_ref;
     var truncated = false;
     while (true) {
-        if (abstract.corridor.items.len >= abstract.corridor.capacity) {
+        if (abstract.corridor.items.len >= abstract.corridor_limit) {
             truncated = true;
             break;
         }
@@ -519,7 +520,7 @@ fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) 
     }
     std.mem.reverse(usize, abstract.corridor.items);
     if (abstract.corridor.items.len == 0) return .none;
-    // Capacity cut the chain before the root: a budget spill, not an unreachable goal.
+    // The corridor limit cut the chain before the root: a budget spill, not an unreachable goal.
     if (truncated) return .truncated;
     // corridor_link[0] is false (no predecessor); corridor_link[i] is whether corridor[i]
     // was reached over a cross-level link, read from the recorded slot flag.
@@ -594,7 +595,7 @@ fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize,
             cell_g[next_slot] = candidate_g;
             cell_parent[next_slot] = @intCast(current.index);
             const h = octileXY(nx, ny, goal_x, goal_y);
-            if (scratch.open.items.len >= scratch.open.capacity) return .budget_exhausted;
+            if (scratch.open.items.len >= scratch.open_limit) return .budget_exhausted;
             scratch.open.appendAssumeCapacity(.{ .index = next_index, .f = candidate_g +| h, .h = h });
             siftUp(scratch.open.items, scratch.open.items.len - 1);
         }
@@ -723,4 +724,91 @@ test "reconstructLocalPath walks the parent chain into start-to-goal order" {
     // A start == goal request yields the single start cell.
     reconstructLocalPath(&scratch, 0, 0);
     try std.testing.expectEqualSlices(u32, &.{0}, scratch.path_scratch.items);
+}
+
+test "local A* spills at open_limit regardless of the heap's physical capacity" {
+    const allocator = std.testing.allocator;
+    var grid = NavGrid{};
+    defer grid.deinit(allocator);
+    try grid.prepare(allocator, 0, 8, 8, 32, 16);
+
+    var a = SearchScratch{};
+    defer a.deinit(allocator);
+    var b = SearchScratch{};
+    defer b.deinit(allocator);
+    var c = SearchScratch{};
+    defer c.deinit(allocator);
+    inline for (.{ &a, &b, &c }) |scratch| try scratch.reserve(allocator, 64, 64, 16, 16, 64);
+    // Local fixture: a tiny logical heap limit on A and B; B also gets far more physical
+    // capacity than any limit, which must not move its spill point.
+    a.open_limit = 3;
+    b.open_limit = 3;
+    try b.open.ensureTotalCapacity(allocator, 4 * types.openHeapLimit(64));
+
+    try std.testing.expectEqual(LocalSolve.budget_exhausted, localAStar(&grid, &a, 0, 63));
+    try std.testing.expectEqual(LocalSolve.budget_exhausted, localAStar(&grid, &b, 0, 63));
+    try std.testing.expectEqual(a.explored, b.explored);
+    try std.testing.expectEqual(@as(usize, 3), a.open.items.len);
+    try std.testing.expectEqual(@as(usize, 3), b.open.items.len);
+    // The reserved limit (openHeapLimit(64) = 256) completes the same search.
+    try std.testing.expectEqual(LocalSolve.found, localAStar(&grid, &c, 0, 63));
+}
+
+test "abstract relax saturates at open_limit regardless of physical capacity" {
+    const allocator = std.testing.allocator;
+    var a = AbstractScratch{};
+    defer a.deinit(allocator);
+    var b = AbstractScratch{};
+    defer b.deinit(allocator);
+    inline for (.{ &a, &b }) |abstract| {
+        try abstract.reserve(allocator, 16);
+        abstract.reset();
+        abstract.open_limit = 2;
+    }
+    try b.open.ensureTotalCapacity(allocator, 256);
+
+    inline for (.{ &a, &b }) |abstract| {
+        try std.testing.expect(relaxAbstractNode(abstract, no_ref, 0, 1, 10, false, 0));
+        try std.testing.expect(relaxAbstractNode(abstract, no_ref, 0, 2, 10, false, 0));
+        try std.testing.expect(!relaxAbstractNode(abstract, no_ref, 0, 3, 10, false, 0));
+        try std.testing.expectEqual(@as(usize, 2), abstract.open.items.len);
+    }
+}
+
+/// Claims `first..first+len` in `abstract` and chains each ref's parent to the previous
+/// one (the first is the root).
+fn claimAbstractChain(abstract: *AbstractScratch, first: usize, len: usize) !void {
+    for (first..first + len) |ref| {
+        const slot = abstract.slotFor(ref) orelse return error.TestUnexpectedResult;
+        if (ref != first) abstract.slot_parent[slot] = ref - 1;
+    }
+}
+
+test "buildCorridor truncates at corridor_limit regardless of physical capacity" {
+    const allocator = std.testing.allocator;
+    var a = AbstractScratch{};
+    defer a.deinit(allocator);
+    var b = AbstractScratch{};
+    defer b.deinit(allocator);
+    inline for (.{ &a, &b }) |abstract| {
+        try abstract.reserve(allocator, 4);
+        try std.testing.expectEqual(@as(usize, 4), abstract.corridor_limit);
+        abstract.reset();
+        // Local fixture: room to claim a 6-node chain past the 4-entry corridor limit.
+        abstract.node_budget = 8;
+        try claimAbstractChain(abstract, 10, 6);
+    }
+    try b.corridor.ensureTotalCapacity(allocator, 64);
+    try b.corridor_link.ensureTotalCapacity(allocator, 64);
+
+    inline for (.{ &a, &b }) |abstract| {
+        try std.testing.expectEqual(CorridorBuild.truncated, buildCorridor(abstract, 15, 0));
+        try std.testing.expectEqual(@as(usize, 4), abstract.corridor.items.len);
+    }
+
+    // Control: a chain within the limit rebuilds in full.
+    a.reset();
+    try claimAbstractChain(&a, 20, 3);
+    try std.testing.expectEqual(CorridorBuild.ok, buildCorridor(&a, 22, 0));
+    try std.testing.expectEqualSlices(usize, &.{ 20, 21, 22 }, a.corridor.items);
 }

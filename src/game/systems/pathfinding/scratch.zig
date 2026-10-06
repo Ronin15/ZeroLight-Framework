@@ -13,7 +13,7 @@ const StitchedCell = types.StitchedCell;
 const unreachable_cost = types.unreachable_cost;
 const no_ref = types.no_ref;
 const no_cell = types.no_cell;
-const open_heap_headroom_factor = types.open_heap_headroom_factor;
+const openHeapLimit = types.openHeapLimit;
 
 pub const AbstractSlotRow = struct {
     node: usize = 0,
@@ -67,6 +67,12 @@ pub const AbstractScratch = struct {
     slot_via_link: []bool = &[_]bool{},
     corridor: std.ArrayList(usize) = .empty,
     corridor_link: std.ArrayList(bool) = .empty,
+    /// Logical open-heap cap set by `reserve` (`openHeapLimit(max_abstract_nodes)`); the
+    /// search gates compare against this, never `open.capacity`.
+    open_limit: usize = 0,
+    /// Logical corridor cap set by `reserve` (`max_abstract_nodes`); the search gates
+    /// compare against this, never `corridor.capacity`.
+    corridor_limit: usize = 0,
 
     pub fn deinit(self: *AbstractScratch, allocator: std.mem.Allocator) void {
         self.corridor_link.deinit(allocator);
@@ -87,11 +93,19 @@ pub const AbstractScratch = struct {
         // on every g-improvement, so the live heap holds stale duplicates the slot table
         // (slotFor) does not. Sizing it past the budget keeps a sub-budget search from
         // false-saturating on a full heap.
-        try self.open.ensureTotalCapacity(allocator, @max(@as(usize, 16), max_abstract_nodes * open_heap_headroom_factor));
+        const open_limit = openHeapLimit(max_abstract_nodes);
+        try self.open.ensureTotalCapacity(allocator, open_limit);
         try self.slots.resize(allocator, slot_capacity);
         self.refreshSlotColumns();
         try self.corridor.ensureTotalCapacity(allocator, max_abstract_nodes);
         try self.corridor_link.ensureTotalCapacity(allocator, max_abstract_nodes);
+        // Logical limits are assigned only after every reserve succeeded. Physical capacity
+        // is grow-only, so a smaller re-reserve lowers the limits while capacity stays.
+        self.open_limit = open_limit;
+        self.corridor_limit = max_abstract_nodes;
+        std.debug.assert(self.open.capacity >= self.open_limit and
+            self.corridor.capacity >= self.corridor_limit and
+            self.corridor_link.capacity >= self.corridor_limit);
         @memset(self.slot_stamp, 0);
         self.generation = 1;
         self.open.clearRetainingCapacity();
@@ -163,13 +177,21 @@ pub const SearchScratch = struct {
     // node BUDGET: an explicit expansion counter caps how many distinct cells one
     // solve may stamp, spilling the request to a later frame when exceeded (storage
     // is per-cell but the budget is unchanged).
-    generation: u32 = 1,
+    // Cache-line aligned (and so padded to whole lines): the per-participant slots sit
+    // contiguously in `PathfindingSystem.scratch_slots` and each worker writes its own slot's
+    // counters (generation, explored, open/path lengths, abstract counters) on every node.
+    // Unaligned, adjacent slots' hot fields share a line and false-share across workers, so
+    // threaded solve throughput swung with this struct's size (Slice 72 A4 bench).
+    generation: u32 align(std.atomic.cache_line) = 1,
     cell_count: usize = 0,
     // Per-solve count of distinct cells stamped this generation, bounded by the
     // node budget so a long-range solve spills instead of fully exploring the grid.
     explored: usize = 0,
     explored_budget: usize = 0,
     open: std.ArrayList(OpenNode) = .empty,
+    /// Logical open-heap cap set by `reserve` (`openHeapLimit(max_explored_nodes)`); the
+    /// search gates compare against this, never `open.capacity`.
+    open_limit: usize = 0,
     // Direct per-cell rows, indexed by cell_index (NOT a hash slot). g/parent/closed
     // carry the A* state; stamp marks which generation last touched the cell so stale
     // values from a prior solve read as "untouched".
@@ -214,12 +236,16 @@ pub const SearchScratch = struct {
         // localAStar pushes a fresh entry per g-improvement and removes the superseded one
         // only lazily on pop, so the heap must hold more than the distinct-cell count or a
         // sub-budget search false-spills on a full heap. explored_budget stays the cap.
-        try self.open.ensureTotalCapacity(allocator, @max(@as(usize, 16), max_explored_nodes * open_heap_headroom_factor));
+        const open_limit = openHeapLimit(max_explored_nodes);
+        try self.open.ensureTotalCapacity(allocator, open_limit);
         try self.cells.resize(allocator, cell_count);
         self.refreshCellColumns();
         try self.path_scratch.ensureTotalCapacity(allocator, @max(max_explored_nodes, max_stored_path_cells));
         // One extra slot lets a segment overflow be detected before truncation.
         try self.stitched_scratch.ensureTotalCapacity(allocator, max_stitched_path_cells + 1);
+        // Assigned only after every reserve succeeded (see AbstractScratch.reserve).
+        self.open_limit = open_limit;
+        std.debug.assert(self.open.capacity >= self.open_limit);
         @memset(self.cell_stamp, 0);
         self.generation = 1;
         self.open.clearRetainingCapacity();
@@ -314,4 +340,45 @@ test "AbstractScratch generation wraparound clears stamps instead of aliasing a 
     try std.testing.expectEqual(@as(usize, 0), scratch.nodes_used);
     _ = scratch.slotFor(42).?;
     try std.testing.expectEqual(@as(usize, 1), scratch.nodes_used);
+}
+
+test "search limits derive from the budget, not the grid size" {
+    const allocator = std.testing.allocator;
+    // One 16x16 chunk (256 cells) vs four (1024 cells), same budgets.
+    var small = SearchScratch{};
+    defer small.deinit(allocator);
+    try small.reserve(allocator, 64, 16, 16, 16, 256);
+    var large = SearchScratch{};
+    defer large.deinit(allocator);
+    try large.reserve(allocator, 64, 16, 16, 16, 1024);
+
+    inline for (.{ &small, &large }) |scratch| {
+        try std.testing.expectEqual(openHeapLimit(64), scratch.open_limit);
+        try std.testing.expectEqual(@as(usize, 256), scratch.open_limit);
+        try std.testing.expectEqual(@as(usize, 64), scratch.abstract.open_limit);
+        try std.testing.expectEqual(@as(usize, 16), scratch.abstract.corridor_limit);
+        try std.testing.expect(scratch.open.capacity >= scratch.open_limit);
+        try std.testing.expect(scratch.abstract.open.capacity >= scratch.abstract.open_limit);
+        try std.testing.expect(scratch.abstract.corridor.capacity >= scratch.abstract.corridor_limit);
+        try std.testing.expect(scratch.abstract.corridor_link.capacity >= scratch.abstract.corridor_limit);
+    }
+}
+
+test "re-reserving a smaller budget lowers the logical limits while physical capacity stays" {
+    const allocator = std.testing.allocator;
+    var scratch = SearchScratch{};
+    defer scratch.deinit(allocator);
+    try scratch.reserve(allocator, 256, 16, 64, 16, 64);
+    try scratch.reserve(allocator, 64, 16, 16, 16, 64);
+
+    try std.testing.expectEqual(@as(usize, 256), scratch.open_limit);
+    try std.testing.expect(scratch.open.capacity >= 1024);
+    try std.testing.expectEqual(@as(usize, 16), scratch.abstract.corridor_limit);
+    try std.testing.expect(scratch.abstract.corridor.capacity >= 64);
+}
+
+test "SearchScratch participant slots never share a cache line" {
+    // Contiguous scratch_slots entries are written concurrently by different workers.
+    try std.testing.expect(@alignOf(SearchScratch) >= std.atomic.cache_line);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(SearchScratch) % std.atomic.cache_line);
 }

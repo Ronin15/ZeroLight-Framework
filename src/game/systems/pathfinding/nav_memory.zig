@@ -15,7 +15,7 @@ const PortalNode = types.PortalNode;
 const AbstractEdge = types.AbstractEdge;
 const chunk_edge_floor = types.chunk_edge_floor;
 const default_edge_slack = types.default_edge_slack;
-const open_heap_headroom_factor = types.open_heap_headroom_factor;
+const openHeapLimit = types.openHeapLimit;
 const nav_interior_link_slots_per_chunk = types.nav_interior_link_slots_per_chunk;
 const LinkEdge = @import("nav_graph.zig").LinkEdge;
 const LinkEdgeRef = @import("nav_graph.zig").LinkEdgeRef;
@@ -122,7 +122,7 @@ pub const NavMemoryBudget = struct {
         // disjoint AbstractScratch, so this is counted per participant like the local
         // A* scratch above.
         const abstract_slot_capacity = @max(@as(usize, 16), self.max_abstract_nodes *| 2);
-        const abstract_open_capacity = @max(@as(usize, 16), self.max_abstract_nodes *| open_heap_headroom_factor);
+        const abstract_open_capacity = openHeapLimit(self.max_abstract_nodes);
         const per_participant_abstract_bytes = (abstract_slot_capacity *| abstract_slot_bytes) +|
             (abstract_open_capacity *| @sizeOf(OpenNode)) +|
             (self.max_abstract_nodes *| abstract_corridor_bytes);
