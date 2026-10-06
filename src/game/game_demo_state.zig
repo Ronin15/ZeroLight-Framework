@@ -662,33 +662,54 @@ pub const GameDemoState = struct {
     }
 
     fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, thread_system: ?*ThreadSystem) !StructuralCommitStats {
-        // The post-commit nav reaction appends at most one nav_region_invalidated
-        // event, driven by EITHER structural commands applied this frame OR
-        // invalidating world events already queued in the stream (e.g. a dig's
-        // world_tile_changed that did not originate from a structural command), OR
-        // new world LevelLinks the nav graph has not folded in yet (a ramp dug on an
-        // already-walkable cell flips no blocking state, so no event announces it).
-        // Reserve the slot for every source so the append never trips a tight
-        // capacity_limit.
-        const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(&self.data, &self.simulation_frame) or
-            SimulationPipeline.pendingEventsMayInvalidateNavigation(&self.simulation_frame) or
-            self.pipeline.hasPendingNavLinks(&self.world);
-        const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
-        const stats = try self.simulation_frame.applyStructuralCommandsBudgeted(&self.data, self.pipeline.structuralCommitBudget(extra_event_count));
-        // Population growth seam: the post-commit reactions and the next step see grown
-        // capacities. O(1) when the committed rows fit the tracked capacities.
-        self.last_population_sync = try self.pipeline.syncPopulationCapacity(&self.simulation_frame, &self.data, &self.world);
-        self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);
-        try self.pipeline.reactToPostCommitPerceptionEvents(&self.simulation_frame, &self.world);
-        self.pipeline.reactToPostCommitSteeringEvents(&self.simulation_frame);
+        const result = try commitStructuralAndReact(&self.pipeline, &self.simulation_frame, &self.data, &self.world, thread_system);
+        self.last_population_sync = result.population_sync;
+        self.last_nav_update_stats = result.nav_update;
         try render_prep.ensureScenePrepCapacity(&self.scene_prep, self.gameplayScene());
-        return stats;
+        return result.structural;
     }
 
     fn validateAtlasReferences(self: *const GameDemoState, runtime_assets: *const RuntimeAssets) !void {
         try render_prep.validateAtlasReferences(&self.data, runtime_assets);
     }
 };
+
+const DemoCommitResult = struct {
+    structural: StructuralCommitStats,
+    population_sync: PopulationSyncStats,
+    nav_update: NavUpdateStats,
+};
+
+/// The demo's structural-commit seam: the budgeted commit, the population growth
+/// seam, then the post-commit reactions, in that order.
+fn commitStructuralAndReact(
+    pipeline: *SimulationPipeline,
+    frame: *SimulationFrame,
+    data: *DataSystem,
+    world: *WorldSystem,
+    thread_system: ?*ThreadSystem,
+) !DemoCommitResult {
+    // The post-commit nav reaction appends at most one nav_region_invalidated
+    // event, driven by EITHER structural commands applied this frame OR
+    // invalidating world events already queued in the stream (e.g. a dig's
+    // world_tile_changed that did not originate from a structural command), OR
+    // new world LevelLinks the nav graph has not folded in yet (a ramp dug on an
+    // already-walkable cell flips no blocking state, so no event announces it).
+    // Reserve the slot for every source so the append never trips a tight
+    // capacity_limit.
+    const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
+        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame) or
+        pipeline.hasPendingNavLinks(world);
+    const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
+    const structural = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
+    // Population growth seam: the post-commit reactions and the next step see grown
+    // capacities. O(1) when the committed rows fit the tracked capacities.
+    const population_sync = try pipeline.syncPopulationCapacity(frame, data, world);
+    const nav_update = try pipeline.reactToPostCommitNavEvents(frame, data, world, thread_system);
+    try pipeline.reactToPostCommitPerceptionEvents(frame, world);
+    pipeline.reactToPostCommitSteeringEvents(frame);
+    return .{ .structural = structural, .population_sync = population_sync, .nav_update = nav_update };
+}
 
 const SpawnCellCoord = struct { x: u16, y: u16 };
 
@@ -2134,11 +2155,53 @@ test "demo event bound is the pinned exhaustive producer sum" {
     try std.testing.expectEqual(pinned_event_bound, demo.pipeline.eventCapacitySum());
 }
 
-test "every event producer has a nonzero budget under the demo config" {
-    var demo = try initDemoForTest(std.testing.allocator);
-    defer demo.deinit();
+/// Minimal pipeline under the demo's config (`demo_structural_headroom`) over a 1x1
+/// one-level world, with one cognition agent carrying the demo's `AiPerception` +
+/// `AiAffect` pair. Test-only local fixture.
+const DemoConfigPipelineFixture = struct {
+    world: WorldSystem,
+    data: DataSystem,
+    frame: SimulationFrame,
+    pipeline: SimulationPipeline,
 
-    const budgets = demo.pipeline.eventBudgets();
+    fn init(self: *DemoConfigPipelineFixture, allocator: std.mem.Allocator) !void {
+        self.world = .{ .allocator = allocator, .width = 1, .height = 1, .tile_size = 32, .chunk_size_tiles = 1 };
+        errdefer self.world.deinit();
+        _ = try self.world.addLevel(0);
+        self.data = DataSystem.init(allocator);
+        errdefer self.data.deinit();
+        const agent = try self.data.createEntity();
+        try self.data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 } });
+        try self.data.setAiPerception(agent, .{});
+        try self.data.setAiAffect(agent, .{});
+        self.frame = SimulationFrame.init(allocator);
+        errdefer self.frame.deinit();
+        self.pipeline = try SimulationPipeline.init(allocator, &self.data, 64, 64, .{
+            .movement_body_capacity = 4,
+            .structural_headroom = demo_structural_headroom,
+            .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1 },
+        });
+        errdefer self.pipeline.deinit();
+        // The demo's init order: streams sized from the producer sum, then `reserve`
+        // raises the event limit to it.
+        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + demo_structural_headroom);
+        try self.pipeline.reserve(&self.frame, 4);
+    }
+
+    fn deinit(self: *DemoConfigPipelineFixture) void {
+        self.pipeline.deinit();
+        self.frame.deinit();
+        self.data.deinit();
+        self.world.deinit();
+    }
+};
+
+test "every event producer has a nonzero budget under the demo config" {
+    var fixture: DemoConfigPipelineFixture = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+
+    const budgets = fixture.pipeline.eventBudgets();
     inline for (comptime std.meta.tags(EventProducerId)) |producer| {
         try std.testing.expect(maxEventsPerStep(producer, budgets) > 0);
     }
@@ -2306,40 +2369,42 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
 }
 
 test "demo commit seam grows pipeline capacity" {
-    var demo = try initDemoForTest(std.testing.allocator);
-    defer demo.deinit();
-    try std.testing.expectEqual(@as(usize, 37), demo.pipeline.movement_body_capacity);
+    var fixture: DemoConfigPipelineFixture = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
 
-    // Three creates (movement, bounds, response: 4 commit events each) push the
-    // population past the init reserve.
-    var commands: [3]StructuralCommand = undefined;
+    // Five creates (movement, bounds, response: 4 commit events each, 20 <= 79) push
+    // the population to 6, past the 4-body initial reserve.
+    var commands: [5]StructuralCommand = undefined;
     for (&commands, 0..) |*command, index| {
-        const x: f32 = 360 + @as(f32, @floatFromInt(index)) * 64;
+        const x: f32 = @as(f32, @floatFromInt(index)) * 64;
         command.* = .{ .create_entity = .{
             .movement_body = .{ .position = .{ .x = x, .y = 180 }, .previous_position = .{ .x = x, .y = 180 }, .velocity = .{}, .speed = 0 },
             .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
             .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
         } };
     }
-    demo.simulation_frame.beginStep();
-    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
-    demo.simulation_frame.structural_commands.addCount(0, commands.len);
-    try demo.simulation_frame.structural_commands.prefix();
-    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    fixture.frame.beginStep();
+    try fixture.frame.structural_commands.prepareRangeCounts(1);
+    fixture.frame.structural_commands.addCount(0, commands.len);
+    try fixture.frame.structural_commands.prefix();
+    var writer = fixture.frame.structural_commands.rangeWriter(0);
     for (commands) |command| writer.write(command);
     writer.finish();
-    demo.simulation_frame.structural_commands.finishWrite();
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
+    fixture.frame.structural_commands.finishWrite();
+    const grown = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
+    try std.testing.expectEqual(@as(usize, 5), grown.structural.created);
 
-    // 40 bodies -> 40 + 20 + 16 = 76, hot-store aligned to 80. The bound follows:
-    // dig 1 + perception 24 + affect 48 + plane (80 + 1) + action_react 64 +
-    // structural 79 (fixed) + nav 1 = 298.
-    try std.testing.expect(demo.last_population_sync.grew);
-    try std.testing.expectEqual(@as(usize, 80), demo.pipeline.movement_body_capacity);
-    try std.testing.expectEqual(@as(usize, 298), demo.pipeline.eventCapacitySum());
-    try std.testing.expectEqual(@as(?usize, 298), demo.simulation_frame.events.capacity_limit);
+    // 6 bodies -> 6 + 3 + 16 = 25, hot-store aligned to 32. The bound follows:
+    // dig 1 + perception 2 + affect 4 + plane (32 + 1) + action_react 64 +
+    // structural 79 (fixed) + nav 1 = 184.
+    try std.testing.expect(grown.population_sync.grew);
+    try std.testing.expectEqual(@as(usize, 32), fixture.pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 184), fixture.pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(?usize, 184), fixture.frame.events.capacity_limit);
 
-    demo.simulation_frame.beginStep();
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
-    try std.testing.expect(!demo.last_population_sync.grew);
+    fixture.frame.beginStep();
+    const unchanged = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
+    try std.testing.expect(!unchanged.population_sync.grew);
 }
