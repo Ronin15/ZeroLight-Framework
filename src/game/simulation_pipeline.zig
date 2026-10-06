@@ -16,6 +16,7 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
+const rangeCount = @import("../app/thread_system.zig").rangeCount;
 const DataSystem = @import("data_system.zig").DataSystem;
 const hotStoreCapacity = @import("data_system.zig").hotStoreCapacity;
 const PopulationRowCounts = @import("data_system.zig").PopulationRowCounts;
@@ -5912,11 +5913,13 @@ const GrowthScenarioResult = struct {
 /// Builds a minimal 3-level world at population 4, grows it to 37 rows through
 /// structural creates and the population seam, runs one stationary step, then one
 /// step where all 24 NPCs fall through dug holes. `max_worker_threads > 0` pins a
-/// multi-range partition. With `prove_zero_alloc`, the first step counts allocations
-/// per owner (none serially; on the multi-worker path only the documented slot >= 1
-/// warm-up) and the falling step runs with every allocator, the world's included,
-/// failing.
-fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool) !GrowthScenarioResult {
+/// multi-range partition (2 workers, 16-item ranges; 32-item ranges when `retune` is
+/// set). With `prove_zero_alloc`, the first step counts allocations per owner (none,
+/// serial or multi-worker: the seam reserved every partition) and the falling step
+/// runs with every allocator, the world's included, failing. A non-null `retune`
+/// re-pins that partition after the first step and runs one more stationary step
+/// under the failing allocators: a partition change never allocates in-stage.
+fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool, retune: ?AdaptiveWorkProfile) !GrowthScenarioResult {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
@@ -6010,8 +6013,11 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
 
     const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
     // Multi-worker runs pin a 2-worker, 16-item partition (3 movement ranges at 37
-    // bodies); the tuners would keep this small workload inline.
-    if (max_worker_threads > 0) pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+    // bodies), or 32-item (2 ranges) ahead of a retune; the tuners would keep this
+    // small workload inline. (A 64-item range is inline at 37 bodies, so the retune
+    // that adds ranges is 32 -> 16.)
+    const first_items_per_range: usize = if (retune != null) 32 else 16;
+    if (max_worker_threads > 0) pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = first_items_per_range });
 
     // First post-growth step, stationary. Every run takes it, so serial and
     // multi-worker runs stay step-for-step identical.
@@ -6024,21 +6030,25 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     const first_stats = try first_result;
     if (max_worker_threads > 0) {
         try std.testing.expect(!first_stats.movement.batch.ran_inline);
-        try std.testing.expectEqual(@as(usize, 3), first_stats.movement.batch.range_count);
+        try std.testing.expectEqual(rangeCount(37, first_items_per_range), first_stats.movement.batch.range_count);
     }
-    if (prove_zero_alloc) {
-        if (max_worker_threads == 0) {
-            // The seam reserved every slot-0 / single-range capacity.
-            try counters.expectOnlyOwnersAllocated(&.{});
-        } else {
-            // Documented (`CollisionSystem.reserve`, `SimulationScopeSystem.reserve`,
-            // `SpatialIndexSystem.reserveRows`): the seam reserves range slot 0, and
-            // slots >= 1 warm on the first multi-range step, on these owners only.
-            try counters.expectOnlyOwnersAllocated(&.{ "collision", "scope", "spatial_index" });
-            try std.testing.expect(counters.allocationsOf("collision") > 0);
-            try std.testing.expect(counters.allocationsOf("scope") > 0);
-            try std.testing.expect(counters.allocationsOf("spatial_index") > 0);
-        }
+    // The seam reserved every capacity for every partition (Slice 72 C5: per-range
+    // outputs are item-count windows, tallies and broadphase slots are reserved to
+    // `maxRangeCount`), so the first post-growth step allocates nothing on any owner.
+    if (prove_zero_alloc) try counters.expectOnlyOwnersAllocated(&.{});
+
+    if (retune) |profile| {
+        // A partition retune to more ranges, with every allocator failing.
+        pinPipelineThreadedProfiles(&pipeline, profile);
+        frame.beginStep();
+        var retune_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        var retune_swap: TestAllocatorSwap = .{};
+        if (prove_zero_alloc) retune_swap.install(targets, .uniform(retune_failing.allocator()));
+        const retune_result = pipeline.update(context);
+        if (prove_zero_alloc) retune_swap.restore(targets);
+        const retune_stats = try retune_result;
+        try std.testing.expectEqual(rangeCount(37, profile.items_per_range), retune_stats.movement.batch.range_count);
+        try std.testing.expectEqual(@as(usize, 0), retune_failing.allocations);
     }
 
     // All 24 NPCs step east into their hole this step.
@@ -6077,18 +6087,25 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
 }
 
 test "population seam grows every pipeline capacity so the next step allocates nothing" {
-    _ = try runPopulationGrowthScenario(0, true);
+    _ = try runPopulationGrowthScenario(0, true, null);
 }
 
-test "population growth on the multi-worker path warms only the documented range slots, then allocates nothing" {
+test "population growth on the multi-worker path allocates nothing on the first step after growth" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    _ = try runPopulationGrowthScenario(2, true);
+    _ = try runPopulationGrowthScenario(2, true, null);
+}
+
+test "a partition retune after population growth allocates nothing" {
+    // 2 workers at 32-item ranges, then re-pinned to 16-item ranges (2 -> 3 ranges at
+    // 37 bodies): no per-range output warms in-stage on the new partition.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    _ = try runPopulationGrowthScenario(2, true, .{ .worker_threads = 2, .items_per_range = 16 });
 }
 
 test "population growth scenario is identical on the serial and multi-worker paths" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    const serial = try runPopulationGrowthScenario(0, false);
-    const threaded = try runPopulationGrowthScenario(2, false);
+    const serial = try runPopulationGrowthScenario(0, false, null);
+    const threaded = try runPopulationGrowthScenario(2, false, null);
     try std.testing.expectEqual(serial.world_tile_changed, threaded.world_tile_changed);
     for (serial.positions, threaded.positions) |a, b| {
         try std.testing.expectEqual(a[0], b[0]);

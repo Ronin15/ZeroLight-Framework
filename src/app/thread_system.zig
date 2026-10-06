@@ -1103,6 +1103,16 @@ pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
     return (item_count + items_per_range - 1) / items_per_range;
 }
 
+/// Upper bound on the range count of any batch over at most `item_count` items with
+/// `range_alignment_items`: every shape (`shapeBatch`, the single shaping path for fixed,
+/// selected, and tuner profiles) aligns its range size up to the alignment or collapses
+/// to one full-width range, so no partition can produce more ranges than this. Callers
+/// size per-range records (tallies, broadphase slots) from it at their capacity seam so
+/// a partition retune never allocates in-stage.
+pub fn maxRangeCount(item_count: usize, range_alignment_items: usize) usize {
+    return rangeCount(item_count, @max(range_alignment_items, @as(usize, 1)));
+}
+
 const BatchShape = struct {
     items_per_range: usize,
     worker_threads: usize,
@@ -1624,6 +1634,46 @@ test "parallel for options cap active workers and align ranges" {
     try std.testing.expect(stats.worker_thread_ranges > 0);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+test "every selectable batch shape stays within maxRangeCount" {
+    const item_counts = [_]usize{ 1, 15, 16, 17, 131, 2053 };
+    const alignments = [_]usize{ 1, 16 };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    for (item_counts) |n| {
+        for (alignments) |alignment| {
+            const bound = maxRangeCount(n, alignment);
+            // Fixed (explicit range size) selections through the single selection path.
+            for ([_]usize{ 1, 16, 64, n }) |items_per_range| {
+                for ([_]?usize{ 0, 1, 3, null }) |workers| {
+                    const selection = threads.selectBatchProfile(null, .{
+                        .item_count = n,
+                        .items_per_range = items_per_range,
+                        .max_worker_threads = workers,
+                        .range_alignment_items = alignment,
+                        .adaptive = false,
+                    });
+                    try std.testing.expect(selection.range_count <= bound);
+                }
+            }
+            // Every profile a tuner (or a caller's selected profile) can hand the shaper,
+            // with the tuner-inline collapse both on and off.
+            var items_per_range: usize = 1;
+            while (items_per_range <= n + 1) : (items_per_range += 1) {
+                for ([_]usize{ 0, 1, 2, 3 }) |worker_threads| {
+                    for ([_]bool{ false, true }) |tuner_active| {
+                        const shape = shapeBatch(n, .{ .worker_threads = worker_threads, .items_per_range = items_per_range }, 3, alignment, tuner_active);
+                        try std.testing.expect(shape.range_count <= bound);
+                    }
+                }
+            }
+            // A live tuner's own selections.
+            var tuner = AdaptiveWorkTuner.init(.{});
+            const selection = threads.selectBatchProfile(&tuner, .{ .item_count = n, .range_alignment_items = alignment });
+            try std.testing.expect(selection.range_count <= bound);
+        }
     }
 }
 

@@ -749,7 +749,11 @@ Simulation outputs coordinate determinism, performance, and efficiency as one
 contract. Threaded processors that produce events, intents, contacts, or
 deferred structural commands use typed range-owned output buffers: count outputs
 per stable range, prefix offsets on the main thread, write contiguous output
-slices, merge by range index, and consume the result as a batch. Output order
+slices, merge by range index, and consume the result as a batch. Passes with at
+most one output per item (scope gathers and tier policy, the spatial gather, the
+collision narrowphase) write fixed per-range windows of one item-count buffer
+plus a padded tally and compact in range order, so their capacity-seam reserve
+covers every partition (Slice 72 C5). Output order
 comes from stable input/range order, not worker timing or worker IDs. Structural
 mutation remains behind `DataSystem` batch commit boundaries. `DataSystem` is
 the single source for applying structural commands and may report plain

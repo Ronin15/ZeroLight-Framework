@@ -17,6 +17,7 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const StageTimer = runtime_perf_log.StageTimer;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -156,23 +157,6 @@ const BroadphaseRangeBuffer = struct {
     }
 };
 
-const NarrowphaseRangeBuffer = struct {
-    contacts: std.ArrayList(CollisionContact) = .empty,
-
-    fn clearRetainingCapacity(self: *NarrowphaseRangeBuffer) void {
-        self.contacts.clearRetainingCapacity();
-    }
-
-    fn appendContactAssumeCapacity(self: *NarrowphaseRangeBuffer, contact: CollisionContact) void {
-        self.contacts.appendAssumeCapacity(contact);
-    }
-
-    fn deinit(self: *NarrowphaseRangeBuffer, allocator: std.mem.Allocator) void {
-        self.contacts.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
 const BroadphaseRangeSlot = struct {
     // Each worker writes only its assigned slot. Padding keeps hot append state
     // from sharing cache lines across concurrently written range records.
@@ -180,15 +164,26 @@ const BroadphaseRangeSlot = struct {
     padding: [paddingForCacheLine(BroadphaseRangeBuffer)]u8 = @splat(0),
 };
 
-const NarrowphaseRangeSlot = struct {
-    // Narrowphase has the same ownership contract as broadphase: one range, one
-    // slot, merged serially after all workers finish.
-    buffer: NarrowphaseRangeBuffer = .{},
-    padding: [paddingForCacheLine(NarrowphaseRangeBuffer)]u8 = @splat(0),
+const BroadphaseRangeSlotList = std.ArrayListAligned(BroadphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));
+
+/// Narrowphase emits at most one contact per candidate pair, so it needs no per-range
+/// buffers: range r writes only its own `[range.start, range.end)` window of one
+/// candidate-pair-count staging list and its count into a padded tally; the main
+/// thread streams the windows in range order.
+const ContactStagingList = std.ArrayListAligned(CollisionContact, .fromByteUnits(thread_shared_record_alignment));
+
+/// One narrowphase range's contact count, written once by the range's job.
+const ContactCountTally = struct {
+    // Padding keeps concurrently written tallies off shared cache lines.
+    count: usize = 0,
+    padding: [paddingForCacheLine(usize)]u8 = @splat(0),
 };
 
-const BroadphaseRangeSlotList = std.ArrayListAligned(BroadphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));
-const NarrowphaseRangeSlotList = std.ArrayListAligned(NarrowphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));
+comptime {
+    std.debug.assert(@sizeOf(ContactCountTally) % thread_shared_record_alignment == 0);
+}
+
+const ContactCountTallyList = std.ArrayListAligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
 
 pub const CollisionSystem = struct {
     allocator: std.mem.Allocator,
@@ -196,7 +191,8 @@ pub const CollisionSystem = struct {
     order: std.ArrayList(usize) = .empty,
     broadphase_ranges: BroadphaseRangeSlotList = .empty,
     candidate_pairs: std.ArrayList(CandidatePair) = .empty,
-    narrowphase_ranges: NarrowphaseRangeSlotList = .empty,
+    narrowphase_staging: ContactStagingList = .empty,
+    narrowphase_tallies: ContactCountTallyList = .empty,
     broadphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     narrowphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
@@ -209,10 +205,8 @@ pub const CollisionSystem = struct {
     }
 
     pub fn deinit(self: *CollisionSystem) void {
-        for (self.narrowphase_ranges.items) |*slot| {
-            slot.buffer.deinit(self.allocator);
-        }
-        self.narrowphase_ranges.deinit(self.allocator);
+        self.narrowphase_tallies.deinit(self.allocator);
+        self.narrowphase_staging.deinit(self.allocator);
         self.candidate_pairs.deinit(self.allocator);
         for (self.broadphase_ranges.items) |*slot| {
             slot.buffer.deinit(self.allocator);
@@ -223,22 +217,34 @@ pub const CollisionSystem = struct {
         self.* = undefined;
     }
 
-    /// Pre-sizes proxy rows, sweep order, merged candidates, and range slot 0 (broadphase
-    /// pairs + narrowphase contacts) for `body_capacity` bodies, so the single-range path
-    /// (serial, 0-worker, tuner-inline) is allocation-free from the first step. Grow-only;
-    /// re-run by the pipeline's population seam. Slots >= 1 warm on their first
-    /// multi-range step (main thread, before dispatch).
+    /// Pre-sizes proxy rows, sweep order, merged candidates, the broadphase range slots,
+    /// and the narrowphase staging + tallies for `body_capacity` bodies, so the serial and
+    /// threaded paths are allocation-free from the first step under every partition the
+    /// tuner can pick. Grow-only; re-run by the pipeline's population seam.
+    ///
+    /// Broadphase pair density per item is data, so it keeps per-range slots: slot r is
+    /// reserved to `estimateBroadphasePairCapacity(cap, ceilDiv(cap, r + 1))` for every
+    /// `r < maxRangeCount(cap)`. Any partition's range r covers at most
+    /// `ceilDiv(cap, r + 1)` items, so this is at least the per-slot warm estimate under
+    /// every partition; a dense cluster past it is the kept grow-and-replay. Narrowphase
+    /// (at most one contact per candidate pair) uses one window per range in a staging
+    /// list sized to the candidate pairs, which grows only with candidate pairs (the same
+    /// pair-density path).
     pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
         if (body_capacity == 0) return;
         const pair_capacity = estimateBroadphasePairCapacity(body_capacity, body_capacity);
         try self.ensureProxyCapacity(body_capacity);
         try self.order.ensureTotalCapacity(self.allocator, body_capacity);
         try self.candidate_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
-        try self.prepareBroadphaseRangeBuffers(1);
-        try self.broadphase_ranges.items[0].buffer.pairs.ensureTotalCapacity(self.allocator, pair_capacity);
-        try self.narrowphase_ranges.ensureTotalCapacity(self.allocator, 1);
-        if (self.narrowphase_ranges.items.len == 0) self.narrowphase_ranges.appendAssumeCapacity(.{});
-        try self.narrowphase_ranges.items[0].buffer.contacts.ensureTotalCapacity(self.allocator, pair_capacity);
+        const broadphase_range_count = maxRangeCount(body_capacity, collision_range_alignment_items);
+        try self.prepareBroadphaseRangeBuffers(broadphase_range_count);
+        for (self.broadphase_ranges.items[0..broadphase_range_count], 0..) |*slot, range_index| {
+            const range_len_bound = (body_capacity + range_index) / (range_index + 1);
+            // Precise: the bound is exact, so no geometric slack per slot.
+            try slot.buffer.pairs.ensureTotalCapacityPrecise(self.allocator, estimateBroadphasePairCapacity(body_capacity, range_len_bound));
+        }
+        try self.narrowphase_staging.ensureTotalCapacityPrecise(self.allocator, pair_capacity);
+        try self.narrowphase_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(pair_capacity, collision_range_alignment_items));
     }
 
     pub fn slice(self: *CollisionSystem) ProxySlice {
@@ -338,11 +344,12 @@ pub const CollisionSystem = struct {
             system_config.narrowphase_adaptive_tuner,
         );
 
-        try self.prepareNarrowphaseRangeBuffers(candidate_pair_count, narrowphase_selection.items_per_range, narrowphase_selection.range_count);
+        try self.prepareNarrowphaseStaging(candidate_pair_count, narrowphase_selection.range_count);
         var context = NarrowphaseJobContext{
             .system = self,
             .range_count = narrowphase_selection.range_count,
             .candidate_pair_count = candidate_pair_count,
+            .items_per_range = narrowphase_selection.items_per_range,
         };
         const narrowphase_batch = thread_system.parallelForWithOptions(candidate_pair_count, &context, narrowphaseContactsJob, .{
             .max_worker_threads = narrowphase_selection.worker_threads,
@@ -350,7 +357,7 @@ pub const CollisionSystem = struct {
             .adaptive_tuner = narrowphase_selection.active_tuner,
             .selected_profile = narrowphase_selection.profile,
         });
-        const contact_count = try self.mergeNarrowphaseContacts(contacts, narrowphase_selection.range_count);
+        const contact_count = try self.mergeNarrowphaseContacts(contacts, narrowphase_selection.items_per_range);
 
         return .{
             .body_count = body_count,
@@ -402,10 +409,10 @@ pub const CollisionSystem = struct {
             };
         }
 
-        try self.prepareNarrowphaseRangeBuffers(candidate_pair_count, candidate_pair_count, 1);
+        try self.prepareNarrowphaseStaging(candidate_pair_count, 1);
         const range = ParallelRange{ .index = 0, .start = 0, .end = candidate_pair_count };
         writeNarrowphaseContactsSimd(self, range);
-        const contact_count = try self.mergeNarrowphaseContacts(contacts, 1);
+        const contact_count = try self.mergeNarrowphaseContacts(contacts, candidate_pair_count);
 
         return .{
             .body_count = body_count,
@@ -478,37 +485,38 @@ pub const CollisionSystem = struct {
         }
     }
 
-    fn prepareNarrowphaseRangeBuffers(self: *CollisionSystem, candidate_pair_count: usize, items_per_range: usize, range_count: usize) !void {
-        try self.narrowphase_ranges.ensureTotalCapacity(self.allocator, range_count);
-        while (self.narrowphase_ranges.items.len < range_count) {
-            self.narrowphase_ranges.appendAssumeCapacity(.{});
-        }
-        for (self.narrowphase_ranges.items[0..range_count], 0..) |*slot, range_index| {
-            const buffer = &slot.buffer;
-            buffer.clearRetainingCapacity();
-            try buffer.contacts.ensureTotalCapacity(
-                self.allocator,
-                rangeLenForIndex(candidate_pair_count, items_per_range, range_index),
-            );
-        }
+    /// Sizes the narrowphase staging to `candidate_pair_count` window slots and resets
+    /// `range_count` tallies. Main thread, before dispatch. Grow-only safety nets: after
+    /// `reserve` they allocate only when candidate pairs outgrow the reserved pair
+    /// capacity (the kept pair-density path), never for a partition change.
+    fn prepareNarrowphaseStaging(self: *CollisionSystem, candidate_pair_count: usize, range_count: usize) !void {
+        try self.narrowphase_staging.ensureTotalCapacity(self.allocator, candidate_pair_count);
+        self.narrowphase_staging.items.len = candidate_pair_count;
+        try self.narrowphase_tallies.ensureTotalCapacity(self.allocator, range_count);
+        self.narrowphase_tallies.items.len = range_count;
+        for (self.narrowphase_tallies.items) |*slot| slot.count = 0;
     }
 
+    /// Streams each range's staging window (`count` contacts at `r * items_per_range`)
+    /// into `contacts` in range order.
     fn mergeNarrowphaseContacts(
         self: *CollisionSystem,
         contacts: *RangeOutputStream(CollisionContact),
-        range_count: usize,
+        items_per_range: usize,
     ) !usize {
-        try contacts.prepareRangeCounts(range_count);
+        const tallies = self.narrowphase_tallies.items;
+        try contacts.prepareRangeCounts(tallies.len);
         var contact_count: usize = 0;
-        for (self.narrowphase_ranges.items[0..range_count], 0..) |*slot, range_index| {
-            const count = slot.buffer.contacts.items.len;
-            contacts.addCount(range_index, count);
-            contact_count += count;
+        for (tallies, 0..) |*slot, range_index| {
+            contacts.addCount(range_index, slot.count);
+            contact_count += slot.count;
         }
         try contacts.prefix();
-        for (self.narrowphase_ranges.items[0..range_count], 0..) |*slot, range_index| {
+        const staging = self.narrowphase_staging.items;
+        for (tallies, 0..) |*slot, range_index| {
             var writer = contacts.rangeWriter(range_index);
-            for (slot.buffer.contacts.items) |contact| {
+            const window_start = range_index * items_per_range;
+            for (staging[window_start..][0..slot.count]) |contact| {
                 writer.write(contact);
             }
             writer.finish();
@@ -834,21 +842,30 @@ const NarrowphaseJobContext = struct {
     system: *CollisionSystem,
     range_count: usize,
     candidate_pair_count: usize,
+    items_per_range: usize,
 };
 
 fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *NarrowphaseJobContext = @ptrCast(@alignCast(context));
     // Dual worker asserts: range.index vs dispatched range count AND range.end
-    // vs the candidate-pair buffer this job reads.
+    // vs the candidate-pair buffer this job reads; the range is the staging window
+    // the main-thread merge expects.
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.candidate_pair_count);
+    std.debug.assert(range.start == range.index * job.items_per_range);
     writeNarrowphaseContactsSimd(job.system, range);
 }
 
+/// Writes range `range`'s contacts into its own staging window
+/// (`narrowphase_staging.items[range.start..range.end]`, at most one contact per
+/// candidate pair) and its count into its tally.
 fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) void {
     const proxies = system.sliceConst();
-    const buffer = &system.narrowphase_ranges.items[range.index].buffer;
+    std.debug.assert(range.index < system.narrowphase_tallies.items.len);
+    std.debug.assert(range.end <= system.narrowphase_staging.items.len);
+    const window = system.narrowphase_staging.items[range.start..range.end];
+    var count: usize = 0;
     var index = range.start;
     const zero = simd.splatFloat4(0);
     const one = simd.splatFloat4(1);
@@ -890,16 +907,15 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
 
         inline for (0..simd.lane_count) |lane| {
             if (valid[lane]) {
-                buffer.appendContactAssumeCapacity(
-                    contactForResolved(
-                        proxies,
-                        a_indices[lane],
-                        b_indices[lane],
-                        normal_x[lane],
-                        normal_y[lane],
-                        penetration[lane],
-                    ),
+                window[count] = contactForResolved(
+                    proxies,
+                    a_indices[lane],
+                    b_indices[lane],
+                    normal_x[lane],
+                    normal_y[lane],
+                    penetration[lane],
                 );
+                count += 1;
             }
         }
     }
@@ -907,9 +923,11 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
     while (index < range.end) : (index += 1) {
         const pair = system.candidate_pairs.items[index];
         if (contactForCandidate(proxies, pair.a, pair.b)) |contact| {
-            buffer.appendContactAssumeCapacity(contact);
+            window[count] = contact;
+            count += 1;
         }
     }
+    system.narrowphase_tallies.items[range.index].count = count;
 }
 
 fn overlapsY(proxies: ConstProxySlice, a: usize, b: usize) bool {
@@ -1344,13 +1362,14 @@ test "narrowphase range buffers merge deterministic contacts and skip rejected c
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 1 });
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 2 });
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 3 });
-    try system.prepareNarrowphaseRangeBuffers(system.candidate_pairs.items.len, 2, 2);
+    try system.prepareNarrowphaseStaging(system.candidate_pairs.items.len, 2);
 
     writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = 2 });
     writeNarrowphaseContactsSimd(&system, .{ .index = 1, .start = 2, .end = 3 });
 
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
+    // Two 2-pair range windows.
     const contact_count = try system.mergeNarrowphaseContacts(&contacts, 2);
     const merged = contacts.mergedItems();
 
@@ -1364,15 +1383,16 @@ test "narrowphase range buffers merge deterministic contacts and skip rejected c
 
 test "thread-written collision range scratch uses cache-line sized slots" {
     try std.testing.expectEqual(@as(usize, 0), @sizeOf(BroadphaseRangeSlot) % thread_shared_record_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(NarrowphaseRangeSlot) % thread_shared_record_alignment);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(ContactCountTally) % thread_shared_record_alignment);
 
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.prepareBroadphaseRangeBuffers(2);
-    try system.prepareNarrowphaseRangeBuffers(8, 4, 2);
+    try system.prepareNarrowphaseStaging(8, 2);
 
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.broadphase_ranges.items.ptr) % thread_shared_record_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.narrowphase_ranges.items.ptr) % thread_shared_record_alignment);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.narrowphase_tallies.items.ptr) % thread_shared_record_alignment);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.narrowphase_staging.items.ptr) % thread_shared_record_alignment);
 }
 
 test "threaded broadphase prewarms empty range buffers before dispatch" {
@@ -1613,6 +1633,63 @@ test "collision reserve makes the first single-range threaded update allocation-
     try std.testing.expectEqual(@as(usize, 2), contacts.mergedItems().len);
 }
 
+test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges allocate nothing" {
+    // Slice 72 C5: `reserve` alone (no warm update) covers every partition the tuner can
+    // pick: broadphase slots reserved to the per-range bound for maxRangeCount ranges, the
+    // narrowphase staging to the candidate pairs. A sparse chain (each body overlaps only
+    // its neighbour) keeps the pair count within the reserved pair capacity.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const body_count: usize = 64;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..body_count) |index| {
+        _ = try addBody(&data, @floatFromInt(index * 10), 0, 12);
+    }
+
+    var reference = CollisionSystem.init(std.testing.allocator);
+    defer reference.deinit();
+    var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer reference_contacts.deinit();
+    _ = try reference.updateSerial(&data, &reference_contacts);
+    const expected = reference_contacts.mergedItems();
+    try std.testing.expect(expected.len > 0);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(body_count);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    try contacts.reserve(maxRangeCount(body_count, collision_range_alignment_items), body_count);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const original_system_allocator = system.allocator;
+    const original_contacts_allocator = contacts.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing_allocator.allocator();
+    contacts.allocator = failing_allocator.allocator();
+    defer {
+        system.allocator = original_system_allocator;
+        contacts.allocator = original_contacts_allocator;
+    }
+
+    for ([_]usize{ 32, 16 }) |items_per_range| {
+        const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        try std.testing.expect(!stats.broadphase_batch.ran_inline);
+        try std.testing.expect(!stats.narrowphase_batch.ran_inline);
+        try std.testing.expectEqual(rangeCount(body_count, items_per_range), stats.broadphase_batch.range_count);
+        const merged = contacts.mergedItems();
+        try std.testing.expectEqual(expected.len, merged.len);
+        for (expected, merged) |want, got| {
+            try std.testing.expectEqual(want.a.index, got.a.index);
+            try std.testing.expectEqual(want.b.index, got.b.index);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+}
+
 test "collision proxy store rounds capacity for cache-line range splitting" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1784,12 +1861,12 @@ test "narrowphase simd contacts match scalar contactForCandidate" {
 
     // One range over a non-multiple-of-lane-count pair list exercises both the
     // SIMD chunk loop and the scalar tail inside writeNarrowphaseContactsSimd.
-    try system.prepareNarrowphaseRangeBuffers(pairs.len, pairs.len, 1);
+    try system.prepareNarrowphaseStaging(pairs.len, 1);
     writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = pairs.len });
 
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    const contact_count = try system.mergeNarrowphaseContacts(&contacts, 1);
+    const contact_count = try system.mergeNarrowphaseContacts(&contacts, pairs.len);
     const merged = contacts.mergedItems();
 
     try std.testing.expectEqual(expected.items.len, contact_count);

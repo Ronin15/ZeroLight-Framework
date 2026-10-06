@@ -143,6 +143,24 @@ a silent OOB write in ReleaseFast rather than a Debug/ReleaseSafe panic. The
 threaded path fails as a concurrent shared-allocator call (a data race), not a
 clean single-threaded OOM.
 
+A threaded pass that emits **at most one output per input item** (a gather, a
+stream compaction, a per-item command or contact) does not use per-range output
+buffers at all: each range writes into its own `[range.start, range.end)` window
+of one cache-line-aligned output buffer sized to the item count, stores its
+count (and any diagnostics) in a cache-line-padded per-range tally, and the main
+thread compacts the windows in range order (a forward copy, since the
+destination never passes the source; no copy at all when nothing was excluded)
+or streams them into the consuming `RangeOutputStream`. The buffer is sized by
+the item capacity and the tallies by `thread_system.maxRangeCount(capacity,
+alignment)` (every batch shape aligns its range size up to the alignment), so
+one capacity-seam reserve covers every partition the tuner can pick and a
+retune never allocates in-stage — there are no per-range buffers to warm. Only
+a pass whose output count per item is data-dependent (the collision
+broadphase's pairs) keeps per-range slots, reserved at the seam to a
+partition-independent per-range bound, with overflow handled by
+grow-and-replay. Reference: `simulation_scope.zig`'s gathers and tier policy,
+`spatial_index.zig`'s gather, `collision.zig`'s narrowphase (Slice 72 C5).
+
 A partitioned processor that **emits an event stream** (not just scatters values
 into disjoint slots) under a per-step cap has a second requirement beyond
 disjoint writes: the merged emit order — and therefore which events survive the
