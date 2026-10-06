@@ -279,6 +279,7 @@ pub const SteeringSystem = struct {
             .min_y = s.items(.min_y),
             .max_x = s.items(.max_x),
             .max_y = s.items(.max_y),
+            .world_level = s.items(.world_level),
         };
     }
 
@@ -574,6 +575,7 @@ pub const SteeringSystem = struct {
         try self.obstacle_cell_ranges.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
 
         var obstacle_row_slice = self.obstacle_snapshot_rows.slice();
+        const scope = data.scopeColumnsSliceConst();
         self.spatial_obstacle_query_extra = 0;
         var obstacle_index: usize = 0;
         for (collision_responses.entities, 0..) |obstacle_entity, response_index| {
@@ -592,6 +594,10 @@ pub const SteeringSystem = struct {
                 .min_y = min_y,
                 .max_x = max_x,
                 .max_y = max_y,
+                // Same-level gate source: scope.level mirrors world_level, and a
+                // static's level change arrives as a `.world_level`
+                // component_changed that invalidates this snapshot.
+                .world_level = movementScopeLevel(scope, movement_index),
             });
             const center_x = (min_x + max_x) * 0.5;
             const center_y = (min_y + max_y) * 0.5;
@@ -928,6 +934,8 @@ const ObstacleSnapshotRow = struct {
     min_y: f32,
     max_x: f32,
     max_y: f32,
+    /// Movement-scope world level for same-level obstacle avoidance gating.
+    world_level: u16,
 };
 
 fn appendMalRow(comptime Row: type, rows: *std.MultiArrayList(Row), row_slice: *std.MultiArrayList(Row).Slice, row: Row) void {
@@ -989,6 +997,7 @@ pub const ConstObstacleSnapshotSlice = struct {
     min_y: ConstHotF32Slice,
     max_x: ConstHotF32Slice,
     max_y: ConstHotF32Slice,
+    world_level: []const u16,
 
     pub fn len(self: ConstObstacleSnapshotSlice) usize {
         return self.min_x.len;
@@ -1138,6 +1147,7 @@ fn computeAvoidance(job: *const SteeringJobContext, index: usize) AvoidanceResul
     const start_y = job.work.start_y[index];
     const radius = job.work.selected_avoidance_radii[index] + job.work.selected_agent_radii[index];
     const weight = job.work.selected_avoidance_weights[index];
+    const agent_level = job.work.selected_world_level[index];
     const obstacle_query_radius = radius + job.spatial_obstacle_query_extra;
     const min_cell_x = spatialCell(start_x - obstacle_query_radius, job.spatial_cell_size);
     const max_cell_x = spatialCell(start_x + obstacle_query_radius, job.spatial_cell_size);
@@ -1152,7 +1162,7 @@ fn computeAvoidance(job: *const SteeringJobContext, index: usize) AvoidanceResul
                 if (obstacle_candidate_count >= max_obstacle_candidate_checks) break;
                 obstacle_candidate_count += 1;
                 const obstacle_index = entry.index;
-                accumulateObstacleSample(job, obstacle_index, start_x, start_y, radius, weight, &ax, &ay, &obstacle_count);
+                accumulateObstacleSample(job, obstacle_index, agent_level, start_x, start_y, radius, weight, &ax, &ay, &obstacle_count);
             }
         }
     }
@@ -1169,6 +1179,7 @@ fn computeAvoidance(job: *const SteeringJobContext, index: usize) AvoidanceResul
 fn accumulateObstacleSample(
     job: *const SteeringJobContext,
     obstacle_index: usize,
+    agent_level: u16,
     start_x: f32,
     start_y: f32,
     radius: f32,
@@ -1177,6 +1188,10 @@ fn accumulateObstacleSample(
     ay: *f32,
     obstacle_count: *u16,
 ) void {
+    // Match collision's sameWorldLevel gate: a static on another floor at the
+    // same XY must not push. The caller already counted this candidate against
+    // `max_obstacle_candidate_checks`, so single-level truncation is unchanged.
+    if (job.obstacles.world_level[obstacle_index] != agent_level) return;
     // Axis-aligned obstacle push uses the closest point on the box. If the agent
     // is inside the box, push away from the center to avoid a zero vector.
     const min_x = job.obstacles.min_x[obstacle_index];
@@ -1404,7 +1419,9 @@ pub fn eventInvalidatesStaticObstacleSpatial(event: SimulationEvent) bool {
     return switch (event.payload) {
         .entity_destroyed => |destroyed| destroyed.was_static_navigation_obstacle,
         .component_changed => |changed| switch (changed.component) {
-            .movement_body, .collision_bounds => changed.was_static_navigation_obstacle or changed.is_static_navigation_obstacle,
+            // world_level: snapshot rows carry the static's level for the
+            // same-level avoidance gate, so a static changing floors is stale.
+            .movement_body, .collision_bounds, .world_level => changed.was_static_navigation_obstacle or changed.is_static_navigation_obstacle,
             .collision_response => changed.was_static_navigation_obstacle != changed.is_static_navigation_obstacle,
             else => false,
         },
@@ -1858,6 +1875,180 @@ test "steering local agent avoidance ignores XY overlap across different world_l
     try std.testing.expectEqual(@as(usize, 0), stats.agent_neighbor_samples);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), movement.direction_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), movement.direction_y, 0.001);
+}
+
+test "steering static obstacle avoidance ignores XY overlap across different world_levels" {
+    // A level-1 agent overlaps a level-0 static box in XY. Without the
+    // same-level gate the box would push it left. Moving the box to level 1
+    // through a committed `.world_level` change must invalidate the retained
+    // snapshot and restore the push.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    const obstacle = try addStaticObstacle(&data, .{ .x = 4, .y = -12 }, .{ .x = 20, .y = 20 });
+    try data.setWorldLevel(agent, 1);
+    try data.setWorldLevel(obstacle, 0);
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 4, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(4);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    const cross_stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    const cross = frame.intents.mergedItems()[0].movement;
+    // The other-level box is still a spatial candidate (counts against the cap)
+    // but contributes no sample and no push.
+    try std.testing.expectEqual(@as(usize, 1), cross_stats.obstacle_candidate_checks);
+    try std.testing.expectEqual(@as(usize, 0), cross_stats.obstacle_samples);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cross.direction_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), cross.direction_y, 0.001);
+
+    // Static changes floors via a structural set_world_level commit.
+    try data.setWorldLevel(obstacle, 1);
+    frame.beginStep();
+    try frame.events.ensureCanAppend(1);
+    try frame.events.appendRequired(.{
+        .stage = .structural_commit,
+        .payload = .{ .component_changed = .{
+            .entity = obstacle,
+            .component = .world_level,
+            .was_static_navigation_obstacle = true,
+            .is_static_navigation_obstacle = true,
+            .level = 1,
+        } },
+    });
+    steering.reactToPostCommitSteeringEvents(&frame);
+    try std.testing.expect(!steering.obstacle_index_valid);
+
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    const same_stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    const same = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(usize, 1), same_stats.obstacle_candidate_checks);
+    try std.testing.expectEqual(@as(usize, 1), same_stats.obstacle_samples);
+    try std.testing.expect(same.direction_x < 1);
+}
+
+test "steering static obstacle invalidation includes world_level only for static obstacles" {
+    const entity = EntityId{ .index = 1, .generation = 1 };
+    const static_change = SimulationEvent{
+        .stage = .structural_commit,
+        .payload = .{ .component_changed = .{
+            .entity = entity,
+            .component = .world_level,
+            .was_static_navigation_obstacle = true,
+            .is_static_navigation_obstacle = true,
+        } },
+    };
+    try std.testing.expect(eventInvalidatesStaticObstacleSpatial(static_change));
+    const dynamic_change = SimulationEvent{
+        .stage = .structural_commit,
+        .payload = .{ .component_changed = .{
+            .entity = entity,
+            .component = .world_level,
+            .was_static_navigation_obstacle = false,
+            .is_static_navigation_obstacle = false,
+        } },
+    };
+    try std.testing.expect(!eventInvalidatesStaticObstacleSpatial(dynamic_change));
+}
+
+test "steering multi-level obstacle gate matches between serial and real threaded workers" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // Alternating agent levels over one static box per level at overlapping XY:
+    // each agent may only react to its own floor's box, identically under every
+    // worker split.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var intents = std.ArrayList(NavigationIntent).empty;
+    defer intents.deinit(std.testing.allocator);
+    try intents.ensureTotalCapacity(std.testing.allocator, 128);
+
+    for (0..128) |index| {
+        const x: f32 = @floatFromInt(index % 16);
+        const y: f32 = @floatFromInt(index / 16);
+        const entity = try addSteeredEntity(&data, .{ .x = x * 14.0, .y = y * 14.0 });
+        try data.setWorldLevel(entity, @intCast(index % 2));
+        intents.appendAssumeCapacity(.{
+            .entity = entity,
+            .goal = .{ .x = 420, .y = 220 },
+            .direct_direction_x = if (index % 2 == 0) 1 else -1,
+            .direct_direction_y = if (index % 3 == 0) 0.25 else -0.15,
+            .priority = 1,
+        });
+    }
+    const ground = try addStaticObstacle(&data, .{ .x = 72, .y = 32 }, .{ .x = 36, .y = 96 });
+    const underground = try addStaticObstacle(&data, .{ .x = 96, .y = 20 }, .{ .x = 48, .y = 60 });
+    try data.setWorldLevel(ground, 0);
+    try data.setWorldLevel(underground, 1);
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_group_fields = 4, .worker_participant_count = 1, .max_solved_requests_per_step = 128 });
+    try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 32);
+
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    try serial_frame.reserveStreams(16, 0, 128, 0, 0, 0);
+    try serial_frame.reservePathRequests(16, 128);
+    serial_frame.beginStep();
+    try appendNavigationIntents(&serial_frame, intents.items);
+    var serial_system = SteeringSystem.init(std.testing.allocator);
+    defer serial_system.deinit();
+    try serial_system.reserveForCapacity(128, 2);
+    const serial_stats = try serial_system.updateSerial(&data, &serial_frame, &pathfinding, .{});
+    const serial = serial_frame.intents.mergedItems();
+    try std.testing.expect(serial.len > 0);
+    try std.testing.expect(serial_stats.obstacle_samples > 0);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 4,
+        .items_per_range = steering_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const splits = [_]struct { items_per_range: usize, workers: usize }{
+        .{ .items_per_range = steering_range_alignment_items, .workers = 2 },
+        .{ .items_per_range = steering_range_alignment_items * 3, .workers = 4 },
+    };
+    for (splits) |split| {
+        var threaded_frame = SimulationFrame.init(std.testing.allocator);
+        defer threaded_frame.deinit();
+        try threaded_frame.reserveStreams(16, 0, 128, 0, 0, 0);
+        try threaded_frame.reservePathRequests(16, 128);
+        threaded_frame.beginStep();
+        try appendNavigationIntents(&threaded_frame, intents.items);
+        var threaded_system = SteeringSystem.init(std.testing.allocator);
+        defer threaded_system.deinit();
+        try threaded_system.reserveForCapacity(128, 2);
+        const threaded_stats = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, .{
+            .items_per_range = split.items_per_range,
+            .max_worker_threads = split.workers,
+            .adaptive = false,
+        });
+        try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
+        try std.testing.expectEqual(serial_stats.obstacle_samples, threaded_stats.obstacle_samples);
+        try std.testing.expectEqual(serial_stats.obstacle_candidate_checks, threaded_stats.obstacle_candidate_checks);
+        const threaded = threaded_frame.intents.mergedItems();
+        try std.testing.expectEqual(serial.len, threaded.len);
+        for (serial, threaded) |a, b| {
+            try std.testing.expectEqual(a.movement.entity.index, b.movement.entity.index);
+            try std.testing.expectEqual(a.movement.entity.generation, b.movement.entity.generation);
+            try std.testing.expectEqual(a.movement.direction_x, b.movement.direction_x);
+            try std.testing.expectEqual(a.movement.direction_y, b.movement.direction_y);
+        }
+    }
 }
 
 test "steering movement index cache rebuilds only after structural invalidate" {
