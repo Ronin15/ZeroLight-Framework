@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** First of 52A → 52B → 52C. No gameplay dependency.
+**Status: in progress.** The Windows LTO-off item landed 2026-10-05 (`01754ec`); everything else not started. First of 52A → 52B → 52C. No gameplay dependency.
 
 Goal: a release build means the same ISA, the same Zig, the same SDL, and the
 same shader bytes on every machine that produces it. The shipped ISA is
