@@ -77,6 +77,7 @@ const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSyst
 const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
+const Rect = @import("../render/renderer.zig").Rect;
 const world_gate = @import("systems/world_gate.zig");
 
 /// Coarse per-step data resources stages read/write, for the stage-ordering
@@ -414,7 +415,31 @@ pub const SimulationPipelineUpdateContext = struct {
     perf: runtime_perf_log.Context = .{},
     /// Optional particle system for soft-drop destroy bursts (Slice 45).
     particles: ?*ParticleSystem = null,
+    /// Fixed-step camera rect the simulation derives scope from (cognition
+    /// halo, tier bands) via `simViewRegion` / `cognitionRegionForWorldRect`.
+    /// Never the render visibility window, which follows the interpolated
+    /// render camera and so depends on frame pacing. `null` keeps the
+    /// full-active fallback (no stagger filter, no tier demotion) for bare-world
+    /// pipeline tests.
+    sim_view: ?Rect = null,
 };
+
+/// Chunk overscan applied to `sim_view` for simulation scope. Equals the demo's
+/// render overscan (comptime-asserted in `game_demo_state.zig`) so the sim
+/// region matches the render window at interpolation alpha 1.
+pub const sim_view_overscan_chunks: u16 = 1;
+
+/// The one scope-band source for pipeline stages: the fixed-step `sim_view`
+/// chunk region anchored at the player's level. Later scope-band readers must
+/// call this rather than reading any world visibility state.
+fn simViewRegion(context: SimulationPipelineUpdateContext) ?ActiveRegion {
+    var region = context.world.chunkRegionForWorldRect(
+        context.sim_view orelse return null,
+        sim_view_overscan_chunks,
+    ) orelse return null;
+    region.level = context.player.current_level;
+    return region;
+}
 
 /// Aggregated outputs from one pipeline step. Runtime perf and tests consume
 /// these counters without adding a separate timing path to gameplay code.
@@ -1046,7 +1071,8 @@ pub const SimulationPipeline = struct {
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
-    /// Advance the stagger clock, derive the camera cognition halo, and select the
+    /// Advance the stagger clock, derive the cognition halo from the fixed-step
+    /// `sim_view` (never the render window), and select the
     /// two cognition populations for this step: unstaggered halo (spatial index +
     /// perception candidates) and the stagger-filtered think set. Chunk columns are
     /// derived later in `chunk_derive`. The AI gather reads the chunk written last
@@ -1054,7 +1080,10 @@ pub const SimulationPipeline = struct {
     fn stageScopeAdvanceAndAiGather(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         self.scope.advanceStep();
-        step.cognition_region = context.world.cognitionActiveRegion(cognition_halo_chunks);
+        step.cognition_region = if (context.sim_view) |view|
+            context.world.cognitionRegionForWorldRect(view, sim_view_overscan_chunks, cognition_halo_chunks)
+        else
+            null;
         const stagger_step = self.scope.staggerStep();
         const ai_pops = try self.scope.gatherAiPopulations(context.data, step.cognition_region, stagger_step, context.thread_system, .{});
         step.ai_halo_indices = ai_pops.halo;
@@ -1291,13 +1320,11 @@ pub const SimulationPipeline = struct {
     }
 
     /// Assign cognition/locomotion/kinematic/dormant by cube distance from the
-    /// visible region. Commands are deferred. The anchor level is the player's,
-    /// so off-level entities demote. Queues nothing when no tier changed.
+    /// fixed-step sim-view region. Commands are deferred. The anchor level is the
+    /// player's, so off-level entities demote. Queues nothing when no tier changed.
     fn stageTierPolicy(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        var visible_region = context.world.visibleChunkRegion();
-        if (visible_region) |*region| region.level = context.player.current_level;
-        _ = try self.scope.queueTierChanges(context.data, visible_region, &context.frame.structural_commands, context.thread_system, .{});
+        _ = try self.scope.queueTierChanges(context.data, simViewRegion(context), &context.frame.structural_commands, context.thread_system, .{});
     }
 
     fn buildScopeStats(
@@ -1687,9 +1714,9 @@ test "pipeline resamples AI wander direction across fixed steps" {
     });
     defer pipeline.deinit();
 
-    // A bare WorldSystem never gets a visibility window set, so
-    // `cognitionActiveRegion()` returns null and the AI gather falls back to
-    // full-active with no stagger gating — the wanderer runs every step.
+    // No `sim_view` is passed, so the cognition region is null and the AI
+    // gather falls back to full-active with no stagger gating — the wanderer
+    // runs every step.
     frame.beginStep();
     const stats1 = try pipeline.update(.{
         .data = &data,
@@ -2305,6 +2332,9 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const AiAgent = @import("data_system.zig").AiAgent;
+const MovementBody = @import("data_system.zig").MovementBody;
+const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 
 /// Minimal multi-level grass/dirt world for dig/plane/gate pipeline tests.
 /// 8×8 tiles cover cell fixtures around (3..6, 3) without full 320 demo paint.
@@ -2579,6 +2609,161 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     try std.testing.expectEqual(@as(usize, 3), stats.movement.body_count);
 }
 
+const scope_render_test_agent_count = 4;
+const scope_render_test_steps = 4;
+
+const ScopeRenderTraceStep = struct {
+    cognition_region: ?ActiveRegion,
+    ai_entity_count: usize,
+    stagger_skips: usize,
+    tier_commands: [scope_render_test_agent_count + 1]?StructuralCommand,
+};
+
+const ScopeRenderTrace = struct {
+    steps: [scope_render_test_steps]ScopeRenderTraceStep,
+    bodies: [scope_render_test_agent_count]MovementBody,
+    agents: [scope_render_test_agent_count]AiAgent,
+};
+
+/// Runs `scope_render_test_steps` pipeline steps with one fixed `sim_view` on a
+/// 64×16-tile, chunk-16 world (4 chunks) with one AI agent per chunk. When
+/// `render_cadence` is set, the render visibility window is rewritten between
+/// steps (varying rects, call counts, and a far rect) as interpolated render
+/// frames would; otherwise it is never set.
+fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+
+    const chunk_pixels: f32 = 16 * 32;
+    var agents: [scope_render_test_agent_count]EntityId = undefined;
+    for (&agents, 0..) |*agent, i| {
+        const x = @as(f32, @floatFromInt(i)) * chunk_pixels + 100;
+        agent.* = try data.createEntity();
+        try data.setMovementBody(agent.*, .{
+            .position = .{ .x = x, .y = 200 },
+            .previous_position = .{ .x = x, .y = 200 },
+            .velocity = .{ .x = 10, .y = 0 },
+            .speed = 20,
+        });
+        try data.setAiAgent(agent.*, .{ .active_behavior = .wander, .gain_pursue = 0 });
+        try data.setAiPerception(agent.*, .{});
+        // Agent 2 starts a band low so the tier policy has a promotion to queue.
+        try data.setSimulationMetadata(agent.*, .{
+            .tier = if (i == 2) .locomotion else .cognition,
+            .chunk = .{ .x = @intCast(i), .y = 0 },
+            .stagger_phase = @intCast(i),
+        });
+    }
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 16,
+        .tile_size = 32,
+        .chunk_size_tiles = 16,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 16, 16, 16, 16, 16);
+    try frame.reservePathRequests(4, 4);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 512, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 8,
+        .pathfinding = .{
+            .max_frame_requests = 4,
+            .max_pending_requests = 4,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 4,
+            .max_fallback_requests_per_step = 4,
+        },
+    });
+    defer pipeline.deinit();
+
+    // Fixed-step view over chunk 1 → overscan-1 region chunks [0,3).
+    const sim_view = Rect{ .x = 600, .y = 0, .w = 400, .h = 256 };
+    // Per-step render frames: differing alpha-lerped rects, call counts, and a
+    // far rect over chunk 3, including a step with no render at all.
+    const render_rects = [scope_render_test_steps][]const Rect{
+        &.{ .{ .x = 0, .y = 0, .w = 256, .h = 256 }, .{ .x = 37.5, .y = 0, .w = 256, .h = 256 } },
+        &.{.{ .x = 1800, .y = 200, .w = 200, .h = 200 }},
+        &.{},
+        &.{ .{ .x = 1500, .y = 0, .w = 256, .h = 256 }, .{ .x = 1700, .y = 64, .w = 256, .h = 256 }, .{ .x = 1900, .y = 100, .w = 128, .h = 128 } },
+    };
+
+    var trace: ScopeRenderTrace = undefined;
+    for (&trace.steps, render_rects) |*out, rects| {
+        if (render_cadence) {
+            for (rects) |rect| world.setVisibleChunksForWorldRect(rect, sim_view_overscan_chunks);
+        }
+        frame.beginStep();
+        const stats = try pipeline.update(.{
+            .data = &data,
+            .frame = &frame,
+            .world = &world,
+            .player = &player,
+            .thread_system = &threads,
+            .delta_seconds = 1.0 / 60.0,
+            .bounds_width = 2048,
+            .bounds_height = 512,
+            .sim_view = sim_view,
+        });
+        out.* = .{
+            .cognition_region = stats.scope.active_region,
+            .ai_entity_count = stats.ai.entity_count,
+            .stagger_skips = stats.scope.stats.stagger_skips,
+            .tier_commands = @splat(null),
+        };
+        const commands = frame.structural_commands.mergedItems();
+        try std.testing.expect(commands.len <= out.tier_commands.len);
+        for (commands, 0..) |command, i| out.tier_commands[i] = command;
+    }
+    if (render_cadence) {
+        // The render window really did leave the sim view (else the comparison
+        // would be vacuous).
+        const render_region = world.visibleChunkRegion() orelse return error.TestExpectedRenderWindow;
+        try std.testing.expect(!std.meta.eql(render_region, world.chunkRegionForWorldRect(sim_view, sim_view_overscan_chunks).?));
+    } else {
+        try std.testing.expect(world.visibleChunkRegion() == null);
+    }
+    for (agents, 0..) |agent, i| {
+        trace.bodies[i] = data.movementBodyConst(agent).?;
+        trace.agents[i] = data.aiAgentConst(agent).?;
+    }
+
+    // Scope came from the sim view: halo region, stagger gating, and the
+    // queued promotion of the locomotion-seeded agent.
+    const expected_cognition = world.cognitionRegionForWorldRect(sim_view, sim_view_overscan_chunks, cognition_halo_chunks).?;
+    for (trace.steps) |step| {
+        try std.testing.expectEqual(@as(?ActiveRegion, expected_cognition), step.cognition_region);
+        try std.testing.expect(step.stagger_skips > 0);
+        const promote = (step.tier_commands[0] orelse return error.TestExpectedTierCommand).set_simulation_tier;
+        try std.testing.expectEqual(agents[2], promote.entity);
+        try std.testing.expectEqual(SimulationTier.cognition, promote.tier);
+    }
+    return trace;
+}
+
+test "simulation scope region ignores the render visibility window" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // Run A rewrites the render window between steps as varying-alpha render
+    // frames would; run B never renders. Cognition region, think set, stagger
+    // skips, queued tier commands, and movement/AI columns must be identical.
+    const with_render = try runScopeRenderWindowScenario(true);
+    const without_render = try runScopeRenderWindowScenario(false);
+    try std.testing.expectEqualDeep(without_render, with_render);
+}
+
 test "pipeline dual-list perception: think observer acquires off-phase halo hostile" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -2629,7 +2814,11 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
     };
     defer world.deinit();
     _ = try world.addLevel(0);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0);
+    // Migrated from a render window at overscan 0: on this single-chunk world
+    // the sim view's overscan-1 region clamps to the same chunk [0,1).
+    const sim_view = Rect{ .x = 0, .y = 0, .w = 32, .h = 32 };
+    const expected_view = ActiveRegion{ .min = .{ .x = 0, .y = 0 }, .max_exclusive = .{ .x = 1, .y = 1 } };
+    try std.testing.expectEqual(expected_view, world.chunkRegionForWorldRect(sim_view, sim_view_overscan_chunks).?);
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -2663,9 +2852,14 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = sim_view,
     });
 
-    try std.testing.expect(world.cognitionActiveRegion(cognition_halo_chunks) != null);
+    const h: i32 = cognition_halo_chunks;
+    try std.testing.expectEqual(ActiveRegion{
+        .min = .{ .x = -h, .y = -h },
+        .max_exclusive = .{ .x = 1 + h, .y = 1 + h },
+    }, stats.scope.active_region.?);
     try std.testing.expectEqual(@as(usize, 2), stats.perception.candidate_population_count);
     try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
     try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
@@ -4392,7 +4586,14 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     defer meta.deinit();
     var world = try testMinimalMultiLevelWorld(&meta);
     defer world.deinit();
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 800, .h = 450 }, cognition_halo_chunks);
+    // Migrated from a render window at overscan `cognition_halo_chunks`: the
+    // 8×8-tile world is one chunk, so the sim view's overscan-1 region clamps
+    // to the same chunk [0,1) and the cognition halo is unchanged.
+    const sim_view = Rect{ .x = 0, .y = 0, .w = 800, .h = 450 };
+    try std.testing.expectEqual(
+        ActiveRegion{ .min = .{ .x = 0, .y = 0 }, .max_exclusive = .{ .x = 1, .y = 1 } },
+        world.chunkRegionForWorldRect(sim_view, sim_view_overscan_chunks).?,
+    );
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4478,6 +4679,7 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = sim_view,
     };
 
     // Next advance lands on stagger slot 0 (phase-0 cohort); dig once there.

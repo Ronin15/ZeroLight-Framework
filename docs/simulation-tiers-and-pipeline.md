@@ -95,6 +95,18 @@ cognition/locomotion/kinematic/dormant tier by cube distance and emits deferred
 `set_simulation_tier` commands at the commit seam. See `docs/architecture.md`
 for scope/tier ownership and the gating rules per stage.
 
+**Sim-view rule (Slice 49).** Every scope band (cognition halo, tier policy,
+and later coast/spawn bands) derives from the fixed-step
+`SimulationPipelineUpdateContext.sim_view` rect: the scope pass uses
+`WorldSystem.cognitionRegionForWorldRect(sim_view, sim_view_overscan_chunks,
+cognition_halo_chunks)` and the tier policy (and any later scope-band reader)
+uses the pipeline's `simViewRegion(context)`. `GameDemoState.simViewRect()` is
+the only sim-view source (`camera_current`, the camera computed at the end of
+the previous step). No simulation path reads `WorldSystem.visibleChunkRegion()`
+— that window is set by `render` from the interpolated camera for draw culling
+only. A `null` `sim_view` keeps the full-active fallback (no stagger filter, no
+tier changes) used by bare-world pipeline tests.
+
 Late-stage pose order (after movement integrate):
 
 1. `collision_scope_gather` → `collision_detect` → `collision_respond`
