@@ -2,14 +2,11 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: landed (2026-10-05), with open follow-up items to the landed
-work:** the display-gated manual acceptance check (not run: no display in
-the implementing session) and the capacity-audit Checklist item added
-2026-10-06 for level-link growth at the dig commit seam (which replaces the
-live perimeter-ramp refusal once the load-sized link pool is spent). The
-nav dirty-buffer capacity item landed 2026-10-06 (sized by the
-structural-stage event bound). Every other code, test, doc, and bench item
-below is checked.
+**Status: landed (2026-10-05); the capacity-audit follow-ups landed
+2026-10-06** (nav dirty buffers sized by the structural-stage event bound;
+level links grow at the dig commit seam). **Only the display-gated manual
+acceptance check remains open** (not run: no display in the implementing
+sessions). Every code, test, doc, and bench item below is checked.
 No open prerequisite. This
 was a live gameplay defect (confirmed below), so it landed independently of
 49–64D and **before 46 and 65B**. 65B's lane rebuild runs the same chunk patch
@@ -52,15 +49,16 @@ Review follow-up (2026-10-05), each item with a test:
   cursor untouched, so nothing is double-counted or warned twice.
 - **Unbuilt graph:** `linkSlotGeometry` returns `.unresolved` when the graph is
   not valid.
-- **Link storage is a load-time capacity** (CLAUDE.md budgets/capacities rule):
-  - `WorldSystem.reserveLevelLinks` sets a limit, and the demo sizes it as
-    authored links + world chunks × K.
+- **Link storage: load-time initial reservation; dig-seam growth landed
+  2026-10-06** (CLAUDE.md budgets/capacities rule):
+  - `WorldSystem.reserveLevelLinks` sets the initial limit, and the demo sizes
+    it as authored links + world chunks × K.
   - The memory gate and the build's `link_edges` reservation both use
     `levelLinkLimit`.
-  - `addLevelLink` refuses links past the limit, and the ramp dig refuses
-    first (counted in `dig_ramp_refused_link_slots`). This refusal is
-    superseded by the 2026-10-06 link-growth follow-up in the Checklist: a
-    load-sized capacity must not change behavior.
+  - The original load-time refusal (`addLevelLink` refused links past the
+    limit, counted in `dig_ramp_refused_link_slots`) is gone: the dig commit
+    seam grows the pool (see the link-growth Checklist item), so a
+    load-sized capacity no longer changes behavior.
   - A FailingAllocator test covers the world, graph, and system.
 - **Admission:** admission replays the assignment rule, so a cell that is an
   existing but unslotted endpoint is refused.
@@ -438,8 +436,53 @@ multi-worker patch path and the serial one.
     a real demo-config commit step's structural-stage event count stays
     within the bound and the seam keeps the reservation at the grown bound
     (`game_demo_state.zig`).
-- [ ] **Capacity-audit follow-up (2026-10-06) to the landed 64E work:
-      level links grow at the dig commit seam.** Today a perimeter-ramp dig
+- [x] **Capacity-audit follow-up (2026-10-06) to the landed 64E work:
+      level links grow at the dig commit seam.** Landed 2026-10-06. As
+      landed: the seam is `SimulationPipeline.ensureLevelLinkRoom`, called
+      from the `dig_world_edit` stage when this step's `dig_intent == .ramp`
+      and `!world.hasLevelLinkRoom()`, on the main thread before
+      `DigController.process` mutates the world. It grows by a bounded
+      ladder: `grownLevelLinkLimit(len) = len + len/2 +
+      nav_new_links_per_step_max` (0 → 8, 8 → 20, 2048 → 3080), else exactly
+      `len + 1`, whichever `PathfindingSystem.admitsLinkLimit` (the same
+      `budgetForCapacity` gate as the build and `raiseAgentBudget`, charging
+      the live agent ceiling) admits first; `reserveLinkCapacity` (→
+      `NavGraph.reserveLinkEdges`) grows the nav link stores first, then
+      `WorldSystem.ensureLevelLinkCapacity` raises the world's logical limit
+      (exact) and storage (geometric), so an OOM leaves the world untouched
+      and the next press retries. A refused growth keeps the pool, warns
+      once, and the dig refuses the ramp into the new
+      `ramp_refused_link_capacity` counter (perf metric
+      `dig_ramp_refused_link_capacity`); `ramp_refused_link_slots` now counts
+      only the K stride. Per-step stats `nav_link_capacity_grows` and
+      `dig_ramp_refused_link_capacity` (`SimulationPipelineStats`, perf log
+      nav line). `error.LevelLinkLimitReached` is deleted (`grep -rn
+      LevelLinkLimitReached src/` is empty); `addLevelLink` past the limit
+      grows it by one (authoring safety net). Extra sites carried (Slice 72
+      K6, world-data-world-02): the `level_link_limit` field comment (now
+      "the logical link count derived stores size from; set at load, raised
+      at the dig seam, not a refusal bound"), the `demoLevelLinkLimit` doc
+      ("initial reservation"), and the `hasLevelLinkRoom` callers (the seam
+      trigger and the dig's capacity refusal). Tests: `world_system.zig`
+      "addLevelLink past the reserved limit grows the logical limit instead
+      of refusing" (+ FailingAllocator OOM variant); `simulation_pipeline.zig`
+      "a ramp dig past the initial link reservation grows at the dig seam and
+      is routable", "link growth happens only at the dig seam" (world, graph,
+      and pathfinding allocators failing: seven ramps within the grown pool
+      allocate nothing; the ninth's seam growth returns `OutOfMemory` with
+      limit, links, and tile unchanged; after restore it grows to 20 and the
+      following dig + reaction allocate nothing), and "a link growth the nav
+      memory gate refuses keeps the pool and refuses the ramp loudly" (+ the
+      `len + 1` ladder rung); `dig_controller.zig` "a ramp dig with no
+      reserved link room is refused before mutating"; `nav_graph.zig`'s
+      runtime-link proof now expects `OutOfMemory` for the seventh link under
+      the failing world allocator, then lands it and checks parity. Each was
+      confirmed to fail with the growth reverted. Bench (ReleaseFast, 5
+      interleaved reps, `1e951ba` → this commit; the build path now goes
+      through `reserveLinkEdges`): every case within max(3%, spread), 0
+      breaches; `nav-update-links` 8 serial 202.02 → 195.57 us, tuned 196.77
+      → 196.46 us; `nav-update-scattered` 256 serial 3.13 → 3.18 ms (spread
+      5.7%). No group isolates the dig stage. Original item text: today a perimeter-ramp dig
       is refused once the load-sized level-link pool is spent
       (`WorldSystem.addLevelLink` / `ensureLevelLinkCapacity` return
       `error.LevelLinkLimitReached`), so a capacity changes gameplay.

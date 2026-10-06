@@ -35,6 +35,7 @@ pub const autoSizedMaxNavMemoryBytes = @import("pathfinding/nav_memory.zig").aut
 pub const NavLinkSlotGeometry = @import("pathfinding/nav_graph.zig").NavLinkSlotGeometry;
 pub const interiorLinkSlotsAvailable = @import("pathfinding/nav_graph.zig").interiorLinkSlotsAvailable;
 pub const nav_interior_link_slots_per_chunk = @import("pathfinding/types.zig").nav_interior_link_slots_per_chunk;
+pub const nav_new_links_per_step_max = @import("pathfinding/types.zig").nav_new_links_per_step_max;
 
 test {
     _ = @import("pathfinding/types.zig");

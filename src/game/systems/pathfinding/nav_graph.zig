@@ -566,13 +566,9 @@ pub const NavGraph = struct {
 
         self.edge_slack = default_edge_slack;
         try self.buildAbstractGraphs(world);
-        // Reserve the global link edges for every link the world can ever hold (its reserved
-        // limit, which the memory gate above admitted), so runtime links never grow them.
-        if (world) |world_system| {
-            const link_limit = world_system.levelLinkLimit();
-            try self.link_edges.ensureTotalCapacity(self.allocator, link_limit);
-            try self.link_edge_refs.ensureTotalCapacity(self.allocator, 2 * link_limit);
-        }
+        // Reserve the global link edges for the world's reserved link limit (which the memory
+        // gate above admitted), so runtime links within it never grow them.
+        if (world) |world_system| try self.reserveLinkEdges(world_system.levelLinkLimit());
         try self.rebuildLinkEdges(world);
 
         // Pre-reserve each slot's edge buffer and compaction cursor so a patch — serial OR
@@ -1288,6 +1284,14 @@ pub const NavGraph = struct {
         }
     }
 
+    // Grow-only reserve of the global link edges for `link_limit` world links (one edge and
+    // up to two refs per link). Called by the full build and, through
+    // `PathfindingSystem.reserveLinkCapacity`, by the dig commit seam's link growth.
+    pub fn reserveLinkEdges(self: *NavGraph, link_limit: usize) !void {
+        try self.link_edges.ensureTotalCapacity(self.allocator, link_limit);
+        try self.link_edge_refs.ensureTotalCapacity(self.allocator, 2 * link_limit);
+    }
+
     // Rebuilds the global live cross-level link edges (O(links)). A link is live only
     // when BOTH endpoint cells are open in their level masks. A live link references its
     // endpoints by CELL, resolved to portal nodes through the partner level's
@@ -1297,9 +1301,10 @@ pub const NavGraph = struct {
     // O(log(link_count)) rather than scanning the full link_edges slice per portal expansion.
     //
     // Allocation: the full build reserves both arrays to the world's reserved link limit
-    // (`WorldSystem.levelLinkLimit`, the same count the nav memory gate admits), so for a
-    // reserved world the ensure below is a no-op and a runtime link never grows them. Only an
-    // unreserved authoring world (links added without `reserveLevelLinks`) grows here.
+    // (`WorldSystem.levelLinkLimit`, the same count the nav memory gate admits), and the dig
+    // commit seam's link growth re-reserves them (`reserveLinkEdges`) before the world's limit
+    // rises, so a runtime link never grows them here. The ensure below is only the safety net
+    // for a direct authoring add (links added without `reserveLevelLinks`).
     fn rebuildLinkEdges(self: *NavGraph, world: ?*const WorldSystem) !void {
         self.link_edges.clearRetainingCapacity();
         self.link_edge_refs.clearRetainingCapacity();
@@ -2655,7 +2660,7 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     // and one more interior and one more perimeter link are added and folded through the REAL
     // 3-worker threaded chunk patch (forced multi-range), then again through the serial path.
     // Every step allocates zero times (world link storage, link edges, dirty buffers, patch
-    // scratch) and matches a full rebuild.
+    // scratch) and matches a full rebuild. A link past the reservation grows world storage.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -2716,13 +2721,20 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     try std.testing.expect(system.graph.last_patch_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 
-    // The reservation is a hard limit: a seventh link is refused, never grown.
-    try std.testing.expectError(error.LevelLinkLimitReached, world.addLevelLink(rampLink(10, 10)));
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    // The reservation is the initial size, not a refusal bound: a seventh link must grow
+    // world storage, so under the failing world allocator it returns OutOfMemory and leaves
+    // the links and the logical limit unchanged.
+    try std.testing.expectError(error.OutOfMemory, world.addLevelLink(rampLink(10, 10)));
+    try std.testing.expectEqual(@as(usize, 6), world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 6), world.levelLinkLimit());
 
     world.allocator = world_original;
     system.graph.allocator = original;
     system.allocator = original;
+    // With real allocators the seventh link lands (the limit grows by one) and folds in.
+    try world.addLevelLink(rampLink(10, 10));
+    try std.testing.expectEqual(@as(usize, 7), world.levelLinkLimit());
+    _ = try reactOneStep(&system, &frame, &data, &world, null);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
 }
 

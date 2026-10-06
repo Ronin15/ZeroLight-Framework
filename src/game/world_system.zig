@@ -301,10 +301,11 @@ pub const WorldSystem = struct {
 
     level_base_z: std.ArrayList(i32) = .empty,
     level_links: std.ArrayList(LevelLink) = .empty,
-    // Logical level-link capacity reserved at init/load by `reserveLevelLinks`. Null =
-    // unreserved (authoring and small fixtures): `addLevelLink` grows storage. Once set,
-    // `level_links` holds exactly this many reserved entries, runtime links never grow it,
-    // and a link past the limit is refused (`error.LevelLinkLimitReached`).
+    // Logical level-link count derived per-link stores (the nav graph's link edges, the nav
+    // memory gate) size from. Null = unreserved (authoring and small fixtures): `addLevelLink`
+    // grows storage. Set at load by `reserveLevelLinks` and raised at the dig commit seam
+    // (`SimulationPipeline.ensureLevelLinkRoom`); links within it never allocate. Not a
+    // refusal bound: a link past it grows the limit (`ensureLevelLinkCapacity`).
     level_link_limit: ?usize = null,
 
     dense_layers: std.MultiArrayList(DenseLayerRow) = .{},
@@ -1553,21 +1554,26 @@ pub const WorldSystem = struct {
 
     /// Reserves room for `additional` more level links without committing any.
     /// Call before a world mutate that must pair with `addLevelLink` so an OOM
-    /// cannot leave a ramp tile without its link.
-    pub fn ensureLevelLinkCapacity(self: *WorldSystem, additional: usize) !void {
+    /// cannot leave a ramp tile without its link. On a reserved world within its limit
+    /// this is a no-op; past it, storage grows (physically geometric) and the logical
+    /// limit becomes exactly `len + additional`. An OOM leaves the limit and links unchanged.
+    pub fn ensureLevelLinkCapacity(self: *WorldSystem, additional: usize) error{OutOfMemory}!void {
         if (additional == 0) return;
+        const needed = self.level_links.items.len + additional;
         if (self.level_link_limit) |limit| {
-            // Reserved world: storage already holds `limit`; never grow past it.
-            if (additional > limit - self.level_links.items.len) return error.LevelLinkLimitReached;
+            if (needed <= limit) return;
+            try self.level_links.ensureTotalCapacity(self.allocator, needed);
+            self.level_link_limit = needed;
             return;
         }
-        try self.level_links.ensureTotalCapacity(self.allocator, self.level_links.items.len + additional);
+        try self.level_links.ensureTotalCapacity(self.allocator, needed);
     }
 
-    /// Reserves the world's level-link capacity up front (init/load), sized by the caller
-    /// from the loaded world and content (authored links plus a runtime allowance). After
-    /// this, links added within the limit never allocate, and derived per-link stores (the
-    /// nav graph's link edges, the nav memory gate) size from `levelLinkLimit`.
+    /// Reserves the world's level-link capacity (init/load, and the dig commit seam's growth),
+    /// sized by the caller: at load from the loaded world and content (authored links plus a
+    /// runtime allowance); at the seam from `grownLevelLinkLimit`. After this, links added
+    /// within the limit never allocate, and derived per-link stores (the nav graph's link
+    /// edges, the nav memory gate) size from `levelLinkLimit`.
     pub fn reserveLevelLinks(self: *WorldSystem, limit: usize) error{ LevelLinkLimitBelowAuthored, OutOfMemory }!void {
         if (limit < self.level_links.items.len) return error.LevelLinkLimitBelowAuthored;
         try self.level_links.ensureTotalCapacityPrecise(self.allocator, limit);
@@ -1580,7 +1586,8 @@ pub const WorldSystem = struct {
         return self.level_link_limit orelse self.level_links.items.len;
     }
 
-    /// Whether one more level link fits (always true for an unreserved world).
+    /// Whether one more level link fits without growing (always true for an unreserved
+    /// world). The dig commit seam grows the pool when this is false.
     pub fn hasLevelLinkRoom(self: *const WorldSystem) bool {
         const limit = self.level_link_limit orelse return true;
         return self.level_links.items.len < limit;
@@ -1603,15 +1610,17 @@ pub const WorldSystem = struct {
     // Appends a persistent inter-level link. Validates both level indices and
     // that both cells lie inside the tile grid before storing. Explicit error
     // set; allocation is bounded to the single append. Prefer
-    // `ensureLevelLinkCapacity` before any paired tile mutate.
-    pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, LevelLinkLimitReached, OutOfMemory }!void {
+    // `ensureLevelLinkCapacity` before any paired tile mutate. On a reserved world a link
+    // within the limit never allocates; one past it grows the limit by one (the dig commit
+    // seam grows geometrically ahead of the dig, so a runtime ramp never takes this path).
+    pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, OutOfMemory }!void {
         try self.validateLevelIndex(link.level_a);
         try self.validateLevelIndex(link.level_b);
         if (link.cell_a.x >= self.width or link.cell_a.y >= self.height) return error.InvalidWorldCell;
         if (link.cell_b.x >= self.width or link.cell_b.y >= self.height) return error.InvalidWorldCell;
-        if (self.level_link_limit) |limit| {
-            if (self.level_links.items.len >= limit) return error.LevelLinkLimitReached;
-            // Reserved by reserveLevelLinks (ensureTotalCapacityPrecise(limit)).
+        if (self.level_link_limit != null) {
+            try self.ensureLevelLinkCapacity(1);
+            // Storage holds the logical limit (reserveLevelLinks / ensureLevelLinkCapacity).
             self.level_links.appendAssumeCapacity(link);
             return;
         }
@@ -3248,6 +3257,40 @@ test "underground dense layers append in storage order not ascending render dept
     // `submitStaticDenseGeometry` walks dense_layer index order (surface first):
     // depths descend with index, so a linear merge must not assume ascending input.
     try std.testing.expect(grass_depth > dirt_depth and dirt_depth > dirt_dark_depth);
+}
+
+test "addLevelLink past the reserved limit grows the logical limit instead of refusing" {
+    // The reservation is an initial size, not a refusal bound: a link past it grows the
+    // logical limit (exactly) and storage (geometrically); an OOM leaves both unchanged.
+    var world = WorldSystem{ .allocator = std.testing.allocator, .width = 1, .height = 1, .tile_size = 32, .chunk_size_tiles = 1 };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addLevel(10);
+    const link = LevelLink{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 0, .y = 0 }, .level_b = 0, .cell_b = .{ .x = 0, .y = 0 }, .traversal_cost = 1, .bidirectional = true };
+
+    try world.reserveLevelLinks(0);
+    try std.testing.expect(!world.hasLevelLinkRoom());
+    try world.addLevelLink(link);
+    try std.testing.expectEqual(@as(usize, 1), world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 1), world.levelLinkLimit());
+    try world.ensureLevelLinkCapacity(2);
+    try std.testing.expectEqual(@as(usize, 3), world.levelLinkLimit());
+    try std.testing.expect(world.hasLevelLinkRoom());
+
+    // FailingAllocator variant: a growth past physical storage fails cleanly.
+    try world.addLevelLink(link);
+    try world.addLevelLink(link);
+    try std.testing.expect(!world.hasLevelLinkRoom());
+    // Trim physical storage to the limit so the next growth must allocate.
+    world.level_links.shrinkAndFree(std.testing.allocator, world.level_links.items.len);
+    const original = world.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    world.allocator = failing.allocator();
+    defer world.allocator = original;
+    try std.testing.expectError(error.OutOfMemory, world.addLevelLink(link));
+    try std.testing.expectError(error.OutOfMemory, world.ensureLevelLinkCapacity(1));
+    try std.testing.expectEqual(@as(usize, 3), world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 3), world.levelLinkLimit());
 }
 
 test "level link store round-trips and validates inputs" {

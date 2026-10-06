@@ -769,7 +769,7 @@ Out of scope (each item has a named owner):
 | Survivor | Site | Owner and item | This slice's part |
 |---|---|---|---|
 | render-assets-05 | `renderer.zig:198-212` stacked-UI headroom; `render_prep.zig:330-339` | 53B "Stacked-UI headroom retired", then 60 `k_post_state_command_headroom` | none; A2 composes unchanged |
-| world-data-world-02, gameplay-systems-31, pathfinding-26 | level-link pool refusal (`world_system.zig:302-308, 1557-1619`; `dig_controller.zig:151-166`; `nav_graph.zig:569-576, 1299-1346`) | 64E "Capacity-audit follow-up … level links grow at the dig commit seam" | K6 adds the extra comment sites and callers to that item's text |
+| world-data-world-02, gameplay-systems-31, pathfinding-26 | level-link pool refusal (`world_system.zig:302-308, 1557-1619`; `dig_controller.zig:151-166`; `nav_graph.zig:569-576, 1299-1346`) | 64E "Capacity-audit follow-up … level links grow at the dig commit seam" (**landed 2026-10-06**: `SimulationPipeline.ensureLevelLinkRoom`; `LevelLinkLimitReached` deleted) | K6 adds the extra comment sites and callers to that item's text |
 | pathfinding-17 | nav dirty buffers (`system.zig:110-127, 268-280`) | 64E "nav dirty buffers are load-time capacities" (**landed 2026-10-06**: `reserveNavDirty(structuralStageEventBound())` from `SimulationPipeline.reserve`; Batch F is unblocked); 65B "Load-time capacities" (fence window) | B1 makes `SimulationPipeline.reserve` production; C3 re-runs it on growth; K6 records the B1 prerequisite in 64E |
 | pathfinding-29 | `nav_grid.zig:105-129` per-call map | 65B "Load-time capacities" | none |
 | pathfinding-34 | `types.zig:97-100` 4096 ceiling; demo `:223` | 71B "71B.1 capacity-audit follow-up" (**landed 2026-10-06**: content-sized initial ceiling; threshold clamps to the ceiling frozen at reserve) | C3's `raiseAgentBudget` composes; K6 notes it in 71B |
@@ -1077,7 +1077,7 @@ Out of scope (each item has a named owner):
 - [ ] **K5 · Collision-SFX cooldown table justified** (gameplay-systems-36, `audio_controller.zig:26-35, 126-172`).
   - Doc: an audible-concurrency budget and audio policy only.
   - Test, if none exists: with 33 cooling pairs, the entry with the least remaining time is evicted deterministically.
-- [ ] **K6 · Owned-elsewhere sites carry an owner pointer.**
+- [x] **K6 · Owned-elsewhere sites carry an owner pointer.** Landed 2026-10-06 with the owners' items: the 64E nav-dirty and link-growth items, the 71B.1 capacity-audit follow-up, and the 68A `reserveAiRowMap` note.
   - `slice-64e.md:376-430`:
     - the nav-dirty item names Slice 72 B1 as its prerequisite and C3's re-run of `reserve`;
     - the link-growth item lists the extra sites from world-data-world-02: the `level_link_limit` field comment (`world_system.zig:304-307`), the `demoLevelLinkLimit` doc (`game_demo_state.zig:210-214`, which becomes "initial reservation"), and the `hasLevelLinkRoom` callers that re-admit after a grow.

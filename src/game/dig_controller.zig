@@ -98,10 +98,13 @@ pub const DigController = struct {
     /// init and after every full nav build. Defaults to the unresolved sentinel: a ramp dig
     /// with it unresolved returns `error.UnresolvedNavLinkGeometry` before any mutate.
     nav_link_geometry: NavLinkSlotGeometry = .unresolved,
-    /// Telemetry: ramp digs refused for lack of a link slot: the faced cell's nav chunk had
-    /// no free interior link slot, or the world's reserved level-link limit was reached
-    /// (perf metric `dig_ramp_refused_link_slots`).
+    /// Telemetry: ramp digs refused because the faced cell's nav chunk had no free interior
+    /// link slot (the K stride, a layout bound; perf metric `dig_ramp_refused_link_slots`).
     ramp_refused_link_slots: u64 = 0,
+    /// Telemetry: ramp digs refused because the world's level-link pool was full and the dig
+    /// commit seam could not grow it (the nav-memory ceiling refused the growth; perf metric
+    /// `dig_ramp_refused_link_capacity`). Zero while growth is admitted.
+    ramp_refused_link_capacity: u64 = 0,
     /// Telemetry: plane-traversal steps whose landing-carve count exceeded
     /// `plane_scratch_reserved` (perf metric `dig_plane_scratch_grown`), whether or not the
     /// scratch's rounded-up capacity absorbed it; the stage grows the scratch first when it
@@ -167,14 +170,19 @@ pub const DigController = struct {
             if (player.current_level == 0 or world.rampLinkOtherLevel(player.current_level, cell) != null) return;
             // Runtime check (not a Debug-only assert), matching UnresolvedDigTiles above.
             if (!self.nav_link_geometry.isResolved()) return error.UnresolvedNavLinkGeometry;
+            // Refuse a ramp when the world's level-link pool is still full: the dig commit seam
+            // (`SimulationPipeline.ensureLevelLinkRoom`) grows it before this runs, so a full
+            // pool here means the nav-memory ceiling refused the growth (the link would have
+            // to grow storage on the hot path). Same no-mutate early return as the
+            // existing-link no-op.
+            if (!world.hasLevelLinkRoom()) {
+                self.ramp_refused_link_capacity += 1;
+                return;
+            }
             // Refuse a ramp whose new interior endpoint would find its nav chunk's fixed link
-            // slots full (the link would be inert to NPC pathing), or the world's reserved
-            // level-link limit is reached (the link would have to grow storage on the hot
-            // path). Same no-mutate early return as the existing-link no-op; the player
-            // re-presses to dig elsewhere.
-            if (!world.hasLevelLinkRoom() or
-                !interiorLinkSlotsAvailable(world.levelLinks(), cell, self.nav_link_geometry))
-            {
+            // slots full (the link would be inert to NPC pathing): the K stride, a layout
+            // bound. The player re-presses to dig elsewhere.
+            if (!interiorLinkSlotsAvailable(world.levelLinks(), cell, self.nav_link_geometry)) {
                 self.ramp_refused_link_slots += 1;
                 return;
             }
@@ -1004,11 +1012,14 @@ test "a ninth interior ramp in one nav chunk is refused" {
     try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_slots);
 }
 
-test "a ramp dig past the world's reserved level-link limit is refused without growing storage" {
+test "a ramp dig with no reserved link room is refused before mutating" {
+    // The dig commit seam grows a full pool before the dig runs; reaching the dig with the
+    // pool still full means the nav-memory ceiling refused the growth, so the dig refuses
+    // without growing storage and counts it as a capacity refusal (not the K stride).
     var tw = try TestWorld.init(.right, 1);
     defer tw.deinit();
     var dig = try testDigController(&tw.meta);
-    // Reserved at load with no room for a runtime link.
+    // Reserved with no room for a runtime link (the seam's growth was refused).
     try tw.world.reserveLevelLinks(0);
 
     const floor = tw.world.denseFloorLayerForLevel(1).?;
@@ -1028,7 +1039,8 @@ test "a ramp dig past the world's reserved level-link limit is refused without g
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
-    try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_slots);
+    try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_capacity);
+    try std.testing.expectEqual(@as(u64, 0), dig.ramp_refused_link_slots);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 

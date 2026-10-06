@@ -875,12 +875,17 @@ classifies, plus the link cursor's two endpoints per link), and the deduped leve
 level count at the nav build; a step past the bound still grows rather than drops, counted as
 `nav_dirty_buffer_grown` with one warn. A genuine topology expansion past it (an unblock opening
 more portals than any prior build) does one bounded amortized growth, which is
-acceptable on this cold, event-triggered path. Level-link storage is a load-time
-CAPACITY: the state reserves it with `WorldSystem.reserveLevelLinks` (the demo sizes it from
-the loaded world as authored links + world chunks × `nav_interior_link_slots_per_chunk`), the
-full nav build reserves `link_edges`/`link_edge_refs` to that same `levelLinkLimit`, and a
-ramp dig past the limit is refused (`dig_ramp_refused_link_slots`) instead of growing storage,
-so runtime links never allocate (FailingAllocator-proven over world, graph, and system). The
+acceptable on this cold, event-triggered path. Level-link storage has a load-time
+initial reservation: the state reserves it with `WorldSystem.reserveLevelLinks` (the demo sizes
+it from the loaded world as authored links + world chunks × `nav_interior_link_slots_per_chunk`),
+and the full nav build reserves `link_edges`/`link_edge_refs` to that same `levelLinkLimit`. A
+ramp press that finds the pool full grows it at the dig commit seam
+(`SimulationPipeline.ensureLevelLinkRoom`, main thread, before the dig mutates the world): a
+bounded ladder (`grownLevelLinkLimit`, else `len + 1`) admitted by the same nav-memory gate,
+nav link edges first, then the world's limit. Only the 8-per-chunk interior stride (a layout
+bound, `dig_ramp_refused_link_slots`) and a refused memory ceiling
+(`dig_ramp_refused_link_capacity`, warn once) refuse a ramp; links within the grown pool never
+allocate (FailingAllocator-proven over world, graph, and system). The
 `max_nav_memory_bytes` gate
 estimates nav memory from realistic structure (portals bounded by chunk-border
 cells, CSR edges by portal count times a small abstract degree), not a per-chunk

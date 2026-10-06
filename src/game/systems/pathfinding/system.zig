@@ -374,6 +374,22 @@ pub const PathfindingSystem = struct {
         return true;
     }
 
+    /// Whether the nav-memory gate admits a world level-link limit of `link_limit`: the same
+    /// `budgetForCapacity` check the build and `raiseAgentBudget` use, charged against the
+    /// live agent ceiling. Pure; the dig commit seam's link growth asks it first.
+    pub fn admitsLinkLimit(self: *const PathfindingSystem, link_limit: usize) bool {
+        const memory_budget = nav_memory.budgetForCapacity(self.capacity, @max(@as(usize, 1), self.graph.levelCount()), link_limit);
+        memory_budget.check(self.graph.width, self.graph.height) catch return false;
+        return true;
+    }
+
+    /// Reserves every pathfinding store sized per world level link for `link_limit` links
+    /// (today the nav graph's link edges). Grow-only. Called by the dig commit seam BEFORE the
+    /// world's limit rises, so an OOM leaves the world untouched.
+    pub fn reserveLinkCapacity(self: *PathfindingSystem, link_limit: usize) !void {
+        try self.graph.reserveLinkEdges(link_limit);
+    }
+
     /// Grow half of the elastic resize: when `agent_count` derives more than the live
     /// capacity, grows (at least 2x, clamped to `agentBudget()`) preserving live state.
     /// Called from the pipeline's population seam and from `beginUpdate`'s safety net.

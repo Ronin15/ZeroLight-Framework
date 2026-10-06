@@ -89,10 +89,11 @@ Goal:
   `WorldSystem.addLevelLink`). The world's load-time `reserveLevelLinks`
   (sized by `GameDemoState` from the authored links plus
   `nav_interior_link_slots_per_chunk` per world chunk) is only the initial
-  size: per Slice 64E's link-growth follow-up, `level_links`, `link_edges`,
-  and `link_edge_refs` grow geometrically at the dig commit seam (main
-  thread), and only the 8-per-chunk interior stride (a layout bound)
-  refuses. Slice 64E removed `groupLinkCellRuns` and its per-build
+  size: per Slice 64E's link-growth follow-up (landed 2026-10-06),
+  `level_links`, `link_edges`, and `link_edge_refs` grow geometrically at the
+  dig commit seam (main thread; `SimulationPipeline.ensureLevelLinkRoom` →
+  `PathfindingSystem.reserveLinkCapacity`), and only the 8-per-chunk interior
+  stride (a layout bound) or a refused nav-memory ceiling refuses. Slice 64E removed `groupLinkCellRuns` and its per-build
   temporary `allocator.alloc`: interior link endpoints live in the
   fixed-stride `chunk_link_cells` table (`chunk_count ×
   nav_interior_link_slots_per_chunk`, sized from the dimensions in
@@ -252,7 +253,7 @@ nav chunks per level (`chunkCount()`), and `ct` = `chunk_tiles`:
 | `overlay_entries` | `L × C` | one entry per changed `(level, chunk)` |
 | `overlay_cells` | `L × C × ct²` | one `ct²` stride slot per entry; edge chunks keep the full stride |
 | `eviction_spans` | the fence-window `nav_dirty_edits` + `nav_dirty_cell_spans` reserve (see the fence) | one span per held cell edit or cell span |
-| `links` | `world.levelLinkLimit()`, re-reserved at the dig commit seam (main thread) whenever 64E's link-growth follow-up grows the world's link store | the snapshot is a prefix of the world's link set (64E) |
+| `links` | `world.levelLinkLimit()`, re-reserved at the dig commit seam (main thread): 65B adds its plan `links` buffer to `PathfindingSystem.reserveLinkCapacity`, which `SimulationPipeline.ensureLevelLinkRoom` calls before the world's link store grows (64E) | the snapshot is a prefix of the world's link set (64E) |
 
 The only plan growth left is `eviction_spans` after a dirty-buffer overflow
 (a window whose marks exceeded the fence-window reserve, which pathfinding

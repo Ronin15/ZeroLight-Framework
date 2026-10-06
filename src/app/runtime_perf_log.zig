@@ -110,6 +110,8 @@ pub const Metric = enum {
     pathfinding_link_endpoints_unslotted,
     nav_dirty_buffer_grown,
     dig_ramp_refused_link_slots,
+    dig_ramp_refused_link_capacity,
+    nav_link_capacity_grows,
     dig_plane_scratch_grown,
     steering_static_snapshot_grown,
     population_capacity_grows,
@@ -721,7 +723,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} chunks_patched={} edge_cap_fallback={} region_invalidated={} links_deferred={} link_endpoints_unslotted={} dirty_buffer_grown={} dig_ramp_refused_link_slots={} dig_plane_scratch_grown={} steering_static_snapshot_grown={} population_capacity_grows={} path_agent_budget_raise_refused={}",
+            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} chunks_patched={} edge_cap_fallback={} region_invalidated={} links_deferred={} link_endpoints_unslotted={} dirty_buffer_grown={} dig_ramp_refused_link_slots={} dig_ramp_refused_link_capacity={} link_capacity_grows={} dig_plane_scratch_grown={} steering_static_snapshot_grown={} population_capacity_grows={} path_agent_budget_raise_refused={}",
             .{
                 elapsed_s,
                 self.metricValue(.nav_dirty_chunks),
@@ -735,6 +737,8 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.pathfinding_link_endpoints_unslotted),
                 self.metricValue(.nav_dirty_buffer_grown),
                 self.metricValue(.dig_ramp_refused_link_slots),
+                self.metricValue(.dig_ramp_refused_link_capacity),
+                self.metricValue(.nav_link_capacity_grows),
                 self.metricValue(.dig_plane_scratch_grown),
                 self.metricValue(.steering_static_snapshot_grown),
                 self.metricValue(.population_capacity_grows),

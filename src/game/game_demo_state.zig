@@ -185,11 +185,12 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 
-/// Level-link capacity reserved at load, sized from the loaded world: its authored links
+/// Initial level-link reservation at load, sized from the loaded world: its authored links
 /// plus one nav chunk's worth of interior link slots (`nav_interior_link_slots_per_chunk`)
 /// per world chunk for runtime ramps. Interior ramps can never exceed that density anyway
 /// (the dig refuses a ninth distinct interior ramp per nav chunk); perimeter ramps share the
-/// same pool, and a dig past the limit is refused rather than growing storage on the hot path.
+/// same pool, and ramps past it grow the pool at the dig commit seam
+/// (`SimulationPipeline.ensureLevelLinkRoom`, gated by the nav-memory ceiling).
 fn demoLevelLinkLimit(world: *const WorldSystem) usize {
     const world_chunks = @as(usize, world.chunksX()) * @as(usize, world.chunksY());
     return world.levelLinks().len + world_chunks * nav_interior_link_slots_per_chunk;
@@ -394,8 +395,8 @@ pub const GameDemoState = struct {
         // does not fire, so there is no double-deinit.
         var world = world_value;
         errdefer world.deinit();
-        // Reserve the world's level-link capacity up front (before the nav build sizes its
-        // link edges and memory gate from it) so runtime ramps never grow link storage.
+        // Reserve the world's initial level-link capacity up front (before the nav build sizes
+        // its link edges and memory gate from it); ramps past it grow at the dig commit seam.
         try world.reserveLevelLinks(demoLevelLinkLimit(&world));
         const pop_cap = deriveDemoPopulationCapacity(mover_count);
         // Cold path: load the data-driven AI archetype catalog once before spawn.
