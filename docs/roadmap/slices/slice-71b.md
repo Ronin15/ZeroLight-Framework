@@ -573,7 +573,12 @@ Narrowphase, contact merge, and response are unchanged.
       `reserve` and `groupFieldThreshold` clamps to it, so a C3 seam raise
       never moves the threshold (test "a seam raise never moves the
       group-field threshold"); a nav-memory test pins
-      `autoSizedMaxNavMemoryBytes(content-sized) <= autoSizedMaxNavMemoryBytes(4096)`.
+      `budgetForCapacity(content-sized).requiredBytes < budgetForCapacity(4096).requiredBytes`
+      (362,372,128 B < 512,998,432 B at battle scale, 0 links). Review
+      follow-up: it first compared `autoSizedMaxNavMemoryBytes`, which rounds
+      both to 536,870,912 B and so passed even with the ceiling pinned back to
+      4096; the unrounded comparison fails then (confirmed by temporarily
+      restoring the fixed 4096).
       The no-change spot check (`pathfinding-shared-goal`,
       `pathfinding-group-field-detour`, 5 interleaved ReleaseFast reps) is
       within noise: shared-goal 1024 serial 22.39 → 22.30 us, tuned 22.03 →

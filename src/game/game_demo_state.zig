@@ -1364,9 +1364,14 @@ test "content-sized agent ceiling never needs more nav memory than the retired f
     const capacity = proceduralPathfindingCapacity(1, 0, population);
     var fixed = capacity;
     fixed.max_agent_budget = 4096;
-    const after = autoSizedMaxNavMemoryBytes(capacity, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles, 0);
-    const before = autoSizedMaxNavMemoryBytes(fixed, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles, 0);
-    try std.testing.expect(after <= before);
+    // Compare the unrounded requirement: `autoSizedMaxNavMemoryBytes` rounds both up to the
+    // same power of two (536,870,912 B), which would hide the difference. At battle scale the
+    // ceiling is 2053 agents: 362,372,128 B vs 512,998,432 B for the fixed 4096.
+    const nav_memory = @import("systems/pathfinding/nav_memory.zig");
+    const after = nav_memory.budgetForCapacity(capacity, procedural_dense_layer_count, 0).requiredBytes(procedural_world_width_tiles, procedural_world_height_tiles);
+    const before = nav_memory.budgetForCapacity(fixed, procedural_dense_layer_count, 0).requiredBytes(procedural_world_width_tiles, procedural_world_height_tiles);
+    try std.testing.expect(capacity.max_agent_budget < fixed.max_agent_budget);
+    try std.testing.expect(after < before);
 }
 
 test "demo spawns atlas-backed moving actors" {
