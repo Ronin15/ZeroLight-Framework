@@ -16,6 +16,8 @@
 //! Emits the resulting `world_tile_changed` event for the post-commit nav re-mask.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const InputState = @import("../app/input.zig").InputState;
 const DataSystem = @import("data_system.zig").DataSystem;
@@ -79,8 +81,11 @@ pub const DigController = struct {
     // Last grid cell the player occupied, so plane traversal (fall/ramp) fires only
     // on cell entry — anti-oscillation and the one-level-per-fall guard.
     player_last_cell: ?CellCoord = null,
-    /// Fall-landing tile changes for one step. Reserved once; the step path
-    /// only clears and `appendAssumeCapacity`s.
+    /// Fall-landing tile changes for one step. Reserved at pipeline init to the
+    /// `.plane_traversal` event budget. `applyPlaneTraversalStage` preflights it to the
+    /// step's landing-carve count before any carve, growing it (counted in
+    /// `plane_scratch_grown`) when that reservation is short. After that the step only
+    /// `appendAssumeCapacity`s.
     plane_tile_changes: std.ArrayList(WorldTileChangedEvent) = .empty,
     scratch_allocator: ?std.mem.Allocator = null,
     /// Nav slot geometry the ramp dig checks before adding a `LevelLink`, so a ramp that
@@ -93,6 +98,11 @@ pub const DigController = struct {
     /// no free interior link slot, or the world's reserved level-link limit was reached
     /// (perf metric `dig_ramp_refused_link_slots`).
     ramp_refused_link_slots: u64 = 0,
+    /// Telemetry: plane-traversal steps whose landing-carve count exceeded
+    /// `plane_tile_changes`' capacity, so the stage grew it before any carve (perf metric
+    /// `dig_plane_scratch_grown`). Nonzero means the `.plane_traversal` reservation is short
+    /// of the live population; the first growth warns once.
+    plane_scratch_grown: u64 = 0,
 
     pub fn init(config: DigConfig) DigController {
         return .{ .ramp_tile = config.ramp_tile, .tunnel_tile = config.tunnel_tile };
@@ -328,6 +338,22 @@ pub const DigController = struct {
         try self.plane_tile_changes.ensureTotalCapacity(allocator, capacity);
     }
 
+    /// Cold growth of the landing-carve scratch to `needed`, taken on the main thread
+    /// before any world mutation. Counts the growth only after it succeeds; the first
+    /// growth warns once (release-visible, compiled out of tests).
+    fn growPlaneScratch(self: *DigController, needed: usize) !void {
+        @branchHint(.cold);
+        const allocator = self.scratch_allocator orelse return error.PlaneScratchUnreserved;
+        try self.plane_tile_changes.ensureTotalCapacity(allocator, needed);
+        self.plane_scratch_grown += 1;
+        if (comptime logging.enabled(.warn) and !builtin.is_test) {
+            if (self.plane_scratch_grown == 1) logging.game.warn(
+                "plane traversal: {d} landing carves exceeded the reserved scratch; grew to {d} (reservation short of the live population)",
+                .{ needed, self.plane_tile_changes.capacity },
+            );
+        }
+    }
+
     pub fn deinit(self: *DigController) void {
         if (self.scratch_allocator) |allocator| self.plane_tile_changes.deinit(allocator);
         self.* = undefined;
@@ -335,8 +361,8 @@ pub const DigController = struct {
 
     /// Player + NPC plane traversal for one step. Event capacity, dense GPU edit
     /// capacity, and missing `world_level` rows are reserved before any carve.
-    /// Landing tile changes go into `plane_tile_changes`, which must already be
-    /// reserved to at least the movement-body ceiling.
+    /// Landing tile changes go into `plane_tile_changes`, which is preflighted to this
+    /// step's carve count (grown and counted if short) before any carve.
     pub fn applyPlaneTraversalStage(
         self: *DigController,
         world: *WorldSystem,
@@ -363,7 +389,7 @@ pub const DigController = struct {
                 if (data.worldLevelConst(entity) == null) missing_world_level += 1;
             }
         }
-        std.debug.assert(pending_carves <= scratch.capacity);
+        if (pending_carves > scratch.capacity) try self.growPlaneScratch(pending_carves);
         try frame.events.ensureEventAppendCapacity(pending_carves);
         try world.ensureDenseTileEditCapacity(pending_carves);
 
@@ -569,6 +595,143 @@ test "DigController plane scratch reserved-then-push is allocation-free (Failing
     dig.plane_tile_changes.appendAssumeCapacity(change);
     try std.testing.expectEqual(@as(usize, 2), dig.plane_tile_changes.items.len);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+/// Adds a locomotion-tier wandering NPC on level 0 whose body enters `to` from `from`
+/// this step (previous position on `from`, current on `to`), so plane traversal sees a
+/// cell entry. Mirrors the pipeline's plane-traversal NPC fixtures.
+fn addCellEntryNpc(data: *DataSystem, from: CellCoord, to: CellCoord) !EntityId {
+    const npc = try data.createEntity();
+    try data.setMovementBody(npc, .{});
+    try data.setPrimitiveVisual(npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(npc, 0);
+    try data.setSimulationTier(npc, .locomotion);
+    const body = data.movementBodyPtr(npc).?;
+    body.previous_x.* = @as(f32, @floatFromInt(from.x)) * 32;
+    body.previous_y.* = @as(f32, @floatFromInt(from.y)) * 32;
+    body.position_x.* = @as(f32, @floatFromInt(to.x)) * 32;
+    body.position_y.* = @as(f32, @floatFromInt(to.y)) * 32;
+    return npc;
+}
+
+/// Opens surface holes at (4,3) and (6,3) with one NPC entering each this step.
+fn setUpTwoFalls(tw: *TestWorld) !void {
+    const floor0 = tw.world.denseFloorLayerForLevel(0).?;
+    _ = try tw.world.clearDenseTile(floor0, 4, 3);
+    _ = try tw.world.clearDenseTile(floor0, 6, 3);
+    _ = try addCellEntryNpc(&tw.data, .{ .x = 3, .y = 3 }, .{ .x = 4, .y = 3 });
+    _ = try addCellEntryNpc(&tw.data, .{ .x = 5, .y = 3 }, .{ .x = 6, .y = 3 });
+}
+
+fn worldTileChangesOf(frame: *const SimulationFrame, out: []WorldTileChangedEvent) ![]WorldTileChangedEvent {
+    var count: usize = 0;
+    for (frame.events.mergedItems()) |event| switch (event.payload) {
+        .world_tile_changed => |change| {
+            if (count == out.len) return error.TestUnexpectedResult;
+            out[count] = change;
+            count += 1;
+        },
+        else => {},
+    };
+    return out[0..count];
+}
+
+test "plane traversal grows an under-reserved scratch before any carve and matches a reserved run" {
+    var tw_short = try TestWorld.init(.right, 0);
+    defer tw_short.deinit();
+    var tw_reserved = try TestWorld.init(.right, 0);
+    defer tw_reserved.deinit();
+    try setUpTwoFalls(&tw_short);
+    try setUpTwoFalls(&tw_reserved);
+
+    var dig_short = try testDigController(&tw_short.meta);
+    defer dig_short.deinit();
+    // A zero reserve sets the allocator but leaves capacity 0, so two carves must grow it.
+    try dig_short.reservePlaneScratch(std.testing.allocator, 0);
+    var dig_reserved = try testDigController(&tw_reserved.meta);
+    defer dig_reserved.deinit();
+    try dig_reserved.reservePlaneScratch(std.testing.allocator, 4);
+
+    var frame_short = SimulationFrame.init(std.testing.allocator);
+    defer frame_short.deinit();
+    try frame_short.reserveStreams(4, 16, 8, 8, 8, 8);
+    frame_short.beginStep();
+    var frame_reserved = SimulationFrame.init(std.testing.allocator);
+    defer frame_reserved.deinit();
+    try frame_reserved.reserveStreams(4, 16, 8, 8, 8, 8);
+    frame_reserved.beginStep();
+
+    try dig_short.applyPlaneTraversalStage(&tw_short.world, &tw_short.data, &tw_short.player, &frame_short);
+    try dig_reserved.applyPlaneTraversalStage(&tw_reserved.world, &tw_reserved.data, &tw_reserved.player, &frame_reserved);
+
+    // Capacity changed only the telemetry: both runs carve both landings.
+    inline for (.{ &tw_short, &tw_reserved }) |tw| {
+        const floor1 = tw.world.denseFloorLayerForLevel(1).?;
+        try std.testing.expect(!tw.world.denseTileBlocksMovement(floor1, 4, 3));
+        try std.testing.expect(!tw.world.denseTileBlocksMovement(floor1, 6, 3));
+    }
+    try std.testing.expectEqual(@as(u64, 1), dig_short.plane_scratch_grown);
+    try std.testing.expect(dig_short.plane_tile_changes.capacity >= 2);
+    try std.testing.expectEqual(@as(u64, 0), dig_reserved.plane_scratch_grown);
+
+    // Same published changes, same order ((4,3) then (6,3)).
+    var short_buf: [4]WorldTileChangedEvent = undefined;
+    var reserved_buf: [4]WorldTileChangedEvent = undefined;
+    const short_changes = try worldTileChangesOf(&frame_short, &short_buf);
+    const reserved_changes = try worldTileChangesOf(&frame_reserved, &reserved_buf);
+    try std.testing.expectEqual(@as(usize, 2), short_changes.len);
+    try std.testing.expectEqual(reserved_changes.len, short_changes.len);
+    for (short_changes, reserved_changes) |a, b| try std.testing.expectEqual(b, a);
+    try std.testing.expectEqual(@as(u16, 4), short_changes[0].x);
+    try std.testing.expectEqual(@as(u16, 6), short_changes[1].x);
+    try std.testing.expectEqual(@as(usize, 2), frame_short.events.stats.world_tile_changed);
+    try std.testing.expectEqual(@as(usize, 2), frame_reserved.events.stats.world_tile_changed);
+}
+
+test "plane traversal within the scratch reserve is allocation-free (FailingAllocator)" {
+    var tw = try TestWorld.init(.right, 0);
+    defer tw.deinit();
+    try setUpTwoFalls(&tw);
+
+    var dig = try testDigController(&tw.meta);
+    defer dig.deinit();
+    try dig.reservePlaneScratch(std.testing.allocator, 2);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 16, 8, 8, 8, 8);
+    frame.beginStep();
+    // Warm the event append path the stage preflights and publishes through.
+    try frame.events.ensureEventAppendCapacity(2);
+
+    const original_dig = dig.scratch_allocator.?;
+    const original_frame = frame.allocator;
+    const original_events = frame.events.stream.allocator;
+    const original_data = tw.data.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const fail_alloc = failing.allocator();
+    dig.scratch_allocator = fail_alloc;
+    frame.allocator = fail_alloc;
+    frame.events.stream.allocator = fail_alloc;
+    tw.data.allocator = fail_alloc;
+    // Declared after the deinit defers, so it restores the real allocators first (LIFO).
+    defer {
+        dig.scratch_allocator = original_dig;
+        frame.allocator = original_frame;
+        frame.events.stream.allocator = original_events;
+        tw.data.allocator = original_data;
+    }
+
+    try dig.applyPlaneTraversalStage(&tw.world, &tw.data, &tw.player, &frame);
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(u64, 0), dig.plane_scratch_grown);
+    try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 }
 
 fn runDig(tw: *TestWorld, dig: DigController, intent: @import("simulation.zig").DigIntent) !SimulationFrame {

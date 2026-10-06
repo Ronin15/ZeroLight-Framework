@@ -108,6 +108,7 @@ pub const Metric = enum {
     pathfinding_links_deferred,
     pathfinding_link_endpoints_unslotted,
     dig_ramp_refused_link_slots,
+    dig_plane_scratch_grown,
     movement_bodies,
     collision_bodies,
     collision_candidate_pairs,
@@ -713,7 +714,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} chunks_patched={} edge_cap_fallback={} region_invalidated={} links_deferred={} link_endpoints_unslotted={} dig_ramp_refused_link_slots={}",
+            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} chunks_patched={} edge_cap_fallback={} region_invalidated={} links_deferred={} link_endpoints_unslotted={} dig_ramp_refused_link_slots={} dig_plane_scratch_grown={}",
             .{
                 elapsed_s,
                 self.metricValue(.nav_dirty_chunks),
@@ -726,6 +727,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.pathfinding_links_deferred),
                 self.metricValue(.pathfinding_link_endpoints_unslotted),
                 self.metricValue(.dig_ramp_refused_link_slots),
+                self.metricValue(.dig_plane_scratch_grown),
             },
         );
         log.debug(

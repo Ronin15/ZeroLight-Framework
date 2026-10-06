@@ -2,7 +2,7 @@
 
 ## Slice 72: Live Capacity Sizing Pass
 
-**Status: not started.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
+**Status: in progress — Batch A.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
 
 **Goal.** The 2026-10-06 capacity audit sized the *planned* slices. This slice applies the same engine practice to every capacity in the *live* `src/` tree. For each data structure, the question is what an experienced engine programmer would do and why. The default answer is to keep it. A change lands only when its concrete benefit outweighs its cost and risk.
 
@@ -214,7 +214,7 @@ Out of scope (each item has a named owner):
 - **Where:** `dig_controller.zig:366` (assert), `:387`, `:392` (`appendAssumeCapacity`); the reserve is at `simulation_pipeline.zig:719`.
 - **Now:** a Debug-only `std.debug.assert(pending_carves <= scratch.capacity)`. In ReleaseFast an overrun is a silent heap write.
 - **Change:**
-  - Replace the assert with `try scratch.ensureTotalCapacity(self.scratch_allocator orelse return error.PlaneScratchUnreserved, pending_carves);`. It sits ahead of the existing event and dense-edit preflights and before any carve.
+  - Replace the assert with `if (pending_carves > scratch.capacity) try self.growPlaneScratch(pending_carves);`. It sits ahead of the existing event and dense-edit preflights and before any carve. The cold `growPlaneScratch` resolves `self.scratch_allocator orelse return error.PlaneScratchUnreserved` only on the growth branch, so an unreserved controller with no carves still runs (resolving the allocator every step would fail it).
   - On an actual growth, increment `plane_scratch_grown: u64` (perf metric `dig_plane_scratch_grown`) and log one warn.
   - There is no loud `error.PlaneScratchCapacityExceeded`. That variant was rejected; see the Kept table.
 - **Benefit / cost:** closes a latent out-of-bounds write for one compare per step.
@@ -703,9 +703,9 @@ Out of scope (each item has a named owner):
     - one pathfinding update with every mover requesting.
   - Tests: one `suite.zig` formatting test for the byte fields, pure utility against stubs. No production test calls the bench.
   - Bench: record baselines at sides {16, 256, 512} before D2, F and G land.
-- [ ] **A1 · Plane-traversal scratch preflight** (§A1).
+- [x] **A1 · Plane-traversal scratch preflight** (§A1).
   - Tests in `dig_controller.zig`:
-    - scratch reserved to 1 and two NPCs entering hole cells in the same step: both carves land, `plane_scratch_grown == 1`, and the events and dense edits match the serial expectation;
+    - scratch reserved to 0 (`reservePlaneScratch(allocator, 0)`: sets the allocator, leaves capacity 0; a reserve of 1 rounds up to 6 entries and never grows) and two NPCs entering hole cells in the same step: both carves land, `plane_scratch_grown == 1`, and the carved tiles and `world_tile_changed` events (same order) match a run reserved to 4 (headless worlds have no GPU tile buffer, so dense edits are empty in both);
     - the existing FailingAllocator test (`:549`) still passes;
     - with a `FailingAllocator` installed after reserve, a step with `pending_carves ≤ reserve` allocates zero times.
   - Bench: none. No group isolates the dig stage, and the cost is one compare per step.

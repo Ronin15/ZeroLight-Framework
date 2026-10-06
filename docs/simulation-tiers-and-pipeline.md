@@ -112,7 +112,8 @@ Late-stage pose order (after movement integrate):
 1. `collision_scope_gather` → `collision_detect` → `collision_respond`
 2. `bounds_and_tile_gate` (world bounds clamp + solid-tile gate)
 3. `plane_traversal` (ramp follow / one-level fall; batches landing-cell tile
-   events into one `finishWrite`)
+   events into one `finishWrite`; landing-carve scratch is preflighted before any
+   carve; a short reservation grows and is counted in `dig_plane_scratch_grown`)
 4. `chunk_derive` → `action_react` → `tier_policy`
 
 The tile gate runs **after** collision response so a contact push into solid

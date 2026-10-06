@@ -477,6 +477,9 @@ pub const SimulationPipelineStats = struct {
     destructibles_hit: usize = 0,
     /// Ramp digs refused this step because the nav chunk's fixed interior link slots were full.
     dig_ramp_refused_link_slots: usize = 0,
+    /// Plane-traversal landing-carve scratch growths this step (reservation short of the
+    /// live population; zero in steady state).
+    dig_plane_scratch_grown: usize = 0,
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -593,6 +596,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
         perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
         perf.recordMetric(.dig_ramp_refused_link_slots, metric(self.dig_ramp_refused_link_slots));
+        perf.recordMetric(.dig_plane_scratch_grown, metric(self.dig_plane_scratch_grown));
     }
 };
 
@@ -983,6 +987,7 @@ pub const SimulationPipeline = struct {
         stimuli_promoted: usize = 0,
         action_intents_dropped: usize = 0,
         dig_ramp_refused_link_slots: usize = 0,
+        dig_plane_scratch_grown: usize = 0,
         cognition_region: ?ActiveRegion = null,
         ai_halo_indices: []const u32 = &[_]u32{},
         ai_cognition_indices: []const u32 = &[_]u32{},
@@ -1041,6 +1046,7 @@ pub const SimulationPipeline = struct {
                 .destructibles_destroyed = self.destructible.destroyed,
                 .destructibles_hit = self.destructible.hits,
                 .dig_ramp_refused_link_slots = self.dig_ramp_refused_link_slots,
+                .dig_plane_scratch_grown = self.dig_plane_scratch_grown,
             };
         }
     };
@@ -1310,7 +1316,9 @@ pub const SimulationPipeline = struct {
     /// standing over a hole. Landing carves are one event range.
     fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        const grown_before = self.dig.plane_scratch_grown;
         try self.dig.applyPlaneTraversalStage(context.world, context.data, context.player, context.frame);
+        step.dig_plane_scratch_grown = @intCast(self.dig.plane_scratch_grown - grown_before);
     }
 
     /// Recompute each body's chunk from its settled position. Consumers are tier

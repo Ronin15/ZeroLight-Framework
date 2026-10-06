@@ -245,7 +245,7 @@ same change):
 | --- | --- | --- |
 | `interact_held_last` | hashed | input edge latch |
 | `sensory` | hashed | `SensoryBus.hashSimulationState`: `deferred_stimulus_count` + live entries; `sticky_count` + live entries + `sticky_remaining[0..sticky_count]`; `config` and `hearing_stimuli_scratch` excluded |
-| `dig` | hashed | `DigController.hashSimulationState`: three latches + `player_last_cell` (optional fold); `ramp_tile`, `tunnel_tile`, `plane_tile_changes`, `scratch_allocator`, and 64E's `ramp_refused_link_slots` telemetry + `nav_link_geometry` config excluded |
+| `dig` | hashed | `DigController.hashSimulationState`: three latches + `player_last_cell` (optional fold); `ramp_tile`, `tunnel_tile`, `plane_tile_changes`, `scratch_allocator`, 64E's `ramp_refused_link_slots` telemetry + `nav_link_geometry` config, and 72's `plane_scratch_grown` telemetry excluded |
 | `ai` | hashed | `AiSystem.hashSimulationState`: `snapped_goal` (x, y), `snapped_goal_initialized`; `allocator`, `rows`, `candidates`, both tuners excluded |
 | `steering` | hashed | `SteeringSystem.hashSimulationState`: `runtime_rows` in list order, every `RuntimeRow` field folded per field (`entity` raw, `f32` NaN-canonical, `bool` fold, `u16`/`u32` raw); all other fields: scratch, derived (`steering_movement_index*`), cache (obstacle snapshot + index, `steering.zig:1911`), tuner |
 | `pathfinding` | normalized | lifecycle, caches, group fields, dirty marks, 64E's `nav_links_processed` cursor, 65B's deferred state, 71B.3's prewarm fields, and the nav graph (B5). Not `cache`: cache warmth changes simulation results (B5 tests) |
