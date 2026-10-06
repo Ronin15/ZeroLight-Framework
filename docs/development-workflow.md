@@ -73,13 +73,15 @@ enabled by the current `--fetch` mode.
 backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
 bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
 discipline rules for the `FailingAllocator` proof-test coverage this requires
-before hot-path code can rely on it safely. On non-Mach-O targets
-(Linux/Windows), `build.zig` enables full link-time optimization (`-flto=full`)
+before hot-path code can rely on it safely. On Linux (ELF) targets,
+`build.zig` enables full link-time optimization (`-flto=full`)
 for the shipped **app executable only** in `ReleaseFast` and explicitly sets the
 LLVM backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
 binaries do not get LTO and use Zig's default backend and linker selection.
 Mach-O targets (macOS) skip LTO in Zig 0.17 because LTO requires LLD and LLD
-cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
+cannot link Mach-O. Windows (COFF) targets also skip LTO: under Zig 0.17, LTO
+with libc fails at `lld-link` with undefined mingw libc/libm symbols, while the
+non-LTO ReleaseFast build links and emits its PDB. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
 local iteration and size-focused builds stay predictable. Before cutting a
 ReleaseFast release candidate, run an extended soak session in
 `--release=safe` (not just `zig build test`) across realistic-to-extreme

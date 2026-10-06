@@ -442,7 +442,7 @@ this slice's `-Dcpu-baseline` option.
   - `README.md` Requirements.
   - `CLAUDE.md` command lines for `fetch-sdl` and
     `shaders-update`.
-- [ ] (added by Slice 66) **Windows LTO under Zig 0.17.** `ltoSupportedForTarget`
+- [x] (added by Slice 66) **Windows LTO under Zig 0.17.** `ltoSupportedForTarget`
       (`build.zig:739-742`) returns false for `.coff` as well as `.macho`.
       Evidence: `zig build check -Dtarget=x86_64-windows
       -Doptimize=ReleaseFast` on `99e6959` fails at `lld-link` with
@@ -457,6 +457,7 @@ this slice's `-Dcpu-baseline` option.
       to "Linux ships with `-flto=full`; Darwin and Windows do not".
       Acceptance: `zig build check -Dtarget=x86_64-windows
       -Doptimize=ReleaseFast` and the `aarch64-windows` equivalent pass.
+      Done 2026-10-05 (this commit): `ltoSupportedForTarget` excludes `.coff`; x86_64/aarch64 windows-gnu ReleaseFast `check` pass.
 - [ ] (added by Slice 66) Add "windows-gnu LTO links (`-flto` hello-world with `-lc`)" to the
       Toolchain Pins And Upgrades re-check list beside "macOS LTO".
 

@@ -94,8 +94,8 @@ pub fn build(b: *std.Build) void {
     // for bench troubleshooting, same as it does for the game build.
     const bench_log_level = parseLogLevel(log_level_arg, .fast);
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
-    // Full LTO needs LLVM+LLD. Zig 0.17 rejects LLD for Mach-O, so Darwin
-    // ReleaseFast stays without LTO; Linux/Windows ship with `-flto=full`.
+    // Full LTO needs LLVM+LLD. Linux ships with `-flto=full`; Darwin and
+    // Windows do not (see `ltoSupportedForTarget`).
     // Every other artifact and mode uses Zig's default backend/linker selection.
     const release_lto = optimize == .fast and ltoSupportedForTarget(target.result);
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
@@ -737,8 +737,15 @@ comptime {
 }
 
 /// Zig 0.17 LTO requires LLD; LLD cannot link Mach-O object files.
+/// Windows (COFF) is also excluded: under Zig 0.17, full and thin LTO with
+/// `link_libc` fail at `lld-link` with undefined mingw libc/libm symbols
+/// (`frexpf`, `lrintl`, `modfl`, `wmemcpy`, `strndup`, ...) for x86_64 and
+/// aarch64 windows-gnu. Without LTO, ReleaseFast links and emits the PDB.
 fn ltoSupportedForTarget(target: std.Target) bool {
-    return target.ofmt != .macho;
+    return switch (target.ofmt) {
+        .macho, .coff => false,
+        else => true,
+    };
 }
 
 fn parseLogLevel(value: []const u8, optimize: std.builtin.Optimize) std.log.Level {
