@@ -223,6 +223,24 @@ pub const CollisionSystem = struct {
         self.* = undefined;
     }
 
+    /// Pre-sizes proxy rows, sweep order, merged candidates, and range slot 0 (broadphase
+    /// pairs + narrowphase contacts) for `body_capacity` bodies, so the single-range path
+    /// (serial, 0-worker, tuner-inline) is allocation-free from the first step. Grow-only;
+    /// re-run by the pipeline's population seam. Slots >= 1 warm on their first
+    /// multi-range step (main thread, before dispatch).
+    pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
+        if (body_capacity == 0) return;
+        const pair_capacity = estimateBroadphasePairCapacity(body_capacity, body_capacity);
+        try self.ensureProxyCapacity(body_capacity);
+        try self.order.ensureTotalCapacity(self.allocator, body_capacity);
+        try self.candidate_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
+        try self.prepareBroadphaseRangeBuffers(1);
+        try self.broadphase_ranges.items[0].buffer.pairs.ensureTotalCapacity(self.allocator, pair_capacity);
+        try self.narrowphase_ranges.ensureTotalCapacity(self.allocator, 1);
+        if (self.narrowphase_ranges.items.len == 0) self.narrowphase_ranges.appendAssumeCapacity(.{});
+        try self.narrowphase_ranges.items[0].buffer.contacts.ensureTotalCapacity(self.allocator, pair_capacity);
+    }
+
     pub fn slice(self: *CollisionSystem) ProxySlice {
         const s = self.rows.slice();
         return .{
@@ -1527,6 +1545,72 @@ fn expectProxyColumnsAligned(proxies: ConstProxySlice) !void {
     try std.testing.expectEqual(count, proxies.min_y.len);
     try std.testing.expectEqual(count, proxies.max_x.len);
     try std.testing.expectEqual(count, proxies.max_y.len);
+}
+
+fn addFourBodiesTwoOverlappingPairs(data: *DataSystem) !void {
+    _ = try addBody(data, 0, 0, 10);
+    _ = try addBody(data, 8, 2, 10);
+    _ = try addBody(data, 100, 0, 10);
+    _ = try addBody(data, 106, 4, 10);
+}
+
+test "collision reserve makes the first serial update allocation-free" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addFourBodiesTwoOverlappingPairs(&data);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(4);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    try contacts.reserve(1, 4);
+
+    const original_system_allocator = system.allocator;
+    const original_contacts_allocator = contacts.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing_allocator.allocator();
+    contacts.allocator = failing_allocator.allocator();
+    defer {
+        system.allocator = original_system_allocator;
+        contacts.allocator = original_contacts_allocator;
+    }
+
+    const stats = try system.updateSerial(&data, &contacts);
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+    try std.testing.expectEqual(@as(usize, 4), stats.body_count);
+    try std.testing.expectEqual(@as(usize, 2), contacts.mergedItems().len);
+}
+
+test "collision reserve makes the first single-range threaded update allocation-free" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addFourBodiesTwoOverlappingPairs(&data);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(4);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    try contacts.reserve(1, 4);
+    // The pipeline's path: the threaded `update` on a single inline range.
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+
+    const original_system_allocator = system.allocator;
+    const original_contacts_allocator = contacts.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing_allocator.allocator();
+    contacts.allocator = failing_allocator.allocator();
+    defer {
+        system.allocator = original_system_allocator;
+        contacts.allocator = original_contacts_allocator;
+    }
+
+    const stats = try system.update(&data, &contacts, &threads, .{ .adaptive = false });
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+    try std.testing.expectEqual(@as(usize, 4), stats.body_count);
+    try std.testing.expectEqual(@as(usize, 2), contacts.mergedItems().len);
 }
 
 test "collision proxy store rounds capacity for cache-line range splitting" {

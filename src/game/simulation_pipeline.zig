@@ -692,6 +692,7 @@ pub const SimulationPipeline = struct {
         var collision_response = CollisionResponseSystem.init(allocator);
         errdefer collision_response.deinit();
         try collision_response.reserveForContacts(config.contact_capacity);
+        try collision.reserve(config.movement_body_capacity);
         var scope = SimulationScopeSystem.init(allocator);
         errdefer scope.deinit();
         try scope.reserve(config.movement_body_capacity);
