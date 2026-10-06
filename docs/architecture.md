@@ -868,9 +868,12 @@ the steady path: the abstract chunk-portal
 buffers grow to their real size at the init rebuild and retain that high-water
 capacity, so an incremental rebuild whose topology stays within the high-water
 mark grows no buffer. The per-participant patch scratch is likewise pre-reserved at
-the build to the largest chunk's caps. The system-owned dirty buffer is likewise
-reserved to a steady-path high-water and does one bounded amortized grow only for an
-unusually large structural step. A genuine topology expansion past it (an unblock opening
+the build to the largest chunk's caps. The system-owned dirty buffers are
+reserved by `SimulationPipeline.reserve` from the structural-stage event bound
+(`structuralStageEventBound()`: the `.structural_commit` producers `eventStageOf`
+classifies, plus the link cursor's two endpoints per link), and the deduped level set to the
+level count at the nav build; a step past the bound still grows rather than drops, counted as
+`nav_dirty_buffer_grown` with one warn. A genuine topology expansion past it (an unblock opening
 more portals than any prior build) does one bounded amortized growth, which is
 acceptable on this cold, event-triggered path. Level-link storage is a load-time
 CAPACITY: the state reserves it with `WorldSystem.reserveLevelLinks` (the demo sizes it from

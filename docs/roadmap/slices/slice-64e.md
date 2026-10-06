@@ -4,10 +4,12 @@
 
 **Status: landed (2026-10-05), with open follow-up items to the landed
 work:** the display-gated manual acceptance check (not run: no display in
-the implementing session) and the capacity-audit Checklist items added
-2026-10-06 (nav dirty-buffer capacities; level-link growth at the dig commit
-seam, which replaces the live perimeter-ramp refusal once the load-sized link
-pool is spent). Every other code, test, doc, and bench item below is checked.
+the implementing session) and the capacity-audit Checklist item added
+2026-10-06 for level-link growth at the dig commit seam (which replaces the
+live perimeter-ramp refusal once the load-sized link pool is spent). The
+nav dirty-buffer capacity item landed 2026-10-06 (sized by the
+structural-stage event bound). Every other code, test, doc, and bench item
+below is checked.
 No open prerequisite. This
 was a live gameplay defect (confirmed below), so it landed independently of
 49–64D and **before 46 and 65B**. 65B's lane rebuild runs the same chunk patch
@@ -373,8 +375,10 @@ multi-worker patch path and the serial one.
         intent at an interior cell. After that step's post-commit reaction,
         `pathfinding.statusForWorld(lower, npc_pos, upper, goal, ...)`
         resolves to `available` within the next 2 steps.
-- [ ] **Capacity audit (2026-10-06): nav dirty buffers are load-time
-      capacities.** They were sized by the wrong quantity: `nav_dirty_levels`
+- [x] **Capacity audit (2026-10-06): nav dirty buffers are load-time
+      capacities.** Landed 2026-10-06 on its landed prerequisites: Slice 72
+      B1 made `SimulationPipeline.reserve` the production init entry and C3's
+      population seam re-runs it on growth. They were sized by the wrong quantity: `nav_dirty_levels`
       to a fixed `@max(nav_full_relabel_level_threshold, 8)` "independent of
       map size", and `nav_dirty_edits` / `nav_dirty_cell_spans` /
       `nav_changed_spans` to the agent-derived `max_frame_requests` (floor 8),
@@ -382,33 +386,58 @@ multi-worker patch path and the serial one.
   - `nav_dirty_levels` is reserved to `graph.levelCount()` in
     `rebuildStaticNavGridWithWorld`, beside `affected_levels`. It is deduped,
     so it holds at most one entry per level.
-  - Every buffered mark comes from one committed `frame.events` record
-    (bounded by its `capacity_limit`; a `component_changed` adds at most two
+  - Every buffered mark comes from one committed `.structural_commit`-stage
+    event (the reaction's stage filter; a `component_changed` adds at most two
     spans) or one new-link endpoint (at most `2 * nav_new_links_per_step_max`
-    per step). `SimulationPipeline.reserve`, after it settles
-    `capacity_limit`, calls `pathfinding.reserveNavDirty(limit)`, which
-    reserves `nav_dirty_edits` to `limit + 2 * nav_new_links_per_step_max`,
-    `nav_dirty_cell_spans` to `2 * limit`, and `nav_changed_spans` to their
-    sum. A later raise of `capacity_limit` by the owning state calls it again
-    (grow-only, init path). `applyDerivedCapacity` stops sizing these four
-    buffers from `max_frame_requests`.
+    per step). The bound is therefore the **structural-stage event bound**,
+    not the whole `capacity_limit`: `simulation.eventStageOf` classifies every
+    `EventProducerId` (exhaustive switch beside `maxEventsPerStep`;
+    `dig_world_edit`, `plane_traversal`, and `structural_commit` are
+    `.structural_commit`; perception, affect, `action_react`, and
+    `nav_reaction` are `.domain_reaction` and can never mark), and
+    `SimulationPipeline.structuralStageEventBound()` sums `maxEventsPerStep`
+    over that stage. Sizing from `capacity_limit` would also reserve for the
+    perception and affect shares, about 2.5 MB at the 2053-body battle demo
+    that can never be used. `SimulationPipeline.reserve`, after it settles
+    `capacity_limit`, calls `pathfinding.reserveNavDirty(structuralStageEventBound())`,
+    which reserves `nav_dirty_edits` to `bound + 2 * nav_new_links_per_step_max`,
+    `nav_dirty_cell_spans` to `2 * bound`, and `nav_changed_spans` to their
+    sum, and records the logical reservations (`nav_dirty_edits_reserved`,
+    `nav_dirty_cell_spans_reserved`; grow-only). C3's `growPopulationCapacity`
+    re-runs `reserve`, so the reservation follows the grown bound.
+    `applyDerivedCapacity` no longer sizes these four buffers from
+    `max_frame_requests`. A misclassified producer only under-reserves (a
+    counted grow), never corrupts.
   - The grow-rather-than-drop fallback stays as the ReleaseFast safety net (a
     dropped cell leaves the graph stale, and a failed step's marks union into
     the next step's), now counted (`NavUpdateStats.dirty_buffer_grown`, perf
-    metric `nav_dirty_buffer_grown`) with one `logging.game.warn`.
+    metric `nav_dirty_buffer_grown`, `nav_dirty_buffer_grown_total`) with one
+    `logging.game.warn`. `applyBufferedNavUpdates` compares each list's
+    `.len` with its logical reservation (Slice 72 A1 rule), never
+    `.capacity`, and counts only on a successful apply.
   - `default_nav_full_relabel_level_threshold` is unchanged: it is a fixed
     per-batch level fan-out bound that Slice 65B's classifier also reads, not
     a capacity. Its doc comment drops the stale "the demo's worlds have very
     few levels" (the procedural world has 32).
-  - Tests (minimal fixtures): after a build on a 10-level 1×1-tile world,
-    marking every level dirty leaves `nav_dirty_levels.capacity` unchanged;
+  - Tests (minimal fixtures; landed): after a build on a 128-level 1×1-tile
+    world (past the old fixed 8 and its `ArrayList` growth rounding, so the
+    test fails on the old reserve), marking every level dirty under a
+    `FailingAllocator` allocates nothing and leaves
+    `nav_dirty_levels.capacity` unchanged;
     with `std.testing.FailingAllocator` installed on `PathfindingSystem.allocator`
     and `graph.allocator` after `SimulationPipeline.reserve`, a step whose
-    committed events fill `capacity_limit` with nav-invalidating tile changes
-    plus 8 new links runs `reactToPostCommitNavEvents` (serial, then a real
-    3-worker `ThreadSystem`) with zero allocations and `dirty_buffer_grown ==
-    0`; a direct mark past the reserve grows, counts 1, and the graph still
-    equals a full rebuild.
+    committed `.structural_commit` events fill `structuralStageEventBound()`
+    with nav-invalidating tile changes plus 8 new perimeter links runs
+    `reactToPostCommitNavEvents` (serial, then a real 3-worker
+    `ThreadSystem` forced off the inline path) with zero allocations,
+    `dirty_buffer_grown == 0`, and full-rebuild parity
+    (`simulation_pipeline.zig` "post-commit nav reaction at the
+    structural-stage bound allocates nothing"); a direct mark past the
+    reserve grows, counts 1, and the graph still equals a full rebuild
+    (`nav_graph.zig`); `eventStageOf` is pinned per tag (`simulation.zig`);
+    a real demo-config commit step's structural-stage event count stays
+    within the bound and the seam keeps the reservation at the grown bound
+    (`game_demo_state.zig`).
 - [ ] **Capacity-audit follow-up (2026-10-06) to the landed 64E work:
       level links grow at the dig commit seam.** Today a perimeter-ramp dig
       is refused once the load-sized level-link pool is spent
@@ -442,9 +471,16 @@ multi-worker patch path and the serial one.
 - [ ] Manual (display, procedural demo): dig a ramp at a non-border cell on
       level 1. NPCs on level 1 path up it within a second, with no
       save/load or restart.
-- [ ] Capacity audit: the dirty-buffer `FailingAllocator` test passes serial
+- [x] Capacity audit: the dirty-buffer `FailingAllocator` test passes serial
       and threaded, and `nav-update-scattered` / `nav-update-links` stay
-      within max(3%, noise) of their recorded medians.
+      within max(3%, noise) of their recorded medians. Recorded 2026-10-06
+      (ReleaseFast, 5 interleaved reps, medians, `1e951ba` → nav dirty-buffer
+      commit; every case of `nav-update-scattered`, `nav-update-links`, and
+      `nav-update-multichunk` within max(3%, spread), 0 breaches):
+      scattered 64 serial 825.24 → 821.45 us, 256 serial 3.17 → 3.21 ms
+      (spread 4.4%), 256 tuned 580.68 → 532.03 us; links 8 serial 196.39 →
+      195.53 us, tuned 198.04 → 195.75 us; multichunk 4096 serial 253.38 →
+      245.02 us, 16384 serial 980.17 → 933.70 us.
 - [x] Bench gate (ReleaseFast, 5 interleaved repetitions, medians, adjacent
       commits):
   - new group `nav-update-links` (`src/benchmarks/nav_update.zig`

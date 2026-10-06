@@ -70,6 +70,7 @@ const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const structuralEventHeadroom = @import("simulation.zig").structuralEventHeadroom;
 const EventProducerId = @import("simulation.zig").EventProducerId;
 const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
+const eventStageOf = @import("simulation.zig").eventStageOf;
 const perception_events_per_observer_max = @import("simulation.zig").perception_events_per_observer_max;
 const affect_events_per_row_max = @import("simulation.zig").affect_events_per_row_max;
 const ActionIntent = @import("simulation.zig").ActionIntent;
@@ -806,6 +807,22 @@ pub const SimulationPipeline = struct {
         } else {
             frame.events.setCapacityLimit(sum);
         }
+        // Later slices' reserves attach here (68A, 56B); C3's `growPopulationCapacity`
+        // re-runs this whole function on growth, so each stays sized to the grown bounds.
+        try self.pathfinding.reserveNavDirty(self.structuralStageEventBound());
+    }
+
+    /// The per-step bound on `.structural_commit`-stage events: the sum of
+    /// `maxEventsPerStep` over the producers `eventStageOf` classifies into that stage.
+    /// The post-commit nav reaction marks dirty cells only from those events, so it sizes
+    /// the pathfinding dirty buffers (`reserveNavDirty`).
+    pub fn structuralStageEventBound(self: *const SimulationPipeline) usize {
+        const budgets = self.eventBudgets();
+        var sum: usize = 0;
+        inline for (comptime std.meta.tags(EventProducerId)) |producer| {
+            if (comptime eventStageOf(producer) == .structural_commit) sum += maxEventsPerStep(producer, budgets);
+        }
+        return sum;
     }
 
     /// The per-step `frame.events` bound: the exhaustive sum of `maxEventsPerStep`
@@ -5174,6 +5191,118 @@ test "player-dug ramp is routable by an underground NPC the same step" {
         }
     }
     try std.testing.expect(resolved);
+}
+
+// Incremental-vs-fresh nav parity for pipeline tests: per-level blocked masks and portal
+// tables, the interior link-slot table, and the link edges equal a fresh full build.
+fn expectNavMatchesFreshBuild(pathfinding: *const PathfindingSystem, data: *const DataSystem, world: *const WorldSystem, extent: f32, capacity: PathfindingCapacity) !void {
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(capacity);
+    try rebuilt.rebuildStaticNavGridWithWorld(data, world, extent, extent, 32, null);
+    const inc = &pathfinding.graph;
+    const full = &rebuilt.graph;
+    try std.testing.expectEqual(full.levels.items.len, inc.levels.items.len);
+    for (full.levels.items, inc.levels.items) |*full_grid, *inc_grid| {
+        try std.testing.expectEqual(full_grid.blocked_count, inc_grid.blocked_count);
+        try std.testing.expectEqualSlices(@TypeOf(full_grid.blocked.items[0]), full_grid.blocked.items, inc_grid.blocked.items);
+    }
+    for (full.level_graphs.items, inc.level_graphs.items) |*full_level, *inc_level| {
+        try std.testing.expectEqualSlices(@TypeOf(full_level.portals.items[0]), full_level.portals.items, inc_level.portals.items);
+        try std.testing.expectEqualSlices(u32, full_level.cell_to_portal.items, inc_level.cell_to_portal.items);
+    }
+    try std.testing.expectEqualSlices(u32, full.chunk_link_count.items, inc.chunk_link_count.items);
+    try std.testing.expectEqualSlices(u32, full.chunk_link_cells.items, inc.chunk_link_cells.items);
+    try std.testing.expectEqualSlices(@TypeOf(full.link_edges.items[0]), full.link_edges.items, inc.link_edges.items);
+}
+
+// Slice 64E: one post-commit nav reaction at the full structural-stage event bound plus a
+// full link-cursor budget, under a failing allocator on the pathfinding system and its nav
+// graph. `threads` drives the chunk patch/remask fan-out (forced off the inline path).
+fn runNavReactionAtStructuralBound(threads: ?*ThreadSystem) !void {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try gateTestWorld(&meta, &.{});
+    defer world.deinit();
+    const new_links = @import("systems/pathfinding/types.zig").nav_new_links_per_step_max;
+    try world.reserveLevelLinks(new_links);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const extent: f32 = 256;
+    const capacity: PathfindingCapacity = .{
+        .max_group_fields = 1,
+        // 4-tile chunks: the 8x8 world spans 2x2 chunks per level so edits fan out.
+        .nav_chunk_tiles = 4,
+        .worker_participant_count = if (threads) |ts| ts.participantSlotCount() else 1,
+    };
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, extent, extent, .{
+        .movement_body_capacity = 16,
+        .structural_headroom = 8,
+        .navigation_world = &world,
+        .pathfinding = capacity,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 16, 16, 16, 16 + 8);
+    try pipeline.reserve(&frame, 16);
+    pipeline.pathfinding.nav_thread_adaptive = false;
+    pipeline.pathfinding.nav_thread_items_per_range = 1;
+
+    // Flip four level-1 cells in four distinct chunks (solid dirt -> walkable tunnel), then
+    // publish the full structural-stage bound of blocking-flip tile events over them (marks
+    // are not deduped, so repeats each take a buffer slot) and a full link-cursor budget.
+    const cave_0 = (meta.tileByName("cave_0") orelse return error.TestUnexpectedResult).id;
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    const cells = [_][2]u16{ .{ 1, 1 }, .{ 5, 1 }, .{ 1, 5 }, .{ 5, 5 } };
+    for (cells) |cell| _ = try world.setDenseTile(floor1, cell[0], cell[1], cave_0);
+    frame.beginStep();
+    const bound = pipeline.structuralStageEventBound();
+    for (0..bound) |index| {
+        const cell = cells[index % cells.len];
+        try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = .{
+            .level = 1,
+            .x = cell[0],
+            .y = cell[1],
+            .old_tile_id = 0,
+            .new_tile_id = cave_0,
+            .old_blocks_movement = true,
+            .new_blocks_movement = false,
+        } } });
+    }
+    // Perimeter cells (x = 0 or 7) of the 8x8 world: chunk-border link endpoints.
+    for (0..new_links) |index| {
+        const y: u16 = @intCast(index);
+        try world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 0, .y = y }, .level_b = 0, .cell_b = .{ .x = 0, .y = y }, .traversal_cost = 1, .bidirectional = true });
+    }
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const original = pipeline.pathfinding.allocator;
+    pipeline.pathfinding.allocator = failing.allocator();
+    pipeline.pathfinding.graph.allocator = failing.allocator();
+    const stats = blk: {
+        defer {
+            pipeline.pathfinding.graph.allocator = original;
+            pipeline.pathfinding.allocator = original;
+        }
+        break :blk try pipeline.reactToPostCommitNavEvents(&frame, &data, &world, threads);
+    };
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 0), stats.dirty_buffer_grown);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), stats.links_deferred);
+    if (threads != null) try std.testing.expect(!pipeline.pathfinding.graph.last_remask_batch.ran_inline);
+    try expectNavMatchesFreshBuild(&pipeline.pathfinding, &data, &world, extent, capacity);
+}
+
+test "post-commit nav reaction at the structural-stage bound allocates nothing" {
+    try runNavReactionAtStructuralBound(null);
+    if (builtin.single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    try runNavReactionAtStructuralBound(&threads);
 }
 
 /// The allocators of everything a pipeline step can reach: frame streams, data, world,

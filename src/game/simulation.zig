@@ -99,6 +99,18 @@ pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) u
     };
 }
 
+/// The event stage every event `producer` appends with. Exhaustive beside
+/// `maxEventsPerStep`, so a new producer does not compile until it is classified. Consumers
+/// that read only one stage (the post-commit nav reaction reads `.structural_commit`) size
+/// their per-step buffers from that stage's share of the event bound. A misclassification
+/// only under-reserves such a buffer (a counted in-step grow), never corrupts.
+pub fn eventStageOf(producer: EventProducerId) SimulationEventStage {
+    return switch (producer) {
+        .dig_world_edit, .plane_traversal, .structural_commit => .structural_commit,
+        .perception_update, .affect_update, .action_react, .nav_reaction => .domain_reaction,
+    };
+}
+
 pub const NavInvalidationReason = enum {
     static_obstacle_changed,
 };
@@ -1161,6 +1173,18 @@ fn writeEvenEvents(context: *anyopaque, range: ParallelRange, _: WorkerId) void 
         }
     }
     writer.finish();
+}
+
+test "eventStageOf classifies every producer, with only world edits, plane traversal, and the commit in the structural stage" {
+    // The nav dirty buffers are sized from the `.structural_commit` share: pin exactly which
+    // producers it sums, so a reclassification is a reviewed change, not a silent resize.
+    inline for (comptime std.meta.tags(EventProducerId)) |producer| {
+        const expected: SimulationEventStage = switch (producer) {
+            .dig_world_edit, .plane_traversal, .structural_commit => .structural_commit,
+            else => .domain_reaction,
+        };
+        try std.testing.expectEqual(expected, eventStageOf(producer));
+    }
 }
 
 test "range output stream merges by range index" {

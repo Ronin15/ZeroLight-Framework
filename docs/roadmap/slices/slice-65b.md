@@ -202,18 +202,17 @@ because of the fence below.
   - **Fence-window reserve (capacity, sized at load).** The fence holds up
     to `k = nav_deferred_rebuild_latency_steps` steps of marks (seams
     `s+1 … s+k`), so the dirty buffers are sized for the window, not for
-    one step. `PathfindingSystem.reserve` sets `nav_dirty_edits` to
-    `max_frame_requests × k`, `nav_dirty_cell_spans` to
-    `2 × max_frame_requests × k`, and the synchronous eviction scratch
-    `nav_changed_spans` to the sum of those two. That scratch consumes the
-    same held marks when the swap step's batch classifies `.synchronous`;
-    today it is reserved to `max_frame_requests` even though one step already
-    needs up to `3 × max_frame_requests`. The nav build reserves
-    `nav_dirty_levels` to the nav level count `L`, replacing the fixed
-    `@max(nav_full_relabel_level_threshold, 8)` ceiling: once marks
-    accumulate across the window, the deduped level set can hold every
-    level. The reserve is a pure function of `PathfindingCapacity`, the
-    fixed latency, and the loaded world. Marks within it never allocate. A
+    one step. 65B scales Slice 64E's `reserveNavDirty` by the fence window:
+    64E (landed 2026-10-06) sizes `nav_dirty_edits` to
+    `structuralStageEventBound() + 2 × nav_new_links_per_step_max`,
+    `nav_dirty_cell_spans` to `2 × structuralStageEventBound()`, and the
+    synchronous eviction scratch `nav_changed_spans` to their sum, from
+    `SimulationPipeline.reserve`; 65B multiplies the per-step bound by `k`.
+    That scratch consumes the same held marks when the swap step's batch
+    classifies `.synchronous`. `nav_dirty_levels` is already reserved to
+    the nav level count `L` at the nav build (landed by 64E): the deduped
+    level set holds every level whatever the window. The reserve is a pure function of the structural-stage event bound,
+    the fixed latency, and the loaded world. Marks within it never allocate. A
     step whose marks exceed its per-step share keeps pathfinding's
     grow-rather-than-drop overflow on the main thread (never a drop, never
     on the lane).
@@ -736,9 +735,10 @@ copied at submit") gains one clause:
   `test "the nav gate counts the deferred back buffer"`.
 - [ ] Load-time capacities (capacity audit):
   - plan buffers reserved at nav build to the Submit table's formulas;
-  - `PathfindingSystem.reserve` sizes `nav_dirty_edits`,
-    `nav_dirty_cell_spans`, and `nav_changed_spans` for the fence window;
-  - the nav build reserves `nav_dirty_levels` to `L`;
+  - 65B scales `reserveNavDirty` by the fence window (`nav_dirty_edits`,
+    `nav_dirty_cell_spans`, and `nav_changed_spans` for `k` steps of the
+    structural-stage bound);
+  - the nav build reserves `nav_dirty_levels` to `L`: landed by 64E;
   - `markStaticBodies` and `rebuildStaticCoverage` share the dense-index
     loop, with no per-call map.
 

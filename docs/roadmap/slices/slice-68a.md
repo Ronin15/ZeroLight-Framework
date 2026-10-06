@@ -143,7 +143,9 @@ system-owned, per-step transient scratch, never persisted.
   - `SimulationPipeline.reserve(frame, pop)` (`:720-723`, which today reserves
     ai / perception / ai_memory / affect but not the spatial index) gains
     `try self.spatial_index.reserveAiRowMap(pop)`. `pop` is the same AI-agent
-    capacity those four reserves use.
+    capacity those four reserves use. C3's `syncPopulationCapacity` re-runs
+    `reserve` on growth (as it already does for 64E's `reserveNavDirty`), so
+    the map follows the grown capacity.
   - After both reserves, `ensureAiRowMap` never allocates while
     `ai_agents.entities.len <= pop`. That is the same "allocation-free after
     reserve/warm-up" contract `rows` already has, and the FailingAllocator

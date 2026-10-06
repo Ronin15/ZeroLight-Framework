@@ -2070,6 +2070,56 @@ test "incremental nav update remask matches the composed world mask across level
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
 
+test "a nav dirty mark past the reservation grows, counts once, and matches a full rebuild" {
+    // reserveNavDirty(4) reserves 4 + 2 * nav_new_links_per_step_max = 20 dirty cells. 21
+    // marks outrun it: the buffer grows (never drops), the apply counts the overflow once,
+    // and the incremental graph still equals a fresh full build.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const floor0 = world.denseFloorLayerForLevel(0).?;
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.reserveNavDirty(4);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    try std.testing.expectEqual(@as(usize, 4 + 2 * types.nav_new_links_per_step_max), system.nav_dirty_edits_reserved);
+
+    var marked: usize = 0;
+    outer: for (0..world.height) |y_usize| {
+        for (0..world.width) |x_usize| {
+            if (marked == 21) break :outer;
+            const x: u16 = @intCast(x_usize);
+            const y: u16 = @intCast(y_usize);
+            _ = try world.setDenseTile(floor0, x, y, tree);
+            try system.markNavDirty(0, x, y);
+            marked += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 21), system.nav_dirty_edits.items.len);
+    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.dirty_buffer_grown);
+    try std.testing.expectEqual(@as(u64, 1), system.nav_dirty_buffer_grown_total);
+
+    // A following step within the reservation counts nothing more.
+    _ = try world.setDenseTile(floor0, 7, 7, tree);
+    try system.markNavDirty(0, 7, 7);
+    const quiet = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 0), quiet.dirty_buffer_grown);
+    try std.testing.expectEqual(@as(u64, 1), system.nav_dirty_buffer_grown_total);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
 test "threaded initial nav build matches a serial build across levels" {
     // navLevelMaskJob (the threaded per-level world-mask/component-build fan-out
     // in NavGraph.rebuild) only fires when the initial build is given both a real

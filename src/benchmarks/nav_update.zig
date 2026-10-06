@@ -292,6 +292,9 @@ fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Varian
             }
         },
     }
+    // Untimed: mirror production, where the pipeline reserves the dirty buffers to its
+    // structural-stage event bound before any step marks them.
+    try fixture.system.reserveNavDirty(fixture.edits.items.len);
 }
 
 // One open->blocked toggle of the edited tiles: the first half opens them (grass), the second
@@ -511,6 +514,8 @@ fn buildEntityObstacleFixture(allocator: std.mem.Allocator, io: std.Io, particip
         const y: f32 = @as(f32, @floatFromInt(cy * nav_chunk_tiles + nav_chunk_tiles / 2)) * tile_size;
         rects.appendAssumeCapacity(.{ .min_x = x, .min_y = y, .max_x = x + obstacle_size, .max_y = y + obstacle_size });
     }
+    // Mirror production's structural-stage reservation: one obstacle event per rect.
+    try system.reserveNavDirty(max_count);
 
     return .{ .allocator = allocator, .data = data, .world = world, .system = system, .entities = entities, .rects = rects };
 }
@@ -734,6 +739,8 @@ fn buildLinksFixture(allocator: std.mem.Allocator, io: std.Io, participant_count
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(.{ .worker_participant_count = @max(@as(usize, 1), participant_count) });
+    // Mirror production: the link cursor's endpoint marks are inside every reservation.
+    try system.reserveNavDirty(0);
     try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size, null);
 
     return .{ .allocator = allocator, .meta = meta, .grass = grass, .data = data, .world = world, .system = system };

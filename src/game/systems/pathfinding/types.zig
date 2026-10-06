@@ -162,8 +162,9 @@ pub const default_edge_slack: u32 = 2;
 pub const chunk_edge_floor: u32 = 32;
 // When an incremental nav update touches more than this many distinct levels, the
 // per-affected-level relabel degenerates into a full relabel of every level. It
-// increments a loud `nav_full_relabel` counter so a runaway batch is visible. The
-// demo's worlds have very few levels, so a real edit stays well under this.
+// increments a loud `nav_full_relabel` counter so a runaway batch is visible. A fixed
+// per-batch level fan-out bound (65B's classifier reads it), not a capacity: the dirty level
+// set is reserved to the world's level count at the nav build.
 pub const default_nav_full_relabel_level_threshold: usize = 8;
 // Fixed abstract-cost penalty added when an abstract A* edge crosses a LevelLink.
 // Kept above any single octile step so the search prefers staying on one level.
@@ -330,6 +331,9 @@ pub const NavUpdateStats = struct {
     // Link endpoint cells the cursor visited this step that found their nav chunk's fixed
     // interior link slots full, so they stay inert (unslotted).
     link_endpoints_unslotted: usize = 0,
+    // 1 when this batch's marks exceeded a logical dirty-buffer reservation (the buffer grew
+    // in-step past the structural-stage bound); else 0. Loud: a producer outran its bound.
+    dirty_buffer_grown: usize = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -340,6 +344,7 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_edge_cap_fallback, metric(self.edge_cap_fallback));
         perf.recordMetric(.pathfinding_links_deferred, metric(self.links_deferred));
         perf.recordMetric(.pathfinding_link_endpoints_unslotted, metric(self.link_endpoints_unslotted));
+        perf.recordMetric(.nav_dirty_buffer_grown, metric(self.dirty_buffer_grown));
     }
 };
 

@@ -770,7 +770,7 @@ Out of scope (each item has a named owner):
 |---|---|---|---|
 | render-assets-05 | `renderer.zig:198-212` stacked-UI headroom; `render_prep.zig:330-339` | 53B "Stacked-UI headroom retired", then 60 `k_post_state_command_headroom` | none; A2 composes unchanged |
 | world-data-world-02, gameplay-systems-31, pathfinding-26 | level-link pool refusal (`world_system.zig:302-308, 1557-1619`; `dig_controller.zig:151-166`; `nav_graph.zig:569-576, 1299-1346`) | 64E "Capacity-audit follow-up … level links grow at the dig commit seam" | K6 adds the extra comment sites and callers to that item's text |
-| pathfinding-17 | nav dirty buffers (`system.zig:110-127, 268-280`) | 64E "nav dirty buffers are load-time capacities"; 65B "Load-time capacities" (fence window) | B1 makes `SimulationPipeline.reserve` production; C3 re-runs it on growth; K6 records the B1 prerequisite in 64E |
+| pathfinding-17 | nav dirty buffers (`system.zig:110-127, 268-280`) | 64E "nav dirty buffers are load-time capacities" (**landed 2026-10-06**: `reserveNavDirty(structuralStageEventBound())` from `SimulationPipeline.reserve`; Batch F is unblocked); 65B "Load-time capacities" (fence window) | B1 makes `SimulationPipeline.reserve` production; C3 re-runs it on growth; K6 records the B1 prerequisite in 64E |
 | pathfinding-29 | `nav_grid.zig:105-129` per-call map | 65B "Load-time capacities" | none |
 | pathfinding-34 | `types.zig:97-100` 4096 ceiling; demo `:223` | 71B "71B.1 capacity-audit follow-up" (**landed 2026-10-06**: content-sized initial ceiling; threshold clamps to the ceiling frozen at reserve) | C3's `raiseAgentBudget` composes; K6 notes it in 71B |
 | gameplay-systems-09 | `perception.zig:458-469, 857-889` `pending_dirty` | 64B "B3 perception cache bound" | none |

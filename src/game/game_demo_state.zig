@@ -2456,3 +2456,44 @@ test "demo commit seam grows pipeline capacity" {
     const unchanged = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
     try std.testing.expect(!unchanged.population_sync.grew);
 }
+
+test "demo commit step's structural-stage events stay within the nav dirty-buffer bound" {
+    // The post-commit nav reaction marks only from `.structural_commit` events, so the
+    // pathfinding dirty buffers are reserved to `structuralStageEventBound()`. A real commit
+    // step (five full-template creates, which also grows the population) stays within it,
+    // and the seam's re-run of `pipeline.reserve` keeps the reservation at the grown bound.
+    var fixture: DemoConfigPipelineFixture = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    var commands: [5]StructuralCommand = undefined;
+    for (&commands, 0..) |*command, index| {
+        const x: f32 = @as(f32, @floatFromInt(index)) * 64;
+        command.* = .{ .create_entity = .{
+            .movement_body = .{ .position = .{ .x = x, .y = 180 }, .previous_position = .{ .x = x, .y = 180 }, .velocity = .{}, .speed = 0 },
+            .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+            .collision_response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+        } };
+    }
+    fixture.frame.beginStep();
+    try fixture.frame.structural_commands.prepareRangeCounts(1);
+    fixture.frame.structural_commands.addCount(0, commands.len);
+    try fixture.frame.structural_commands.prefix();
+    var writer = fixture.frame.structural_commands.rangeWriter(0);
+    for (commands) |command| writer.write(command);
+    writer.finish();
+    fixture.frame.structural_commands.finishWrite();
+    const result = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
+    try std.testing.expectEqual(@as(usize, 5), result.structural.created);
+    try std.testing.expect(result.population_sync.grew);
+
+    var structural_events: usize = 0;
+    for (fixture.frame.events.mergedItems()) |event| {
+        if (event.stage == .structural_commit) structural_events += 1;
+    }
+    const bound = fixture.pipeline.structuralStageEventBound();
+    try std.testing.expect(structural_events > 0);
+    try std.testing.expect(structural_events <= bound);
+    try std.testing.expect(fixture.pipeline.pathfinding.nav_dirty_edits_reserved >= bound);
+    try std.testing.expect(fixture.pipeline.pathfinding.nav_dirty_cell_spans_reserved >= 2 * bound);
+    try std.testing.expectEqual(@as(usize, 0), result.nav_update.dirty_buffer_grown);
+}
