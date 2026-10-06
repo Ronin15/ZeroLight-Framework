@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 62](slice-62.md), [Slice 71A](slice-71a.md) (71B.3 only; 71B.1 ungated, 71B.2 bench-gated) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** It has three parts with different gates:
+**Status: in progress** (71B.1 steering level gate landed 2026-10-05; everything else not started). It has three parts with different gates:
 
 - **71B.1, fixed group-field threshold + shared static-collider rows +
   steering migration + steering level gate.** No gate. It needs only live
@@ -78,7 +78,9 @@ Goal:
   - `ObstacleSnapshotRow` has **no level** (`:926-931`). The obstacle query
     (`:1135-1158`) and `accumulateObstacleSample` (`:1168-1200`) apply
     **no level gate**. **Live defect:** underground agents avoid surface
-    crates and the reverse.
+    crates and the reverse. *(Fixed 2026-10-05 ahead of the shared-rows
+    migration: see the split checklist item below. Line refs in this
+    section predate that fix.)*
   - Invalidation is `reactToPostCommitSteeringEvents` (`:190-206`) and
     `eventInvalidatesStaticObstacleSpatial` (`:1403-1413`).
 - **Static contract:** `isStaticNavigationObstacle` = movement + bounds +
@@ -512,12 +514,29 @@ Narrowphase, contact merge, and response are unchanged.
       `static_obstacle_capacity`; Slice 64B field-table rows
       (`static_colliders` = `checksum_cache_fields`, steering snapshot note)
       with the cold-vs-warm proving test.
-- [ ] **71B.1** Steering reads the shared rows (version-driven rebuild),
-      `ObstacleSnapshotRow.world_level`, same-level gate in
+- [x] **71B.1** `ObstacleSnapshotRow.world_level`, same-level gate in
       `accumulateObstacleSample`. Tests: every existing steering test passes
       unchanged (bit-identical single-level); a level-1 static at the agent's
       x/y exerts no push on a level-0 agent and does on a level-1 agent;
       candidate-check counts unchanged on a single-level fixture.
+      *Done 2026-10-05 (live-defect fix, split out of the shared-rows item
+      below).* The row level comes from `movementScopeLevel` in today's
+      `rebuildStaticObstacleSnapshot`; the gate skips after the candidate is
+      counted, so `max_obstacle_candidate_checks` truncation is unchanged.
+      `eventInvalidatesStaticObstacleSpatial` now also fires on a
+      `.world_level` `component_changed` for a static (was/is), because the
+      cached row level would otherwise go stale. That is the subset of the
+      `eventInvalidatesStaticColliders` extension this fix strictly needs.
+      Tests (`steering.zig`): a level-1 agent overlapping a level-0 box gets 1
+      candidate check, 0 samples, and an unchanged direction. After a
+      committed `.world_level` move of the box to level 1, the snapshot is
+      invalidated and the push returns. A predicate test covers static vs
+      non-static `.world_level` events. A multi-level serial-vs-real-threaded
+      parity test runs 2 splits. All existing steering tests pass unchanged.
+      `zig build bench -- --group steering` workload candidates are unchanged
+      (4173/17122/36302 at 128/512/1024) and timings are within noise.
+- [ ] **71B.1** Steering reads the shared rows (version-driven rebuild),
+      carrying `world_level` from the shared rows into the existing gate.
 - [ ] **71B.2 (gate item, lands first)** Bench groups in
       `src/benchmarks/collision.zig`, registered after `collision.sparse_group`:
       `collision-static-heavy-sap` (null index, today's path) and
