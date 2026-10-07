@@ -59,10 +59,10 @@ Goal:
   - Past `nav_full_relabel_level_threshold = 8` (`types.zig:142`,
     `PathfindingCapacity` `:457`), it instead runs `buildComponents` over
     every level plus `buildAbstractGraphs` (`:710-718`).
-  - A chunk that outgrows its edge window has that window relocated and is
-    re-patched on the main thread after the patch barrier
-    (`growChunkEdgeWindow`, `stats.edge_windows_grown`; 64E follow-up
-    2026-10-06 — the old full-rebuild fallback is gone).
+  - A chunk that outgrows its edge window is flagged; after the level's
+    dirty set is patched, one main-thread repack of that level grows its
+    windows and re-patches the flagged chunks (`repackLevelEdges`,
+    `stats.edge_windows_grown` / `edge_repacks`; 64F).
   - Then `rebuildLinkEdges` runs, and `version` bumps only on a full
     relabel.
 - **The queried graph.** `PathfindingSystem.graph: NavGraph` (`system.zig:78`)
@@ -348,9 +348,9 @@ rule enforced structurally: the job cannot reach `parallelFor`.
 1. `back.copyGraphFrom(front)` returns `error{OutOfMemory}!void`.
    - It deep-copies every `.copied` field (table below) with
      `ensureTotalCapacity` (a no-op after `ensureCapacityLike`) plus
-     `@memcpy`; the back edge arenas use `ensureTotalCapacityPrecise` to
-     `min(front.capacity, edge_arena_slot_limit)` so the copy never rounds
-     past the gate's ceiling (64E M9). Growth is safe if it ever occurs, because the allocator is
+     `@memcpy`; each back level arena is allocated exactly to the front
+     level's `total_edge_slots` (64F: len == capacity), reused when already
+     that size. Growth is safe if it ever occurs, because the allocator is
      thread-safe.
    - Scratch fields keep the back's own capacity and its own self-consistent
      `dirty_epoch` / `dirty_stamp`.
@@ -366,10 +366,11 @@ rule enforced structurally: the job cannot reach `parallelFor`.
      - `patchChunk(level, links, chunk, &patch_scratch[0])` over dirty
        chunks;
      - `stats.chunks_patched += dirty_len`;
-     - a chunk that overflows its edge window is grown and re-patched
-       (`growChunkEdgeWindow`, counted at the source in
-       `edge_windows_grown_total`), the same as the synchronous serial path.
-   - `stats.edge_windows_grown` / `stats.edge_compactions` are reported as
+     - chunks that overflow their edge window are flagged, then
+       `repackLevelEdges` runs once for the level (counted at the source in
+       `edge_windows_grown_total` / `edge_repacks_total`), the same as the
+       synchronous serial path.
+   - `stats.edge_windows_grown` / `stats.edge_repacks` are reported as
      `total - reported` after every fallible step succeeds, advancing the
      two `_reported` cursors (64E M10), so a failed lane job's growths are
      reported by the next successful apply.
@@ -382,8 +383,7 @@ rule enforced structurally: the job cannot reach `parallelFor`.
    overlays are applied, then each level's components and patch, and within
    a level remask comes before patch, the same as `nav_graph.zig:721-732`.
 4. Store `result: union(enum) { pending, ok: NavUpdateStats, failed: NavGraph.ChunkPatchError }`
-   (a lane relabel can hit 64E M5's measured-arena check and a lane patch
-   M4's growth refusal, not only OOM).
+   (OOM only: since 64F no build or growth is refused for edge density).
    The job writes only `back` and `result`.
 
 **Graph-phase refactor (`nav_graph.zig`, same change)**
@@ -411,15 +411,10 @@ rule enforced structurally: the job cannot reach `parallelFor`.
     - `NavGraph`: `cell_size`, `width`, `height`, `chunk_tiles`, `version`,
       `levels`, `level_graphs`, `link_edges`, `link_edge_refs`,
       `chunk_portal_cap`, `chunk_portal_base`, `total_slots`,
-      `chunk_edge_cap`, `chunk_edge_base`, `total_edge_slots`,
-      `edge_hole_slots` (layout state: `total` includes holes; the
-      hole ≤ live assert and compaction read it), `edge_arena_slot_limit`
-      (the ceiling the background rebuild's growths must respect),
       `edge_windows_grown_total`, `edge_windows_grown_reported`,
-      `edge_compactions_total`, `edge_compactions_reported`,
-      `edge_growth_refused_total`, `edge_arena_unslacked_total` (lifetime
-      counters and their report cursors, carried across the swap; 64E
-      M8/M10), `chunk_link_cells` (64E's
+      `edge_repacks_total`, `edge_repacks_reported` (lifetime counters and
+      their report cursors, carried across the swap; 64E M10, 64F),
+      `chunk_link_cells` (64E's
       fixed-stride `[chunk_count * nav_interior_link_slots_per_chunk]`
       table), `chunk_link_count`, `full_build_link_endpoints_unslotted`
       (last-full-build diagnostic, recomputed by the copy's own build).
@@ -427,14 +422,15 @@ rule enforced structurally: the job cannot reach `parallelFor`.
       them.)
     - `NavGrid`: `level`, `cell_size`, `width`, `height`, `chunk_tiles`,
       `blocked_count`, `blocked`, `components`, `static_blocked`.
-    - `NavLevelGraph`: every list except `edge_scratch`.
+    - `NavLevelGraph`: every field, including the per-level edge windows
+      `chunk_edge_cap`, `chunk_edge_base`, `total_edge_slots` (64F).
   - **scratch** (capacity and count ensured, contents not copied):
     `build_u32_scratch`, `patch_scratch`, `remask_scratch`,
     `last_patch_batch`, `last_remask_batch`, `chunk_edge_overflow`
     (per-batch flags, sized to chunk count, all false), `dirty_set`,
     `dirty_stamp`, `dirty_epoch`, `changed_chunks`,
-    `NavGrid.component_queue`, `NavLevelGraph.edge_scratch` (a build
-    transient, freed after every build since 64E M9: empty, not ensured).
+    `NavGrid.component_queue`, `build_edge_scratch` (a one-level build
+    transient, freed after every build: empty, not ensured).
   - **owner**: `allocator`.
 
 **Swap (main thread, start of step `s + k`)**
@@ -457,16 +453,6 @@ is called through `SimulationPipeline.serviceDeferredNavRebuild` by
        contract holds; set `state = .idle`; return the error. This is
        exactly where the synchronous path would have returned its OOM, `k`
        steps earlier. The front is unchanged.
-     - `error.NavWorldTooLarge` (decided 2026-10-07, 64E M12): **swap the
-       back graph** (step 3), then set `nav_apply_degraded = true`, re-mark
-       the plan's levels whole-level dirty, set `state = .idle`, and return
-       the error. Reason: the back is fully patched except the refused
-       chunks (live portals, empty adjacency, no edge into a tombstone, per
-       M4) and is more current than the frozen front, which is stale
-       against the world the step already committed; keeping the front
-       would route agents through dug-out or blocked cells until the retry.
-       The degraded flag makes the next successful apply drop the whole
-       completed cache, so detours solved meanwhile do not outlive it.
   3. Run `std.mem.swap(NavGraph, &self.graph, &deferred.back)`.
      `std.debug.assert(deferred.front == &self.graph)` confirms the system
      has not moved. The old front becomes the next back buffer, so the swap
@@ -548,7 +534,8 @@ is called through `SimulationPipeline.serviceDeferredNavRebuild` by
 
 - The lane may grow back-graph buffers only on the topology blow-up paths:
   a full relabel that re-measures edge windows past the prior high-water
-  mark, or an edge-window growth past the edge arena's capacity. This is the
+  mark, or a level repack (64F: a window growth allocates that level's new
+  arena). This is the
   same exception
   `nav_graph.zig:623-629` grants the synchronous path. It goes through
   `PathfindingSystem.allocator`, which must be thread-safe.
@@ -641,13 +628,12 @@ copied at submit") gains one clause:
     - `test "a full abstract rebuild that fits its high-water mark is allocation-free"`:
       `FailingAllocator` on `graph.allocator` after one warm rebuild, then a
       second `buildAbstractGraphs(links)`, counting allocations other than
-      the per-level `edge_scratch` staging (freed after every build, 64E M9)
+      the one-level `build_edge_scratch` staging (freed after every build)
       as failures.
     - `test "copyGraphFrom produces an equivalent graph"`:
-      `expectGraphsEquivalent` plus equal `version` / `total_edge_slots` /
-      `edge_hole_slots` / `edge_arena_slot_limit` /
-      `edge_windows_grown_total` / `edge_windows_grown_reported` /
-      `edge_compactions_reported` / `edge_arena_unslacked_total`, on the 256-px, 4-tile-chunk two-level fixture used
+      `expectGraphsEquivalent` plus `expectSameEdgeLayout` and equal
+      `version` / `edge_windows_grown_total` / `edge_windows_grown_reported` /
+      `edge_repacks_total` / `edge_repacks_reported`, on the 256-px, 4-tile-chunk two-level fixture used
       at `:1904-1913`.
 - [ ] `NavGrid.rebuildStaticCoverage`, `deriveChunkMask`, and `applyChunkMask`.
   - `test "deriveChunkMask plus applyChunkMask equals remaskChunkFromWorld"`:
@@ -851,24 +837,24 @@ copied at submit") gains one clause:
     group list.
 - [ ] Non-fatal failure states (64E M8–M13 review, 2026-10-07; required
   because 65B makes a failed apply non-fatal):
-  - A relabel now allocates per-level `edge_scratch` staging every time
-    (64E M9 frees it after each build), so an OOM can stop a relabel with
-    level k partly rebuilt and `link_edges` not rebuilt. Make the failed
-    relabel leave a solve-safe graph (every level's adjacency empty or
-    complete, links resolving through the `no_cell` guard) and add a
-    relabel OOM sweep asserting `expectNoEdgeTargetsTombstone` plus parity
-    after the retry.
+  - A relabel allocates its one-level `build_edge_scratch` staging every
+    time, so an OOM can stop a relabel at level k with `link_edges` not
+    rebuilt. 64F commits each level on its own (arena allocated before any
+    layout write: levels < k rebuilt, level k with empty adjacency, levels
+    > k on their old layer). Remaining: add a relabel OOM sweep asserting
+    `expectNoEdgeTargetsTombstone` and links resolving through the
+    `no_cell` guard, plus parity after the retry.
   - `rebuild()` writes `width`/`height`/`chunk_tiles` before
-    `memory_budget.check` can fail, so `chunkCount()` can outrun
-    `chunk_edge_base` and `build_u32_scratch`, and the now-infallible
-    `compactEdgeArena` is reachable from a seam on that state. Validate
+    `memory_budget.check` can fail, so `chunkCount()` can outrun the
+    per-level `chunk_edge_base` and `build_u32_scratch` (a later repack
+    indexes them). Validate
     into locals and commit the dimensions only after the check passes;
     test that a refused `rebuild` leaves the prior graph's dimensions.
   - Restate the planned test "a full abstract rebuild that fits its
     high-water mark is allocation-free": `FailingAllocator` counts every
-    allocation, so it cannot exempt `edge_scratch`. Use a counting
+    allocation, so it cannot exempt `build_edge_scratch`. Use a counting
     allocator wrapper that records allocation sizes and assert the only
-    allocations are the per-level staging lists.
+    allocations are the staging list's.
 
 ### Acceptance checks
 

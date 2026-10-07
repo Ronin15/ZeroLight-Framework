@@ -59,10 +59,10 @@ serial or threaded; and (4) stays an allocation-free, same-build oracle.
     `group_key_map`, `next_group_evict`, `effective_agent_capacity`,
     `low_load_steps`, and `graph: NavGraph`. After **64E** the graph's portals
     and each portal's edge *sequence* equal a full rebuild. Only the per-chunk
-    edge-window layout (`chunk_edge_cap`/`chunk_edge_base`/`edge_hole_slots`,
-    measured at the last full build, then moved by window growths and arena
-    compactions) depends on build history. A relocation or compaction changes
-    where a window sits in the arena, never the order of a portal's edges, and
+    edge-window layout (each level's `chunk_edge_cap`/`chunk_edge_base`,
+    measured at the last full build, then grown by level repacks, 64F)
+    depends on build history. A repack changes where a window sits in the
+    arena, never the order of a portal's edges, and
     abstract A* walks each portal's edges in that order, so search results do
     not depend on the layout (64E tests: `expectPortalEdgeSequencesEqual` and
     "abstract A* after an edge-window growth returns the paths of a fresh full
@@ -310,8 +310,8 @@ bytes each, about 80 KiB at 2048).
       full build (64E);
     - (c′) the full build resets `nav_link_cursor_pending` and
       `nav_apply_degraded` and syncs the graph's
-      `edge_windows_grown_reported` / `edge_compactions_reported` to their
-      totals (64E M7/M10/M12);
+      `edge_windows_grown_reported` / `edge_repacks_reported` to their
+      totals (64E M7/M10/M12, 64F);
     - (d) when Slice 71B.3 has landed, resets every `group_fields[i]` to
       `.empty` with `origin = .demand` and `prewarm_source = .none`.
 

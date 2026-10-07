@@ -20,6 +20,17 @@ Acceptance checks). **Open: one post-fix manual acceptance check on current
 code** (display-gated; not run in the implementing sessions). Every code,
 test, doc, and bench item below is checked. The slice stays in `slices/`
 until the owner confirms that check.
+
+**Superseded in part by 64F (2026-10-07).** Edge windows are per level and a
+level whose windows overflow is repacked in full (`repackLevelEdges`); the edge
+arena left the nav memory gate. That deletes the tail relocation, holes,
+compaction, the edge-arena ceiling and its slacked → unslacked → refuse ladder,
+growth refusal and its `err`, and live-slot re-admission charging: the M3 gate
+and compaction parts, M5, M6, M8, M9, M11, and M14/M15 below. M4's visit-all
+patch, M7, M10 (now also `edge_repacks`), M12 (kept for OOM), M13, and every
+parity, OOM-sweep, and cached-path test stand; the failure-path tests inject
+OOM instead of a pinned ceiling. See `slice-64f.md`.
+
 No open prerequisite. This
 was a live gameplay defect (confirmed below), so it landed independently of
 49–64D and **before 46 and 65B**. 65B's lane rebuild runs the same chunk patch
@@ -568,13 +579,16 @@ multi-worker patch path and the serial one.
     deferral;
   - `docs/reviews/` pathfinder note if present;
   - drop the "deferred until full rebuild" wording.
-- [ ] **M14 · Threaded parity of an unslacked relocation** (M8–M13 review,
+- [x] **M14 · Threaded parity of an unslacked relocation** — superseded by
+  64F (no unslacked rung, no relocation; serial == threaded repack layouts are
+  covered by 64F's tests). Original item (M8–M13 review,
   2026-10-07). The ladder test runs serial only and the existing parity test
   never reaches rung 2. Add a multi-chunk fixture (3×3 chunks of 8, 3-worker
   pool, `items_per_range = 1`) where one chunk's slacked growth needs a
   compaction and then lands unslacked; assert `expectSameEdgeLayout` serial
   vs threaded and `edge_arena_unslacked_total == 1` on both.
-- [ ] **M15 · Count unslacked landings only once they land** (same review).
+- [x] **M15 · Count unslacked landings only once they land** — superseded by
+  64F (`edge_arena_unslacked_total` deleted). Original item (same review).
   `edge_arena_unslacked_total` is bumped before `ensureEdgeArenaCapacity`
   (relocation) and before `placeLevelEdges` (build), so an OOM after the bump
   over-counts. Move both bumps after the fallible call; extend the existing
@@ -594,10 +608,9 @@ multi-worker patch path and the serial one.
 - [ ] **Post-fix manual check on current code** (display; Debug or
       ReleaseSafe build). The run above predates the in-place edge-window
       growth and its M1–M7 follow-ups. Dig several ramps in one open chunk:
-      the perf dump shows `edge_windows_grown > 0` and `full_relabel=0`,
-      the log has no `nav update refused` error (no edge-growth refusals)
-      and no `landed without edge growth slack` warn, and NPCs route over
-      the new ramps.
+      the perf dump shows `edge_windows_grown > 0`, `edge_repacks > 0`, and
+      `full_relabel=0`, and NPCs route over the new ramps (64F removed the
+      growth refusal and unslacked paths).
 - [x] **Edge-window overflow after runtime ramps (found in the 2026-10-06
       manual run).** Later in the same run the log printed
       `nav abstract-graph edge-cap fallback: per-chunk edge window overflow,

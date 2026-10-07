@@ -89,14 +89,11 @@ new features.
   - `NavGrid.markWorldObstacles` memsets uniform layers, walks non-uniform
     layers per cell, and marks sparse tiles separately
     (`systems/pathfinding/nav_grid.zig:278-302`).
-  - A chunk that outgrows its per-chunk edge window has that one window
-    relocated at twice its new edge count and re-patched in the same
-    incremental update (`growChunkEdgeWindow` in
-    `systems/pathfinding/nav_graph.zig`, counted as `edge_windows_grown`;
-    64E follow-up, 2026-10-06). The old full-rebuild fallback is gone. The
-    vacated windows are holes (perf gauge `nav_edge_hole_slots`), never more
-    than the live window slots, and growth stays under the nav memory gate
-    (compacting in place before it refuses).
+  - A chunk that outgrows its per-level edge window is regrown at twice its
+    new edge count by one repack of that level in the same incremental update
+    (`repackLevelEdges` in `systems/pathfinding/nav_graph.zig`, counted as
+    `edge_windows_grown` / `edge_repacks`; 64F). Growth is never refused for
+    density: the nav memory gate only estimates the edge arena.
 - **Tileset.**
   - `assets/sprites/world_tileset.json` already ships `autotile_sets`
     `grass_dirt`, `water_shore` and `path`, each `layout: "transition_16"` with
@@ -337,10 +334,10 @@ installed beside `worldgen.json`:
     generation, so they flow into `autoSizedMaxNavMemoryBytes` through that
     load-time capacity (Slice 64E).
   - The only content-dependent cost is the measured per-chunk edge window. A
-    window that outgrows its build size relocates in place (no rebuild); the
-    acceptance soak records `edge_windows_grown` and the hole gauge
-    `edge_hole_slots_max` at production size against the bounds in the
-    acceptance check.
+    window that outgrows its build size is regrown by a level repack (no
+    rebuild); the acceptance soak records `edge_windows_grown` and
+    `edge_repacks` at production size against the bounds in the acceptance
+    check.
 
 **Structures and villages.**
 
@@ -730,28 +727,18 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       levels, shipped caves) passes `budget.check` under
       `autoSizedMaxNavMemoryBytes` with `link_count` including entrances. A
       60 s ReleaseSafe soak shows:
-      - no `NavWorldTooLarge` (so `edge_growth_refused_total` stays 0) and
-        `edge_arena_unslacked_total == 0` (no build, relabel, or relocation
-        had to drop its growth slack to fit the ceiling; 64E M8);
-      - `edge_windows_grown` recorded (window relocations, no rebuilds,
+      - `edge_windows_grown` recorded (level repacks, no rebuilds,
         `full_relabel=0`), its summed per-step values (and those of
-        `edge_compactions`) equal to `edge_windows_grown_total` /
-        `edge_compactions_total` even across a failed step (64E M10: a
+        `edge_repacks`) equal to `edge_windows_grown_total` /
+        `edge_repacks_total` even across a failed step (64E M10: a
         failed step's work is reported by the next successful one), at most
         8 × the distinct nav chunks dug or ramped
         during the soak: each growth at least doubles a window, from the
         32-edge floor to the 4,588-edge layout maximum of a 16-tile chunk
         (log2(4588/32) ≈ 7.2), so a chunk grows at most 8 times between full
         builds;
-      - `edge_hole_slots_max` below half of one level's edge arena: each
-        relocation leaves its old cap as a hole and adds more than that to the
-        live windows, so holes stay below the live window slots. At build the
-        arena is at least 256 chunks × the 32-edge floor = 8,192 slots per
-        level, so a soak whose growths stay in the few dozen chunks around
-        the player stays in the low thousands;
-      - `edge_compactions=0`: compaction runs only when a growth reaches the
-        nav memory gate's arena ceiling, which should not happen at
-        production size. A nonzero value is a finding to explain;
+      - `edge_repacks` at most `edge_windows_grown` (one repack per affected
+        level per step, each growing at least one window);
       - `loading_build` recorded before and after.
 - [ ] Unit tests stay at 16×16 or smaller with 1 underground level.
 - [ ] Bench: new group `worldgen-breadth` (`src/benchmarks/worldgen.zig`,
