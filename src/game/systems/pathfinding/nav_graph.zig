@@ -105,8 +105,9 @@ pub const NavLevelGraph = struct {
     chunk_label_keys: std.ArrayList(u32) = .empty,
     chunk_label_starts: std.ArrayList(u32) = .empty,
     chunk_label_len: std.ArrayList(u32) = .empty,
-    // Per-chunk edge scratch, filled by discover/intra and drained into the chunk's edge
-    // window. Holds one chunk's edges during a patch (or one whole level during init).
+    // Full-build staging: one whole level's edges, filled by buildLevelInit and drained into
+    // the edge windows by placeLevelEdges. A build-time transient freed at the end of every
+    // build (buildAbstractGraphs), so it sits outside the resident arena bound.
     edge_scratch: std.ArrayList(EdgeScratch) = .empty,
 
     const EdgeScratch = struct {
@@ -384,6 +385,9 @@ pub const NavGraph = struct {
     chunk_edge_cap: std.ArrayList(u32) = .empty,
     chunk_edge_base: std.ArrayList(u32) = .empty,
     total_edge_slots: u32 = 0,
+    // Physical bound: every level's portal_edges.capacity stays <= edge_arena_slot_limit at every
+    // seam (build reserve clamped, growth clamped, re-admission compacts and shrinks), so
+    // resident arena bytes stay within the share max_nav_memory_bytes accounts for.
     // Arena slots vacated by window relocations and referenced by no window: the same count in
     // every level's arena (windows are shared). total_edge_slots - edge_hole_slots is the slots
     // live windows own (edgeArenaLiveSlots), the quantity the nav memory gate charges. Zeroed by
@@ -400,8 +404,8 @@ pub const NavGraph = struct {
     // The full build and a window growth size windows by one ladder (windowCap): slacked, then
     // unslacked when the slacked size would pass it, then refuse. A growth compacts before its
     // unslacked rung and otherwise fails loudly (NavWorldTooLarge, edge_growth_refused_total,
-    // one count per refused chunk; the rest of the dirty set is still patched), so in-place
-    // growth never allocates past max_nav_memory_bytes. Because every chunk's live window holds
+    // one count per refused chunk; the rest of the dirty set is still patched). Admission
+    // charges live slots only; physical capacity is clamped to this at every seam. Because every chunk's live window holds
     // at least max(its edges, floor), any state the incremental path admitted re-measures under
     // the same ceiling (a full relabel, or a load under the same budget).
     edge_arena_slot_limit: u32 = std.math.maxInt(u32),
@@ -653,6 +657,9 @@ pub const NavGraph = struct {
     // incremental patch relocated), so it never overflows. A measured arena past the nav memory
     // gate fails (computeEdgeCaps) before any edge-layout write.
     fn buildAbstractGraphs(self: *NavGraph, world: ?*const WorldSystem) !void {
+        // The per-level staging lists are build transients: free them on every exit so no
+        // whole-level edge copy stays resident past the gate's arena bound.
+        defer for (self.level_graphs.items) |*lg| lg.edge_scratch.clearAndFree(self.allocator);
         try self.computePortalGeometry(world);
         // Pass 1: build portals/order/labels and fill each level's edge_scratch (retained
         // per level so pass 2 can drain it after the shared edge caps are known).
@@ -839,7 +846,7 @@ pub const NavGraph = struct {
         }
 
         // Every fallible step above has succeeded: report the window growths and compactions
-        // (run only inside a growth that reached the nav memory gate) since the last report,
+        // (by a growth that reached the gate, or by a re-admission) since the last report,
         // including those of a prior step that failed after growing or compacting.
         stats.edge_windows_grown = @intCast(self.edge_windows_grown_total - self.edge_windows_grown_reported);
         self.edge_windows_grown_reported = self.edge_windows_grown_total;
@@ -1458,6 +1465,14 @@ pub const NavGraph = struct {
         return self.build_u32_scratch.items;
     }
 
+    // buildScratch for a caller whose `len` a prior build already reserved (see
+    // compactEdgeArena). The assert backs the stripped std check behind the .len write.
+    fn buildScratchAssumeCapacity(self: *NavGraph, len: usize) []u32 {
+        std.debug.assert(self.build_u32_scratch.capacity >= len);
+        self.build_u32_scratch.items.len = len;
+        return self.build_u32_scratch.items;
+    }
+
     // Per-chunk label stride matching NavGrid's chunk-local label encoding (one shared
     // definition in ChunkGeometry), so a chunk id can be recovered from one of its encoded
     // labels by integer division.
@@ -1551,7 +1566,7 @@ pub const NavGraph = struct {
         std.debug.assert(needed > old_cap);
         const needed_u32 = std.math.cast(u32, needed) orelse return error.NavWorldTooLarge;
         var new_cap = windowCap(needed_u32, default_edge_slack);
-        if (!self.edgeArenaAdmits(new_cap) and self.edge_hole_slots != 0) try self.compactEdgeArena();
+        if (!self.edgeArenaAdmits(new_cap) and self.edge_hole_slots != 0) self.compactEdgeArena();
         // The unslacked rung starts from zero holes: either there were none, or the compaction
         // above just reclaimed them (the edge_hole_slots invariant relies on this).
         var unslacked = false;
@@ -1622,12 +1637,12 @@ pub const NavGraph = struct {
     // (arena order), so each one moves toward the front and a forward copy never overwrites a
     // window that has not moved yet. Caps, per-slot adjacency order, and every level's content
     // are unchanged; only window positions move (portal_edge_start is rebased). The arenas keep
-    // their capacity, so later growths reuse the freed tail. Allocation-free: the chunk order
-    // lives in build_u32_scratch, sized to total_slots (>= chunk count) at every full build.
-    // Main thread only, never under a patch dispatch. Deterministic: the result is a function of
-    // the current layout, which the serial and threaded patches build identically.
-    fn compactEdgeArena(self: *NavGraph) std.mem.Allocator.Error!void {
-        const order = try self.buildScratch(self.chunkCount());
+    // their capacity, so later growths reuse the freed tail. Infallible: the chunk order lives in
+    // build_u32_scratch, which every full build's placeLevelEdges sized to total_slots (>= chunk
+    // count), and compaction runs only on a built graph. Main thread only, never under a patch
+    // dispatch. Deterministic: the result is a function of the current layout.
+    fn compactEdgeArena(self: *NavGraph) void {
+        const order = self.buildScratchAssumeCapacity(self.chunkCount());
         for (order, 0..) |*chunk, index| chunk.* = @intCast(index);
         std.sort.pdq(u32, order, ChunkEdgeBaseOrder{ .bases = self.chunk_edge_base.items }, ChunkEdgeBaseOrder.lessThan);
         var running: u32 = 0;
@@ -1658,9 +1673,8 @@ pub const NavGraph = struct {
 
     // The per-level edge-arena slots live windows own (total minus holes): what the arena
     // occupies after a compaction, and the quantity the nav memory gate charges. Holes are
-    // reclaimable in place without allocating, and physical capacity past the live slots is
-    // build rounding or geometric growth clamped to the ceiling current at that time, so
-    // neither is charged.
+    // reclaimable in place without allocating; physical capacity is clamped to the ceiling at
+    // every seam and is never a gate input.
     pub fn edgeArenaLiveSlots(self: *const NavGraph) u32 {
         return self.total_edge_slots - self.edge_hole_slots;
     }
@@ -1675,10 +1689,25 @@ pub const NavGraph = struct {
 
     // Re-derives the gated per-level edge-arena ceiling from a re-admitted budget. Callers gate
     // first (raiseAgentBudget via edgeArenaFitsBudget, the dig seam via admitsLinkLimit before
-    // reserveLinkCapacity), so the live slots stay within the new ceiling.
+    // reserveLinkCapacity), so the live slots stay within the new ceiling. An arena whose length
+    // (holes included) exceeds it is compacted (a logical, allocator-independent trigger), then
+    // every arena's capacity is fit to the ceiling.
     pub fn applyEdgeArenaBudget(self: *NavGraph, budget: NavMemoryBudget) void {
         self.edge_arena_slot_limit = budget.edgeArenaSlotLimit(self.width, self.height);
+        if (self.total_edge_slots > self.edge_arena_slot_limit) {
+            std.debug.assert(self.edge_hole_slots != 0);
+            self.compactEdgeArena();
+        }
         std.debug.assert(self.edgeArenaLiveSlots() <= self.edge_arena_slot_limit);
+        for (self.level_graphs.items) |*lg| self.fitArenaCapacityToCeiling(lg);
+    }
+
+    // Shrinks one level's arena capacity to its length when it exceeds the ceiling. Best effort
+    // by std semantics: an allocator that can neither shrink in place nor allocate the smaller
+    // block keeps the old capacity (the list stays correct), so no assert follows.
+    fn fitArenaCapacityToCeiling(self: *NavGraph, lg: *NavLevelGraph) void {
+        std.debug.assert(lg.portal_edges.items.len <= self.edge_arena_slot_limit);
+        if (lg.portal_edges.capacity > self.edge_arena_slot_limit) lg.portal_edges.shrinkAndFree(self.allocator, lg.portal_edges.items.len);
     }
 
     // Tombstones a chunk's whole slot window and clears the cell_to_portal entries of the
@@ -1960,7 +1989,14 @@ pub const NavGraph = struct {
     // measured to fit, so it cannot overflow.
     fn placeLevelEdges(self: *NavGraph, level: u16) !void {
         const lg = &self.level_graphs.items[level];
-        try setLen(&lg.portal_edges, self.allocator, self.total_edge_slots);
+        // Same geometric first-growth slack setLen gave (keeps the first relocation
+        // allocation-free), clamped to the ceiling; computeEdgeCaps admitted total <= limit.
+        const total: usize = self.total_edge_slots;
+        std.debug.assert(total <= self.edge_arena_slot_limit);
+        const want = @max(total, @min(std.ArrayList(AbstractEdge).growCapacity(total), @as(usize, self.edge_arena_slot_limit)));
+        if (lg.portal_edges.capacity < total) try lg.portal_edges.ensureTotalCapacityPrecise(self.allocator, want);
+        lg.portal_edges.items.len = total;
+        self.fitArenaCapacityToCeiling(lg);
         @memset(lg.portal_edge_count.items, 0);
         for (lg.edge_scratch.items) |scratch| lg.portal_edge_count.items[scratch.from] += 1;
         const chunk_count = self.chunkCount();
@@ -3601,6 +3637,15 @@ fn expectNoEdgeTargetsTombstone(graph: *const NavGraph) !void {
     }
 }
 
+// M9 oracle: every level's arena capacity is within the gate's ceiling and its length is the
+// arena size.
+fn expectArenaWithinCeiling(graph: *const NavGraph) !void {
+    for (graph.level_graphs.items) |*lg| {
+        try std.testing.expect(lg.portal_edges.capacity <= graph.edge_arena_slot_limit);
+        try std.testing.expectEqual(@as(usize, graph.total_edge_slots), lg.portal_edges.items.len);
+    }
+}
+
 // Nav cell index of (x, y) on `level` of a built graph.
 fn navCellIndex(graph: *const NavGraph, level: u16, x: u16, y: u16) !u32 {
     const level_grid = graph.grid(level) orelse return error.TestUnexpectedResult;
@@ -4052,7 +4097,65 @@ test "link growth and agent-budget raises charge the edge arena's live slots gro
     try std.testing.expect(system.raiseAgentBudget(requested, cells.len));
     try std.testing.expectEqual(requested, system.agentBudget());
     try std.testing.expectEqual(live_grown, graph.edge_arena_slot_limit);
+    // M9: the admitted ceiling is under the arena's length, so the re-admission compacted the
+    // holes and shrank every arena to its length (pre-fix: 4248 slots past a 2520 ceiling).
+    try expectArenaWithinCeiling(graph);
+    try std.testing.expectEqual(@as(u32, 0), graph.edge_hole_slots);
+    try std.testing.expectEqual(live_grown, graph.total_edge_slots);
+    for (graph.level_graphs.items) |*lg| try std.testing.expectEqual(@as(usize, live_grown), lg.portal_edges.capacity);
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_compactions_total);
+    try expectNoEdgeTargetsTombstone(graph);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 256, capacity);
+}
+
+test "a re-admission that lowers the ceiling under the arena's length compacts first and never past the gate" {
+    // M9: four 8-ramp steps under no ceiling leave chunk 0's window at 1104 (live) with 624 hole
+    // slots (total 1728). A link re-admission whose ceiling (1600) is under the arena's length
+    // compacts and fits every arena's capacity to it; the next growth (1260 edges) then fits
+    // neither rung (1104 + 2520, 1104 + 1260 > 1600) and is refused.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var world = try initTwoLevelOpenWorld(&meta, 256);
+    defer world.deinit();
+    const cells = oneChunkRampCells();
+    try world.reserveLevelLinks(cells.len);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    const graph = &system.graph;
+    graph.edge_arena_slot_limit = std.math.maxInt(u32);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    for (0..4) |step| {
+        for (cells[step * 8 ..][0..8]) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+        _ = try reactOneStep(&system, &frame, &data, &world, null);
+    }
+    try std.testing.expectEqual(@as(u32, 1728), graph.total_edge_slots);
+    try std.testing.expectEqual(@as(u32, 624), graph.edge_hole_slots);
+    try std.testing.expectEqual(@as(u32, 1104), graph.edgeArenaLiveSlots());
+    for (graph.level_graphs.items) |*lg| try std.testing.expect(lg.portal_edges.capacity > 1600);
+
+    system.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(system.capacity, cells.len, 1600);
+    try std.testing.expect(system.admitsLinkLimit(cells.len));
+    try system.reserveLinkCapacity(cells.len);
+    try std.testing.expectEqual(@as(u32, 1600), graph.edge_arena_slot_limit);
+    try std.testing.expectEqual(@as(u32, 0), graph.edge_hole_slots);
+    try std.testing.expectEqual(@as(u32, 1104), graph.total_edge_slots);
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_compactions_total);
+    try expectArenaWithinCeiling(graph);
+    try expectNoEdgeTargetsTombstone(graph);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 256, capacity);
+
+    for (cells[32..]) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+    try std.testing.expectError(error.NavWorldTooLarge, reactOneStep(&system, &frame, &data, &world, null));
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_growth_refused_total);
+    try expectArenaWithinCeiling(graph);
+    try expectNoEdgeTargetsTombstone(graph);
 }
 
 test "a measured edge arena past the nav memory gate fails the build loudly" {
@@ -4117,6 +4220,15 @@ test "a measured edge arena past the nav memory gate fails the build loudly" {
     try std.testing.expectEqual(slacked, rung1.graph.total_edge_slots);
     try std.testing.expectEqual(rung1.graph.total_edge_slots, rung1.graph.edge_arena_slot_limit);
     try std.testing.expectEqual(@as(u64, 0), rung1.graph.edge_arena_unslacked_total);
+    // M9: a build at the ceiling clamps each arena's reserve to it (pre-fix: growCapacity(2520)
+    // = 3788 slots); away from the ceiling the reserve keeps setLen's geometric slack.
+    try expectArenaWithinCeiling(&rung1.graph);
+    try expectArenaWithinCeiling(&rung2.graph);
+    // The full build's per-level staging lists are transients, freed with the build.
+    for (rung1.graph.level_graphs.items) |*lg| try std.testing.expectEqual(@as(usize, 0), lg.edge_scratch.capacity);
+    for (measured.graph.level_graphs.items) |*lg| {
+        try std.testing.expectEqual(std.ArrayList(AbstractEdge).growCapacity(slacked), lg.portal_edges.capacity);
+    }
 
     // Same graph (keyed, so window layout is ignored) and the same solved paths on both rungs.
     try expectGraphsEquivalent(&rung2.graph, &rung1.graph);

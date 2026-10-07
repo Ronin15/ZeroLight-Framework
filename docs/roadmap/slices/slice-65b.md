@@ -348,7 +348,9 @@ rule enforced structurally: the job cannot reach `parallelFor`.
 1. `back.copyGraphFrom(front)` returns `error{OutOfMemory}!void`.
    - It deep-copies every `.copied` field (table below) with
      `ensureTotalCapacity` (a no-op after `ensureCapacityLike`) plus
-     `@memcpy`. Growth is safe if it ever occurs, because the allocator is
+     `@memcpy`; the back edge arenas use `ensureTotalCapacityPrecise` to
+     `min(front.capacity, edge_arena_slot_limit)` so the copy never rounds
+     past the gate's ceiling (64E M9). Growth is safe if it ever occurs, because the allocator is
      thread-safe.
    - Scratch fields keep the back's own capacity and its own self-consistent
      `dirty_epoch` / `dirty_stamp`.
@@ -429,7 +431,8 @@ rule enforced structurally: the job cannot reach `parallelFor`.
     `last_patch_batch`, `last_remask_batch`, `chunk_edge_overflow`
     (per-batch flags, sized to chunk count, all false), `dirty_set`,
     `dirty_stamp`, `dirty_epoch`, `changed_chunks`,
-    `NavGrid.component_queue`, `NavLevelGraph.edge_scratch`.
+    `NavGrid.component_queue`, `NavLevelGraph.edge_scratch` (a build
+    transient, freed after every build since 64E M9: empty, not ensured).
   - **owner**: `allocator`.
 
 **Swap (main thread, start of step `s + k`)**
@@ -626,7 +629,9 @@ copied at submit") gains one clause:
   - New tests:
     - `test "a full abstract rebuild that fits its high-water mark is allocation-free"`:
       `FailingAllocator` on `graph.allocator` after one warm rebuild, then a
-      second `buildAbstractGraphs(links)`.
+      second `buildAbstractGraphs(links)`, counting allocations other than
+      the per-level `edge_scratch` staging (freed after every build, 64E M9)
+      as failures.
     - `test "copyGraphFrom produces an equivalent graph"`:
       `expectGraphsEquivalent` plus equal `version` / `total_edge_slots` /
       `edge_hole_slots` / `edge_arena_slot_limit`, on the 256-px, 4-tile-chunk two-level fixture used

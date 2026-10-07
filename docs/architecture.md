@@ -894,7 +894,7 @@ exceeds it even unslacked fails loudly before any edge-layout write. A growth pa
 place (`compactEdgeArena`, no allocation, `nav_edge_compactions`) and otherwise fails the step loudly (one `err` per step naming the refused-chunk count; `NavWorldTooLarge`, counted in
 `edge_growth_refused_total`); a refused growth keeps the chunk's live portals with empty
 adjacency and the rest of the dirty set is still patched, so no edge targets a dead slot. The agent-budget and level-link re-admissions charge the
-arena's live edge slots (total minus holes); physical capacity is never a gate input. Windows are not sized for
+arena's live edge slots (total minus holes); physical capacity is never a gate input, and every level's arena capacity stays within that ceiling at every seam, so resident arena memory is within the share the gate accounts for (the build's per-level edge staging is freed after each build). Windows are not sized for
 the layout maximum (every perimeter cell plus 8 link endpoints in one component, ~4.6k
 edges per 16-tile chunk-level, ~300 MB at 256x256x32) because measured topology needs
 ~2 MB. The per-participant patch scratch is likewise pre-reserved at

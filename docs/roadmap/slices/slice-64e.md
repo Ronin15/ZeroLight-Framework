@@ -818,14 +818,9 @@ multi-worker patch path and the serial one.
         charging live makes the build, relocation refusal, and
         re-admission one predicate. Charging `total` would refuse what the
         next relocation admits. `edgeArenaCapacitySlots` is deleted.
-      - Physical slack is not charged and never consulted, and it is
-        bounded by construction: build `setLen` rounding (≤ n/2 plus a
-        cache line), and growth `ensureTotalCapacityPrecise` clamped to the
-        ceiling current at that time, which is non-increasing between full
-        builds (only re-admissions lower it). No allocation past the
-        current ceiling is ever made. `placeLevelEdges` keeps `setLen`
-        (default keep: precise sizing only tightens a byte bound, at the
-        cost of an extra cold realloc on the first growth).
+      - Physical capacity is not charged and never consulted; M9 clamps it
+        to the ceiling at every seam (build reserve, growth, re-admission),
+        so resident arena bytes stay within the gate's arena share.
       - Asserts: `applyEdgeArenaBudget` and `applyNavUpdates` assert live ≤
         `edge_arena_slot_limit` (callers gate first); the relocation asserts
         each arena's capacity covers the new length before its `.len`
@@ -933,6 +928,28 @@ multi-worker patch path and the serial one.
         lands unslacked before refusing" (56-slot unslacked landing under a
         100-slot ceiling, then refusal), and the updated build test (refuses
         at 1259, unslacked 1260–2519, slacked 2520; same graph and paths).
+    - [x] **M9 · every arena's capacity stays within the ceiling.** Build
+          `setLen` rounding (~1.5×, unclamped), holes, and a re-admission
+          that lowered the ceiling under the arena's length all left resident
+          arena past `levels × limit × 8 B`. Fix: `placeLevelEdges` reserves
+          `max(total, min(growCapacity(total), limit))` (unchanged away from
+          the ceiling); `applyEdgeArenaBudget` compacts when `total > limit`
+          and `fitArenaCapacityToCeiling` shrinks each arena to its length
+          when its capacity exceeds the ceiling (best effort by std
+          `shrinkAndFree`); `compactEdgeArena` is infallible
+          (`buildScratchAssumeCapacity`: every build sized the scratch to
+          `total_slots ≥ chunk count`). The gate stays logical (live slots).
+          `NavLevelGraph.edge_scratch` (a whole level's build staging) was
+          resident too: it is now freed at the end of every build, a
+          build-time transient outside the resident bound (no current
+          allocation proof covers a relabel with edges; 65B's planned
+          allocation-free rebuild test excludes it). Tests (fail with the
+          fix reverted): the M6 test's admitted raise now ends compacted with
+          every arena at 2520; "a re-admission that lowers the ceiling under
+          the arena's length compacts first and never past the gate" (1728 →
+          1104 under a 1600 ceiling, then the next growth is refused); the
+          build test asserts the clamp at the ceiling (pre-fix 3788 > 2520),
+          the unchanged reserve away from it, and freed staging lists.
     - [x] **M10 · a failed step's growths and compactions are reported by
           the next success** (third review, 2026-10-07). Fix: lifetime
           `edge_windows_grown_total` counted at the source plus
