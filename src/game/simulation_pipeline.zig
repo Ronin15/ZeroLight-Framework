@@ -2419,6 +2419,9 @@ test "pipeline fear selects flee before movement, not only a positive drive" {
     };
     defer world.deinit();
     _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: pin the observer thinking on this single step (not a stagger test).
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
@@ -2490,6 +2493,9 @@ test "pipeline perception acquire refreshes memory last_known the same step" {
     };
     defer world.deinit();
     _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: pin the observer thinking on this single step (not a stagger test).
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
@@ -2652,6 +2658,9 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
     // A level must exist or PerceptionSystem's LOS-blocked cache treats every
     // observer as fail-closed (blocked), never reporting a target visible.
     _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: pin the pursuer thinking on this single step (not a stagger test).
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 4, 4, 4, 4, 4);
@@ -4124,6 +4133,9 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(observer, 0);
     try data.setAiPerception(observer, .{ .hearing_range = 1000 });
+    // The chunked world's full-world `sim_view` applies stagger: pin the observer
+    // thinking on this single step (dig-before-perception order, not stagger).
+    try markAllAlwaysActive(&data);
 
     // Sanity: the observer does not hear anything before the step runs.
     try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
@@ -6025,8 +6037,6 @@ const TestAllocatorCounters = struct {
     }
 };
 
-/// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: commit with the
-/// nav-reaction slot reserved, run the population seam, then the post-commit reactions.
 /// Test-only `sim_view` covering the whole world extent: every chunk of the
 /// player's level is in view, so nothing on that level leaves the cognition halo
 /// or demotes. A chunkless world yields no region (the full-active fallback).
@@ -6046,6 +6056,8 @@ fn markAllAlwaysActive(data: *DataSystem) !void {
     }
 }
 
+/// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: commit with the
+/// nav-reaction slot reserved, run the population seam, then the post-commit reactions.
 fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
     const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
         SimulationPipeline.pendingEventsMayInvalidateNavigation(frame) or
