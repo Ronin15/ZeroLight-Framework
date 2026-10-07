@@ -1266,14 +1266,25 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
     );
 }
 
-/// One dig press through the pipeline's production seam: admission plus level-link
-/// growth (`admitDigAndGrowLinks`), then the dig commit, as the `dig_world_edit` stage
-/// runs it.
-fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
+/// One dig press through the real pipeline step (`SimulationPipeline.update`), whose
+/// `dig_world_edit` stage runs admission, the level-link growth seam, and the dig commit.
+/// The demo's merge phase (structural commit plus post-commit reactions) does not run, so
+/// a test drives those itself where it needs them.
+fn digFacedForTest(demo: *GameDemoState, threads: *ThreadSystem, intent: DigIntent) !void {
     demo.simulation_frame.beginStep();
     demo.simulation_frame.dig_intent = intent;
-    const admitted = try demo.pipeline.admitDigAndGrowLinks(&demo.world, &demo.data, demo.player, &demo.simulation_frame);
-    if (admitted.dig) |plan| try demo.pipeline.dig.commit(plan, &demo.world, &demo.simulation_frame);
+    _ = try demo.pipeline.update(.{
+        .data = &demo.data,
+        .frame = &demo.simulation_frame,
+        .world = &demo.world,
+        .player = &demo.player,
+        .thread_system = threads,
+        .delta_seconds = 0.016,
+        .bounds_width = demo.bounds_width,
+        .bounds_height = demo.bounds_height,
+        .particles = &demo.particles,
+        .sim_view = demo.simViewRect(),
+    });
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
@@ -1622,6 +1633,8 @@ test "demo world tile event invalidates navigation after commit reaction" {
 test "demo dig hole drops the player one plane and a ramp climbs back" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
@@ -1629,7 +1642,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 
     // Dig a hole in the faced cell on the surface plane.
-    try digFacedForTest(&demo, .hole);
+    try digFacedForTest(&demo, &threads, .hole);
     const floor0 = demo.world.denseFloorLayerForLevel(0).?;
     try std.testing.expectEqual(world_system.invalid_tile_id, demo.world.denseTile(floor0, 4, 3));
 
@@ -1649,7 +1662,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // On the dirt plane, dig a ramp in the faced cell (5,3), then walk onto it.
-    try digFacedForTest(&demo, .ramp);
+    try digFacedForTest(&demo, &threads, .ramp);
     try std.testing.expectEqual(@as(u16, 1), demo.world.levelLinks().len);
     placePlayerInCell(&demo, 5, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
@@ -1664,18 +1677,20 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     // DEFERRED by tryLinkPortal, not resolved against an absent run (linkTailIndex unreachable).
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
 
     // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,3).
-    try digFacedForTest(&demo, .hole);
+    try digFacedForTest(&demo, &threads, .hole);
     placePlayerInCell(&demo, 4, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
-    try digFacedForTest(&demo, .ramp);
+    try digFacedForTest(&demo, &threads, .ramp);
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
     // The real per-step nav re-mask the live game runs each frame. Must not panic.
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
@@ -1697,20 +1712,22 @@ test "demo reserves the nav invalidation event for a pending ramp link that flip
     // only the later nav append would fail.
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
-    try digFacedForTest(&demo, .hole);
+    try digFacedForTest(&demo, &threads, .hole);
     placePlayerInCell(&demo, 4, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
     // Mine (5,3) walkable on the dirt plane, and settle the nav graph for it.
-    try digFacedForTest(&demo, .hole);
+    try digFacedForTest(&demo, &threads, .hole);
     _ = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
 
     // Ramp on the already-walkable (5,3): no blocking flip.
-    try digFacedForTest(&demo, .ramp);
+    try digFacedForTest(&demo, &threads, .ramp);
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
     const dig_events = demo.simulation_frame.events.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), dig_events.len);
@@ -1746,19 +1763,21 @@ test "demo reserves the nav invalidation event for a pending ramp link that flip
 test "demo dig down drops the player through the dirt plane to the void plane" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
 
     // Surface hole + fall onto the dirt plane (level 1), landing carved at (4,3).
-    try digFacedForTest(&demo, .hole);
+    try digFacedForTest(&demo, &threads, .hole);
     placePlayerInCell(&demo, 4, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // Dig DOWN through the faced cell (5,3): a see-through hole, not a tunnel carve.
-    try digFacedForTest(&demo, .down);
+    try digFacedForTest(&demo, &threads, .down);
     const floor1 = demo.world.denseFloorLayerForLevel(1).?;
     try std.testing.expectEqual(world_system.invalid_tile_id, demo.world.denseTile(floor1, 5, 3));
 

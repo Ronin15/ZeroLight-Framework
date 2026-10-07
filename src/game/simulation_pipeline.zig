@@ -1401,7 +1401,7 @@ pub const SimulationPipeline = struct {
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
-    pub const AdmittedDigStep = struct {
+    const AdmittedDigStep = struct {
         dig: ?AdmittedDig,
         link_pool_grew: bool,
     };
@@ -1412,7 +1412,7 @@ pub const SimulationPipeline = struct {
     /// nav-memory ceiling behaves as if the pool were unbounded). A refused or no-op press
     /// never grows the pool. Mutates nothing but the pool growth and the K-stride refusal
     /// counter, so the stage runs it before any other step-state change.
-    pub fn admitDigAndGrowLinks(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *const SimulationFrame) !AdmittedDigStep {
+    fn admitDigAndGrowLinks(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *const SimulationFrame) !AdmittedDigStep {
         const dig = try self.dig.admit(world, data, player, frame) orelse return .{ .dig = null, .link_pool_grew = false };
         const grew = dig.intent == .ramp and try self.ensureLevelLinkRoom(world);
         return .{ .dig = dig, .link_pool_grew = grew };
