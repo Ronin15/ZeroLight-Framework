@@ -3271,6 +3271,7 @@ test "an edge-window growth failing at any allocation retries to a full-rebuild 
                 break :blk true;
             } else |err| blk: {
                 try std.testing.expectEqual(error.OutOfMemory, err);
+                try expectNoEdgeTargetsTombstone(&system.graph);
                 _ = try reactOneStep(&system, &frame, &data, &world, thread_arg);
                 break :blk false;
             };
@@ -3288,57 +3289,62 @@ test "an edge-window growth failing at any allocation retries to a full-rebuild 
 test "a threaded multi-chunk window growth that fails clears every overflow flag" {
     // Regression: the post-barrier pass cleared a chunk's flag only when it reached it, so a
     // growth that failed left every LATER flagged chunk of the batch flagged into the next
-    // patch. The lattice dig overflows several chunks in one threaded batch; an OOM at any
-    // allocation must leave no flag set, and the retried batch must equal a full rebuild.
+    // patch. The lattice dig overflows several chunks in one batch; an OOM at any allocation
+    // must leave no flag set and no edge into a tombstone, and the retried batch must equal a
+    // full rebuild. Swept serial and through the real 3-worker patch.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
     const capacity = windowGrowthCapacity(&threads);
-    var failures: usize = 0;
-    var fail_index: usize = 0;
-    while (true) : (fail_index += 1) {
-        var data = DataSystem.init(std.testing.allocator);
-        defer data.deinit();
-        var walled = try initWalledWorld(&meta);
-        defer walled.world.deinit();
-        var system = PathfindingSystem.init(std.testing.allocator);
-        defer system.deinit();
-        try system.reserve(capacity);
-        try system.rebuildStaticNavGridWithWorld(&data, &walled.world, 768, 768, 32, null);
-        system.nav_thread_adaptive = false;
-        system.nav_thread_items_per_range = 1;
-        var edits = std.ArrayList(NavCellEdit).empty;
-        defer edits.deinit(std.testing.allocator);
-        try digCorridorLattice(&walled, &edits);
-        for (edits.items) |edit| try system.markNavDirty(edit.level, edit.x, edit.y);
-        for (system.graph.level_graphs.items) |*lg| lg.portal_edges.shrinkAndFree(std.testing.allocator, lg.portal_edges.items.len);
+    for ([_]bool{ false, true }) |threaded| {
+        const thread_arg: ?*ThreadSystem = if (threaded) &threads else null;
+        var failures: usize = 0;
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var data = DataSystem.init(std.testing.allocator);
+            defer data.deinit();
+            var walled = try initWalledWorld(&meta);
+            defer walled.world.deinit();
+            var system = PathfindingSystem.init(std.testing.allocator);
+            defer system.deinit();
+            try system.reserve(capacity);
+            try system.rebuildStaticNavGridWithWorld(&data, &walled.world, 768, 768, 32, null);
+            system.nav_thread_adaptive = false;
+            system.nav_thread_items_per_range = 1;
+            var edits = std.ArrayList(NavCellEdit).empty;
+            defer edits.deinit(std.testing.allocator);
+            try digCorridorLattice(&walled, &edits);
+            for (edits.items) |edit| try system.markNavDirty(edit.level, edit.x, edit.y);
+            for (system.graph.level_graphs.items) |*lg| lg.portal_edges.shrinkAndFree(std.testing.allocator, lg.portal_edges.items.len);
 
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
-        installFailingAllocator(&system, &failing);
-        const result = system.applyBufferedNavUpdates(&data, &walled.world, &threads);
-        restoreTestingAllocator(&system);
-        try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
-        for (system.graph.chunk_edge_overflow.items) |flag| try std.testing.expect(!flag);
-        const succeeded = if (result) |stats| blk: {
-            try std.testing.expect(stats.edge_windows_grown > 1);
-            break :blk true;
-        } else |err| blk: {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            failures += 1;
-            const retried = try system.applyBufferedNavUpdates(&data, &walled.world, &threads);
-            try std.testing.expectEqual(@as(usize, 0), retried.version_bumps);
-            break :blk false;
-        };
-        var rebuilt = PathfindingSystem.init(std.testing.allocator);
-        defer rebuilt.deinit();
-        try rebuilt.reserve(capacity);
-        try rebuilt.rebuildStaticNavGridWithWorld(&data, &walled.world, 768, 768, 32, null);
-        try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
-        if (succeeded) break;
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+            installFailingAllocator(&system, &failing);
+            const result = system.applyBufferedNavUpdates(&data, &walled.world, thread_arg);
+            restoreTestingAllocator(&system);
+            try std.testing.expectEqual(threaded, !system.graph.last_patch_batch.ran_inline);
+            for (system.graph.chunk_edge_overflow.items) |flag| try std.testing.expect(!flag);
+            const succeeded = if (result) |stats| blk: {
+                try std.testing.expect(stats.edge_windows_grown > 1);
+                break :blk true;
+            } else |err| blk: {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try expectNoEdgeTargetsTombstone(&system.graph);
+                failures += 1;
+                const retried = try system.applyBufferedNavUpdates(&data, &walled.world, thread_arg);
+                try std.testing.expectEqual(@as(usize, 0), retried.version_bumps);
+                break :blk false;
+            };
+            var rebuilt = PathfindingSystem.init(std.testing.allocator);
+            defer rebuilt.deinit();
+            try rebuilt.reserve(capacity);
+            try rebuilt.rebuildStaticNavGridWithWorld(&data, &walled.world, 768, 768, 32, null);
+            try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+            if (succeeded) break;
+        }
+        try std.testing.expect(failures > 0);
     }
-    try std.testing.expect(failures > 0);
 }
 
 test "serial and threaded edge-window growth build identical layouts" {

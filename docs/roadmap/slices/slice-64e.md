@@ -961,6 +961,11 @@ multi-worker patch path and the serial one.
           that the detour cached before the retry re-solves to a fresh
           rebuild's direct path (fails without the clear: the stale detour
           stays cached). 65B's `NavWorldTooLarge` swap rule sets it.
+    - [x] **M13 · tombstone oracle in the OOM sweeps.** Both growth OOM
+          sweeps call `expectNoEdgeTargetsTombstone` on every failed step
+          before the retry, and the lattice sweep now runs serial and
+          threaded (`ran_inline` checked per variant). Test-only coverage of
+          M4's failure state under OOM.
     - [x] **M10 · a failed step's growths and compactions are reported by
           the next success** (third review, 2026-10-07). Fix: lifetime
           `edge_windows_grown_total` counted at the source plus
