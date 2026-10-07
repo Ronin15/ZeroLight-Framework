@@ -11,5 +11,8 @@
 - Pipeline-owned controllers orchestrate (small queues, budgets, cooldowns,
   conflict policy); they never hide per-entity stores, own renderer/audio/SDL
   handles, hide RNG, or replace hot SoA processors (`docs/architecture.md`).
+- The particle pool (`systems/particle.zig`) is presentation-only: no
+  simulation reads it, so it may be fixed-capacity with deterministic overflow
+  drop (CS § Budgets, Capacities, And Thresholds).
 - Tests use the smallest `WorldSystem`/`DataSystem` fixture that exercises the
   behavior; a `1x1` world is one real chunk (CS § Tests).

@@ -63,8 +63,6 @@ convenience.
   Capacities, And Thresholds.
 - Partitioned, pre-reserved threaded writes; serial + threaded paths:
   § Threading.
-- New pipeline stages declare their contract: § Simulation Pipeline Stage
-  Ordering.
 - Relative traversal-safe asset paths; stable IDs in persistent data: § Assets
   And Persistent Data.
 - Small fixtures, no test-only production hooks: § Tests. Perf numbers only from

@@ -12,7 +12,8 @@
   `msl_entry_signature`), and host constants that size shader arrays stay
   test-tied to the GLSL (e.g. `layer_offsets` vs
   `k_max_tilemap_window_layers`).
-- Presentation pools that no simulation reads (particles, text labels) may be
+- Presentation pools that no simulation reads (text labels) may be
   fixed-capacity with deterministic overflow drop (CS § Budgets, Capacities,
   And Thresholds).
-- No per-draw lookup, validation, or allocation (CS § Dispatch And Lookup).
+- No per-draw lookup, validation, or allocation unless measured, bounded, and
+  isolated (CS § Dispatch And Lookup).
