@@ -232,7 +232,7 @@ const synthesis = await agent(
   [
     `Consolidate verified DEEP-correctness findings (PASS 3) for ZeroLight-Framework. Passes 1-2 handled idiom/surface; this pass is behavioral correctness, concurrency, numerics, determinism, resource lifetime, and test gaps.`,
     ``,
-    `Split the output cleanly: top_bugs (confirmed real defects ranked by severity, each with a concrete fix direction), test_gaps (highest-value untested load-bearing invariants ranked by blast radius, each with the narrow scenario to add), and durable_items (only genuinely net-new lint/agent-guidance/doc items — the linter already has 7 rules and both agents carry extensive allocator/threading/ReleaseFast/SIMD/errdefer/validation guidance, so do not duplicate). Be precise and non-duplicative; a clean result with few items is fine.`,
+    `Split the output cleanly: top_bugs (confirmed real defects ranked by severity, each with a concrete fix direction), test_gaps (highest-value untested load-bearing invariants ranked by blast radius, each with the narrow scenario to add), and durable_items (only genuinely net-new lint/agent-guidance/doc items — tools/lint_idioms.py and docs/coding-standards.md already cover allocator/threading/ReleaseFast/SIMD/errdefer/validation rules, so do not duplicate; a new technical rule targets a named docs/coding-standards.md section). Be precise and non-duplicative; a clean result with few items is fine.`,
     ``,
     `Each top_bugs fix_direction and test_gaps scenario names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Findings marked UNVERIFIED were not adversarially checked (below high).`,
     ``,

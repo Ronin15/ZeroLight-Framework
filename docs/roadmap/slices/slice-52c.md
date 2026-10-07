@@ -144,7 +144,7 @@ Goal:
     - `frame-battle --iterations 36000`: 10 minutes of 60 Hz simulation per
       case, the deterministic battle soak.
     - The full suite with `--profile stress`. This is the one sanctioned
-      full-suite run: CLAUDE.md reserves full runs for deliberate
+      full-suite run: coding-standards § Benchmarks reserves full runs for deliberate
       OOM/capacity sweeps, and this is that sweep.
     - A serial-versus-threaded digest check: one `frame-battle` run with
       `--case thread-adaptive-tuned-range`. The suite adds the `serial-direct`
@@ -230,7 +230,7 @@ Goal:
     - A mismatch is a determinism defect. Route it to
       **zig-debug-specialist** before 52C closes; never widen the check.
   - Internal `std.debug.assert`s cover the population and frame-stream
-    capacities, as CLAUDE.md requires for bench-fixture correctness. No
+    capacities, as coding-standards § Benchmarks requires for bench-fixture correctness. No
     `zig build test` code calls this file.
   - **Cost:** the default `zig build bench` run includes frame-battle. In
     Debug, that adds a production world build per case. This is documented.

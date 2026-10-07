@@ -125,26 +125,16 @@ game-specific behavior under `src/game/`.
   facility (`mix64`/`uniformF32`/`boundedU32`/`unitVec2`) for reproducible
   gameplay randomness (AI wander, etc.).
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
-- `src/root.zig` stays minimal for math aliases and compile coverage.
+- `src/root.zig` stays minimal for math aliases and compile coverage; feature
+  modules live in their matching `src/` area and import each other directly.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
 
 ## Cross-Cutting Ownership Rules
 
-The main thread is not a fallback owner for work that lacks a better home.
-Main-thread code must preserve a concrete boundary such as SDL/GPU/audio
-ownership, state transitions, structural commits, asset loading, save/load
-streaming, renderer resource ownership, or deliberately light orchestration.
-Work that can scale with entity count, event count, asset count, draw count,
-map size, file size, or tool complexity needs a named owner in app, game,
-render, assets, platform, or tooling code. When it can become expensive, use
-immutable inputs plus deterministic owned outputs instead of hiding the cost in
-the frame coordinator or another convenient caller.
-
-Production contracts expose runtime concepts only. Do not add test-only enum
-tags, union payloads, marker fields, fake stages, fixture hooks, or service
-shortcuts to production APIs just to make tests easier. Tests should use private
-helper types, local fixtures, test-only mocks, or real runtime payloads without
-changing the shape of app, game, render, asset, platform, or tool contracts.
+Two rules apply across every module below: the main thread is not a fallback
+owner for scalable work (`docs/coding-standards.md` § Threading), and
+production contracts expose runtime concepts only (`docs/coding-standards.md`
+§ Tests).
 
 ## Frame Flow
 
@@ -170,9 +160,8 @@ render-blocked gameplay pause before the next update, keeps using fallback
 pacing, and clears that policy after a later frame is submitted. Occluded or
 unfocused visible windows keep rendering but apply a 60Hz cap to avoid
 background render runaway.
-Frame pacing policy should stay explicit and situational. Do not add broad
-frame-rate caps that hide timing problems or harm high-refresh rendering unless
-the cap preserves a named boundary and is measured.
+Frame pacing policy stays explicit and situational (frame-cap rule:
+`docs/coding-standards.md` § Performance).
 
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
@@ -351,8 +340,8 @@ distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
 owns the decision. The tuner starts inline, records that inline baseline for the
 owning batch, probes a threaded profile when the measured work is expensive
 enough, and only reports a best threaded profile after a threaded candidate wins.
-Static item-count floors should not gate production threading; slower hardware
-or expensive small-N processors must be able to train their own threaded
+There are no static item-count floors (`docs/coding-standards.md` § Threading);
+slower hardware or expensive small-N processors train their own threaded
 profile.
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
@@ -499,7 +488,8 @@ Emergent NPC behavior layers on the cognition tier. Perception, memory, and
 **affect (feelings / emotion drives)** are durable per-entity concepts that live
 as SoA components in `DataSystem` and are advanced by cognition-gated processor
 stages in `src/game/systems/`, alongside AI, steering, and pathfinding. They
-follow the same rules as every other processor: allocation-free hot paths,
+follow the same rules as every other processor (`docs/coding-standards.md`
+§ Performance and § Threading): allocation-free hot paths,
 deterministic serial/threaded and scalar/SIMD parity, range-disjoint output, and
 explicit barriers. Dense per-step sensing/affect data stays in component columns
 or transient range streams; only notable transitions become low-volume domain
@@ -533,8 +523,8 @@ domains. Controllers own feature orchestration: small queues, budgets,
 cooldowns, priority/conflict policy, and handoff between processors. They should
 emit `SimulationFrame` outputs or deferred structural commands and call
 processors with typed `DataSystem` views. They should not become hidden
-per-entity stores, own renderer/audio/SDL handles, or replace SoA processors for
-hot/reusable loops.
+per-entity stores, own renderer/audio/SDL handles, hide RNG, or replace SoA
+processors for hot/reusable loops.
 
 Landed pipeline-owned domain controllers (beside processors):
 
@@ -939,6 +929,5 @@ or NEON on ARM targets, when the target and optimization mode make that
 profitable. Platform intrinsics such as x86 or ARM-specific calls stay hidden
 from gameplay.
 
-Prefer scalar code for tiny batches or simple logic where vectorization would
-make the code harder to read. Use the SIMD helpers when a processor already
-operates over dense slices and can handle vector ranges plus a scalar tail.
+When to use them is `docs/coding-standards.md` § Performance (SIMD and core
+math).

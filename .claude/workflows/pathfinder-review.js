@@ -37,10 +37,9 @@ const FINDING_SCHEMA = {
 }
 
 const STANDARDS = `Before reviewing, read these canonical docs (they are the source of truth, not notes):
-- docs/coding-standards.md (Zig style, performance, comments, tests)
+- docs/coding-standards.md — the rules; cite its section in each standards finding (Zig Style, Performance, Allocator discipline, Budgets/Capacities/Thresholds, Threading, Dense SoA storage, Logging, Comments, Tests, Benchmarks)
 - docs/simulation-tiers-and-pipeline.md (fixed-step simulation contracts)
-- docs/architecture.md (ownership boundaries, frame flow)
-And honor CLAUDE.md working rules: hot/frame paths must be allocation-free after init/reserve/warmup; no per-frame string lookups, hash-map dispatch, broad dynamic dispatch, or formatted logging on hot paths; camelCase fns, snake_case vars/fields/enum tags, PascalCase types, explicit error sets, zig fmt; terse comments (no essays/roadmap refs/review tags); production APIs expose runtime concepts only (no test-only enum tags/marker fields).`
+- docs/architecture.md (ownership boundaries, frame flow, pathfinding contracts)`
 
 const LENSES = `Review along three lenses:
 1. COHERENCY — does the logic hold together and behave consistently? Inconsistent invariants, contradictory assumptions across functions, mismatched units/coordinate spaces, off-by-one or edge-case gaps, comments that disagree with code.
@@ -83,7 +82,7 @@ phase('Cross-cut')
 const CROSS = [
   { key: 'module-coherency', prompt: 'Review the WHOLE pathfinder module for cross-file COHERENCY: invariants that must agree across files (coordinate spaces, units, cell/world conversions, request lifecycle states, error sets), assumptions made in one file that another file violates, and data contracts that drift between producer and consumer. Trace the request lifecycle from system.zig through solve.zig, nav_graph.zig, nav_grid.zig, caches.zig.' },
   { key: 'module-cohesion', prompt: 'Review the WHOLE pathfinder module for cross-file COHESION and architecture: is the split into files (system/nav_graph/nav_grid/solve/caches/types/group_field/scratch/nav_memory) clean and single-responsibility? Find duplication that should be unified, misplaced concerns, ownership-boundary violations (does anything reach outside the pathfinding module improperly, or import render/gpu internals?), and dead or redundant code. Assess whether the public facade (pathfinding.zig) exposes the right minimal surface.' },
-  { key: 'standards-and-hotpath', prompt: 'Review the WHOLE pathfinder module for STANDARDS adherence and hot-path discipline: scan every file for allocations after init/reserve/warmup on per-frame/per-request paths, per-frame string lookups, hash-map dispatch, broad dynamic dispatch, formatted logging on hot paths, naming-convention violations, missing explicit error sets, and comment-style violations (essays, roadmap/slice refs, review tags). Also confirm tests are idiomatic co-located test blocks, not an aggregated file.' },
+  { key: 'standards-and-hotpath', prompt: 'Review the WHOLE pathfinder module for STANDARDS adherence and hot-path discipline against docs/coding-standards.md: allocation after warmup on per-frame/per-request paths and missing FailingAllocator proofs (Allocator discipline), dispatch/lookup/logging on hot paths (Performance, Logging), fixed node/solve budgets vs world-scaled ones (Budgets, Capacities, And Thresholds), naming and error sets (Zig Style), comment style (Comments), and co-located test blocks (Tests).' },
 ]
 const allFiles = UNITS.flatMap((u) => u.files)
 const crossReviews = await parallel(CROSS.map((c) => () =>

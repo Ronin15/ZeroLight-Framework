@@ -33,7 +33,7 @@ geometrically at the main-thread structural-commit seam, refusing only at a
 format/index ceiling. Fixed caps remain for format/index limits, loud
 load-time safety ceilings, and standard fixed pools (the 512-slot text-label
 pool with idle reclaim), and heuristic thresholds derive from the cost of the
-operation they gate (the CLAUDE.md budgets / capacities / thresholds rule).
+operation they gate (coding-standards § Budgets, Capacities, And Thresholds).
 
 **Shared contracts later slices rely on (one owner each; never fork them):**
 

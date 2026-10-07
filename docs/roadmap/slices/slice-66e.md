@@ -48,7 +48,7 @@ promoted to `default`.
 - `docs/development-workflow.md`.
 
 There is no production `src/` change. All numbers come from `zig build bench`
-(CLAUDE.md), driven through `bench_run.py`.
+(coding-standards § Benchmarks), driven through `bench_run.py`.
 
 **Machine-readable records (`suite.zig`):**
 - New `Options.records: bool = false`, set by `--records` (also listed in
@@ -62,7 +62,7 @@ There is no production `src/` change. All numbers come from `zig build bench`
 
 - Formatting is a pure `formatRecordLine(writer, group_name, result)` over
   `std.Io.Writer`. Tests sit in `suite.zig`'s own test block, against
-  hand-built `CaseResult` stubs (allowed by CLAUDE.md for suite utilities):
+  hand-built `CaseResult` stubs (allowed by coding-standards § Benchmarks for suite utilities):
   - a measured line golden;
   - a skipped line golden;
   - `parseOptions(&.{"--records"})` sets the flag.

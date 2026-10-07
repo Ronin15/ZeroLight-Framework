@@ -16,7 +16,7 @@ and 71B.3 are not started. It has three parts with different gates:
   steering migration + steering level gate.** No gate. It needs only live
   code and can land any time. It is the foundation that 71B.2 depends on.
   - **Its first checklist item, the fixed group-field threshold, fixes a
-    confirmed live violation** of the CLAUDE.md fixed-budget rule
+    confirmed live violation** of the fixed-budget rule (coding-standards § Budgets, Capacities, And Thresholds)
     (`pathfinding/system.zig:220-225`, `types.zig:88-96`). It lands
     unconditionally and first, as its own change if the rest of 71B.1 is not
     ready. It must not wait for 62, 71A, a bench gate, or the static-collider

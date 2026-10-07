@@ -55,7 +55,7 @@ the background lane has a thread.
 
 - Serialize by **stable asset IDs, entity slot + generation, and enum/scalar
   columns** — never file paths, live SDL/GPU/mixer handles, or prepared draw
-  records (CLAUDE.md hard rule). This is what makes `DataSystem` the correct
+  records (coding-standards § Assets And Persistent Data). This is what makes `DataSystem` the correct
   boundary rather than the renderer or asset layer.
 - Versioned container: header (magic + format version) and per-store
   length-prefixed sections; strict validation on load (reject unknown version,
@@ -247,7 +247,7 @@ the background lane has a thread.
       confirm flows. `playtime_steps` from the persisted `step_count`.
 - [ ] Bench groups `save-encode` and `save-decode` (one group per workload,
       `suite.zig` convention) on a mid-size fixture.
-- [ ] Save buffer capacity (CLAUDE.md capacity rule): `encodedSaveBytes`
+- [ ] Save buffer capacity (coding-standards § Budgets, Capacities, And Thresholds): `encodedSaveBytes`
       equals the bytes `encode` writes for a hand-built minimal fixture
       (including an empty store), and with `std.testing.FailingAllocator`
       installed after the one reserve, `encode` allocates nothing. A load

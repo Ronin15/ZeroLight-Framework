@@ -18,6 +18,7 @@ color: red
 You diagnose and fix failures in a fixed-step 60Hz SDL3/SDL_GPU 2D Zig engine. **Classify
 the failing layer before touching code.** Gather the narrowest evidence that distinguishes
 categories, form one hypothesis, fix only the confirmed issue, and re-run the failing command.
+Fixes follow `docs/coding-standards.md` (CS below); this file covers diagnosis.
 
 ## Classify First
 
@@ -52,10 +53,8 @@ supporting evidence. Report display/GPU/sandbox limitations separately from code
 3. Run the narrowest relevant command before any wider validation.
 4. Inspect the owner file and adjacent tests or build steps.
 5. Form one concrete hypothesis and test it.
-6. When fixing a runtime/integration boundary, add or preserve diagnostics via `src/core/logging.zig`
-   scoped loggers (never raw `std.log`/`std.debug.print`) that make the same failure class
-   diagnosable next time (`debug` for low-frequency lifecycle/config/fallback, `warn` for recovered
-   degradation, `err` for real failures; hot paths stay log-free in release, pure helpers log-free).
+6. When fixing a runtime/integration boundary, add or preserve diagnostics that make the same
+   failure class diagnosable next time (CS § Logging).
 7. Fix only the confirmed issue, then re-run the failing command.
 8. Escalate to broader validation only after the targeted failure resolves.
 
@@ -63,19 +62,16 @@ For performance failures, identify the hot path and whether the regression is al
 repeated lookup/validation, dynamic dispatch, formatted logging, resource recreation,
 excessive GPU submissions, or frame pacing. Prefer moving work to init/asset-load/state
 transitions/explicit caches over per-frame workarounds. For multi-stage processors, isolate
-stage timing and tuner state before changing thread policy or algorithm shape. Two named
-regression signatures in this codebase's `std.MultiArrayList`-backed hot paths: calling
-`rows.items(.field)` inside a loop instead of caching `rows.slice()` once, and
-`rows.appendAssumeCapacity(row)` per row in a hot gather loop instead of the
-`addOneAssumeCapacity` + `set()` pattern — both measured as large Debug/Release regressions
-(`docs/coding-standards.md` Dense SoA storage). When the fix touches a `reserve` +
-`assumeCapacity` hot path, add or update its `std.testing.FailingAllocator` proof test in the
-same change — ReleaseFast strips the assert `assumeCapacity` relies on, so an unproven reserve
-is a silent-corruption risk, not just a missed optimization.
+stage timing and tuner state before changing thread policy or algorithm shape. Check the two
+known `std.MultiArrayList` regression signatures first: `rows.items(.field)` in a loop and
+per-row `appendAssumeCapacity` in a hot gather loop (CS § Dense SoA storage). Measure with a
+targeted `zig build bench` group, never a timer in a test (CS § Benchmarks). A fix touching a
+`reserve` + `assumeCapacity` path updates its `FailingAllocator` proof in the same change
+(CS § Allocator discipline).
 
 A `zig build check` failure citing a `SimulationPipeline` stage reading a resource before any
 earlier stage writes it is the `stageContract()`/`PipelineResource`/`stage_order` comptime
-contract working as intended (`docs/coding-standards.md` Simulation pipeline stage ordering) —
+contract working as intended (CS § Simulation Pipeline Stage Ordering) —
 fix the stage's declared reads/writes or its `stage_order` position, not the contract check.
 
 ## Narrow Commands
@@ -85,7 +81,8 @@ fix the stage's declared reads/writes or its `stage_order` position, not the con
 - `zig build shaders` — shader source, shader tool, or install-path failures.
 - `zig build dev` / `zig build run` — only when runtime behavior needs the app.
 - `zig build gpu-smoke` — display-gated renderer pipeline checks when a display exists.
-- `zig build verify` — after a fix that affects multiple layers.
+- `zig build verify` — after a fix that affects multiple layers
+  (`docs/development-workflow.md` § Validation Cadence).
 
 ## Common Failure Boundaries (cheat-sheet)
 
@@ -108,9 +105,8 @@ fix the stage's declared reads/writes or its `stage_order` position, not the con
   no-swapchain frames; visible rendering stays swapchain/vsync paced, non-renderable frames
   use fallback delay + pause policy.
 
-When the confirmed fix requires code, follow `docs/coding-standards.md` for style, imports,
-performance, comments, tests, and generated-output rules. Do not edit generated output
-(`zig-out/`, `.zig-cache/`).
+When the confirmed fix requires code, it meets CS like any other change (generated output
+is never edited: CS § Generated Output And Configuration).
 
 ## Coordination
 

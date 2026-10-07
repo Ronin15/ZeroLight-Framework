@@ -74,7 +74,7 @@ Review follow-up (2026-10-05), each item with a test:
 - **Unbuilt graph:** `linkSlotGeometry` returns `.unresolved` when the graph is
   not valid.
 - **Link storage: load-time initial reservation; dig-seam growth landed
-  2026-10-06** (CLAUDE.md budgets/capacities rule):
+  2026-10-06** (coding-standards § Budgets, Capacities, And Thresholds):
   - `WorldSystem.reserveLevelLinks` sets the initial limit, and the demo sizes
     it as authored links + world chunks × K.
   - The memory gate and the build's `link_edges` reservation both use

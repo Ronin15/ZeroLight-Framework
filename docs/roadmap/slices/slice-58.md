@@ -206,7 +206,7 @@ world-sized working capacities follow the table.
   bigger world produces more candidates, not more spawns.
   `max_worldgen_resource_nodes` is the same kind of per-step-cost population
   budget; the node store itself is a world-sized capacity (Slice 61).
-- **Classification (CLAUDE.md budgets / capacities / thresholds).**
+- **Classification (coding-standards § Budgets, Capacities, And Thresholds).**
   - Entity-population budgets: the population cap and
     `max_worldgen_resource_nodes`. Every spawn and node is a live entity with
     per-step cost (AI and steering for spawns; a static collision proxy and

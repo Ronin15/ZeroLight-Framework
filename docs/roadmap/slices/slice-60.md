@@ -345,7 +345,7 @@ body of `simViewRect()`. No second anchor store or `PipelineResource` is added.
   (validated `< zoom_level_count`), a schema bump by one with the
   `upgradeVNToVN+1` step this slice adds. The rig reads it at init as its starting
   `zoom_index`; a zoom change writes it back through the store's normal dirty path.
-- Fixed constants, classified (CLAUDE.md budgets / capacities / thresholds):
+- Fixed constants, classified (coding-standards § Budgets, Capacities, And Thresholds):
   - `k_max_zoom_levels = 8`: format (the inline `zoom_levels` array;
     `zoom_index: u8`)
   - `k_shake_max_offset_px = 8`: presentation tuning amplitude, not a cap

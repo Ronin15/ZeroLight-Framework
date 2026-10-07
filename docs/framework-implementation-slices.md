@@ -5,7 +5,10 @@ Work is organized as **numbered slices**: each slice is one complete,
 verifiable feature chunk with a **Goal**, **Checklist**, and **Acceptance
 checks**. Agents implement by opening a slice file, checking items off only
 when integrated, and running `zig build verify` before marking the slice
-complete.
+complete. Technical rules (style, performance, budgets and capacities,
+threading, stage ordering, tests, benchmarks) live in
+[coding-standards.md](coding-standards.md); this file holds roadmap process
+only.
 
 **Layout.** This file is the index only: rules, workflow, the open slice
 table, priorities, and the Suggested Order. Each open slice or sub-slice is
@@ -47,38 +50,24 @@ open until that residual is closed.
   item in its owning slice or a decision-complete new slice (Status may be
   "gated on <trigger>"). Scaling Gaps holds only measured pressure points
   awaiting a benchmark. "Out of scope" text must name the slice that owns the
-  work. Exception: items the owner explicitly defers go in
+  work. Agent briefs never ask agents to "propose Scaling Gaps lines".
+  Exception: items the owner explicitly defers go in
   [**Deferred By Owner**](#deferred-by-owner) with their trigger; agents
   never add entries there on their own.
-- Keep hot paths simple: prefer enums, bitsets, arrays, and generational slot IDs
-  over dynamic dispatch, string lookup, or hash maps during input/update/draw.
 - If a dependent system does not exist yet, label the work as foundation or
-  preparation and leave the slice checklist incomplete.
+  preparation and leave the slice checklist incomplete. Scaffolding counts only
+  when it lands the final owner modules, storage defaults, validation, and
+  tests that preserve current behavior; say what is scaffolded and where future
+  behavior hooks in, and never document deferred runtime behavior as complete.
 - Avoid half-wired states; either finish the slice end to end or keep every open
   item visible in that slice's Checklist or Acceptance checks.
-- Keep `src/root.zig` minimal; feature modules should live in their matching
-  `src/` area and import each other directly when needed.
 - Read [architecture.md](architecture.md) and the owning live modules before
-  editing; code wins over stale slice prose when they disagree.
-- A new fixed-step system lands in `SimulationPipeline` as one `StageId`, one
-  `stage_order` entry, a complete `stageContract` (reads, writes, and carried
-  resources), and one `runStage` arm. The comptime stage-order checks are the
-  dependency gate. Do not add a scheduler beside the pipeline. The planned
-  merged order is Table T4.
-- Budgets, capacities, and thresholds follow CLAUDE.md's three-way rule.
-  Per-step/per-query **work budgets** are fixed counts, never scaled to world,
-  level, cell, portal, or band counts; work that does not fit is deferred
-  deterministically. **Capacities** are right-sized per world instance: world-extent
-  data is sized exactly at load; runtime-growing stores (population, items,
-  particles, nodes) start right-sized plus headroom and grow only at the
-  main-thread structural-commit seam (geometric, ahead of need) or via paged
-  storage — hot paths stay allocation-free between growth points (proven by
-  `FailingAllocator`), and capacity never changes behavior; fixed caps only
-  for index/format widths proven unreachable for the world extent, failing
-  loudly at load, never at a gameplay-reachable point. Never change a
-  constant just for the rule — a change needs a concrete perf/efficiency
-  benefit. **Thresholds** derive from the cost of the
-  operation they gate, not the whole world.
+  editing; code wins over stale slice prose when they disagree. Module
+  placement follows architecture.md's Source Layout.
+- Every slice follows [coding-standards.md](coding-standards.md), in
+  particular § Budgets, Capacities, And Thresholds, § Threading, and
+  § Simulation Pipeline Stage Ordering. The planned merged stage order is
+  Table T4.
 - Do not promote threaded stage overlap, nav-remask cost changes, render-collect
   scan changes, or persistence beyond Slice 46's written stable-ID boundary
   into a checklist until those behaviors are confirmed in the live modules.
@@ -94,7 +83,8 @@ open until that residual is closed.
   [VoidLight port track](roadmap/tracks/voidlight-port.md). Every bump is
   relative (live value + 1); a slice that changes one updates the table in
   the same change.
-- Run `zig build verify` before considering a slice complete.
+- Validate per [development-workflow.md](development-workflow.md)
+  § Validation Cadence; `zig build verify` passes before a slice is complete.
 
 ## Agent Workflow: Implementing A Slice
 
@@ -220,7 +210,7 @@ Use this index to choose the next slice; **implement from that slice's file**
 `mergeDrawList`) are measure-first notes in [Scaling Gaps](roadmap/scaling-gaps.md),
 not a live slice body. (The 23A `expand2`→`world` merge is settled.)
 
-**Bench policy:** 50k bench scales are throughput ceilings, not per-frame targets.
+**Bench policy:** coding-standards § Benchmarks (50k scales are ceilings).
 `frame-battle` (Slice 52C: 2048-mover production demo, full fixed step plus CPU
 render-prep) is the release full-frame baseline; 66E adds the authoritative
 self-hosted perf runner.
@@ -258,9 +248,10 @@ table-driven affect→behavior are in place. Open work grows *beside* that loop.
   projects 10 more and Slice 71A one (`ai_post`): **25 of 32** (Table T5).
 - **Interest kinds:** all reserved kinds are wired once 71C lands
   (investigate 41, resource 61, patrol 71A, cover 71C).
-- Guard CPU paths with existing benches; keep SDL_GPU submit on the render
-  thread. Reuse state-owned `SimulationPipeline`; persistent data in
-  `DataSystem`; structural changes through `SimulationFrame`.
+- Guard CPU paths with existing benches. Architecture constraints (SDL_GPU
+  submit on the render thread, state-owned `SimulationPipeline`, persistent
+  data in `DataSystem`, structural changes through `SimulationFrame`) are in
+  [architecture.md](architecture.md).
 
 ## Deferred By Owner
 

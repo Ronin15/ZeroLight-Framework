@@ -169,6 +169,8 @@ configure cache on Windows hosts and the configure phase re-runs on every
 `zig build` there. Non-Windows hosts, including Windows cross-builds, are
 unaffected.
 
+## Diagnostics And Log Levels
+
 SDL_GPU debug validation is enabled by default in Debug builds. Override it with:
 
 ```sh
@@ -275,26 +277,22 @@ intent); dig and move keep their existing keyboard / stick bindings — see
 ## Testing
 
 Tests follow Zig conventions: small unit tests live beside the code they cover
-as `test` blocks. Run them with:
+as `test` blocks. Run them with `zig build test`. Test standards live in
+`docs/coding-standards.md` § Tests.
 
-```sh
-zig build test
-```
+## Validation Cadence
 
-For a broader local check before sharing changes:
-
-```sh
-zig build shaders
-zig build check
-zig build test
-zig build verify
-```
-
-`verify` runs compile coverage, unit tests, shader compilation, atlas lint, and
-idiom lint.
-
-Coding style, performance standards, comment policy, test standards, and
-generated-output rules live in `docs/coding-standards.md`.
+- While iterating, prefer `zig build check` for fast compile feedback.
+- Per commit: `zig build check` + `zig build test` + `zig build idiom-lint`.
+- Once per multi-commit batch, and before a slice or broad change is
+  considered complete: `zig build verify` (compile coverage, unit tests,
+  shader compilation, atlas lint, idiom lint).
+- `zig build shaders` after shader source or shader build-wiring changes.
+- `zig build gpu-smoke` only when display/GPU validation is relevant and a
+  display exists; report it as not run otherwise.
+- Cost savings never drop proof: keep every proof test, every
+  `FailingAllocator` proof, and the fails-with-the-fix-reverted check.
+- Benchmarks follow `docs/coding-standards.md` § Benchmarks.
 
 ## Benchmarks
 

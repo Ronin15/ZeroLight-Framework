@@ -477,4 +477,5 @@ Tests for this module should prove the stream contracts directly:
 - capacity overflow distinguishes required events from diagnostic drops;
 - structural command commits publish events only after successful `DataSystem`
   mutation;
-- no test-only payload tags or fake stages are added to production contracts.
+- no test-only payload tags or fake stages in production contracts
+  (`docs/coding-standards.md` § Tests).
