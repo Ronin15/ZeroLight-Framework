@@ -27,15 +27,11 @@ simulation, richer emergent AI, and production-friendly asset workflows.
   out.
 - **Dig-aware pathfinding** — NPCs path across levels and use newly dug
   tunnels and ramps right away.
-- **Emergent AI (in progress)** — early substrate, not a finished AI game
-  layer. Agents can see and hear, keep short-term memory, carry simple emotion
-  drives, and choose among a few locomotion behaviors; personalities and
-  interest points are data-authored. Hearing digs/footsteps/impacts and
-  investigate markers are wired; combat AI, deeper goals, coupled feelings, and
-  broader world reactions are still on the roadmap.
-- **Action intents and destructibles (early)** — a typed interact/attack bus
-  with a first consumer (smashable crates that open navigation). Not a full
-  combat or interaction system yet.
+- **Emergent AI (in progress)** — agents see, hear, remember, and react with
+  simple emotions and data-authored personalities. Combat AI and deeper goals
+  are on the roadmap.
+- **Interactables (early)** — smashable crates that open new paths; a full
+  combat and interaction system is on the roadmap.
 - **Atlas-backed assets** — packed runtime atlases with stable IDs so art and
   audio can be swapped without rewriting game code.
 - **Multithreaded and deterministic** — threaded systems with identical
@@ -55,6 +51,8 @@ For design detail and ownership boundaries, start with
 - SDL3, SDL3_ttf, and SDL3_mixer
 - Shader toolchain: `glslc`; `spirv-cross` on macOS; `spirv-cross` and `dxc`
   on Windows
+- Python 3 for the lint steps in `zig build verify` (Pillow only for atlas
+  packing and art tools)
 
 Linux and macOS use system development packages. Windows can fetch pinned SDL
 packages through the build. See [setup](docs/setup.md) for platform notes.
