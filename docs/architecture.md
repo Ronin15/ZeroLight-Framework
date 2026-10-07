@@ -822,9 +822,9 @@ recomputes those chunks' components, and patches the chunk-portal abstract graph
 (bounded by chunk borders, not cells). An incremental batch keeps `nav_version` STABLE
 and evicts only the cached paths crossing the changed cells (a whole-level request,
 whose change is not bounded by edit spans, drops the whole completed-path cache
-instead); only a degenerate full relabel or an edge-cap fallback — a genuine topology
-rebuild — bumps `nav_version` once so every goal-keyed cache/pending entry and group
-field keyed on the old version re-solves. The dirty
+instead); only a degenerate full relabel — a whole-graph rebuild — bumps `nav_version`
+once so every goal-keyed cache/pending entry and group field keyed on the old version
+re-solves. The dirty
 buffer GROWS rather than dropping, so any number of simultaneous diggers or
 obstacle edits in one step all reach the graph — a dropped cell would leave the
 graph stale. Unaffected chunks are never touched, and the whole-world build runs
@@ -872,7 +872,15 @@ threaded result is byte-identical to the serial one (and to a full rebuild). Onl
 the steady path: the abstract chunk-portal
 buffers grow to their real size at the init rebuild and retain that high-water
 capacity, so an incremental rebuild whose topology stays within the high-water
-mark grows no buffer. The per-participant patch scratch is likewise pre-reserved at
+mark grows no buffer. A chunk whose edges outgrow its edge window (edges are quadratic in
+same-component portals, so a dig lattice or a few runtime ramps in one open chunk can do it)
+has just that window relocated to the edge arena's tail at twice its new edge count and is
+re-patched on the main thread after the patch barrier (`growChunkEdgeWindow`, counted as
+`edge_windows_grown`): the step stays an incremental patch equal to a full rebuild, with no
+`nav_version` bump, and the next full build compacts the arena. Windows are not sized for
+the layout maximum (every perimeter cell plus 8 link endpoints in one component, ~4.6k
+edges per 16-tile chunk-level, ~300 MB at 256x256x32) because measured topology needs
+~2 MB. The per-participant patch scratch is likewise pre-reserved at
 the build to the largest chunk's caps. The system-owned dirty buffers are
 reserved by `SimulationPipeline.reserve` from the structural-stage event bound
 (`structuralStageEventBound()`: the `.structural_commit` producers `eventStageOf`

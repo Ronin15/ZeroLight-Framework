@@ -678,6 +678,27 @@ pub fn linkItemCounts(profile: suite.Profile) []const usize {
     return &link_counts;
 }
 
+// The full per-step cursor budget (8, which equals the fixed interior link slots per chunk)
+// landing in ONE nav chunk: distinct interior cells of chunk (1,1). Every ramp endpoint joins the
+// chunk's open component, so its edges (4 + 12*11 = 136) outgrow the build-measured 32-edge
+// window and the timed step crosses it: an in-place window growth (64E follow-up, 2026-10-06;
+// formerly the full-graph edge-cap fallback rebuild).
+const dense_link_counts = [_]usize{link_counts[link_counts.len - 1]};
+
+pub const links_dense_group = suite.BenchmarkGroup{
+    .name = "nav-update-links-dense",
+    .defaultItemCounts = denseLinkItemCounts,
+    .runCase = runDenseLinksCase,
+};
+
+pub fn denseLinkItemCounts(profile: suite.Profile) []const usize {
+    _ = profile;
+    return &dense_link_counts;
+}
+
+// Where a batch's ramp links land: one per chunk (chunk centers, row-major) or all in one chunk.
+const LinkLayout = enum { spread, one_chunk };
+
 // Same world shape as the tile-edit fixture (256x256 tiles, 32 px cells, default 16-tile nav
 // chunks) with an open grass level 1 under the surface, so every ramp link joins two open levels.
 // The tileset meta is loaded once; the world itself is rebuilt fresh (zero links) before every
@@ -768,21 +789,38 @@ fn resetLinkWorld(fixture: *LinksFixture) !void {
 // of the first `n` chunks, row-major, levels 1<->0; untimed), then times the link cursor
 // (fresh slot assignment + both-level dirty marks) and the buffered incremental apply, exactly
 // the post-commit reaction's link work.
-fn timeLinkBatch(fixture: *LinksFixture, io: std.Io, n: usize, thread_system: ?*ThreadSystem) !u64 {
+fn timeLinkBatch(fixture: *LinksFixture, io: std.Io, n: usize, layout: LinkLayout, thread_system: ?*ThreadSystem) !u64 {
     try resetLinkWorld(fixture);
     for (0..n) |i| {
-        const x: u16 = @intCast((i % chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2);
-        const y: u16 = @intCast((i / chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2);
+        const x: u16, const y: u16 = switch (layout) {
+            .spread => .{
+                @intCast((i % chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2),
+                @intCast((i / chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2),
+            },
+            // Chunk (1,1) spans tiles 16..31; cells 18..27 step 3 stay off its perimeter.
+            .one_chunk => .{ @intCast(nav_chunk_tiles + 2 + (i % 4) * 3), @intCast(nav_chunk_tiles + 2 + (i / 4) * 3) },
+        };
         try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = x, .y = y }, .level_b = 0, .cell_b = .{ .x = x, .y = y }, .traversal_cost = 1, .bidirectional = true });
     }
     fixture.system.clearNavDirty();
     const t0 = suite.nowNs(io);
     _ = try fixture.system.markNewNavLinksDirty(&fixture.world);
-    _ = try fixture.system.applyBufferedNavUpdates(&fixture.data, &fixture.world, thread_system);
-    return suite.elapsedNs(t0, suite.nowNs(io));
+    const stats = try fixture.system.applyBufferedNavUpdates(&fixture.data, &fixture.world, thread_system);
+    const elapsed = suite.elapsedNs(t0, suite.nowNs(io));
+    // The dense layout exists to time the step that outgrows a chunk's edge window.
+    std.debug.assert(layout != .one_chunk or stats.edge_windows_grown != 0);
+    return elapsed;
 }
 
 pub fn runLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runLinksCaseWithLayout(allocator, io, options, case, item_count, .spread);
+}
+
+pub fn runDenseLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runLinksCaseWithLayout(allocator, io, options, case, item_count, .one_chunk);
+}
+
+fn runLinksCaseWithLayout(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, layout: LinkLayout) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var threads: ?ThreadSystem = null;
@@ -809,12 +847,12 @@ pub fn runLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     fixture.system.nav_thread_adaptive = case.adaptive;
     fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try timeLinkBatch(fixture, io, n, thread_ptr);
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try timeLinkBatch(fixture, io, n, layout, thread_ptr);
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while ((!fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try timeLinkBatch(fixture, io, n, thread_ptr);
+            _ = try timeLinkBatch(fixture, io, n, layout, thread_ptr);
         }
     }
     const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
@@ -822,7 +860,7 @@ pub fn runLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 
     var accumulator = suite.StatsAccumulator.init(n);
     for (0..options.iterations) |_| {
-        accumulator.record(try timeLinkBatch(fixture, io, n, thread_ptr), suite.serialBatch(n, 1));
+        accumulator.record(try timeLinkBatch(fixture, io, n, layout, thread_ptr), suite.serialBatch(n, 1));
     }
     var stats = accumulator.finish();
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);

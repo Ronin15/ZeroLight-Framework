@@ -59,8 +59,9 @@ serial or threaded; and (4) stays an allocation-free, same-build oracle.
     `group_key_map`, `next_group_evict`, `effective_agent_capacity`,
     `low_load_steps`, and `graph: NavGraph`. After **64E** the graph's portal
     and edge *sets* equal a full rebuild, but the per-chunk edge-window layout
-    (`chunk_edge_cap`/`edge_slack`, measured at the last full build) still
-    depends on build history, and A* expansion order follows that layout;
+    (`chunk_edge_cap`/`chunk_edge_base`, measured at the last full build and
+    relocated by later window growths) still depends on build history, and
+    A* expansion order follows that layout;
   - `perception.level_blocked` + `step_counter` (`systems/perception.zig:500-518`):
     an LOS cache whose scoped patch is proven equal to a full rebuild
     (`perception.zig:2576-2793` tests);

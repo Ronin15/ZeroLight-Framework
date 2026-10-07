@@ -89,8 +89,11 @@ new features.
   - `NavGrid.markWorldObstacles` memsets uniform layers, walks non-uniform
     layers per cell, and marks sparse tiles separately
     (`systems/pathfinding/nav_grid.zig:278-302`).
-  - The per-chunk edge window doubles its slack and logs `nav abstract-graph
-    edge-cap fallback` on overflow (`systems/pathfinding/nav_graph.zig:741-743`).
+  - A chunk that outgrows its per-chunk edge window has that one window
+    relocated at twice its new edge count and re-patched in the same
+    incremental update (`growChunkEdgeWindow` in
+    `systems/pathfinding/nav_graph.zig`, counted as `edge_windows_grown`;
+    64E follow-up, 2026-10-06). The old full-rebuild fallback is gone.
 - **Tileset.**
   - `assets/sprites/world_tileset.json` already ships `autotile_sets`
     `grass_dirt`, `water_shore` and `path`, each `layout: "transition_16"` with
@@ -330,8 +333,9 @@ installed beside `worldgen.json`:
     `levelLinks().len` when the demo reserves `levelLinkLimit()` after
     generation, so they flow into `autoSizedMaxNavMemoryBytes` through that
     load-time capacity (Slice 64E).
-  - The only content-dependent risk is the measured per-chunk edge window. The
-    acceptance soak requires no edge-cap fallback warning at production size.
+  - The only content-dependent cost is the measured per-chunk edge window. A
+    window that outgrows its build size relocates in place (no rebuild); the
+    acceptance soak records `edge_windows_grown` at production size.
 
 **Structures and villages.**
 
@@ -722,7 +726,7 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       `autoSizedMaxNavMemoryBytes` with `link_count` including entrances. A
       60 s ReleaseSafe soak shows:
       - no `NavWorldTooLarge`;
-      - no `nav abstract-graph edge-cap fallback` warning;
+      - `edge_windows_grown` recorded (window relocations, no rebuilds);
       - `loading_build` recorded before and after.
 - [ ] Unit tests stay at 16×16 or smaller with 1 underground level.
 - [ ] Bench: new group `worldgen-breadth` (`src/benchmarks/worldgen.zig`,

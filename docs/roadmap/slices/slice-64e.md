@@ -4,7 +4,9 @@
 
 **Status: landed (2026-10-05); the capacity-audit follow-ups landed
 2026-10-06** (nav dirty buffers sized by the structural-stage event bound;
-level links grow at the dig commit seam). **Only the display-gated manual
+level links grow at the dig commit seam), and the edge-window overflow the
+manual run found is fixed (2026-10-06: in-place per-chunk window growth
+replaces the full-rebuild fallback). **Only the display-gated manual
 acceptance check remains open** (not run: no display in the implementing
 sessions). Every code, test, doc, and bench item below is checked.
 No open prerequisite. This
@@ -561,20 +563,92 @@ multi-worker patch path and the serial one.
       battle demo): NPCs followed dug ramps out; perf dump showed 14 tile
       changes → 13 incremental rebuilds, `full_relabel=0`, `links_deferred=0`,
       `link_endpoints_unslotted=0`, both ramp refusal counters 0.
-- [ ] **Edge-window overflow after runtime ramps (found in the 2026-10-06
+- [x] **Edge-window overflow after runtime ramps (found in the 2026-10-06
       manual run).** Later in the same run the log printed
       `nav abstract-graph edge-cap fallback: per-chunk edge window overflow,
-      full rebuild with slack 4`. The fallback is graceful but performs a
-      full nav rebuild (a potential frame hitch). Likely cause: runtime ramp
-      links now really add cross-level abstract edges (this slice's fix), and
-      the per-chunk edge window is not sized for the 8 interior link slots per
-      chunk. That window is a per-chunk layout capacity, so under the
-      capacity rule it must be sized for its true per-chunk maximum (portals +
-      8 link endpoints) at build, not overflow into a full rebuild. Steps:
-      zig-debug-specialist reproduces with a tiny fixture (dig ramps in one
-      chunk up to the 8-slot limit, assert no `edge_cap_fallback`); fix the
-      window sizing; incremental==full parity and `nav-update-links` /
-      `nav-update-scattered` bench gates; a test that fails on the old sizing.
+      full rebuild with slack 4`. Fixed 2026-10-06.
+  - **Root cause.** A full build sized each chunk's edge window as
+    max(measured edges × 2, 32) and never grew it. A chunk's edge count is
+    quadratic in its same-component portals: b border-run portals plus k link
+    endpoints give b + (b+k)(b+k−1) edges. An open interior chunk builds with
+    4 border portals, so 16 edges and a 32-edge window. Since this slice, every
+    runtime ramp endpoint is a real portal, so the **second** ramp in one open
+    chunk (4 + 6·5 = 34 edges) overflowed. The overflow fell back to a full
+    abstract rebuild of every level with doubled slack (the logged "slack 4" is
+    the first fallback) plus a `nav_version` bump. Digging alone triggers the
+    same overflow: a corridor lattice giving a walled chunk 12 border runs makes
+    144 edges. So the cause is the window policy, not the slot count.
+  - **True maximum rejected.** Edges per chunk are bounded by layout, but the
+    bound is quadratic. Every perimeter cell can be a ramp endpoint (perimeter
+    endpoints need no interior slot), so at ct = 16 the bound is 60 perimeter
+    cells + 8 link slots in one component: 32 + 68·67 = 4,588 edges, about
+    37 KB per chunk-level. For the 256×256×32 demo that is about 300 MB of
+    resident edge arena against about 2 MB measured.
+  - **Fix: deterministic in-place window growth.** Nothing is rebuilt.
+    - A chunk whose edges outgrow its window has just that window (shared by
+      every level) relocated to the arena tail with cap = max(2 × its new edge
+      count, 32). Every level's window contents are copied, and the chunk's
+      `portal_edge_start` entries are rebased. Arena capacity for every level
+      is ensured before any mutation, so an OOM leaves the layout intact.
+    - The chunk is then re-patched on the main thread
+      (`NavGraph.growChunkEdgeWindow` / `relocateChunkEdgeWindow` in
+      `nav_graph.zig`). The serial patch does this inline. The threaded patch
+      sets a per-chunk flag (`chunk_edge_overflow`, a disjoint write sized at
+      build), and a serial pass after the barrier grows the flagged chunks in
+      dirty-set order, so the resulting layout is the same either way.
+    - The step stays an incremental patch with no `nav_version` bump, and the
+      graph equals a full rebuild.
+    - Growth is geometric (a window at least doubles each time, so a chunk
+      grows at most about 8 times between full builds). Vacated windows are
+      holes until the next full build compacts the arena.
+    - `edge_slack` and the fallback are deleted. `NavUpdateStats.edge_cap_fallback`
+      becomes `edge_windows_grown` (perf metric `nav_edge_windows_grown`), and
+      growth logs one `debug` line.
+    - Slice 72 E4 (a fallback without the version bump) is superseded and
+      closed. The 65B, 69A, and 64B cross-references and `architecture.md`
+      are updated.
+  - **Tests (the regression tests failed before the fix with
+    `edge_cap_fallback == 1`):**
+    - `"runtime ramps filling one chunk's link capacity grow its edge window in
+      place, never rebuilding"`: 8 ramps, one per step, in one 8-tile chunk.
+      It covers the interior and perimeter variants, each serial and through the
+      3-worker threaded patch. Every step has `version_bumps == 0`, there are
+      exactly 2 growths (32 → 68 → 152), and the result matches
+      `expectLinkPatchMatchesFullRebuild`.
+    - `"incremental dig opening many border crossings in one chunk grows its edge
+      window in place"`: the dig-only classifier, compared against a full
+      rebuild.
+    - `"after an edge-window growth, ramps that fit the grown window are
+      allocation-free"`: a FailingAllocator on the world, graph, and system,
+      threaded and serial, with 0 allocations.
+    - Updated tests: the forced-overflow test now expects every window to grow
+      with no bump; `system.zig`'s high-water test expects `version_bumps == 0`
+      and stays allocation-free afterwards; the cursor test keeps only the
+      full-relabel variant.
+  - **Verify and bench.** `zig build verify` and `zig build test` pass in Debug
+    and ReleaseFast. Bench: ReleaseFast, 3 interleaved runs against a `HEAD`
+    export, medians. Every recorded case of `nav-update-links`,
+    `nav-update-scattered`, and `nav-update-multichunk` is within
+    max(3%, spread), with 0 breaches:
+    - links 8, serial: 198.68 → 205.05 us (spread 7%);
+    - scattered 64, serial: 830.55 → 828.99 us;
+    - scattered 256, serial: 3.23 → 3.26 ms;
+    - multichunk 16384, serial: 999.08 → 995.75 us.
+  - **New group `nav-update-links-dense`.** It adds 8 ramps in one chunk in one
+    step, which crosses the window. Serial: 196.30 → 31.47 us (−84%). Tuned:
+    185.70 → 30.53 us. That is on the 2-level bench fixture; the removed full
+    rebuild scales with level count, so the 32-level demo saves more.
+  - **Memory.**
+    - Steady state is unchanged: build-time window sizing is identical, plus
+      one bool per chunk. `ChunkPatchScratch` loses a field but keeps its
+      64/128 B slot.
+    - A growth adds 2 × edges × 8 B per level. At 32 levels that is 17 KB for
+      the first growth of an open chunk and 39 KB for the second.
+    - The first growth that exceeds an arena's capacity reallocates it
+      geometrically (ArrayList growth, about 1.5×; about 1 MB of capacity at
+      256×256×32), so later growths usually allocate nothing.
+    - The old fallback instead re-measured every window at slack 4, roughly
+      doubling every busy chunk's window.
 - [x] Capacity audit: the dirty-buffer `FailingAllocator` test passes serial
       and threaded, and `nav-update-scattered` / `nav-update-links` stay
       within max(3%, noise) of their recorded medians. Recorded 2026-10-06

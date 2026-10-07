@@ -880,11 +880,11 @@ pub const PathfindingSystem = struct {
         var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
         stats.links_deferred = link_stats.deferred;
         stats.link_endpoints_unslotted = link_stats.unslotted;
-        // A full relabel / edge-cap fallback rebuilds the abstract graph from the whole link set
+        // A full relabel rebuilds the abstract graph from the whole link set
         // (computePortalGeometry assigns from index 0) but deliberately leaves the cursor alone:
         // deferred links are still visited by later steps' cursor (idempotent assignment plus
         // a redundant bounded patch), so per-step link accounting and the warn-once rule do not
-        // depend on whether a fallback happened to fire.
+        // depend on whether a relabel happened to fire.
         // Only signal invalidation when the batch actually changed the graph: an incremental dig
         // keeps nav_version stable, so gate on real work too, not just a full-rebuild version bump.
         if (stats.version_bumps == 0 and stats.incremental_rebuilds == 0) return stats;
@@ -4390,7 +4390,10 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     for (system.graph.chunk_edge_cap.items) |*cap| cap.* = 0;
     const stats = try system.applyNavUpdates(&data, &world, edits.items);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 1), stats.version_bumps);
+    // The overflowing chunks grew their edge windows in place: still an incremental patch,
+    // so nav_version is unchanged.
+    try std.testing.expect(stats.edge_windows_grown > 0);
+    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
     // The expansion produced new portals (the abstract graph grew past init).
     try std.testing.expect(system.graph.totalPortals() > 0);
 

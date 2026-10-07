@@ -153,12 +153,13 @@ pub const nav_interior_link_slots_per_chunk: u32 = 8;
 // next step's reaction. Covers every current producer (DigController makes at most one ramp
 // per step); never derived from world size or link count.
 pub const nav_new_links_per_step_max: usize = 8;
-// Slack multiplier applied to a chunk's measured init edge count to size its fixed edge
-// window, so an in-place dig that adds a few edges stays within the window instead of
-// triggering the loud full-rebuild fallback.
+// Slack multiplier applied to a chunk's measured edge count to size its edge window, both at
+// a full build and when an incremental patch outgrows the window and relocates it
+// (NavGraph.growChunkEdgeWindow), so window growth is geometric: a chunk relocates at most
+// O(log(max edges / floor)) times between full builds.
 pub const default_edge_slack: u32 = 2;
 // Smallest per-chunk edge window, so a chunk that builds with zero edges at init still has
-// headroom for a dig that opens a little connectivity before any fallback.
+// headroom for a dig that opens a little connectivity before its window has to grow.
 pub const chunk_edge_floor: u32 = 32;
 // When an incremental nav update touches more than this many distinct levels, the
 // per-affected-level relabel degenerates into a full relabel of every level. It
@@ -321,10 +322,10 @@ pub const NavUpdateStats = struct {
     // border-adjacent neighbors), summed across affected levels. The dirty-bounded
     // work proxy: independent of total level size.
     chunks_patched: usize = 0,
-    // 1 when an affected chunk's transition/intra edges overflowed its fixed
-    // per-chunk edge window, forcing a loud full abstract-graph rebuild with more
-    // slack (a genuine topology blow-up); else 0.
-    edge_cap_fallback: usize = 0,
+    // Chunk edge windows this batch outgrew and relocated to the arena tail
+    // (NavGraph.growChunkEdgeWindow): a cold, dig-triggered growth that keeps the update an
+    // incremental patch (no rebuild, no version bump). 0 on the steady path.
+    edge_windows_grown: usize = 0,
     // New LevelLinks left for a later step's reaction because this step already folded
     // nav_new_links_per_step_max of them (deterministic, link-order deferral).
     links_deferred: usize = 0,
@@ -341,7 +342,7 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_full_relabel, metric(self.full_relabel));
         perf.recordMetric(.nav_version_bumps, metric(self.version_bumps));
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
-        perf.recordMetric(.nav_edge_cap_fallback, metric(self.edge_cap_fallback));
+        perf.recordMetric(.nav_edge_windows_grown, metric(self.edge_windows_grown));
         perf.recordMetric(.pathfinding_links_deferred, metric(self.links_deferred));
         perf.recordMetric(.pathfinding_link_endpoints_unslotted, metric(self.link_endpoints_unslotted));
         perf.recordMetric(.nav_dirty_buffer_grown, metric(self.dirty_buffer_grown));

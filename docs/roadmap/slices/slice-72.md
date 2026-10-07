@@ -535,7 +535,7 @@ Out of scope (each item has a named owner):
 - **Cost:** a stamp payload plus eviction code.
 - **Determinism:** eviction uses a fixed cursor order.
 
-**E4. Edge-window overflow evicts by scope instead of bumping the nav version** (pathfinding-25). Medium priority, Batch E.
+**E4. Edge-window overflow evicts by scope instead of bumping the nav version** (pathfinding-25). Medium priority, Batch E. **Superseded 2026-10-06 by the 64E edge-window follow-up:** the edge-cap fallback no longer exists. An overflowing chunk's window is relocated and re-patched inside the incremental update (`growChunkEdgeWindow`, `edge_windows_grown`), so the update takes the incremental branch (scoped eviction, `version_bumps == 0`) by construction; `system.zig`'s high-water test now asserts that. Nothing is left to implement here.
 
 - **Where:** `nav_graph.zig:750-774`; `system.zig:487-490`.
 - **Now:** an edge-cap fallback rebuilds the abstract graph and bumps `nav_version`, which flushes the whole result cache. Cached results store cells, slots are geometry-stable, and the fallback graph equals the full rebuild, so the flush is purely conservative.
@@ -1079,12 +1079,15 @@ Out of scope (each item has a named owner):
     - `caches.zig:738`, `:876` stay valid for `pending_keys`;
     - the negative-cache tests in `system.zig` re-run.
   - Bench: `pathfinding-cache-unreachable`, `pathfinding-hard-fallback`.
-- [ ] **E4 · Edge-cap fallback without a version bump** (§E4).
-  - Tests:
-    - `system.zig:4213` now expects `version_bumps == 0` after a forced fallback, and a cached path that does not cross the batch spans survives and equals a fresh solve on the rebuilt graph;
-    - `nav_graph.zig:2812-2860` splits the expectations for edge-cap fallback and full relabel.
-  - Cross-edit: in `slice-65b.md`, the lane-job "On a full relabel or fallback, bump version" text and its fallback-equivalence case.
-  - Bench: `nav-update-scattered`, `nav-update-multichunk`, `nav-update-links`, `pathfinding`.
+- [x] **E4 · Edge-cap fallback without a version bump** (§E4). Superseded
+  2026-10-06 by the 64E edge-window follow-up (window growth replaces the
+  fallback; see `slice-64e.md`). The `slice-65b.md` cross-edit landed with it.
+  - Tests (as landed): `system.zig`'s high-water test expects `version_bumps == 0`
+    and `edge_windows_grown > 0` after a forced overflow; a window growth runs the
+    ordinary incremental branch, so the existing scoped-eviction tests cover the
+    surviving-cache case; the `nav_graph.zig` cursor test keeps only the full
+    relabel (a growth never touches the cursor).
+  - Bench: recorded in `slice-64e.md` (`nav-update-links`, `-scattered`, `-multichunk`).
 - [ ] **E5 · Group tally sized from intake** (§E5).
   - Tests: a step with `max_solved_requests_per_step + 1` distinct shared goals tallies all of them in the same step. The group-field tests (e.g. `:1937`) re-run.
   - Bench: `pathfinding-group-field-detour`, `pathfinding-group-field-detour-moving`, `pathfinding-group-field-detour-moving-hysteresis`.

@@ -59,10 +59,12 @@ Goal:
   - Past `nav_full_relabel_level_threshold = 8` (`types.zig:142`,
     `PathfindingCapacity` `:457`), it instead runs `buildComponents` over
     every level plus `buildAbstractGraphs` (`:710-718`).
-  - An edge-window overflow triggers `buildAbstractGraphs` with doubled slack
-    (`:733-746`).
+  - A chunk that outgrows its edge window has that window relocated and is
+    re-patched on the main thread after the patch barrier
+    (`growChunkEdgeWindow`, `stats.edge_windows_grown`; 64E follow-up
+    2026-10-06 — the old full-rebuild fallback is gone).
   - Then `rebuildLinkEdges` runs, and `version` bumps only on a full
-    relabel or a fallback (`:748-757`).
+    relabel.
 - **The queried graph.** `PathfindingSystem.graph: NavGraph` (`system.zig:78`)
   is read every step by `pathfinding_update` workers and by steering's
   `statusForWorld` (`:789-852`).
@@ -362,10 +364,11 @@ rule enforced structurally: the job cannot reach `parallelFor`.
      - `patchChunk(level, links, chunk, &patch_scratch[0])` over dirty
        chunks;
      - `stats.chunks_patched += dirty_len`;
-     - on overflow, double `edge_slack`, run `buildAbstractGraphs(links)`,
-       set `stats.edge_cap_fallback = 1`.
+     - a chunk that overflows its edge window is grown and re-patched
+       (`growChunkEdgeWindow`, `stats.edge_windows_grown += 1`), the same as
+       the synchronous serial path.
    - Then `rebuildLinkEdges(links)`.
-   - On a full relabel or fallback, bump `version` (skipping 0) and set
+   - On a full relabel, bump `version` (skipping 0) and set
      `stats.version_bumps = 1`.
    - `stats.incremental_rebuilds = 1`.
 
@@ -516,7 +519,8 @@ is called through `SimulationPipeline.serviceDeferredNavRebuild` by
 
 - The lane may grow back-graph buffers only on the topology blow-up paths:
   a full relabel that re-measures edge windows past the prior high-water
-  mark, or an edge-cap fallback. This is the same exception
+  mark, or an edge-window growth past the edge arena's capacity. This is the
+  same exception
   `nav_graph.zig:623-629` grants the synchronous path. It goes through
   `PathfindingSystem.allocator`, which must be thread-safe.
 - `PathfindingSystem.init`'s doc comment states this requirement. Production
@@ -660,7 +664,7 @@ copied at submit") gains one clause:
       `NavUpdateStats` (incremental case).
     - Repeat with `nav_full_relabel_level_threshold = 1` (full relabel,
       version bumped on both).
-    - Repeat with an edge-window overflow (fallback).
+    - Repeat with an edge-window overflow (window growth, no version bump).
     - Repeat with a runtime ramp (64E) added before submit and another added
       during the job: the during-job link is held by the fence (cursor
       unchanged, `links_deferred` counted) and processed from step `s + k`'s
@@ -820,7 +824,7 @@ copied at submit") gains one clause:
   report zero races. This proves the frozen front is read concurrently by
   the lane and never written.
 - [ ] The equivalence tests pass in all three shapes: incremental, full
-  relabel, and edge-cap fallback. The four-lane checksum traces are equal.
+  relabel, and edge-window growth. The four-lane checksum traces are equal.
 - [ ] The `FailingAllocator` proofs pass for submit, the job, and the swap
   with no warm cycle (armed right after load), for fence-held marks across
   the whole window, and for the whole-level static coverage refresh. The
