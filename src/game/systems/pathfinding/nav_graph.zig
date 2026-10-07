@@ -144,11 +144,11 @@ pub const NavLevelGraph = struct {
         return count;
     }
 
-    // Edges chunk D's live slots hold: its slot window's adjacency counts summed.
-    fn chunkEdgeCount(self: *const NavLevelGraph, pbase: u32, pcap: u32) u32 {
-        var count: u32 = 0;
-        for (self.portal_edge_count.items[pbase..][0..pcap]) |slot_count| count += slot_count;
-        return count;
+    // Edges one chunk's live slots hold: its slot window's adjacency counts summed.
+    fn chunkEdgeCount(self: *const NavLevelGraph, portal_base: u32, portal_cap: u32) u32 {
+        var edge_count: u32 = 0;
+        for (self.portal_edge_count.items[portal_base..][0..portal_cap]) |slot_edges| edge_count += slot_edges;
+        return edge_count;
     }
 };
 // Cache-line separation for per-worker scratch slots, same policy as collision.zig,
@@ -1239,9 +1239,10 @@ pub const NavGraph = struct {
     // Every window cap a build or repack sets is windowCap of a real edge count, so no level
     // arena can exceed it.
     fn maxLevelEdgeSlots(self: *const NavGraph) u64 {
-        const pcap: u64 = 4 * @as(u64, self.chunk_tiles) + nav_interior_link_slots_per_chunk;
-        const window = @max(pcap * pcap * default_edge_slack, chunk_edge_floor);
-        return @as(u64, self.chunkCount()) * window;
+        const portal_cap: u64 = 4 * @as(u64, self.chunk_tiles) + nav_interior_link_slots_per_chunk;
+        const max_chunk_edges = portal_cap * portal_cap;
+        const max_window = @max(max_chunk_edges * default_edge_slack, chunk_edge_floor);
+        return @as(u64, self.chunkCount()) * max_window;
     }
 
     // Who is assigning link-endpoint slots: a full build (count only) or the incremental link
@@ -1460,69 +1461,80 @@ pub const NavGraph = struct {
     }
 
     // Main thread, after `level`'s patch barrier, when some dirty chunk overflowed its window:
-    // rebuilds the level's edge arena once. Measures every chunk's edges (a flagged chunk is
-    // rebuilt into scratch), keeps a chunk's cap while its edges fit and sizes a grown one at
-    // windowCap, allocates the new arena exactly, copies every unflagged chunk's live edges into
-    // its new window, and re-patches the flagged chunks into theirs. The arena is allocated before
-    // any layout write, so an OOM leaves the old layout valid (flagged chunks at empty adjacency).
-    // Other levels are untouched. Clears this level's overflow flags on every exit.
+    // rebuilds the level's edge arena once, in three steps:
+    //   1. measure every chunk's edges (a flagged chunk is rebuilt into scratch) and pick its new
+    //      cap: unchanged while its edges fit, windowCap(edges) when they do not;
+    //   2. allocate the new arena exactly, then move every unflagged chunk's edges into it;
+    //   3. re-patch the flagged chunks into their new windows.
+    // The arena is allocated before any layout write, so an OOM leaves the old layout valid
+    // (flagged chunks at empty adjacency). Other levels are untouched. Clears this level's
+    // overflow flags on every exit.
     fn repackLevelEdges(self: *NavGraph, level: u16, world: *const WorldSystem) ChunkPatchError!void {
         defer for (self.dirty_set.items) |chunk| {
             self.chunk_edge_overflow.items[chunk] = false;
         };
-        const lg = &self.level_graphs.items[level];
+        const level_graph = &self.level_graphs.items[level];
         const scratch = &self.patch_scratch.items[0];
         const chunk_count = self.chunkCount();
         // Allocation-free after a build: build_u32_scratch then holds total_slots (> 2 * chunk count).
-        const sizes = try self.buildScratch(2 * chunk_count);
-        const new_caps = sizes[0..chunk_count];
-        const live = sizes[chunk_count..];
-        var total: u64 = 0;
-        var grown: u32 = 0;
-        for (new_caps, live, lg.chunk_edge_cap.items, 0..) |*cap, *count, old_cap, chunk_index| {
+        const u32_scratch = try self.buildScratch(2 * chunk_count);
+        const new_caps = u32_scratch[0..chunk_count];
+        const edge_counts = u32_scratch[chunk_count..];
+
+        // Step 1: measure.
+        var new_total: u64 = 0;
+        var windows_grown: u32 = 0;
+        for (0..chunk_count) |chunk_index| {
             const chunk: u32 = @intCast(chunk_index);
             if (self.chunk_edge_overflow.items[chunk]) {
                 try self.buildChunkPatch(level, world, chunk, scratch);
-                count.* = @intCast(scratch.edges.items.len);
+                edge_counts[chunk] = @intCast(scratch.edges.items.len);
             } else {
-                count.* = lg.chunkEdgeCount(self.chunk_portal_base.items[chunk], self.chunk_portal_cap.items[chunk]);
+                edge_counts[chunk] = level_graph.chunkEdgeCount(self.chunk_portal_base.items[chunk], self.chunk_portal_cap.items[chunk]);
             }
-            cap.* = if (count.* <= old_cap) old_cap else windowCap(count.*);
-            if (cap.* != old_cap) grown += 1;
-            total += cap.*;
+            const old_cap = level_graph.chunk_edge_cap.items[chunk];
+            new_caps[chunk] = if (edge_counts[chunk] <= old_cap) old_cap else windowCap(edge_counts[chunk]);
+            if (new_caps[chunk] != old_cap) windows_grown += 1;
+            new_total += new_caps[chunk];
         }
         // computePortalGeometry proved this extent's worst case fits the u32 edge index.
-        std.debug.assert(total <= self.maxLevelEdgeSlots());
-        if (grown != 0) {
-            var fresh: std.ArrayList(AbstractEdge) = .empty;
-            try fresh.ensureTotalCapacityPrecise(self.allocator, @intCast(total));
-            fresh.items.len = @intCast(total);
-            var base: u32 = 0;
-            for (new_caps, live, lg.chunk_edge_cap.items, lg.chunk_edge_base.items, 0..) |cap, count, *chunk_cap, *chunk_base, chunk_index| {
+        std.debug.assert(new_total <= self.maxLevelEdgeSlots());
+
+        // Step 2: a new arena only when some window grew (an error-flagged chunk may still fit).
+        if (windows_grown != 0) {
+            var new_arena: std.ArrayList(AbstractEdge) = .empty;
+            try new_arena.ensureTotalCapacityPrecise(self.allocator, @intCast(new_total));
+            new_arena.items.len = @intCast(new_total);
+            var new_base: u32 = 0;
+            for (0..chunk_count) |chunk_index| {
                 const chunk: u32 = @intCast(chunk_index);
-                const pbase = self.chunk_portal_base.items[chunk];
-                const starts = lg.portal_edge_start.items[pbase..][0..self.chunk_portal_cap.items[chunk]];
+                const old_base = level_graph.chunk_edge_base.items[chunk];
+                const portal_base = self.chunk_portal_base.items[chunk];
+                const starts = level_graph.portal_edge_start.items[portal_base..][0..self.chunk_portal_cap.items[chunk]];
                 if (self.chunk_edge_overflow.items[chunk]) {
-                    // Empty adjacency until the re-patch below; keep its starts in the new arena.
-                    @memset(starts, base);
+                    // Empty adjacency until step 3; keep its starts inside the new arena.
+                    @memset(starts, new_base);
                 } else {
-                    @memcpy(fresh.items[base..][0..count], lg.portal_edges.items[chunk_base.*..][0..count]);
-                    for (starts) |*start| start.* = start.* - chunk_base.* + base;
+                    const edges = level_graph.portal_edges.items[old_base..][0..edge_counts[chunk]];
+                    @memcpy(new_arena.items[new_base..][0..edges.len], edges);
+                    for (starts) |*start| start.* = start.* - old_base + new_base;
                 }
-                chunk_cap.* = cap;
-                chunk_base.* = base;
-                base += cap;
+                level_graph.chunk_edge_cap.items[chunk] = new_caps[chunk];
+                level_graph.chunk_edge_base.items[chunk] = new_base;
+                new_base += new_caps[chunk];
             }
-            lg.portal_edges.deinit(self.allocator);
-            lg.portal_edges = fresh;
-            lg.total_edge_slots = base;
-            self.edge_windows_grown_total += grown;
+            level_graph.portal_edges.deinit(self.allocator);
+            level_graph.portal_edges = new_arena;
+            level_graph.total_edge_slots = new_base;
+            self.edge_windows_grown_total += windows_grown;
             self.edge_repacks_total += 1;
             // Cold, dig-triggered (a window at least doubles per growth); out of test builds,
             // which trigger it on purpose.
             if (comptime logging.enabled(.debug) and !builtin.is_test)
-                logging.game.debug("nav level {d} edge arena repacked: {d} window(s) grown, {d} slots", .{ level, grown, base });
+                logging.game.debug("nav level {d} edge arena repacked: {d} window(s) grown, {d} slots", .{ level, windows_grown, new_base });
         }
+
+        // Step 3: re-patch the flagged chunks.
         for (self.dirty_set.items) |chunk| {
             if (!self.chunk_edge_overflow.items[chunk]) continue;
             const overflowed = try self.patchChunk(level, world, chunk, scratch);
@@ -1819,31 +1831,32 @@ pub const NavGraph = struct {
         const lg = &self.level_graphs.items[level];
         const chunk_count = self.chunkCount();
         const u32_scratch = try self.buildScratch(@as(usize, self.total_slots) + chunk_count);
-        const caps = u32_scratch[0..chunk_count];
+        const new_caps = u32_scratch[0..chunk_count];
         const cursor = u32_scratch[chunk_count..];
-        @memset(caps, 0);
-        for (self.build_edge_scratch.items) |entry| caps[lg.portals.items[entry.from].chunk] += 1;
-        var total: u64 = 0;
-        for (caps) |*cap| {
+        // Count each chunk's edges, then size its window.
+        @memset(new_caps, 0);
+        for (self.build_edge_scratch.items) |entry| new_caps[lg.portals.items[entry.from].chunk] += 1;
+        var new_total: u64 = 0;
+        for (new_caps) |*cap| {
             cap.* = windowCap(cap.*);
-            total += cap.*;
+            new_total += cap.*;
         }
         // computePortalGeometry proved this extent's worst case fits the u32 edge index.
-        std.debug.assert(total <= self.maxLevelEdgeSlots());
-        if (lg.portal_edges.capacity != total) {
-            var fresh: std.ArrayList(AbstractEdge) = .empty;
-            try fresh.ensureTotalCapacityPrecise(self.allocator, @intCast(total));
+        std.debug.assert(new_total <= self.maxLevelEdgeSlots());
+        if (lg.portal_edges.capacity != new_total) {
+            var new_arena: std.ArrayList(AbstractEdge) = .empty;
+            try new_arena.ensureTotalCapacityPrecise(self.allocator, @intCast(new_total));
             lg.portal_edges.deinit(self.allocator);
-            lg.portal_edges = fresh;
+            lg.portal_edges = new_arena;
         }
-        lg.portal_edges.items.len = @intCast(total);
-        var base: u32 = 0;
-        for (caps, lg.chunk_edge_cap.items, lg.chunk_edge_base.items) |cap, *chunk_cap, *chunk_base| {
-            chunk_cap.* = cap;
-            chunk_base.* = base;
-            base += cap;
+        lg.portal_edges.items.len = @intCast(new_total);
+        var new_base: u32 = 0;
+        for (0..chunk_count) |chunk| {
+            lg.chunk_edge_cap.items[chunk] = new_caps[chunk];
+            lg.chunk_edge_base.items[chunk] = new_base;
+            new_base += new_caps[chunk];
         }
-        lg.total_edge_slots = base;
+        lg.total_edge_slots = new_base;
         @memset(lg.portal_edge_count.items, 0);
         for (self.build_edge_scratch.items) |entry| lg.portal_edge_count.items[entry.from] += 1;
         var chunk: u32 = 0;
@@ -2565,6 +2578,11 @@ fn rampLink(x: u16, y: u16) LevelLink {
     return .{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = x, .y = y }, .level_b = 0, .cell_b = .{ .x = x, .y = y }, .traversal_cost = 1, .bidirectional = true };
 }
 
+// Adds one ramp link at each cell.
+fn addRamps(world: *WorldSystem, cells: []const CellCoord) !void {
+    for (cells) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+}
+
 // Runs one step's real post-commit nav reaction (no structural events: the link cursor is
 // the only trigger) and returns its stats.
 fn reactOneStep(system: *PathfindingSystem, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
@@ -3210,19 +3228,26 @@ const WalledTwoLevelWorld = struct {
     tree: TileId,
     grass: TileId,
 
-    // Sets every cell of `level`'s odd rows and columns in [lo, hi) to `tile`, appending the
-    // changed cells to `edits`. Odd lanes give each chunk 8-16 border runs in one component.
+    // Carves (tile = grass) or fills (tile = tree) a lattice of 1-wide corridors on the odd
+    // rows and columns inside [lo, hi) of `level`, appending every changed cell to `edits`.
+    // Odd corridors give each chunk 8-16 border runs in one component.
     fn setLattice(self: *WalledTwoLevelWorld, level: u16, lo: u16, hi: u16, tile: TileId, edits: *std.ArrayList(NavCellEdit)) !void {
-        var lane: u16 = lo | 1;
-        while (lane < hi) : (lane += 2) {
-            var i: u16 = lo;
-            while (i < hi) : (i += 1) {
-                for ([_][2]u16{ .{ i, lane }, .{ lane, i } }) |xy| {
-                    const changed = (try self.world.setDenseTile(self.walls[level], xy[0], xy[1], tile)) orelse continue;
-                    try edits.append(std.testing.allocator, .{ .level = changed.level, .x = changed.x, .y = changed.y });
-                }
+        // Corridors run on odd rows/columns.
+        const first_corridor: u16 = if (lo % 2 == 0) lo + 1 else lo;
+        var corridor = first_corridor;
+        while (corridor < hi) : (corridor += 2) {
+            var along: u16 = lo;
+            while (along < hi) : (along += 1) {
+                try self.setCell(level, along, corridor, tile, edits); // row corridor
+                try self.setCell(level, corridor, along, tile, edits); // column corridor
             }
         }
+    }
+
+    // Sets one wall-layer cell, recording it in `edits` when the tile actually changed.
+    fn setCell(self: *WalledTwoLevelWorld, level: u16, x: u16, y: u16, tile: TileId, edits: *std.ArrayList(NavCellEdit)) !void {
+        const changed = (try self.world.setDenseTile(self.walls[level], x, y, tile)) orelse return;
+        try edits.append(std.testing.allocator, .{ .level = changed.level, .x = changed.x, .y = changed.y });
     }
 };
 
@@ -3240,12 +3265,6 @@ fn initWindowSystem(system: *PathfindingSystem, data: *const DataSystem, world: 
     try system.rebuildStaticNavGridWithWorld(data, world, 768, 768, 32, null);
     system.nav_thread_adaptive = false;
     system.nav_thread_items_per_range = 1;
-}
-
-fn sumEdgeCaps(lg: *const NavLevelGraph) usize {
-    var total: usize = 0;
-    for (lg.chunk_edge_cap.items) |cap| total += cap;
-    return total;
 }
 
 test "a destruction-shaped batch repacks each affected level once, serial equals threaded, no refusal" {
@@ -3297,12 +3316,16 @@ test "a destruction-shaped batch repacks each affected level once, serial equals
     try expectGraphsEquivalent(&threaded.graph, &rebuilt.graph);
     try expectNoEdgeTargetsTombstone(&serial.graph);
 
+    // Recorded: dense 2000 slots, sparse 788, per-level sum 2788; shared windows would be 4000.
     const dense = &serial.graph.level_graphs.items[0];
     const sparse = &serial.graph.level_graphs.items[1];
-    var shared: usize = 0;
-    for (dense.chunk_edge_cap.items, sparse.chunk_edge_cap.items) |a, b| shared += 2 * @max(a, b);
-    try std.testing.expect(sparse.total_edge_slots * 2 < dense.total_edge_slots);
-    try std.testing.expect((dense.total_edge_slots + sparse.total_edge_slots) * 4 < shared * 3);
+    var shared_window_total: usize = 0;
+    for (dense.chunk_edge_cap.items, sparse.chunk_edge_cap.items) |dense_cap, sparse_cap| {
+        shared_window_total += 2 * @max(dense_cap, sparse_cap);
+    }
+    const per_level_total = dense.total_edge_slots + sparse.total_edge_slots;
+    try std.testing.expect(sparse.total_edge_slots < dense.total_edge_slots / 2);
+    try std.testing.expect(per_level_total < shared_window_total * 3 / 4);
 }
 
 test "a level repack touches only its own level, and an OOM in it leaves the old layout intact" {
@@ -3389,8 +3412,9 @@ test "repeated dig and fill cycles grow windows once, then stay allocation-free 
     var edits = std.ArrayList(NavCellEdit).empty;
     defer edits.deinit(std.testing.allocator);
     var grown_total: usize = 0;
+    const carve_then_fill = [_]TileId{ walled.grass, walled.tree };
     for (0..3) |cycle| {
-        for ([_]TileId{ walled.grass, walled.tree }) |tile| {
+        for (carve_then_fill) |tile| {
             edits.clearRetainingCapacity();
             try walled.setLattice(0, 0, 24, tile, &edits);
             const total_before = level0.total_edge_slots;
@@ -4158,14 +4182,15 @@ test "edge-window growths of a failed step are reported by the next successful s
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    for ([_][2]u16{ .{ 9, 17 }, .{ 11, 17 }, .{ 13, 17 } }) |xy| try world.addLevelLink(rampLink(xy[0], xy[1]));
+    try addRamps(&world, &.{ .{ .x = 9, .y = 17 }, .{ .x = 11, .y = 17 }, .{ .x = 13, .y = 17 } });
     const step1 = try reactOneStep(&system, &frame, &data, &world, null);
     try std.testing.expectEqual(@as(usize, 2), step1.edge_windows_grown);
     try std.testing.expectEqual(@as(usize, 2), step1.edge_repacks);
     try std.testing.expectEqual(@as(u32, 66), level0.chunk_edge_cap.items[7]);
     try std.testing.expectEqual(@as(u32, 8 * 32 + 66), level0.total_edge_slots);
 
-    for ([_][2]u16{ .{ 9, 1 }, .{ 11, 1 }, .{ 13, 1 }, .{ 9, 9 }, .{ 11, 9 } }) |xy| try world.addLevelLink(rampLink(xy[0], xy[1]));
+    try addRamps(&world, &.{ .{ .x = 9, .y = 1 }, .{ .x = 11, .y = 1 }, .{ .x = 13, .y = 1 } }); // chunk 1
+    try addRamps(&world, &.{ .{ .x = 9, .y = 9 }, .{ .x = 11, .y = 9 } }); // chunk 4
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
     graph.allocator = failing.allocator();
     const failed = reactOneStep(&system, &frame, &data, &world, null);
