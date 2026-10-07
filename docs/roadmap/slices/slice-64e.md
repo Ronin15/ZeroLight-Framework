@@ -944,6 +944,11 @@ multi-worker patch path and the serial one.
           successful step" (a step grows chunk 1, compacts twice, and is
           refused on chunk 4; the retry reports 2 growths and 2 compactions;
           per-step counting reports 1 and fails).
+    - [x] **M11 · one refusal `err` per failed step.** The per-chunk refusal
+          line in `relocateChunkEdgeWindow` is now `debug`; `applyNavUpdates`
+          logs one comptime-gated `err` per failed step (refused-chunk count,
+          level, live slots, ceiling). No test (logs are gated out of tests;
+          `edge_growth_refused_total` is already asserted).
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.

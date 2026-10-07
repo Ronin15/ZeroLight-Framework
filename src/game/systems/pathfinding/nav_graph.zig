@@ -796,6 +796,7 @@ pub const NavGraph = struct {
             try self.buildAbstractGraphs(world);
             stats.full_relabel = 1;
         } else {
+            const refused_before = self.edge_growth_refused_total;
             for (self.levels.items, 0..) |_, level_index| {
                 if (!affected_levels.items[level_index]) continue;
                 const level: u16 = @intCast(level_index);
@@ -806,7 +807,15 @@ pub const NavGraph = struct {
                 self.remaskChangedChunks(level, data, world, edits, cell_edits, full_level, remask_threads);
                 self.buildDirtySet(level, world, edits, cell_edits, full_level);
                 stats.chunks_patched += self.dirty_set.items.len;
-                try self.patchDirtyChunks(level, world, patch_threads);
+                self.patchDirtyChunks(level, world, patch_threads) catch |err| {
+                    // The level loop stops at the first failing level: one err per failed step.
+                    if (err == error.NavWorldTooLarge) {
+                        @branchHint(.cold);
+                        if (comptime logging.enabled(.err) and !builtin.is_test)
+                            logging.game.err("nav update refused {d} chunk edge-window growth(s) on level {d}: {d} live slots per level, ceiling {d} (max_nav_memory_bytes); the step retries next reaction", .{ self.edge_growth_refused_total - refused_before, level, self.edgeArenaLiveSlots(), self.edge_arena_slot_limit });
+                    }
+                    return err;
+                };
             }
             // Holes never exceed the slots live windows own, so the arena needs no compaction
             // trigger of its own: a slacked relocation adds its old cap to the holes and a new
@@ -1554,8 +1563,9 @@ pub const NavGraph = struct {
         if (!self.edgeArenaAdmits(new_cap)) {
             @branchHint(.cold);
             self.edge_growth_refused_total += 1;
-            if (comptime logging.enabled(.err) and !builtin.is_test)
-                logging.game.err("nav chunk {d} edge window growth to {d} refused: arena {d} live + {d} slots per level exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); refusal {d}", .{ chunk, new_cap, self.edgeArenaLiveSlots(), new_cap, self.edge_arena_slot_limit, self.edge_growth_refused_total });
+            // Per-chunk detail; applyNavUpdates logs the one err per failed step.
+            if (comptime logging.enabled(.debug) and !builtin.is_test)
+                logging.game.debug("nav chunk {d} edge window growth refused at the unslacked rung ({d} slots): arena {d} live + {d} exceeds the {d}-slot ceiling; refusal {d}", .{ chunk, new_cap, self.edgeArenaLiveSlots(), new_cap, self.edge_arena_slot_limit, self.edge_growth_refused_total });
             return error.NavWorldTooLarge;
         }
         // Termination: every rung is strictly larger than the window it replaces.
