@@ -365,8 +365,12 @@ rule enforced structurally: the job cannot reach `parallelFor`.
        chunks;
      - `stats.chunks_patched += dirty_len`;
      - a chunk that overflows its edge window is grown and re-patched
-       (`growChunkEdgeWindow`, `stats.edge_windows_grown += 1`), the same as
-       the synchronous serial path.
+       (`growChunkEdgeWindow`, counted at the source in
+       `edge_windows_grown_total`), the same as the synchronous serial path.
+   - `stats.edge_windows_grown` / `stats.edge_compactions` are reported as
+     `total - reported` after every fallible step succeeds, advancing the
+     two `_reported` cursors (64E M10), so a failed lane job's growths are
+     reported by the next successful apply.
    - Then `rebuildLinkEdges(links)`.
    - On a full relabel, bump `version` (skipping 0) and set
      `stats.version_bumps = 1`.
@@ -407,8 +411,10 @@ rule enforced structurally: the job cannot reach `parallelFor`.
       `edge_hole_slots` (layout state: `total` includes holes; the
       hole ≤ live assert and compaction read it), `edge_arena_slot_limit`
       (the ceiling the background rebuild's growths must respect),
-      `edge_compactions_total`, `edge_growth_refused_total` (lifetime
-      counters carried across the swap), `chunk_link_cells` (64E's
+      `edge_windows_grown_total`, `edge_windows_grown_reported`,
+      `edge_compactions_total`, `edge_compactions_reported`,
+      `edge_growth_refused_total` (lifetime counters and their report
+      cursors, carried across the swap; 64E M10), `chunk_link_cells` (64E's
       fixed-stride `[chunk_count * nav_interior_link_slots_per_chunk]`
       table), `chunk_link_count`, `full_build_link_endpoints_unslotted`
       (last-full-build diagnostic, recomputed by the copy's own build).

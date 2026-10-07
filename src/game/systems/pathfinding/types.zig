@@ -322,12 +322,15 @@ pub const NavUpdateStats = struct {
     // border-adjacent neighbors), summed across affected levels. The dirty-bounded
     // work proxy: independent of total level size.
     chunks_patched: usize = 0,
-    // Chunk edge windows this batch outgrew and relocated to the arena tail
-    // (NavGraph.growChunkEdgeWindow): a cold, dig-triggered growth that keeps the update an
-    // incremental patch (no rebuild, no version bump). 0 on the steady path.
+    // Chunk edge windows outgrown and relocated to the arena tail
+    // (NavGraph.growChunkEdgeWindow) since the last successful batch reported them: this
+    // batch's, plus those of a prior batch that failed after growing (carried through
+    // NavGraph.edge_windows_grown_reported). A cold, dig-triggered growth that keeps the update
+    // an incremental patch (no rebuild, no version bump). 0 on the steady path.
     edge_windows_grown: usize = 0,
-    // Edge-arena compactions this batch ran (NavGraph.compactEdgeArena, run by a window growth
-    // that reached the nav memory gate's arena ceiling). Cold; 0 on the steady path.
+    // Edge-arena compactions (NavGraph.compactEdgeArena, run by a window growth that reached
+    // the nav memory gate's arena ceiling) since the last successful batch reported them, on
+    // the same carry rule as edge_windows_grown. Cold; 0 on the steady path.
     edge_compactions: usize = 0,
     // Gauge, not a per-batch delta: the graph's relocation holes (NavGraph.edge_hole_slots,
     // per-level arena slots no window references) after this batch. Recorded as a max.

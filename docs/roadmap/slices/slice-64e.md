@@ -912,6 +912,38 @@ multi-worker patch path and the serial one.
           scattered 256 serial 3.12 → 3.14 ms. `pathfinding` 512 (4
           interleaved runs, since the first single run was noisy): serial
           3.42 → 3.49 ms (spread 12%), adaptive-tuned 485.8 → 488.7 us.
+    - [x] **M10 · a failed step's growths and compactions are reported by
+          the next success** (third review, 2026-10-07). `patchDirtyChunks`
+          returned its growth count only on success and `applyNavUpdates`
+          diffed `edge_compactions_total` only on success, so a step that
+          grew or compacted and then failed (a refusal, or an OOM in a later
+          chunk or in `rebuildLinkEdges`) dropped that work from the perf
+          dump, and the summed `edge_windows_grown` / `edge_compactions`
+          stopped matching the lifetime counters slice-69a's soak compares.
+      - Fix: counters at the source plus "last reported" cursors.
+        `NavGraph.edge_windows_grown_total` (incremented in
+        `growChunkEdgeWindow` once the re-patch lands),
+        `edge_windows_grown_reported`, and `edge_compactions_reported`. After
+        every fallible step of `applyNavUpdates` succeeds (patch or relabel,
+        then `rebuildLinkEdges`), the stats report `total - reported` and
+        advance the cursors. `patchDirtyChunks` returns `ChunkPatchError!void`
+        and `growChunkEdgeWindow` `ChunkPatchError!void`. A full build
+        (`rebuild`) syncs both cursors to their totals: it re-measured every
+        window, superseding unreported work (the same rule as M7's cursor
+        reset). No accumulator to reset; two u64 subtractions per applied
+        step.
+      - Test: "edge-window growths and compactions of a failed step are
+        reported by the next successful step" (24×24 cells, 8-tile chunks,
+        serial). Step 1 grows chunk 7 (3 border + 3 link portals, 33 edges)
+        to 66 (total 354, live 322). Step 2 adds three ramps in chunk 1 (33
+        edges) and two in chunk 4 (34 edges) under a ceiling pinned at live
+        + 66 = 388: chunk 1 compacts and grows, chunk 4 compacts again and is
+        refused. After the failure `edge_windows_grown_total == 2`,
+        `edge_compactions_total == 2`, one refusal, no edge into a tombstone;
+        the admitted retry reports `edge_windows_grown == 2` and
+        `edge_compactions == 2` and matches a full rebuild. Every number was
+        verified by running; with the cursors re-synced at the start of each
+        apply (per-step counting) the retry reports 1 and the test fails.
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.

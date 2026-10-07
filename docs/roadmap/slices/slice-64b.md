@@ -308,6 +308,9 @@ bytes each, about 80 KiB at 2048).
       reads, and a fresh system holds none;
     - (c) leaves `nav_links_processed == world.levelLinks().len` through the
       full build (64E);
+    - (c′) the full build resets `nav_link_cursor_pending` and syncs the
+      graph's `edge_windows_grown_reported` / `edge_compactions_reported`
+      to their totals (64E M7/M10);
     - (d) when Slice 71B.3 has landed, resets every `group_fields[i]` to
       `.empty` with `origin = .demand` and `prewarm_source = .none`.
 

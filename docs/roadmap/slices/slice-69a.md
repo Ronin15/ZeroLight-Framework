@@ -732,7 +732,11 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       60 s ReleaseSafe soak shows:
       - no `NavWorldTooLarge` (so `edge_growth_refused_total` stays 0);
       - `edge_windows_grown` recorded (window relocations, no rebuilds,
-        `full_relabel=0`), at most 8 × the distinct nav chunks dug or ramped
+        `full_relabel=0`), its summed per-step values (and those of
+        `edge_compactions`) equal to `edge_windows_grown_total` /
+        `edge_compactions_total` even across a failed step (64E M10: a
+        failed step's work is reported by the next successful one), at most
+        8 × the distinct nav chunks dug or ramped
         during the soak: each growth at least doubles a window, from the
         32-edge floor to the 4,588-edge layout maximum of a 16-tile chunk
         (log2(4588/32) ≈ 7.2), so a chunk grows at most 8 times between full
