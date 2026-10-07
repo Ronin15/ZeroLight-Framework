@@ -668,10 +668,10 @@ multi-worker patch path and the serial one.
           Every failure leaves no overflow flag set and `nav_version`
           unchanged; the retry (the step's marks stay buffered) gives the
           68-edge window and `expectLinkPatchMatchesFullRebuild` parity. Fix:
-          the threaded post-barrier grow loop now clears every flag of the
-          batch on a failed `try` (`errdefer` in `patchDirtyChunks`), so a
-          failed growth no longer leaves later chunks flagged into the next
-          patch. Behavior test: "a threaded multi-chunk window growth that
+          the threaded post-barrier grow loop now visits and clears every
+          flag of the batch even past a failed growth (first an `errdefer`,
+          replaced by M4's visit-all loop), so a failed growth no longer
+          leaves later chunks flagged into the next patch. Behavior test: "a threaded multi-chunk window growth that
           fails clears every overflow flag" (an odd-row/column lattice dig
           overflows all nine chunks in one threaded batch; same sweep, then
           full-rebuild parity).
@@ -718,8 +718,9 @@ multi-worker patch path and the serial one.
         (e.g. `autoSizedMaxNavMemoryBytes`) leaves. A relocation past it
         compacts first. If it still does not fit, the step fails
         deterministically with `NavWorldTooLarge`, counted in
-        `edge_growth_refused_total` with an `err` log, and the chunk keeps
-        empty adjacency. The arena's geometric growth is clamped to the
+        `edge_growth_refused_total` with an `err` log; the chunk keeps its
+        live portals with empty adjacency, and the rest of the dirty set is
+        still patched (M4). The arena's geometric growth is clamped to the
         limit. `raiseAgentBudget`, `admitsLinkLimit`, and
         `reserveLinkCapacity` charge the arena as grown and re-derive the
         limit, so headroom spent on edges is not admitted twice. Tests: "an
@@ -745,6 +746,47 @@ multi-worker patch path and the serial one.
           stitched cells unchanged, `nav_version` stays the same, it still
           answers `available`, and it equals a fresh solve on a full rebuild.
           This is the test Slice 72 E4 (closed as superseded) now points to.
+    - [x] **M4 · a failed growth still patches the whole dirty set.** The
+          serial patch used to `try` each chunk's growth and return at the
+          first refusal or OOM. The refused chunk's orthogonal neighbors come
+          later in the dirty set, so they kept CSR edges into its old
+          border-run slot, which its own patch had just tombstoned (when the
+          edit moved that run's midpoint). Abstract A* then popped the
+          tombstone and indexed `components` with `no_cell`: a Debug panic,
+          UB in ReleaseFast. The threaded path already patched every chunk
+          before its post-barrier growth pass.
+      - Policy (`NavGraph.patchDirtyChunks`, both paths): every dirty chunk
+        is patched and, where it overflowed, grown; the first error
+        (`ChunkPatchError = Allocator.Error || NavGridError`) is returned
+        after the loop. A refused chunk keeps the live portals
+        `buildChunkPatch` rebuilt, with empty adjacency, and its neighbors
+        are patched against them, so no CSR edge targets a tombstone. The
+        serial and threaded failure layouts are identical. The serial
+        `patchChunk` error routes through the main-thread re-patch like
+        `patchChunkJob`'s (`catch true`). `edge_growth_refused_total` now
+        counts one per refused chunk. Later affected levels keep their old
+        mask and abstract layer (self-consistent) until the retry, which
+        re-patches the buffered dirty set.
+      - `solve.zig` `abstractCorridor` asserts a popped portal is live
+        (`std.debug.assert(portal.cell_index != no_cell)`) instead of
+        skipping: a tombstone there is a graph-invariant bug, the assert is
+        stripped from the ReleaseFast hot loop, and a skip would hide the
+        bug.
+      - Test: "a refused edge-window growth still patches the rest of the
+        dirty set, serial and threaded, with no edge into a tombstone".
+        Chunk (1,1) holds one ramp; one step adds a second and blocks
+        (8,12), the midpoint of its left border run, under a gate pinned at
+        the arena size (5 border + 2 link portals = 47 edges > 32, refused).
+        Serial and 3-worker threaded: `NavWorldTooLarge`, one refusal, no
+        flag set, `nav_version` unchanged, the chunk's level-0 edge counts
+        zero with (9,9), (11,9), (8,10), (8,14) live and (8,12) not, and
+        `expectNoEdgeTargetsTombstone` holds; the two layouts, portals, and
+        `cell_to_portal` are identical. A same-level and a cross-level solve
+        then route around the chunk (`available`). Admitted, the retry grows
+        the window to 94 and matches a full rebuild, serial == threaded, and
+        a new request equals a fresh solve. Before the fix the oracle fails
+        and the cross-level solve traps (h = 0 on its start level pops the
+        tombstone).
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.

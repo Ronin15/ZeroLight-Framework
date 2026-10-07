@@ -888,7 +888,8 @@ and a full build re-measures the arena. Growth respects the nav memory gate: eac
 arena may use the gate's own edge-arena estimate plus the headroom `max_nav_memory_bytes`
 leaves (`NavMemoryBudget.edgeArenaSlotLimit`). A growth past that first compacts the arena in
 place (`compactEdgeArena`, no allocation, `nav_edge_compactions`) and otherwise fails the step loudly (`NavWorldTooLarge`, counted in
-`edge_growth_refused_total`), and the agent-budget and level-link re-admissions charge the
+`edge_growth_refused_total`); a refused growth keeps the chunk's live portals with empty
+adjacency and the rest of the dirty set is still patched, so no edge targets a dead slot. The agent-budget and level-link re-admissions charge the
 arena as grown. Windows are not sized for
 the layout maximum (every perimeter cell plus 8 link endpoints in one component, ~4.6k
 edges per 16-tile chunk-level, ~300 MB at 256x256x32) because measured topology needs
