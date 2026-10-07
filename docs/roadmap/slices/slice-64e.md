@@ -861,6 +861,32 @@ multi-worker patch path and the serial one.
         the ramp cell live on both levels, no edge into a tombstone, a
         cross-chunk solve completes; admitted, the retry relabels and
         matches a full rebuild). Both fail with the check removed.
+    - [x] **M7 · link-cursor stats survive a failed apply.**
+          `markNewNavLinksDirty` advances the cursor and returns per-call
+          stats when its marks land; `reactToPostCommitNavEvents` then
+          applied the buffered updates, and a failed apply dropped those
+          stats. The retry's cursor call found nothing new and reported
+          `links_deferred = link_endpoints_unslotted = 0` for the links it
+          actually folded.
+      - Fix: `PathfindingSystem.nav_link_cursor_pending` (a
+        `NavLinkCursorStats`) carries the counts until an apply succeeds:
+        `processed` and `unslotted` accumulate, `deferred` is the latest
+        gauge. `reactToPostCommitNavEvents` reports and clears it after a
+        successful apply; a full build resets it. The cursor's standalone
+        contract (its return value, used by the `nav-update-links` bench) is
+        unchanged. Rolling the cursor back instead would re-mark the same
+        links on the retry and push the dirty buffer past its logical
+        reservation (a false `dirty_buffer_grown`).
+      - Test: "link cursor stats of a failed apply are reported once by the
+        successful retry". Chunk (0,0)'s interior slots are filled; one step
+        then adds a ninth interior ramp there (unslotted) and five interior
+        ramps in chunk (1,1), whose growth (2 + 7·6 = 44 edges > 32) the
+        pinned gate refuses. After the failed step the cursor is at 14 and
+        the pending stats are {6 processed, 0 deferred, 1 unslotted}; the
+        admitted retry reports `link_endpoints_unslotted == 1` and
+        `links_deferred == 0`, clears the pending stats, and matches a full
+        rebuild. Before the fix the retry reported 0. This also exercises
+        M4's serial continue-after-refusal.
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.

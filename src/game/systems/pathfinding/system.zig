@@ -147,6 +147,11 @@ pub const PathfindingSystem = struct {
     // the post-commit reaction (markNewNavLinksDirty) by at most nav_new_links_per_step_max per
     // step. World-derived, so a non-blocking-flip ramp dig still patches the graph.
     nav_links_processed: usize = 0,
+    // Cursor stats of steps whose nav apply has not succeeded yet: `processed`/`unslotted`
+    // accumulate, `deferred` is the latest gauge. The cursor advances when its marks land, so a
+    // failed apply would otherwise lose them (the retry's cursor call finds nothing new).
+    // Consumed by reactToPostCommitNavEvents after a successful apply; reset by a full build.
+    nav_link_cursor_pending: NavLinkCursorStats = .{},
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -545,6 +550,7 @@ pub const PathfindingSystem = struct {
         self.nav_dirty_levels_reserved = @max(self.nav_dirty_levels_reserved, self.graph.levelCount());
         // The full build assigned every current link's endpoint slots and patched every chunk.
         self.nav_links_processed = if (world) |world_system| world_system.levelLinks().len else 0;
+        self.nav_link_cursor_pending = .{};
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
@@ -779,14 +785,21 @@ pub const PathfindingSystem = struct {
         // Links are append-only; clamp anyway so a stale cursor can never slice out of bounds.
         const first = @min(self.nav_links_processed, links.len);
         const end = @min(links.len, first + nav_new_links_per_step_max);
-        if (first == end) return .{};
+        if (first == end) {
+            self.nav_link_cursor_pending.deferred = links.len - end;
+            return .{};
+        }
         for (links[first..end]) |link| {
             try self.markNavDirty(link.level_a, link.cell_a.x, link.cell_a.y);
             try self.markNavDirty(link.level_b, link.cell_b.x, link.cell_b.y);
         }
         const unslotted = self.graph.assignLinkEndpointSlots(links[0..end], first, .cursor);
         self.nav_links_processed = end;
-        return .{ .processed = end - first, .deferred = links.len - end, .unslotted = unslotted };
+        const stats = NavLinkCursorStats{ .processed = end - first, .deferred = links.len - end, .unslotted = unslotted };
+        self.nav_link_cursor_pending.processed += stats.processed;
+        self.nav_link_cursor_pending.unslotted += stats.unslotted;
+        self.nav_link_cursor_pending.deferred = stats.deferred;
+        return stats;
     }
 
     // Applies the buffered dirty nav cells, obstacle rects, and whole-level requests as one
@@ -833,7 +846,8 @@ pub const PathfindingSystem = struct {
     // function's own `try` on ensureCanAppend, or a propagated applyNavUpdatesImpl failure)
     // leaves this step's marks in the buffer for the NEXT call's marking pass to union with and
     // retry — matching the buffer's own "grows rather than drops" contract across a failed step,
-    // not just within one. Re-applying an already-applied cell is always safe (a nav-cell edit
+    // not just within one. The link cursor's counts likewise survive a failed step
+    // (nav_link_cursor_pending) and are reported once, by the step whose apply succeeds. Re-applying an already-applied cell is always safe (a nav-cell edit
     // re-derives its blocked state from current data/world, never from a stale snapshot), so the
     // union is never wrong, only possibly redundant.
     pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
@@ -882,15 +896,17 @@ pub const PathfindingSystem = struct {
         }
         // New world links (e.g. a ramp dug this step) are a separate, world-derived trigger: a
         // ramp on an already-walkable cell flips no blocking state and so emits no
-        // nav-invalidating event, yet its link must still join the graph on both levels.
-        const link_stats = try self.markNewNavLinksDirty(world);
+        // nav-invalidating event, yet its link must still join the graph on both levels. Its
+        // stats accumulate in nav_link_cursor_pending until an apply succeeds (below).
+        _ = try self.markNewNavLinksDirty(world);
 
         // The hole gauge is reported every step, not only on steps that patch.
         if (!self.hasPendingNavUpdates()) return .{ .edge_hole_slots = self.graph.edge_hole_slots };
         try frame.events.ensureCanAppend(1);
         var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
-        stats.links_deferred = link_stats.deferred;
-        stats.link_endpoints_unslotted = link_stats.unslotted;
+        stats.links_deferred = self.nav_link_cursor_pending.deferred;
+        stats.link_endpoints_unslotted = self.nav_link_cursor_pending.unslotted;
+        self.nav_link_cursor_pending = .{};
         // A full relabel rebuilds the abstract graph from the whole link set
         // (computePortalGeometry assigns from index 0) but deliberately leaves the cursor alone:
         // deferred links are still visited by later steps' cursor (idempotent assignment plus

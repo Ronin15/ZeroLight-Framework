@@ -2084,6 +2084,7 @@ const PortalComponentSort = struct {
 // ----------------------------------------------------------------------------
 
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const NavLinkCursorStats = PathfindingSystem.NavLinkCursorStats;
 const EntityId = @import("../../data_system.zig").EntityId;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const test_support = @import("test_support.zig");
@@ -4202,6 +4203,55 @@ test "a failed link mark assigns, counts, and warns nothing; the retry does it e
     try std.testing.expectEqual(@as(usize, 1), retry.unslotted);
     try std.testing.expectEqual(@as(u32, 1), system.graph.chunk_link_count.items[chunk11]);
     _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
+}
+
+test "link cursor stats of a failed apply are reported once by the successful retry" {
+    // The cursor advances (and counts) when its dirty marks land, before the apply. A step whose
+    // apply then fails used to lose those counts: the retry's cursor call finds no new links and
+    // reported links_deferred = link_endpoints_unslotted = 0 for the links it actually folds.
+    // Step 2 adds a ninth interior ramp in the full chunk (0,0) (unslotted) and five interior
+    // ramps in chunk (1,1), which then needs 2 border + 5 link portals = 2 + 7*6 = 44 edges > its
+    // 32-edge window, under a gate pinned at the arena size: the growth is refused. The retry
+    // reports the unslotted endpoint exactly once.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    // 16x16 cells, 8-tile chunks (2x2).
+    var world = try initTwoLevelOpenWorld(&meta, 512);
+    defer world.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+
+    // Step 1: fill chunk (0,0)'s K interior slots through the cursor.
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    for (0..nav_interior_link_slots_per_chunk) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+    const step1 = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 0), step1.link_endpoints_unslotted);
+    try std.testing.expectEqual(NavLinkCursorStats{}, system.nav_link_cursor_pending);
+
+    // Step 2: six links in one step; the chunk (1,1) growth is refused.
+    try world.addLevelLink(rampLink(3, 2));
+    for ([_][2]u16{ .{ 9, 9 }, .{ 11, 9 }, .{ 13, 9 }, .{ 9, 11 }, .{ 11, 11 } }) |xy| try world.addLevelLink(rampLink(xy[0], xy[1]));
+    system.graph.edge_arena_slot_limit = system.graph.total_edge_slots;
+    try std.testing.expectError(error.NavWorldTooLarge, reactOneStep(&system, &frame, &data, &world, null));
+    try std.testing.expectEqual(@as(u64, 1), system.graph.edge_growth_refused_total);
+    try std.testing.expectEqual(nav_interior_link_slots_per_chunk + 6, system.nav_links_processed);
+    try std.testing.expectEqual(NavLinkCursorStats{ .processed = 6, .deferred = 0, .unslotted = 1 }, system.nav_link_cursor_pending);
+
+    // Step 3 (no new links): the admitted retry folds them and reports the unslotted endpoint.
+    system.graph.edge_arena_slot_limit = std.math.maxInt(u32);
+    const step3 = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), step3.edge_windows_grown);
+    try std.testing.expectEqual(@as(usize, 1), step3.link_endpoints_unslotted);
+    try std.testing.expectEqual(@as(usize, 0), step3.links_deferred);
+    try std.testing.expectEqual(NavLinkCursorStats{}, system.nav_link_cursor_pending);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
 }
 
