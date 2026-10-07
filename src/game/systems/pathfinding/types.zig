@@ -156,7 +156,9 @@ pub const nav_new_links_per_step_max: usize = 8;
 // Slack multiplier applied to a chunk's measured edge count to size its edge window, both at
 // a full build and when an incremental patch outgrows the window and relocates it
 // (NavGraph.growChunkEdgeWindow), so window growth is geometric: a chunk relocates at most
-// O(log(max edges / floor)) times between full builds.
+// O(log(max edges / floor)) times between full builds. A preference, not a requirement: past
+// the nav memory gate's ceiling the build and a relocation fall back to an unslacked window
+// (exactly the edge count) before refusing.
 pub const default_edge_slack: u32 = 2;
 // Smallest per-chunk edge window, so a chunk that builds with zero edges at init still has
 // headroom for a dig that opens a little connectivity before its window has to grow.

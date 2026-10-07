@@ -370,8 +370,9 @@ pub const NavGraph = struct {
     chunk_portal_base: std.ArrayList(u32) = .empty,
     total_slots: u32 = 0,
     // Per-chunk edge windows (shared by every level): a full build sets cap =
-    // max-across-levels measured edge count * default_edge_slack (with a floor), base its
-    // exclusive prefix-sum, total_edge_slots their sum. A chunk's edge count is a function of
+    // max-across-levels measured edge count * default_edge_slack (with a floor; without the
+    // slack when the slacked arena would pass the nav memory gate, see computeEdgeCaps), base
+    // its exclusive prefix-sum, total_edge_slots their sum. A chunk's edge count is a function of
     // its live topology (quadratic in same-component portals: border runs, dug openings, and
     // runtime ramp endpoints), so an incremental patch that outgrows a window relocates just
     // that chunk's window to the arena tail (growChunkEdgeWindow) instead of rebuilding the
@@ -386,16 +387,23 @@ pub const NavGraph = struct {
     // Arena slots vacated by window relocations and referenced by no window: the same count in
     // every level's arena (windows are shared). total_edge_slots - edge_hole_slots is the slots
     // live windows own (edgeArenaLiveSlots), the quantity the nav memory gate charges. Zeroed by
-    // a full build and by compactEdgeArena (run by a growth that reaches the nav memory gate). Each relocation adds its old cap here and more than that to
-    // the live windows (growth at least doubles), so holes never exceed live slots: the arena
-    // is at most about 2x its live windows. applyNavUpdates asserts that invariant.
+    // a full build and by compactEdgeArena (run by a growth that reaches the nav memory gate).
+    // Holes never exceed live slots, because per chunk the windows it vacated since the last
+    // compaction sum to less than its current window: a slacked relocation more than doubles the
+    // window, and an unslacked one (exactly its edge count) runs only after the compaction that
+    // its slacked size forced, so it starts from zero holes. The arena is therefore at most about
+    // 2x its live windows. applyNavUpdates asserts that invariant.
     edge_hole_slots: u32 = 0,
     // Per-level edge-arena slot ceiling from the nav memory gate the graph was last admitted
     // under (NavMemoryBudget.edgeArenaSlotLimit, set at every full build and on re-admission),
     // charged against the arena's live slots (edgeArenaLiveSlots), never its physical capacity.
-    // A window growth past it compacts first and otherwise fails loudly (NavWorldTooLarge,
-    // edge_growth_refused_total, one count per refused chunk; the rest of the dirty set is still
-    // patched), so in-place growth never allocates past max_nav_memory_bytes.
+    // The full build and a window growth size windows by one ladder (windowCap): slacked, then
+    // unslacked when the slacked size would pass it, then refuse. A growth compacts before its
+    // unslacked rung and otherwise fails loudly (NavWorldTooLarge, edge_growth_refused_total,
+    // one count per refused chunk; the rest of the dirty set is still patched), so in-place
+    // growth never allocates past max_nav_memory_bytes. Because every chunk's live window holds
+    // at least max(its edges, floor), any state the incremental path admitted re-measures under
+    // the same ceiling (a full relabel, or a load under the same budget).
     edge_arena_slot_limit: u32 = std.math.maxInt(u32),
     // Lifetime diagnostics: chunk edge windows grown (relocated), arena compactions run, and
     // window growths the gate refused. The two `_reported` cursors mark how much of each total
@@ -408,6 +416,10 @@ pub const NavGraph = struct {
     edge_compactions_total: u64 = 0,
     edge_compactions_reported: u64 = 0,
     edge_growth_refused_total: u64 = 0,
+    // Lifetime diagnostic: full builds, full relabels, and window relocations that landed
+    // without growth slack because the slacked size exceeded the nav memory gate's ceiling.
+    // Never read by a gate; nonzero means the world is running at its edge-arena ceiling.
+    edge_arena_unslacked_total: u64 = 0,
     // Per-chunk "outgrew its edge window this patch" flags, sized at every full build (before
     // any dispatch). The threaded patch writes only its own chunks' slots (disjoint); the
     // post-barrier serial pass in patchDirtyChunks reads and clears them.
@@ -679,11 +691,12 @@ pub const NavGraph = struct {
     // at the prior build's high-water capacity, and the slot/order arrays are geometrically
     // sized so they never grow on a dig. The only growth is a chunk outgrowing its edge window
     // (a dig or runtime ramp adding same-component portals), which relocates that one chunk's
-    // window to the arena tail at slack * its new edge count (growChunkEdgeWindow); each
-    // level's edge arena grows geometrically up to the nav memory gate's ceiling, so most
-    // relocations fit the existing capacity. Holes the relocations leave stay below the live
-    // window slots (growth at least doubles); a growth past the gate compacts them in place (no
-    // allocation) first, then fails loudly; a failed step still patches every dirty chunk of
+    // window to the arena tail at slack * its new edge count, or exactly that count when the
+    // slacked window would pass the nav memory gate (growChunkEdgeWindow); each level's edge
+    // arena grows geometrically up to the gate's ceiling, so most relocations fit the existing
+    // capacity. Holes the relocations leave stay below the live window slots (see
+    // edge_hole_slots); a growth past the gate compacts them in place (no allocation) first,
+    // then tries the unslacked window, then fails loudly; a failed step still patches every dirty chunk of
     // the failing level (the refused chunk keeps live portals with empty adjacency, so no edge
     // targets a tombstone), and later affected levels keep their old, self-consistent mask and
     // abstract layer until the retry. That is acceptable per
@@ -796,9 +809,10 @@ pub const NavGraph = struct {
                 try self.patchDirtyChunks(level, world, patch_threads);
             }
             // Holes never exceed the slots live windows own, so the arena needs no compaction
-            // trigger of its own: every relocation adds its old cap to the holes and a new cap
-            // of max(2 * needed, floor) > 2 * old cap to the live windows (relocateChunkEdgeWindow),
-            // and a full build or compaction zeroes the holes.
+            // trigger of its own: a slacked relocation adds its old cap to the holes and a new
+            // cap of max(2 * needed, floor) > 2 * old cap to the live windows; an unslacked one
+            // (cap = needed > old cap) runs only right after a compaction zeroed the holes
+            // (relocateChunkEdgeWindow); a full build or compaction zeroes the holes.
             std.debug.assert(self.edge_hole_slots <= self.edgeArenaLiveSlots());
             // Every seam that sets or spends the ceiling keeps the live slots within it: the
             // build, an admitted relocation, and an admitted re-admission (edgeArenaFitsBudget).
@@ -1486,8 +1500,8 @@ pub const NavGraph = struct {
     }
 
     // Main thread only (never under a worker): re-patches a chunk flagged by a patch, first
-    // relocating its edge window to the arena tail at slack * the new edge count when its edges
-    // outgrew it (no growth when a threaded patch flagged the chunk for an error rather than an
+    // relocating its edge window to the arena tail (relocateChunkEdgeWindow's sizing ladder) when
+    // its edges outgrew it (no growth when a threaded patch flagged the chunk for an error rather than an
     // overflow, so the plain re-patch fits). A growth counts in edge_windows_grown_total once the
     // re-patch lands. The re-patch rebuilds the transient edge list (the threaded path's worker
     // scratch was reused by later chunks), so the result is exactly the chunk's patch, just in a
@@ -1502,29 +1516,41 @@ pub const NavGraph = struct {
         if (!grow) return;
         self.edge_windows_grown_total += 1;
         // Low-frequency growth diagnostic (a cold dig-triggered event, at most a few times per
-        // chunk between full builds since each growth at least doubles the window). The count
-        // is also surfaced through stats.edge_windows_grown. Kept out of test builds, which
-        // trigger it on purpose.
-        if (comptime logging.enabled(.debug) and !builtin.is_test)
-            logging.game.debug("nav chunk {d} level {d} edge window grown {d} -> {d} ({d} edges); arena {d} slots per level", .{ chunk, level, old_cap, self.chunk_edge_cap.items[chunk], scratch.edges.items.len, self.total_edge_slots });
+        // chunk between full builds since each slacked growth at least doubles the window). The
+        // count is also surfaced through stats.edge_windows_grown. Kept out of test builds,
+        // which trigger it on purpose.
+        if (comptime logging.enabled(.debug) and !builtin.is_test) {
+            const new_cap = self.chunk_edge_cap.items[chunk];
+            const unslacked: []const u8 = if (new_cap == scratch.edges.items.len) " unslacked" else "";
+            logging.game.debug("nav chunk {d} level {d} edge window grown {d} -> {d}{s} ({d} edges); arena {d} slots per level", .{ chunk, level, old_cap, new_cap, unslacked, scratch.edges.items.len, self.total_edge_slots });
+        }
     }
 
-    // Moves one chunk's edge window (shared by every level) to the tail of the edge arena with
-    // cap = max(needed * default_edge_slack, chunk_edge_floor), copying every level's current
-    // window contents and rebasing that chunk's portal_edge_start entries. The vacated window
-    // becomes a hole (edge_hole_slots). The growth respects the nav memory gate
-    // (edge_arena_slot_limit): past it the arena is compacted first, and a growth that still
-    // does not fit is refused loudly (counted, NavWorldTooLarge): the chunk keeps the live
-    // portals buildChunkPatch just rebuilt with zero edge counts, and patchDirtyChunks still
-    // patches the rest of the dirty set and returns the first error after the loop. Every
-    // level's arena capacity is ensured BEFORE the relocation mutates anything, so an OOM
-    // leaves a valid layout (compacted at most).
+    // Moves one chunk's edge window (shared by every level) to the tail of the edge arena,
+    // copying every level's current window contents and rebasing that chunk's portal_edge_start
+    // entries. The vacated window becomes a hole (edge_hole_slots). The new cap follows the same
+    // ladder as the full build (computeEdgeCaps), against the nav memory gate
+    // (edge_arena_slot_limit): windowCap(needed, default_edge_slack); past the ceiling the arena
+    // is compacted first; still past it, windowCap(needed, 1) (exactly the edge count: no growth
+    // slack, so the chunk's next growth relocates again); still past it, the growth is refused
+    // loudly (counted, NavWorldTooLarge): the chunk keeps the live portals buildChunkPatch just
+    // rebuilt with zero edge counts, and patchDirtyChunks still patches the rest of the dirty set
+    // and returns the first error after the loop. Every level's arena capacity is ensured BEFORE
+    // the relocation mutates anything, so an OOM leaves a valid layout (compacted at most).
     fn relocateChunkEdgeWindow(self: *NavGraph, chunk: u32, needed: usize) ChunkPatchError!void {
         const old_cap = self.chunk_edge_cap.items[chunk];
         std.debug.assert(needed > old_cap);
         const needed_u32 = std.math.cast(u32, needed) orelse return error.NavWorldTooLarge;
-        const new_cap = @max(needed_u32 *| default_edge_slack, chunk_edge_floor);
+        var new_cap = windowCap(needed_u32, default_edge_slack);
         if (!self.edgeArenaAdmits(new_cap) and self.edge_hole_slots != 0) try self.compactEdgeArena();
+        // The unslacked rung starts from zero holes: either there were none, or the compaction
+        // above just reclaimed them (the edge_hole_slots invariant relies on this).
+        var unslacked = false;
+        if (!self.edgeArenaAdmits(new_cap)) {
+            std.debug.assert(self.edge_hole_slots == 0);
+            new_cap = windowCap(needed_u32, 1);
+            unslacked = true;
+        }
         if (!self.edgeArenaAdmits(new_cap)) {
             @branchHint(.cold);
             self.edge_growth_refused_total += 1;
@@ -1532,6 +1558,9 @@ pub const NavGraph = struct {
                 logging.game.err("nav chunk {d} edge window growth to {d} refused: arena {d} live + {d} slots per level exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); refusal {d}", .{ chunk, new_cap, self.edgeArenaLiveSlots(), new_cap, self.edge_arena_slot_limit, self.edge_growth_refused_total });
             return error.NavWorldTooLarge;
         }
+        // Termination: every rung is strictly larger than the window it replaces.
+        std.debug.assert(new_cap > old_cap);
+        if (unslacked) self.edge_arena_unslacked_total += 1;
         // Read after any compaction above, which moves windows.
         const old_base = self.chunk_edge_base.items[chunk];
         const new_base = self.total_edge_slots;
@@ -1553,6 +1582,14 @@ pub const NavGraph = struct {
         self.chunk_edge_cap.items[chunk] = new_cap;
         self.total_edge_slots = new_total;
         self.edge_hole_slots += old_cap;
+    }
+
+    // One chunk's edge-window size for `needed` edges at a growth `slack`: the single sizing rule
+    // shared by the full build (computeEdgeCaps) and a relocation (relocateChunkEdgeWindow).
+    // Rung 1 is default_edge_slack; rung 2 (slack 1) is the window an admitted state already
+    // fits, so a re-measure of any admitted state fits the same ceiling.
+    fn windowCap(needed: u32, slack: u32) u32 {
+        return @max(needed *| slack, chunk_edge_floor);
     }
 
     // Whether appending a `new_cap`-slot window keeps every level's arena within the nav memory
@@ -1938,14 +1975,12 @@ pub const NavGraph = struct {
     }
 
     // Sizes the per-chunk edge windows from the measured per-chunk MAX edge count across
-    // levels, times the slack multiplier, with a floor. Shared geometry, so the cap of a chunk
-    // covers every level's count for that chunk. Also resets the per-chunk overflow flags.
-    // Measure, check, commit: a measured arena past the nav memory gate's per-level ceiling
-    // (edge_arena_slot_limit; holes are zero at this seam, so this is its live slots) fails
-    // loudly with NavWorldTooLarge BEFORE any layout field is written. The init build then
-    // fails at load as the gate promises; a full relabel keeps the old windows, caps, bases,
-    // and arena (its portals are rebuilt with zero edge counts, so the graph stays solve-safe)
-    // and does not bump `version`.
+    // levels (windowCap). Shared geometry, so the cap of a chunk covers every level's count for
+    // that chunk. Also resets the per-chunk overflow flags. Measure, check, commit against
+    // edge_arena_slot_limit on the relocation's ladder: all windows slacked, else all unslacked
+    // (edge_arena_unslacked_total), else NavWorldTooLarge before any layout write. Rung 2 fits
+    // any state the incremental path admitted. A refused relabel keeps the old windows, caps,
+    // bases, and arena (portals rebuilt with zero edge counts: solve-safe), no `version` bump.
     fn computeEdgeCaps(self: *NavGraph) (std.mem.Allocator.Error || NavGridError)!void {
         const chunk_count = self.chunkCount();
         // Allocation-free after the first build: build_u32_scratch then holds total_slots
@@ -1959,13 +1994,24 @@ pub const NavGraph = struct {
             for (lg.edge_scratch.items) |entry| per_level[lg.portals.items[entry.from].chunk] += 1;
             for (max_edges, per_level) |*max_count, count| max_count.* = @max(max_count.*, count);
         }
-        var running: u32 = 0;
-        for (max_edges) |raw| running +|= @max(raw *| default_edge_slack, chunk_edge_floor);
+        var slack: u32 = default_edge_slack;
+        const slacked = sumWindowCaps(max_edges, slack);
+        var running = slacked;
+        if (running > self.edge_arena_slot_limit) {
+            slack = 1;
+            running = sumWindowCaps(max_edges, slack);
+        }
         if (running > self.edge_arena_slot_limit) {
             @branchHint(.cold);
             if (comptime logging.enabled(.err) and !builtin.is_test)
-                logging.game.err("nav graph build: measured edge arena {d} slots per level exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); raise max_nav_memory_bytes or shrink the world", .{ running, self.edge_arena_slot_limit });
+                logging.game.err("nav graph build: measured edge arena {d} slots per level ({d} with growth slack) exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); raise max_nav_memory_bytes or shrink the world", .{ running, slacked, self.edge_arena_slot_limit });
             return NavGridError.NavWorldTooLarge;
+        }
+        if (slack == 1) {
+            @branchHint(.cold);
+            self.edge_arena_unslacked_total += 1;
+            if (comptime logging.enabled(.warn) and !builtin.is_test)
+                logging.game.warn("nav graph build landed without edge growth slack: {d} of {d} slots per level (slacked size {d}); the first growth of any chunk relocates its window", .{ running, self.edge_arena_slot_limit, slacked });
         }
 
         try setLen(&self.chunk_edge_cap, self.allocator, chunk_count);
@@ -1974,13 +2020,20 @@ pub const NavGraph = struct {
         @memset(self.chunk_edge_overflow.items, false);
         var base: u32 = 0;
         for (max_edges, self.chunk_edge_cap.items, self.chunk_edge_base.items) |raw, *cap, *chunk_base| {
-            cap.* = @max(raw *| default_edge_slack, chunk_edge_floor);
+            cap.* = windowCap(raw, slack);
             chunk_base.* = base;
             base +|= cap.*;
         }
         std.debug.assert(base == running);
         self.total_edge_slots = running;
         self.edge_hole_slots = 0;
+    }
+
+    // Saturating sum of every chunk's window at `slack` (computeEdgeCaps' measure pass).
+    fn sumWindowCaps(max_edges: []const u32, slack: u32) u32 {
+        var running: u32 = 0;
+        for (max_edges) |raw| running +|= windowCap(raw, slack);
+        return running;
     }
 
     // Local portal node index for a cell on `level`, or null when the cell is not a
@@ -3996,10 +4049,11 @@ test "a measured edge arena past the nav memory gate fails the build loudly" {
     // The gate estimates the edge arena structurally (704 slots per level on this 8x8,
     // one-chunk, two-level world) and the build re-measures it from real topology. 36 ramps
     // authored before the build put 36 portals in the chunk's one open component: 36*35 = 1260
-    // edges, a 2520-slot window. A byte ceiling whose per-level arena ceiling is one slot under
-    // that measured arena fails the build with NavWorldTooLarge; at it, the build lands with
-    // the arena exactly at the ceiling. (Before the check, both built and every later
-    // relocation and re-admission was refused against an arena already past its ceiling.)
+    // edges, a 2520-slot slacked window. The build sizes windows on a ladder (M8): slacked, then
+    // unslacked (exactly 1260), then refuse. A byte ceiling whose per-level arena ceiling is one
+    // slot under the unslacked arena fails the build with NavWorldTooLarge; from 1260 to 2519
+    // the build lands unslacked; at 2520 it lands slacked. Either rung yields the same graph and
+    // the same solved paths: capacity never changes a result.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4016,8 +4070,10 @@ test "a measured edge arena past the nav memory gate fails the build loudly" {
     defer measured.deinit();
     try measured.reserve(capacity);
     try measured.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
-    const total = measured.graph.total_edge_slots;
-    try std.testing.expectEqual(@as(u32, 2 * 36 * 35), total);
+    const slacked: u32 = 2 * 36 * 35;
+    const unslacked: u32 = 36 * 35;
+    try std.testing.expectEqual(slacked, measured.graph.total_edge_slots);
+    try std.testing.expectEqual(@as(u64, 0), measured.graph.edge_arena_unslacked_total);
     // The gate's own estimate is far below the measured arena.
     var exact = budgetForCapacity(measured.capacity, 2, cells.len);
     exact.max_bytes = exact.requiredBytes(8, 8);
@@ -4026,17 +4082,45 @@ test "a measured edge arena past the nav memory gate fails the build loudly" {
     var refused = PathfindingSystem.init(std.testing.allocator);
     defer refused.deinit();
     try refused.reserve(capacity);
-    refused.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(refused.capacity, cells.len, total - 1);
+    refused.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(refused.capacity, cells.len, unslacked - 1);
     try std.testing.expectError(NavGridError.NavWorldTooLarge, refused.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null));
 
-    var admitted = PathfindingSystem.init(std.testing.allocator);
-    defer admitted.deinit();
-    try admitted.reserve(capacity);
-    admitted.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(admitted.capacity, cells.len, total);
-    try admitted.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
-    try std.testing.expectEqual(total, admitted.graph.total_edge_slots);
-    try std.testing.expectEqual(admitted.graph.total_edge_slots, admitted.graph.edge_arena_slot_limit);
-    try std.testing.expectEqual(total, admitted.graph.edgeArenaLiveSlots());
+    // Unslacked from the exact edge count up to one slot under the slacked size.
+    var rung2 = PathfindingSystem.init(std.testing.allocator);
+    defer rung2.deinit();
+    for ([_]u32{ unslacked, slacked - 1 }) |limit| {
+        try rung2.reserve(capacity);
+        rung2.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(rung2.capacity, cells.len, limit);
+        try rung2.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+        try std.testing.expectEqual(limit, rung2.graph.edge_arena_slot_limit);
+        try std.testing.expectEqual(unslacked, rung2.graph.total_edge_slots);
+        try std.testing.expectEqual(unslacked, rung2.graph.chunk_edge_cap.items[0]);
+        try std.testing.expectEqual(unslacked, rung2.graph.edgeArenaLiveSlots());
+    }
+    try std.testing.expectEqual(@as(u64, 2), rung2.graph.edge_arena_unslacked_total);
+
+    var rung1 = PathfindingSystem.init(std.testing.allocator);
+    defer rung1.deinit();
+    try rung1.reserve(capacity);
+    rung1.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(rung1.capacity, cells.len, slacked);
+    try rung1.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    try std.testing.expectEqual(slacked, rung1.graph.total_edge_slots);
+    try std.testing.expectEqual(rung1.graph.total_edge_slots, rung1.graph.edge_arena_slot_limit);
+    try std.testing.expectEqual(@as(u64, 0), rung1.graph.edge_arena_unslacked_total);
+
+    // Same graph (keyed, so window layout is ignored) and the same solved paths on both rungs.
+    try expectGraphsEquivalent(&rung2.graph, &rung1.graph);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const requests = [_]PathRequest{
+        cellCenterRequest(0, .{ 0, 2 }, 0, .{ 7, 5 }),
+        cellCenterRequest(1, .{ 2, 2 }, 0, .{ 6, 6 }),
+    };
+    for (requests) |request| {
+        const slot2 = try solveAndCache(&rung2, requester, request);
+        const slot1 = try solveAndCache(&rung1, requester, request);
+        try std.testing.expect(rung1.completed.resultAt(slot1).path_len != 0);
+        try expectSameCachedPath(&rung2, slot2, &rung1, slot1);
+    }
 }
 
 test "a full relabel whose re-measured arena exceeds the gate fails before touching the edge layout" {
@@ -4111,6 +4195,141 @@ test "a full relabel whose re-measured arena exceeds the gate fails before touch
     try std.testing.expectEqual(@as(usize, 1), retried.full_relabel);
     try std.testing.expectEqual(@as(usize, 1), retried.version_bumps);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
+}
+
+test "a world grown incrementally under the nav memory gate re-measures under the same ceiling (1600-slot relabel)" {
+    // Regression (M8): an incrementally admitted session (window 1104, 992 edges, 1600-slot
+    // ceiling) failed every relabel and a same-budget load (2 * 992 > 1600). Both now land
+    // unslacked at 992; ramps past what the ceiling can hold are still refused.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var world = try initTwoLevelOpenWorld(&meta, 256);
+    defer world.deinit();
+    const cells = oneChunkRampCells();
+    try world.reserveLevelLinks(cells.len);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    system.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(system.capacity, cells.len, 1600);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    const graph = &system.graph;
+    try std.testing.expectEqual(@as(u32, 1600), graph.edge_arena_slot_limit);
+    try std.testing.expectEqual(@as(u32, 32), graph.total_edge_slots);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const caps = [_]u32{ 112, 480, 1104, 1104 };
+    const totals = [_]u32{ 144, 624, 1584, 1584 };
+    const holes = [_]u32{ 32, 144, 480, 480 };
+    const compactions = [_]usize{ 0, 0, 1, 0 };
+    for (caps, totals, holes, compactions, 0..) |cap, total, hole, compacted, step| {
+        for (cells[step * 8 ..][0..8]) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+        const stats = try reactOneStep(&system, &frame, &data, &world, null);
+        try std.testing.expectEqual(cap, graph.chunk_edge_cap.items[0]);
+        try std.testing.expectEqual(total, graph.total_edge_slots);
+        try std.testing.expectEqual(hole, graph.edge_hole_slots);
+        try std.testing.expectEqual(compacted, stats.edge_compactions);
+        try std.testing.expect(graph.edge_hole_slots <= graph.edgeArenaLiveSlots());
+    }
+    try std.testing.expectEqual(@as(u64, 0), graph.edge_growth_refused_total);
+    try std.testing.expectEqual(@as(u64, 0), graph.edge_arena_unslacked_total);
+
+    // (i) A full relabel (two affected levels past a threshold of 1; (2,2) is open and not a
+    // ramp cell) re-measures 992 edges: 1984 slacked > 1600, so it lands unslacked.
+    system.capacity.nav_full_relabel_level_threshold = 1;
+    try system.markNavDirty(0, 2, 2);
+    try system.markNavDirty(1, 2, 2);
+    const relabel = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), relabel.full_relabel);
+    try std.testing.expectEqual(@as(usize, 1), relabel.version_bumps);
+    try std.testing.expectEqual(@as(u32, 992), graph.total_edge_slots);
+    try std.testing.expectEqual(@as(u32, 992), graph.chunk_edge_cap.items[0]);
+    try std.testing.expectEqual(@as(u32, 0), graph.edge_hole_slots);
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_arena_unslacked_total);
+    try expectNoEdgeTargetsTombstone(graph);
+    // The reference rebuild runs under the default budget (slacked, 1984 slots); the keyed
+    // compare proves the unslacked layout holds the same graph.
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 256, capacity);
+
+    // (ii) A load under the same budget (the save/load path) lands unslacked too, with the
+    // relabelled layout byte for byte.
+    var loaded = PathfindingSystem.init(std.testing.allocator);
+    defer loaded.deinit();
+    try loaded.reserve(capacity);
+    loaded.capacity.max_nav_memory_bytes = system.capacity.max_nav_memory_bytes;
+    try loaded.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    try std.testing.expectEqual(@as(u32, 1600), loaded.graph.edge_arena_slot_limit);
+    try std.testing.expectEqual(@as(u32, 992), loaded.graph.total_edge_slots);
+    try expectGraphsEquivalent(&loaded.graph, graph);
+    try expectSameEdgeLayout(&loaded.graph, graph);
+
+    // (iii) The incremental ceiling is still loud: 36 portals need 1260 edges, and the chunk's
+    // live 992-slot window is the whole arena (no hole to compact), so the slacked 992 + 2520
+    // and the exact 992 + 1260 both pass 1600. (Back at the default threshold, so the step is an
+    // incremental patch, not another relabel.)
+    system.capacity.nav_full_relabel_level_threshold = types.default_nav_full_relabel_level_threshold;
+    for (cells[32..]) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+    try std.testing.expectError(error.NavWorldTooLarge, reactOneStep(&system, &frame, &data, &world, null));
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_growth_refused_total);
+    try expectNoEdgeTargetsTombstone(graph);
+}
+
+test "a window growth whose slacked size exceeds the ceiling lands unslacked before refusing" {
+    // The relocation ladder (M8): one 8-tile chunk of an 8x8 two-level world, ceiling pinned at
+    // 100 after the build (32 slots). Step 1's 8 ramps need 56 edges: the slacked 112-slot window
+    // does not fit (32 + 112 > 100) and there is no hole to compact, so the window lands
+    // unslacked at exactly 56 (32 + 56 = 88). Step 2's 16 portals need 240 edges: the slacked
+    // 480 does not fit even after compacting the 32-slot hole (56 + 480), nor does the exact 240
+    // (56 + 240), so the growth is refused. Admitted, the retry grows slacked to 480.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var world = try initTwoLevelOpenWorld(&meta, 256);
+    defer world.deinit();
+    const cells = oneChunkRampCells();
+    try world.reserveLevelLinks(cells.len);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    const graph = &system.graph;
+    try std.testing.expectEqual(@as(u32, 32), graph.total_edge_slots);
+    graph.edge_arena_slot_limit = 100;
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    for (cells[0..8]) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+    const step1 = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), step1.edge_windows_grown);
+    try std.testing.expectEqual(@as(u32, 56), graph.chunk_edge_cap.items[0]);
+    try std.testing.expectEqual(@as(u32, 88), graph.total_edge_slots);
+    try std.testing.expectEqual(@as(u32, 32), graph.edge_hole_slots);
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_arena_unslacked_total);
+    try std.testing.expectEqual(@as(u64, 0), graph.edge_growth_refused_total);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 256, capacity);
+
+    for (cells[8..16]) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+    try std.testing.expectError(error.NavWorldTooLarge, reactOneStep(&system, &frame, &data, &world, null));
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_compactions_total);
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_growth_refused_total);
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_arena_unslacked_total);
+    try std.testing.expectEqual(@as(u32, 56), graph.total_edge_slots);
+    try std.testing.expectEqual(@as(u32, 0), graph.edge_hole_slots);
+    try expectNoEdgeTargetsTombstone(graph);
+
+    graph.edge_arena_slot_limit = std.math.maxInt(u32);
+    const retried = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), retried.edge_windows_grown);
+    try std.testing.expectEqual(@as(u32, 480), graph.chunk_edge_cap.items[0]);
+    try std.testing.expectEqual(@as(u64, 1), graph.edge_arena_unslacked_total);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 256, capacity);
 }
 
 test "interiorLinkSlotsAvailable refuses a cell that is an existing but unslotted endpoint" {

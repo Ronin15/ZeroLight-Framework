@@ -730,7 +730,9 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       levels, shipped caves) passes `budget.check` under
       `autoSizedMaxNavMemoryBytes` with `link_count` including entrances. A
       60 s ReleaseSafe soak shows:
-      - no `NavWorldTooLarge` (so `edge_growth_refused_total` stays 0);
+      - no `NavWorldTooLarge` (so `edge_growth_refused_total` stays 0) and
+        `edge_arena_unslacked_total == 0` (no build, relabel, or relocation
+        had to drop its growth slack to fit the ceiling; 64E M8);
       - `edge_windows_grown` recorded (window relocations, no rebuilds,
         `full_relabel=0`), its summed per-step values (and those of
         `edge_compactions`) equal to `edge_windows_grown_total` /

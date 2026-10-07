@@ -877,17 +877,20 @@ buffers grow to their real size at the init rebuild and retain that high-water
 capacity, so an incremental rebuild whose topology stays within the high-water
 mark grows no buffer. A chunk whose edges outgrow its edge window (edges are quadratic in
 same-component portals, so a dig lattice or a few runtime ramps in one open chunk can do it)
-has just that window relocated to the edge arena's tail at twice its new edge count and is
-re-patched on the main thread after the patch barrier (`growChunkEdgeWindow`, counted as
+has just that window relocated to the edge arena's tail at twice its new edge count (or exactly
+its new edge count when the doubled window would pass the gate's ceiling: the same slacked →
+unslacked → refuse ladder the full build applies, so any state the incremental path admitted
+re-measures under the same ceiling) and is re-patched on the main thread after the patch barrier (`growChunkEdgeWindow`, counted as
 `edge_windows_grown`): the step stays an incremental patch equal to a full rebuild, with no
 `nav_version` bump. Relocation moves a window, never the order of a portal's edges, so
 abstract A* results match a full rebuild too. Vacated windows are holes
 (`edge_hole_slots`, perf gauge `nav_edge_hole_slots`). Holes never exceed the slots live
-windows own, because every growth at least doubles a window; `applyNavUpdates` asserts this,
+windows own, because a slacked growth more than doubles a window and an unslacked one runs only
+right after a compaction; `applyNavUpdates` asserts this,
 and a full build re-measures the arena. Growth respects the nav memory gate: each level's
 arena may use the gate's own edge-arena estimate plus the headroom `max_nav_memory_bytes`
 leaves (`NavMemoryBudget.edgeArenaSlotLimit`), and a build or full relabel whose measured arena
-exceeds it fails loudly before any edge-layout write. A growth past that first compacts the arena in
+exceeds it even unslacked fails loudly before any edge-layout write. A growth past that first compacts the arena in
 place (`compactEdgeArena`, no allocation, `nav_edge_compactions`) and otherwise fails the step loudly (`NavWorldTooLarge`, counted in
 `edge_growth_refused_total`); a refused growth keeps the chunk's live portals with empty
 adjacency and the rest of the dirty set is still patched, so no edge targets a dead slot. The agent-budget and level-link re-admissions charge the

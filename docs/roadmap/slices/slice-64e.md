@@ -728,8 +728,9 @@ multi-worker patch path and the serial one.
         per-level edge-arena estimate plus the headroom `max_nav_memory_bytes`
         (e.g. `autoSizedMaxNavMemoryBytes`) leaves. The full build and a
         full relabel refuse (`NavWorldTooLarge`) when the measured arena
-        exceeds the ceiling, before any layout write (M5). A relocation past
-        it compacts first. If it still does not fit, the step fails
+        exceeds the ceiling even unslacked, before any layout write (M5,
+        M8's ladder). A relocation past it compacts first, then tries an
+        unslacked window (M8). If it still does not fit, the step fails
         deterministically with `NavWorldTooLarge`, counted in
         `edge_growth_refused_total` with an `err` log; the chunk keeps its
         live portals with empty adjacency, and the rest of the dirty set is
@@ -854,7 +855,7 @@ multi-worker patch path and the serial one.
         the would-be arena, and returns `NavWorldTooLarge` with an `err` log
         when it exceeds `edge_arena_slot_limit` (holes are zero at this
         seam), before writing caps, bases, overflow flags, the total, or
-        the holes. The init build fails at load as the gate promises. A
+        the holes. M8 adds an unslacked rung before the refusal. The init build fails at load as the gate promises. A
         failed full relabel keeps the old windows, caps, bases, and arena;
         `buildLevelInit` has already rebuilt every level's portals with zero
         edge counts, so the graph is solve-safe, and `version` is not
@@ -912,38 +913,37 @@ multi-worker patch path and the serial one.
           scattered 256 serial 3.12 → 3.14 ms. `pathfinding` 512 (4
           interleaved runs, since the first single run was noisy): serial
           3.42 → 3.49 ms (spread 12%), adaptive-tuned 485.8 → 488.7 us.
+    - [x] **M8 · one slacked → unslacked → refuse sizing ladder** (third
+          review, 2026-10-07). The build required 2× slack per window while
+          relocation only preferred it, so an admitted incremental session
+          could fail to re-measure: reproduced on `aad4acb` (one 8×8 chunk,
+          1600-slot ceiling, windows 112/480/1104, 992 live edges; the relabel
+          and a same-budget load both returned `NavWorldTooLarge`, the relabel
+          on every retry).
+      - Fix: `windowCap(needed, slack)` shared by `computeEdgeCaps` and
+        `relocateChunkEdgeWindow`: slacked, then (relocation compacts first)
+        unslacked, then refuse; unslacked landings count in
+        `edge_arena_unslacked_total` (build: one `warn`). Every live window
+        holds ≥ max(edges, floor), so any admitted state re-measures under
+        its ceiling. No constant changes; rungs move only window layout.
+      - Tests (fail with rung 2 removed): "a world grown incrementally under
+        the nav memory gate re-measures under the same ceiling (1600-slot
+        relabel)" (relabel and load land at 992; past-ceiling ramps still
+        refused), "a window growth whose slacked size exceeds the ceiling
+        lands unslacked before refusing" (56-slot unslacked landing under a
+        100-slot ceiling, then refusal), and the updated build test (refuses
+        at 1259, unslacked 1260–2519, slacked 2520; same graph and paths).
     - [x] **M10 · a failed step's growths and compactions are reported by
-          the next success** (third review, 2026-10-07). `patchDirtyChunks`
-          returned its growth count only on success and `applyNavUpdates`
-          diffed `edge_compactions_total` only on success, so a step that
-          grew or compacted and then failed (a refusal, or an OOM in a later
-          chunk or in `rebuildLinkEdges`) dropped that work from the perf
-          dump, and the summed `edge_windows_grown` / `edge_compactions`
-          stopped matching the lifetime counters slice-69a's soak compares.
-      - Fix: counters at the source plus "last reported" cursors.
-        `NavGraph.edge_windows_grown_total` (incremented in
-        `growChunkEdgeWindow` once the re-patch lands),
-        `edge_windows_grown_reported`, and `edge_compactions_reported`. After
-        every fallible step of `applyNavUpdates` succeeds (patch or relabel,
-        then `rebuildLinkEdges`), the stats report `total - reported` and
-        advance the cursors. `patchDirtyChunks` returns `ChunkPatchError!void`
-        and `growChunkEdgeWindow` `ChunkPatchError!void`. A full build
-        (`rebuild`) syncs both cursors to their totals: it re-measured every
-        window, superseding unreported work (the same rule as M7's cursor
-        reset). No accumulator to reset; two u64 subtractions per applied
-        step.
-      - Test: "edge-window growths and compactions of a failed step are
-        reported by the next successful step" (24×24 cells, 8-tile chunks,
-        serial). Step 1 grows chunk 7 (3 border + 3 link portals, 33 edges)
-        to 66 (total 354, live 322). Step 2 adds three ramps in chunk 1 (33
-        edges) and two in chunk 4 (34 edges) under a ceiling pinned at live
-        + 66 = 388: chunk 1 compacts and grows, chunk 4 compacts again and is
-        refused. After the failure `edge_windows_grown_total == 2`,
-        `edge_compactions_total == 2`, one refusal, no edge into a tombstone;
-        the admitted retry reports `edge_windows_grown == 2` and
-        `edge_compactions == 2` and matches a full rebuild. Every number was
-        verified by running; with the cursors re-synced at the start of each
-        apply (per-step counting) the retry reports 1 and the test fails.
+          the next success** (third review, 2026-10-07). Fix: lifetime
+          `edge_windows_grown_total` counted at the source plus
+          `edge_windows_grown_reported` / `edge_compactions_reported` cursors;
+          a successful `applyNavUpdates` reports `total − reported` after its
+          last fallible step; a full build syncs the cursors.
+          `patchDirtyChunks`/`growChunkEdgeWindow` return `!void`. Test: "edge-window
+          growths and compactions of a failed step are reported by the next
+          successful step" (a step grows chunk 1, compacts twice, and is
+          refused on chunk 4; the retry reports 2 growths and 2 compactions;
+          per-step counting reports 1 and fails).
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.

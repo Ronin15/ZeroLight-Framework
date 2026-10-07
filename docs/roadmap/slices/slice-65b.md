@@ -413,8 +413,9 @@ rule enforced structurally: the job cannot reach `parallelFor`.
       (the ceiling the background rebuild's growths must respect),
       `edge_windows_grown_total`, `edge_windows_grown_reported`,
       `edge_compactions_total`, `edge_compactions_reported`,
-      `edge_growth_refused_total` (lifetime counters and their report
-      cursors, carried across the swap; 64E M10), `chunk_link_cells` (64E's
+      `edge_growth_refused_total`, `edge_arena_unslacked_total` (lifetime
+      counters and their report cursors, carried across the swap; 64E
+      M8/M10), `chunk_link_cells` (64E's
       fixed-stride `[chunk_count * nav_interior_link_slots_per_chunk]`
       table), `chunk_link_count`, `full_build_link_endpoints_unslotted`
       (last-full-build diagnostic, recomputed by the copy's own build).
