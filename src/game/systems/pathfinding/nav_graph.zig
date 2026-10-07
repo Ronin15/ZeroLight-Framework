@@ -144,10 +144,18 @@ pub const NavLevelGraph = struct {
         return count;
     }
 
-    // Edges one chunk's live slots hold: its slot window's adjacency counts summed.
-    fn chunkEdgeCount(self: *const NavLevelGraph, portal_base: u32, portal_cap: u32) u32 {
-        var edge_count: u32 = 0;
-        for (self.portal_edge_count.items[portal_base..][0..portal_cap]) |slot_edges| edge_count += slot_edges;
+    // Edges a packed chunk holds. Its slots' adjacency runs are laid out back to back from the
+    // window base (every slot, tombstones included, gets a start), so the count is the last
+    // slot's run end minus the base: O(1) instead of summing the slot window.
+    fn packedChunkEdgeCount(self: *const NavLevelGraph, chunk: u32, portal_base: u32, portal_cap: u32) u32 {
+        const last_slot = portal_base + portal_cap - 1;
+        const run_end = self.portal_edge_start.items[last_slot] + self.portal_edge_count.items[last_slot];
+        const edge_count = run_end - self.chunk_edge_base.items[chunk];
+        if (std.debug.runtime_safety) {
+            var summed: u32 = 0;
+            for (self.portal_edge_count.items[portal_base..][0..portal_cap]) |slot_edges| summed += slot_edges;
+            std.debug.assert(summed == edge_count);
+        }
         return edge_count;
     }
 };
@@ -1490,7 +1498,7 @@ pub const NavGraph = struct {
                 try self.buildChunkPatch(level, world, chunk, scratch);
                 edge_counts[chunk] = @intCast(scratch.edges.items.len);
             } else {
-                edge_counts[chunk] = level_graph.chunkEdgeCount(self.chunk_portal_base.items[chunk], self.chunk_portal_cap.items[chunk]);
+                edge_counts[chunk] = level_graph.packedChunkEdgeCount(chunk, self.chunk_portal_base.items[chunk], self.chunk_portal_cap.items[chunk]);
             }
             const old_cap = level_graph.chunk_edge_cap.items[chunk];
             new_caps[chunk] = if (edge_counts[chunk] <= old_cap) old_cap else windowCap(edge_counts[chunk]);
@@ -1517,7 +1525,9 @@ pub const NavGraph = struct {
                 } else {
                     const edges = level_graph.portal_edges.items[old_base..][0..edge_counts[chunk]];
                     @memcpy(new_arena.items[new_base..][0..edges.len], edges);
-                    for (starts) |*start| start.* = start.* - old_base + new_base;
+                    if (new_base != old_base) {
+                        for (starts) |*start| start.* = start.* - old_base + new_base;
+                    }
                 }
                 level_graph.chunk_edge_cap.items[chunk] = new_caps[chunk];
                 level_graph.chunk_edge_base.items[chunk] = new_base;
