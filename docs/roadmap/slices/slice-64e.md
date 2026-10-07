@@ -11,7 +11,11 @@ A*-result, and cached-path proofs, in-place hole compaction, and a nav memory
 gate on growth), and the second review's follow-ups landed 2026-10-07 (M4–M7:
 a failed growth still patches the whole dirty set, re-admission charges live
 edge slots, the build checks its measured arena, and link-cursor stats survive
-a failed apply). The pre-fix manual run passed (owner, 2026-10-06; see
+a failed apply), and the third review's follow-ups landed 2026-10-07
+(M8–M13: one slacked → unslacked → refuse window-sizing ladder, arena
+capacity within the gate's ceiling, failed-step growth stats carried,
+one refusal `err` per step, a cache clear after a degraded apply, and the
+tombstone oracle in the OOM sweeps). The pre-fix manual run passed (owner, 2026-10-06; see
 Acceptance checks). **Open: one post-fix manual acceptance check on current
 code** (display-gated; not run in the implementing sessions). Every code,
 test, doc, and bench item below is checked. The slice stays in `slices/`
@@ -528,7 +532,9 @@ multi-worker patch path and the serial one.
       grows). Branch-review follow-up: the remaining test-only
       `DigController.process` wrapper (admit + commit with no seam) was
       removed from the production API; pipeline and demo tests dig through
-      `admitDigAndGrowLinks` + `commit`, and `dig_controller.zig`'s own tests
+      the real pipeline step (`SimulationPipeline.update` via the demo's
+      `digFacedForTest`; the admission seam is private again), and
+      `dig_controller.zig`'s own tests
       use a private `digPressForTest` helper.
     - **L4 · no in-step growth past a reserved limit.** `addLevelLink` /
       `ensureLevelLinkCapacity` on a reserved world used to grow the limit by
@@ -578,8 +584,9 @@ multi-worker patch path and the serial one.
       ReleaseSafe build). The run above predates the in-place edge-window
       growth and its M1–M7 follow-ups. Dig several ramps in one open chunk:
       the perf dump shows `edge_windows_grown > 0` and `full_relabel=0`,
-      the log has no `edge window growth ... refused` error (no edge-growth
-      refusals), and NPCs route over the new ramps.
+      the log has no `nav update refused` error (no edge-growth refusals)
+      and no `landed without edge growth slack` warn, and NPCs route over
+      the new ramps.
 - [x] **Edge-window overflow after runtime ramps (found in the 2026-10-06
       manual run).** Later in the same run the log printed
       `nav abstract-graph edge-cap fallback: per-chunk edge window overflow,
@@ -950,22 +957,6 @@ multi-worker patch path and the serial one.
           1104 under a 1600 ceiling, then the next growth is refused); the
           build test asserts the clamp at the ceiling (pre-fix 3788 > 2520),
           the unchanged reserve away from it, and freed staging lists.
-    - [x] **M12 · a degraded apply drops the completed cache.** Paths
-          solved between a failed apply (refused chunk with empty adjacency,
-          later levels on their old layer) and its retry could detour and
-          survive the retry's scoped eviction. Fix:
-          `PathfindingSystem.nav_apply_degraded`, set on any apply error; the
-          next successful incremental apply clears the whole completed cache
-          (a relabel or full build already does) and resets it. Test: the M4
-          refusal test now asserts the flag across the failure and retry and
-          that the detour cached before the retry re-solves to a fresh
-          rebuild's direct path (fails without the clear: the stale detour
-          stays cached). 65B's `NavWorldTooLarge` swap rule sets it.
-    - [x] **M13 · tombstone oracle in the OOM sweeps.** Both growth OOM
-          sweeps call `expectNoEdgeTargetsTombstone` on every failed step
-          before the retry, and the lattice sweep now runs serial and
-          threaded (`ran_inline` checked per variant). Test-only coverage of
-          M4's failure state under OOM.
     - [x] **M10 · a failed step's growths and compactions are reported by
           the next success** (third review, 2026-10-07). Fix: lifetime
           `edge_windows_grown_total` counted at the source plus
@@ -982,6 +973,28 @@ multi-worker patch path and the serial one.
           logs one comptime-gated `err` per failed step (refused-chunk count,
           level, live slots, ceiling). No test (logs are gated out of tests;
           `edge_growth_refused_total` is already asserted).
+    - [x] **M12 · a degraded apply drops the completed cache.** Paths
+          solved between a failed apply (refused chunk with empty adjacency,
+          later levels on their old layer) and its retry could detour and
+          survive the retry's scoped eviction. Fix:
+          `PathfindingSystem.nav_apply_degraded`, set on any apply error; the
+          next successful incremental apply clears the whole completed cache
+          (a relabel or full build already does) and resets it. Test: the M4
+          refusal test now asserts the flag across the failure and retry and
+          that the detour cached before the retry re-solves to a fresh
+          rebuild's direct path (fails without the clear: the stale detour
+          stays cached). 65B's `NavWorldTooLarge` swap rule sets it.
+    - [x] **M13 · tombstone oracle in the OOM sweeps.** Both growth OOM
+          sweeps call `expectNoEdgeTargetsTombstone` on every failed step
+          before the retry, and the lattice sweep now runs serial and
+          threaded (`ran_inline` checked per variant). Test-only coverage of
+          M4's failure state under OOM.
+    - [x] **Bench (M8–M13).** ReleaseFast, 3 interleaved runs of `aad4acb`
+          (before) and `3c31040` (after) exported with `git archive`,
+          serial-direct medians; per-step change is two u64 subtractions.
+          All within max(3%, spread): links-dense 8 31.47 → 31.15 us;
+          scattered 16 208.64 → 206.67 us, 32 412.33 → 408.72 us, 64 811.76
+          → 807.34 us, 128 1.57 → 1.55 ms, 256 3.11 → 3.07 ms.
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.
