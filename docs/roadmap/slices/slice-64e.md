@@ -722,16 +722,18 @@ multi-worker patch path and the serial one.
         live portals with empty adjacency, and the rest of the dirty set is
         still patched (M4). The arena's geometric growth is clamped to the
         limit. `raiseAgentBudget`, `admitsLinkLimit`, and
-        `reserveLinkCapacity` charge the arena as grown and re-derive the
-        limit, so headroom spent on edges is not admitted twice. Tests: "an
+        `reserveLinkCapacity` charge the arena's live edge slots (M6) and
+        re-derive the limit, so headroom spent on edges is not admitted
+        twice. Tests: "an
         edge-window growth past the nav memory gate compacts first, then
         refuses loudly" (compaction admits ramp 5's growth under a pinned
         ceiling, through the real 3-worker patch's post-barrier pass with a
         `FailingAllocator` on the graph and system: 0 allocations,
         `edge_compactions == 1`; then a growth with no hole to reclaim is refused twice in a
         row, counted, with no flag left set, and lands with parity once
-        admitted); "link growth and agent-budget raises charge an edge arena
-        grown past its build estimate"; `nav_memory.zig` "edgeArenaSlotLimit
+        admitted); "link growth and agent-budget raises charge the edge
+        arena's live slots grown by real relocations, never physical capacity
+        or holes" (M6's rewrite); `nav_memory.zig` "edgeArenaSlotLimit
         is the per-level arena estimate plus the budget's headroom".
       - Memory: steady state is unchanged (24 B of new `NavGraph` fields, no
         per-chunk arrays). Holes stay below the live window slots, so an
@@ -787,6 +789,47 @@ multi-worker patch path and the serial one.
         a new request equals a fresh solve. Before the fix the oracle fails
         and the cross-level solve traps (h = 0 on its start level pops the
         tombstone).
+    - [x] **M6 · re-admission charges live edge slots, not physical
+          capacity.** `edgeArenaFitsBudget` compared the largest per-level
+          `portal_edges.capacity` with the ceiling. That is
+          history-dependent (`setLen` rounding, 1.5× geometric growth,
+          compaction keeps capacity), so `raiseAgentBudget` and the dig
+          seam's `admitsLinkLimit` could refuse or admit on allocator
+          history; the old test flipped results only by changing physical
+          capacity.
+      - One logical quantity: `NavGraph.edgeArenaLiveSlots()` =
+        `total_edge_slots - edge_hole_slots`, what the arena occupies after
+        a compaction. The relocation gate already admits exactly
+        live + new_cap ≤ limit (it compacts first when holes exist), so
+        charging live makes the build, relocation refusal, and
+        re-admission one predicate. Charging `total` would refuse what the
+        next relocation admits. `edgeArenaCapacitySlots` is deleted.
+      - Physical slack is not charged and never consulted, and it is
+        bounded by construction: build `setLen` rounding (≤ n/2 plus a
+        cache line), and growth `ensureTotalCapacityPrecise` clamped to the
+        ceiling current at that time, which is non-increasing between full
+        builds (only re-admissions lower it). No allocation past the
+        current ceiling is ever made. `placeLevelEdges` keeps `setLen`
+        (default keep: precise sizing only tightens a byte bound, at the
+        cost of an extra cold realloc on the first growth).
+      - Asserts: `applyEdgeArenaBudget` and `applyNavUpdates` assert live ≤
+        `edge_arena_slot_limit` (callers gate first); the relocation asserts
+        each arena's capacity covers the new length before its `.len`
+        write; the compaction asserts its packed length equals the live
+        slots. The refusal log prints the live slots.
+      - Test (rewritten): "link growth and agent-budget raises charge the
+        edge arena's live slots grown by real relocations, never physical
+        capacity or holes". A one-chunk 8×8 two-level world takes 36 ramps,
+        8 per step; real relocations grow its window 32 → 112 → 480 → 1104
+        → (fits) → 2520, leaving 1728 holes (total 4248, live 2520; both
+        verified by running). With a byte ceiling one slot under the live
+        slots at 600 links, `admitsLinkLimit(600)` flips from true to false
+        only through the relocations, while `admitsLinkLimit(36)` stays
+        true even though `total_edge_slots` exceeds its ceiling. Growing
+        every arena to 10,000 slots and trimming it back to its length
+        changes neither answer. An agent-budget raise is refused one slot
+        under the live slots and admitted at them, which sets the growth
+        ceiling. The test fails with the old capacity-based gate.
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.

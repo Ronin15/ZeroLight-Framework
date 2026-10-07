@@ -349,7 +349,8 @@ pub const PathfindingSystem = struct {
 
     /// Raises `max_agent_budget` to `requested` when the nav-memory gate admits the
     /// raised ceiling (same `budgetForCapacity` the build gate uses, charged against the
-    /// live reserved link limit). A refusal keeps the old ceiling, is counted, warns once,
+    /// live reserved link limit and the edge arena's live slots, total minus holes, never
+    /// its physical capacity). A refusal keeps the old ceiling, is counted, warns once,
     /// and is final for that ceiling (see `coversAgentCount`). Main thread, population seam.
     /// Never writes `group_field_threshold_ceiling`: a raise lifts capacity, not policy.
     pub fn raiseAgentBudget(self: *PathfindingSystem, requested: usize, link_count: usize) bool {
@@ -358,7 +359,8 @@ pub const PathfindingSystem = struct {
         var raised = self.capacity;
         raised.max_agent_budget = requested;
         const memory_budget = nav_memory.budgetForCapacity(raised, @max(@as(usize, 1), self.graph.levelCount()), link_count);
-        // The raise spends the same headroom an edge arena grown past its build estimate uses.
+        // The raise spends the same headroom an edge arena grown past its build estimate uses,
+        // charged as the arena's live slots (NavGraph.edgeArenaLiveSlots).
         const admitted = if (memory_budget.check(self.graph.width, self.graph.height)) |_| self.graph.edgeArenaFitsBudget(memory_budget) else |_| false;
         if (!admitted) {
             self.agent_budget_raise_refused += 1;
@@ -379,7 +381,8 @@ pub const PathfindingSystem = struct {
 
     /// Whether the nav-memory gate admits a world level-link limit of `link_limit`: the same
     /// `budgetForCapacity` check the build and `raiseAgentBudget` use, charged against the
-    /// live agent ceiling, plus the edge arena as grown so far (see `raiseAgentBudget`). Pure;
+    /// live agent ceiling, plus the edge arena's live slots (total minus holes, never physical
+    /// capacity; see `raiseAgentBudget`). Pure;
     /// the dig commit seam's link growth asks it first.
     pub fn admitsLinkLimit(self: *const PathfindingSystem, link_limit: usize) bool {
         const memory_budget = nav_memory.budgetForCapacity(self.capacity, @max(@as(usize, 1), self.graph.levelCount()), link_limit);

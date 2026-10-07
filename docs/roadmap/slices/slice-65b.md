@@ -403,17 +403,25 @@ rule enforced structurally: the job cannot reach `parallelFor`.
     - `NavGraph`: `cell_size`, `width`, `height`, `chunk_tiles`, `version`,
       `levels`, `level_graphs`, `link_edges`, `link_edge_refs`,
       `chunk_portal_cap`, `chunk_portal_base`, `total_slots`,
-      `chunk_edge_cap`, `chunk_edge_base`, `total_edge_slots`, `edge_slack`,
-      `chunk_link_cells` (64E's fixed-stride `[chunk_count *
-      nav_interior_link_slots_per_chunk]` table), `chunk_link_count`.
-      (`chunk_link_base` no longer exists; 64E deletes it.)
+      `chunk_edge_cap`, `chunk_edge_base`, `total_edge_slots`,
+      `edge_hole_slots` (layout state: `total` includes holes; the
+      hole ≤ live assert and compaction read it), `edge_arena_slot_limit`
+      (the ceiling the background rebuild's growths must respect),
+      `edge_compactions_total`, `edge_growth_refused_total` (lifetime
+      counters carried across the swap), `chunk_link_cells` (64E's
+      fixed-stride `[chunk_count * nav_interior_link_slots_per_chunk]`
+      table), `chunk_link_count`, `full_build_link_endpoints_unslotted`
+      (last-full-build diagnostic, recomputed by the copy's own build).
+      (`chunk_link_base` and `edge_slack` no longer exist; 64E deletes
+      them.)
     - `NavGrid`: `level`, `cell_size`, `width`, `height`, `chunk_tiles`,
       `blocked_count`, `blocked`, `components`, `static_blocked`.
     - `NavLevelGraph`: every list except `edge_scratch`.
   - **scratch** (capacity and count ensured, contents not copied):
-    `build_u32_scratch`, `patch_scratch`,
-    `remask_scratch`, `dirty_set`, `dirty_stamp`, `dirty_epoch`,
-    `changed_chunks`, `last_patch_batch`, `last_remask_batch`,
+    `build_u32_scratch`, `patch_scratch`, `remask_scratch`,
+    `last_patch_batch`, `last_remask_batch`, `chunk_edge_overflow`
+    (per-batch flags, sized to chunk count, all false), `dirty_set`,
+    `dirty_stamp`, `dirty_epoch`, `changed_chunks`,
     `NavGrid.component_queue`, `NavLevelGraph.edge_scratch`.
   - **owner**: `allocator`.
 
@@ -613,8 +621,8 @@ copied at submit") gains one clause:
       `FailingAllocator` on `graph.allocator` after one warm rebuild, then a
       second `buildAbstractGraphs(links)`.
     - `test "copyGraphFrom produces an equivalent graph"`:
-      `expectGraphsEquivalent` plus equal `version` / `edge_slack` /
-      `total_edge_slots`, on the 256-px, 4-tile-chunk two-level fixture used
+      `expectGraphsEquivalent` plus equal `version` / `total_edge_slots` /
+      `edge_hole_slots` / `edge_arena_slot_limit`, on the 256-px, 4-tile-chunk two-level fixture used
       at `:1904-1913`.
 - [ ] `NavGrid.rebuildStaticCoverage`, `deriveChunkMask`, and `applyChunkMask`.
   - `test "deriveChunkMask plus applyChunkMask equals remaskChunkFromWorld"`:

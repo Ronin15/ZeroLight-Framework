@@ -385,13 +385,14 @@ pub const NavGraph = struct {
     total_edge_slots: u32 = 0,
     // Arena slots vacated by window relocations and referenced by no window: the same count in
     // every level's arena (windows are shared). total_edge_slots - edge_hole_slots is the slots
-    // live windows own. Zeroed by a full build and by compactEdgeArena (run by a growth that
-    // reaches the nav memory gate). Each relocation adds its old cap here and more than that to
+    // live windows own (edgeArenaLiveSlots), the quantity the nav memory gate charges. Zeroed by
+    // a full build and by compactEdgeArena (run by a growth that reaches the nav memory gate). Each relocation adds its old cap here and more than that to
     // the live windows (growth at least doubles), so holes never exceed live slots: the arena
     // is at most about 2x its live windows. applyNavUpdates asserts that invariant.
     edge_hole_slots: u32 = 0,
     // Per-level edge-arena slot ceiling from the nav memory gate the graph was last admitted
-    // under (NavMemoryBudget.edgeArenaSlotLimit, set at every full build and on re-admission).
+    // under (NavMemoryBudget.edgeArenaSlotLimit, set at every full build and on re-admission),
+    // charged against the arena's live slots (edgeArenaLiveSlots), never its physical capacity.
     // A window growth past it compacts first and otherwise fails loudly (NavWorldTooLarge,
     // edge_growth_refused_total, one count per refused chunk; the rest of the dirty set is still
     // patched), so in-place growth never allocates past max_nav_memory_bytes.
@@ -788,7 +789,10 @@ pub const NavGraph = struct {
             // trigger of its own: every relocation adds its old cap to the holes and a new cap
             // of max(2 * needed, floor) > 2 * old cap to the live windows (relocateChunkEdgeWindow),
             // and a full build or compaction zeroes the holes.
-            std.debug.assert(self.edge_hole_slots <= self.total_edge_slots - self.edge_hole_slots);
+            std.debug.assert(self.edge_hole_slots <= self.edgeArenaLiveSlots());
+            // Every seam that sets or spends the ceiling keeps the live slots within it: the
+            // build, an admitted relocation, and an admitted re-admission (edgeArenaFitsBudget).
+            std.debug.assert(self.edgeArenaLiveSlots() <= self.edge_arena_slot_limit);
         }
         try self.rebuildLinkEdges(world);
 
@@ -1514,7 +1518,7 @@ pub const NavGraph = struct {
             @branchHint(.cold);
             self.edge_growth_refused_total += 1;
             if (comptime logging.enabled(.err) and !builtin.is_test)
-                logging.game.err("nav chunk {d} edge window growth to {d} refused: arena {d} + {d} slots per level exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); refusal {d}", .{ chunk, new_cap, self.total_edge_slots, new_cap, self.edge_arena_slot_limit, self.edge_growth_refused_total });
+                logging.game.err("nav chunk {d} edge window growth to {d} refused: arena {d} live + {d} slots per level exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); refusal {d}", .{ chunk, new_cap, self.edgeArenaLiveSlots(), new_cap, self.edge_arena_slot_limit, self.edge_growth_refused_total });
             return error.NavWorldTooLarge;
         }
         // Read after any compaction above, which moves windows.
@@ -1525,6 +1529,8 @@ pub const NavGraph = struct {
         const pbase = self.chunk_portal_base.items[chunk];
         const pcap = self.chunk_portal_cap.items[chunk];
         for (self.level_graphs.items) |*lg| {
+            // Ensured above; the std check behind a .len write is stripped in ReleaseFast.
+            std.debug.assert(lg.portal_edges.capacity >= new_total);
             lg.portal_edges.items.len = new_total;
             @memcpy(lg.portal_edges.items[new_base..][0..old_cap], lg.portal_edges.items[old_base..][0..old_cap]);
             for (lg.portal_edge_start.items[pbase .. pbase + pcap]) |*start| {
@@ -1539,7 +1545,7 @@ pub const NavGraph = struct {
     }
 
     // Whether appending a `new_cap`-slot window keeps every level's arena within the nav memory
-    // gate's per-level ceiling.
+    // gate's per-level ceiling. Post-compaction (no holes) this is live + new_cap.
     fn edgeArenaAdmits(self: *const NavGraph, new_cap: u32) bool {
         return @as(u64, self.total_edge_slots) + new_cap <= self.edge_arena_slot_limit;
     }
@@ -1585,29 +1591,36 @@ pub const NavGraph = struct {
             }
             running += cap;
         }
-        std.debug.assert(running == self.total_edge_slots - self.edge_hole_slots);
+        std.debug.assert(running == self.edgeArenaLiveSlots());
         for (self.level_graphs.items) |*lg| lg.portal_edges.items.len = running;
         self.total_edge_slots = running;
         self.edge_hole_slots = 0;
         self.edge_compactions_total += 1;
     }
 
-    // Re-derives the gated per-level edge-arena ceiling from a budget the system just
-    // re-admitted (agent-budget raise, link growth), and whether the arena as grown so far fits
-    // it: growth past the build-time estimate spends the same headroom those raises consume.
-    pub fn edgeArenaFitsBudget(self: *const NavGraph, budget: NavMemoryBudget) bool {
-        return self.edgeArenaCapacitySlots() <= budget.edgeArenaSlotLimit(self.width, self.height);
+    // The per-level edge-arena slots live windows own (total minus holes): what the arena
+    // occupies after a compaction, and the quantity the nav memory gate charges. Holes are
+    // reclaimable in place without allocating, and physical capacity past the live slots is
+    // build rounding or geometric growth clamped to the ceiling current at that time, so
+    // neither is charged.
+    pub fn edgeArenaLiveSlots(self: *const NavGraph) u32 {
+        return self.total_edge_slots - self.edge_hole_slots;
     }
 
+    // Whether the arena's live slots fit the per-level edge-arena ceiling of a budget the system
+    // is re-admitting (agent-budget raise, link growth): edge growth past the build-time
+    // estimate spends the same headroom those raises consume. The same predicate the relocation
+    // gate applies after a compaction (live + new_cap <= limit), so the two never disagree.
+    pub fn edgeArenaFitsBudget(self: *const NavGraph, budget: NavMemoryBudget) bool {
+        return self.edgeArenaLiveSlots() <= budget.edgeArenaSlotLimit(self.width, self.height);
+    }
+
+    // Re-derives the gated per-level edge-arena ceiling from a re-admitted budget. Callers gate
+    // first (raiseAgentBudget via edgeArenaFitsBudget, the dig seam via admitsLinkLimit before
+    // reserveLinkCapacity), so the live slots stay within the new ceiling.
     pub fn applyEdgeArenaBudget(self: *NavGraph, budget: NavMemoryBudget) void {
         self.edge_arena_slot_limit = budget.edgeArenaSlotLimit(self.width, self.height);
-    }
-
-    // Largest per-level edge-arena capacity (the resident slots the gate charges).
-    fn edgeArenaCapacitySlots(self: *const NavGraph) usize {
-        var slots: usize = 0;
-        for (self.level_graphs.items) |*lg| slots = @max(slots, lg.portal_edges.capacity);
-        return slots;
+        std.debug.assert(self.edgeArenaLiveSlots() <= self.edge_arena_slot_limit);
     }
 
     // Tombstones a chunk's whole slot window and clears the cell_to_portal entries of the
@@ -3824,48 +3837,129 @@ test "nav memory gate admits the world's reserved link limit, not just its curre
     try std.testing.expectError(NavGridError.NavWorldTooLarge, gated.rebuildStaticNavGridWithWorld(&data, &reserved, 384, 384, 32, null));
 }
 
-test "link growth and agent-budget raises charge an edge arena grown past its build estimate" {
-    // Window growth may spend the gate's headroom (edge_arena_slot_limit = the per-level arena
-    // estimate plus the bytes max_nav_memory_bytes leaves unused). A later re-admission (the
-    // dig seam's link growth, an agent-budget raise) spends the same headroom, so it must
-    // charge the arena as grown: with every arena at the ceiling, a re-admission that needs any
-    // headroom is refused; with the arena back under it, the raise is admitted and re-derives
-    // the (now lower) ceiling.
+// The 36 ramp endpoint cells of the one-chunk 8x8 fixture (8-tile nav chunks): 8 interior
+// cells first (the chunk's K interior link slots), then all 28 perimeter cells (positional
+// slots), so every ramp adds a portal to the chunk's one open component on the all-grass level.
+fn oneChunkRampCells() [36]CellCoord {
+    var cells: [36]CellCoord = undefined;
+    var n: usize = 0;
+    for ([_][2]u16{ .{ 1, 1 }, .{ 3, 1 }, .{ 5, 1 }, .{ 1, 3 }, .{ 3, 3 }, .{ 5, 3 }, .{ 1, 5 }, .{ 3, 5 } }) |xy| {
+        cells[n] = .{ .x = xy[0], .y = xy[1] };
+        n += 1;
+    }
+    var y: u16 = 0;
+    while (y < 8) : (y += 1) {
+        var x: u16 = 0;
+        while (x < 8) : (x += 1) {
+            if (x != 0 and y != 0 and x != 7 and y != 7) continue;
+            cells[n] = .{ .x = x, .y = y };
+            n += 1;
+        }
+    }
+    std.debug.assert(n == cells.len);
+    return cells;
+}
+
+// The per-level edge-arena ceiling `capacity`'s nav memory gate yields for the two-level 8x8
+// fixture charging `link_limit` world links.
+fn oneChunkGateSlotLimit(capacity: types.PathfindingCapacity, link_limit: usize) u32 {
+    return budgetForCapacity(capacity, 2, link_limit).edgeArenaSlotLimit(8, 8);
+}
+
+// The max_nav_memory_bytes at which `capacity`'s gate, charging `link_limit` links on the
+// two-level 8x8 fixture, yields exactly `slots` per-level edge-arena slots: the required bytes
+// (whose ceiling is the gate's own arena estimate) plus one edge per level per extra slot.
+fn oneChunkGateBytesForSlotLimit(capacity: types.PathfindingCapacity, link_limit: usize, slots: u32) usize {
+    var budget = budgetForCapacity(capacity, 2, link_limit);
+    budget.max_bytes = budget.requiredBytes(8, 8);
+    const estimate = budget.edgeArenaSlotLimit(8, 8);
+    std.debug.assert(slots >= estimate);
+    return budget.max_bytes + 2 * @sizeOf(AbstractEdge) * @as(usize, slots - estimate);
+}
+
+test "link growth and agent-budget raises charge the edge arena's live slots grown by real relocations, never physical capacity or holes" {
+    // The re-admissions (the dig seam's link growth through admitsLinkLimit, the population
+    // seam's agent-budget raise) charge the edge arena's LIVE slots, total minus holes: the
+    // quantity the relocation gate itself admits after a compaction. Real relocations drive it:
+    // 36 ramps, 8 added per step, in the one 8-tile chunk of an 8x8 two-level world grow its window
+    // 32 -> 112 -> 480 -> 1104 -> 2520 (k(k-1) edges for k = 8/16/24/32/36 portals; the
+    // fourth step's 992 fits), leaving 1728 hole slots. A ceiling one slot under the live 2520
+    // refuses and a ceiling at it admits, though total_edge_slots (4248) exceeds both; the
+    // arena's physical capacity never changes an answer.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
-    var world = try initTwoLevelOpenWorld(&meta, 384);
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var world = try initTwoLevelOpenWorld(&meta, 256);
     defer world.deinit();
+    const cells = oneChunkRampCells();
+    try world.reserveLevelLinks(cells.len);
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
-    try system.reserve(abstractCapacity());
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    const graph = &system.graph;
+    try std.testing.expectEqual(@as(u32, 32), graph.total_edge_slots);
+    // Keep the growths out of the relocation gate (its refusal path has its own test); the
+    // re-admission answers below read only system.capacity and the arena.
+    graph.edge_arena_slot_limit = std.math.maxInt(u32);
+
+    const live_grown: u32 = 2520;
+    const big_link_limit: usize = 600;
+    // At big_link_limit links the ceiling sits one slot under the grown arena's live slots;
+    // the world's own reserved limit leaves more headroom.
+    system.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(system.capacity, big_link_limit, live_grown - 1);
+    try std.testing.expect(oneChunkGateSlotLimit(system.capacity, cells.len) >= live_grown);
+    try std.testing.expect(system.admitsLinkLimit(cells.len));
+    try std.testing.expect(system.admitsLinkLimit(big_link_limit));
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    // Eight ramps join the world per step (a chunk patch admits every world link endpoint it
+    // finds, and perimeter endpoints need no cursor slot, so adding all 36 at once would land
+    // them in one step).
+    for ([_]u32{ 112, 480, 1104, 1104, live_grown }, 0..) |cap, step| {
+        const first = step * 8;
+        for (cells[first..@min(first + 8, cells.len)]) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+        _ = try reactOneStep(&system, &frame, &data, &world, null);
+        try std.testing.expectEqual(cap, graph.chunk_edge_cap.items[0]);
+        try std.testing.expect(graph.edge_hole_slots <= graph.edgeArenaLiveSlots());
+    }
+    try std.testing.expect(!system.hasPendingNavLinks(&world));
+    try std.testing.expectEqual(@as(u32, 32 + 112 + 480 + 1104), graph.edge_hole_slots);
+    try std.testing.expectEqual(@as(u32, 4248), graph.total_edge_slots);
+    try std.testing.expectEqual(live_grown, graph.edgeArenaLiveSlots());
+
+    // Only the relocations flipped the big limit, and the holes are not charged: total exceeds
+    // the ceiling the reserved limit still admits.
+    try std.testing.expect(graph.total_edge_slots > oneChunkGateSlotLimit(system.capacity, cells.len));
+    try std.testing.expect(system.admitsLinkLimit(cells.len));
+    try std.testing.expect(!system.admitsLinkLimit(big_link_limit));
+    // Physical capacity is not an input: far past the live slots, then trimmed to the length.
+    for (graph.level_graphs.items) |*lg| try lg.portal_edges.ensureTotalCapacityPrecise(std.testing.allocator, 10_000);
+    try std.testing.expect(system.admitsLinkLimit(cells.len));
+    try std.testing.expect(!system.admitsLinkLimit(big_link_limit));
+    for (graph.level_graphs.items) |*lg| lg.portal_edges.shrinkAndFree(std.testing.allocator, lg.portal_edges.items.len);
+    try std.testing.expect(system.admitsLinkLimit(cells.len));
+    try std.testing.expect(!system.admitsLinkLimit(big_link_limit));
+
+    // The agent-budget raise charges the same live slots: a raised ceiling one slot under them
+    // is refused (the gate's byte check itself passes) and leaves the growth ceiling alone; a
+    // raised ceiling at them is admitted and becomes the growth ceiling.
     const requested = system.agentBudget() * 2;
     var raised = system.capacity;
     raised.max_agent_budget = requested;
-    const base_bytes = budgetForCapacity(system.capacity, 2, 0).requiredBytes(12, 12);
-    const raised_bytes = budgetForCapacity(raised, 2, 0).requiredBytes(12, 12);
-    try std.testing.expect(raised_bytes > base_bytes);
-    // Headroom for exactly the raise plus 64 spare edge slots per level.
-    system.capacity.max_nav_memory_bytes = raised_bytes + 2 * 64 * @sizeOf(AbstractEdge);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
-    const build_limit = system.graph.edge_arena_slot_limit;
-    try std.testing.expect(system.admitsLinkLimit(8));
-
-    // Every level's arena grows to the ceiling: all headroom is spent on edges.
-    for (system.graph.level_graphs.items) |*lg| try lg.portal_edges.ensureTotalCapacityPrecise(std.testing.allocator, build_limit);
-    try std.testing.expect(system.admitsLinkLimit(0));
-    try std.testing.expect(!system.admitsLinkLimit(8));
-    try std.testing.expect(!system.raiseAgentBudget(requested, 0));
-    try std.testing.expectEqual(build_limit, system.graph.edge_arena_slot_limit);
-
-    // Back under the raised ceiling, the raise lands and lowers the growth ceiling to match.
-    for (system.graph.level_graphs.items) |*lg| lg.portal_edges.shrinkAndFree(std.testing.allocator, lg.portal_edges.items.len);
-    try std.testing.expect(system.raiseAgentBudget(requested, 0));
-    raised.max_nav_memory_bytes = system.capacity.max_nav_memory_bytes;
-    const raised_limit = budgetForCapacity(raised, 2, 0).edgeArenaSlotLimit(12, 12);
-    try std.testing.expect(raised_limit < build_limit);
-    try std.testing.expectEqual(raised_limit, system.graph.edge_arena_slot_limit);
+    system.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(raised, cells.len, live_grown - 1);
+    try std.testing.expect(!system.raiseAgentBudget(requested, cells.len));
+    try std.testing.expectEqual(@as(u64, 1), system.agent_budget_raise_refused);
+    try std.testing.expectEqual(std.math.maxInt(u32), graph.edge_arena_slot_limit);
+    system.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(raised, cells.len, live_grown);
+    try std.testing.expect(system.raiseAgentBudget(requested, cells.len));
+    try std.testing.expectEqual(requested, system.agentBudget());
+    try std.testing.expectEqual(live_grown, graph.edge_arena_slot_limit);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 256, capacity);
 }
 
 test "interiorLinkSlotsAvailable refuses a cell that is an existing but unslotted endpoint" {
