@@ -102,6 +102,10 @@ pub const NavLevelGraph = struct {
     // Per slot: absolute start of its adjacency in portal_edges, and edge count (0 for a
     // tombstone). Sized to total_slots. Reads never depend on a neighbor slot, which is
     // what lets per-chunk edge windows work without global contiguity.
+    // Packed invariant: every chunk not flagged in chunk_edge_overflow has its slots' runs back
+    // to back from chunk_edge_base (first start == base, next start == start + count), so every
+    // writer that zeroes counts also resets the starts to the base. packedChunkEdgeCount relies
+    // on it.
     portal_edge_start: std.ArrayList(u32) = .empty,
     portal_edge_count: std.ArrayList(u32) = .empty,
     // Per-chunk live-portal ordering: chunk D's run lives in
@@ -144,9 +148,8 @@ pub const NavLevelGraph = struct {
         return count;
     }
 
-    // Edges a packed chunk holds. Its slots' adjacency runs are laid out back to back from the
-    // window base (every slot, tombstones included, gets a start), so the count is the last
-    // slot's run end minus the base: O(1) instead of summing the slot window.
+    // Edges a packed chunk holds (see portal_edge_start): the last slot's run end minus the
+    // window base, O(1) instead of summing the slot window.
     fn packedChunkEdgeCount(self: *const NavLevelGraph, chunk: u32, portal_base: u32, portal_cap: u32) u32 {
         const last_slot = portal_base + portal_cap - 1;
         const run_end = self.portal_edge_start.items[last_slot] + self.portal_edge_count.items[last_slot];
@@ -629,22 +632,54 @@ pub const NavGraph = struct {
         }
     }
 
-    // (Re)builds the chunk-stable slot geometry and every level's full abstract graph from
-    // the current masks/components. Used by the init rebuild and by a full relabel; it
-    // re-measures every level's edge windows from the current topology, so it never overflows.
-    // Each level commits on its own (placeLevelEdges), so an OOM leaves every level either fully
-    // rebuilt or on its old, self-consistent layout.
+    // (Re)builds the chunk-stable slot geometry and every level's full abstract graph from the
+    // current masks/components (the init build). It re-measures every level's edge windows from
+    // the current topology, so it never overflows. A failure leaves the graph unusable; rebuild's
+    // caller treats it as fatal.
     fn buildAbstractGraphs(self: *NavGraph, world: ?*const WorldSystem) !void {
         // The staging list is a build transient: freed on every exit.
         defer self.build_edge_scratch.clearAndFree(self.allocator);
-        try self.computePortalGeometry(world);
-        const chunk_count = self.chunkCount();
-        try setLen(&self.chunk_edge_overflow, self.allocator, chunk_count);
-        @memset(self.chunk_edge_overflow.items, false);
+        try self.beginAbstractBuild(world);
         for (0..self.levels.items.len) |level_index| {
             try self.buildLevelInit(@intCast(level_index), world);
             try self.placeLevelEdges(@intCast(level_index));
         }
+    }
+
+    // Full relabel: remasks, re-floods and rebuilds one level at a time, so an OOM at level L
+    // leaves levels before L rebuilt; level L on its new mask with portals rebuilt up to the
+    // failing chunk (later chunks tombstoned) and empty, packed adjacency; and later levels on
+    // their old, self-consistent mask and abstract layer. Every level's label sub-index matches
+    // its grid and no edge targets a tombstone. The dirty marks stay buffered, so the retry is
+    // the same relabel, from the world.
+    fn relabelAllLevels(
+        self: *NavGraph,
+        data: *const DataSystem,
+        world: *const WorldSystem,
+        edits: []const NavCellEdit,
+        cell_edits: []const types.ChangedSpan,
+        full_level_ids: []const u16,
+        affected_levels: []const bool,
+        remask_threads: ?NavStageThreads,
+    ) !void {
+        defer self.build_edge_scratch.clearAndFree(self.allocator);
+        try self.beginAbstractBuild(world);
+        for (self.levels.items, 0..) |*level_grid, level_index| {
+            const level: u16 = @intCast(level_index);
+            if (affected_levels[level_index]) {
+                self.remaskChangedChunks(level, data, world, edits, cell_edits, levelIsFull(full_level_ids, level_index), remask_threads);
+            }
+            level_grid.buildComponents();
+            try self.buildLevelInit(level, world);
+            try self.placeLevelEdges(level);
+        }
+    }
+
+    // Slot geometry and cleared overflow flags for a full build or relabel.
+    fn beginAbstractBuild(self: *NavGraph, world: ?*const WorldSystem) !void {
+        try self.computePortalGeometry(world);
+        try setLen(&self.chunk_edge_overflow, self.allocator, self.chunkCount());
+        @memset(self.chunk_edge_overflow.items, false);
     }
 
     // Incrementally folds a batch of static-obstacle edits into the existing graph
@@ -675,7 +710,8 @@ pub const NavGraph = struct {
     // runtime-growing data, never refused by the nav memory gate: only an OOM fails a step. A
     // failed step still patches every dirty chunk of the failing level (an overflowed chunk
     // keeps live portals with empty adjacency, so no edge targets a tombstone), and later
-    // affected levels keep their old, self-consistent mask and abstract layer until the retry.
+    // affected levels keep their old, self-consistent mask and abstract layer until the retry
+    // (a failed full relabel likewise: relabelAllLevels).
     // That is acceptable per coding-standards.md allocation exceptions: a cold, event-triggered
     // main-thread step (after the patch barrier) with NavGraph as the explicit owner, whose cost
     // cannot move to init because the topology is only known when the edit arrives, and sizing
@@ -764,12 +800,7 @@ pub const NavGraph = struct {
         // silently doing whole-world work.
         const full_relabel = affected_level_count > full_relabel_level_threshold;
         if (full_relabel) {
-            for (self.levels.items, 0..) |_, level_index| {
-                if (!affected_levels.items[level_index]) continue;
-                self.remaskChangedChunks(@intCast(level_index), data, world, edits, cell_edits, levelIsFull(full_level_ids, level_index), remask_threads);
-            }
-            for (self.levels.items) |*level_grid| level_grid.buildComponents();
-            try self.buildAbstractGraphs(world);
+            try self.relabelAllLevels(data, world, edits, cell_edits, full_level_ids, affected_levels.items, remask_threads);
             stats.full_relabel = 1;
         } else {
             for (self.levels.items, 0..) |_, level_index| {
@@ -1328,11 +1359,16 @@ pub const NavGraph = struct {
         @memset(lg.portal_edge_count.items, 0);
         @memset(lg.chunk_order_len.items, 0);
         @memset(lg.chunk_label_len.items, 0);
+        const chunk_count = self.chunkCount();
+        // Empty adjacency at each window base, so a failed build leaves every chunk packed.
+        for (0..chunk_count) |chunk_index| {
+            const starts = lg.portal_edge_start.items[self.chunk_portal_base.items[chunk_index]..][0..self.chunk_portal_cap.items[chunk_index]];
+            @memset(starts, lg.chunk_edge_base.items[chunk_index]);
+        }
         self.build_edge_scratch.clearRetainingCapacity();
         // The init build is serial (never threaded), so slot 0 is always the right — and
         // only — patch scratch to use here.
         const scratch = &self.patch_scratch.items[0];
-        const chunk_count = self.chunkCount();
         var chunk: u32 = 0;
         while (chunk < chunk_count) : (chunk += 1) {
             scratch.edges.clearRetainingCapacity();
@@ -1564,6 +1600,7 @@ pub const NavGraph = struct {
         const lg = &self.level_graphs.items[level];
         const pbase = self.chunk_portal_base.items[chunk];
         const pcap = self.chunk_portal_cap.items[chunk];
+        const edge_base = lg.chunk_edge_base.items[chunk];
         var slot = pbase;
         while (slot < pbase + pcap) : (slot += 1) {
             const cell = lg.portals.items[slot].cell_index;
@@ -1572,6 +1609,7 @@ pub const NavGraph = struct {
             // level's portals stay byte-identical to a full rebuild after a patch.
             lg.portals.items[slot] = .{ .level = level, .cell_index = no_cell, .chunk = 0 };
             lg.portal_edge_count.items[slot] = 0;
+            lg.portal_edge_start.items[slot] = edge_base;
         }
         lg.chunk_order_len.items[chunk] = 0;
         lg.chunk_label_len.items[chunk] = 0;
@@ -1789,6 +1827,9 @@ pub const NavGraph = struct {
         const pcap = self.chunk_portal_cap.items[chunk];
         const ebase = lg.chunk_edge_base.items[chunk];
         const ecap = lg.chunk_edge_cap.items[chunk];
+        // Per-slot write cursor (window-relative), this worker's own buffer. Sized before any
+        // count or start write, so a failure leaves the chunk as clearChunkSlots left it.
+        try setLen(&scratch.cursor, self.allocator, pcap);
         var slot = pbase;
         while (slot < pbase + pcap) : (slot += 1) lg.portal_edge_count.items[slot] = 0;
         for (scratch.edges.items) |entry| lg.portal_edge_count.items[entry.from] += 1;
@@ -1818,9 +1859,6 @@ pub const NavGraph = struct {
             }
             return true;
         }
-        // Per-slot write cursor (indexed window-relative) seeded at each slot's edge start. Uses
-        // this worker's own cursor buffer so parallel chunk patches never share writable state.
-        try setLen(&scratch.cursor, self.allocator, pcap);
         const cursor = scratch.cursor.items;
         var i: u32 = 0;
         while (i < pcap) : (i += 1) cursor[i] = lg.portal_edge_start.items[pbase + i];
@@ -1835,8 +1873,8 @@ pub const NavGraph = struct {
     // Sizes `level`'s windows from its measured per-chunk edge counts (windowCap), allocates its
     // arena exactly (reused when already that size), then drains build_edge_scratch into it,
     // grouped by source slot within each chunk's window. The arena is allocated before any
-    // layout write, so an OOM leaves this level on its old layout (buildLevelInit zeroed its
-    // counts: solve-safe).
+    // layout write, so an OOM leaves this level on its old windows with the empty, packed
+    // adjacency buildLevelInit left (solve-safe).
     fn placeLevelEdges(self: *NavGraph, level: u16) !void {
         const lg = &self.level_graphs.items[level];
         const chunk_count = self.chunkCount();
@@ -3018,6 +3056,36 @@ fn expectExactArena(lg: *const NavLevelGraph) !void {
     try std.testing.expectEqual(lg.total_edge_slots, base);
 }
 
+// Every chunk is packed: its slots' adjacency runs lie back to back from its window base,
+// within its cap (what packedChunkEdgeCount reads).
+fn expectPackedEdgeWindows(graph: *const NavGraph) !void {
+    for (graph.level_graphs.items) |*lg| {
+        for (graph.chunk_portal_base.items, graph.chunk_portal_cap.items, lg.chunk_edge_base.items, lg.chunk_edge_cap.items) |portal_base, portal_cap, edge_base, edge_cap| {
+            var run_end = edge_base;
+            const starts = lg.portal_edge_start.items[portal_base..][0..portal_cap];
+            const counts = lg.portal_edge_count.items[portal_base..][0..portal_cap];
+            for (starts, counts) |start, count| {
+                try std.testing.expectEqual(run_end, start);
+                run_end += count;
+            }
+            try std.testing.expect(run_end - edge_base <= edge_cap);
+        }
+    }
+}
+
+// Every live portal is found under its cell's current component: each level's label sub-index
+// matches its grid.
+fn expectLabelIndexMatchesGrid(graph: *const NavGraph) !void {
+    for (graph.level_graphs.items, graph.levels.items, 0..) |*lg, *level_grid, level_index| {
+        for (lg.portals.items, 0..) |portal, slot| {
+            if (portal.cell_index == no_cell) continue;
+            const component = level_grid.components.items[portal.cell_index];
+            const run = graph.levelComponentPortals(@intCast(level_index), component);
+            try std.testing.expect(std.mem.indexOfScalar(u32, run, @intCast(slot)) != null);
+        }
+    }
+}
+
 // The build capacity the edge-window tests share: 8-tile nav chunks, one patch-scratch slot per
 // participant of `threads`.
 fn windowGrowthCapacity(threads: *const ThreadSystem) types.PathfindingCapacity {
@@ -3399,6 +3467,70 @@ test "a level repack touches only its own level, and an OOM in it leaves the old
     defer rebuilt.deinit();
     try initWindowSystem(&rebuilt, &data, &walled.world, capacity);
     try expectGraphsEquivalent(graph, &rebuilt.graph);
+}
+
+test "a full relabel failing at any allocation stays packed and consistent, then retries to a full rebuild" {
+    // Both levels change in one step (2 levels > threshold 1: a full relabel). Whichever
+    // allocation fails, every chunk stays packed, no edge targets a tombstone, every level's
+    // label sub-index matches its grid, and the retry (dirty marks stay buffered) equals a full
+    // rebuild.
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    capacity.nav_full_relabel_level_threshold = 1;
+    var failures: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var walled = try initWalledTwoLevelWorld(&meta);
+        defer walled.world.deinit();
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try initWindowSystem(&system, &data, &walled.world, capacity);
+        const graph = &system.graph;
+
+        var edits = std.ArrayList(NavCellEdit).empty;
+        defer edits.deinit(std.testing.allocator);
+        try walled.setLattice(0, 6, 18, walled.grass, &edits);
+        try walled.setLattice(1, 0, 24, walled.grass, &edits);
+        const carved = try system.applyNavUpdates(&data, &walled.world, edits.items);
+        try std.testing.expectEqual(@as(usize, 1), carved.full_relabel);
+
+        // Swept step: widen level 0's lattice, fill the middle of level 1.
+        edits.clearRetainingCapacity();
+        try walled.setLattice(0, 0, 24, walled.grass, &edits);
+        try walled.setLattice(1, 6, 18, walled.tree, &edits);
+        for (edits.items) |edit| try system.markNavDirty(edit.level, edit.x, edit.y);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        graph.allocator = failing.allocator();
+        const result = system.applyBufferedNavUpdates(&data, &walled.world, null);
+        graph.allocator = std.testing.allocator;
+        const succeeded = if (result) |stats| blk: {
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 1), stats.full_relabel);
+            break :blk true;
+        } else |err| blk: {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try expectNoEdgeTargetsTombstone(graph);
+            try expectPackedEdgeWindows(graph);
+            try expectLabelIndexMatchesGrid(graph);
+            const retried = try system.applyBufferedNavUpdates(&data, &walled.world, null);
+            try std.testing.expectEqual(@as(usize, 1), retried.full_relabel);
+            break :blk false;
+        };
+        try expectPackedEdgeWindows(graph);
+        try expectLabelIndexMatchesGrid(graph);
+        var rebuilt = PathfindingSystem.init(std.testing.allocator);
+        defer rebuilt.deinit();
+        try initWindowSystem(&rebuilt, &data, &walled.world, capacity);
+        try expectGraphsEquivalent(graph, &rebuilt.graph);
+        if (succeeded) break;
+    }
+    // Failures landed in both levels' builds (staging growth and arena per level).
+    try std.testing.expect(failures >= 4);
 }
 
 test "repeated dig and fill cycles grow windows once, then stay allocation-free and equal a full rebuild" {
