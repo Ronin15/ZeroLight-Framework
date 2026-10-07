@@ -8,9 +8,14 @@ level links grow at the dig commit seam), and the edge-window overflow the
 manual run found is fixed (2026-10-06: in-place per-chunk window growth
 replaces the full-rebuild fallback; its review follow-ups add OOM, edge-order,
 A*-result, and cached-path proofs, in-place hole compaction, and a nav memory
-gate on growth). **Only the display-gated manual
-acceptance check remains open** (not run: no display in the implementing
-sessions). Every code, test, doc, and bench item below is checked.
+gate on growth), and the second review's follow-ups landed 2026-10-07 (M4–M7:
+a failed growth still patches the whole dirty set, re-admission charges live
+edge slots, the build checks its measured arena, and link-cursor stats survive
+a failed apply). The pre-fix manual run passed (owner, 2026-10-06; see
+Acceptance checks). **Open: one post-fix manual acceptance check on current
+code** (display-gated; not run in the implementing sessions). Every code,
+test, doc, and bench item below is checked. The slice stays in `slices/`
+until the owner confirms that check.
 No open prerequisite. This
 was a live gameplay defect (confirmed below), so it landed independently of
 49–64D and **before 46 and 65B**. 65B's lane rebuild runs the same chunk patch
@@ -569,6 +574,12 @@ multi-worker patch path and the serial one.
       battle demo): NPCs followed dug ramps out; perf dump showed 14 tile
       changes → 13 incremental rebuilds, `full_relabel=0`, `links_deferred=0`,
       `link_endpoints_unslotted=0`, both ramp refusal counters 0.
+- [ ] **Post-fix manual check on current code** (display; Debug or
+      ReleaseSafe build). The run above predates the in-place edge-window
+      growth and its M1–M7 follow-ups. Dig several ramps in one open chunk:
+      the perf dump shows `edge_windows_grown > 0` and `full_relabel=0`,
+      the log has no `edge window growth ... refused` error (no edge-growth
+      refusals), and NPCs route over the new ramps.
 - [x] **Edge-window overflow after runtime ramps (found in the 2026-10-06
       manual run).** Later in the same run the log printed
       `nav abstract-graph edge-cap fallback: per-chunk edge window overflow,
@@ -887,6 +898,20 @@ multi-worker patch path and the serial one.
         `links_deferred == 0`, clears the pending stats, and matches a full
         rebuild. Before the fix the retry reported 0. This also exercises
         M4's serial continue-after-refusal.
+    - [x] **Bench (M4–M7).** ReleaseFast, 3 interleaved runs of `3f54b79`
+          (before) and `cf1107f` (after) exported with `git archive`,
+          medians. All touched paths are cold (refusal, build check, gate)
+          except the serial patch loop's `catch` restructure; the solve
+          assert is stripped in ReleaseFast. Every case of
+          `nav-update-links`, `nav-update-links-dense`, and
+          `nav-update-scattered` is within max(3%, spread), with 0 breaches:
+          links 1 serial 25.62 → 26.08 us (spread 4.8%); links 8 serial
+          195.38 → 195.95 us; links-dense 8 serial 31.51 → 31.31 us;
+          scattered 16 serial 207.30 → 204.43 us; scattered 64 serial 820.43
+          → 818.79 us; scattered 128 serial 1.54 → 1.62 ms (spread 5.8%);
+          scattered 256 serial 3.12 → 3.14 ms. `pathfinding` 512 (4
+          interleaved runs, since the first single run was noisy): serial
+          3.42 → 3.49 ms (spread 12%), adaptive-tuned 485.8 → 488.7 us.
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.
