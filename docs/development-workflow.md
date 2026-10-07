@@ -54,9 +54,8 @@ the binary. The asset root must stay a **relative**, traversal-safe path
 
 ## Release Modes
 
-The default optimize mode is `Debug`, matching standard Zig build behavior. Use
-an explicit release mode only when preparing a release candidate or shipping
-build:
+The default optimize mode is `Debug`. Use an explicit release mode only for a
+release candidate or shipping build:
 
 ```sh
 zig build --release=safe
@@ -69,25 +68,24 @@ Release builds use the same pinned packages in `zig-pkg/` as Debug builds. They 
 not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
-**Packaged builds ship `ReleaseFast`.** That mode strips the debug assert
-backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
-bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
-discipline rules for the `FailingAllocator` proof-test coverage this requires
-before hot-path code can rely on it safely. On Linux (ELF) targets,
-`build.zig` enables full link-time optimization (`-flto=full`)
-for the shipped **app executable only** in `ReleaseFast` and explicitly sets the
-LLVM backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
-binaries do not get LTO and use Zig's default backend and linker selection.
-Mach-O targets (macOS) skip LTO in Zig 0.17 because LTO requires LLD and LLD
-cannot link Mach-O. Windows (COFF) targets also skip LTO: under Zig 0.17, LTO
-with libc fails at `lld-link` with undefined mingw libc/libm symbols, while the
-non-LTO ReleaseFast build links and emits its PDB. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
-local iteration and size-focused builds stay predictable. Before cutting a
-ReleaseFast release candidate, run an extended soak session in
-`--release=safe` (not just `zig build test`) across realistic-to-extreme
-entity counts and spawn/despawn churn. A clean multi-hour ReleaseSafe run is
-the actual release gate: ReleaseFast itself will not report a capacity or
-bounds violation if one exists, it will just corrupt memory silently.
+**Packaged builds ship `ReleaseFast`.** It strips the assert behind every
+`assumeCapacity`/`addOneAssumeCapacity` and disables bounds/overflow checks, so
+hot-path reserves need the `FailingAllocator` proofs in
+`docs/coding-standards.md` § Allocator Discipline.
+
+LTO: on Linux (ELF), `build.zig` enables `-flto=full` for the shipped **app
+executable only** in `ReleaseFast`, explicitly selecting LLVM + LLD (which LTO
+requires). `gpu-smoke`, benchmarks, and tests get no LTO and use Zig's default
+backend and linker. macOS skips LTO (LLD cannot link Mach-O in Zig 0.17);
+Windows skips it (under Zig 0.17, LTO with libc fails at `lld-link` on mingw
+libc/libm symbols, while non-LTO ReleaseFast links and emits its PDB). Debug,
+ReleaseSafe, and ReleaseSmall leave LTO off.
+
+**Release gate:** before cutting a ReleaseFast release candidate, run a
+multi-hour `--release=safe` soak (not just `zig build test`) across realistic
+to extreme entity counts and spawn/despawn churn. A clean ReleaseSafe run is the
+gate, because ReleaseFast corrupts memory silently instead of reporting a
+capacity or bounds violation.
 
 ## Build Options
 
@@ -296,113 +294,75 @@ as `test` blocks. Run them with `zig build test`. Test standards live in
 
 ## Benchmarks
 
-`zig build bench` pins its own default log level to `warn` regardless of
-optimize mode (Debug included), rather than inheriting the game's `auto`
-default — per-case debug logging (e.g. `ThreadSystem` re-init chatter) adds
-real overhead across many bench cases/items and isn't useful in a benchmark
-table. Pass `-Dlog-level=debug` to override this explicitly for
-troubleshooting.
+`zig build bench` pins its default log level to `warn` in every optimize mode
+(per-case debug chatter adds overhead across many cases); pass
+`-Dlog-level=debug` when troubleshooting.
 
-`zig build bench` runs non-interactive CPU benchmarks for movement bodies,
-transient particle rows, AI agents, steering agents, dense collision bodies,
-sparse collision bodies, collision-response contacts, scoped simulation gathers,
-incremental nav rebuilds, and renderer sprite CPU prep, plus pathfinding
-open-list, common-goal, cached-result, hard-fallback, and production-scale nav
-workloads. The default run exercises one serial baseline, fixed-worker, fixed
-small-range, fixed large-range, and adaptive cases so the full processor flow can
-be checked for regressions.
+It runs non-interactive CPU benchmarks for movement bodies, particles, AI and
+steering agents, dense and sparse collision bodies, collision-response
+contacts, scoped simulation gathers, incremental nav rebuilds, renderer sprite
+CPU prep, and pathfinding (open-list, common-goal, cached-result,
+hard-fallback, production-scale nav). Each case set has a serial baseline,
+fixed-worker, fixed small/large-range, and adaptive cases.
 `thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
-fixed range size, while `thread-adaptive-tuned-range` uses the same
-processor-owned adaptive worker and range tuner path as production systems. The
-fixed cases are controls for scheduler overhead, worker-count scaling, and
-range-size effects. Gameplay processor and render-prep benchmarks use a shared
-event-scale count ladder so each system shows a performance curve across small,
-medium, and high counts: quick runs 1,024, 4,096, and 10,000 items; standard
-adds 25,000 and 50,000; stress keeps the high-count 10,000, 25,000, and 50,000
-signal points.
-AI separation uses a transient spatial grid with bounded neighbor and candidate
-samples, then intent emission runs as its own stage.
-Collision output includes candidate-pair and contact counts so dense stress
-cases can be compared against sparse gameplay-shaped distributions. Detail rows
-also report narrowphase as `narrow=inline` or `narrow=worker_threads/items_per_range`
-because collision has independently tuned broadphase and narrowphase stages. AI
-detail rows similarly report intent-stage worker/range tuning, while AI output
-reports bounded separation checks and emitted navigation-intent counts.
-Steering output reports bounded avoidance candidate checks, accepted avoidance
-samples, and emitted movement-intent counts. Steering movement emission is a
-threaded processor stage with serial fallback, per-system adaptive tuning, and
-deterministic range-owned output.
-Render-prep output reports draw commands, valid sprites, skipped invalid
-resources, generated vertices, draw groups, worker usage, range size, and the
-render-owned adaptive tuner state. It is a CPU-only render-prep benchmark and
-does not open a window or submit SDL_GPU command buffers. Each measured
-iteration submits an already ordered sprite stream into the same `SpriteBatch`
-command storage, then snapshots, emits vertices, and builds draw groups.
-`render-game-prep` extends that coverage with production-shaped game render
-work: dynamic record collection and depth-bucket sparse/dynamic emit, sparse
-visible-tile submission through `WorldSystem`, realistic static+dynamic
-`mergeDrawList` group counts, and phase timings for entity_collect, merge,
-snapshot, and vertex_emit.
-Current production world rendering submits already ordered commands from
-explicit z-layer passes instead of a separate general ordering queue. The
-benchmark owns its phase timers around that shared path and reports ordered
-submission, snapshot, vertex-emission, and draw-group timings; the production
-renderer does not run those benchmark timers.
-For runtime performance judgment, read the adaptive rows as the production-style
-scheduling signal: they start from measured inline work and only use workers
-when the adaptive tuner finds a batch large enough and a threaded profile that
-wins. The fixed-thread rows are forced controls for scheduler/range behavior,
-not evidence that runtime rendering will force worker participation for cheap
-sprite/rect prep.
+fixed range size; `thread-adaptive-tuned-range` uses the production
+processor-owned worker and range tuner. Fixed cases are controls for scheduler
+overhead, worker scaling, and range size. Processor and render-prep benchmarks
+share a count ladder: quick runs 1,024, 4,096, and 10,000 items; standard adds
+25,000 and 50,000; stress keeps 10,000, 25,000, and 50,000.
 
-Benchmark output is grouped by workload and count. Each block prints an aligned
-plain-text table with per-case timing, speedup, throughput, worker-thread use,
-and status, then ends with a concise validation summary. The summary reports
-what the run proved, such as which path won, whether adaptive stayed inline or
-used worker threads, the adaptive tuner phase and selected profile, and whether
-the expected flows were measured or skipped. It is not an entity-count or
-batching recommendation.
+What rows report:
 
-The `worker_threads` column is `active/available` background workers. It does
-not include the main thread, which can also process ranges while waiting for the
-synchronous batch to complete. For example, `1/10` means one background worker
-was active out of ten available workers; if the main thread also processed
-ranges, the batch had two executing CPU participants. `0/10` means the adaptive
-path stayed inline through the ThreadSystem. That can still be slower than
-`serial-direct` in very small ReleaseFast movement workloads because
-`serial-direct` is the raw single-thread control path with no ThreadSystem
-submission overhead.
+- AI: bounded separation checks (transient spatial grid, bounded neighbor and
+  candidate samples), emitted navigation intents, and intent-stage worker/range
+  tuning.
+- Collision: candidate-pair and contact counts, and narrowphase as
+  `narrow=inline` or `narrow=worker_threads/items_per_range` (broadphase and
+  narrowphase tune independently).
+- Steering: avoidance candidate checks, accepted samples, emitted movement
+  intents (a threaded stage with serial fallback and range-owned output).
+- Render-prep (CPU only, no window or GPU submission): draw commands, valid
+  sprites, skipped invalid resources, vertices, draw groups, worker usage, range
+  size, tuner state. Each iteration submits an ordered sprite stream into one
+  `SpriteBatch`, then snapshots, emits vertices, and builds draw groups.
+  `render-game-prep` adds production-shaped work: dynamic record collection,
+  depth-bucket emit, sparse visible-tile submission through `WorldSystem`,
+  realistic `mergeDrawList` group counts, and phase timings (entity_collect,
+  merge, snapshot, vertex_emit). The benchmark owns those phase timers; the
+  production renderer does not run them.
+- Pathfinding hard-fallback: true fallback requests, requests deferred by the
+  per-step budget, pending work, results, and cache evictions.
+  `pathfinding-hard-fallback` measures raw A* throughput;
+  `pathfinding-hard-fallback-budget` caps solves at the runtime frame budget, so
+  solved count and `deferred` backlog are expected signals.
 
-For regression checking, adaptive benchmark cases first run the explicit
-`--warmup` iterations, then run a bounded adaptive settle phase before the
-timed measurement loop. This keeps the adaptive rows focused on the selected
-steady-state profile instead of averaging the tuner search cost into the mean.
-If the tuner still fails to settle within that budget, the detail table reports
-the probing phase and selected candidate so the run is treated as an adaptive
-coverage failure, not a clean steady-state timing.
-Use `--details` when you need scheduler ranges, wait time, items-per-range,
-tuning phase, and workload counters. In adaptive cases, processors may stay
-inline until measured completion time shows that active worker threads are worth
-the synchronization cost; fixed worker/range cases are benchmark controls only,
-not production scheduling policy. Inline batches are timing samples for that
-batch only and do not reset adaptive work-tuner state for later processors.
-For multi-stage systems, read each stage independently: an adaptive row can have
-a threaded primary batch while a secondary batch still reports `inline`, or both
-stages can settle on separate threaded profiles. This is expected when the
-stages have different work shapes. Pathfinding follows this same rule: request
-preparation/grid marking can use SIMD lane batches, while the branch-heavy A*
-solve stage owns its own pathfinding tuner and benchmark row instead of sharing
-another system's profile. Hard-fallback pathfinding rows expose true fallback
-requests, fallback requests deferred by the per-step budget, total pending work,
-results, and cache evictions so rare A* cost stays visible instead of being
-hidden by cache-shaped or field-reuse workloads. Use
-`pathfinding-hard-fallback` for raw true-A* throughput and
-`pathfinding-hard-fallback-budget` for budget-pressure regression tracking; the
-budgeted group uses the same hard fixture but caps fallback solves at the runtime
-frame budget so solved fallback count and total `deferred` backlog are expected
-signals under larger request counts. `--items N` overrides the registered profile counts for
-the selected group, and `--fallback-budget N` lets ReleaseFast tuning compare
-candidate hard-fallback caps against the runtime default.
+Reading results:
+
+- Output is grouped by workload and count: an aligned table (timing, speedup,
+  throughput, worker use, status) and a validation summary of what the run
+  proved (winning path, whether adaptive stayed inline, tuner phase and
+  profile, measured or skipped flows). It is not an entity-count or batching
+  recommendation.
+- Adaptive rows are the production scheduling signal: they start inline and use
+  workers only when the tuner finds a batch large enough and a threaded profile
+  that wins. Fixed-thread rows are forced controls, not evidence that runtime
+  will use workers for cheap prep.
+- `worker_threads` is `active/available` background workers, excluding the main
+  thread (which also processes ranges). `0/10` means adaptive stayed inline; it
+  can still trail `serial-direct` in tiny ReleaseFast movement workloads because
+  `serial-direct` has no ThreadSystem submission overhead.
+- Adaptive cases run `--warmup` iterations, then a bounded settle phase before
+  timing, so the mean excludes tuner search. A tuner that fails to settle shows
+  its probing phase and candidate: an adaptive coverage failure, not a clean
+  timing. Inline batches do not reset tuner state for later processors.
+- Multi-stage systems are read per stage: a primary batch may thread while a
+  secondary stays `inline`. Pathfinding's request preparation can use SIMD lane
+  batches while the A* solve stage owns its own tuner and row.
+- `--details` adds scheduler ranges, wait time, items-per-range, tuning phase,
+  and workload counters. `--items N` overrides the profile counts for the
+  selected group; `--fallback-budget N` compares hard-fallback caps against the
+  runtime default in ReleaseFast tuning.
+
 Use other optional arguments only to narrow or scale the run:
 
 ```sh

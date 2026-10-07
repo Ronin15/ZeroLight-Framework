@@ -4974,7 +4974,7 @@ test "a grow that runs out of memory mid-resize keeps logical limits within ever
 }
 
 test "group-field threshold is independent of world size" {
-    // CLAUDE.md fixed-budget rule: the default threshold is the fixed 1024 on a 1024-cell
+    // coding-standards.md § Budgets, Capacities, And Thresholds: the default threshold is the fixed 1024 on a 1024-cell
     // grid AND on a 262,144-cell grid (the retired derivation gave 64 and 1024 here).
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

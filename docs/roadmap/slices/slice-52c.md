@@ -144,8 +144,8 @@ Goal:
     - `frame-battle --iterations 36000`: 10 minutes of 60 Hz simulation per
       case, the deterministic battle soak.
     - The full suite with `--profile stress`. This is the one sanctioned
-      full-suite run: coding-standards § Benchmarks reserves full runs for deliberate
-      OOM/capacity sweeps, and this is that sweep.
+      full-suite run: coding-standards § Benchmarks allows a full-suite sweep only
+      when a slice names it, and this slice names this one.
     - A serial-versus-threaded digest check: one `frame-battle` run with
       `--case thread-adaptive-tuned-range`. The suite adds the `serial-direct`
       baseline row automatically when a non-baseline case is filtered

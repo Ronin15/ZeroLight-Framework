@@ -1257,7 +1257,7 @@ Out of scope (each item has a named owner):
     - Structural Commands and Post-Commit Reactions add the sync step;
     - the Slice 45 consumer paragraph describes the inverted resolve.
   - `docs/rendering-assets-shaders.md`: `drawSprite` growth and its counter (landed with A2); GPU growth without an idle (after H4).
-  - `docs/coding-standards.md` Allocator discipline gets the rule: "behavior gates compare stored logical limits, never `.capacity`" (coding-standards rule landed with A3).
+  - `docs/coding-standards.md` § Allocator Discipline gets the rule: "behavior gates compare stored logical limits, never `.capacity`" (coding-standards rule landed with A3).
   - Add the Slice 72 row to the roadmap index's Open Frontier table, plus a Suggested Order entry ("72 — any time; Batch A first").
 
 ### Acceptance checks

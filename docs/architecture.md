@@ -161,7 +161,7 @@ pacing, and clears that policy after a later frame is submitted. Occluded or
 unfocused visible windows keep rendering but apply a 60Hz cap to avoid
 background render runaway.
 Frame pacing policy stays explicit and situational (frame-cap rule:
-`docs/coding-standards.md` § Performance).
+`docs/coding-standards.md` § Timing And Frame Pacing).
 
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
@@ -929,5 +929,4 @@ or NEON on ARM targets, when the target and optimization mode make that
 profitable. Platform intrinsics such as x86 or ARM-specific calls stay hidden
 from gameplay.
 
-When to use them is `docs/coding-standards.md` § Performance (SIMD and core
-math).
+When to use them is `docs/coding-standards.md` § SIMD And Core Math.

@@ -1,120 +1,93 @@
 # Framework Implementation Slices
 
-This roadmap is the agent implementation contract for the project frontier.
-Work is organized as **numbered slices**: each slice is one complete,
-verifiable feature chunk with a **Goal**, **Checklist**, and **Acceptance
-checks**. Agents implement by opening a slice file, checking items off only
-when integrated, and running `zig build verify` before marking the slice
-complete. Technical rules (style, performance, budgets and capacities,
-threading, stage ordering, tests, benchmarks) live in
+The roadmap index and agent implementation contract. Work is organized as
+numbered **slices**: one complete, verifiable feature each, with a **Goal**,
+**Checklist**, and **Acceptance checks**. Technical rules live in
 [coding-standards.md](coding-standards.md); this file holds roadmap process
 only.
 
-**Layout.** This file is the index only: rules, workflow, the open slice
-table, priorities, and the Suggested Order. Each open slice or sub-slice is
-one file under [`roadmap/slices/`](roadmap/slices/); settled slices are one
-file each under [`roadmap/archive/`](roadmap/archive/) (index:
+**Layout.** Each open slice or sub-slice is one file under
+[`roadmap/slices/`](roadmap/slices/); settled slices are one file each under
+[`roadmap/archive/`](roadmap/archive/) (index:
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md)).
-Shared context lives in [`roadmap/tracks/`](roadmap/tracks/) —
-[VoidLight port](roadmap/tracks/voidlight-port.md) (shared contracts and the
-authoritative cross-slice tables T1–T6), [Emergent AI](roadmap/tracks/emergent-ai.md),
-[Long-term gameplay direction](roadmap/tracks/gameplay-direction.md) — and
-measured pressure points live in [Scaling Gaps](roadmap/scaling-gaps.md).
+Tracks in [`roadmap/tracks/`](roadmap/tracks/):
+[VoidLight port](roadmap/tracks/voidlight-port.md) (shared contracts,
+authoritative Tables T1–T6), [Emergent AI](roadmap/tracks/emergent-ai.md),
+[Long-term gameplay direction](roadmap/tracks/gameplay-direction.md). Measured
+pressure points: [Scaling Gaps](roadmap/scaling-gaps.md).
 
-**Reading rule.** To implement a slice, read this index, the one slice file,
-and only the track/contract files that slice links. Do not load the whole
-roadmap. Each slice file starts with a header line naming its dependencies and
-track.
-
-Landed slices that still need manual/`gpu-smoke` confirmation (33, 43) stay
-open until that residual is closed.
+**Reading rule.** To implement a slice, read this index, the one slice file
+(its header line names dependencies and track), and only the track/contract
+files it links. Do not load the whole roadmap.
 
 ## Ground Rules
 
-- Preserve runnable defaults: `zig build`, `zig build run`, and installed assets
-  should keep working after every slice.
-- **A slice is not complete until every Checklist and Acceptance check in its
-  slice file is `[x]`** and runtime behavior, owning-module docs, and tests are
-  integrated. Partial wiring stays `[ ]` with explicit remaining notes in the
-  slice file — never implied complete elsewhere.
-- **One file per slice or sub-slice** under `docs/roadmap/slices/`
-  (`slice-<id>.md`, lowercase id; umbrellas such as `slice-64.md` summarize
-  their sub-slices). Every open slice file has exactly one row in the Open
-  Frontier Slice Index below, and every row links to its file.
-- **Completed slices move to the archive.** When every item is `[x]`, `git mv`
-  the file to `docs/roadmap/archive/`, move its index row from this file to
-  the [archive index](framework-implementation-slices-archive.md) table, and
-  update the Suggested Order annotation. Do not delete acceptance history.
-- **No backlog dumping.** Design and review work never parks discovered
-  follow-ups as bare Scaling Gaps/backlog lines. Each one becomes a Checklist
-  item in its owning slice or a decision-complete new slice (Status may be
-  "gated on <trigger>"). Scaling Gaps holds only measured pressure points
-  awaiting a benchmark. "Out of scope" text must name the slice that owns the
-  work. Agent briefs never ask agents to "propose Scaling Gaps lines".
-  Exception: items the owner explicitly defers go in
-  [**Deferred By Owner**](#deferred-by-owner) with their trigger; agents
-  never add entries there on their own.
-- If a dependent system does not exist yet, label the work as foundation or
-  preparation and leave the slice checklist incomplete. Scaffolding counts only
-  when it lands the final owner modules, storage defaults, validation, and
-  tests that preserve current behavior; say what is scaffolded and where future
-  behavior hooks in, and never document deferred runtime behavior as complete.
-- Avoid half-wired states; either finish the slice end to end or keep every open
-  item visible in that slice's Checklist or Acceptance checks.
-- Read [architecture.md](architecture.md) and the owning live modules before
-  editing; code wins over stale slice prose when they disagree. Module
-  placement follows architecture.md's Source Layout.
-- Every slice follows [coding-standards.md](coding-standards.md), in
-  particular § Budgets, Capacities, And Thresholds, § Threading, and
-  § Simulation Pipeline Stage Ordering. The planned merged stage order is
-  Table T4.
+- Keep runnable defaults: `zig build`, `zig build run`, and installed assets
+  work after every slice.
+- **A slice is complete only when every Checklist and Acceptance item in its
+  file is `[x]`** and runtime behavior, diagnostics, owning-module docs, and
+  tests are integrated. Partial wiring stays `[ ]` with remaining notes in the
+  slice file. Landed slices awaiting manual/`gpu-smoke` confirmation (33, 43)
+  stay open until that residual closes.
+- **One file per slice or sub-slice** (`slices/slice-<id>.md`, lowercase id;
+  umbrellas such as `slice-64.md` summarize their sub-slices), each with exactly
+  one row in the Open Frontier Slice Index that links to it.
+- **Completed slices move to the archive:** `git mv` the file to
+  `roadmap/archive/`, move its row to the
+  [archive index](framework-implementation-slices-archive.md), and update the
+  Suggested Order annotation. Never delete acceptance history.
+- **No backlog dumping.** Design and review never park follow-ups as bare
+  Scaling Gaps/backlog lines: each becomes a Checklist item in its owning slice
+  or a decision-complete new slice (Status may be "gated on <trigger>").
+  Scaling Gaps holds only measured pressure points awaiting a benchmark. "Out
+  of scope" names the owning slice. Agent briefs never ask for Scaling Gaps
+  lines. Only the owner adds [**Deferred By Owner**](#deferred-by-owner)
+  entries.
+- When a dependency does not exist yet, label the work foundation/preparation
+  and leave the checklist open. Scaffolding counts only when it lands the final
+  owner modules, storage defaults, validation, and tests that preserve current
+  behavior; say what is scaffolded and where future behavior hooks in, and
+  never document deferred behavior as complete. No half-wired states: finish
+  end to end or keep every open item visible in the slice file.
+- Read [architecture.md](architecture.md) and the live owning modules first;
+  code wins over stale slice prose. Module placement follows architecture.md
+  § Source Layout.
+- Every slice follows [coding-standards.md](coding-standards.md), in particular
+  § Budgets, Capacities, And Thresholds, § Threading, and § Simulation Pipeline
+  Stage Ordering. The planned merged stage order is Table T4.
 - Do not promote threaded stage overlap, nav-remask cost changes, render-collect
-  scan changes, or persistence beyond Slice 46's written stable-ID boundary
-  into a checklist until those behaviors are confirmed in the live modules.
-  Slice 46 remains the save/load slice as its file specifies. Slice 54
-  settings are app preferences, never save data. A later slice that adds
+  scan changes, or persistence beyond Slice 46's stable-ID boundary into a
+  checklist until confirmed in the live modules. Slice 46 is the save/load
+  slice; Slice 54 settings are app preferences, never save data. A slice adding
   persistent `DataSystem`/`WorldSystem` state classifies it in Slice 49's
   checksum completeness lists (and 64B's classification) and adds its Slice 46
-  save section in the same change; that stays inside Slice 46's stable-ID
-  boundary.
+  save section in the same change.
 - Version numbers (replay format and flag bits, settings schema, save format,
-  checksum tag), `stage_order` positions, and component tags follow the
-  authoritative Tables T1–T6 in the
-  [VoidLight port track](roadmap/tracks/voidlight-port.md). Every bump is
-  relative (live value + 1); a slice that changes one updates the table in
-  the same change.
-- Validate per [development-workflow.md](development-workflow.md)
-  § Validation Cadence; `zig build verify` passes before a slice is complete.
+  checksum tag), `stage_order` positions, and component tags follow Tables
+  T1–T6 in the [VoidLight port track](roadmap/tracks/voidlight-port.md). Every
+  bump is relative (live value + 1); a slice that changes one updates the table
+  in the same change.
+- Validate per [development-workflow.md](development-workflow.md) § Validation
+  Cadence; `zig build verify` passes before a slice is complete.
 
 ## Agent Workflow: Implementing A Slice
 
-1. **Pick a slice** from the **Open Frontier Slice Index** (below) or the
-   **Suggested Order** when dependencies matter. Confirm the prerequisites
-   named in the slice file's header line are settled (archive files and/or
-   live Status) before starting.
-2. **Open the slice file** (`docs/roadmap/slices/slice-<id>.md`), or the
-   archive file if you need a landed prerequisite's acceptance record. Read
-   **Goal**, **Current foundation**, and **Architecture notes**; cross-read
-   [architecture.md](architecture.md), the track file in the header line, and
-   any doc linked in the slice. Do not read other slice files unless the slice
-   links them.
-3. **Implement only that slice's scope** in the owning `src/` modules. Do not
-   expand into unrelated refactors.
-4. **Check off items** in the slice file's **Checklist** as each integration
-   lands (runtime behavior + tests for that item). Items marked "(added by
-   Slice N)" came from another slice's design and are part of this slice's
-   scope.
-5. **Satisfy Acceptance checks** — each must pass before the slice is done.
-6. **Update durable docs** the slice touches (`architecture.md`, rendering/sim
-   docs) when contracts change, and the T1–T6 tables when a number moves.
-7. **Set slice Status** and run `zig build verify`.
-8. **When complete,** move the file to `docs/roadmap/archive/` and its row to
-   the archive index (Ground Rules). Follow-ups go into a slice Checklist or a
-   new slice file, never into Scaling Gaps.
+1. **Pick a slice** from the Open Frontier Slice Index or the Suggested Order;
+   confirm the prerequisites in its header line are settled.
+2. **Open the slice file** (or a landed prerequisite's archive file). Read
+   **Goal**, **Current foundation**, and **Architecture notes**, plus
+   architecture.md, the header's track file, and any doc the slice links; no
+   other slice files unless linked.
+3. **Implement only that slice's scope** in the owning `src/` modules.
+4. **Check off Checklist items** as each lands with its tests. Items marked
+   "(added by Slice N)" are part of this slice's scope.
+5. **Pass every Acceptance check.**
+6. **Update durable docs** (`architecture.md`, rendering/sim docs) when
+   contracts change, and Tables T1–T6 when a number moves.
+7. **Set Status**, run `zig build verify`, and when complete archive the file
+   (Ground Rules). Follow-ups go into a slice Checklist or a new slice file.
 
 ### Standard slice file shape
-
-Every slice file contains (some fields optional for early foundation slices):
 
 | Block | Agent use |
 | --- | --- |
@@ -126,11 +99,12 @@ Every slice file contains (some fields optional for early foundation slices):
 | **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
 | **Status** | Open/partial note, or one-line completion record before the archive move |
 
+Some fields are optional for early foundation slices.
+
 ## Open Frontier Slice Index
 
-Use this index to choose the next slice; **implement from that slice's file**
-(checklists live there, not here). Settled acceptance history is in the
-[archive](framework-implementation-slices-archive.md).
+Choose the next slice here; **implement from its file**. Settled history is in
+the [archive](framework-implementation-slices-archive.md).
 
 | Slice | Status | Open work (see the slice file for the full Checklist) |
 | --- | --- | --- |
@@ -207,8 +181,7 @@ Use this index to choose the next slice; **implement from that slice's file**
 
 **Recently settled (archive only):** 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice notes:** optional render micro-opts (e.g. an O(n) linear
-`mergeDrawList`) are measure-first notes in [Scaling Gaps](roadmap/scaling-gaps.md),
-not a live slice body. (The 23A `expand2`→`world` merge is settled.)
+`mergeDrawList`) are measure-first notes in [Scaling Gaps](roadmap/scaling-gaps.md).
 
 **Bench policy:** coding-standards § Benchmarks (50k scales are ceilings).
 `frame-battle` (Slice 52C: 2048-mover production demo, full fixed step plus CPU
@@ -217,25 +190,22 @@ self-hosted perf runner.
 
 ## Next Priority Tracks
 
-Sequencing hints only — **does not replace slice Checklists**. When in doubt,
-follow **Suggested Order** and the open items in the target slice file.
+Sequencing hints only; slice Checklists and the Suggested Order govern.
+Locomotion emergence is closed (archive 26–32, 39, 41, 47, 48; 33 visual
+residual only); open work grows beside that loop.
 
-**Locomotion emergence is closed** (archive 26–32, 39, 41, 47, 48; frontier residual 33
-visual only). Multi-source investigate (stimuli + world markers + memory) and
-table-driven affect→behavior are in place. Open work grows *beside* that loop.
-
-| Track | Slices | Notes |
+| Track | Slices | Focus |
 | --- | --- | --- |
-| **Primary — action/interaction** | archive **40** + **45** → **56** | Action-intent substrate + first domain controller (destructibles) landed. Combat (56) is the second action-intent consumer: `ai_action_select` is the single AI emitter, and `action_claims` enforces one consumer per intent in the fixed order trade → harvest → destructible, with `combat_resolve` taking unclaimed `.attack` intents. Slice 68A owns the bus fairness policy. |
-| **Pipeline composer** | archive **48** | Thin-composer restoration landed. `world_gate` SIMD + threading is a Slice 35 Checklist item, gated on its `world-gate` bench trigger. |
-| **Feelings growth** | **42** (after 56, 61; caution needs 59) | The first new drive (`need`) lands in Slice 61; Slice 56's damage watermark supplies the signal for an optional `pain` drive; night/storm caution is a per-entity fear gain on Slice 59's environment. 42 keeps gains-as-data, coupling, and optional mood — no dead enum tags. |
-| **World / render verticality** | archive **37** → **38** | Fixed submit cap, shader/host sync, and fixed byte budget landed; next is elevation semantics inside the existing submit cap, which also derives `level_sky_exposed` from elevation. Independent of AI. |
-| **Perf** | **72** (any time; Batch A first) + **55** + **35** + **70A** → **68A** → **71B** + Scaling Gaps | 72 removes every live dependence of behavior on physical capacity or allocation history (commit-seam population growth, one exhaustive event bound, logical gates, exact world-extent and nav reserves, preserving pathfinding resizes) and measures memory with `footprint-*` benches; its Batch F lands after 64E's nav dirty-buffer item, and it lands only cross-edits for the capacity items owned by 53B, 60, 61, 62, 64B, 64E, 65B, and 71B. 55 (after 49's `simViewRegion`) cuts how many rows reach AI decide and steering (idle coasting, scope-owned, sensing untouched); 35 cuts per-row SIMD math when the battle soak says math dominates. 70A is a render upload-bandwidth win (192 → 80 B/sprite; its `render-prep` bench must show `vertex_emit_ns` below baseline). 68A (after 55's soak) removes the remaining O(halo) main-thread AI/perception walks, makes the fixed bus fair, and owns the re-baseline procedure. 71B moves static colliders out of the collision sort and prewarms authored goals; 71B.1 also fixes the multi-level steering avoidance defect and the world-scaled group-field threshold. None reshapes arbitration contracts. |
-| **Determinism & threading** | **64E** → **49** → **50** → **52A–52D** → **64A** → **55** → **51** → **65A** → **64B** → … → **64C** → **65B** (65C after 58; 64D consumer-gated) | **64E** first, as soon as possible: runtime ramps are inert for NPC pathing today. Seeded sessions and a checksum/replay oracle come next; 49 also fixes the render-window→sim-scope coupling, types steps as `StepIndex = u64`, and publishes the `SeedDomain` registry and `simViewRegion` that 55–63 consume. 64 extends 49's same-binary guarantee to every supported target from one source + toolchain: pause is simulation-invisible (64A), float min/max/keys/FP env are pinned (64A, including the lane thread), the checksum is NaN-canonical and covers pipeline history (64B), and `zig build replay` proves cross-machine identity (64C). 46 lands after 64B because it saves exactly 64B's hashed set and writes 64B's `buildFingerprint()`; a save never changes the continuing session (64B B5). 65A settles lane priority (per-OS helper; every fallback ladder ends in a recorded outcome) and keeps the pool at `cpu_count − 1`; 65B makes large nav patches and full relabels the first step-keyed simulation consumer of the lane (front frozen, swap at `submit + 30`); 65C streams load-time worldgen through the lane with a fixed per-step commit budget. |
-| **Release & platform** | **52A** → **52B** → **52C** → **66A**; **52D** after 52A; **66B–66E** gated | Pinned CPU (`x86_64_v2` / `apple_m1`), toolchain, SDL, and shader baseline; per-OS packaging; CI + reproducible `frame-battle` release perf baseline; SIMD layer codegen for the `x86_64_v2` baseline (52D). 52A/52B are independent of the AI/render/input tracks; 52C needs Slice 49's checksum. Land 52A before games fork from the framework. 66A is the ungated release follow-up: it lands after Slice 54 (pref dir) and before any build leaves the team, because crash reports and symbols cannot be added retroactively to a shipped build. 66B–66E are fully specified but wait for their storefront, platform, or release-candidate triggers. |
-| **Shipping UI / settings / input / persistence** | **53A** → **53B** → **54** → **44** → **46** → **67A** / **67B** → (60) → **67C** → **67E** (full localization: [Deferred By Owner](#deferred-by-owner)) | Ports VoidLight's shipping UI, settings, rebinding, and save features onto ZL contracts: tint-not-rerender GPU text, retained enum-indexed screens, Action-driven focus, Engine-owned versioned settings, stable-ID binary saves. Bindings (44) persist in Slice 54 settings, never in saves; saves (46) are binary, stable-ID, same-build checksum parity, on the Slice 51 lane. 67 finishes the track: mouse, pad repeat, physical-key bindings, one text pipeline (labels only), event log, UI SFX, save thumbnails and names, and localization roots (string IDs and the English table). No 67 work touches simulation state, replay, or the checksum. |
-| **Gameplay domains** | **56** → **56B** → **57** → **57B** → **61** → **58** → **63** → **62** → **71A** → **71C** / **71D** → **69A**; **68B** → **68C** | Combat, ranged combat, items + UI, harvesting, worldgen, social/trade, and population ported onto `DataSystem` + `SimulationPipeline`. Every roll and placement keys off `seed.derive(.<domain>)` (worldgen off `WorldBuildConfig.seed`). Reuse `action_intents`, `ai_action_select`, `ActionClaimSet`, 57's transfer substrate, 61's `AffectImpulse` queue, and 57B's `PendingPlayerActions`; never add a second bus, emitter, claim set, impulse queue, or inventory-delta path. Population (62) is scoped by Slice 49's sim view, places anchors through 58's spec, and takes merchants from 63. 71A adds posts (patrol / follow / guard, help call), 71C cover-aware flee and ranged pursue, and 71D AI selling (closes forage → sell); worldgen breadth (69A) follows 62. 68B adds the knockback column + retaliation memory and 68C the carried death drop + ammo through the 57 transfer substrate. |
-| **World presentation** | **60** → **59** → **69B** / **69C** → **70B** (69D–69F gated) | Camera rig + scene composite first; the rig's zoom-1 `anchorRect()` feeds Slice 49's `sim_view`. Environment sim (clock, weather, modifiers) can land beside it; its tint/haze/flash and weather visuals consume 60's `SceneGrade`. Weather becomes regional through 58's `chunk_biomes` with no new persistent state; rest (69C) moves only the calendar clock, inside its single writer. 70B closes 60's deferred presentation items (runtime scene resolution, pad zoom, fade-out, sharp-bilinear, zoom tween) and also needs 54 and 44. |
+| **Primary: action/interaction** | archive 40 + 45 → **56** | Combat is the second action-intent consumer on the one `ai_action_select` emitter and `action_claims` order (trade → harvest → destructible); 68A owns bus fairness. |
+| **Pipeline composer** | archive 48 | Landed; `world_gate` SIMD + threading is a gated Slice 35 item. |
+| **Feelings growth** | **42** (after 56, 61; caution needs 59) | Gains as data, coupling, optional mood; `need` lands in 61, `pain` reads 56's watermark. |
+| **World / render verticality** | archive 37 → **38** | Elevation inside the existing submit cap, deriving `level_sky_exposed`. |
+| **Perf** | **72** (Batch A first), **55**, **35**, **70A** → **68A** → **71B** | 72 removes behavior's dependence on physical capacity; 55 and 35 cut AI/steering rows and math; 70A cuts sprite bandwidth; 68A removes O(halo) walks; 71B adds static fast paths. |
+| **Determinism & threading** | **64E** → **49** → **50** → **52A–52D** → **64A** → **55** → **51** → **65A** → **64B** → … → **64C** → **65B** (65C after 58; 64D gated) | 64E first (runtime ramps are inert for NPC pathing); then seeded sessions, checksum/replay, cross-machine determinism, and lane consumers. |
+| **Release & platform** | **52A** → **52B** → **52C** → **66A**; **52D** after 52A; **66B–66E** gated | Pinned baseline, packaging, CI, crash triage; land 52A before games fork, 66A before any build leaves the team. |
+| **Shipping UI / settings / input / persistence** | **53A** → **53B** → **54** → **44** → **46** → **67A** / **67B** → (60) → **67C** → **67E** | VoidLight's UI, settings, rebinding, and saves on ZL contracts; bindings live in settings, never saves; no 67 work touches simulation, replay, or the checksum. |
+| **Gameplay domains** | **56** → **56B** → **57** → **57B** → **61** → **58** → **63** → **62** → **71A** → **71C** / **71D** → **69A**; **68B** → **68C** | Every roll keys off `seed.derive(.<domain>)`; reuse the one action bus, claim set, transfer substrate, impulse queue, and `PendingPlayerActions`, never a second. |
+| **World presentation** | **60** → **59** → **69B** / **69C** → **70B** (69D–69F gated) | Camera rig + scene composite first (its `anchorRect()` feeds 49's `sim_view`), then environment, regional weather, rest, and presentation polish. |
 
 - **Slice 32 contract (standing rule):** `scoreBehaviors` / `selectSticky` /
   `resolveGoal` stay the expandable path. Emotion → behavior is **table-driven
@@ -243,9 +213,8 @@ table-driven affect→behavior are in place. Open work grows *beside* that loop.
   per-agent and multi-source (not broadcast player-only). Utility + sticky
   select over exclusive FSMs. No test-only production API tags.
 - **Component headroom:** 14 of 32 `Component` tags used (`enum(u5)` +
-  `ComponentMask = u32`). Slice 45 added `destructible`. Slice 41 used
-  `WorldSystem` interest markers, not a new tag. The VoidLight port track
-  projects 10 more and Slice 71A one (`ai_post`): **25 of 32** (Table T5).
+  `ComponentMask = u32`); the VoidLight port projects 10 more and Slice 71A one
+  (`ai_post`): **25 of 32** (Table T5).
 - **Interest kinds:** all reserved kinds are wired once 71C lands
   (investigate 41, resource 61, patrol 71A, cover 71C).
 - Guard CPU paths with existing benches. Architecture constraints (SDL_GPU
@@ -255,10 +224,9 @@ table-driven affect→behavior are in place. Open work grows *beside* that loop.
 
 ## Deferred By Owner
 
-Product work the owner explicitly deferred. These are not slices and carry no
-design: when an entry's trigger trips, design a decision-complete slice for it
-and remove the entry. Only the owner adds entries here (Ground Rules, "No
-backlog dumping").
+Product work the owner explicitly deferred: not slices, no design. When an
+entry's trigger trips, design a decision-complete slice and remove the entry.
+Only the owner adds entries (Ground Rules).
 
 - **Full localization.** Per-locale string tables with validation, a locale
   setting (the next settings version at landing), OS-preference default and
@@ -272,24 +240,8 @@ backlog dumping").
 
 ## Suggested Order
 
-### Historical order (settled foundation)
-
-The original dependency order, kept for history (all landed and archived
-unless noted): 0 runtime diagnostics → 1 input routing → 2 logical resolution
-→ 3 render resources → 4 asset cache → 5 text/fonts → 6 renderer composition →
-7 thread system + parallel render prep → 8 shader/platform expansion → 9 SIMD
-helpers → 10 `DataSystem` → 11 SIMD processors → 12 simulation contracts → 13
-spatial queries/contacts → 14 first AI intent processor → 15 audio → 16
-menus → 17 runtime asset catalog → 18 frame-delayed pathfinding → 19 steering
-→ 20 nav hardening → 21 typed events → 22 pipeline + tier/scope scaffolding →
-23 / 23A / 23B world rendering → 24 / 24B scoped tiers + render collect → 25 /
-25E Z-aware navigation + per-entity levels → 26 factions → 27 RNG → 28 spatial
-index → 34 core SIMD expansion → 29 perception → 30 memory → 31 affect → 32
-arbitration → 33 archetypes + debug (visual residual open) → 39 stimuli → 41
-interest markers → 40 action intents → 45 destructibles → 36 single-pass
-compositing → 37 dense-window cap → 43 gamepad (HW residual open) → 47
-un-staggered sensing → 48 thin composer. Open slices from that list (33, 35,
-38, 43) are placed in the merged order below.
+The settled foundation order is in the
+[archive index](framework-implementation-slices-archive.md#historical-order).
 
 ### Open slices — merged order
 
@@ -451,11 +403,10 @@ VoidLight port order are 64C → 57B (replay numbering), 64B → 46
 
 ## Roadmap Files
 
-- Open slices: [`roadmap/slices/`](roadmap/slices/) (one file per slice or
-  sub-slice; header line names dependencies and track).
-- Settled slices: [`roadmap/archive/`](roadmap/archive/) — index:
+- Open slices: [`roadmap/slices/`](roadmap/slices/).
+- Settled slices: [`roadmap/archive/`](roadmap/archive/), index
   [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
-- Tracks: [VoidLight port](roadmap/tracks/voidlight-port.md) (shared contracts,
-  Tables T1–T6), [Emergent AI](roadmap/tracks/emergent-ai.md),
+- Tracks: [VoidLight port](roadmap/tracks/voidlight-port.md) (Tables T1–T6),
+  [Emergent AI](roadmap/tracks/emergent-ai.md),
   [Long-term gameplay direction](roadmap/tracks/gameplay-direction.md).
 - Measured pressure points: [Scaling Gaps](roadmap/scaling-gaps.md).

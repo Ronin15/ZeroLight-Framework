@@ -37,7 +37,7 @@ const FINDING_SCHEMA = {
 }
 
 const STANDARDS = `Before reviewing, read these canonical docs (they are the source of truth, not notes):
-- docs/coding-standards.md — the rules; cite its section in each standards finding (Zig Style, Performance, Allocator discipline, Budgets/Capacities/Thresholds, Threading, Dense SoA storage, Logging, Comments, Tests, Benchmarks)
+- docs/coding-standards.md — the rules; cite its section in each standards finding (Zig Style, Performance, Allocator Discipline, Budgets, Capacities, And Thresholds, Threading, Dense SoA Storage, Logging, Comments, Tests, Benchmarks)
 - docs/simulation-tiers-and-pipeline.md (fixed-step simulation contracts)
 - docs/architecture.md (ownership boundaries, frame flow, pathfinding contracts)`
 
@@ -82,7 +82,7 @@ phase('Cross-cut')
 const CROSS = [
   { key: 'module-coherency', prompt: 'Review the WHOLE pathfinder module for cross-file COHERENCY: invariants that must agree across files (coordinate spaces, units, cell/world conversions, request lifecycle states, error sets), assumptions made in one file that another file violates, and data contracts that drift between producer and consumer. Trace the request lifecycle from system.zig through solve.zig, nav_graph.zig, nav_grid.zig, caches.zig.' },
   { key: 'module-cohesion', prompt: 'Review the WHOLE pathfinder module for cross-file COHESION and architecture: is the split into files (system/nav_graph/nav_grid/solve/caches/types/group_field/scratch/nav_memory) clean and single-responsibility? Find duplication that should be unified, misplaced concerns, ownership-boundary violations (does anything reach outside the pathfinding module improperly, or import render/gpu internals?), and dead or redundant code. Assess whether the public facade (pathfinding.zig) exposes the right minimal surface.' },
-  { key: 'standards-and-hotpath', prompt: 'Review the WHOLE pathfinder module for STANDARDS adherence and hot-path discipline against docs/coding-standards.md: allocation after warmup on per-frame/per-request paths and missing FailingAllocator proofs (Allocator discipline), dispatch/lookup/logging on hot paths (Performance, Logging), fixed node/solve budgets vs world-scaled ones (Budgets, Capacities, And Thresholds), naming and error sets (Zig Style), comment style (Comments), and co-located test blocks (Tests).' },
+  { key: 'standards-and-hotpath', prompt: 'Review the WHOLE pathfinder module for STANDARDS adherence and hot-path discipline against docs/coding-standards.md: allocation after warmup on per-frame/per-request paths and missing FailingAllocator proofs (Allocator Discipline), dispatch/lookup/logging on hot paths (Dispatch And Lookup, Logging), fixed node/solve budgets vs world-scaled ones (Budgets, Capacities, And Thresholds), naming and error sets (Zig Style), comment style (Comments), and co-located test blocks (Tests).' },
 ]
 const allFiles = UNITS.flatMap((u) => u.files)
 const crossReviews = await parallel(CROSS.map((c) => () =>

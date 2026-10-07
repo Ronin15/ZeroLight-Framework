@@ -80,9 +80,8 @@ const demo_test_viewport_width: f32 = 256;
 const demo_test_viewport_height: f32 = 256;
 // Default mover count for every path EXCEPT the real battle-scale procedural entry
 // (initProceduralWithRuntimeAssets) — this is what initDemoForTest and every other test
-// in this file spawn through, so it stays small on purpose (see coding-standards.md /
-// CLAUDE.md's "keep test fixtures at the smallest size that still exercises the
-// behavior under test"). A prior pass bumped this GLOBALLY to battle-scale to exercise
+// in this file spawn through, so it stays small on purpose (coding-standards.md
+// § Tests: smallest fixture that still exercises the behavior). A prior pass bumped this GLOBALLY to battle-scale to exercise
 // the pathfinding group-field threshold live — that made every test in this file spawn
 // 2048 movers too, taking `zig build test` from ~6s to ~43s. Population is now a
 // runtime parameter (see DemoPopulationCapacity/deriveDemoPopulationCapacity) so the

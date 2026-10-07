@@ -77,3 +77,22 @@ acceptance history intact.
 | [45](roadmap/archive/slice-45.md) | First Action-Intent Consumer Domain Controller (Destructibles) | First action-intent consumer: destructibles controller. |
 | [47](roadmap/archive/slice-47.md) | Un-Stagger The Shared Sensing Substrate | Un-staggered shared sensing substrate (perception defect fix). |
 | [48](roadmap/archive/slice-48.md) | SimulationPipeline Thin-Composer Restoration | `SimulationPipeline` thin-composer restoration. |
+
+## Historical Order
+
+The original dependency order, kept for history (all landed and archived
+unless noted): 0 runtime diagnostics → 1 input routing → 2 logical resolution
+→ 3 render resources → 4 asset cache → 5 text/fonts → 6 renderer composition →
+7 thread system + parallel render prep → 8 shader/platform expansion → 9 SIMD
+helpers → 10 `DataSystem` → 11 SIMD processors → 12 simulation contracts → 13
+spatial queries/contacts → 14 first AI intent processor → 15 audio → 16
+menus → 17 runtime asset catalog → 18 frame-delayed pathfinding → 19 steering
+→ 20 nav hardening → 21 typed events → 22 pipeline + tier/scope scaffolding →
+23 / 23A / 23B world rendering → 24 / 24B scoped tiers + render collect → 25 /
+25E Z-aware navigation + per-entity levels → 26 factions → 27 RNG → 28 spatial
+index → 34 core SIMD expansion → 29 perception → 30 memory → 31 affect → 32
+arbitration → 33 archetypes + debug (visual residual open) → 39 stimuli → 41
+interest markers → 40 action intents → 45 destructibles → 36 single-pass
+compositing → 37 dense-window cap → 43 gamepad (HW residual open) → 47
+un-staggered sensing → 48 thin composer. Open slices from that list (33, 35,
+38, 43) are placed in the roadmap index's merged order.

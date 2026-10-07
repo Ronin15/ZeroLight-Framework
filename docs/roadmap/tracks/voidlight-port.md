@@ -22,18 +22,12 @@ presentation polish (70), and AI behavior parity (71). Every former
 in gameplay, no completion-order application of path/job results, no
 atomic-sequence conflict resolution, no `-ffast-math`
 (`@setFloatMode(.optimized)`). Never port a world-scaled work budget (for
-example VoidLight's `worldW / 200` pathfinding sectors): per-step and per-query
-budgets stay fixed counts, with deterministic deferral when they bind.
-Data-structure capacities (anchor and node stores, the projectile live store,
-persistent populations, plan buffers) are sized from the loaded world and
-content at init/load and reserved up front (`FailingAllocator`-proven).
-Stores that grow at runtime (the inventory slot arena, level links, and any
-later runtime node producer) take a content-derived initial size and grow
-geometrically at the main-thread structural-commit seam, refusing only at a
-format/index ceiling. Fixed caps remain for format/index limits, loud
-load-time safety ceilings, and standard fixed pools (the 512-slot text-label
-pool with idle reclaim), and heuristic thresholds derive from the cost of the
-operation they gate (coding-standards § Budgets, Capacities, And Thresholds).
+example VoidLight's `worldW / 200` pathfinding sectors). Budgets, capacities,
+and caps follow coding-standards § Budgets, Capacities, And Thresholds; in this
+track that means world/content-sized anchor and node stores, projectile live
+store, populations, and plan buffers; commit-seam growth for the inventory slot
+arena, level links, and later runtime node producers; and the 512-slot
+text-label pool with idle reclaim as a presentation pool.
 
 **Shared contracts later slices rely on (one owner each; never fork them):**
 
