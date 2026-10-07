@@ -152,6 +152,11 @@ pub const PathfindingSystem = struct {
     // failed apply would otherwise lose them (the retry's cursor call finds nothing new).
     // Consumed by reactToPostCommitNavEvents after a successful apply; reset by a full build.
     nav_link_cursor_pending: NavLinkCursorStats = .{},
+    // The last buffered apply failed after possibly patching part of the dirty set (a refused
+    // chunk keeps empty adjacency; later levels keep their old layer), so paths solved since may
+    // detour. The next successful apply drops the whole completed cache instead of the scoped
+    // eviction. Reset by a full build.
+    nav_apply_degraded: bool = false,
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -551,6 +556,8 @@ pub const PathfindingSystem = struct {
         // The full build assigned every current link's endpoint slots and patched every chunk.
         self.nav_links_processed = if (world) |world_system| world_system.levelLinks().len else 0;
         self.nav_link_cursor_pending = .{};
+        // The full build clears the completed cache below.
+        self.nav_apply_degraded = false;
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
@@ -602,7 +609,7 @@ pub const PathfindingSystem = struct {
             }
         else
             null;
-        var stats = try self.graph.applyNavUpdates(
+        var stats = self.graph.applyNavUpdates(
             data,
             world,
             edits,
@@ -611,17 +618,24 @@ pub const PathfindingSystem = struct {
             &self.affected_levels,
             self.capacity.nav_full_relabel_level_threshold,
             update_threads,
-        );
+        ) catch |err| {
+            // Any failure (even one before a write) marks the cache suspect; one extra cold clear.
+            self.nav_apply_degraded = true;
+            return err;
+        };
         if (stats.version_bumps != 0) {
             // Full rebuild bumped nav_version: blunt-invalidate all work and group fields.
             self.clearTransientRequestsRetainingFields();
             self.dropGroupFields();
+            self.nav_apply_degraded = false;
         } else if (stats.incremental_rebuilds != 0) {
-            if (full_level_ids.len != 0) {
-                // A whole-level remask is not bounded by edit spans, so scoped eviction cannot
-                // find every stale path. Drop the entire completed cache instead. Graph node ids
-                // are unchanged (no topology rebuild), so nav_version stays stable.
+            if (self.nav_apply_degraded or full_level_ids.len != 0) {
+                // A whole-level remask is not bounded by edit spans, and paths cached after a
+                // degraded apply may detour anywhere, so scoped eviction cannot find every stale
+                // path. Drop the entire completed cache instead. Graph node ids are unchanged
+                // (no topology rebuild), so nav_version stays stable.
                 self.completed.clear();
+                self.nav_apply_degraded = false;
             } else {
                 // Incremental edit: evict only cached paths that cross the changed cells.
                 try self.evictCachedPathsCrossingEdits(world, edits, cell_edits);

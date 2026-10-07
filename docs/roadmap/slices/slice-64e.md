@@ -950,6 +950,17 @@ multi-worker patch path and the serial one.
           1104 under a 1600 ceiling, then the next growth is refused); the
           build test asserts the clamp at the ceiling (pre-fix 3788 > 2520),
           the unchanged reserve away from it, and freed staging lists.
+    - [x] **M12 · a degraded apply drops the completed cache.** Paths
+          solved between a failed apply (refused chunk with empty adjacency,
+          later levels on their old layer) and its retry could detour and
+          survive the retry's scoped eviction. Fix:
+          `PathfindingSystem.nav_apply_degraded`, set on any apply error; the
+          next successful incremental apply clears the whole completed cache
+          (a relabel or full build already does) and resets it. Test: the M4
+          refusal test now asserts the flag across the failure and retry and
+          that the detour cached before the retry re-solves to a fresh
+          rebuild's direct path (fails without the clear: the stale detour
+          stays cached). 65B's `NavWorldTooLarge` swap rule sets it.
     - [x] **M10 · a failed step's growths and compactions are reported by
           the next success** (third review, 2026-10-07). Fix: lifetime
           `edge_windows_grown_total` counted at the source plus

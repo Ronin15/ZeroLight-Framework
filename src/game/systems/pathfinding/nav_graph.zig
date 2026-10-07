@@ -3722,6 +3722,7 @@ test "a refused edge-window growth still patches the rest of the dirty set, seri
         try std.testing.expectEqual(blocked_before + 1, graph.levels.items[0].blocked_count);
         try std.testing.expectEqual(@as(u64, 1), graph.edge_growth_refused_total);
         try std.testing.expectEqual(version, graph.version);
+        try std.testing.expect(system.nav_apply_degraded);
         for (graph.chunk_edge_overflow.items) |flag| try std.testing.expect(!flag);
         // The refused chunk keeps its rebuilt live portals with empty adjacency.
         const lg = &graph.level_graphs.items[0];
@@ -3767,6 +3768,7 @@ test "a refused edge-window growth still patches the rest of the dirty set, seri
         try std.testing.expectEqual(@as(usize, 1), retried.edge_windows_grown);
         // 2 x the 47 edges the refused step measured.
         try std.testing.expectEqual(@as(u32, 94), system.graph.chunk_edge_cap.items[chunk]);
+        try std.testing.expect(!system.nav_apply_degraded);
         try expectNoEdgeTargetsTombstone(&system.graph);
         try expectLinkPatchMatchesFullRebuild(system, &data, &world, 768, capacity);
     }
@@ -3779,9 +3781,14 @@ test "a refused edge-window growth still patches the rest of the dirty set, seri
     try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
     const across = cellCenterRequest(0, .{ 3, 11 }, 0, .{ 21, 11 });
     const fresh_slot = try solveAndCache(&rebuilt, requester, across);
+    // M12: the detour cached between the refusal and the retry (around chunk 4) was dropped by
+    // the degraded-apply cache clear, so it re-solves to the direct route.
+    const detour_fresh = try solveAndCache(&rebuilt, requester, before_retry[0]);
     for (systems) |system| {
         const slot = try solveAndCache(system, requester, across);
         try expectSameCachedPath(system, slot, &rebuilt, fresh_slot);
+        const detour_slot = try solveAndCache(system, requester, before_retry[0]);
+        try expectSameCachedPath(system, detour_slot, &rebuilt, detour_fresh);
     }
 }
 

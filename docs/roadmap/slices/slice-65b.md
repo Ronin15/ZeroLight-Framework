@@ -381,7 +381,9 @@ rule enforced structurally: the job cannot reach `parallelFor`.
    This order matches the synchronous path. Levels are independent: all
    overlays are applied, then each level's components and patch, and within
    a level remask comes before patch, the same as `nav_graph.zig:721-732`.
-4. Store `result: union(enum) { pending, ok: NavUpdateStats, failed: error{OutOfMemory} }`.
+4. Store `result: union(enum) { pending, ok: NavUpdateStats, failed: NavGraph.ChunkPatchError }`
+   (a lane relabel can hit 64E M5's measured-arena check and a lane patch
+   M4's growth refusal, not only OOM).
    The job writes only `back` and `result`.
 
 **Graph-phase refactor (`nav_graph.zig`, same change)**
@@ -450,12 +452,21 @@ is called through `SimulationPipeline.serviceDeferredNavRebuild` by
      if queued and waits if running. Without one, run `runNavDeferredJob`
      inline now.
   2. On `.failed`:
-     - Re-mark every plan run's level as whole-level dirty
-       (`markNavLevelDirty`), so the "grows rather than drops" contract
-       holds.
-     - Set `state = .idle`.
-     - Return the error. This is exactly where the synchronous path would
-       have returned its OOM, `k` steps earlier. The front is unchanged.
+     - `error.OutOfMemory`: re-mark every plan run's level as whole-level
+       dirty (`markNavLevelDirty`), so the "grows rather than drops"
+       contract holds; set `state = .idle`; return the error. This is
+       exactly where the synchronous path would have returned its OOM, `k`
+       steps earlier. The front is unchanged.
+     - `error.NavWorldTooLarge` (decided 2026-10-07, 64E M12): **swap the
+       back graph** (step 3), then set `nav_apply_degraded = true`, re-mark
+       the plan's levels whole-level dirty, set `state = .idle`, and return
+       the error. Reason: the back is fully patched except the refused
+       chunks (live portals, empty adjacency, no edge into a tombstone, per
+       M4) and is more current than the frozen front, which is stale
+       against the world the step already committed; keeping the front
+       would route agents through dug-out or blocked cells until the retry.
+       The degraded flag makes the next successful apply drop the whole
+       completed cache, so detours solved meanwhile do not outlive it.
   3. Run `std.mem.swap(NavGraph, &self.graph, &deferred.back)`.
      `std.debug.assert(deferred.front == &self.graph)` confirms the system
      has not moved. The old front becomes the next back buffer, so the swap
@@ -634,7 +645,9 @@ copied at submit") gains one clause:
       as failures.
     - `test "copyGraphFrom produces an equivalent graph"`:
       `expectGraphsEquivalent` plus equal `version` / `total_edge_slots` /
-      `edge_hole_slots` / `edge_arena_slot_limit`, on the 256-px, 4-tile-chunk two-level fixture used
+      `edge_hole_slots` / `edge_arena_slot_limit` /
+      `edge_windows_grown_total` / `edge_windows_grown_reported` /
+      `edge_compactions_reported` / `edge_arena_unslacked_total`, on the 256-px, 4-tile-chunk two-level fixture used
       at `:1904-1913`.
 - [ ] `NavGrid.rebuildStaticCoverage`, `deriveChunkMask`, and `applyChunkMask`.
   - `test "deriveChunkMask plus applyChunkMask equals remaskChunkFromWorld"`:
