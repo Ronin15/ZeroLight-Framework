@@ -20,17 +20,13 @@ simulation, richer emergent AI, and production-friendly asset workflows.
 - **Worlds and tilemaps** — procedural multi-level worlds, chunk visibility,
   dig and plane traversal between floors, and tile edits that feed navigation
   and gameplay.
-- **Fixed-step simulation** — 60Hz gameplay on an ordered stage pipeline
-  (perception, memory, emotion drives, AI decisions, steering, pathfinding,
-  movement, collision, tile gating, floor traversal) plus particles and small
-  domain controllers (dig, audio, interactables). Stage reads and writes are
-  checked at compile time.
-- **Scoped simulation** — entities near the camera simulate in full, while
-  distant ones drop to cheaper tiers and staggered AI thinking. Scope follows
-  the fixed-step camera, so it never depends on the frame rate.
-- **Dig-aware pathfinding** — hierarchical chunk-portal pathfinding across
-  levels. Digs, ramps, and other terrain edits patch navigation incrementally
-  in the same step, so NPCs route through new tunnels immediately.
+- **Fixed-step simulation** — 60Hz gameplay with AI, steering, pathfinding,
+  movement, collision, particles, and small domain controllers (dig, audio,
+  interactables).
+- **Scoped simulation** — full detail near the camera, cheaper tiers farther
+  out.
+- **Dig-aware pathfinding** — NPCs path across levels and use newly dug
+  tunnels and ramps right away.
 - **Emergent AI (in progress)** — early substrate, not a finished AI game
   layer. Agents can see and hear, keep short-term memory, carry simple emotion
   drives, and choose among a few locomotion behaviors; personalities and
@@ -42,10 +38,9 @@ simulation, richer emergent AI, and production-friendly asset workflows.
   combat or interaction system yet.
 - **Atlas-backed assets** — packed runtime atlases with stable IDs so art and
   audio can be swapped without rewriting game code.
-- **Multithreaded and deterministic** — hot systems run serial or threaded
-  with identical results. Hot paths are allocation-free after warmup, and tests
-  prove it; storage grows only at safe points in the step. Benchmarks track
-  scaling to large populations.
+- **Multithreaded and deterministic** — threaded systems with identical
+  serial and threaded results, allocation-free hot paths, and benchmarks that
+  track scaling.
 
 For design detail and ownership boundaries, start with
 [architecture](docs/architecture.md). Topic guides cover
@@ -106,9 +101,8 @@ zig build assets-lint # lint runtime atlases and optional source sprite consiste
 zig build idiom-lint  # lint Zig naming, stdlib currency, and unsafe catch patterns
 ```
 
-Releases are packaged with `--release=fast` (ReleaseFast). See
-[development workflow](docs/development-workflow.md) for the ReleaseSafe soak
-gate that implies, release modes, build options, and packaging notes.
+See [development workflow](docs/development-workflow.md) for release modes, build
+options, and packaging notes.
 
 ## Project Layout
 
