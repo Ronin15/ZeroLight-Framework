@@ -302,7 +302,7 @@ new phases; Expiry becomes phase 6.
 | `pending_drop_capacity` | `death_drop_creates_per_step × 16` (512) | Backlog budget, not a content capacity: 16 drain steps (0.27 s) of `death_drop_creates_per_step`, whatever the world or population; sustained overload defers kills (phase 1b) and never grows the FIFO. Assert `>= max_carried_drop_stacks_per_victim`, so one full victim always fits an empty FIFO (also 7 full `slots_64` carriers in one step). Admission keeps `len ≤ capacity` without ever discarding an entry. |
 | `death_drop_creates_per_step` | 32 | Drains a full FIFO in 16 steps (0.27 s) when the world has headroom |
 | `world_item_creates_per_step_max` | `combat_max_kills_per_step + 1 (58) + 1 (57B) + death_drop_creates_per_step` | Assert `< world_item_live_capacity`. 162 with 56B. |
-| Structural headroom | `+ death_drop_creates_per_step` creates | Added to the demo `structural_reserve` through the named constant |
+| Structural share | No new term | Phase 5 runs in `inventory_update`, a pipeline stage, so its creates are pipeline-owned. `death_drop_creates_per_step` is already a term of `world_item_creates_per_step_max`, which sizes Slice 57's `world_item_structural_event_share` (a term of `pipeline_structural_event_share`). Adding it again would double-count; callers add nothing |
 
 Phase 1b and phases 4 and 5 are serial and bounded:
 - Phase 1b: at most `combat_max_hits_per_step` (128) pending targets, O(1)
@@ -358,8 +358,17 @@ changing through `ItemCatalog.fingerprint()`. Kill deferral adds no state:
       save `format_version` bumps.
 - [ ] Phases 4 and 5 in `InventoryController` (phase 4 asserts every push and
       counts `death_drop_push_refused`). Constants and comptime asserts.
-      Grow the demo reserve terms through the named constants.
-      `pending_drops_peak`.
+      `pending_drops_peak`. No separate structural term: phase 5's creates grow Slice 57's
+      pipeline-owned `world_item_structural_event_share` through
+      `world_item_creates_per_step_max`. `demo_structural_headroom` is
+      unchanged (callers add nothing), and the demo `capacity_limit` literal is
+      re-pinned. Test: extend Slice 57's world-item structural-share test in
+      `simulation_pipeline.zig` (`structural_headroom = 0`,
+      `world_item_creates_per_step_max` creates plus the pickup and expiry
+      destroys) so its `death_drop_creates_per_step` share of the creates uses
+      `coinPileTemplate`. The full set commits through
+      `applyStructuralCommandsBudgeted(&data, pipeline.structuralCommitBudget(0))`
+      and lands every create and destroy.
 - [ ] Tests:
       - **Full drop:** a `slots_8` victim with 3 stacks, 1 equipped sword,
         and 57 coins drops exactly 5 world items (sword, 3 stacks, coin pile)

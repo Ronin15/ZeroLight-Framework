@@ -120,8 +120,8 @@ at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
   `combat_max_hits_per_step = action_intent_live_capacity +
   projectile_hits_per_step` (128) and `combat_max_kills_per_step =
   combat_max_hits_per_step` (128). Slice 56's `PendingHit` / `PendingTarget`
-  arrays, event budget, and structural headroom are sized from these, so they
-  grow with this change; the comptime array-length asserts from Slice 56 catch
+  arrays, event budget, and pipeline-owned `combat_structural_event_share` are
+  sized from these, so they grow with this change; the comptime array-length asserts from Slice 56 catch
   any missed site. Without this, 64 intents plus 64 projectile hits would
   overrun 64-entry arrays (out-of-bounds UB in ReleaseFast).
 - The roll treats the projectile entity as the attacker in `hit_seed`. Killer
@@ -164,13 +164,29 @@ at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
     serial and threaded runs size identically.
 - `EventProducerId.combat_resolve` stays
   `combat_max_hits_per_step + combat_max_kills_per_step` (now 256).
-- **Structural headroom, enumerated** (added to the demo's
-  `structural_reserve` through named constants): projectile spawns
-  `projectile_spawns_per_step` (32) + destroys on hit `projectile_hits_per_step`
-  (64) + expiry/impact/out-of-world `projectile_expiry_budget_per_step` (64) +
-  victim kills `combat_max_kills_per_step` (128, replacing Slice 56's term). A
-  projectile that hits and expires in one step queues two destroys; the
-  headroom counts both and structural commit tolerates the double destroy.
+- **Structural share, enumerated per stage.** `combat_resolve` and
+  `projectile_update` are pipeline stages, so every projectile structural
+  command is pipeline-owned and counted in `pipeline_structural_event_share`
+  (`simulation.zig`). Callers add nothing: `demo_structural_headroom` stays
+  `structuralEventHeadroom(demo_creates_per_step, 0)`.
+  - `combat_resolve`: Slice 56's `combat_structural_event_share` is redefined
+    as `structuralEventHeadroom(projectile_spawns_per_step,
+    combat_max_kills_per_step)`. That is the projectile spawn creates (32, each
+    up to `max_structural_events_per_create` events) plus the victim kill
+    destroys. The kill term stays Slice 56's own: it reaches 128 through the
+    redefined `combat_max_kills_per_step`, so this slice does not add kills a
+    second time.
+  - `projectile_update`: a new sibling constant
+    `projectile_structural_event_share = structuralEventHeadroom(0,
+    projectile_hits_per_step + projectile_expiry_budget_per_step)`. That is the
+    destroys on hit (64) plus the expiry/impact/out-of-world destroys (64). It
+    is added as a term of `pipeline_structural_event_share`.
+  - A projectile that hits and expires in one step queues two destroys. The
+    share counts both, and structural commit tolerates the double destroy.
+    The `.structural_commit` share, the structural-command stream room
+    (`structuralCommandHeadroom()`), and the demo's pinned `capacity_limit`
+    all grow by these terms through the pipeline. The demo re-pins its
+    `capacity_limit` literal test by hand.
 - **Collision capacity.** Add `projectile_live_capacity` to the body count the
   demo passes to `estimateContactCapacity` (and therefore
   `estimateTriggerCapacity`) and to `.movement_body_capacity`. Intent capacity
@@ -228,8 +244,27 @@ Ammo consumption lands in Slice 68C (`requires_ammo`, `TransferBatch.consume`).
 - [ ] Projectile hits folded into `combat_resolve`; `combat_max_hits_per_step`
       / `combat_max_kills_per_step` redefined, with the Slice 56 comptime
       array-length asserts still passing.
-- [ ] Event budget and enumerated structural headroom; collision
-      contact/trigger and `movement_body_capacity` body count includes
+- [ ] Event budget and pipeline-owned structural terms. Slice 56's
+      `combat_structural_event_share` is redefined as
+      `structuralEventHeadroom(projectile_spawns_per_step,
+      combat_max_kills_per_step)`, and the new
+      `projectile_structural_event_share = structuralEventHeadroom(0,
+      projectile_hits_per_step + projectile_expiry_budget_per_step)` is added
+      as a term of `pipeline_structural_event_share`.
+      `demo_structural_headroom` is unchanged (callers add nothing), and the
+      demo `capacity_limit` literal is re-pinned.
+      - Test (in `simulation_pipeline.zig`): use a pipeline with
+        `structural_headroom = 0`. Write one step's maximal projectile command
+        set with the test file's `writeStructuralCommands` helper:
+        `combat_resolve`'s `projectile_spawns_per_step` projectile creates and
+        `combat_max_kills_per_step` victim destroys, plus `projectile_update`'s
+        `projectile_hits_per_step` hit destroys and
+        `projectile_expiry_budget_per_step` expiry destroys, all on distinct
+        live entities. It commits through `applyStructuralCommandsBudgeted(&data,
+        pipeline.structuralCommitBudget(0))` and applies every command.
+        `maxEventsPerStep(.structural_commit, pipeline.eventBudgets())` equals
+        `pipeline_structural_event_share`, which includes both terms.
+- [ ] Collision contact/trigger and `movement_body_capacity` body count includes
       `projectile_live_capacity` (initial sizes only;
       `SimulationPipeline.syncPopulationCapacity` grows every
       population-sized pipeline capacity at the commit seam — Slice 72 C3); counters `projectiles_spawned` / `_refused` /

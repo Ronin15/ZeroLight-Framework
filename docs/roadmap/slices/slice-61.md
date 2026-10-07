@@ -463,7 +463,42 @@ constants, never derived from world, map, or node count;
 | `harvest_frustration_relief` | 0.25 | ~3 failed attempts fall below the default 0.6 threshold |
 | affect impulses (harvest producer) | 64 | One per intent |
 | transfer batches | ≤ 64 / step | One grant per accepted intent, within Slice 57's `inventory_transfer_capacity` (128) |
-| structural headroom | `64*2 + 64*2 = 256` cmds/step | Node set + visual per intent (grants are transfer batches, not structural commands); refill + visual per sweep row; reserved at state init |
+| `action_react_structural_event_share` | `64*2 + 64*2 = 256` events/step | Pipeline-owned structural term (below): node set + depleted visual or `destroy_entity` per intent (grants are transfer batches, not structural commands); refill + available visual per sweep row; callers add nothing |
+
+**Structural share.** `HarvestController.process` and the regrowth sweep run
+in `action_react`, a pipeline stage, so their structural commands are
+pipeline-owned and counted in `pipeline_structural_event_share`
+(`simulation.zig`). Callers add nothing: `demo_structural_headroom` stays
+`structuralEventHeadroom(demo_creates_per_step, 0)`.
+
+Claims give each intent at most one `action_react` controller, so the stage's
+per-intent bound is the largest single claimant's command count, not the sum.
+This slice therefore replaces the destructible-only `action_react` term of
+`pipeline_structural_event_share`, `structuralEventHeadroom(0,
+action_intent_live_capacity)`, rather than adding a harvest term beside it,
+which would count the same 64 intents twice. Slice 56's and later slices' terms
+(`combat_structural_event_share` and its siblings) are unchanged.
+
+New constants in `simulation.zig`, beside `pipeline_structural_event_share`:
+- `destructible_commands_per_intent = 1`: one `destroy_entity` or
+  `set_destructible` per claimed intent, as today.
+- `harvest_commands_per_intent = 2`: a net `set_resource_node`, plus either the
+  depleted visual swap (`regrow`) or `destroy_entity` (`remove`) at zero
+  charges.
+- `action_react_commands_per_intent = @max(destructible_commands_per_intent,
+  harvest_commands_per_intent)` (2). Slice 63's trade claimant queues no
+  structural commands (its transfers are batches), so it adds no operand.
+- `harvest_refill_commands_per_row = 2`: the refill `set_resource_node` plus
+  the available visual.
+- `action_react_structural_event_share = structuralEventHeadroom(0,
+  action_intent_live_capacity * action_react_commands_per_intent +
+  regrowth_sweep_budget * harvest_refill_commands_per_row)` (`64*2 + 64*2 =
+  256`). It is the `action_react` term of `pipeline_structural_event_share`.
+
+The `.structural_commit` share, the structural-command stream room
+(`structuralCommandHeadroom()`), and the demo's pinned `capacity_limit` grow by
+the difference (+192) through the pipeline. The demo re-pins its
+`capacity_limit` literal test by hand.
 
 **Events.** `harvest_completed { harvester, node, kind, level, cell_x, cell_y,
 item: ItemId, quantity: u8, owned: bool, owner: Faction, depleted: bool }` is a
@@ -518,6 +553,7 @@ as Slice 57 world items, and NPC↔merchant selling of harvested goods (a future
 - [ ] `ActionKind.harvest`; `HarvestController` inserted before destructible in Slice 56's claim order using 56's `ActionClaimSet`; destructible parity tests are unchanged.
 - [ ] Slice 57 transfer wiring: `PipelineResource.inventory_transfers`, the `StepState` queue instance, and `inventory_update` phase 0 via `applyTransferBatch`; a two-sided batch with insufficient funds still applies nothing (57's test, now through the pipeline).
 - [ ] `HarvestController.process`, steps 1–8 above (grants via `TransferBatch.grant` + `tryAppend` with `canAccept` preflight), plus the regrowth sweep with the `u64`-widened cursor and `stepAfter`/`stepReached`.
+- [ ] Structural share: `destructible_commands_per_intent`, `harvest_commands_per_intent`, `action_react_commands_per_intent`, `harvest_refill_commands_per_row`, and `action_react_structural_event_share` in `simulation.zig`. The new share replaces the destructible-only `structuralEventHeadroom(0, action_intent_live_capacity)` term of the pipeline-owned `pipeline_structural_event_share`; `demo_structural_headroom` is unchanged (callers add nothing), and the demo `capacity_limit` literal is re-pinned. Test (in `simulation_pipeline.zig`): use a pipeline with `structural_headroom = 0`. Write `action_react`'s maximal per-step command set with the test file's `writeStructuralCommands` helper: `action_intent_live_capacity` harvest depletions on distinct nodes (each a `set_resource_node` plus a depleted visual swap) and `regrowth_sweep_budget` refills on further distinct nodes (each a `set_resource_node` plus an available visual). It commits through `applyStructuralCommandsBudgeted(&data, pipeline.structuralCommitBudget(0))` and applies every command. `maxEventsPerStep(.structural_commit, pipeline.eventBudgets())` equals `pipeline_structural_event_share`, which includes `action_react_structural_event_share`.
 - [ ] `AiAffectDrive.need` end to end via the runbook: columns, validation, archetype keys, debug bar, table row; the affect share widens automatically through `affect_events_per_row_max` (Slice 72 C4); the demo `capacity_limit` literal is re-pinned.
 - [ ] `AffectImpulse` substrate in `AffectSystem`; per-producer budgets; `reactToPostCommitAffectImpulses` drain at the commit seam; `FailingAllocator` proof.
 - [ ] `AiBehavior.forage`, `gain_forage`, the `Signals` fields, the weight column, `resolveGoal`, `coastableBehavior(.forage) = false`; generalised `findNearestMarker`; `RowForage` gather; `.harvest` arm in `ai_action_select`.

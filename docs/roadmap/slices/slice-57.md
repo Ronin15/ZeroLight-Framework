@@ -431,7 +431,29 @@ arena, which grows at the structural-commit seam.
 | `world_item_expiry_budget_per_step` | 32 | Dense-order deferral |
 | Inventory slot arena | Content-derived initial bound from the state; geometric growth at the structural-commit seam; `u32` ceiling | Runtime-growing store, not a budget: covers pooled-run fragmentation by growth; refusal only at the `u32` ceiling |
 | `inventory_transfer_capacity` / `max_transfer_item_deltas` | 128 / 4 | Fixed transfer queue; full queue refuses the producer's batch |
-| Structural headroom | `+ world_item_creates_per_step_max` creates `+ pickup_budget_per_step` destroys `+ world_item_expiry_budget_per_step` expiry | Added to the demo's `structural_reserve` through the named constants |
+| `world_item_structural_event_share` | `structuralEventHeadroom(world_item_creates_per_step_max, pickup_budget_per_step + world_item_expiry_budget_per_step)` | Pipeline-owned structural term (below); callers add nothing |
+
+**Structural share.** Every world-item structural command is queued by a
+pipeline stage, so it is pipeline-owned and counted in
+`pipeline_structural_event_share` (`simulation.zig`). Callers add nothing:
+`demo_structural_headroom` stays `structuralEventHeadroom(demo_creates_per_step,
+0)`. A new sibling constant in `simulation.zig`,
+`world_item_structural_event_share = structuralEventHeadroom(world_item_creates_per_step_max,
+pickup_budget_per_step + world_item_expiry_budget_per_step)`, is added as a term
+of `pipeline_structural_event_share`. It covers:
+- world-item creates (each up to `max_structural_events_per_create` events);
+- full-take pickup destroys;
+- expiry destroys. Expiry skips `count == 0` rows, so a picked-up item is never
+  destroyed twice.
+
+The share is sized from `world_item_creates_per_step_max`, the comptime sum of
+every world-item create producer's per-step cap, not from `inventory_update`
+alone. Later producers therefore grow it automatically and add no term of their
+own: Slice 58's dig yield (queued by `dig_world_edit`), Slice 57B's UI drop, and
+Slice 68C's death drops. The `.structural_commit` share, the structural-command
+stream room (`structuralCommandHeadroom()`), and the demo's pinned
+`capacity_limit` all grow by the term through the pipeline. The demo re-pins its
+`capacity_limit` literal test by hand.
 
 **Persistence boundary (Slice 46 save sections, added in this slice).**
 
@@ -516,7 +538,20 @@ fixed per-step constant or by the fixed `world_item_live_capacity`.
 - [ ] Equipment modifiers wired into `AiActionSelectSystem` and
       `CombatController` through `SimulationPipelineUpdateContext.items`.
 - [ ] Event payloads, stats, and metrics; `EventProducerId.inventory_update`;
-      demo reserve terms through named constants; collision contact/trigger
+      `world_item_structural_event_share = structuralEventHeadroom(world_item_creates_per_step_max,
+      pickup_budget_per_step + world_item_expiry_budget_per_step)` in
+      `simulation.zig`, added as a term of the pipeline-owned
+      `pipeline_structural_event_share`; `demo_structural_headroom` unchanged
+      (callers add nothing); demo `capacity_limit` literal re-pinned. Test (in
+      `simulation_pipeline.zig`): use a pipeline with `structural_headroom = 0`.
+      Write the maximal world-item command set with the test file's
+      `writeStructuralCommands` helper: `world_item_creates_per_step_max`
+      `worldItemTemplate` creates, `pickup_budget_per_step` pickup destroys,
+      and `world_item_expiry_budget_per_step` expiry destroys on distinct
+      world items. It commits through `applyStructuralCommandsBudgeted(&data,
+      pipeline.structuralCommitBudget(0))` and lands every create and destroy.
+      The test is sized from the constants, so it re-covers each later producer
+      that raises `world_item_creates_per_step_max`. Collision contact/trigger
       and `movement_body_capacity` body count includes
       `world_item_live_capacity`; `AudioController.queueItems`.
 - [ ] Player hotkey `Action.use_item`: key `H` (an `SDL_SCANCODE_*` value in
