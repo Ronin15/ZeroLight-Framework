@@ -626,7 +626,8 @@ pub const NavGraph = struct {
     // (Re)builds the chunk-stable slot geometry and every level's full abstract graph from
     // the current masks/components. Used by the init rebuild and by a full relabel; it
     // re-measures per-chunk edge caps from the current topology (compacting any windows an
-    // incremental patch relocated), so it never overflows.
+    // incremental patch relocated), so it never overflows. A measured arena past the nav memory
+    // gate fails (computeEdgeCaps) before any edge-layout write.
     fn buildAbstractGraphs(self: *NavGraph, world: ?*const WorldSystem) !void {
         try self.computePortalGeometry(world);
         // Pass 1: build portals/order/labels and fill each level's edge_scratch (retained
@@ -1929,27 +1930,45 @@ pub const NavGraph = struct {
     // Sizes the per-chunk edge windows from the measured per-chunk MAX edge count across
     // levels, times the slack multiplier, with a floor. Shared geometry, so the cap of a chunk
     // covers every level's count for that chunk. Also resets the per-chunk overflow flags.
-    fn computeEdgeCaps(self: *NavGraph) !void {
+    // Measure, check, commit: a measured arena past the nav memory gate's per-level ceiling
+    // (edge_arena_slot_limit; holes are zero at this seam, so this is its live slots) fails
+    // loudly with NavWorldTooLarge BEFORE any layout field is written. The init build then
+    // fails at load as the gate promises; a full relabel keeps the old windows, caps, bases,
+    // and arena (its portals are rebuilt with zero edge counts, so the graph stays solve-safe)
+    // and does not bump `version`.
+    fn computeEdgeCaps(self: *NavGraph) (std.mem.Allocator.Error || NavGridError)!void {
         const chunk_count = self.chunkCount();
+        // Allocation-free after the first build: build_u32_scratch then holds total_slots
+        // (>= 2 * chunk_count) entries.
+        const scratch = try self.buildScratch(2 * chunk_count);
+        const per_level = scratch[0..chunk_count];
+        const max_edges = scratch[chunk_count..];
+        @memset(max_edges, 0);
+        for (self.level_graphs.items) |*lg| {
+            @memset(per_level, 0);
+            for (lg.edge_scratch.items) |entry| per_level[lg.portals.items[entry.from].chunk] += 1;
+            for (max_edges, per_level) |*max_count, count| max_count.* = @max(max_count.*, count);
+        }
+        var running: u32 = 0;
+        for (max_edges) |raw| running +|= @max(raw *| default_edge_slack, chunk_edge_floor);
+        if (running > self.edge_arena_slot_limit) {
+            @branchHint(.cold);
+            if (comptime logging.enabled(.err) and !builtin.is_test)
+                logging.game.err("nav graph build: measured edge arena {d} slots per level exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); raise max_nav_memory_bytes or shrink the world", .{ running, self.edge_arena_slot_limit });
+            return NavGridError.NavWorldTooLarge;
+        }
+
         try setLen(&self.chunk_edge_cap, self.allocator, chunk_count);
         try setLen(&self.chunk_edge_base, self.allocator, chunk_count);
         try setLen(&self.chunk_edge_overflow, self.allocator, chunk_count);
         @memset(self.chunk_edge_overflow.items, false);
-        @memset(self.chunk_edge_cap.items, 0);
-        const per_level = try self.buildScratch(chunk_count);
-        for (self.level_graphs.items) |*lg| {
-            @memset(per_level, 0);
-            for (lg.edge_scratch.items) |scratch| per_level[lg.portals.items[scratch.from].chunk] += 1;
-            for (0..chunk_count) |c| self.chunk_edge_cap.items[c] = @max(self.chunk_edge_cap.items[c], per_level[c]);
+        var base: u32 = 0;
+        for (max_edges, self.chunk_edge_cap.items, self.chunk_edge_base.items) |raw, *cap, *chunk_base| {
+            cap.* = @max(raw *| default_edge_slack, chunk_edge_floor);
+            chunk_base.* = base;
+            base +|= cap.*;
         }
-        var running: u32 = 0;
-        for (0..chunk_count) |c| {
-            const raw = self.chunk_edge_cap.items[c];
-            const cap = @max(raw *| default_edge_slack, chunk_edge_floor);
-            self.chunk_edge_cap.items[c] = cap;
-            self.chunk_edge_base.items[c] = running;
-            running +|= cap;
-        }
+        std.debug.assert(base == running);
         self.total_edge_slots = running;
         self.edge_hole_slots = 0;
     }
@@ -3960,6 +3979,127 @@ test "link growth and agent-budget raises charge the edge arena's live slots gro
     try std.testing.expectEqual(requested, system.agentBudget());
     try std.testing.expectEqual(live_grown, graph.edge_arena_slot_limit);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 256, capacity);
+}
+
+test "a measured edge arena past the nav memory gate fails the build loudly" {
+    // The gate estimates the edge arena structurally (704 slots per level on this 8x8,
+    // one-chunk, two-level world) and the build re-measures it from real topology. 36 ramps
+    // authored before the build put 36 portals in the chunk's one open component: 36*35 = 1260
+    // edges, a 2520-slot window. A byte ceiling whose per-level arena ceiling is one slot under
+    // that measured arena fails the build with NavWorldTooLarge; at it, the build lands with
+    // the arena exactly at the ceiling. (Before the check, both built and every later
+    // relocation and re-admission was refused against an arena already past its ceiling.)
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var world = try initTwoLevelOpenWorld(&meta, 256);
+    defer world.deinit();
+    const cells = oneChunkRampCells();
+    try world.reserveLevelLinks(cells.len);
+    for (cells) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+
+    var measured = PathfindingSystem.init(std.testing.allocator);
+    defer measured.deinit();
+    try measured.reserve(capacity);
+    try measured.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    const total = measured.graph.total_edge_slots;
+    try std.testing.expectEqual(@as(u32, 2 * 36 * 35), total);
+    // The gate's own estimate is far below the measured arena.
+    var exact = budgetForCapacity(measured.capacity, 2, cells.len);
+    exact.max_bytes = exact.requiredBytes(8, 8);
+    try std.testing.expectEqual(@as(u32, 704), exact.edgeArenaSlotLimit(8, 8));
+
+    var refused = PathfindingSystem.init(std.testing.allocator);
+    defer refused.deinit();
+    try refused.reserve(capacity);
+    refused.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(refused.capacity, cells.len, total - 1);
+    try std.testing.expectError(NavGridError.NavWorldTooLarge, refused.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null));
+
+    var admitted = PathfindingSystem.init(std.testing.allocator);
+    defer admitted.deinit();
+    try admitted.reserve(capacity);
+    admitted.capacity.max_nav_memory_bytes = oneChunkGateBytesForSlotLimit(admitted.capacity, cells.len, total);
+    try admitted.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    try std.testing.expectEqual(total, admitted.graph.total_edge_slots);
+    try std.testing.expectEqual(admitted.graph.total_edge_slots, admitted.graph.edge_arena_slot_limit);
+    try std.testing.expectEqual(total, admitted.graph.edgeArenaLiveSlots());
+}
+
+test "a full relabel whose re-measured arena exceeds the gate fails before touching the edge layout" {
+    // A full relabel re-measures every window (computeEdgeCaps) against the same ceiling as the
+    // build. Pinned one slot under the current arena, a relabel triggered by one interior ramp
+    // (two affected levels past a threshold of 1) must fail with NavWorldTooLarge before any
+    // edge-layout write: caps, bases, arena size, and every level's arena untouched, no holes,
+    // `version` unchanged. buildLevelInit has already rebuilt every level's portals with zero
+    // edge counts, so the graph stays solve-safe (no edge targets a tombstone). Admitted, the
+    // retry relabels and matches a full rebuild.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    // 16x16 cells, 8-tile chunks (2x2).
+    var world = try initTwoLevelOpenWorld(&meta, 512);
+    defer world.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+    system.capacity.nav_full_relabel_level_threshold = 1;
+    const graph = &system.graph;
+
+    var caps_before = std.ArrayList(u32).empty;
+    defer caps_before.deinit(std.testing.allocator);
+    try caps_before.appendSlice(std.testing.allocator, graph.chunk_edge_cap.items);
+    var bases_before = std.ArrayList(u32).empty;
+    defer bases_before.deinit(std.testing.allocator);
+    try bases_before.appendSlice(std.testing.allocator, graph.chunk_edge_base.items);
+    var arena_before = std.ArrayList(AbstractEdge).empty;
+    defer arena_before.deinit(std.testing.allocator);
+    for (graph.level_graphs.items) |*lg| {
+        try std.testing.expectEqual(@as(usize, graph.total_edge_slots), lg.portal_edges.items.len);
+        try arena_before.appendSlice(std.testing.allocator, lg.portal_edges.items);
+    }
+    const total_before = graph.total_edge_slots;
+    const version = graph.version;
+    graph.edge_arena_slot_limit = total_before - 1;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try world.addLevelLink(rampLink(3, 3));
+    try std.testing.expectError(error.NavWorldTooLarge, reactOneStep(&system, &frame, &data, &world, null));
+    try std.testing.expectEqualSlices(u32, caps_before.items, graph.chunk_edge_cap.items);
+    try std.testing.expectEqualSlices(u32, bases_before.items, graph.chunk_edge_base.items);
+    try std.testing.expectEqual(total_before, graph.total_edge_slots);
+    try std.testing.expectEqual(@as(u32, 0), graph.edge_hole_slots);
+    try std.testing.expectEqual(version, graph.version);
+    var offset: usize = 0;
+    for (graph.level_graphs.items, 0..) |*lg, level_index| {
+        try std.testing.expectEqualSlices(AbstractEdge, arena_before.items[offset..][0..total_before], lg.portal_edges.items);
+        offset += total_before;
+        for (lg.portal_edge_count.items) |count| try std.testing.expectEqual(@as(u32, 0), count);
+        try std.testing.expect(graph.portalIndex(@intCast(level_index), try navCellIndex(graph, @intCast(level_index), 3, 3)) != null);
+    }
+    try expectNoEdgeTargetsTombstone(graph);
+    // With every level's adjacency empty a cross-chunk solve finds no abstract corridor, but it
+    // completes safely (no tombstone to pop, no out-of-bounds CSR range).
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    var request = cellCenterRequest(0, .{ 2, 2 }, 0, .{ 13, 13 });
+    request.entity = requester;
+    try appendPathRequest(&stream, request);
+    _ = try system.updateSerial(&stream, 8, .{});
+
+    graph.edge_arena_slot_limit = std.math.maxInt(u32);
+    const retried = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), retried.full_relabel);
+    try std.testing.expectEqual(@as(usize, 1), retried.version_bumps);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
 }
 
 test "interiorLinkSlotsAvailable refuses a cell that is an existing but unslotted endpoint" {

@@ -715,8 +715,10 @@ multi-worker patch path and the serial one.
       - Gate: the full build sets `edge_arena_slot_limit` from
         `NavMemoryBudget.edgeArenaSlotLimit`, which is the gate's own
         per-level edge-arena estimate plus the headroom `max_nav_memory_bytes`
-        (e.g. `autoSizedMaxNavMemoryBytes`) leaves. A relocation past it
-        compacts first. If it still does not fit, the step fails
+        (e.g. `autoSizedMaxNavMemoryBytes`) leaves. The full build and a
+        full relabel refuse (`NavWorldTooLarge`) when the measured arena
+        exceeds the ceiling, before any layout write (M5). A relocation past
+        it compacts first. If it still does not fit, the step fails
         deterministically with `NavWorldTooLarge`, counted in
         `edge_growth_refused_total` with an `err` log; the chunk keeps its
         live portals with empty adjacency, and the rest of the dirty set is
@@ -830,6 +832,35 @@ multi-worker patch path and the serial one.
         changes neither answer. An agent-budget raise is refused one slot
         under the live slots and admitted at them, which sets the growth
         ceiling. The test fails with the old capacity-based gate.
+    - [x] **M5 · the build checks its measured arena against the gate.**
+          `rebuild` set `edge_arena_slot_limit` from the gate's structural
+          estimate, but `computeEdgeCaps` sized the arena from measured
+          topology and never compared the two (nor did the full relabel).
+          A dense world built past its ceiling, and every later relocation
+          and re-admission was then refused.
+      - `computeEdgeCaps` now measures the per-chunk maxima into
+        `build_u32_scratch` (allocation-free after the first build), sums
+        the would-be arena, and returns `NavWorldTooLarge` with an `err` log
+        when it exceeds `edge_arena_slot_limit` (holes are zero at this
+        seam), before writing caps, bases, overflow flags, the total, or
+        the holes. The init build fails at load as the gate promises. A
+        failed full relabel keeps the old windows, caps, bases, and arena;
+        `buildLevelInit` has already rebuilt every level's portals with zero
+        edge counts, so the graph is solve-safe, and `version` is not
+        bumped.
+      - Tests: "a measured edge arena past the nav memory gate fails the
+        build loudly" (36 ramps authored before the build of the one-chunk
+        8×8 two-level world: 36·35 = 1260 edges, a measured 2520-slot arena
+        against the gate's 704-slot estimate; a byte ceiling one slot under
+        it fails the build, at it the build lands with the arena exactly at
+        the ceiling) and "a full relabel whose re-measured arena exceeds the
+        gate fails before touching the edge layout" (2×2 chunks, relabel
+        threshold 1, ceiling pinned one slot under the arena, one interior
+        ramp: `NavWorldTooLarge`, caps, bases, total, and every level's arena
+        byte-identical, no holes, `version` unchanged, every edge count zero,
+        the ramp cell live on both levels, no edge into a tombstone, a
+        cross-chunk solve completes; admitted, the retry relabels and
+        matches a full rebuild). Both fail with the check removed.
     - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
           `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
           gauge, `slice-72.md` E4 reference, `architecture.md`.

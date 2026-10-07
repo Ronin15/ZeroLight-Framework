@@ -886,7 +886,8 @@ abstract A* results match a full rebuild too. Vacated windows are holes
 windows own, because every growth at least doubles a window; `applyNavUpdates` asserts this,
 and a full build re-measures the arena. Growth respects the nav memory gate: each level's
 arena may use the gate's own edge-arena estimate plus the headroom `max_nav_memory_bytes`
-leaves (`NavMemoryBudget.edgeArenaSlotLimit`). A growth past that first compacts the arena in
+leaves (`NavMemoryBudget.edgeArenaSlotLimit`), and a build or full relabel whose measured arena
+exceeds it fails loudly before any edge-layout write. A growth past that first compacts the arena in
 place (`compactEdgeArena`, no allocation, `nav_edge_compactions`) and otherwise fails the step loudly (`NavWorldTooLarge`, counted in
 `edge_growth_refused_total`); a refused growth keeps the chunk's live portals with empty
 adjacency and the rest of the dirty set is still patched, so no edge targets a dead slot. The agent-budget and level-link re-admissions charge the
