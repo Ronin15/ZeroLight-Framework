@@ -520,7 +520,11 @@ multi-worker patch path and the serial one.
       ramp press the dig does not admit never grows the full link pool"
       (surface and off-world presses through `pipeline.update` leave the
       limit, link edges, and grow counters at 0; the next admitted ramp
-      grows).
+      grows). Branch-review follow-up: the remaining test-only
+      `DigController.process` wrapper (admit + commit with no seam) was
+      removed from the production API; pipeline and demo tests dig through
+      `admitDigAndGrowLinks` + `commit`, and `dig_controller.zig`'s own tests
+      use a private `digPressForTest` helper.
     - **L4 · no in-step growth past a reserved limit.** `addLevelLink` /
       `ensureLevelLinkCapacity` on a reserved world used to grow the limit by
       one without the nav-memory gate or `reserveLinkCapacity`, leaving the

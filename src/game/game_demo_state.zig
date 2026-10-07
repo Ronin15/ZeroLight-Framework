@@ -187,12 +187,13 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 
-/// Initial level-link reservation at load, sized from the loaded world: its authored links
-/// plus one nav chunk's worth of interior link slots (`nav_interior_link_slots_per_chunk`)
-/// per world chunk for runtime ramps. Interior ramps can never exceed that density anyway
-/// (the dig refuses a ninth distinct interior ramp per nav chunk); perimeter ramps share the
-/// same pool, and ramps past it grow the pool at the dig commit seam
-/// (`SimulationPipeline.ensureLevelLinkRoom`, gated by the nav-memory ceiling).
+/// Initial level-link reservation at load: a headroom estimate, not a bound. The loaded
+/// world's authored links plus one level's worth of runtime interior ramp slots
+/// (`nav_interior_link_slots_per_chunk` per chunk), counting world chunks as nav chunks
+/// (assumes the nav chunk equals the world chunk; the demo's 16-tile chunks match
+/// `default_nav_chunk_tiles`). Ramps stacked across several levels' chunks and perimeter
+/// ramps (which take no interior slot) can exceed it; they grow the pool at the dig commit
+/// seam (`SimulationPipeline.ensureLevelLinkRoom`, gated by the nav-memory ceiling).
 fn demoLevelLinkLimit(world: *const WorldSystem) usize {
     const world_chunks = @as(usize, world.chunksX()) * @as(usize, world.chunksY());
     return world.levelLinks().len + world_chunks * nav_interior_link_slots_per_chunk;
@@ -1265,10 +1266,14 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
     );
 }
 
+/// One dig press through the pipeline's production seam: admission plus level-link
+/// growth (`admitDigAndGrowLinks`), then the dig commit, as the `dig_world_edit` stage
+/// runs it.
 fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
     demo.simulation_frame.beginStep();
     demo.simulation_frame.dig_intent = intent;
-    try demo.pipeline.dig.process(&demo.world, &demo.data, demo.player, &demo.simulation_frame);
+    const admitted = try demo.pipeline.admitDigAndGrowLinks(&demo.world, &demo.data, demo.player, &demo.simulation_frame);
+    if (admitted.dig) |plan| try demo.pipeline.dig.commit(plan, &demo.world, &demo.simulation_frame);
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {

@@ -351,7 +351,8 @@ Slice 59's regional-weather gap consume it.
   `DigConfig`, and the yield path passes the stored icon to Slice 57's
   `worldItemTemplate`, which takes a pre-resolved icon rather than the
   catalog.
-- When `DigController.process` (`src/game/dig_controller.zig:112`) makes a
+- When `DigController.commit` (`src/game/dig_controller.zig`, run by the
+  `dig_world_edit` stage after `admit` and the level-link seam) makes a
   successful dig edit and the old tile has a yield entry, it queues one
   `create_entity(worldItemTemplate(...))` at the dug cell center.
 - Roll, keyed by `(cell_index, level)` so the same cell index on different

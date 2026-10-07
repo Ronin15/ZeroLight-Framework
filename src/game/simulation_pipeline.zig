@@ -1401,7 +1401,7 @@ pub const SimulationPipeline = struct {
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
-    const AdmittedDigStep = struct {
+    pub const AdmittedDigStep = struct {
         dig: ?AdmittedDig,
         link_pool_grew: bool,
     };
@@ -1412,7 +1412,7 @@ pub const SimulationPipeline = struct {
     /// nav-memory ceiling behaves as if the pool were unbounded). A refused or no-op press
     /// never grows the pool. Mutates nothing but the pool growth and the K-stride refusal
     /// counter, so the stage runs it before any other step-state change.
-    fn admitDigAndGrowLinks(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *const SimulationFrame) !AdmittedDigStep {
+    pub fn admitDigAndGrowLinks(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *const SimulationFrame) !AdmittedDigStep {
         const dig = try self.dig.admit(world, data, player, frame) orelse return .{ .dig = null, .link_pool_grew = false };
         const grew = dig.intent == .ramp and try self.ensureLevelLinkRoom(world);
         return .{ .dig = dig, .link_pool_grew = grew };
@@ -5588,12 +5588,12 @@ test "link growth happens only at the dig seam" {
     // With real allocators the seam grows to grownLevelLinkLimit(8) = 20 ...
     try std.testing.expect(try fixture.pipeline.ensureLevelLinkRoom(&fixture.world));
     try std.testing.expectEqual(@as(usize, 20), fixture.world.levelLinkLimit());
-    // ... and the dig and reaction that follow allocate nothing.
+    // ... and the dig (through the seam, which now finds room) and reaction that follow
+    // allocate nothing.
     var failing_after = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     saved = LinkGrowthAllocators.install(&fixture, failing_after.allocator());
     defer saved.restore(&fixture);
-    try fixture.pipeline.dig.process(&fixture.world, &fixture.data, fixture.player, &fixture.frame);
-    _ = try fixture.pipeline.reactToPostCommitNavEvents(&fixture.frame, &fixture.data, &fixture.world, null);
+    try fixture.dig(cells[8]);
     try std.testing.expect(fixture.rampAt(cells[8]));
     try std.testing.expectEqual(@as(usize, 9), fixture.world.levelLinks().len);
     try std.testing.expectEqual(@as(usize, 0), failing_after.allocations);
