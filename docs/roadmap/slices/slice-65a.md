@@ -23,20 +23,21 @@ Goal:
 
 ### Current foundation (do not rebuild)
 
-- **Six private copies** of `const thread_shared_record_alignment: usize = 64;`:
+- **Six private copies** of `const thread_shared_record_alignment: usize = 64;`
+  (file-scope symbol `thread_shared_record_alignment` in each):
   - `systems/pathfinding/scratch.zig` (added by the Slice 72 Batch A review
     follow-up, which moved `SearchScratch` from `std.atomic.cache_line` to the
     64 B rule by measurement; see the slice-72 Status)
-  - `systems/simulation_scope.zig:66`
-  - `systems/spatial_index.zig:76`
-  - `systems/pathfinding/nav_graph.zig:137`
-  - `systems/collision.zig:97`
-  - `systems/perception.zig:327`
+  - `systems/simulation_scope.zig`
+  - `systems/spatial_index.zig`
+  - `systems/pathfinding/nav_graph.zig`
+  - `systems/collision.zig`
+  - `systems/perception.zig`
 - **Four identical private `paddingForCacheLine(comptime T)` helpers**
-  (Slice 72 I2 deleted affect's copy, its constant and `AffectEventRangeSlot`):
-  `spatial_index.zig:887-890`,
-  `simulation_scope.zig:848-851`, `collision.zig:994-997`,
-  `perception.zig:339-342`.
+  (file-scope `fn paddingForCacheLine`; Slice 72 I2 deleted affect's copy, its
+  constant and `AffectEventRangeSlot`): `systems/spatial_index.zig`,
+  `systems/simulation_scope.zig`, `systems/collision.zig`,
+  `systems/perception.zig`.
 - **The padded slot types they guard**:
   - `GatherTallySlot` (`simulation_scope.zig:584-592`, already with a comptime
     size assert; runtime size test `:1552`). Slice 72 C5 replaced the old
