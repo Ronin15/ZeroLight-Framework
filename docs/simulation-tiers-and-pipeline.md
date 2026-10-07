@@ -104,8 +104,11 @@ uses the pipeline's `simViewRegion(context)`. `GameDemoState.simViewRect()` is
 the only sim-view source (`camera_current`, the camera computed at the end of
 the previous step). No simulation path reads `WorldSystem.visibleChunkRegion()`
 — that window is set by `render` from the interpolated camera for draw culling
-only. A `null` `sim_view` keeps the full-active fallback (no stagger filter, no
-tier changes) used by bare-world pipeline tests.
+only. `sim_view` is required (a non-optional `Rect`), so no caller can silently
+skip scope gating. Only a world with no chunks yields no region, which keeps the
+full-active fallback (no halo, no stagger filter, no tier changes); pipeline tests
+pass a full-world-extent rect, and a test whose subject is the whole population
+thinking in one step on a chunked world marks it `always_active`.
 
 Late-stage pose order (after movement integrate):
 

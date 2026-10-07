@@ -294,6 +294,9 @@ pub const SimulationSeed = struct {
 - Add `SimulationPipelineUpdateContext.sim_view: ?Rect = null`. It is the
   fixed-step camera rect the simulation uses for scope. `null` keeps today's
   full-active fallback for bare-world pipeline tests that never set a window.
+  (Branch-review follow-up: `sim_view` is now a required `Rect`; tests pass a
+  full-world-extent rect, and only a chunkless world yields the null-region
+  full-active fallback.)
 - Add `pub fn chunkRegionForWorldRect(self: *const WorldSystem, rect: Rect,
   overscan_chunks: u16) ?ActiveRegion`. It is pure and returns `null` when
   `chunks.len == 0`. Factor the tile/chunk math out of

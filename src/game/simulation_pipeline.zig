@@ -435,13 +435,13 @@ pub const SimulationPipelineUpdateContext = struct {
     /// Optional particle system for soft-drop destroy bursts (Slice 45).
     particles: ?*ParticleSystem = null,
     /// Fixed-step camera rect the simulation derives scope from (cognition
-    /// halo, tier bands) via `simViewRegion` / `cognitionRegionForWorldRect`.
-    /// Never the render visibility window, which follows the interpolated
-    /// render camera and so depends on frame pacing. `null` keeps the
-    /// full-active fallback (no stagger filter, no tier demotion) for bare-world
-    /// pipeline tests. Production callers must always set this: a missing view
-    /// silently disables scope gating and runs every entity at full cost.
-    sim_view: ?Rect = null,
+    /// halo, stagger, tier bands) via `simViewRegion` /
+    /// `cognitionRegionForWorldRect`. Never the render visibility window, which
+    /// follows the interpolated render camera and so depends on frame pacing.
+    /// Required: a missing view would silently disable scope gating and run every
+    /// entity at full cost. A world with no chunks yields no region, which keeps
+    /// the full-active fallback (no halo, no stagger, no tier demotion).
+    sim_view: Rect,
 };
 
 /// Chunk overscan applied to `sim_view` for simulation scope. Equals the demo's
@@ -454,7 +454,7 @@ pub const sim_view_overscan_chunks: u16 = 1;
 /// call this rather than reading any world visibility state.
 fn simViewRegion(context: SimulationPipelineUpdateContext) ?ActiveRegion {
     var region = context.world.chunkRegionForWorldRect(
-        context.sim_view orelse return null,
+        context.sim_view,
         sim_view_overscan_chunks,
     ) orelse return null;
     region.level = context.player.current_level;
@@ -1347,8 +1347,9 @@ pub const SimulationPipeline = struct {
         }
     };
 
-    /// Runs `stage_order` and returns stage stats. Scope selection uses the live
-    /// camera cognition halo (index/candidates) plus stagger (think set); chunk
+    /// Runs `stage_order` and returns stage stats. Scope selection uses the
+    /// fixed-step `sim_view` cognition halo (index/candidates) plus stagger (think
+    /// set); chunk
     /// columns are derived in their own late stage after positions settle.
     /// Action intents are already on the frame from `captureActionIntent`.
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
@@ -1426,10 +1427,7 @@ pub const SimulationPipeline = struct {
     fn stageScopeAdvanceAndAiGather(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         self.scope.advanceStep();
-        step.cognition_region = if (context.sim_view) |view|
-            context.world.cognitionRegionForWorldRect(view, sim_view_overscan_chunks, cognition_halo_chunks)
-        else
-            null;
+        step.cognition_region = context.world.cognitionRegionForWorldRect(context.sim_view, sim_view_overscan_chunks, cognition_halo_chunks);
         const stagger_step = self.scope.staggerStep();
         const ai_pops = try self.scope.gatherAiPopulations(context.data, step.cognition_region, stagger_step, context.thread_system, .{});
         step.ai_halo_indices = ai_pops.halo;
@@ -1776,6 +1774,7 @@ test "pipeline updates full active player-only state through serial path" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     try std.testing.expectEqual(@as(usize, 1), stats.scope.stats.total_entities);
@@ -1863,6 +1862,7 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The NPC crossed from (5,3) into the just-dug hole cell (6,3) and fell to
@@ -2010,6 +2010,7 @@ test "pipeline update after reserve allocates nothing on frame streams with dig,
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -2084,9 +2085,9 @@ test "pipeline resamples AI wander direction across fixed steps" {
     });
     defer pipeline.deinit();
 
-    // No `sim_view` is passed, so the cognition region is null and the AI
-    // gather falls back to full-active with no stagger gating — the wanderer
-    // runs every step.
+    // The world has no chunks, so the full-world `sim_view` yields no cognition
+    // region and the AI gather falls back to full-active with no stagger gating —
+    // the wanderer runs every step.
     frame.beginStep();
     const stats1 = try pipeline.update(.{
         .data = &data,
@@ -2097,6 +2098,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 1), stats1.ai.entity_count);
     const step1 = frame.navigation_intents.mergedItems()[0];
@@ -2116,6 +2118,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
             .delta_seconds = 0.016,
             .bounds_width = 800,
             .bounds_height = 450,
+            .sim_view = fullWorldSimView(&world),
         });
     }
     const step_after_epoch = frame.navigation_intents.mergedItems()[0];
@@ -2203,6 +2206,7 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Both stages ran over the same scoped agent this step (observable stage
@@ -2284,6 +2288,7 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Memory is fresh and valid, but belongs to `other_target`, not the
@@ -2330,6 +2335,9 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     // A level must exist or PerceptionSystem's LOS-blocked cache treats every
     // observer as fail-closed (blocked), never reporting a target visible.
     _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: keep both agents thinking this step.
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 4, 4, 4, 4, 4);
@@ -2360,6 +2368,7 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Both perception and affect ran this step over the observer (the only
@@ -2442,6 +2451,7 @@ test "pipeline fear selects flee before movement, not only a positive drive" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     try std.testing.expectEqual(@import("data_system.zig").AiBehavior.flee, data.aiAgentConst(observer).?.active_behavior);
@@ -2511,6 +2521,7 @@ test "pipeline perception acquire refreshes memory last_known the same step" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const memory = data.aiMemoryConst(observer).?;
@@ -2589,6 +2600,7 @@ test "chunk_derive matches the pose after a contact push crosses a chunk boundar
         .delta_seconds = 0.016,
         .bounds_width = 128,
         .bounds_height = 64,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const settled = data.movementBodyConst(player.entity).?;
@@ -2670,6 +2682,7 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The pursuer's real perception saw `target` (close, hostile stance) this
@@ -2865,6 +2878,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Dormant NPC never transitioned: the tier gate skipped it despite straddling
@@ -2940,6 +2954,7 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Scoping: perception's gather ran only over the cognition-tier ai agent,
@@ -3294,6 +3309,9 @@ test "default-config pipeline publishes every perception acquisition and refresh
 
     var world = try shareTestWorld();
     defer world.deinit();
+    // Every observer acquires in one step (the share's worst case), so opt out of
+    // the full-world `sim_view`'s stagger.
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
@@ -3316,6 +3334,7 @@ test "default-config pipeline publishes every perception acquisition and refresh
         .delta_seconds = 0.016,
         .bounds_width = 2048,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     try std.testing.expectEqual(@as(usize, 2), countPerceptionEvents(&frame).perceived);
@@ -3342,6 +3361,9 @@ test "derived perception share covers an identity swap for every observer" {
 
     var world = try shareTestWorld();
     defer world.deinit();
+    // Every observer swaps in one step (the share's worst case), so opt out of the
+    // full-world `sim_view`'s stagger.
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
@@ -3362,6 +3384,7 @@ test "derived perception share covers an identity swap for every observer" {
         .delta_seconds = 0.016,
         .bounds_width = 2048,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     };
     frame.beginStep();
     _ = try pipeline.update(context);
@@ -3450,7 +3473,10 @@ test "perception share grows at the seam so newly created observers never trunca
     try std.testing.expectEqual(@as(usize, 64), pipeline.perception_max_events_per_step);
     try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
 
-    // Every observer acquires in the same step: 7 events, none truncated.
+    // Every observer acquires in the same step: 7 events, none truncated. Opt the
+    // whole committed population out of the full-world `sim_view`'s stagger so the
+    // share's worst case is what runs.
+    try markAllAlwaysActive(&data);
     frame.beginStep();
     const stats = try pipeline.update(.{
         .data = &data,
@@ -3461,6 +3487,7 @@ test "perception share grows at the seam so newly created observers never trunca
         .delta_seconds = 0.016,
         .bounds_width = 2048,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 7), countPerceptionEvents(&frame).perceived);
     try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
@@ -3548,6 +3575,7 @@ test "pipeline commits the dig stage's world edit before the tile gate reads wal
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The dig mined (6,3) walkable this step, so the gate let the NPC keep its
@@ -3647,6 +3675,7 @@ test "pipeline tile gate after collision response rejects contact push into soli
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const body = data.movementBodyConst(player.entity).?;
@@ -3740,6 +3769,7 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
         .delta_seconds = 0.016,
         .bounds_width = tile_size * 16,
         .bounds_height = tile_size * 8,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const body = data.movementBodyConst(player.entity).?;
@@ -3832,6 +3862,7 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     var tile_events: usize = 0;
@@ -4132,6 +4163,7 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The observer heard this step's dig, which is only possible if dig produced
@@ -4210,6 +4242,7 @@ test "pipeline promotes deferred impacts before perception on the following step
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const perception = data.aiPerceptionConst(observer).?;
@@ -4297,6 +4330,7 @@ test "pipeline defers player collision impacts until the next step" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expect(stats.collision.contact_count > 0);
     try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
@@ -4313,6 +4347,7 @@ test "pipeline defers player collision impacts until the next step" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
 }
@@ -4390,6 +4425,7 @@ test "head-on player impact enqueues even after collision response zeroes approa
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     try std.testing.expect(stats.collision.contact_count > 0);
@@ -4468,6 +4504,7 @@ test "pipeline emits player footstep stimulus before perception in the same step
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const perception = data.aiPerceptionConst(observer).?;
@@ -4926,6 +4963,7 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 1), stats.action_intents_consumed);
     try std.testing.expectEqual(@as(usize, 0), stats.action_intents_dropped);
@@ -5026,6 +5064,7 @@ test "pipeline.update reports action_intents_dropped after capture soft-drop" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 1), stats.action_intents_dropped);
 }
@@ -5296,6 +5335,7 @@ test "player-dug ramp is routable by an underground NPC the same step" {
         .delta_seconds = 0.016,
         .bounds_width = 256,
         .bounds_height = 256,
+        .sim_view = fullWorldSimView(&world),
     };
     frame.beginStep();
     frame.dig_intent = .ramp;
@@ -5378,6 +5418,7 @@ test "a ramp dig past the initial link reservation grows at the dig seam and is 
         .delta_seconds = 0.016,
         .bounds_width = 256,
         .bounds_height = 256,
+        .sim_view = fullWorldSimView(&world),
     };
     frame.beginStep();
     frame.dig_intent = .ramp;
@@ -5480,6 +5521,7 @@ const LinkGrowthFixture = struct {
             .delta_seconds = 0.016,
             .bounds_width = 256,
             .bounds_height = 256,
+            .sim_view = fullWorldSimView(&self.world),
         });
     }
 
@@ -5985,6 +6027,25 @@ const TestAllocatorCounters = struct {
 
 /// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: commit with the
 /// nav-reaction slot reserved, run the population seam, then the post-commit reactions.
+/// Test-only `sim_view` covering the whole world extent: every chunk of the
+/// player's level is in view, so nothing on that level leaves the cognition halo
+/// or demotes. A chunkless world yields no region (the full-active fallback).
+fn fullWorldSimView(world: *const WorldSystem) Rect {
+    return .{ .x = 0, .y = 0, .w = world.worldWidthPixels(), .h = world.worldHeightPixels() };
+}
+
+/// Test-only: opts every movement body out of cognition stagger. A full-world
+/// `sim_view` on a chunked world applies stagger (each agent thinks one step in
+/// `cognition_stagger_n`); tests whose subject is the whole population thinking in
+/// one step (a worst-case event share, a stage-order read) mark it always-active.
+fn markAllAlwaysActive(data: *DataSystem) !void {
+    for (data.movementBodySliceConst().entities) |entity| {
+        var metadata = data.simulationMetadata(entity).?;
+        metadata.always_active = true;
+        try data.setSimulationMetadata(entity, metadata);
+    }
+}
+
 fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
     const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
         SimulationPipeline.pendingEventsMayInvalidateNavigation(frame) or
@@ -6124,6 +6185,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         .delta_seconds = 0.016,
         .bounds_width = 256,
         .bounds_height = 256,
+        .sim_view = fullWorldSimView(&world),
     };
     // Warm step at the initial population.
     frame.beginStep();
@@ -6308,6 +6370,7 @@ fn runContactBoundScenario(mode: CollisionResponseMode) !void {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     };
     // Warm step at the initial population.
     frame.beginStep();
@@ -6531,6 +6594,7 @@ test "statics committed within the responder headroom never grow the steering sn
         .delta_seconds = 0.016,
         .bounds_width = 4096,
         .bounds_height = 64,
+        .sim_view = fullWorldSimView(&world),
     };
 
     // First growth: 12 dynamic responders and 1 static.

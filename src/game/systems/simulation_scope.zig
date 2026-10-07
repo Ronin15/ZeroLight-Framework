@@ -104,8 +104,8 @@ pub const SimulationScopeSystem = struct {
     /// Warmed collision dense-index list. null return = full-active (no dormant/kinematic with bounds).
     /// The threaded gather writes per-range windows into it, then compacts them in place.
     collision_indices: IndexList = .empty,
-    /// Warmed AI agent dense-index list: cognition-tier agents inside the camera
-    /// halo (no stagger). Spatial index and perception candidates consume this.
+    /// Warmed AI agent dense-index list: cognition-tier agents inside the
+    /// fixed-step `sim_view` cognition halo (no stagger). Spatial index and perception candidates consume this.
     /// `always_active` agents are included even outside the halo. The threaded gather
     /// writes per-range windows into it, then compacts them in place.
     ai_halo_indices: IndexList = .empty,

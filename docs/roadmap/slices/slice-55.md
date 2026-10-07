@@ -289,10 +289,10 @@ comptime carried rules at `simulation_pipeline.zig:319-347`.
   `gatherAiPopulations`, which also takes its tick explicitly. `sim_region` is
   whatever `simViewRegion(context)` returned; the scope system never reads a
   world window itself.
-- When `sim_region` is null (no `sim_view`, as in bare-world pipeline tests),
-  the decide list is a memcpy of `think` and `decision_coast_skips = 0`. This
-  mirrors the stagger's null-region full-active fallback, so every existing
-  null-region test keeps today's behavior. An empty `think` returns
+- When `sim_region` is null (a world with no chunks; `sim_view` itself is a
+  required `Rect`), the decide list is a memcpy of `think` and
+  `decision_coast_skips = 0`. This mirrors the stagger's null-region full-active
+  fallback, so every existing chunkless-world test keeps today's behavior. An empty `think` returns
   immediately.
 - `fn coastableBehavior(b: AiBehavior) bool`: wander and cohere return true;
   pursue, flee, and investigate return false.
@@ -474,8 +474,10 @@ list. Separation caps 32/128, `decideDir`, the avoidance kernels, and the
       passes a non-null `sim_view`, so coasting is active in **every** demo
       test that runs `update` (the init-time window at
       `game_demo_state.zig:414-419` no longer matters). Grep every test that
-      runs `GameDemoState.update` or `pipeline.update` with a non-null
-      `sim_view` and asserts per-agent intents or motion within one stagger
+      runs `GameDemoState.update` or `pipeline.update` (every one passes a
+      `sim_view` now that it is required; pipeline tests pass
+      `fullWorldSimView`, so coasting applies to them on any chunked world) and
+      asserts per-agent intents or motion within one stagger
       cycle, and list each in the PR. Known today:
       - `game_demo_state.zig:1831` ("demo ai processor drives non-player
         squares via intents"): loop `cognition_stagger_n *
