@@ -30,8 +30,8 @@ simulation, richer emergent AI, and production-friendly asset workflows.
 - **Emergent AI (in progress)** — agents see, hear, remember, and react with
   simple emotions and data-authored personalities. Combat AI and deeper goals
   are on the roadmap.
-- **Interactables (early)** — smashable crates that open new paths; a full
-  combat and interaction system is on the roadmap.
+- **Destruction and construction (in progress)** — digging, ramps, and
+  destructible objects today, built toward large-scale destruction and building.
 - **Atlas-backed assets** — packed runtime atlases with stable IDs so art and
   audio can be swapped without rewriting game code.
 - **Multithreaded and deterministic** — threaded systems with identical
