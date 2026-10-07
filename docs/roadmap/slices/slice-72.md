@@ -760,7 +760,7 @@ Out of scope (each item has a named owner):
   - `ensureFrameBatchCapacity` is unchanged and still grows prepared, vertex and group storage plus the GPU streams before the threaded emit.
   - Update the comments at `renderer.zig:1239-1244` and `gpu_smoke_impl.zig:73-76`.
 - **Benefit:** the outcome no longer depends on growth history, and drift in the reservation formula shows up as a counter.
-- **Cost:** the loud failure becomes counter plus warn. Tests assert zero growth under a correct reservation. No hot-path cost, because the same compare is reused.
+- **Cost:** the loud failure becomes counter plus warn. Tests assert zero growth under a correct reservation. The capacity-growth check is the only draw-path compare that ships. The as-landed drift accounting (a separate per-submit compare against the frame's reservation, which `ensureTotalCapacity` rounds the physical capacity past) is not free, so branch review moved it, its counters, and the warn into `SpriteBatch.ReservationDrift`, which is comptime-gated on `runtime_perf_log.enabled`. That makes it zero-sized in ReleaseFast/ReleaseSmall, where `sprite_command_overflow_grows` reads 0.
 - **Determinism:** submission happens on the main thread only (`render_prep.zig:94-95`).
 
 **H2. Geometric tile-edit transfer growth** (render-assets-11). Medium priority, Batch H.

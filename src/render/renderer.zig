@@ -436,9 +436,10 @@ pub const Renderer = struct {
     /// Grows batch storage to hold `command_capacity` ordered sprite commands.
     /// Setup-time and grow-only (never shrinks); call before relying on
     /// allocation-free render frames. Marks the frame reserved at `command_high_water`,
-    /// the same bound `ensureFrameBatchCapacity` grows past, so a frame whose submits
-    /// exceed it is counted as reservation drift (`SpriteBatch.command_overflow_grows`)
-    /// even when the command list's rounded-up capacity absorbed them; it still grows.
+    /// the same bound `ensureFrameBatchCapacity` grows past, so in perf-diagnostic builds a
+    /// frame whose submits exceed it is counted as reservation drift
+    /// (`SpriteBatch.commandOverflowGrows`) even when the command list's rounded-up
+    /// capacity absorbed them; it still grows in every build.
     pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
         if (command_capacity > self.command_high_water) {
             const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
@@ -1241,8 +1242,8 @@ pub const Renderer = struct {
         if (command_count == 0) return;
         // Over-submission beyond the reserved `command_high_water` is handled the same
         // way in Debug and ReleaseFast. `drawSprite` already grew the command list if
-        // needed and, in a reserved frame, counted crossing this same bound as drift
-        // (`SpriteBatch.command_overflow_grows`); this fallback grows prepared/vertex/group
+        // needed and, in a reserved frame of a perf-diagnostic build, counted crossing this
+        // same bound as drift (`SpriteBatch.commandOverflowGrows`); this fallback grows prepared/vertex/group
         // storage and the GPU streams before the threaded emit. There is no hard submit
         // bound. A Debug-only assert against `command_high_water` would panic where
         // ReleaseFast regrows.
@@ -2336,7 +2337,7 @@ test "reserve sprite commands is grow-only and enables allocation-free enqueue" 
     try renderer.reserveSpriteCommands(8);
     const capacity_before = renderer.batch.commands.capacity;
     try renderer.reserveSpriteCommands(4);
-    try std.testing.expect(renderer.batch.frameReserved());
+    try std.testing.expectEqual(@as(usize, 8), renderer.command_high_water);
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
 
     const white = TextureId.init(0, 1) catch unreachable;
@@ -2485,10 +2486,12 @@ test "reserved sprite frame submits allocation-free with no overflow growth (Fai
     }
     try std.testing.expectEqual(reserved, renderer.spriteCommandCount());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), renderer.batch.command_overflow_grows);
+    try std.testing.expectEqual(@as(u64, 0), renderer.batch.commandOverflowGrows());
 }
 
 test "submits past the reservation inside the command list's slack count as drift" {
+    // Drift diagnostics compile out of shipping builds (`SpriteBatch.ReservationDrift`).
+    if (!@import("../app/runtime_perf_log.zig").enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var renderer = Renderer{
         .allocator = allocator,
@@ -2524,7 +2527,7 @@ test "submits past the reservation inside the command list's slack count as drif
     // once for the frame.
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
     try std.testing.expect(renderer.spriteCommandCount() > renderer.command_high_water);
-    try std.testing.expectEqual(@as(u64, 1), renderer.batch.command_overflow_grows);
+    try std.testing.expectEqual(@as(u64, 1), renderer.batch.commandOverflowGrows());
     try std.testing.expectEqual(@as(usize, 1), renderer.batch.finishPrepStats(.{}).command_overflow_grows);
 }
 
