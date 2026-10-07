@@ -149,26 +149,14 @@ took ~6 min.
   Tests: the existing repack, OOM-sweep and parity tests keep passing; add a case
   where the first grown chunk is not chunk 0 and assert the result equals a full
   rebuild.
-- [ ] **Threaded level repack (owner requirement).** One step's repacks run
-  after all affected levels are patched, serial or threaded across levels
-  through the same `patch_threads` (adaptive tuner, inline fallback, the
-  existing pre-select + dual-assert job pattern). Main thread first measures
-  every affected level and allocates every new arena (an OOM leaves every
-  level's old layout intact), plus per-participant patch scratch already
-  reserved at the build; workers then do disjoint per-level copy, rebase and
-  re-patch of flagged chunks; stats merge in level order. The per-level
-  measure scratch (`new_caps` / `edge_counts`) becomes per level (2 × chunk
-  count × affected levels, reserved at the build for the level count). Note the
-  level loop in `applyNavUpdates` then patches every affected level before any
-  repack, so the failure-state comments change (a failed repack leaves every
-  affected level patched with flagged chunks at empty adjacency). Tests: serial
-  == threaded layout and graph for a multi-level cave-in step (real 3-worker
-  `ThreadSystem`); a FailingAllocator proof that a warmed threaded repack step
-  that fits allocates nothing except the arenas, and a steady step allocates
-  zero; an OOM before dispatch leaves every level's caps, bases, arena pointer
-  and length intact, no flag set, no edge into a tombstone, and the retry equals
-  a full rebuild. Bench both paths on the cave-in case and record before/after.
-
+- [ ] **Threaded level repack: gated on a real trigger.** A repack runs only
+  on a step where a chunk's window overflows, and it touches only the levels
+  that step changed, a handful at most. It does not scale with population. The
+  1024² / 32-level cave-in bench, at about 2 ms for 3 levels on one rare step,
+  is a scaling stress test, not a frame-budget target. Thread it, with serial
+  and threaded paths across levels, allocate-before-mutate on the main thread,
+  and serial == threaded plus OOM tests, only if the demo-scale soak (Slice
+  69A) shows repack steps above 1 ms or several per second.
 ### Acceptance checks
 
 - [x] `zig build verify` passes, and `zig build test -Doptimize=ReleaseFast`
