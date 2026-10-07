@@ -4,7 +4,7 @@
 
 //! AI decision processor: gathers per-row perception/memory/affect/personality
 //! signals, runs `arbitration.zig`'s utility scoring + sticky selection +
-//! goal resolution (Slice 32) to pick one of 5 behaviors and a concrete goal,
+//! goal resolution to pick one of 5 behaviors and a concrete goal,
 //! then blends that goal with wander noise and local separation into a
 //! `NavigationIntent`. Arbitration output is per-agent: perception's
 //! `nearest_threat` is already faction-generic (any hostile can become a
@@ -14,7 +14,7 @@
 //! Stateless (except work memory + per-system tuner); reads typed const slices for ai + movement prior positions,
 //! pre-sizes NavigationIntent output ranges and uses staged parallelForWithOptions work.
 //! Deterministic via explicit seed in config. Gather uses DataSystem dense-index lookup, so cost is bounded by live AI rows.
-//! Separation queries the pipeline-owned `SpatialIndexSystem` (Slice 28) — the caller
+//! Separation queries the pipeline-owned `SpatialIndexSystem` — the caller
 //! builds it once per step from the unstaggered cognition halo and passes a
 //! read-only `SpatialIndexView` in; this module no longer owns a private grid.
 //! Think-set rows are a subset of that halo, so gather records `spatial_self_index`
@@ -154,7 +154,7 @@ const RowDrives = struct {
     fatigue: f32,
 };
 
-/// World interest marker signal (Slice 41), gathered from `WorldSystem`.
+/// World interest marker signal, gathered from `WorldSystem`.
 const RowInterest = struct {
     present: bool = false,
     x: f32 = 0,
@@ -362,7 +362,7 @@ pub const AiConfig = struct {
     /// drive scores as 0 (pure personality-gain + perception/memory scoring).
     affect_slice: ?ConstAiAffectSlice = null,
     /// Solver-mode ceiling honored only when a row's `kind_hint` is not
-    /// `.individual`. Per Slice 32's `arbitration.resolveGoal`, every
+    /// `.individual`. Per `arbitration.resolveGoal`, every
     /// behavior (including the `focus_target` pursue fallback) currently
     /// resolves `kind_hint = .individual` — goals are agent-specific by
     /// construction now, not a single broadcast target — so this field has
@@ -577,7 +577,7 @@ pub const AiSystem = struct {
         };
     }
 
-    // Population-domain contract with `spatial_index.zig` (Slice 28): the shared
+    // Population-domain contract with `spatial_index.zig`: the shared
     // `SpatialIndexSystem` the caller builds for this step walks the identical
     // halo/`scope_dense_indices` selection with the identical
     // `movementBodyDenseIndex(entity) orelse continue` skip, in the same order —
@@ -1651,12 +1651,11 @@ test "ai goal requantization: nonzero hysteresis holds the goal until displaceme
 }
 
 test "ai goal requantization: decideDir's steering target is the same held goal as the NavigationIntent, not a separate live target" {
-    // Slice 32 simplification: unlike the pre-arbitration broadcast design,
-    // there is no longer a separate raw/live vs hysteresis-held pair for a
-    // resolved goal -- resolveGoal's output feeds both the NavigationIntent's
+    // There is no separate raw/live vs hysteresis-held pair for a
+    // resolved goal: resolveGoal's output feeds both the NavigationIntent's
     // `.goal` and decideDir's steering target uniformly, for every tier
     // (perception/memory goals are already fresh every step; only the
-    // focus_target fallback has a hysteresis concept at all, and it now
+    // focus_target fallback has a hysteresis concept at all, and it
     // applies identically to both consumers).
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2592,7 +2591,7 @@ test "ai gather direct table and separation blend produce correct order + dirs (
 test "ai serial and threaded (0 workers) produce identical intents with separation + seek_target" {
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns, so serial
-    // and threaded must start from identical unmutated state (L2).
+    // and threaded must start from identical unmutated state.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -2645,7 +2644,7 @@ test "ai serial and real threaded workers produce identical navigation intents" 
     if (builtin.single_threaded) return error.SkipZigTest;
 
     // Two DataSystems: arbitration write-back mutates sticky columns, so serial
-    // and threaded must start from identical unmutated state (L2).
+    // and threaded must start from identical unmutated state.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3378,7 +3377,7 @@ test "ai memory override does not apply while perception still reports the targe
 
 test "ai serial and threaded (0 workers) agree on a memory-overridden seek target" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    // Two DataSystems: arbitration write-back mutates sticky columns (L2).
+    // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3444,7 +3443,7 @@ test "ai serial and threaded (0 workers) agree on a memory-overridden seek targe
     try std.testing.expectEqual(@as(f32, 100), serial[0].goal.y);
 }
 
-// ---- Slice 32 arbitration integration tests -----------------------------------
+// ---- Arbitration integration tests ---------------------------------------------
 
 test "arbitration pursue resolves from a non-player hostile entity, not context.player" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3506,7 +3505,7 @@ test "arbitration graceful degrade to wander when perception/memory/affect are a
     // A nonzero pursue gain but no perception/memory/affect component and no
     // configured focus_target: no signal anywhere ties pursue's score above
     // wander's, so wander wins the lowest-index tie-break -- an ordinary
-    // wander-only agent behaves identically to before this slice.
+    // wander-only agent keeps wandering.
     try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = 30, .gain_pursue = 1.0 });
 
     const ai_slice = data.aiAgentSliceConst();
@@ -3577,7 +3576,7 @@ test "invalid pursue goal writes wander active_behavior so fatigue does not trea
 
 test "arbitration serial and threaded (0 workers) parity across perception + memory + affect signals" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    // Two DataSystems: arbitration write-back mutates sticky columns (L2).
+    // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);

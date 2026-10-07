@@ -453,8 +453,6 @@ pub const ConstSteeringAgentSlice = struct {
 // Default half-angle is 60 degrees (120 degree full cone). Capped in
 // validateAiPerception at pi/2 (90 degrees) so cos_half_fov never goes
 // negative — the FOV test in PerceptionSystem relies on cos_half_fov >= 0.
-// Widening past 90 degrees is deferred to a future slice if a wider cone is
-// ever needed.
 const default_ai_perception_fov_half_angle_radians: f32 = std.math.pi / 3.0;
 // cos(pi/3) == 0.5 exactly; kept as a literal comptime constant (not a
 // math.sinCos call) so the struct-field default stays trivially comptime-known.
@@ -615,9 +613,8 @@ pub const AiMemorySlice = struct {
     ring_next_slot: []u8,
 };
 
-/// One appraisal drive an `AiAffect` row tracks. A future arbitration slice
-/// switches behavior selection on this; this slice only appraises and
-/// decays the four drives.
+/// One appraisal drive an `AiAffect` row tracks. `AffectSystem` appraises and
+/// decays the four drives; arbitration reads them.
 pub const AiAffectDrive = enum { fear, curiosity, aggression, fatigue };
 
 /// Rising/falling-edge threshold-crossing band: a drive must fall below
@@ -679,7 +676,7 @@ pub const AiAffectCommand = struct {
     affect: AiAffect,
 };
 
-/// Compact destructible fact for action-intent consumers (Slice 45). Demo crates
+/// Compact destructible fact for action-intent consumers. Demo crates
 /// use `hit_points = 1` (one interact/attack destroys). Multi-hit entities keep
 /// remaining HP via deferred `set_destructible` until zero → `destroy_entity`.
 pub const Destructible = struct {

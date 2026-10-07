@@ -2,16 +2,16 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AI perception substrate (Slice 29): gathers the cognition-scoped subset of
+//! AI perception substrate: gathers the cognition-scoped subset of
 //! AI agents that also carry an `AiPerception` component, queries the shared
-//! `SpatialIndexSystem` (Slice 28) for nearby hostile candidates, applies a
+//! `SpatialIndexSystem` for nearby hostile candidates, applies a
 //! squared-form field-of-view test and a bounded line-of-sight raycast, and
 //! writes the winning `nearest_threat`/`target_visible`/`last_seen_x/y`/
 //! `facing_x/y` hot columns back onto `DataSystem`'s `PerceptionStore`.
 //! Emits `entity_perceived`/`entity_lost` `SimulationEvent`s on transitions,
 //! derived on the main thread after the parallel compute pass from the
 //! per-row `prev_*`/`final_nearest_threat_*` columns the workers already
-//! write (`emitTransitionEvents`, Slice 72 I1) — no per-range event scratch.
+//! write (`emitTransitionEvents`) — no per-range event scratch.
 //!
 //! Two-index-space contract (population-domain equivalence with
 //! `spatial_index.zig`, mirrors `ai.zig`'s cross-file contract): this
@@ -47,10 +47,10 @@
 //! dist_squared` is equivalent to a true angle compare given `cos_half_fov >=
 //! 0`, which `AiPerception`'s `fov_half_angle_radians <= pi/2` cap guarantees
 //! (see `data_system/perception.zig`). A wider-than-90-degree cone (needing a
-//! sign-split) is explicitly out of scope for this slice.
+//! sign-split) is not supported.
 //!
 //! Scalar exceptions (each documented again at its call site): the spatial
-//! cell-scan traversal and stance lookup (Slice 28 shared infra; branchy and a
+//! cell-scan traversal and stance lookup (shared spatial-index infra; branchy and a
 //! 4-value enum table index, not float math), the small (<= 17) per-agent
 //! nearest-candidate sort (irreducibly small/branchy, does not scale with
 //! population), and the bounded LOS raycast (early-exit grid/DDA walk, one
@@ -1028,8 +1028,8 @@ pub const PerceptionSystem = struct {
         return totals;
     }
 
-    /// Main-thread transition emit after the parallel/serial compute pass
-    /// (Slice 72 I1). `total` is the workers' uncapped event count
+    /// Main-thread transition emit after the parallel/serial compute pass.
+    /// `total` is the workers' uncapped event count
     /// (`PerceptionRangeStats.transition_events`); this system's own
     /// deterministic per-step cap keeps the first `max_events_per_step` in
     /// row order (`entity_lost` before `entity_perceived` within a row),
@@ -1304,7 +1304,7 @@ const NeighborVisitContext = struct {
     scratch: *CandidateScratch,
 };
 
-/// Scalar: the spatial cell-scan traversal itself (Slice 28 shared infra) and
+/// Scalar: the spatial cell-scan traversal itself (shared spatial-index infra) and
 /// the stance lookup (a 4-value enum table index, not float math) are both
 /// branchy/sparse, not dense uniform work, so this callback stays scalar —
 /// same shape as ai.zig's `separationNeighborVisit`. Negates
@@ -1577,7 +1577,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     var heard_stimulus = false;
     var heard_x: f32 = 0;
     var heard_y: f32 = 0;
-    // Soft ranking (Slice 39): max intensity / (1 + dist2 * k) among same-level
+    // Soft ranking: max intensity / (1 + dist2 * k) among same-level
     // stimuli inside the hard hearing range. Equal intensities reduce to nearest.
     // Kind is not stored on perception columns — bus-only metadata.
     var best_score = -std.math.inf(f32);
@@ -3032,7 +3032,7 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
 }
 
 test "multi-range serial/threaded cap=1 keeps the same survivor under identity-swap + acquire" {
-    // M14: observer A identity-swaps (lost then perceived), observer B acquires.
+    // Observer A identity-swaps (lost then perceived), observer B acquires.
     // With multi-range dispatch and max_events_per_step=1, both serial and real
     // multi-worker threaded paths must keep the same single survivor event
     // (row order, `entity_lost` before `entity_perceived` within a row — A's
@@ -3356,7 +3356,7 @@ test "PerceptionSystem dual-list gather has no steady-state allocation after war
 test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    // Slice 72 I1: nothing partition-sized is left to reserve, so `reserve`
+    // Nothing partition-sized is left to reserve, so `reserve`
     // alone (no warm step) covers the tuner's 64-item initial profile and the
     // 16-item alignment floor on the real multi-worker path. 16 hostile
     // non-observers on y = 0 and 96 `.player` observers on y = 10 facing -y:

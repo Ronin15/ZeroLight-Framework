@@ -392,7 +392,7 @@ test "autoSizedMaxNavMemoryBytes covers the gate's ceiling caps and counts level
 }
 
 test "abstract slot term is levels * chunks * (4*ct + K) and links add only the link_edges term" {
-    // Slice 64E E3: every chunk carries the fixed nav_interior_link_slots_per_chunk interior
+    // Every chunk carries the fixed nav_interior_link_slots_per_chunk interior
     // slots regardless of the link set, so the slot-scaled buffers (and the per-participant
     // patch scratch bounded by one chunk's portal cap) never move with link_count. Links only
     // size the global link_edges/link_edge_refs arrays.

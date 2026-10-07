@@ -2,11 +2,11 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Pipeline-owned shared spatial index (Slice 28). Builds one uniform grid per
+//! Pipeline-owned shared spatial index. Builds one uniform grid per
 //! fixed step from the unstaggered cognition-halo population and exposes a bounded,
 //! radius-parameterized neighbor-query API. Replaces the private per-step grid
-//! `AiSystem` used to build for separation and is the substrate future
-//! perception queries (Slice 29) reuse instead of building a second grid.
+//! `AiSystem` used to build for separation and is the substrate perception
+//! queries reuse instead of building a second grid.
 //! Collision broadphase is intentionally NOT ported onto this index: it runs a
 //! tuned sweep-and-prune order (`systems/collision.zig`) that is a different,
 //! already-tuned algorithm, not a duplicate grid build.

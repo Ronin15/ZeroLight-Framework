@@ -599,7 +599,7 @@ pub const CollisionContact = struct {
 /// cross-plane link to climb up.
 pub const DigIntent = enum { none, hole, ramp, down };
 
-/// Closed sensory-bus kind enum (Slice 39). Append tags when a real producer
+/// Closed sensory-bus kind enum. Append tags when a real producer
 /// exists — no speculative empty tags, no strings. Kind is bus/metadata only
 /// for the AI path today: perception still writes position-only heard columns.
 pub const StimulusKind = enum {
@@ -651,8 +651,8 @@ pub const stimulus_sticky_capacity: usize = (stimulus_max_impacts_per_step + 1) 
 
 /// A transient per-step positional stimulus AI hearing can sense. Cleared
 /// every step on the live bus, so it carries no entity identity and is not a
-/// `SimulationEvent`. `intensity` is relative loudness used by hearing ranking
-/// (Slice 39); `kind` is producer metadata on the bus (not a perception column).
+/// `SimulationEvent`. `intensity` is relative loudness used by hearing ranking;
+/// `kind` is producer metadata on the bus (not a perception column).
 pub const WorldStimulus = struct {
     position: math.Vec2,
     intensity: f32,

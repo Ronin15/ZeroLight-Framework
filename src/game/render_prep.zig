@@ -1421,7 +1421,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     const tree = try world.requireTileByName(&meta, "tree_0");
     const level1 = try world.addLevel(-level_z_step);
     _ = try world.addDenseLayer(level1, 0, .floor, grass);
-    // A sparse tile on the deeper, non-active level: the gap this slice closes.
+    // A sparse tile on the deeper, non-active level.
     // Neither `active_level` special-casing nor the old per-layer-draw design
     // needed this; the general interleave-point rule is what must catch it.
     _ = try world.addSparseTile(level1, 0, 0, tree, 0, .effect);
@@ -1435,7 +1435,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
 
     // Test-only: headless SpriteBatch construction (no live GPU). Kept inside the
-    // test so production game code stays on the renderer facade (L6).
+    // test so production game code stays on the renderer facade.
     const sprite_batch = @import("../render/sprite_batch.zig");
     const Material = renderer_mod.Material;
     const DrawGroup = renderer_mod.DrawGroup;
@@ -1531,7 +1531,7 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
 
-    // Test-only headless SpriteBatch (see L6 note on the layered-world test).
+    // Test-only headless SpriteBatch; production game code stays on the renderer facade.
     const sprite_batch = @import("../render/sprite_batch.zig");
 
     var renderer = Renderer{

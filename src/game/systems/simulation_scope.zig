@@ -16,7 +16,7 @@
 //!     tier_policy (same step) and next-step gathers see final world positions.
 //!     Movement/collision gate on tier only — no chunk filter.
 //!
-//! Stage participation rules (Slice 24 / Slice 47):
+//! Stage participation rules:
 //!   movement   — tier.allowsMovement()  — no chunk filter
 //!   collision  — tier.allowsCollision() — no chunk filter
 //!   spatial index / perception candidates — cognition halo, no stagger
@@ -1633,7 +1633,7 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
 }
 
 test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges allocate nothing and match serial" {
-    // Slice 72 C5: `reserve` alone (no warm pass) covers every partition the tuner can
+    // `reserve` alone (no warm pass) covers every partition the tuner can
     // pick, because each pass writes per-range windows of one item-count buffer and the
     // tallies are reserved to maxRangeCount. A retune to more ranges allocates nothing.
     if (builtin.single_threaded) return error.SkipZigTest;

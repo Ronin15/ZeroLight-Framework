@@ -3,8 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! State-owned simulation tier and active-scope contracts.
-//! Slice 24 wires the tier/chunk scaffolding into real scoped behavior:
-//! cognition-stage gating by camera halo, stagger cadence, and tier commands.
+//! Tier/chunk scoping drives cognition-stage gating by camera halo, stagger cadence, and tier commands.
 
 const std = @import("std");
 

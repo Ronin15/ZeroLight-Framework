@@ -16,8 +16,7 @@ const no_cell = types.no_cell;
 const openHeapLimit = types.openHeapLimit;
 
 // Cache-line separation for per-worker scratch slots, same policy as nav_graph.zig,
-// collision.zig, simulation_scope.zig and spatial_index.zig (Slice 65A consolidates the
-// copies into one owner).
+// collision.zig, simulation_scope.zig and spatial_index.zig.
 const thread_shared_record_alignment: usize = 64;
 
 pub const AbstractSlotRow = struct {
@@ -187,9 +186,9 @@ pub const SearchScratch = struct {
     // worker writes its own slot's counters (generation, explored, open/path lengths,
     // abstract counters) on every node. Unaligned, adjacent slots' hot fields share a line
     // and false-share across workers, so threaded solve throughput swung with this struct's
-    // size (Slice 72 A4 bench). 64, not `std.atomic.cache_line` (128 on x86_64): the
-    // ReleaseFast `pathfinding --items 512` bench measured no gain from 128 (Slice 72
-    // follow-up record), matching the engine-wide per-slot rule.
+    // size. 64, not `std.atomic.cache_line` (128 on x86_64): the ReleaseFast
+    // `pathfinding --items 512` bench measured no gain from 128, matching the engine-wide
+    // per-slot rule.
     generation: u32 align(thread_shared_record_alignment) = 1,
     cell_count: usize = 0,
     // Per-solve count of distinct cells stamped this generation, bounded by the

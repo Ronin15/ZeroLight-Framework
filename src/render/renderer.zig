@@ -50,7 +50,7 @@ pub const VertexColumns = sprite_batch.VertexColumns;
 pub const VertexColumnsConst = sprite_batch.VertexColumnsConst;
 pub const writeWorldSpriteQuad = sprite_batch.writeWorldSpriteQuad;
 // Re-exported so game/test code can name draw-list types without importing
-// sprite_batch.zig outside the render facade (L6).
+// sprite_batch.zig outside the render facade.
 pub const DrawGroup = sprite_batch.DrawGroup;
 const DrawSource = sprite_batch.DrawSource;
 pub const Material = sprite_batch.Material;

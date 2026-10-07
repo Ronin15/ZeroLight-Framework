@@ -165,7 +165,7 @@ pub const chunk_edge_floor: u32 = 32;
 // When an incremental nav update touches more than this many distinct levels, the
 // per-affected-level relabel degenerates into a full relabel of every level. It
 // increments a loud `nav_full_relabel` counter so a runaway batch is visible. A fixed
-// per-batch level fan-out bound (65B's classifier reads it), not a capacity: the dirty level
+// per-batch level fan-out bound, not a capacity: the dirty level
 // set is reserved to the world's level count at the nav build.
 pub const default_nav_full_relabel_level_threshold: usize = 8;
 // Fixed abstract-cost penalty added when an abstract A* edge crosses a LevelLink.

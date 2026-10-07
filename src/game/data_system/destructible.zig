@@ -3,7 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Destructible component storage: dense per-entity hit-point / affordance
-//! rows for action-intent consumers (Slice 45). Mirrors faction_level.zig's
+//! rows for action-intent consumers. Mirrors faction_level.zig's
 //! simple dense-row shape — no cold/hot split; all fields are author-set
 //! facts updated via structural `set_destructible` or destroyed wholesale.
 

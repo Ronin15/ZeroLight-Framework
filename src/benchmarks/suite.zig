@@ -257,7 +257,7 @@ pub const RenderGamePrepPhaseSummary = struct {
 };
 
 /// Per-behavior selection counts after one measured `ai` run, read from
-/// `AiAgentStore`'s hot `active_behavior` column post-update (Slice 32
+/// `AiAgentStore`'s hot `active_behavior` column post-update (the
 /// arbitration output) -- proves the utility scorer actually spreads
 /// selections across all five `AiBehavior` buckets at the measured fixture,
 /// not just wander/pursue.

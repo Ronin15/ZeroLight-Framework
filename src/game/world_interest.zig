@@ -2,7 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! World-owned durable interest / affordance markers (Slice 41). Distinct from
+//! World-owned durable interest / affordance markers. Distinct from
 //! ephemeral `WorldStimulus` dig/footstep/impact events.
 //!
 //! Storage is **fixed inline arrays** (`interest_marker_capacity` slots) —

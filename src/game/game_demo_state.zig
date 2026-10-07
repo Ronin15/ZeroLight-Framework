@@ -148,7 +148,7 @@ const demo_creates_per_step: usize = 1;
 
 /// The demo's own part of the `.structural_commit` event share: `demo_creates_per_step`
 /// full creates. The pipeline adds its own destructible share (one
-/// `entity_destroyed`/`set_destructible` per action intent, Slice 45) on top, and tier
+/// `entity_destroyed`/`set_destructible` per action intent) on top, and tier
 /// changes emit no structural event.
 const demo_structural_headroom: usize = structuralEventHeadroom(demo_creates_per_step, 0);
 
@@ -248,13 +248,13 @@ fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_cou
     cap.max_nav_memory_bytes = autoSizedMaxNavMemoryBytes(cap, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles, level_link_count);
     return cap;
 }
-/// Chunk + pixel AABB margin for dynamic collect and sparse visibility (Slice 24B).
+/// Chunk + pixel AABB margin for dynamic collect and sparse visibility.
 const world_render_overscan_chunks: u16 = 1;
 
 comptime {
     // The fixed-step sim view uses the same overscan as the render window, so
     // the simulation scope region equals the render window at interpolation
-    // alpha 1 (Slice 49 render→sim decoupling kept the region unchanged).
+    // alpha 1.
     std.debug.assert(sim_view_overscan_chunks == world_render_overscan_chunks);
 }
 
@@ -284,7 +284,7 @@ pub const GameDemoState = struct {
     ai_overlay: AiDebugOverlay = .{},
     // Last incremental nav-update batch diagnostics, recorded into perf metrics.
     last_nav_update_stats: NavUpdateStats = .{},
-    // Last population-seam result (Slice 72 C3), recorded into perf metrics.
+    // Last population-seam result, recorded into perf metrics.
     last_population_sync: PopulationSyncStats = .{},
     camera_previous: Camera2D = .{},
     camera_current: Camera2D = .{},
@@ -650,8 +650,7 @@ pub const GameDemoState = struct {
     /// Fixed-step camera rect the simulation derives scope from: `camera_current`
     /// (computed by `updateCamera` at the end of the previous step) over the
     /// viewport / zoom. Deterministic — never the interpolated render camera.
-    /// The only sim-view source; Slice 60 replaces just this body with its
-    /// camera-rig anchor.
+    /// The only sim-view source, so a different view anchor changes only this body.
     fn simViewRect(self: *const GameDemoState) Rect {
         return .{
             .x = self.camera_current.position.x,
@@ -943,7 +942,7 @@ fn carveUndergroundSpawnPocket(world: *WorldSystem, tunnel_tile: world_system.Ti
 }
 
 /// Places durable investigate POIs on the surface level (index 0 today).
-/// When Slice 38 lands elevation stacks above the surface, rebind this to the
+/// If elevation stacks above the surface are added, rebind this to the
 /// level whose `levelElevation` is 0 rather than hardcoding storage index 0.
 fn placeDemoInterestMarkers(world: *WorldSystem) !void {
     const w = world.worldWidthPixels();
@@ -1140,7 +1139,7 @@ fn spawnObstacles(data: *DataSystem, world: *const WorldSystem) ![obstacle_count
         try data.setAssetReference(entity, .{ .sprite = .demo_tile });
         try data.setCollisionBounds(entity, .{ .size = spec.size });
         try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
-        // Slice 45: demo crates are one-shot destructibles (R / interact).
+        // Demo crates are one-shot destructibles (R / interact).
         try data.setDestructible(entity, .{ .hit_points = 1 });
         entities[index] = entity;
     }

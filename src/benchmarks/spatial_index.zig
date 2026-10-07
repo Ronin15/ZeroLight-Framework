@@ -2,7 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Shared spatial index (Slice 28) build throughput: times only
+//! Shared spatial index build throughput: times only
 //! `SpatialIndexSystem.build`/`buildSerial` in isolation, answering "index
 //! build allocation-free, no regression" separately from the `ai` group (which
 //! now excludes the build from its own timed window — see

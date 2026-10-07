@@ -2,7 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AI perception substrate (Slice 29) throughput bench: gather -> shared
+//! AI perception substrate throughput bench: gather -> shared
 //! spatial-index neighbor query -> squared-form FOV filter -> bounded
 //! line-of-sight raycast -> transition emit, at the same population scale
 //! `ai.zig`/`spatial_index.zig` already use (`suite.eventScaleCounts`).
@@ -32,9 +32,7 @@
 //! remained between the two groups at every population this bench measures
 //! (not proportional to agent count or `los_checks`) -- the once-per-step
 //! cache-rebuild cost paid against this fixture's deliberately unrealistic
-//! 20,000-tile density, not a per-sample regression. See
-//! `docs/roadmap/archive/slice-29.md` (archived Slice 29) for the full
-//! before/after tables of this original fix.
+//! 20,000-tile density, not a per-sample regression.
 //!
 //! That residual was closed by giving `level_blocked` incremental
 //! dirty-tracking (`LevelBlockedSlot.pending_dirty`,

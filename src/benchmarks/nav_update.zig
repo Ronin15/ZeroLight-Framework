@@ -23,13 +23,13 @@
 //! threading config, so each row's vs_serial column reads directly as localized-vs-whole-level
 //! speedup.
 //!
-//! A fourth group, `nav-update-links`, measures the runtime LevelLink reaction (Slice 64E): a
+//! A fourth group, `nav-update-links`, measures the runtime LevelLink reaction: a
 //! batch of `item_count` new ramp links (one per distinct chunk, interior cell, levels 1<->0)
 //! folded in through the link cursor (fixed interior slot + both endpoint levels dirtied) and the
 //! buffered incremental apply. The 8-link row is the same dirty-footprint order as the scattered
 //! group's 16-chunk row (8 chunks on each of 2 levels).
 //!
-//! A fifth pair, `nav-update-cave-in` / `nav-update-cave-in-warm` (Slice 64F), times one step
+//! A fifth pair, `nav-update-cave-in` / `nav-update-cave-in-warm`, times one step
 //! that carves a 4x4-chunk lattice on `item_count` levels of a 1024x1024-tile, 32-level world:
 //! cold outgrows the windows and repacks each caved level, warm reuses grown windows. Cold minus
 //! warm is the repack cost.
@@ -671,7 +671,7 @@ pub fn runEntityObstacleCase(allocator: std.mem.Allocator, io: std.Io, options: 
     return stats;
 }
 // ----------------------------------------------------------------------------
-// Runtime LevelLink reaction (Slice 64E): link cursor + buffered incremental apply.
+// Runtime LevelLink reaction: link cursor + buffered incremental apply.
 // ----------------------------------------------------------------------------
 
 // Links added per batch: one (a single player ramp) and the full per-step cursor budget.
@@ -691,8 +691,7 @@ pub fn linkItemCounts(profile: suite.Profile) []const usize {
 // The full per-step cursor budget (8, which equals the fixed interior link slots per chunk)
 // landing in ONE nav chunk: distinct interior cells of chunk (1,1). Every ramp endpoint joins the
 // chunk's open component, so its edges (4 + 12*11 = 136) outgrow the build-measured 32-edge
-// window and the timed step crosses it: an in-place window growth (64E follow-up, 2026-10-06;
-// formerly the full-graph edge-cap fallback rebuild).
+// window and the timed step crosses it: an in-place window growth.
 const dense_link_counts = [_]usize{link_counts[link_counts.len - 1]};
 
 pub const links_dense_group = suite.BenchmarkGroup{
@@ -883,7 +882,7 @@ fn runLinksCaseWithLayout(allocator: std.mem.Allocator, io: std.Io, options: sui
 }
 
 // ----------------------------------------------------------------------------
-// Cave-in repack (Slice 64F): one step outgrows edge windows on several levels.
+// Cave-in repack: one step outgrows edge windows on several levels.
 // ----------------------------------------------------------------------------
 
 // A large world: 1024x1024 tiles, 32 levels, default 16-tile nav chunks (64x64 per level). A

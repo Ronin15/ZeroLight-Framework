@@ -2,7 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Pipeline-owned domain controller: first Slice 40 `action_intents` consumer.
+//! Pipeline-owned domain controller: an `action_intents` consumer.
 //! Resolves interact/attack intents against `Destructible` entities, applies
 //! same-step multi-hit damage in a fixed scratch, and queues deferred
 //! structural commands + a `destructible_destroyed` domain event. Never mutates

@@ -31,7 +31,7 @@ pub fn cosHalfFov(fov_half_angle_radians: f32) f32 {
     // The f32 nearest pi/2 rounds slightly high, so @cos(pi/2) evaluates to a
     // tiny negative value rather than exactly 0. Clamp so cos_half_fov never
     // goes negative at the validated (0, pi/2] boundary, matching the "FOV
-    // test relies on cos_half_fov >= 0" invariant this slice guarantees.
+    // test relies on cos_half_fov >= 0" invariant.
     return @max(0.0, math.sinCos(fov_half_angle_radians).cos);
 }
 

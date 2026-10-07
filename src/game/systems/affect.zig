@@ -12,7 +12,7 @@
 //! `AiAffect.above_threshold_mask`, persisted across steps) gates the edges,
 //! so a value hovering at threshold cannot refire the same edge twice. Runs
 //! after perception and ai_memory (both must have written this step's state
-//! first) and before AI reads it — arbitration (`arbitration.zig`, Slice 32)
+//! first) and before AI reads it — arbitration (`arbitration.zig`)
 //! reads the resulting drives one stage later via `AiConfig.affect_slice`;
 //! this system only appraises and decays them, it never switches behavior
 //! itself.
@@ -45,7 +45,7 @@
 //! the new value drops below threshold - ai_affect_threshold_hysteresis. A
 //! scalar tail repeats the same math for the remainder.
 //!
-//! Event emission (Slice 72 I2): workers only mark each row's per-drive
+//! Event emission: workers only mark each row's per-drive
 //! "crossed"/"rising" bits in the gather rows' `crossing_bits` column; after
 //! the join the main thread popcounts the column, applies this system's own
 //! per-step cap, and emits the crossings in (gather row, drive declaration)
@@ -361,8 +361,8 @@ pub const AffectSystem = struct {
         }
     }
 
-    /// Main-thread crossing emit after the parallel/serial compute pass
-    /// (Slice 72 I2): popcounts the "crossed" bits of every row's
+    /// Main-thread crossing emit after the parallel/serial compute pass:
+    /// popcounts the "crossed" bits of every row's
     /// `crossing_bits` for the uncapped total, applies this system's own
     /// deterministic per-step cap (truncating the tail rather than letting
     /// `SimulationEvents`'s own capacity check throw), then writes the first
@@ -1263,7 +1263,7 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
 test "after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    // Slice 72 I2: the only reserved store is the gather rows (crossing bits
+    // The only reserved store is the gather rows (crossing bits
     // included), so `reserve` alone (no warm step) covers the tuner's 64-item
     // initial profile and the 16-item alignment floor on the real multi-worker
     // path. Every row crosses fear on step 1. 96 rows put 32 in the 64-item

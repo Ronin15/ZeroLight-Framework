@@ -1718,7 +1718,7 @@ test "collision reserve makes the first single-range threaded update allocation-
 }
 
 test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges allocate nothing" {
-    // Slice 72 C5: `reserve` alone (no warm update) covers every partition the tuner can
+    // `reserve` alone (no warm update) covers every partition the tuner can
     // pick: broadphase slots reserved to the per-range bound for maxRangeCount ranges, the
     // narrowphase staging to the candidate pairs. A sparse chain (each body overlaps only
     // its neighbour) keeps the pair count within the reserved pair capacity.

@@ -194,15 +194,15 @@ fn stageContract(stage: StageId) StageContract {
         .spatial_index_build => .{ .reads = resources(&.{.ai_halo_indices}), .writes = resources(&.{.spatial_index}) },
         // Queries the spatial index for hostile candidates (halo) and writes sensed
         // state for this step's observers (think set); also emits acquisition/loss
-        // transition events (Slice 29). Reads world_tiles for line-of-sight /
+        // transition events. Reads world_tiles for line-of-sight /
         // occlusion against the dig-authored floor state from dig_world_edit.
         // Reads `stimuli` authored at dig_world_edit (live bus + hearing scratch).
         .perception_update => .{ .reads = resources(&.{ .ai_halo_indices, .ai_cognition_indices, .spatial_index, .world_tiles, .stimuli }), .writes = resources(&.{ .perception_sensed, .perception_events }) },
-        // Refreshes from this step's perception transition events (Slice 30),
+        // Refreshes from this step's perception transition events,
         // reading the acquired target's last-seen position from perception_sensed.
         .ai_memory_update => .{ .reads = resources(&.{ .ai_cognition_indices, .perception_events, .perception_sensed }), .writes = resources(&.{.ai_memory}) },
         // Appraises this step's just-written perception + memory columns into drives
-        // (Slice 31). Carries `ai_behavior` from the previous step; `ai_decide`
+        // Carries `ai_behavior` from the previous step; `ai_decide`
         // writes the new mode later in this step.
         .affect_update => .{
             .reads = resources(&.{ .ai_cognition_indices, .perception_sensed, .ai_memory }),
@@ -394,7 +394,7 @@ pub const SimulationPipelineConfig = struct {
     /// Initial population size for every population-sized capacity (scope, spatial
     /// index, collision, steering, cognition gathers, plane scratch, event shares).
     /// `init` raises it to the committed `DataSystem` rows; afterwards only
-    /// `SimulationPipeline.syncPopulationCapacity` grows it (Slice 72 C3).
+    /// `SimulationPipeline.syncPopulationCapacity` grows it.
     movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
     nav_cell_size: f32 = 32.0,
@@ -432,7 +432,7 @@ pub const SimulationPipelineUpdateContext = struct {
     /// Borrowed runtime perf sink. Stage timers are zero-cost when perf
     /// logging is disabled at comptime, so the hot path stays clean.
     perf: runtime_perf_log.Context = .{},
-    /// Optional particle system for soft-drop destroy bursts (Slice 45).
+    /// Optional particle system for soft-drop destroy bursts.
     particles: ?*ParticleSystem = null,
     /// Fixed-step camera rect the simulation derives scope from (cognition
     /// halo, stagger, tier bands) via `simViewRegion` /
@@ -665,11 +665,11 @@ pub const SimulationPipeline = struct {
     /// cognition halo and the stagger-filtered think set, and drives auto tier
     /// wake/sleep.
     scope: SimulationScopeSystem,
-    /// Shared per-step spatial index (Slice 28), built once from the unstaggered
+    /// Shared per-step spatial index, built once from the unstaggered
     /// cognition halo. Perception candidates and AI separation/cohere query it
     /// read-only; think rows map in via `spatial_self_index`.
     spatial_index: SpatialIndexSystem,
-    /// AI perception substrate (Slice 29): queries the shared spatial index for
+    /// AI perception substrate: queries the shared spatial index for
     /// hostile candidates (halo) within vision/FOV/line-of-sight and writes
     /// sensed state to `PerceptionStore` for this step's think-set observers.
     perception: PerceptionSystem,
@@ -682,7 +682,7 @@ pub const SimulationPipeline = struct {
     /// this step's just-refreshed `AiPerception`/`AiMemory` state (both
     /// optional per row) plus each agent's own `AiAgent.active_behavior` into
     /// the think-set `AiAffect` subset. `AiConfig.affect_slice` threads
-    /// the resulting drives into arbitration (Slice 32) one stage later; this
+    /// the resulting drives into arbitration one stage later; this
     /// stage only appraises and decays them.
     affect: AffectSystem,
     dig: DigController,
@@ -833,7 +833,7 @@ pub const SimulationPipeline = struct {
         } else {
             frame.events.setCapacityLimit(sum);
         }
-        // Later slices' reserves attach here (68A, 56B); C3's `growPopulationCapacity`
+        // Further per-step reserves attach here; `growPopulationCapacity`
         // re-runs this whole function on growth, so each stays sized to the grown bounds.
         try self.pathfinding.reserveNavDirty(self.structuralStageEventBound());
     }
@@ -989,8 +989,8 @@ pub const SimulationPipeline = struct {
             try frame.structural_commands.reserve(range_count, body + self.structuralCommandHeadroom());
             try frame.reservePathRequests(1, body);
             // Raises the event limit, re-runs the cognition reserves and the contact
-            // streams + response reserves to the grown pair bound (and every reserve
-            // later slices attach to `reserve`).
+            // streams + response reserves to the grown pair bound (and every other
+            // reserve attached to `reserve`).
             try self.reserve(frame, body);
         }
 
@@ -1217,7 +1217,7 @@ pub const SimulationPipeline = struct {
                 .entity = player.entity,
                 .kind = .interact,
             };
-            // Same faced-cell probe as dig so Slice 45 consumers match dig targeting.
+            // Same faced-cell probe as dig so action-intent consumers match dig targeting.
             if (facedCellForEntity(world, data, player.entity)) |cell| {
                 intent.level = player.current_level;
                 intent.cell_x = cell.x;
@@ -1402,7 +1402,7 @@ pub const SimulationPipeline = struct {
         step.ai_cognition_indices = ai_pops.cognition;
     }
 
-    /// Shared spatial index (Slice 28): built once from the unstaggered halo, from
+    /// Shared spatial index: built once from the unstaggered halo, from
     /// the same prior positions the candidate walks read. Index row `i` matches
     /// PerceptionSystem/AiSystem candidate row `i`; think rows map via
     /// `spatial_self_index`.
@@ -1420,7 +1420,7 @@ pub const SimulationPipeline = struct {
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
     }
 
-    /// Perception (Slice 29): hostile candidates within vision/FOV/line-of-sight
+    /// Perception: hostile candidates within vision/FOV/line-of-sight
     /// over the halo, writing sensed state only for this step's think-set observers.
     /// The player is folded in as an extra hostile candidate. Sticky dig/impact
     /// stimuli advance after this step's hearing read.
@@ -3850,7 +3850,7 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
         }
     }
     try std.testing.expectEqual(@as(usize, 2), tile_events);
-    // Strong M7 contract: both landing carves share one events range (batched
+    // Both landing carves share one events range (batched
     // publishWorldTileChanges), not two appendRequired ranges of one each.
     var batch_ranges: usize = 0;
     for (frame.events.range_stats.items) |range_stat| {
@@ -3921,7 +3921,7 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
 }
 
 test "plane traversal multi-entity world_level attach OOM leaves landings uncarved" {
-    // M8: two NPCs missing world_level over holes. Stage reserves attach capacity
+    // Two NPCs missing world_level over holes. Stage reserves attach capacity
     // and attaches both before any carve — so OOM on capacity leaves both landings
     // solid (no mid-loop carve without matching events). Avoid Player.spawn: it
     // pre-grows world_levels and can hide the attach allocation.
@@ -3998,7 +3998,7 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
 }
 
 test "plane traversal multi-fall after scratch reserve is allocation-free (FailingAllocator)" {
-    // M9: warm scratch + event capacity, arm FA at index 0, two falls publish
+    // Warm scratch + event capacity, arm FA at index 0, two falls publish
     // with zero further allocations on the frame / events / data paths used.
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -5252,7 +5252,7 @@ fn requestCrossLevelPath(pipeline: *SimulationPipeline, requester: EntityId, sta
 }
 
 test "player-dug ramp is routable by an underground NPC the same step" {
-    // Slice 64E end to end: a ramp dug at an INTERIOR nav cell through the real dig_ramp
+    // End to end: a ramp dug at an INTERIOR nav cell through the real dig_ramp
     // intent joins the abstract nav tier in that step's post-commit reaction (link cursor:
     // fixed interior slot + both levels dirtied), so an underground NPC's surface-bound
     // request resolves `available` without any save/load or full rebuild.
@@ -5341,7 +5341,7 @@ test "player-dug ramp is routable by an underground NPC the same step" {
 }
 
 test "a ramp dig past the initial link reservation grows at the dig seam and is routable" {
-    // Slice 64E link growth: the world reserves no runtime link room at load, so the first
+    // The world reserves no runtime link room at load, so the first
     // ramp press finds the pool full. The dig seam grows it (and the nav link edges) before
     // the dig, the ramp and its link land, and the underground NPC's surface-bound request
     // resolves `available`, exactly as if the pool were unbounded.
@@ -5706,7 +5706,7 @@ fn expectNavMatchesFreshBuild(pathfinding: *const PathfindingSystem, data: *cons
     try std.testing.expectEqualSlices(@TypeOf(full.link_edges.items[0]), full.link_edges.items, inc.link_edges.items);
 }
 
-// Slice 64E: one post-commit nav reaction at the full structural-stage event bound plus a
+// One post-commit nav reaction at the full structural-stage event bound plus a
 // full link-cursor budget, under a failing allocator on the pathfinding system and its nav
 // graph. `threads` drives the chunk patch/remask fan-out (forced off the inline path).
 fn runNavReactionAtStructuralBound(threads: ?*ThreadSystem) !void {
@@ -6230,7 +6230,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         try std.testing.expect(!first_stats.movement.batch.ran_inline);
         try std.testing.expectEqual(rangeCount(37, first_items_per_range), first_stats.movement.batch.range_count);
     }
-    // The seam reserved every capacity for every partition (Slice 72 C5: per-range
+    // The seam reserved every capacity for every partition (per-range
     // outputs are item-count windows, tallies and broadphase slots are reserved to
     // `maxRangeCount`), so the first post-growth step allocates nothing on any owner.
     if (prove_zero_alloc) try counters.expectOnlyOwnersAllocated(&.{});
@@ -6328,7 +6328,7 @@ fn addContactChainBodies(data: *DataSystem, first: usize, end: usize, mode: Coll
     }
 }
 
-/// Slice 72 C6: the contact stream, the trigger stream and the response reserves follow
+/// The contact stream, the trigger stream and the response reserves follow
 /// the collision pair bound (4 per body of capacity) through `reserve` and the seam, so a
 /// population that fills its grown capacity at ~2 contacts per body runs
 /// `collision_detect` and `collision_respond` on a real 2-worker partition with every

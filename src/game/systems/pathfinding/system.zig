@@ -131,7 +131,7 @@ pub const PathfindingSystem = struct {
     // longer resolvable from the entity — so the whole level is re-derived from the world.
     // Deduped, so it is world-extent: reserved to the level count at the nav build.
     nav_dirty_levels: std.ArrayList(u16) = .empty,
-    // Logical reservations of the three dirty buffers (Slice 72 A1 rule: the overflow check
+    // Logical reservations of the three dirty buffers (the overflow check
     // compares `.len` with these, never the allocator-rounded `.capacity`). Grow-only.
     nav_dirty_edits_reserved: usize = 0,
     nav_dirty_cell_spans_reserved: usize = 0,
@@ -3050,7 +3050,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
     try std.testing.expectEqual(PathStatus.available, on_view.status);
 
     // After the field is ready, the off-level member must still reach .available
-    // via an individual cross-level corridor (pins C1: no permanent stall).
+    // via an individual cross-level corridor (no permanent stall).
     var reached = false;
     var off_guard: usize = 0;
     while (off_guard < 64) : (off_guard += 1) {
@@ -3989,7 +3989,7 @@ test "reactToPostCommitNavEvents preserves buffered marks across a failed apply 
 }
 
 test "reactToPostCommitNavEvents maps world_obstacle_changed to one cell-span (not O(tiles) edits)" {
-    // M15: a multi-tile world_obstacle_changed must append a single ChangedSpan via
+    // A multi-tile world_obstacle_changed must append a single ChangedSpan via
     // markNavTileRectDirty, not one NavCellEdit per tile. Multi-chunk fixture
     // (nav_chunk_tiles=4) so the dirty rect spans ≥2 abstract chunks and a control
     // cell in an untouched chunk stays open.
@@ -4105,7 +4105,7 @@ test "reactToPostCommitNavEvents maps world_obstacle_changed to one cell-span (n
 }
 
 test "markNavTileRectDirty clamps partial OOB rects instead of dropping them" {
-    // L7: a rect whose max corner is past the world edge still dirties the in-bounds
+    // A rect whose max corner is past the world edge still dirties the in-bounds
     // portion (perception-style clamp), rather than all-or-nothing no-op on cellRect miss.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

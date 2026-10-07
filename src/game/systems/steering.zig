@@ -1,7 +1,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Steering and local avoidance system for Slice 19.
+//! Steering and local avoidance system.
 //! Consumes high-level navigation intents, pathfinding status, and steering
 //! component data, then emits final movement intents for NPC movement.
 //! Selection, path requests, and world snapshots run on the main thread; worker

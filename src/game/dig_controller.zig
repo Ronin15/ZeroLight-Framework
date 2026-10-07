@@ -369,7 +369,7 @@ pub const DigController = struct {
         self.plane_scratch_reserved = capacity;
     }
 
-    /// Grow-only re-reserve from the pipeline's population seam (Slice 72 C3), using the
+    /// Grow-only re-reserve from the pipeline's population seam, using the
     /// allocator `reservePlaneScratch` set. Not a shortfall: `plane_scratch_grown` is
     /// not counted.
     pub fn ensurePlaneScratchReserve(self: *DigController, capacity: usize) !void {

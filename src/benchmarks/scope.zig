@@ -2,7 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Scoped simulation-processing throughput. This is the Slice 24 evidence bench:
+//! Scoped simulation-processing throughput:
 //! it runs the real per-step processing stages — AI cognition, collision, movement,
 //! and chunk maintenance — but gated by the scope system, so the measured cost
 //! reflects the ACTIVE work, not the full entity count.

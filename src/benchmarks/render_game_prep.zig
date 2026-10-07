@@ -36,14 +36,14 @@ const world_overscan_chunks: u16 = 1;
 const bench_viewport_w: f32 = 800;
 const bench_viewport_h: f32 = 450;
 const static_sprite_group_count: usize = 1;
-/// Slice 36 collapsed `submitStaticDenseGeometry`'s per-layer draws into at
+/// `submitStaticDenseGeometry` emits at
 /// most `Renderer.k_max_dense_composite_draws` interleave-partitioned
 /// composite draws; this fixture has no sparse/entity content at non-active
 /// levels, so it always hits the common single-bucket case, i.e. exactly one
 /// retained `.tilemap` group regardless of dense window depth.
 const tilemap_group_count: usize = 1;
 const max_static_group_count: usize = tilemap_group_count + static_sprite_group_count;
-/// Mid-depth play level for dense render-window bench variants (Slice 23B).
+/// Mid-depth play level for dense render-window bench variants.
 const bench_mid_player_level: u16 = 40;
 
 const FixtureConfig = struct {
@@ -604,7 +604,7 @@ fn initFixture(
             .depth = benchmarkEntityDepth(index),
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
-        // Slice 25E render-prep culls non-player entities to their own world
+        // Render-prep culls non-player entities to their own world
         // level; deep-window fixtures (player_level > 0) must place entities
         // on that same level or collectDynamicRecords drops them all.
         if (fixture_config.player_level != 0) {
@@ -630,8 +630,7 @@ fn initFixture(
     fixture.dynamic_record_capacity = render_prep.dynamicRecordCapacity(scene);
 }
 
-/// Builds the static draw groups `submitStaticDenseGeometry` produces post
-/// Slice 36: one retained `.tilemap` composite draw ordered at the window's
+/// Builds the static draw groups `submitStaticDenseGeometry` produces: one retained `.tilemap` composite draw ordered at the window's
 /// own shallowest submitted layer (`start_level`, the common single-bucket
 /// case this fixture always hits) plus one static sprite accent group.
 fn benchStaticGroups(

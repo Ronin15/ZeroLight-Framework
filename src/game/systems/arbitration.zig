@@ -3,9 +3,9 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Pure, zero-allocation, zero-vtable utility-arbitration + sticky-selection +
-//! goal-resolution contract for Slice 32. Deliberately decoupled from
+//! goal-resolution contract. Deliberately decoupled from
 //! `AiPerception`/`AiMemory`/`AiAffect` row types: `Signals` is flat data any
-//! future producer (world markers, Slice 41) can populate without depending
+//! future producer (e.g. world markers) can populate without depending
 //! on today's component layout. `ai.zig` is the only current caller: it
 //! gathers `Signals` per row, then chains `scoreBehaviors` -> `selectSticky`
 //! -> `resolveGoal`. This module has no dependency on `ai.zig`, the
@@ -50,7 +50,7 @@ pub const Signals = struct {
     heard_stimulus_x: f32 = 0,
     heard_stimulus_y: f32 = 0,
 
-    // World interest marker (Slice 41), gathered read-only from `WorldSystem`.
+    // World interest marker, gathered read-only from `WorldSystem`.
     interest_present: bool = false,
     interest_x: f32 = 0,
     interest_y: f32 = 0,
@@ -209,7 +209,7 @@ fn memoryTerm(behavior: AiBehavior, signals: Signals) f32 {
 /// Table-driven utility score per behavior:
 /// `score[b] = gain[b] * sum_d(drive[d] * weight[d][b]) + perceptionTerm(b) + memoryTerm(b)`.
 /// The drive loop (`for (0..drive_count)`) is the extensibility contract for
-/// a future fifth drive (Slice 42): appending a drive means a new enum tag
+/// a future fifth drive: appending a drive means a new enum tag
 /// and a new table row, never a change to this control flow.
 pub fn scoreBehaviors(signals: Signals, gains: PersonalityGains) Scores {
     const drive_values = [drive_count]f32{ signals.fear, signals.curiosity, signals.aggression, signals.fatigue };

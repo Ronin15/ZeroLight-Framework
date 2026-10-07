@@ -605,7 +605,7 @@ test "draw never exceeds commandCapacity for a worst-case frame (FailingAllocato
     }
 
     // Test-only: headless SpriteBatch construction (no live GPU). Kept inside
-    // the test so production stays on the renderer facade (L6).
+    // the test so production stays on the renderer facade.
     const sprite_batch = @import("../render/sprite_batch.zig");
     const TextureId = renderer_mod.TextureId;
 

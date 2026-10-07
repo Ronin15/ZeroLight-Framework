@@ -2118,7 +2118,7 @@ fn collectParityEdges(graph: *const NavGraph, out: *std.ArrayList(ParityEdge)) !
     std.sort.pdq(ParityEdge, out.items, {}, ParityEdge.lessThan);
 }
 
-test "applyBlockedDelta saturates a negative net to zero (M8)" {
+test "applyBlockedDelta saturates a negative net to zero" {
     // blocked_count=0 + delta=-1 must NOT @intCast-wrap into a huge usize.
     // Private NavGraph helper is visible same-file via the container name.
     var grid = NavGrid{ .blocked_count = 0 };
@@ -2645,7 +2645,7 @@ fn reactOneStep(system: *PathfindingSystem, frame: *SimulationFrame, data: *cons
     return system.reactToPostCommitNavEvents(frame, data, world, thread_system);
 }
 
-// Slice 64E parity: the incremental graph equals a fresh full rebuild over the same world:
+// Parity: the incremental graph equals a fresh full rebuild over the same world:
 // portals and cell_to_portal byte-identical per level, the shared interior link-slot table
 // identical, per-portal edge sets equal (expectGraphsEquivalent), and link_edges /
 // link_edge_refs equal.
@@ -3670,7 +3670,7 @@ test "abstract A* after an edge-window growth returns the paths of a fresh full 
 }
 
 test "a cached path outside the dirty batch survives an edge-window growth and equals a fresh solve" {
-    // Slice 64E (Slice 72 E4's surviving-cache case): a window growth stays an incremental
+    // A window growth stays an incremental
     // patch, so nav_version (part of every cache key) is unchanged and scoped eviction drops
     // only paths crossing the edited cells. A path along the top row (chunks 0-2) never
     // touches the ramp cells in chunk (1,1), so it must stay cached, unchanged, through the
@@ -3874,7 +3874,7 @@ test "a failed edge-window growth still patches the rest of the dirty set, seria
     try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
     const across = cellCenterRequest(0, .{ 3, 11 }, 0, .{ 21, 11 });
     const fresh_slot = try solveAndCache(&rebuilt, requester, across);
-    // M12: the detour cached between the failure and the retry (around chunk 4) was dropped by
+    // The detour cached between the failure and the retry (around chunk 4) was dropped by
     // the degraded-apply cache clear, so it re-solves to the direct route.
     const detour_fresh = try solveAndCache(&rebuilt, requester, before_retry[0]);
     for (systems) |system| {
