@@ -8,6 +8,7 @@
 //! TextureId values are generational handles backed by renderer-owned slots.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const LoadedImage = @import("../assets/image.zig").LoadedImage;
 const build_options = @import("build_options");
@@ -1033,7 +1034,8 @@ pub const Renderer = struct {
             const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
             const element_count = self.tileDataCount(edit.buffer);
             if (edit.element_index >= element_count) {
-                log.warn("dropped tile-data edit: element {d} out of range for buffer {d}", .{
+                // Silent under test so the drop path is testable without stderr noise.
+                if (comptime logging.enabled(.warn) and !builtin.is_test) log.warn("dropped tile-data edit: element {d} out of range for buffer {d}", .{
                     edit.element_index,
                     @backingInt(edit.buffer),
                 });
@@ -2067,6 +2069,71 @@ test "replacePendingStorageRegion overwrites a carried edit to the same element 
 
     try std.testing.expect(!replacePendingStorageRegion(&pending, .{ .buffer = buffer_a, .element_index = 4, .element_count = 8, .value = 7 }));
     try std.testing.expect(!replacePendingStorageRegion(pending[0..0], .{ .buffer = buffer_a, .element_index = 3, .element_count = 8, .value = 7 }));
+}
+
+test "uploadTileDataEdits rewrites a carried element in place and drops stale or out-of-range edits allocation-free" {
+    const allocator = std.testing.allocator;
+    var renderer = testRenderer(allocator);
+    defer renderer.batch.deinit();
+    defer renderer.tile_edit_scratch.deinit(allocator);
+    defer renderer.tile_data_counts.deinit(allocator);
+    defer renderer.tile_data_buffers.deinit(allocator);
+    // Fake GPU handles: the upload only resolves and compares them, never touches SDL.
+    const buffer_a: *c.SDL_GPUBuffer = @ptrFromInt(0x1000);
+    const buffer_b: *c.SDL_GPUBuffer = @ptrFromInt(0x2000);
+    try renderer.tile_data_buffers.appendSlice(allocator, &.{ buffer_a, buffer_b });
+    try renderer.tile_data_counts.appendSlice(allocator, &.{ 8, 4 });
+    const id_a: TileDataId = @fromBackingInt(0);
+    const id_b: TileDataId = @fromBackingInt(1);
+    // Never created: the handle no longer resolves.
+    const stale: TileDataId = @fromBackingInt(5);
+
+    // First batch stays pending (no `endFrame` copy pass ran), so it is carried.
+    try renderer.uploadTileDataEdits(&.{
+        .{ .buffer = id_a, .element_index = 1, .value = 10 },
+        .{ .buffer = id_a, .element_index = 3, .value = 30 },
+        .{ .buffer = id_b, .element_index = 2, .value = 50 },
+    });
+    try std.testing.expectEqual(@as(usize, 3), renderer.tile_edit_scratch.items.len);
+
+    const second = [_]TileDataEdit{
+        // Rewrites the carried (a, 3) edit.
+        .{ .buffer = id_a, .element_index = 3, .value = 33 },
+        // Out of range for buffer a's 8 elements: dropped.
+        .{ .buffer = id_a, .element_index = 8, .value = 99 },
+        .{ .buffer = id_b, .element_index = 0, .value = 60 },
+        // Stale handle: dropped.
+        .{ .buffer = stale, .element_index = 0, .value = 77 },
+    };
+    // Warm the scratch the way a reserved frame would, then prove the second call
+    // allocates nothing.
+    try renderer.tile_edit_scratch.ensureTotalCapacity(allocator, renderer.tile_edit_scratch.items.len + second.len);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    renderer.allocator = failing.allocator();
+    try renderer.uploadTileDataEdits(&second);
+    renderer.allocator = allocator;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    const regions = renderer.tile_edit_scratch.items;
+    try std.testing.expectEqual(@as(usize, 4), regions.len);
+    var a3_count: usize = 0;
+    for (regions) |region| {
+        if (region.buffer == buffer_a and region.element_index == 3) {
+            a3_count += 1;
+            try std.testing.expectEqual(@as(u32, 33), region.value);
+        }
+        try std.testing.expect(region.element_index < region.element_count);
+        try std.testing.expect(region.value != 99 and region.value != 77);
+    }
+    try std.testing.expectEqual(@as(usize, 1), a3_count);
+    // Carried edits keep their slots; the one new in-range edit appends after them.
+    try std.testing.expectEqual(@as(u32, 10), regions[0].value);
+    try std.testing.expectEqual(@as(u32, 33), regions[1].value);
+    try std.testing.expectEqual(@as(u32, 50), regions[2].value);
+    try std.testing.expect(regions[3].buffer == buffer_b);
+    try std.testing.expectEqual(@as(usize, 0), regions[3].element_index);
+    try std.testing.expectEqual(@as(u32, 60), regions[3].value);
+    try std.testing.expect(renderer.tile_edits_pending);
 }
 
 test "tileDataElementCount halves cell counts rounding up" {
