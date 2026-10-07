@@ -6115,7 +6115,9 @@ const GrowthScenarioResult = struct {
 
 /// Builds a minimal 3-level world at population 4, grows it to 37 rows through
 /// structural creates and the population seam, runs one stationary step, then one
-/// step where all 24 NPCs fall through dug holes. `max_worker_threads > 0` pins a
+/// step where all 24 NPCs fall through dug holes. The 3 initial NPCs and the first 2
+/// created ones carry `AiPerception` + `AiAffect`, so the perception and affect
+/// stages run (and their derived event shares grow at the seam) on every step. `max_worker_threads > 0` pins a
 /// multi-range partition (2 workers, 16-item ranges; 32-item ranges when `retune` is
 /// set). With `prove_zero_alloc`, the first step counts allocations per owner (none,
 /// serial or multi-worker: the seam reserved every partition) and the falling step
@@ -6152,6 +6154,8 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         try data.setCollisionBounds(npc, .{ .size = .{ .x = 16, .y = 16 } });
         try data.setCollisionResponse(npc, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
         try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+        try data.setAiPerception(npc, .{});
+        try data.setAiAffect(npc, .{});
         try data.setWorldLevel(npc, 0);
     }
 
@@ -6192,19 +6196,32 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     _ = try pipeline.update(context);
     _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
 
-    // Growth: 21 NPCs (7 commit events each) + 12 steering-only agents parked on rows
-    // 6-7 (4 events each) = 195 events within the 200-event structural share.
+    // Growth: 19 NPCs (7 commit events each) + 2 NPCs that also carry AiPerception and
+    // AiAffect (9 each) + 12 steering-only agents parked on rows 6-7 (4 events each) =
+    // 133 + 18 + 48 = 199 events within the caller's 200-event `structural_headroom`
+    // (the pipeline's own action-react share sits on top of it).
     var commands: [33]StructuralCommand = undefined;
     for (start_cells[3..], 0..) |cell, index| commands[index] = growthNpcTemplate(cell);
+    for (commands[0..2]) |*command| {
+        command.create_entity.ai_perception = .{};
+        command.create_entity.ai_affect = .{};
+    }
     for (0..12) |index| {
         const cell = [2]u16{ @intCast(index % 8), @intCast(6 + index / 8) };
         commands[21 + index] = growthSteeringTemplate(cell);
     }
+    const init_perception_share = pipeline.perception_max_events_per_step;
+    const init_affect_share = pipeline.affect_max_events_per_step;
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
     const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
     try std.testing.expect(sync.grew);
     try std.testing.expect(!sync.agent_budget_raise_refused);
+    // 3 -> 5 perception/affect rows: the seam's share-growth arm ran too.
+    try std.testing.expectEqual(@as(usize, 5), data.ai_perceptions.len());
+    try std.testing.expectEqual(@as(usize, 5), data.ai_affects.len());
+    try std.testing.expect(pipeline.perception_max_events_per_step > init_perception_share);
+    try std.testing.expect(pipeline.affect_max_events_per_step > init_affect_share);
 
     // Every tracked capacity followed the committed rows.
     try std.testing.expectEqual(@as(usize, 37), data.populationRowCounts().population());
@@ -6232,6 +6249,10 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     const first_result = pipeline.update(context);
     if (prove_zero_alloc) counting_swap.restore(targets);
     const first_stats = try first_result;
+    // The zero-allocation proof covers perception and affect only if they ran: the
+    // 5 observers' stagger phases cover all four, so every step thinks at least one.
+    try std.testing.expect(first_stats.perception.observer_count >= 1);
+    try std.testing.expect(first_stats.affect.processed_count >= 1);
     if (max_worker_threads > 0) {
         try std.testing.expect(!first_stats.movement.batch.ran_inline);
         try std.testing.expectEqual(rangeCount(37, first_items_per_range), first_stats.movement.batch.range_count);
@@ -6252,6 +6273,8 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         if (prove_zero_alloc) retune_swap.restore(targets);
         const retune_stats = try retune_result;
         try std.testing.expectEqual(rangeCount(37, profile.items_per_range), retune_stats.movement.batch.range_count);
+        try std.testing.expect(retune_stats.perception.observer_count >= 1);
+        try std.testing.expect(retune_stats.affect.processed_count >= 1);
         try std.testing.expectEqual(@as(usize, 0), retune_failing.allocations);
     }
 
