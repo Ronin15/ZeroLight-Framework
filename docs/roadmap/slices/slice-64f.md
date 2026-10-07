@@ -60,10 +60,11 @@ Neither A, B nor C as written. Two owner decisions replaced the comparison:
 2. **The edge arena is runtime-growing data, never refused** (dig/cave-in
    game: no gameplay path may fail because terrain got dense).
    `max_nav_memory_bytes` budgets the reserve-time stores and only estimates
-   the arena. The one fixed cap is the u32 edge index: `computePortalGeometry`
-   fails the build (`NavWorldTooLarge`) when this extent's worst case (every
-   chunk at `windowCap((4·ct + K)²)`) could overflow it; placement and repack
-   assert the bound. OOM stays an ordinary error that leaves the old layout
+   the arena. The one fixed cap is the u32 edge index: `rebuild` fails
+   (`NavWorldTooLarge`, next to the memory gate and before any allocation) when
+   this extent's worst case (every chunk at `windowCap((4·ct + K)²)`) could
+   overflow it; placement and repack assert the bound. For one chunk the bound
+   falls between ct = 11,583 and 11,584 (tested). OOM stays an ordinary error that leaves the old layout
    valid.
 
 Decided from the code:

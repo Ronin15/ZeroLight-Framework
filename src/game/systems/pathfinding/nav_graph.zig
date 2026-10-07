@@ -520,6 +520,7 @@ pub const NavGraph = struct {
 
         // Fail loud at build instead of degrading at query time.
         try memory_budget.check(self.width, self.height);
+        try self.checkEdgeIndexFits();
 
         const level_count: u16 = if (world) |world_system|
             @intCast(@max(@as(usize, 1), world_system.levelCount()))
@@ -1246,9 +1247,8 @@ pub const NavGraph = struct {
             running +|= cap;
         }
         self.total_slots = running;
-        // The only fixed edge cap is the u32 edge index: fail loud here when this extent's
-        // worst case could overflow it, so runtime growth provably cannot.
-        if (self.maxLevelEdgeSlots() > std.math.maxInt(u32)) return NavGridError.NavWorldTooLarge;
+        // rebuild rejected an extent whose edge index could overflow u32.
+        std.debug.assert(self.maxLevelEdgeSlots() <= std.math.maxInt(u32));
 
         // Size the dirty-set scratch (bounded by chunk count) and per-chunk stamps.
         try self.dirty_set.ensureTotalCapacity(self.allocator, chunk_count);
@@ -1282,6 +1282,12 @@ pub const NavGraph = struct {
         const max_chunk_edges = portal_cap * portal_cap;
         const max_window = @max(max_chunk_edges * default_edge_slack, chunk_edge_floor);
         return @as(u64, self.chunkCount()) * max_window;
+    }
+
+    // The one fixed edge cap is the u32 edge index: rebuild fails before any allocation when
+    // this extent's worst case could overflow it, so runtime growth provably cannot.
+    fn checkEdgeIndexFits(self: *const NavGraph) NavGridError!void {
+        if (self.maxLevelEdgeSlots() > std.math.maxInt(u32)) return NavGridError.NavWorldTooLarge;
     }
 
     // Who is assigning link-endpoint slots: a full build (count only) or the incremental link
@@ -1541,7 +1547,7 @@ pub const NavGraph = struct {
             if (new_caps[chunk] != old_cap) windows_grown += 1;
             new_total += new_caps[chunk];
         }
-        // computePortalGeometry proved this extent's worst case fits the u32 edge index.
+        // rebuild proved this extent's worst case fits the u32 edge index.
         std.debug.assert(new_total <= self.maxLevelEdgeSlots());
 
         // Step 2: a new arena only when some window grew (an error-flagged chunk may still fit).
@@ -1889,7 +1895,7 @@ pub const NavGraph = struct {
             cap.* = windowCap(cap.*);
             new_total += cap.*;
         }
-        // computePortalGeometry proved this extent's worst case fits the u32 edge index.
+        // rebuild proved this extent's worst case fits the u32 edge index.
         std.debug.assert(new_total <= self.maxLevelEdgeSlots());
         if (lg.portal_edges.capacity != new_total) {
             var new_arena: std.ArrayList(AbstractEdge) = .empty;
@@ -4089,6 +4095,25 @@ fn oneChunkRampCells() [36]CellCoord {
     }
     std.debug.assert(n == cells.len);
     return cells;
+}
+
+test "the u32 edge index is the one fixed cap: a one-cell world past it fails the build" {
+    // Worst case per level = chunks * windowCap((4*ct + K)^2); for one chunk it crosses
+    // maxInt(u32) between ct = 11583 and 11584. The gate runs before any allocation, under an
+    // unlimited memory budget.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var graph = NavGraph{ .allocator = std.testing.allocator };
+    defer graph.deinit();
+    var budget = budgetForCapacity(abstractCapacity(), 1, 0);
+    budget.max_bytes = std.math.maxInt(usize);
+    try std.testing.expectError(NavGridError.NavWorldTooLarge, graph.rebuild(&data, null, 1, 1, 1, 11584, budget, null));
+    try std.testing.expectEqual(@as(usize, 0), graph.levels.items.len);
+    // One below passes the gate. Not built here: the build would reserve pcap^2 patch scratch
+    // per participant (~26 GB), which the memory gate rejects at any realistic ceiling.
+    graph.chunk_tiles = 11583;
+    try graph.checkEdgeIndexFits();
+    try std.testing.expectEqual(@as(u64, 4_294_791_200), graph.maxLevelEdgeSlots());
 }
 
 test "an edge arena past the nav memory gate's estimate builds and grows without refusal" {
