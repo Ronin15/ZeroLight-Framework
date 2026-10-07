@@ -1168,8 +1168,10 @@ Out of scope (each item has a named owner):
 - [ ] **H4 · Growth without a GPU drain** (§H4).
   - Tests: none headless. `zig build gpu-smoke` passes on every backend available to the owner, and each backend is recorded in Status.
   - Bench: `render-prep` (CPU, no change).
-- [ ] **I1 · Perception events from columns** (§I1).
-  - Tests:
+- [x] **I1 · Perception events from columns** (§I1). Landed 2026-10-07, ahead of Batch I's order, triggered by the branch review finding that slot r ≥ 1 was reserved for 16 rows while the tuner's initial profile is 64 (a 96-observer threaded step at 64-item ranges grew slot 1 in-stage after `reserve`).
+  - As landed: workers tally each range's uncapped transition-event count in the padded `PerceptionRangeStats` slot (`transition_events`, counted on the row just written); after the join `PerceptionSystem.emitTransitionEvents` makes one `simd.equalInt4` pass over the `prev_*`/`final_nearest_threat_*` columns (skipped when the capped count is 0) and writes the first `max_events_per_step` events in row order as one range. `PerceptionEventRangeBuffer`/`Slot`/`SlotList`, `event_ranges`, `range_take_counts`, `prepareEventRangeBuffers`, `mergePerceptionEvents`, `emitTransitionsForRange` and `rangeLenForIndex` are deleted; `reserve` sizes rows, candidates and `range_stats` (`maxRangeCount(cap, 16)`) only. Output is byte-identical (row order = range-ascending concatenation).
+  - Test rewritten: "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" (96 observers, real 2-worker pool, no warm step; fails on the pre-I1 code in `prepareEventRangeBuffers`). The M14 cap/parity, serial/threaded parity, serial `FailingAllocator` and C4 truncation tests are unchanged. 65A cross-edit landed (also corrects its stale C5 slot names).
+  - Tests (as planned):
     - serial and threaded parity is unchanged;
     - new FailingAllocator variants in `perception.zig:3284-3495`: after `reserve`, two `items_per_range` values on a real 2-worker pool allocate zero times;
     - drop the event-slot reserve expectations;

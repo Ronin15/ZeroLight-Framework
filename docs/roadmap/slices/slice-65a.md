@@ -32,20 +32,22 @@ Goal:
   - `systems/spatial_index.zig:76`
   - `systems/pathfinding/nav_graph.zig:137`
   - `systems/collision.zig:97`
-  - `systems/perception.zig:317`
+  - `systems/perception.zig:327`
 - **Five identical private `paddingForCacheLine(comptime T)` helpers**:
   `affect.zig:156-159`, `spatial_index.zig:887-890`,
   `simulation_scope.zig:848-851`, `collision.zig:994-997`,
-  `perception.zig:355-358`.
+  `perception.zig:339-342`.
 - **The padded slot types they guard**:
   - `AffectEventRangeSlot` (`affect.zig:179-185`)
-  - `IndexRangeSlot` / `CommandRangeSlot` (`simulation_scope.zig:583-609`;
-    runtime size tests `:1554-1555`)
-  - `RowRangeSlot` (`spatial_index.zig:797-804`)
-  - `BroadphaseRangeSlot` / `NarrowphaseRangeSlot` (`collision.zig:176-191`;
-    runtime tests `:1348-1357`)
-  - `PerceptionEventRangeSlot` / `PerceptionRangeStatsSlot`
-    (`perception.zig:336-353`)
+  - `GatherTallySlot` (`simulation_scope.zig:584-592`, already with a comptime
+    size assert; runtime size test `:1552`). Slice 72 C5 replaced the old
+    `IndexRangeSlot` / `CommandRangeSlot` with windows plus this tally.
+  - `RowCountTally` (`spatial_index.zig:834-842`, already with a comptime size
+    assert; C5 replaced `RowRangeSlot`)
+  - `BroadphaseRangeSlot` / `ContactCountTally` (`collision.zig:171-195`;
+    runtime tests `:1469-1470`; C5 replaced `NarrowphaseRangeSlot`)
+  - `PerceptionRangeStatsSlot` (`perception.zig:329-337`; Slice 72 I1 deleted
+    `PerceptionEventRangeSlot`)
   - `ChunkPatchScratch` / `ChunkRemaskScratch` (`nav_graph.zig:150-183`).
     These use a field `align(...)` and already carry comptime asserts at
     `:156-159` and `:180-183`.
@@ -147,10 +149,10 @@ pub fn assertThreadSharedRecord(comptime T: type) void {
 - **Each site** gains one `comptime` block that calls
   `assertThreadSharedRecord` for every slot type it owns:
   - affect: `AffectEventRangeSlot`;
-  - simulation_scope: `IndexRangeSlot`, `CommandRangeSlot`;
-  - spatial_index: `RowRangeSlot`;
-  - collision: `BroadphaseRangeSlot`, `NarrowphaseRangeSlot`;
-  - perception: `PerceptionEventRangeSlot`, `PerceptionRangeStatsSlot`;
+  - simulation_scope: `GatherTallySlot`;
+  - spatial_index: `RowCountTally`;
+  - collision: `BroadphaseRangeSlot`, `ContactCountTally`;
+  - perception: `PerceptionRangeStatsSlot`;
   - nav_graph: `ChunkPatchScratch`, `ChunkRemaskScratch`;
   - pathfinding/scratch: `SearchScratch` (imports
     `../../../app/thread_system.zig`).

@@ -754,7 +754,9 @@ slices, merge by range index, and consume the result as a batch. Passes with at
 most one output per item (scope gathers and tier policy, the spatial gather, the
 collision narrowphase) write fixed per-range windows of one item-count buffer
 plus a padded tally and compact in range order, so their capacity-seam reserve
-covers every partition (Slice 72 C5). Output order
+covers every partition (Slice 72 C5). Events derived from per-row state after
+the join (perception transitions) use no output buffer at all (Slice 72 I1).
+Output order
 comes from stable input/range order, not worker timing or worker IDs. Structural
 mutation remains behind `DataSystem` batch commit boundaries. `DataSystem` is
 the single source for applying structural commands and may report plain

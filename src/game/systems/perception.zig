@@ -9,9 +9,9 @@
 //! writes the winning `nearest_threat`/`target_visible`/`last_seen_x/y`/
 //! `facing_x/y` hot columns back onto `DataSystem`'s `PerceptionStore`.
 //! Emits `entity_perceived`/`entity_lost` `SimulationEvent`s on transitions,
-//! range-owned during the parallel compute pass and merged deterministically
-//! afterward — same gather -> parallel compute -> per-range emit -> merge
-//! shape as `ai.zig`/`collision.zig`.
+//! derived on the main thread after the parallel compute pass from the
+//! per-row `prev_*`/`final_nearest_threat_*` columns the workers already
+//! write (`emitTransitionEvents`, Slice 72 I1) — no per-range event scratch.
 //!
 //! Two-index-space contract (population-domain equivalence with
 //! `spatial_index.zig`, mirrors `ai.zig`'s cross-file contract): this
@@ -68,11 +68,15 @@
 //! `perception-los-dense` groups for the before/after cost proof.
 //!
 //! Threaded writes: each worker range writes only its own gather rows' hot
-//! columns in `PerceptionStore` (disjoint per entity, since gather rows are
-//! 1:1 with entities and ranges partition row indices) and appends events
-//! only into its own reserved, exactly-sized event scratch buffer
-//! (`range_len * 2` — an identity-swap transition emits at most two events per
-//! row, so this can never overflow, unlike collision's broadphase estimate).
+//! columns in `PerceptionStore` and its rows' `final_nearest_threat_*`
+//! columns (disjoint per entity, since gather rows are 1:1 with entities and
+//! ranges partition row indices), plus its own padded `range_stats` slot,
+//! which also tallies the range's transition-event count. Nothing appendable
+//! is shared, so nothing partition-sized needs reserving. After the join the
+//! main thread derives the events from the now-immutable `prev_*`/`final_*`
+//! columns in row order and appends them as one range
+//! (`emitTransitionEvents`); concatenating ranges in ascending order already
+//! equals row order, so this is byte-identical to the former per-range merge.
 //! Serial and threaded paths share every vectorized helper
 //! (`computeFacingDense`, `filterFovSurvivors`, the transition `equalInt4`
 //! pass) and the same per-range compute function
@@ -92,6 +96,7 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
@@ -106,7 +111,6 @@ const SimulationEvents = @import("../simulation.zig").SimulationEvents;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const WorldStimulus = @import("../simulation.zig").WorldStimulus;
 const stimulusHearingScore = @import("../simulation.zig").stimulusHearingScore;
-const perception_events_per_observer_max = @import("../simulation.zig").perception_events_per_observer_max;
 const spatial_index_mod = @import("spatial_index.zig");
 const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborVisitResult = spatial_index_mod.NeighborVisitResult;
@@ -188,9 +192,9 @@ pub const PerceptionConfig = struct {
     /// by the hearing pass folded into `computeOneAgent`.
     stimuli: []const WorldStimulus = &.{},
     /// Deterministic per-step cap on emitted perception events, enforced by
-    /// this system itself (see the module doc's threaded-writes note and
-    /// `mergePerceptionEvents`) rather than letting `SimulationEvents`'s own
-    /// capacity check throw.
+    /// this system itself in row order (see the module doc's threaded-writes
+    /// note and `emitTransitionEvents`) rather than letting
+    /// `SimulationEvents`'s own capacity check throw.
     max_events_per_step: usize = default_max_events_per_step,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
@@ -232,17 +236,15 @@ pub const PerceptionStats = struct {
     batch: BatchStats = .{},
 };
 
-// Per-range accumulator for the LOS/sensed/found counters above. Each range
-// job owns one slot (indexed by `range.index`, mirrors `event_ranges`), writes
-// to a local `PerceptionRangeStats` value throughout its own
-// `computeOneAgent` calls, and stores it once at the end of
+// Per-range accumulator for the LOS/sensed/found counters above and the
+// range's transition-event count. Each range job owns one slot (indexed by
+// `range.index`), writes to a local `PerceptionRangeStats` value throughout
+// its own `computeOneAgent` calls, and stores it once at the end of
 // `computePerceptionRange` — a single write per range, so no atomics are
-// needed (unlike the event scratch buffers, nothing appends concurrently
-// into a range's slot). It is 32 bytes (4 `usize` fields), so two adjacent
-// slots would otherwise share one 64-byte cache line; concurrently running
-// worker ranges writing their final stats into adjacent slots would then
-// false-share that line, so `PerceptionRangeStatsSlot` pads it the same way
-// `PerceptionEventRangeSlot` pads `PerceptionEventRangeBuffer` below.
+// needed. It is 48 bytes (6 `usize` fields), so two adjacent slots would
+// otherwise share a 64-byte cache line; concurrently running worker ranges
+// writing their final stats into adjacent slots would then false-share that
+// line, so `PerceptionRangeStatsSlot` pads each slot to a full line.
 const PerceptionRangeStats = struct {
     sensed_count: usize = 0,
     nearest_threat_found: usize = 0,
@@ -256,6 +258,11 @@ const PerceptionRangeStats = struct {
     // visited-then-rejected shows up here even though it never reaches
     // `sensed_count`.
     candidate_checks: usize = 0,
+    // Uncapped `entity_lost` + `entity_perceived` events this range's rows
+    // will produce (`transitionEventCount`), counted by the worker on the row
+    // it just wrote so the main-thread emit (`emitTransitionEvents`) knows the
+    // step total, and so the cap, before it walks the columns.
+    transition_events: usize = 0,
 };
 
 const CandidateRow = struct {
@@ -319,32 +326,6 @@ const ConstCandidateSlice = struct {
 
 const thread_shared_record_alignment: usize = 64;
 
-const PerceptionEventRangeBuffer = struct {
-    events: std.ArrayList(SimulationEvent) = .empty,
-
-    fn clearRetainingCapacity(self: *PerceptionEventRangeBuffer) void {
-        self.events.clearRetainingCapacity();
-    }
-
-    fn appendAssumeCapacity(self: *PerceptionEventRangeBuffer, event: SimulationEvent) void {
-        self.events.appendAssumeCapacity(event);
-    }
-
-    fn deinit(self: *PerceptionEventRangeBuffer, allocator: std.mem.Allocator) void {
-        self.events.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-const PerceptionEventRangeSlot = struct {
-    // Each worker writes only its assigned slot. Padding keeps hot append
-    // state off shared cache lines across concurrently written range records.
-    buffer: PerceptionEventRangeBuffer = .{},
-    padding: [paddingForCacheLine(PerceptionEventRangeBuffer)]u8 = @splat(0),
-};
-
-const PerceptionEventRangeSlotList = std.ArrayListAligned(PerceptionEventRangeSlot, .fromByteUnits(thread_shared_record_alignment));
-
 const PerceptionRangeStatsSlot = struct {
     // Each worker writes only its assigned slot, once, at the end of its
     // range (see `PerceptionRangeStats`'s doc comment). Padding keeps that
@@ -358,12 +339,6 @@ const PerceptionRangeStatsSlotList = std.ArrayListAligned(PerceptionRangeStatsSl
 fn paddingForCacheLine(comptime T: type) usize {
     const rem = @sizeOf(T) % thread_shared_record_alignment;
     return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
-fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usize) usize {
-    const start = range_index * items_per_range;
-    if (start >= item_count) return 0;
-    return @min(start + items_per_range, item_count) - start;
 }
 
 fn serialBatch(count: usize) BatchStats {
@@ -494,13 +469,12 @@ fn lookupLevelBlocked(level_blocked: []const LevelBlockedSlot, level: u16, x: u1
 pub const PerceptionSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in
-    // job context, except their own reserved event scratch range).
+    // job context, except their own rows' `final_nearest_threat_*` columns
+    // and their own padded `range_stats` slot).
     candidates: std.MultiArrayList(CandidateRow) = .{},
     rows: std.MultiArrayList(PerceptionGatherRow) = .{},
-    event_ranges: PerceptionEventRangeSlotList = .empty,
     range_stats: PerceptionRangeStatsSlotList = .empty,
-    range_take_counts: std.ArrayList(usize) = .empty,
-    /// Once-only flag for the merge-cap drop warn. The pipeline's derived share makes a
+    /// Once-only flag for the emit-cap drop warn. The pipeline's derived share makes a
     /// drop impossible by construction; the cap and `dropped_events` stay as the
     /// shared-frame safety net.
     dropped_events_warned: bool = false,
@@ -534,13 +508,25 @@ pub const PerceptionSystem = struct {
     pub fn deinit(self: *PerceptionSystem) void {
         for (self.level_blocked.items) |*slot| slot.deinit(self.allocator);
         self.level_blocked.deinit(self.allocator);
-        self.range_take_counts.deinit(self.allocator);
         self.range_stats.deinit(self.allocator);
-        for (self.event_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.event_ranges.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.candidates.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Sizes candidate/observer rows and the per-range stats tallies
+    /// (`maxRangeCount`, every partition the tuner can pick) for `pop` agents;
+    /// nothing partition-sized remains, so `update`/`updateSerial` allocate
+    /// nothing after this under any `items_per_range`. Grow-only; re-run by
+    /// the pipeline's population seam. LOS bitmaps stay on
+    /// `prebuildLevelCaches` because they follow world dimensions, not the
+    /// agent count.
+    pub fn reserve(self: *PerceptionSystem, pop: usize) !void {
+        if (pop == 0) return;
+        const cap = hotStoreCapacity(pop);
+        try self.candidates.ensureTotalCapacity(self.allocator, cap);
+        try self.rows.ensureTotalCapacity(self.allocator, cap);
+        try self.prepareRangeStats(maxRangeCount(cap, perception_range_alignment_items));
     }
 
     /// Eagerly builds every existing level's `level_blocked` cache once, at
@@ -554,23 +540,6 @@ pub const PerceptionSystem = struct {
     /// step's observer set could span at once. Safe to call with zero
     /// levels (no-op) or to call again later (subsequent per-level calls are
     /// the normal cheap "nothing changed" reuse path, not a second rebuild).
-    /// Sizes candidate/observer rows and event scratch for `pop` agents. LOS
-    /// bitmaps stay on `prebuildLevelCaches` because they follow world dimensions,
-    /// not the agent count.
-    pub fn reserve(self: *PerceptionSystem, pop: usize) !void {
-        if (pop == 0) return;
-        const cap = hotStoreCapacity(pop);
-        try self.candidates.ensureTotalCapacity(self.allocator, cap);
-        try self.rows.ensureTotalCapacity(self.allocator, cap);
-        const ranges = std.math.divCeil(usize, cap, perception_range_alignment_items) catch 1;
-        try self.prepareEventRangeBuffers(ranges, perception_range_alignment_items, cap);
-        try self.prepareRangeStats(ranges);
-        try self.range_take_counts.ensureTotalCapacity(self.allocator, ranges);
-        if (self.event_ranges.items.len > 0) {
-            try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * perception_events_per_observer_max);
-        }
-    }
-
     pub fn prebuildLevelCaches(self: *PerceptionSystem, world: *const WorldSystem) !void {
         var level: usize = 0;
         while (level < world.levelCount()) : (level += 1) {
@@ -613,7 +582,8 @@ pub const PerceptionSystem = struct {
             config.adaptive,
             active_tuner,
         );
-        try self.prepareEventRangeBuffers(selection.range_count, selection.items_per_range, observer_count);
+        // Grow-only safety net for unreserved standalone use; after `reserve`
+        // it never allocates (`selection.range_count <= maxRangeCount(cap, 16)`).
         try self.prepareRangeStats(selection.range_count);
 
         var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, selection.range_count);
@@ -624,8 +594,8 @@ pub const PerceptionSystem = struct {
             .selected_profile = selection.profile,
         });
 
-        const merge = try self.mergePerceptionEvents(events, selection.range_count, config.max_events_per_step);
         const totals = self.sumRangeStats(selection.range_count);
+        const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
             .candidate_population_count = self.candidates.len,
@@ -662,14 +632,13 @@ pub const PerceptionSystem = struct {
         try self.ensureLevelBlockedCachesForObservers(world);
 
         const range_count: usize = 1;
-        try self.prepareEventRangeBuffers(range_count, observer_count, observer_count);
         try self.prepareRangeStats(range_count);
 
         var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, range_count);
         computePerceptionRange(&job, .{ .index = 0, .start = 0, .end = observer_count });
 
-        const merge = try self.mergePerceptionEvents(events, range_count, config.max_events_per_step);
         const totals = self.sumRangeStats(range_count);
+        const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
             .candidate_population_count = self.candidates.len,
@@ -724,7 +693,6 @@ pub const PerceptionSystem = struct {
             .world = world,
             .level_blocked = self.level_blocked.items,
             .player_candidate = player_candidate,
-            .event_ranges = self.event_ranges.items[0..range_count],
             .range_stats = self.range_stats.items[0..range_count],
         };
     }
@@ -1038,23 +1006,9 @@ pub const PerceptionSystem = struct {
         }
     }
 
-    fn prepareEventRangeBuffers(self: *PerceptionSystem, range_count: usize, items_per_range: usize, item_count: usize) !void {
-        try self.event_ranges.ensureTotalCapacity(self.allocator, range_count);
-        while (self.event_ranges.items.len < range_count) self.event_ranges.appendAssumeCapacity(.{});
-        for (self.event_ranges.items[0..range_count], 0..) |*slot, range_index| {
-            slot.buffer.clearRetainingCapacity();
-            const range_len = rangeLenForIndex(item_count, items_per_range, range_index);
-            // Worst case: an identity swap emits two events for one row, so
-            // this exact reserve can never overflow (unlike collision's
-            // broadphase pair estimate) — no grow-and-replay dance needed.
-            try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * perception_events_per_observer_max);
-        }
-    }
-
-    // Sizes/resets `range_stats` to `range_count` slots before dispatch (same
-    // reserve-before-dispatch shape as `prepareEventRangeBuffers`), so every
-    // range job has a pre-existing slot to write its single accumulated
-    // `PerceptionRangeStats` value into.
+    // Sizes/resets `range_stats` to `range_count` slots before dispatch
+    // (reserve-before-dispatch), so every range job has a pre-existing slot to
+    // write its single accumulated `PerceptionRangeStats` value into.
     fn prepareRangeStats(self: *PerceptionSystem, range_count: usize) !void {
         try self.range_stats.ensureTotalCapacity(self.allocator, range_count);
         while (self.range_stats.items.len < range_count) self.range_stats.appendAssumeCapacity(.{});
@@ -1069,57 +1023,73 @@ pub const PerceptionSystem = struct {
             totals.los_checks += slot.stats.los_checks;
             totals.los_blocked += slot.stats.los_blocked;
             totals.candidate_checks += slot.stats.candidate_checks;
+            totals.transition_events += slot.stats.transition_events;
         }
         return totals;
     }
 
-    /// Serial merge after the parallel/serial compute pass: sums each range's
-    /// real (not worst-case) event count, applies this system's own
-    /// deterministic per-step cap in range-ascending, within-range-write-order
-    /// (truncating the tail rather than letting `SimulationEvents`'s own
-    /// capacity check throw — see the module doc), then re-walks each range's
-    /// scratch into `events`'s shared range-output stream.
-    fn mergePerceptionEvents(
+    /// Main-thread transition emit after the parallel/serial compute pass
+    /// (Slice 72 I1). `total` is the workers' uncapped event count
+    /// (`PerceptionRangeStats.transition_events`); this system's own
+    /// deterministic per-step cap keeps the first `max_events_per_step` in
+    /// row order (`entity_lost` before `entity_perceived` within a row),
+    /// truncating the tail rather than letting `SimulationEvents`'s own
+    /// capacity check throw. One pass over the immutable `prev_*`/`final_*`
+    /// columns (`simd.equalInt4`, scalar tail) writes them as one range; the
+    /// pass is skipped outright when nothing is emitted. Row order equals the
+    /// former range-ascending concatenation, so the output is byte-identical
+    /// under every partition.
+    fn emitTransitionEvents(
         self: *PerceptionSystem,
+        job: *const PerceptionJobContext,
         events: *SimulationEvents,
-        range_count: usize,
+        total: usize,
         max_events_per_step: usize,
     ) !PerceptionEventMergeResult {
-        try self.range_take_counts.ensureTotalCapacity(self.allocator, range_count);
-        self.range_take_counts.clearRetainingCapacity();
-
-        var total: usize = 0;
-        for (self.event_ranges.items[0..range_count]) |*slot| total += slot.buffer.events.items.len;
         const capped_total = @min(total, max_events_per_step);
         const dropped = total - capped_total;
 
-        var remaining = capped_total;
-        for (self.event_ranges.items[0..range_count]) |*slot| {
-            const take = @min(slot.buffer.events.items.len, remaining);
-            self.range_take_counts.appendAssumeCapacity(take);
-            remaining -= take;
-        }
-
-        const first_range = try events.appendRangeCounts(range_count);
-        for (self.range_take_counts.items, 0..) |take, range_index| {
-            events.addCount(first_range + range_index, take);
-        }
+        const first_range = try events.appendRangeCounts(1);
+        events.addCount(first_range, capped_total);
         try events.prefixAppendedRanges(first_range);
 
-        var perceived: usize = 0;
-        var lost: usize = 0;
-        for (self.event_ranges.items[0..range_count], self.range_take_counts.items, 0..) |*slot, take, range_index| {
-            var writer = events.rangeWriter(first_range + range_index);
-            for (slot.buffer.events.items[0..take]) |event| {
-                writer.write(event);
-                switch (event.payload) {
-                    .entity_perceived => perceived += 1,
-                    .entity_lost => lost += 1,
-                    else => {},
+        var sink = TransitionSink{ .writer = events.rangeWriter(first_range), .remaining = capped_total };
+        if (capped_total > 0) {
+            const n = job.entities.len;
+            const prev_index = job.prev_nearest_threat_index;
+            const prev_generation = job.prev_nearest_threat_generation;
+            const final_index = job.final_nearest_threat_index;
+            const final_generation = job.final_nearest_threat_generation;
+            var i: usize = 0;
+            const vend = simd.vectorizedEnd(n);
+            while (i < vend and sink.remaining > 0) : (i += simd.lane_count) {
+                const idx_equal = simd.equalInt4(simd.loadInt4(prev_index[i..]), simd.loadInt4(final_index[i..]));
+                const gen_equal = simd.equalInt4(simd.loadInt4(prev_generation[i..]), simd.loadInt4(final_generation[i..]));
+                const unchanged = idx_equal & gen_equal;
+                inline for (0..simd.lane_count) |lane| {
+                    if (!unchanged[lane]) {
+                        sink.write(
+                            job.entities[i + lane],
+                            reconstructEntityId(prev_index[i + lane], prev_generation[i + lane]),
+                            reconstructEntityId(final_index[i + lane], final_generation[i + lane]),
+                        );
+                    }
                 }
             }
-            writer.finish();
+            while (i < n and sink.remaining > 0) : (i += 1) {
+                if (prev_index[i] != final_index[i] or prev_generation[i] != final_generation[i]) {
+                    sink.write(
+                        job.entities[i],
+                        reconstructEntityId(prev_index[i], prev_generation[i]),
+                        reconstructEntityId(final_index[i], final_generation[i]),
+                    );
+                }
+            }
         }
+        // Declared count == written count: `sink` stops at exactly
+        // `capped_total` because the workers' tally and this pass read the
+        // same immutable columns (`RangeWriter.finish` asserts it).
+        sink.writer.finish();
         events.finishWrite();
         events.stats.dropped += dropped;
         if (dropped > 0 and !self.dropped_events_warned) {
@@ -1130,7 +1100,7 @@ pub const PerceptionSystem = struct {
             );
         }
 
-        return .{ .perceived = perceived, .lost = lost, .dropped = dropped };
+        return .{ .perceived = sink.perceived, .lost = sink.lost, .dropped = dropped };
     }
 };
 
@@ -1276,7 +1246,6 @@ const PerceptionJobContext = struct {
     // every worker range.
     level_blocked: []const LevelBlockedSlot,
     player_candidate: ?PlayerPerceptionCandidate,
-    event_ranges: []PerceptionEventRangeSlot,
     range_stats: []PerceptionRangeStatsSlot,
 };
 
@@ -1284,26 +1253,32 @@ fn writePerceptionRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerI
     const job: *PerceptionJobContext = @ptrCast(@alignCast(context));
     // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
     // dispatched range count AND range.end vs the observer buffer this job walks.
-    // Guards the reserve-before-dispatch invariant: prepareEventRangeBuffers
-    // must have sized event_ranges to at least this dispatch's range count.
-    std.debug.assert(range.index < job.event_ranges.len);
+    // Guards the reserve-before-dispatch invariant: prepareRangeStats must
+    // have sized range_stats to at least this dispatch's range count.
+    std.debug.assert(range.index < job.range_stats.len);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.entities.len);
     computePerceptionRange(job, range);
 }
 
 /// Shared per-range compute: scalar per-agent neighbor query/FOV/LOS/writeback
-/// (`computeOneAgent`), then the dense transition-detection + scalar emit
-/// pass (`emitTransitionsForRange`). Called identically by the threaded
-/// dispatch and the serial single-range path — see the module doc's
-/// serial/threaded parity note.
+/// (`computeOneAgent`), then a tally of the transition events the row just
+/// written will produce (`transitionEventCount`); the events themselves are
+/// emitted after the join by `PerceptionSystem.emitTransitionEvents`. Called
+/// identically by the threaded dispatch and the serial single-range path —
+/// see the module doc's serial/threaded parity note.
 fn computePerceptionRange(job: *PerceptionJobContext, range: ParallelRange) void {
     // Local accumulator, not a pointer into job.range_stats: only one write
     // (below) ever lands per range, so concurrently running ranges never
     // touch each other's slot mid-accumulation.
     var range_stats = PerceptionRangeStats{};
-    for (range.start..range.end) |i| computeOneAgent(job, i, &range_stats);
-    emitTransitionsForRange(job, range);
+    for (range.start..range.end) |i| {
+        computeOneAgent(job, i, &range_stats);
+        range_stats.transition_events += transitionEventCount(
+            reconstructEntityId(job.prev_nearest_threat_index[i], job.prev_nearest_threat_generation[i]),
+            reconstructEntityId(job.final_nearest_threat_index[i], job.final_nearest_threat_generation[i]),
+        );
+    }
     job.range_stats[range.index].stats = range_stats;
 }
 
@@ -1633,61 +1608,41 @@ fn reconstructEntityId(index_bits: i32, generation_bits: i32) EntityId {
     return .{ .index = @bitCast(index_bits), .generation = @bitCast(generation_bits) };
 }
 
-/// Batches the prev-vs-final `EntityId` compare 4 rows at a time via
-/// `simd.equalInt4` over the row's contiguous bitcast index/generation
-/// columns, feeding a scalar per-row emit — same shape as collision.zig's
-/// SIMD Y-overlap filter feeding scalar contact emission. Scalar tail for the
-/// `< lane_count` remainder.
-fn emitTransitionsForRange(job: *PerceptionJobContext, range: ParallelRange) void {
-    const buffer = &job.event_ranges[range.index].buffer;
-    var i = range.start;
-    while (i + simd.lane_count <= range.end) : (i += simd.lane_count) {
-        const prev_idx = simd.loadInt4(job.prev_nearest_threat_index[i..]);
-        const prev_gen = simd.loadInt4(job.prev_nearest_threat_generation[i..]);
-        const final_idx = simd.loadInt4(job.final_nearest_threat_index[i..]);
-        const final_gen = simd.loadInt4(job.final_nearest_threat_generation[i..]);
-        const idx_equal = simd.equalInt4(prev_idx, final_idx);
-        const gen_equal = simd.equalInt4(prev_gen, final_gen);
-        const unchanged = idx_equal & gen_equal;
-        inline for (0..simd.lane_count) |lane| {
-            if (!unchanged[lane]) {
-                emitTransition(
-                    buffer,
-                    job.entities[i + lane],
-                    reconstructEntityId(job.prev_nearest_threat_index[i + lane], job.prev_nearest_threat_generation[i + lane]),
-                    reconstructEntityId(job.final_nearest_threat_index[i + lane], job.final_nearest_threat_generation[i + lane]),
-                );
-            }
-        }
-    }
-    while (i < range.end) : (i += 1) {
-        if (job.prev_nearest_threat_index[i] != job.final_nearest_threat_index[i] or
-            job.prev_nearest_threat_generation[i] != job.final_nearest_threat_generation[i])
-        {
-            emitTransition(
-                buffer,
-                job.entities[i],
-                reconstructEntityId(job.prev_nearest_threat_index[i], job.prev_nearest_threat_generation[i]),
-                reconstructEntityId(job.final_nearest_threat_index[i], job.final_nearest_threat_generation[i]),
-            );
-        }
-    }
-}
-
 /// Transition rules (see module doc): invalid->valid emits only
 /// `entity_perceived`; valid->invalid emits only `entity_lost`; a
 /// valid->different-valid identity swap emits both, `entity_lost` (the
 /// previous target) before `entity_perceived` (the new one), in that order.
-/// `prev`/`final` equal (including both invalid) never reaches here — the
-/// caller's `unchanged` check already filtered that out.
-fn emitTransition(buffer: *PerceptionEventRangeBuffer, observer: EntityId, prev: EntityId, final: EntityId) void {
-    if (prev.isValid()) {
-        buffer.appendAssumeCapacity(.{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = prev } } });
-    }
-    if (final.isValid()) {
-        buffer.appendAssumeCapacity(.{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = final } } });
-    }
+/// `prev`/`final` bit-identical (including both invalid) emits nothing. This
+/// count and `TransitionSink.write` encode the same rules, so the worker
+/// tally and the main-thread emit agree exactly.
+fn transitionEventCount(prev: EntityId, final: EntityId) usize {
+    if (prev.index == final.index and prev.generation == final.generation) return 0;
+    return @as(usize, @intFromBool(prev.isValid())) + @intFromBool(final.isValid());
 }
+
+/// Main-thread row-order writer for `emitTransitionEvents`: writes at most
+/// `remaining` more events, so a swap truncated with one slot left keeps only
+/// its `entity_lost` (the same within-row write-order truncation the former
+/// per-range merge applied).
+const TransitionSink = struct {
+    writer: SimulationEvents.RangeWriter,
+    remaining: usize,
+    perceived: usize = 0,
+    lost: usize = 0,
+
+    fn write(self: *TransitionSink, observer: EntityId, prev: EntityId, final: EntityId) void {
+        if (prev.isValid() and self.remaining > 0) {
+            self.writer.write(.{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = prev } } });
+            self.remaining -= 1;
+            self.lost += 1;
+        }
+        if (final.isValid() and self.remaining > 0) {
+            self.writer.write(.{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = final } } });
+            self.remaining -= 1;
+            self.perceived += 1;
+        }
+    }
+};
 
 const StageWorkSelection = BatchSelection;
 
@@ -3080,7 +3035,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     // M14: observer A identity-swaps (lost then perceived), observer B acquires.
     // With multi-range dispatch and max_events_per_step=1, both serial and real
     // multi-worker threaded paths must keep the same single survivor event
-    // (range-ascending, within-range write order — the first of A's lost).
+    // (row order, `entity_lost` before `entity_perceived` within a row — A's
+    // lost, row 0's first write).
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // items_per_range is aligned up to perception_range_alignment_items (16), so
@@ -3159,8 +3115,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         ids.b_threat = try addAgent(data, 210, 0, 0, 0, .hostile);
     }
 
-    // Aligned range size with A..fillers in range 0 and B in range 1 so the cap
-    // merge walks ranges in order rather than a single serial buffer.
+    // Aligned range size with A..fillers in range 0 and B in range 1: the cap
+    // applies in row order after the join, regardless of the partition.
     const multi_range_cfg = PerceptionConfig{
         .items_per_range = range_items,
         .max_worker_threads = 2,
@@ -3175,7 +3131,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     var serial_events = SimulationEvents.init(testing.allocator);
     defer serial_events.deinit();
     // updateSerial always uses range_count=1; drive serial through update with
-    // max_worker_threads=0 so the same multi-range merge path is exercised on both sides.
+    // max_worker_threads=0 so the same multi-range compute + row-order emit is
+    // exercised on both sides.
     var serial_threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0, .items_per_range = range_items });
     defer serial_threads.deinit();
     const serial_stats = try serial_sys.update(
@@ -3209,7 +3166,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         multi_range_cfg,
     );
 
-    // Both paths: multi-range, cap=1 survivor is A's entity_lost (first write in range 0).
+    // Both paths: multi-range, cap=1 survivor is A's entity_lost (row 0's first write).
     try testing.expect(serial_stats.batch.range_count > 1);
     try testing.expect(threaded_stats.batch.range_count > 1);
     try testing.expect(!threaded_stats.batch.ran_inline);
@@ -3396,23 +3353,26 @@ test "PerceptionSystem dual-list gather has no steady-state allocation after war
     try testing.expectEqual(@as(usize, 2), sys.rows.len);
 }
 
-test "PerceptionSystem threaded update has no steady-state allocation after warmup, multi-range (FailingAllocator)" {
+test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    // Enough observers to force multiple ranges under items_per_range ==
-    // perception_range_alignment_items, exercising prepareEventRangeBuffers's
-    // and prepareRangeStats's multi-slot growth loops (only reachable when
-    // range_count > 1), which the serial-only proof above never touches.
+    // Slice 72 I1: nothing partition-sized is left to reserve, so `reserve`
+    // alone (no warm step) covers the tuner's 64-item initial profile and the
+    // 16-item alignment floor on the real multi-worker path. 16 hostile
+    // non-observers on y = 0 and 96 `.player` observers on y = 10 facing -y:
+    // every observer acquires a hostile within 41 units on step 1. 96 rows
+    // put 32 in the 64-item partition's second range, which the old per-range
+    // event slots (reserved for 16 rows past slot 0) grew in-stage.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    for (0..40) |i| {
-        const fi: f32 = @floatFromInt(i);
-        const faction: Faction = if (i % 3 == 0) .hostile else .player;
-        _ = try addAgent(&data, fi * 6, 0, 0, 0, faction);
+    for (0..16) |h| {
+        const fh: f32 = @floatFromInt(h);
+        _ = try addAgent(&data, fh * 80, 0, 0, 0, .hostile);
     }
-    for (0..40) |i| {
-        const fi: f32 = @floatFromInt(i);
-        _ = try addObserver(&data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
+    const observer_total: usize = 96;
+    for (0..observer_total) |j| {
+        const fj: f32 = @floatFromInt(j);
+        _ = try addObserver(&data, fj * 12.5, 10, 0, -10, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
     }
 
     var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
@@ -3429,28 +3389,13 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 63, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 }};
-    const config = PerceptionConfig{
-        .items_per_range = perception_range_alignment_items,
-        .max_worker_threads = 2,
-        .adaptive = false,
-        .stimuli = &stimuli,
-    };
-
     try sys.reserve(data.aiAgentSliceConst().entities.len);
     try sys.prebuildLevelCaches(&world);
-    try events.reserve(64, 64);
-    try testing.expect(sys.level_blocked.items.len > 0);
-    try testing.expect(sys.level_blocked.items[0].valid);
+    try events.reserve(1, 256);
 
-    // Mirror the real per-frame lifecycle (SimulationFrame.beginStep) that
-    // resets `events` to steady-state-retained-capacity before every step;
-    // without this, `events.range_stats`'s own first_range bookkeeping would
-    // keep growing across steps regardless of this system's allocation
-    // behavior, which is not what this proof is about.
-    events.clearRetainingCapacity();
-
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    // resize_fail_index = 0 also catches in-place growth (a resize/remap that
+    // would not count as an allocation).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original_system_allocator = sys.allocator;
     const original_events_allocator = events.stream.allocator;
     sys.allocator = failing.allocator();
@@ -3460,11 +3405,22 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
         events.stream.allocator = original_events_allocator;
     }
 
-    const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
-    try testing.expectEqual(@as(usize, 40), stats.observer_count);
-    try testing.expect(stats.batch.range_count > 1);
-    try testing.expect(!stats.batch.ran_inline);
-    try testing.expect(stats.batch.active_worker_threads > 0);
+    const partitions = [_]usize{ perception_adaptive_tuner_config.initial_range_items, perception_range_alignment_items };
+    for (partitions, 0..) |items, step| {
+        // Mirrors `SimulationFrame.beginStep`'s per-step reset of `events`.
+        events.clearRetainingCapacity();
+        const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{
+            .items_per_range = items,
+            .max_worker_threads = 2,
+            .adaptive = false,
+        });
+        try testing.expectEqual(observer_total, stats.observer_count);
+        try testing.expectEqual(rangeCount(observer_total, items), stats.batch.range_count);
+        try testing.expect(!stats.batch.ran_inline);
+        try testing.expect(stats.batch.active_worker_threads > 0);
+        if (step == 0) try testing.expectEqual(observer_total, stats.perceived_events);
+    }
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "PerceptionSystem's dirty-tracked patch path has no steady-state allocation after warmup (FailingAllocator)" {

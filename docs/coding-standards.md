@@ -162,12 +162,17 @@ partition (never clamped to the total), with overflow handled by a counted
 grow-and-replay. Reference: `simulation_scope.zig`'s gathers and tier policy,
 `spatial_index.zig`'s gather, `collision.zig`'s narrowphase (Slice 72 C5).
 
+A pass whose events are a pure function of per-row state its workers already
+write (perception's prev/final nearest-threat columns) keeps no event scratch at
+all: the main thread derives and emits them in row order after the join as one
+range, so nothing partition-sized exists to reserve (Slice 72 I1).
+
 A partitioned processor that **emits an event stream** (not just scatters values
 into disjoint slots) under a per-step cap has a second requirement beyond
 disjoint writes: the merged emit order — and therefore which events survive the
 cap — is canonical and partition-independent. Such processors emit in a stable
 key order (per row, with a row's sub-kinds grouped, as
-`PerceptionSystem.emitTransitionsForRange` and `AffectSystem`'s per-row crossing
+`PerceptionSystem.emitTransitionEvents` and `AffectSystem`'s per-row crossing
 emit do), or sort the merged buffer by that key before applying the cap. Emitting
 one sub-kind or column at a time across a whole range makes both the merged order
 and the capped membership depend on how many ranges the tuner picked, so
