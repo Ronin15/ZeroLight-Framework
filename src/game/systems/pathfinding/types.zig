@@ -326,8 +326,8 @@ pub const NavUpdateStats = struct {
     // (NavGraph.growChunkEdgeWindow): a cold, dig-triggered growth that keeps the update an
     // incremental patch (no rebuild, no version bump). 0 on the steady path.
     edge_windows_grown: usize = 0,
-    // Edge-arena compactions this batch ran at the post-patch seam (NavGraph.compactEdgeArena,
-    // when relocation holes outnumber the slots live windows own). Cold; 0 on the steady path.
+    // Edge-arena compactions this batch ran (NavGraph.compactEdgeArena, run by a window growth
+    // that reached the nav memory gate's arena ceiling). Cold; 0 on the steady path.
     edge_compactions: usize = 0,
     // Gauge, not a per-batch delta: the graph's relocation holes (NavGraph.edge_hole_slots,
     // per-level arena slots no window references) after this batch. Recorded as a max.

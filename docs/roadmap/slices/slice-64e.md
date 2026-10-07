@@ -697,16 +697,17 @@ multi-worker patch path and the serial one.
         forward copy never overwrites an unmoved window. It keeps caps and
         edge order, rebases `portal_edge_start`, keeps each arena's capacity
         for later growths, and allocates nothing (the chunk order reuses
-        `build_u32_scratch`, sized to `total_slots` at every full build). The
-        post-commit nav reaction runs it after the last patch barrier when
-        holes outnumber the slots live windows own. Each relocation adds its
-        old cap to the holes and more than that to the live windows (growth
-        at least doubles), so that trigger is a backstop that today's growth
-        policy does not reach on its own. Test: "relocation holes past the
-        live window slots compact in place at the post-patch seam" builds a
-        fragmented but consistent layout with a test-local window move, then
-        a real ramp step compacts it under a `FailingAllocator` (0
-        allocations), serial and threaded, with full-rebuild parity.
+        `build_u32_scratch`, sized to `total_slots` at every full build). It
+        runs only on the memory-gate path below. Owner decision 2026-10-06:
+        the first version also had a post-patch trigger ("compact when holes
+        outnumber live window slots") and a test that relied on a test-built
+        fragmented layout. Both were removed because the trigger could never
+        fire. Each relocation adds its old cap to the holes and a new cap of
+        max(2 × needed, floor), which is more than 2 × the old cap, to the
+        live windows. So holes ≤ live window slots always holds, and
+        `applyNavUpdates` now `std.debug.assert`s it after the patch barrier
+        where the trigger used to sit. The compaction's zero-allocation proof
+        moved into the gate test (threaded, `FailingAllocator`).
       - Gate: the full build sets `edge_arena_slot_limit` from
         `NavMemoryBudget.edgeArenaSlotLimit`, which is the gate's own
         per-level edge-arena estimate plus the headroom `max_nav_memory_bytes`
@@ -720,7 +721,9 @@ multi-worker patch path and the serial one.
         limit, so headroom spent on edges is not admitted twice. Tests: "an
         edge-window growth past the nav memory gate compacts first, then
         refuses loudly" (compaction admits ramp 5's growth under a pinned
-        ceiling, then a growth with no hole to reclaim is refused twice in a
+        ceiling, through the real 3-worker patch's post-barrier pass with a
+        `FailingAllocator` on the graph and system: 0 allocations,
+        `edge_compactions == 1`; then a growth with no hole to reclaim is refused twice in a
         row, counted, with no flag left set, and lands with parity once
         admitted); "link growth and agent-budget raises charge an edge arena
         grown past its build estimate"; `nav_memory.zig` "edgeArenaSlotLimit

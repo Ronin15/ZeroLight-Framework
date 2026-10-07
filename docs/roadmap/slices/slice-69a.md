@@ -94,8 +94,9 @@ new features.
     incremental update (`growChunkEdgeWindow` in
     `systems/pathfinding/nav_graph.zig`, counted as `edge_windows_grown`;
     64E follow-up, 2026-10-06). The old full-rebuild fallback is gone. The
-    vacated windows are holes (perf gauge `nav_edge_hole_slots`), compacted in
-    place at the post-patch seam, and growth stays under the nav memory gate.
+    vacated windows are holes (perf gauge `nav_edge_hole_slots`), never more
+    than the live window slots, and growth stays under the nav memory gate
+    (compacting in place before it refuses).
 - **Tileset.**
   - `assets/sprites/world_tileset.json` already ships `autotile_sets`
     `grass_dirt`, `water_shore` and `path`, each `layout: "transition_16"` with
@@ -742,10 +743,9 @@ world (Slice 58 precedent). Nothing changes on hot paths.
         arena is at least 256 chunks × the 32-edge floor = 8,192 slots per
         level, so a soak whose growths stay in the few dozen chunks around
         the player stays in the low thousands;
-      - `edge_compactions=0`: compaction fires only when holes outnumber live
-        window slots (which at-least-doubling growth precludes) or a growth
-        reaches the nav memory gate's arena ceiling, and neither should happen
-        at production size. A nonzero value is a finding to explain;
+      - `edge_compactions=0`: compaction runs only when a growth reaches the
+        nav memory gate's arena ceiling, which should not happen at
+        production size. A nonzero value is a finding to explain;
       - `loading_build` recorded before and after.
 - [ ] Unit tests stay at 16×16 or smaller with 1 underground level.
 - [ ] Bench: new group `worldgen-breadth` (`src/benchmarks/worldgen.zig`,
