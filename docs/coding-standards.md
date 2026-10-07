@@ -27,8 +27,8 @@ setup/service paths, not hot per-frame dispatch, so they do not violate the
 Prefer direct declaration imports for project types and constants when that
 keeps call sites clear, such as `const Engine = @import("app/engine.zig").Engine;`
 or `const ThreadSystem = @import("app/thread_system.zig").ThreadSystem;`. Use a
-concise lowerCamelCase file namespace only when the call site is clearer as a
-function or namespace lookup, such as `inputFile.actionForKey(...)` or
+concise snake_case file namespace only when the call site is clearer as a
+function or namespace lookup, such as `input_file.actionForKey(...)` or
 `assets.validateRelativePath(...)`.
 
 Avoid `_mod` suffixes, `const Type = file.Type` bridge aliases, and double names
@@ -397,6 +397,11 @@ Keep state transitions, entity structural changes, SDL/GPU/audio calls, asset
 loading, save/load streaming, renderer resource ownership, and mixer resource
 ownership out of threaded SIMD processors unless an explicit deferred or
 main-thread boundary is designed.
+
+Work that scales with population, terrain change, or world size ships serial and
+threaded paths in its first implementation, with serial/threaded parity tests.
+Small fixed-size or cold one-off work may stay serial; ask the owner if unsure
+whether it scales.
 
 Production worker participation should be driven by measured batch timing and
 structural constraints. Do not add static item-count floors for worker

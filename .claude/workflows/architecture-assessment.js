@@ -42,28 +42,28 @@ phase('Docs Scan')
 
 const docResults = await parallel([
   () => agent(
-    `Read and analyze /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/architecture.md and /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/simulation-tiers-and-pipeline.md.
+    `Read and analyze docs/architecture.md and docs/simulation-tiers-and-pipeline.md.
     Focus on: overall source layout, ownership model, frame flow, simulation pipeline contracts, tier structure, fixed-step loop, threading model, and how well the architecture supports adding new emergent gameplay systems.
     Return a structured analysis.`,
-    { label: 'docs:arch+sim', phase: 'Docs Scan', schema: DOCS_SCHEMA }
+    { label: 'docs:arch+sim', phase: 'Docs Scan', schema: DOCS_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
-    `Read and analyze /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/state-stack-and-input.md and /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/coding-standards.md.
+    `Read and analyze docs/state-stack-and-input.md and docs/coding-standards.md.
     Focus on: state stack contracts, transitions, input routing policy, performance constraints, coding standards for DOD patterns, SoA usage, SIMD policy, allocation rules, and how these constrain or enable emergent gameplay.
     Return a structured analysis.`,
-    { label: 'docs:state+standards', phase: 'Docs Scan', schema: DOCS_SCHEMA }
+    { label: 'docs:state+standards', phase: 'Docs Scan', schema: DOCS_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
-    `Read and analyze /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/framework-implementation-slices.md (the roadmap index), then the open slice files it links under docs/roadmap/slices/ that matter for emergent gameplay, the track overviews in docs/roadmap/tracks/, and docs/roadmap/scaling-gaps.md. Use docs/framework-implementation-slices-archive.md (index of docs/roadmap/archive/) only to confirm what is settled.
+    `Read and analyze docs/framework-implementation-slices.md (the roadmap index), then the open slice files it links under docs/roadmap/slices/ that matter for emergent gameplay, the track overviews in docs/roadmap/tracks/, and docs/roadmap/scaling-gaps.md. Use docs/framework-implementation-slices-archive.md (index of docs/roadmap/archive/) only to confirm what is settled.
     Focus on: what slices are complete (settled), what is the current open frontier (see the Open Frontier Slice Index), what future slices are planned, what emergent gameplay capabilities are explicitly planned vs gaps, and the priority/ordering rationale.
     Return a structured analysis.`,
-    { label: 'docs:roadmap', phase: 'Docs Scan', schema: DOCS_SCHEMA }
+    { label: 'docs:roadmap', phase: 'Docs Scan', schema: DOCS_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
-    `Read and analyze /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/rendering-assets-shaders.md and /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/atlas-asset-workflow.md.
+    `Read and analyze docs/rendering-assets-shaders.md and docs/atlas-asset-workflow.md.
     Focus on: how rendering and assets are decoupled from simulation, stable asset ID approach, render_prep pipeline boundary, whether the rendering architecture scales with many entity types, and constraints it imposes on gameplay variety.
     Return a structured analysis.`,
-    { label: 'docs:render+assets', phase: 'Docs Scan', schema: DOCS_SCHEMA }
+    { label: 'docs:render+assets', phase: 'Docs Scan', schema: DOCS_SCHEMA, agentType: 'zig-design-specialist' }
   ),
 ])
 
@@ -72,44 +72,44 @@ phase('Code Scan')
 const codeResults = await parallel([
   () => agent(
     `Read these files and analyze the core simulation pipeline:
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/data_system.zig
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/simulation_pipeline.zig (if exists, else check src/game/ for pipeline-related files)
-    Run: ls /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/ to see all files first.
+    - src/game/data_system.zig
+    - src/game/simulation_pipeline.zig (if exists, else check src/game/ for pipeline-related files)
+    Run: ls src/game/ to see all files first.
     Focus on: SoA data layout, entity capacity, how processors are registered/ordered, whether new systems can be added without modifying the pipeline core, data dependencies between systems, and readiness for many interacting simulation layers.`,
-    { label: 'code:data+pipeline', phase: 'Code Scan', schema: CODE_SCHEMA }
+    { label: 'code:data+pipeline', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
     `Read these files:
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/systems/movement.zig (or similar in src/game/systems/)
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/systems/ai.zig (or similar)
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/systems/collision.zig (or similar)
-    Run: ls /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/systems/ first to see available systems.
+    - src/game/systems/movement.zig (or similar in src/game/systems/)
+    - src/game/systems/ai.zig (or similar)
+    - src/game/systems/collision.zig (or similar)
+    Run: ls src/game/systems/ first to see available systems.
     Focus on: per-system data access patterns, how they interact with the SoA store, whether they read/write shared state safely, SIMD usage, and how a new emergent system (e.g. resource spreading, fire propagation, crowd behavior) would slot in.`,
-    { label: 'code:systems', phase: 'Code Scan', schema: CODE_SCHEMA }
+    { label: 'code:systems', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
     `Read these files:
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/app/engine.zig
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/app/thread_system.zig
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/app/time_loop.zig
+    - src/app/engine.zig
+    - src/app/thread_system.zig
+    - src/app/time_loop.zig
     Focus on: how the engine initializes and drives the fixed-step loop, thread pool setup and job dispatch, whether the threading model supports parallel simulation phases, and scalability limits (max threads, queue depth, job granularity).`,
-    { label: 'code:engine+threads', phase: 'Code Scan', schema: CODE_SCHEMA }
+    { label: 'code:engine+threads', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
     `Read these files related to pathfinding and world systems:
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/world_system.zig
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/pathfinding.zig (or src/game/systems/pathfinding/)
-    Run: ls /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/systems/pathfinding/ first if it exists.
+    - src/game/world_system.zig
+    - src/game/systems/pathfinding.zig (and src/game/systems/pathfinding/)
+    Run: ls src/game/systems/pathfinding/ first if it exists.
     Focus on: world/map data model, how navigation mesh or grid is managed, whether the world model supports dynamic changes (terrain modification, destructibles), how spatial queries are done, and readiness for emergent world-state gameplay.`,
-    { label: 'code:world+pathfinding', phase: 'Code Scan', schema: CODE_SCHEMA }
+    { label: 'code:world+pathfinding', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
     `Read these files:
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/render_prep.zig
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/dig_controller.zig
-    - /Users/roninxv/projects/zig_projects/ZeroLight-Framework/src/game/audio_controller.zig
+    - src/game/render_prep.zig
+    - src/game/dig_controller.zig
+    - src/game/audio_controller.zig
     Focus on: how render_prep decouples simulation from rendering, controller pattern for cross-cutting concerns, whether new controllers (e.g. particle events, status effects, emergent audio) can be added cleanly, and the deferred structural change model.`,
-    { label: 'code:controllers', phase: 'Code Scan', schema: CODE_SCHEMA }
+    { label: 'code:controllers', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
 ])
 
@@ -156,8 +156,10 @@ Write a structured assessment report covering:
 
 7. **Risk Register** (top 5 architectural risks with mitigation paths)
 
+Each follow-up (next step, risk, fix, or test gap) names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line.
+
 Return the full report as plain markdown text.`,
-  { label: 'synthesis:report', phase: 'Synthesis' }
+  { label: 'synthesis:report', phase: 'Synthesis', agentType: 'zig-design-specialist' }
 )
 
 return report

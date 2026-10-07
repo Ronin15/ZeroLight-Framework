@@ -184,17 +184,19 @@ const perUnit = await pipeline(
   (u) => agent(reviewPrompt(u), { label: `review:${u.unit}`, phase: 'Review', schema: FINDINGS_SCHEMA, agentType: 'zig-review-specialist' }),
   (review, u) => {
     if (!review || !review.findings || review.findings.length === 0) return { unit: u.unit, verified: [] }
+    // Adversarially verify only high findings; others pass through unverified.
+    const unverified = review.findings.filter((f) => f.severity !== 'high').map((f) => ({ ...f, unit: u.unit, verdict: { verdict: 'UNVERIFIED', is_real: true, reasoning: 'not verified (below high)', corrected_severity: f.severity, durable_confirmed: f.durable } }))
     return parallel(
-      review.findings.map((f) => () =>
-        agent(verifyPrompt(f), { label: `verify:${u.unit}:${f.category}`, phase: 'Verify', schema: VERDICT_SCHEMA })
+      review.findings.filter((f) => f.severity === 'high').map((f) => () =>
+        agent(verifyPrompt(f), { label: `verify:${u.unit}:${f.category}`, phase: 'Verify', schema: VERDICT_SCHEMA, agentType: 'zig-review-specialist' })
           .then((v) => (v ? { ...f, unit: u.unit, verdict: v } : null))
       )
-    ).then((rows) => ({ unit: u.unit, verified: rows.filter(Boolean) }))
+    ).then((rows) => ({ unit: u.unit, verified: [...rows.filter(Boolean), ...unverified] }))
   }
 )
 
 const allVerified = perUnit.filter(Boolean).flatMap((r) => r.verified)
-const confirmed = allVerified.filter((f) => f.verdict && (f.verdict.verdict === 'CONFIRMED' || f.verdict.verdict === 'PLAUSIBLE') && f.verdict.is_real)
+const confirmed = allVerified.filter((f) => f.verdict && (f.verdict.verdict === 'CONFIRMED' || f.verdict.verdict === 'PLAUSIBLE' || f.verdict.verdict === 'UNVERIFIED') && f.verdict.is_real)
 const durable = confirmed.filter((f) => f.durable && f.verdict.durable_confirmed)
 
 log(`Reviewed ${REVIEW_UNITS.length} units; ${allVerified.length} raw findings, ${confirmed.length} confirmed/plausible, ${durable.length} confirmed-durable.`)
@@ -219,10 +221,12 @@ const synthesis = await agent(
     ``,
     `Propose ONLY NET-NEW durable items justified by the findings below. For lint_rules: only propose a rule that a line-scanner can enforce with LOW false positives — give a concrete detection heuristic AND the exemptions it must carve out; if a pattern is real but not mechanically detectable without noise, route it to agent_guidance instead. For agent_guidance: write it in the terse voice of the existing agent files and target the right agent(s). Keep everything concise and non-duplicative. Also list the top concrete one-off fixes (top_fixes) ranked by severity for the human to act on.`,
     ``,
+    `Each top_fixes fix_direction names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Findings marked UNVERIFIED were not adversarially checked (below high).`,
+    ``,
     `Verified findings:`,
     digest,
   ].join('\n'),
-  { label: 'synthesize', phase: 'Synthesize', schema: SYNTHESIS_SCHEMA, effort: 'high' }
+  { label: 'synthesize', phase: 'Synthesize', schema: SYNTHESIS_SCHEMA, agentType: 'zig-review-specialist' }
 )
 
 return {

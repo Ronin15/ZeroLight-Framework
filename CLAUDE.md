@@ -13,6 +13,10 @@ with a state-owned `SimulationPipeline`, scoped simulation tiers, and
 multithreaded/SIMD processors for movement, AI, steering, collision,
 pathfinding, and particles.
 
+The game built on it is dig/build with cave-ins and explosions: dense,
+multi-chunk terrain change in one step is normal gameplay. Test
+destruction-shaped workloads (explosion region in one step, repeated dig/fill).
+
 ## Source Of Truth (`docs/`)
 
 Read the doc that owns the area before editing — these are canonical, not notes.
@@ -117,8 +121,11 @@ boundaries just to make a local change easier.
     `FailingAllocator` rule still applies and proves exactly that). Capacity
     must never change behavior: no iteration order, deferral, or result may
     depend on how much is reserved. Fixed caps only for index/format widths
-    (e.g. `u16`/`u32` indices, save/replay layouts) or a platform memory
-    ceiling, and they fail loudly.
+    (e.g. `u16`/`u32` indices, save/replay layouts) proven unreachable for the
+    loaded world extent; they fail loudly at load, never at a
+    gameplay-reachable point. No dig, build, cave-in, or explosion may be
+    refused for capacity. Exception: cosmetic effect pools that no simulation
+    reads may be fixed-capacity with deterministic overflow drop.
   - **Heuristic thresholds** (e.g. "build a group flow field above N agents")
     derive from the cost of the operation they gate (its own bounded region or
     input), never from the whole world's size.
@@ -133,6 +140,11 @@ boundaries just to make a local change easier.
   during. Allocators are explicit fields set at `init`, never a global reached
   for mid-function. See `docs/coding-standards.md` for the full
   allocator-discipline rules.
+- Work that scales with population, terrain change, or world size ships serial
+  and threaded paths from its first implementation (`docs/coding-standards.md`
+  Performance).
+- Write the plain, readable form first (`docs/coding-standards.md` Zig Style);
+  keep comments terse.
 - Keep runtime asset paths relative and traversal-safe. Persist gameplay data by
   stable asset IDs (e.g. `SpriteAssetId`, `AudioAssetId`), not string paths,
   live renderer/SDL handles, or prepared draw records.
@@ -164,6 +176,8 @@ boundaries just to make a local change easier.
 ## Build & Validation Commands
 
 Run `zig build verify` before considering a slice or broad change complete.
+In a multi-commit batch, run `check` + `test` + `idiom-lint` per commit and the
+full `verify` once at the end.
 
 ```sh
 zig build            # build and install app, runtime assets, and shaders
@@ -201,6 +215,9 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.17.0**.
 - Always run a targeted benchmark with `zig build bench -- --group <name>`
   (optionally `--case`/`--items`) unless explicitly told to run the full suite.
   Do not run the whole `zig build bench` and filter its output.
+- Benches at target scale ship with the first implementation. Large-scale
+  benches are stress tests, not frame targets: weight a result by how often
+  that workload really occurs at that count.
 - **`zig build bench` is for perf and OOM/leak-sweep checks; `zig build test`
   is for fast contract/correctness checks only.** Never measure or report
   performance/timing by hand-rolling a timer inside a `zig build test` test —
@@ -223,6 +240,8 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.17.0**.
   during an actual `zig build bench` run instead of wrapping it in a test. If
   a perf question needs answering and no benchmark case covers it yet, add or
   extend one under `src/benchmarks/` and run it via `zig build bench`.
+- Implementation agents run sequentially in the main tree with linear commits;
+  no `isolation: worktree` or merge commits. Parallelize only read-only work.
 
 ## Claude Code Tooling (`.claude/`)
 
@@ -233,9 +252,11 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.17.0**.
   effort, review/implementation/debug at `high` (review fans out across many
   workflow agents).
   **Required, not optional:** all non-trivial Zig design, implementation,
-  review, and debugging goes through these agents, chained as one pipeline —
-  `zig-design-specialist` plans → `zig-specialist` implements →
-  `zig-review-specialist` reviews (findings go back to `zig-specialist`) →
+  review, and debugging goes through these agents —
+  `zig-design-specialist` plans only when the design is ambiguous (clear fixes
+  go straight to `zig-specialist`); `zig-review-specialist` reviews once per
+  batch (findings go back to `zig-specialist`; at most one review-of-fixes
+  round; adversarially verify only High/Critical findings);
   `zig-debug-specialist` for build/test/runtime failures. Do not implement
   non-trivial changes inline, and do not substitute or add generic skills or
   agents (`/code-review`, `/simplify`, generic Explore/Plan) for this repo's

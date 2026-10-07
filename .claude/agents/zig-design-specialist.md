@@ -29,8 +29,8 @@ ownership, data flow, or performance policy. **You do not edit code** — return
    `docs/rendering-assets-shaders.md`, `docs/atlas-asset-workflow.md`,
    `docs/coding-standards.md` (enforced style/performance/test/contract rules), and
    `docs/framework-implementation-slices.md` (roadmap index; each slice is one file under
-   `docs/roadmap/slices/`, shared contracts and cross-slice version/stage/tag tables in
-   `docs/roadmap/tracks/voidlight-port.md`).
+   `docs/roadmap/slices/`, shared contracts and cross-slice tables in the track files under
+   `docs/roadmap/tracks/` that the slice links).
 2. Keep designs scoped to the repo's actual direction: normal 2D game, fixed-step sim,
    state-owned `DataSystem`, dense SoA stores, mostly stateless processors, explicit
    main-thread/deferred boundaries, hardware-aware hot paths. No package/library framing,
@@ -70,7 +70,8 @@ the game layer needs. Game states never call SDL_GPU directly.
   stores). Persistent storage carries stable asset IDs (`SpriteAssetId`, `AudioAssetId`)
   and enum render-depth intent — never SDL/GPU handles, live texture IDs, text leases,
   asset-loading state, input-frame state, thread state, events, or scratch. State-owned
-  transient pools (e.g. particles) may own fixed-capacity SoA when the data is effect state.
+  cosmetic effect pools that no simulation reads (e.g. particles) may be fixed-capacity with
+  deterministic overflow drop (CLAUDE.md).
   Default persistent/gather-buffer stores to `std.MultiArrayList` (row struct, column-slice
   accessors) per `docs/coding-standards.md` Dense SoA storage; name the exception when a
   layout intentionally isn't row-per-index (hot/cold column split, striped/arena buffer,
@@ -88,9 +89,9 @@ the game layer needs. Game states never call SDL_GPU directly.
   (CLAUDE.md): world-extent data sized exactly at load; runtime-growing stores start
   right-sized + headroom and grow only at the structural-commit seam (geometric, ahead of
   need) or via paged storage — state the sizing formula, the growth point/policy, and the
-  `FailingAllocator` proof for the steady state; fixed caps only for index/format widths or a
-  loud platform ceiling. Default is keep: justify any change with a concrete perf/efficiency
-  benefit vs. its cost/risk. **Thresholds** derive from the cost of the gated operation.
+  `FailingAllocator` proof for the steady state; fixed caps only for index/format widths proven
+  unreachable for the world extent, failing loudly at load, never gameplay-reachable. Default
+  is keep: justify any change with a concrete perf/efficiency benefit vs. its cost/risk. **Thresholds** derive from the cost of the gated operation.
 - **Deferred / main-thread boundary** for structural entity/component changes, state
   transitions, SDL/GPU calls, asset loading, save/load streaming, renderer resource
   ownership. The main thread is not a dumping ground — any subsystem that scales with
@@ -99,7 +100,9 @@ the game layer needs. Game states never call SDL_GPU directly.
   disjoint worker row ranges that avoid sharing a writable cache line; deterministic output
   order from stable input/range order (count-per-range → prefix offsets → contiguous write →
   range-index merge → batch commit), never worker timing/IDs or global per-command atomics.
-  Always keep a serial fallback for small batches, tests, and unsupported thread targets.
+  Work that scales gets serial and threaded paths from the first implementation
+  (`docs/coding-standards.md` Performance); the serial path also covers small batches, tests,
+  and unsupported thread targets.
   64-byte padding only for concurrently written thread-shared records — never cold slot metadata.
 - **Test strategy** that proves contracts without a display (unless the feature is GPU-gated),
   and without adding test-only enum tags, marker payloads, fake stages, fixture hooks, or

@@ -74,7 +74,8 @@ open until that residual is closed.
   main-thread structural-commit seam (geometric, ahead of need) or via paged
   storage — hot paths stay allocation-free between growth points (proven by
   `FailingAllocator`), and capacity never changes behavior; fixed caps only
-  for index/format widths or a loud platform memory ceiling. Never change a
+  for index/format widths proven unreachable for the world extent, failing
+  loudly at load, never at a gameplay-reachable point. Never change a
   constant just for the rule — a change needs a concrete perf/efficiency
   benefit. **Thresholds** derive from the cost of the
   operation they gate, not the whole world.

@@ -40,7 +40,7 @@ const STANDARDS = `Before reviewing, read these canonical docs (they are the sou
 - docs/coding-standards.md (Zig style, performance, comments, tests)
 - docs/simulation-tiers-and-pipeline.md (fixed-step simulation contracts)
 - docs/architecture.md (ownership boundaries, frame flow)
-And honor CLAUDE.md working rules: hot/frame paths must be allocation-free after init/reserve/warmup; no per-frame string lookups, hash-map dispatch, broad dynamic dispatch, or formatted logging on hot paths; lowerCamelCase fns/vars, PascalCase types, explicit error sets, zig fmt; terse comments (no essays/roadmap refs/review tags); production APIs expose runtime concepts only (no test-only enum tags/marker fields).`
+And honor CLAUDE.md working rules: hot/frame paths must be allocation-free after init/reserve/warmup; no per-frame string lookups, hash-map dispatch, broad dynamic dispatch, or formatted logging on hot paths; camelCase fns, snake_case vars/fields/enum tags, PascalCase types, explicit error sets, zig fmt; terse comments (no essays/roadmap refs/review tags); production APIs expose runtime concepts only (no test-only enum tags/marker fields).`
 
 const LENSES = `Review along three lenses:
 1. COHERENCY — does the logic hold together and behave consistently? Inconsistent invariants, contradictory assumptions across functions, mismatched units/coordinate spaces, off-by-one or edge-case gaps, comments that disagree with code.
@@ -49,11 +49,11 @@ const LENSES = `Review along three lenses:
 Give file:line references. Be specific and severity-honest; do not invent problems where the code is sound.`
 
 const UNITS = [
-  { unit: 'system', files: ['src/game/systems/pathfinding/system.zig'], note: 'The largest file (~3200 lines): per-frame request scheduling, agent state, integration with simulation pipeline. Scrutinize hot-path allocation and dispatch.' },
-  { unit: 'nav_graph', files: ['src/game/systems/pathfinding/nav_graph.zig'], note: '~2170 lines: navigation graph construction/representation.' },
-  { unit: 'caches', files: ['src/game/systems/pathfinding/caches.zig'], note: '~800 lines: path/result caching. Check invalidation coherency and lifetime.' },
-  { unit: 'solve', files: ['src/game/systems/pathfinding/solve.zig'], note: '~590 lines: the core search/solve (A*/etc). Check allocation discipline and correctness of the search.' },
-  { unit: 'nav_grid', files: ['src/game/systems/pathfinding/nav_grid.zig'], note: '~590 lines: grid representation and walkability. Comments must be tile-agnostic (describe cells by walkability, not grass/tree).' },
+  { unit: 'system', files: ['src/game/systems/pathfinding/system.zig'], note: 'Per-frame request scheduling, agent state, integration with simulation pipeline. Scrutinize hot-path allocation and dispatch.' },
+  { unit: 'nav_graph', files: ['src/game/systems/pathfinding/nav_graph.zig'], note: 'Navigation graph construction/representation.' },
+  { unit: 'caches', files: ['src/game/systems/pathfinding/caches.zig'], note: 'Path/result caching. Check invalidation coherency and lifetime.' },
+  { unit: 'solve', files: ['src/game/systems/pathfinding/solve.zig'], note: 'The core search/solve (A*/etc). Check allocation discipline and correctness of the search.' },
+  { unit: 'nav_grid', files: ['src/game/systems/pathfinding/nav_grid.zig'], note: 'Grid representation and walkability. Comments must be tile-agnostic (describe cells by walkability, not grass/tree).' },
   { unit: 'types_and_memory', files: ['src/game/systems/pathfinding/types.zig', 'src/game/systems/pathfinding/nav_memory.zig'], note: 'Shared types/contracts and memory/arena management for the module.' },
   { unit: 'group_field_and_scratch', files: ['src/game/systems/pathfinding/group_field.zig', 'src/game/systems/pathfinding/scratch.zig'], note: 'Flow/group field and scratch buffers. Check reuse vs per-frame allocation.' },
   { unit: 'facade_and_test_support', files: ['src/game/systems/pathfinding.zig', 'src/game/systems/pathfinding/test_support.zig'], note: 'Public facade (re-exports/ownership surface) and test-support helpers. Verify no test-only constructs leak into production API.' },
@@ -115,9 +115,9 @@ Produce a single, polished Markdown review report. Requirements:
 - A severity-ordered findings section (Critical -> High -> Medium -> Low -> Nit). Merge duplicate findings reported by multiple agents into one entry (note corroboration). Drop anything that is clearly spurious or contradicted by other reviewers, and say briefly what you dropped if notable.
 - Each finding: severity, category, file:line, the problem, and a concrete suggested fix.
 - A "Cross-cutting themes" subsection for module-wide coherency/cohesion observations.
-- End with a prioritized action list (top fixes first).
+- End with a prioritized action list (top fixes first). Each follow-up (next step, risk, fix, or test gap) names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line.
 Be concise and concrete. Do not invent findings beyond the corpus. Return ONLY the Markdown report.`,
-  { label: 'synthesize', phase: 'Synthesize' }
+  { label: 'synthesize', phase: 'Synthesize', agentType: 'zig-review-specialist' }
 )
 
 return { report, unitCount: UNITS.length, crossCount: CROSS.length, totalFindings: corpus.reduce((n, r) => n + (r.findings?.length || 0), 0) }

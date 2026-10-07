@@ -93,7 +93,8 @@ budget is fixed via graceful degradation or an algorithmic change, not a bigger 
 flag the opposite: a data-structure **capacity** hard-coded as one fixed working size where
 it should be right-sized per world instance (world-extent data sized at load; runtime-growing
 stores grown only at the structural-commit seam or via paged storage; fixed caps only for
-index/format widths or a loud platform ceiling), behavior that depends on reserved capacity,
+index/format widths proven unreachable for the world extent, failing at load — never a
+gameplay-reachable refusal), behavior that depends on reserved capacity,
 growth inside a threaded stage, and any change justified only by rule compliance, and **thresholds** derived from whole-
 world size instead of the cost of the gated operation. Capacity growth on the hot path is
 still a High finding.
@@ -108,7 +109,7 @@ already-built const column slices from its caller — the rebuild hides behind t
 
 **Pipeline stage-ordering contract** — a new or reordered `SimulationPipeline` stage must add
 its `PipelineResource` read/write tag(s) to `stageContract()`, its `StageId` in `stage_order`
-at the correct dependency position, and the real call in `update()` there. If the real
+at the correct dependency position, and one `runStage` arm for it. If the real
 ordering dependency isn't expressible as a tracked resource read/write, flag a missing
 causal-effect test (a scenario where the wrong order would produce an observably different
 result).
@@ -194,6 +195,11 @@ records, not cold entity slot metadata.
 **Main-thread dumping** — flag scalable work moved to the main thread without an explicit
 ownership boundary (SDL/GPU/audio ownership, state transitions, structural commits, asset
 loading, save/load streaming, renderer resource ownership, or measured light orchestration).
+Flag scaling work (population, terrain change, world size) shipped without both serial and
+threaded paths (`docs/coding-standards.md` Performance).
+
+**Readability** — flag clever forms (bit tricks, cryptic names, inline tuple arrays) on non-hot
+or unbenched paths (`docs/coding-standards.md` Zig Style).
 
 **Tests** — prefer tests that directly verify behavior (input routing, state policy, viewport
 math, resource-ID/descriptor validation, gameplay movement, pure timing). Unit tests must not

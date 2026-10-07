@@ -113,10 +113,9 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
     reserve and its `assumeCapacity` commit live in separate functions/entry points (not one guarded
     helper), the proof must exercise the reserved-then-push SUCCESS branch — reserve, fail the next
     allocation, assert the push completes — not just the reserve-fails cleanup branch.
-11. Per-query/per-frame work budgets (search node caps, solve ceilings) are fixed constants —
-    never derived from world/map size, cell count, portal count, or other "current scale." A
-    chronically insufficient budget gets graceful degradation (deferral / bounded retry) or an
-    algorithm change, never a bigger number sized to one map.
+11. Budgets, capacities, and thresholds follow CLAUDE.md's three-way rule in full: fixed work
+    budgets (never scaled to world size), right-sized capacities that grow only at the
+    structural-commit seam, no gameplay-reachable refusal.
 12. Log only through `src/core/logging.zig` scoped loggers, never raw `std.log`/`std.debug.print`;
     `warn` for recovered degradation, `err` for real failures; pure helpers/validation stay
     log-free. Hot/frame-adjacent paths carry no logging in release — comptime-gate any such
@@ -149,7 +148,7 @@ bounds assert the release build strips. A per-row SoA store append uses a privat
 Adding or reordering a `SimulationPipeline` stage requires, in the same change: the
 `PipelineResource` tag(s) it reads/writes in `simulation_pipeline.zig`'s `stageContract()`,
 its `StageId` slotted into `stage_order` at the position its real dependencies require, and
-the real call in `update()` at that position. `zig build check` comptime-fails a stage that
+one `runStage` arm for it. `zig build check` comptime-fails a stage that
 reads a resource no earlier stage writes. Ordering dependencies with no shared tracked
 resource need a targeted causal-effect test instead (construct a scenario where the wrong
 order produces an observably different result).
@@ -164,7 +163,8 @@ hash-map dispatch in hot loops. Threaded/SIMD processors keep structural changes
 transitions, SDL/GPU calls, asset loading, save/load, and renderer resource ownership behind
 an explicit deferred/main-thread boundary, and use typed range-owned output buffers
 (count/prefix/contiguous-write/range-index merge/batch commit) over global per-command
-atomics or event buses. Keep a serial fallback; do not gate worker participation with static
+atomics or event buses. Scaling work ships serial and threaded paths
+(`docs/coding-standards.md` Performance); do not gate worker participation with static
 item-count floors. Do not turn the main thread into a dumping ground for scalable work. Drive a
 batched `RangeOutputStream`/`SimulationEvents` producer once per commit — reserve and write every
 range, then call `finishWrite` a single time; a record-per-item publish loop is O(N²) because
