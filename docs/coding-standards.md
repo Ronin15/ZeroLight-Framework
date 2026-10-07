@@ -10,7 +10,13 @@ Follow `zig fmt`; use 4-space indentation and avoid manual alignment that the
 formatter will rewrite. Follow Zig's standard naming: camelCase for functions
 and other callables, snake_case for variables, struct fields, and non-type
 constants, PascalCase for types (and functions that return a type), and short
-descriptive names. Keep error sets explicit when practical, as in
+descriptive names.
+
+Write the plain, obvious form first, in production and test code alike: names
+that say what a value is (`corridor`, not `i`/`xy`), arithmetic over bit tricks
+(`x % 2 == 1`, not `x | 1`), and small named helpers over inline tuple arrays.
+Use a clever form only where a bench shows it matters on a hot path, and name
+what it does in a one-line comment. Keep error sets explicit when practical, as in
 `error{SdlError}`. The `*anyopaque` + `anyerror!T` function-pointer vtables at
 type-erased service boundaries (state adapters, asset upload, audio/text
 backends) are the accepted "not practical" exception: the concrete error set
