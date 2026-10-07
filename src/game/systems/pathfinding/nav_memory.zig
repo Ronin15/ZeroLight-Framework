@@ -2,10 +2,11 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Build-time nav memory budget gate. Estimates the reserve-time nav stores from
+//! Load-time nav memory budget gate. Estimates the reserve-time nav stores from
 //! world dimensions and reserve config and fails loud (NavGridError.NavWorldTooLarge)
 //! before a rebuild reserves past the configured ceiling. Runtime-growing data (the
-//! abstract edge arena) is estimated here but never refused after the build.
+//! abstract edge arena, level links, the agent budget) is estimated here but never
+//! refused during play: it grows at its commit seam.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -240,8 +241,8 @@ comptime {
 // The single NavMemoryBudget constructor shared by the rebuild gate, the
 // auto-sizer, and tests. Counts the ELASTIC CEILING caps (deriveCapacity at
 // max_agent_budget), not the live derived values: the safe-point elastic resize
-// can grow the result cache and worker pools to the ceiling later WITHOUT
-// re-running the gate, so admission must already cover that worst case.
+// can grow the result cache and worker pools to the configured ceiling WITHOUT
+// re-running the gate, so load-time admission covers that worst case.
 pub fn budgetForCapacity(capacity: types.PathfindingCapacity, level_count: usize, link_count: usize) NavMemoryBudget {
     const ceiling = types.deriveCapacity(capacity, @max(types.min_capacity_floor, capacity.max_agent_budget));
     return .{
@@ -356,8 +357,8 @@ test "autoSizedMaxNavMemoryBytes returns a sane floor for degenerate zero-sized 
 test "nav memory gate admits by elastic ceiling caps so later growth stays budgeted" {
     // A ceiling sized to the FLOOR-derived caps must fail admission when the
     // max_agent_budget-derived ceiling caps need more: the elastic resize grows the
-    // result cache and worker pools to the ceiling later WITHOUT re-running the gate,
-    // so floor-only admission would let growth allocate past max_nav_memory_bytes.
+    // result cache and worker pools to the configured ceiling WITHOUT re-running the
+    // gate, so floor-only admission would under-count the load-time estimate.
     var capacity = baselineCapacity();
     capacity.max_agent_budget = 1 << 16;
     var floor_view = capacity;

@@ -1559,7 +1559,7 @@ pub const WorldSystem = struct {
     /// cannot leave a ramp tile without its link. On a reserved world this never grows:
     /// within its limit it is a no-op, and past it it returns
     /// `error.LevelLinkRoomUnreserved` (only `reserveLevelLinks`, via the dig commit seam's
-    /// admitted growth, raises the limit). On an unreserved world storage grows; an OOM
+    /// growth, raises the limit). On an unreserved world storage grows; an OOM
     /// leaves the links unchanged.
     pub fn ensureLevelLinkCapacity(self: *WorldSystem, additional: usize) error{ LevelLinkRoomUnreserved, OutOfMemory }!void {
         if (additional == 0) return;
@@ -1614,7 +1614,7 @@ pub const WorldSystem = struct {
     // set; allocation is bounded to the single append. Prefer
     // `ensureLevelLinkCapacity` before any paired tile mutate. On a reserved world a link
     // within the limit never allocates; one past it returns `error.LevelLinkRoomUnreserved`
-    // without growing: room is granted only by the dig commit seam's admitted growth
+    // without growing: room is granted only by the dig commit seam's growth
     // (`SimulationPipeline.ensureLevelLinkRoom` -> `reserveLevelLinks`), so the nav link
     // edges are always reserved for every link and never grow in-step.
     pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, LevelLinkRoomUnreserved, OutOfMemory }!void {
@@ -3264,7 +3264,7 @@ test "underground dense layers append in storage order not ascending render dept
 }
 
 test "addLevelLink past the reserved limit fails loudly; only reserveLevelLinks raises it" {
-    // The reservation is raised only by the dig commit seam's admitted growth
+    // The reservation is raised only by the dig commit seam's growth
     // (`reserveLevelLinks`): a direct add or ensure past it neither grows the limit nor
     // storage, so the nav link edges reserved for the limit can never be outgrown in-step.
     var world = WorldSystem{ .allocator = std.testing.allocator, .width = 1, .height = 1, .tile_size = 32, .chunk_size_tiles = 1 };

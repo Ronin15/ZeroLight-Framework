@@ -31,6 +31,16 @@ patch, M7, M10 (now also `edge_repacks`), M12 (kept for OOM), M13, and every
 parity, OOM-sweep, and cached-path test stand; the failure-path tests inject
 OOM instead of a pinned ceiling. See `slice-64f.md`.
 
+**Link-growth refusal removed (owner decision, 2026-10-07).** The dig seam's
+link growth is never refused: `ensureLevelLinkRoom` always grows to
+`grownLevelLinkLimit`, `max_nav_memory_bytes` is a load-time check only, and an
+OOM is an ordinary retryable error. `admitsLinkLimit`, the `len + 1` rung, the
+refusal warn, `ramp_refused_link_capacity` /
+`dig_ramp_refused_link_capacity`, and the commit-time full-pool refusal are
+deleted (a dig that skips the seam fails with `error.LevelLinkRoomUnreserved`).
+The K interior stride stays the only ramp refusal. Text below that describes
+the ladder or the capacity refusal is history.
+
 No open prerequisite. This
 was a live gameplay defect (confirmed below), so it landed independently of
 49–64D and **before 46 and 65B**. 65B's lane rebuild runs the same chunk patch

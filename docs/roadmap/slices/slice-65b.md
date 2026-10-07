@@ -95,7 +95,7 @@ Goal:
   `level_links`, `link_edges`, and `link_edge_refs` grow geometrically at the
   dig commit seam (main thread; `SimulationPipeline.ensureLevelLinkRoom` →
   `PathfindingSystem.reserveLinkCapacity`), and only the 8-per-chunk interior
-  stride (a layout bound) or a refused nav-memory ceiling refuses. Slice 64E removed `groupLinkCellRuns` and its per-build
+  stride (a layout bound) refuses. Slice 64E removed `groupLinkCellRuns` and its per-build
   temporary `allocator.alloc`: interior link endpoints live in the
   fixed-stride `chunk_link_cells` table (`chunk_count ×
   nav_interior_link_slots_per_chunk`, sized from the dimensions in

@@ -263,7 +263,7 @@ same change):
 | `nav_cell_size`, `structural_headroom` | excluded | config |
 | `movement_body_capacity`, `responder_capacity`, `perception_max_events_per_step`, `affect_max_events_per_step` | excluded | derived capacity (grown only at the commit seam, Slice 72 C3; output-transparent) |
 | `population_capacity_grows`, `population_growth_logged` | excluded | telemetry |
-| `pathfinding.capacity.max_agent_budget` (seam-raised) and `agent_budget_raise_refused_at` (72 C3) | hashed | history-dependent ceiling that changes future request intake; not derivable from `DataSystem` |
+| `pathfinding.capacity.max_agent_budget` (seam-raised, 72 C3) | hashed | history-dependent ceiling that changes future request intake; not derivable from `DataSystem` |
 | `action_intents_dropped_step` | excluded | telemetry, reset each update |
 | `seed` (49) | excluded | `seed.root` is in `"header"` |
 | `ai_intent_seed` (49) | excluded | derived from `seed` |

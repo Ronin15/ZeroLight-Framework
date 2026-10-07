@@ -205,8 +205,8 @@ const demo_min_group_field_agents: usize = 2000;
 /// The demo's initial pathfinding agent ceiling, content-sized from the loaded population:
 /// every steering agent (the intent capacity), floored at the group-field threshold so the
 /// threshold is never clamped below its pin. An initial ceiling only: the population seam
-/// raises it (`PathfindingSystem.raiseAgentBudget`) when `max_nav_memory_bytes` admits the
-/// raise, and the threshold stays on the value frozen at reserve.
+/// raises it (`PathfindingSystem.raiseAgentBudget`) as the population grows, and the
+/// threshold stays on the value frozen at reserve.
 fn demoAgentBudget(population: DemoPopulationCapacity, min_group_field_agents: usize) usize {
     return @max(population.intent_capacity, min_group_field_agents);
 }
@@ -455,11 +455,11 @@ pub const GameDemoState = struct {
             // Elastic pathfinding capacity tracks the live steering-agent crowd:
             // the per-step request/cache caps derive from the agent count
             // automatically, and the group-field threshold is the fixed default
-            // (never derived from world size). Only the hard ceiling is fixed, so
+            // (never derived from world size). Nothing caps growth, so
             // a battle grows and quiets shrinks without bumping knobs. At this demo's
             // small scale capacity settles low and the group path stays dormant. The
             // agent ceiling is an initial, content-sized value the population seam raises
-            // (`raiseAgentBudget`), gated by `max_nav_memory_bytes`.
+            // (`raiseAgentBudget`) as the population grows.
             .pathfinding = pathfinding_override orelse .{
                 .max_group_fields = 4,
                 .max_agent_budget = demoAgentBudget(pop_cap, default_min_group_field_agents),
@@ -725,7 +725,7 @@ fn commitStructuralAndReact(
     const structural = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     // Population growth seam: the post-commit reactions and the next step see grown
     // capacities. O(1) when the committed rows fit the tracked capacities.
-    const population_sync = try pipeline.syncPopulationCapacity(frame, data, world);
+    const population_sync = try pipeline.syncPopulationCapacity(frame, data);
     const nav_update = try pipeline.reactToPostCommitNavEvents(frame, data, world, thread_system);
     try pipeline.reactToPostCommitPerceptionEvents(frame, world);
     pipeline.reactToPostCommitSteeringEvents(frame);

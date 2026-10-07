@@ -111,10 +111,6 @@ pub const DigController = struct {
     /// Telemetry: ramp digs refused because the faced cell's nav chunk had no free interior
     /// link slot (the K stride, a layout bound; perf metric `dig_ramp_refused_link_slots`).
     ramp_refused_link_slots: u64 = 0,
-    /// Telemetry: ramp digs refused because the world's level-link pool was full and the dig
-    /// commit seam could not grow it (the nav-memory ceiling refused the growth; perf metric
-    /// `dig_ramp_refused_link_capacity`). Zero while growth is admitted.
-    ramp_refused_link_capacity: u64 = 0,
     /// Telemetry: plane-traversal steps whose landing-carve count exceeded
     /// `plane_scratch_reserved` (perf metric `dig_plane_scratch_grown`), whether or not the
     /// scratch's rounded-up capacity absorbed it; the stage grows the scratch first when it
@@ -197,24 +193,16 @@ pub const DigController = struct {
         return .{ .intent = intent, .level = player.current_level, .floor_layer = floor_layer, .cell = cell };
     }
 
-    /// Commit half of a dig admitted by `admit` this step. Refuses an admitted ramp when the
-    /// world's level-link pool is still full (the dig commit seam,
-    /// `SimulationPipeline.ensureLevelLinkRoom`, grows it between admit and commit, so a full
-    /// pool here means the nav-memory ceiling refused the growth; counted in
-    /// `ramp_refused_link_capacity`). Then preflights event + stimulus capacity and mutates.
+    /// Commit half of a dig admitted by `admit` this step. The dig commit seam
+    /// (`SimulationPipeline.ensureLevelLinkRoom`) has already grown a full level-link pool
+    /// for an admitted ramp. Preflights event + stimulus capacity, then mutates.
     pub fn commit(self: *DigController, plan: AdmittedDig, world: *WorldSystem, frame: *SimulationFrame) !void {
         std.debug.assert(plan.intent != .none);
-        // Refusing here (not growing) keeps the link append off the allocator: the same
-        // no-mutate early return as the admission no-ops.
-        if (plan.intent == .ramp and !world.hasLevelLinkRoom()) {
-            self.ramp_refused_link_capacity += 1;
-            return;
-        }
 
         // Reserve event + stimulus slots before any world mutate so a capacity miss
-        // cannot leave the tile changed without matching outputs. digRamp also
-        // checks level-link room before its tile write (on a reserved world the
-        // `hasLevelLinkRoom` refusal above already guarantees it).
+        // cannot leave the tile changed without matching outputs. digRamp checks
+        // level-link room before its tile write; a reserved world with no room (the seam
+        // skipped) fails loudly with `error.LevelLinkRoomUnreserved` before mutating.
         if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
         try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
         try frame.ensureStimulusAppendCapacity(1);
@@ -249,8 +237,8 @@ pub const DigController = struct {
 
     /// Carves a walkable ramp tile and adds a bidirectional ramp `LevelLink` to the
     /// plane above (ramps ascend — they exist to climb out of a pit). `admit` has
-    /// already filtered surface / existing-link no-ops, and `commit` has refused a full
-    /// pool and preflighted event + stimulus capacity before this runs. Level-link room
+    /// already filtered surface / existing-link no-ops, and `commit` has preflighted
+    /// event + stimulus capacity before this runs. Level-link room
     /// is checked here before the tile write so a failure cannot leave an orphan ramp
     /// tile: on a reserved world `ensureLevelLinkCapacity` only checks the limit (the
     /// room comes from the dig commit seam, `SimulationPipeline.ensureLevelLinkRoom`);
@@ -1050,14 +1038,12 @@ test "a ninth interior ramp in one nav chunk is refused" {
     try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_slots);
 }
 
-test "a ramp dig with no reserved link room is refused before mutating" {
-    // The dig commit seam grows a full pool before the dig runs; reaching the dig with the
-    // pool still full means the nav-memory ceiling refused the growth, so the dig refuses
-    // without growing storage and counts it as a capacity refusal (not the K stride).
+test "a ramp dig with no reserved link room fails before mutating" {
+    // The dig commit seam grows a full pool before the dig runs. A dig that skips it on a
+    // full reserved pool fails loudly without growing storage or touching the world.
     var tw = try TestWorld.init(.right, 1);
     defer tw.deinit();
     var dig = try testDigController(&tw.meta);
-    // Reserved with no room for a runtime link (the seam's growth was refused).
     try tw.world.reserveLevelLinks(0);
 
     const floor = tw.world.denseFloorLayerForLevel(1).?;
@@ -1072,12 +1058,11 @@ test "a ramp dig with no reserved link room is refused before mutating" {
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     frame.beginStep();
     frame.dig_intent = .ramp;
-    try digPressForTest(&dig, &tw.world, &tw.data, tw.player, &frame);
+    try std.testing.expectError(error.LevelLinkRoomUnreserved, digPressForTest(&dig, &tw.world, &tw.data, tw.player, &frame));
 
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
-    try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_capacity);
     try std.testing.expectEqual(@as(u64, 0), dig.ramp_refused_link_slots);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }

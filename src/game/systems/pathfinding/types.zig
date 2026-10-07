@@ -104,9 +104,8 @@ pub const default_group_field_max_cells: usize = 131072;
 // never demands more sharers than the configured ceiling admits).
 pub const default_min_group_field_agents: usize = 1024;
 // Library default initial elastic agent ceiling for bare callers (benches, tests). The demo
-// derives its own from content. The population seam raises it (raiseAgentBudget) when the
-// nav-memory gate admits the raise. Requests past a refused ceiling follow the pending
-// backpressure / dropped_requests path.
+// derives its own from content. The population seam raises it (raiseAgentBudget) whenever
+// the steering population outgrows it; the raise is never refused.
 pub const default_max_agent_budget: usize = 4096;
 // Smallest agent count the per-step caps are derived for. The derived capacity
 // tracks the live crowd down to this floor (so a tiny demo settles tiny), but never
@@ -129,7 +128,7 @@ pub const cached_results_per_agent: usize = 4;
 // (raised from the single-thread-era 256). Clamped down to the population so a tiny
 // demo (8 agents) still caps at 8.
 pub const default_max_solves_per_frame: usize = 512;
-// Generous default nav-memory ceiling. The build-time gate fails loud well before
+// Generous default nav-memory ceiling. The load-time gate fails loud well before
 // real allocation pressure; tests use a tiny ceiling to exercise the gate.
 pub const default_max_nav_memory_bytes: usize = 512 * 1024 * 1024;
 // Bounded outward radius (in cells) for projecting a blocked goal to the nearest
@@ -501,8 +500,9 @@ pub const PathfindingCapacity = struct {
     // many levels, it relabels every level (a loud, counted fallback) rather than
     // only the affected ones.
     nav_full_relabel_level_threshold: usize = default_nav_full_relabel_level_threshold,
-    // Build-time nav memory ceiling over the reserve-time stores (estimates). Exceeding it fails
-    // the rebuild loudly; runtime edge-arena growth is never refused by it.
+    // Load-time nav memory ceiling over the reserve-time stores (estimates). Exceeding it fails
+    // the nav build loudly. Runtime growth (edge arena, level links, agent budget) is never
+    // refused by it.
     max_nav_memory_bytes: usize = default_max_nav_memory_bytes,
     // Managed shared-goal flow fields.
     max_group_fields: usize = default_max_group_fields,
@@ -514,10 +514,9 @@ pub const PathfindingCapacity = struct {
     // [1, max(min_capacity_floor, max_agent_budget)], using the ceiling frozen at reserve.
     min_group_field_agents: usize = default_min_group_field_agents,
     // Initial elastic agent ceiling. Live capacity tracks the agent count up to it; the
-    // population seam raises it (raiseAgentBudget) when the nav-memory gate admits the
-    // raise. Library default for bare callers (benches, tests); the demo derives its own
-    // from content. Requests past a refused ceiling follow the pending backpressure /
-    // dropped_requests path.
+    // population seam raises it (raiseAgentBudget) whenever the steering population
+    // outgrows it. Library default for bare callers (benches, tests); the demo derives its
+    // own from content.
     max_agent_budget: usize = default_max_agent_budget,
     // Steps the agent count must stay below half capacity before pools shrink.
     capacity_shrink_window: u32 = default_capacity_shrink_window,

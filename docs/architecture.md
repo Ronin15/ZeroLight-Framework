@@ -896,17 +896,16 @@ initial reservation: the state reserves it with `WorldSystem.reserveLevelLinks` 
 it from the loaded world as authored links + world chunks × `nav_interior_link_slots_per_chunk`),
 and the full nav build reserves `link_edges`/`link_edge_refs` to that same `levelLinkLimit`. A
 ramp press that finds the pool full grows it at the dig commit seam
-(`SimulationPipeline.ensureLevelLinkRoom`, main thread, before the dig mutates the world): a
-bounded ladder (`grownLevelLinkLimit`, else `len + 1`) admitted by the same nav-memory gate,
+(`SimulationPipeline.ensureLevelLinkRoom`, main thread, before the dig mutates the world)
+geometrically to `grownLevelLinkLimit`, never refused (the nav-memory gate runs only at load),
 nav link edges first, then the world's limit (`reserveLevelLinks`). The seam runs only for a
 ramp `DigController.admit` let through (a no-op or refused press never grows the pool) and
 before the step's stimulus promote, so a growth OOM leaves the step's state for the retry. On
 a reserved world `addLevelLink` / `ensureLevelLinkCapacity` never grow: past the limit they
 return `error.LevelLinkRoomUnreserved`, so the nav link edges never grow in-step. Only the 8-per-chunk interior stride (a layout
-bound, `dig_ramp_refused_link_slots`) and a refused memory ceiling
-(`dig_ramp_refused_link_capacity`, warn once) refuse a ramp; links within the grown pool never
+bound, `dig_ramp_refused_link_slots`) refuses a ramp; links within the grown pool never
 allocate (FailingAllocator-proven over world, graph, and system). The
-`max_nav_memory_bytes` gate
+load-time `max_nav_memory_bytes` gate
 estimates nav memory from realistic structure (portals bounded by chunk-border
 cells, CSR edges by portal count times a small abstract degree), not a per-chunk
 pairwise worst case, so large sparse worlds build instead of being falsely

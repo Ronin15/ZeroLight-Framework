@@ -4025,7 +4025,7 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 
     // A seventh direct link past the reservation is refused without growing anything: only
-    // the dig commit seam's admitted growth raises the limit, so the link edges can never be
+    // the dig commit seam's growth raises the limit, so the link edges can never be
     // outgrown in-step.
     try std.testing.expectError(error.LevelLinkRoomUnreserved, world.addLevelLink(rampLink(10, 10)));
     try std.testing.expectEqual(@as(usize, 6), world.levelLinks().len);

@@ -496,9 +496,6 @@ pub const SimulationPipelineStats = struct {
     destructibles_hit: usize = 0,
     /// Ramp digs refused this step because the nav chunk's fixed interior link slots were full.
     dig_ramp_refused_link_slots: usize = 0,
-    /// Ramp digs refused this step because the level-link pool was full and the nav-memory
-    /// ceiling refused its growth at the dig commit seam.
-    dig_ramp_refused_link_capacity: usize = 0,
     /// Level-link pool growths at the dig commit seam this step (0 or 1).
     nav_link_capacity_grows: usize = 0,
     /// Plane-traversal landing-carve scratch growths this step (reservation short of the
@@ -622,7 +619,6 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
         perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
         perf.recordMetric(.dig_ramp_refused_link_slots, metric(self.dig_ramp_refused_link_slots));
-        perf.recordMetric(.dig_ramp_refused_link_capacity, metric(self.dig_ramp_refused_link_capacity));
         perf.recordMetric(.nav_link_capacity_grows, metric(self.nav_link_capacity_grows));
         perf.recordMetric(.dig_plane_scratch_grown, metric(self.dig_plane_scratch_grown));
     }
@@ -649,12 +645,9 @@ pub fn grownLevelLinkLimit(links: usize) usize {
 pub const PopulationSyncStats = struct {
     /// A tracked population/responder capacity grew this call.
     grew: bool = false,
-    /// The pathfinding agent ceiling needed a raise the nav-memory gate refused.
-    agent_budget_raise_refused: bool = false,
 
     pub fn recordTo(self: PopulationSyncStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.population_capacity_grows, @intFromBool(self.grew));
-        perf.recordMetric(.path_agent_budget_raise_refused, @intFromBool(self.agent_budget_raise_refused));
     }
 };
 
@@ -711,8 +704,6 @@ pub const SimulationPipeline = struct {
     level_link_capacity_grows: u64 = 0,
     /// Once-only flag for the first level-link growth log.
     level_link_growth_logged: bool = false,
-    /// Once-only flag for the refused level-link growth warn.
-    level_link_growth_refused_warned: bool = false,
     /// This pipeline's share of `frame.events`' `capacity_limit` for perception,
     /// passed through as `PerceptionConfig.max_events_per_step`. Derived share
     /// (`perception_events_per_observer_max` x tracked `AiPerception` rows), exact at
@@ -912,7 +903,7 @@ pub const SimulationPipeline = struct {
         };
     }
 
-    /// Population growth seam (Slice 72 C3). Main thread, `merge_outputs`, right after
+    /// Population growth seam. Main thread, `merge_outputs`, right after
     /// the structural commit and before the post-commit reactions. O(1) fast path; on
     /// growth, re-reserves every population-sized pipeline capacity, the frame streams
     /// and event bound, and the pathfinding elastic pools. The only population growth
@@ -924,7 +915,6 @@ pub const SimulationPipeline = struct {
         self: *SimulationPipeline,
         frame: *SimulationFrame,
         data: *const DataSystem,
-        world: *const WorldSystem,
     ) !PopulationSyncStats {
         const rows = data.populationRowCounts();
         const population = rows.population();
@@ -936,13 +926,12 @@ pub const SimulationPipeline = struct {
         {
             return .{};
         }
-        return self.growPopulationCapacity(frame, world, rows);
+        return self.growPopulationCapacity(frame, rows);
     }
 
     fn growPopulationCapacity(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
-        world: *const WorldSystem,
         rows: PopulationRowCounts,
     ) !PopulationSyncStats {
         @branchHint(.cold);
@@ -1006,11 +995,10 @@ pub const SimulationPipeline = struct {
         }
 
         if (!self.pathfinding.coversAgentCount(rows.steering_agents)) {
+            const old_agent_budget = self.pathfinding.capacity.max_agent_budget;
+            errdefer self.pathfinding.capacity.max_agent_budget = old_agent_budget;
             if (rows.steering_agents > self.pathfinding.agentBudget()) {
-                stats.agent_budget_raise_refused = !self.pathfinding.raiseAgentBudget(
-                    grownPopulationCapacity(rows.steering_agents),
-                    world.levelLinkLimit(),
-                );
+                self.pathfinding.raiseAgentBudget(grownPopulationCapacity(rows.steering_agents));
             }
             try self.pathfinding.growForAgentCount(rows.steering_agents);
         }
@@ -1029,33 +1017,18 @@ pub const SimulationPipeline = struct {
         return stats;
     }
 
-    /// Level-link growth seam (Slice 64E). Main thread, the `dig_world_edit` stage, before
-    /// the dig mutates the world; cold. When the world's link pool is full, grows it by a
-    /// bounded ladder: `grownLevelLinkLimit(len)`, else exactly `len + 1`, whichever the
-    /// nav-memory gate (`PathfindingSystem.admitsLinkLimit`) admits first. The pathfinding
+    /// Level-link growth seam. Main thread, the `dig_world_edit` stage, before the dig
+    /// mutates the world; cold. When the world's link pool is full, grows it geometrically
+    /// to `grownLevelLinkLimit(len)`; level links are runtime-growing, so growth is never
+    /// refused (`max_nav_memory_bytes` is checked only at the nav build). The pathfinding
     /// link stores grow FIRST, then the world's limit, so an OOM leaves the world untouched
-    /// and the next press retries. If neither rung is admitted the pool stays full (warn
-    /// once) and the dig refuses the ramp (`dig_ramp_refused_link_capacity`). Runs only for
-    /// a ramp `DigController.admit` let through (`admitDigAndGrowLinks`), so the trigger and
-    /// target are pure functions of the committed link count, an admitted ramp, and the
-    /// gate; refused presses never grow the pool. Returns whether the pool grew.
+    /// and the next press retries. Runs only for a ramp `DigController.admit` let through
+    /// (`admitDigAndGrowLinks`), so the trigger and target are pure functions of the
+    /// committed link count and an admitted ramp; refused presses never grow the pool.
+    /// Returns whether the pool grew.
     fn ensureLevelLinkRoom(self: *SimulationPipeline, world: *WorldSystem) !bool {
         if (world.hasLevelLinkRoom()) return false;
-        const links = world.levelLinks().len;
-        var target = grownLevelLinkLimit(links);
-        if (!self.pathfinding.admitsLinkLimit(target)) {
-            target = links + 1;
-            if (!self.pathfinding.admitsLinkLimit(target)) {
-                if (!self.level_link_growth_refused_warned) {
-                    self.level_link_growth_refused_warned = true;
-                    if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
-                        "level-link growth past {d} links refused by max_nav_memory_bytes; ramp digs are refused",
-                        .{links},
-                    );
-                }
-                return false;
-            }
-        }
+        const target = grownLevelLinkLimit(world.levelLinks().len);
         try self.pathfinding.reserveLinkCapacity(target);
         try world.reserveLevelLinks(target);
         self.level_link_capacity_grows += 1;
@@ -1279,7 +1252,6 @@ pub const SimulationPipeline = struct {
         stimuli_promoted: usize = 0,
         action_intents_dropped: usize = 0,
         dig_ramp_refused_link_slots: usize = 0,
-        dig_ramp_refused_link_capacity: usize = 0,
         nav_link_capacity_grows: usize = 0,
         dig_plane_scratch_grown: usize = 0,
         cognition_region: ?ActiveRegion = null,
@@ -1340,7 +1312,6 @@ pub const SimulationPipeline = struct {
                 .destructibles_destroyed = self.destructible.destroyed,
                 .destructibles_hit = self.destructible.hits,
                 .dig_ramp_refused_link_slots = self.dig_ramp_refused_link_slots,
-                .dig_ramp_refused_link_capacity = self.dig_ramp_refused_link_capacity,
                 .nav_link_capacity_grows = self.nav_link_capacity_grows,
                 .dig_plane_scratch_grown = self.dig_plane_scratch_grown,
             };
@@ -1385,7 +1356,6 @@ pub const SimulationPipeline = struct {
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const refused_before = self.dig.ramp_refused_link_slots;
-        const refused_capacity_before = self.dig.ramp_refused_link_capacity;
         // Admission and the level-link growth seam run first, before the promote below
         // consumes the deferred stimuli, so a growth OOM leaves this step's state untouched
         // and the next press retries from the same state.
@@ -1397,7 +1367,6 @@ pub const SimulationPipeline = struct {
         // re-masks navigation in merge_outputs regardless of order.
         if (admitted.dig) |dig| try self.dig.commit(dig, context.world, context.frame);
         step.dig_ramp_refused_link_slots = @intCast(self.dig.ramp_refused_link_slots - refused_before);
-        step.dig_ramp_refused_link_capacity = @intCast(self.dig.ramp_refused_link_capacity - refused_capacity_before);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
@@ -1408,8 +1377,7 @@ pub const SimulationPipeline = struct {
 
     /// The dig's admission plus the level-link growth seam: `DigController.admit`, then,
     /// only for an admitted ramp, `ensureLevelLinkRoom` (main thread, before the dig
-    /// mutates the world, so the dig's link append never allocates and a dig below the
-    /// nav-memory ceiling behaves as if the pool were unbounded). A refused or no-op press
+    /// mutates the world, so the dig's link append never allocates). A refused or no-op press
     /// never grows the pool. Mutates nothing but the pool growth and the K-stride refusal
     /// counter, so the stage runs it before any other step-state change.
     fn admitDigAndGrowLinks(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *const SimulationFrame) !AdmittedDigStep {
@@ -5442,7 +5410,6 @@ test "a ramp dig past the initial link reservation grows at the dig seam and is 
     try std.testing.expect(pipeline.pathfinding.graph.link_edges.capacity >= world.levelLinkLimit());
     try std.testing.expectEqual(@as(usize, 1), stats.nav_link_capacity_grows);
     try std.testing.expectEqual(@as(usize, 0), stats.dig_ramp_refused_link_slots);
-    try std.testing.expectEqual(@as(usize, 0), stats.dig_ramp_refused_link_capacity);
     try std.testing.expectEqual(@as(u64, 1), pipeline.level_link_capacity_grows);
     _ = try pipeline.reactToPostCommitNavEvents(&frame, &data, &world, null);
 
@@ -5609,7 +5576,6 @@ test "link growth happens only at the dig seam" {
     try std.testing.expect(fixture.rampAt(cells[8]));
     try std.testing.expectEqual(@as(usize, 9), fixture.world.levelLinks().len);
     try std.testing.expectEqual(@as(usize, 0), failing_after.allocations);
-    try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.dig.ramp_refused_link_capacity);
     try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.dig.ramp_refused_link_slots);
 }
 
@@ -5633,7 +5599,6 @@ test "a ramp press the dig does not admit never grows the full link pool" {
     const off_world = try fixture.step(&threads);
     for ([_]SimulationPipelineStats{ surface, off_world }) |stats| {
         try std.testing.expectEqual(@as(usize, 0), stats.nav_link_capacity_grows);
-        try std.testing.expectEqual(@as(usize, 0), stats.dig_ramp_refused_link_capacity);
     }
     try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinkLimit());
     try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.level_link_capacity_grows);
@@ -5688,37 +5653,34 @@ test "a link-growth OOM leaves the step's stimuli and the pool for the retry pre
     try std.testing.expectEqual(grownLevelLinkLimit(0), fixture.world.levelLinkLimit());
 }
 
-test "a link growth the nav memory gate refuses keeps the pool and refuses the ramp loudly" {
+test "link growth past the load-time nav memory limit always lands and matches a fresh build" {
     var fixture: LinkGrowthFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
     const nav_memory = @import("systems/pathfinding/nav_memory.zig");
     const pathfinding = &fixture.pipeline.pathfinding;
-    const levels = pathfinding.graph.levelCount();
-    const width = pathfinding.graph.width;
-    const height = pathfinding.graph.height;
+    const load_capacity = pathfinding.capacity;
+    // A ceiling exactly at the load-time (empty) pool: any growth exceeds it.
+    pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pathfinding.capacity, pathfinding.graph.levelCount(), 0).requiredBytes(pathfinding.graph.width, pathfinding.graph.height);
 
-    // A ceiling exactly at the current (empty) pool admits no growth at all.
-    pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pathfinding.capacity, levels, 0).requiredBytes(width, height);
-    try fixture.dig(.{ 1, 0 });
-    try std.testing.expect(!fixture.rampAt(.{ 1, 0 }));
-    try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinks().len);
+    // An OOM during growth is an ordinary error: the world is untouched and the retry lands.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const saved = LinkGrowthAllocators.install(&fixture, failing.allocator());
+    try std.testing.expectError(error.OutOfMemory, fixture.dig(.{ 1, 0 }));
+    saved.restore(&fixture);
     try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinkLimit());
-    try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.dig.ramp_refused_link_capacity);
-    try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.dig.ramp_refused_link_slots);
-    try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.level_link_capacity_grows);
-    try std.testing.expect(fixture.pipeline.level_link_growth_refused_warned);
+    try std.testing.expect(!fixture.rampAt(.{ 1, 0 }));
 
-    // Ladder: a ceiling admitting exactly one more link (not the 1.5x target) grows to
-    // len + 1, and the dig lands.
-    pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pathfinding.capacity, levels, 1).requiredBytes(width, height);
-    try std.testing.expect(!pathfinding.admitsLinkLimit(grownLevelLinkLimit(0)));
-    try fixture.dig(.{ 1, 0 });
-    try std.testing.expect(fixture.rampAt(.{ 1, 0 }));
-    try std.testing.expectEqual(@as(usize, 1), fixture.world.levelLinks().len);
-    try std.testing.expectEqual(@as(usize, 1), fixture.world.levelLinkLimit());
-    try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.level_link_capacity_grows);
-    try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.dig.ramp_refused_link_capacity);
+    // Nine perimeter ramps grow the pool twice (0 -> 8 -> 20), every one landing.
+    const cells = [_][2]u16{ .{ 1, 0 }, .{ 2, 0 }, .{ 3, 0 }, .{ 4, 0 }, .{ 5, 0 }, .{ 6, 0 }, .{ 7, 0 }, .{ 1, 3 }, .{ 2, 3 } };
+    for (cells) |cell| {
+        try fixture.dig(cell);
+        try std.testing.expect(fixture.rampAt(cell));
+    }
+    try std.testing.expectEqual(cells.len, fixture.world.levelLinks().len);
+    try std.testing.expectEqual(grownLevelLinkLimit(grownLevelLinkLimit(0)), fixture.world.levelLinkLimit());
+    try std.testing.expectEqual(@as(u64, 2), fixture.pipeline.level_link_capacity_grows);
+    try expectNavMatchesFreshBuild(pathfinding, &fixture.data, &fixture.world, 256, load_capacity);
 }
 
 // Incremental-vs-fresh nav parity for pipeline tests: per-level blocked masks and portal
@@ -6064,7 +6026,7 @@ fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame,
         pipeline.hasPendingNavLinks(world);
     const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
     _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
-    const sync = try pipeline.syncPopulationCapacity(frame, data, world);
+    const sync = try pipeline.syncPopulationCapacity(frame, data);
     _ = try pipeline.reactToPostCommitNavEvents(frame, data, world, null);
     try pipeline.reactToPostCommitPerceptionEvents(frame, world);
     pipeline.reactToPostCommitSteeringEvents(frame);
@@ -6228,7 +6190,6 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     try writeStructuralCommands(&frame, &commands);
     const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
     try std.testing.expect(sync.grew);
-    try std.testing.expect(!sync.agent_budget_raise_refused);
     // 3 -> 5 perception/affect rows: the seam's share-growth arm ran too.
     try std.testing.expectEqual(@as(usize, 5), data.ai_perceptions.len());
     try std.testing.expectEqual(@as(usize, 5), data.ai_affects.len());
@@ -6414,10 +6375,10 @@ fn runContactBoundScenario(mode: CollisionResponseMode) !void {
     // 31 bodies + the player grow the tracked capacity to 64; 32 more fill it without
     // another growth. 3 full rows: 117 contacts over 64 bodies.
     try addContactChainBodies(&data, 0, 31, mode);
-    try std.testing.expect((try pipeline.syncPopulationCapacity(&frame, &data, &world)).grew);
+    try std.testing.expect((try pipeline.syncPopulationCapacity(&frame, &data)).grew);
     try std.testing.expectEqual(@as(usize, 64), pipeline.movement_body_capacity);
     try addContactChainBodies(&data, 31, 63, mode);
-    try std.testing.expect(!(try pipeline.syncPopulationCapacity(&frame, &data, &world)).grew);
+    try std.testing.expect(!(try pipeline.syncPopulationCapacity(&frame, &data)).grew);
     const population = data.populationRowCounts().population();
     try std.testing.expectEqual(@as(usize, 64), population);
 
@@ -6499,7 +6460,7 @@ test "population sync at an unchanged population allocates nothing and never re-
     const starts_ptr = lookup.starts.items.ptr;
     const capacity_cells_x = lookup.capacity_cells_x;
     lookup.starts.items[0] = 7;
-    const grown = try pipeline.syncPopulationCapacity(&frame, &data, &world);
+    const grown = try pipeline.syncPopulationCapacity(&frame, &data);
     try std.testing.expect(grown.grew);
     try std.testing.expectEqual(grownPopulationCapacity(30), pipeline.movement_body_capacity);
     try std.testing.expectEqual(starts_ptr, lookup.starts.items.ptr);
@@ -6512,7 +6473,7 @@ test "population sync at an unchanged population allocates nothing and never re-
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     var swap: TestAllocatorSwap = .{};
     swap.install(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads }, .uniform(failing.allocator()));
-    const unchanged = pipeline.syncPopulationCapacity(&frame, &data, &world);
+    const unchanged = pipeline.syncPopulationCapacity(&frame, &data);
     swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
     try std.testing.expect(!(try unchanged).grew);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -6548,19 +6509,19 @@ test "a population growth that fails after the collision reserve restores the de
     const response_allocator = pipeline.collision_response.allocator;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     pipeline.collision_response.allocator = failing.allocator();
-    const failed = pipeline.syncPopulationCapacity(&frame, &data, &world);
+    const failed = pipeline.syncPopulationCapacity(&frame, &data);
     pipeline.collision_response.allocator = response_allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
     try std.testing.expectEqual(@as(usize, 4), pipeline.movement_body_capacity);
     try std.testing.expectEqual(old_pair_bound, pipeline.collision.reserved_pair_bound);
 
-    const grown = try pipeline.syncPopulationCapacity(&frame, &data, &world);
+    const grown = try pipeline.syncPopulationCapacity(&frame, &data);
     try std.testing.expect(grown.grew);
     try std.testing.expectEqual(grownPopulationCapacity(30), pipeline.movement_body_capacity);
     try std.testing.expectEqual(CollisionSystem.estimateContactCapacity(pipeline.movement_body_capacity), pipeline.collision.reserved_pair_bound);
 }
 
-test "population sync raises the pathfinding agent budget when the nav-memory gate admits it" {
+test "population sync raises the agent budget past the load-time nav memory limit" {
     var world = try minimalSyncWorld();
     defer world.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -6573,19 +6534,33 @@ test "population sync raises the pathfinding agent budget when the nav-memory ga
     defer pipeline.deinit();
     try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 0, 0, 0, 0);
     try pipeline.reserve(&frame, 0);
+    // A ceiling exactly at the loaded 8-agent budget: any raise exceeds it.
+    const nav_memory = @import("systems/pathfinding/nav_memory.zig");
+    const graph = &pipeline.pathfinding.graph;
+    pipeline.pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pipeline.pathfinding.capacity, graph.levelCount(), world.levelLinkLimit()).requiredBytes(graph.width, graph.height);
 
     for (0..12) |index| {
         const entity = try data.createEntity();
         try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
         try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
     }
-    const stats = try pipeline.syncPopulationCapacity(&frame, &data, &world);
-    try std.testing.expect(!stats.agent_budget_raise_refused);
+
+    // An OOM during the pathfinding grow keeps the old ceiling and pools; the retry lands.
+    const real_allocator = pipeline.pathfinding.allocator;
+    var failing = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    pipeline.pathfinding.allocator = failing.allocator();
+    const failed = pipeline.syncPopulationCapacity(&frame, &data);
+    pipeline.pathfinding.allocator = real_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 8), pipeline.pathfinding.agentBudget());
+    try std.testing.expectEqual(@as(usize, 8), pipeline.pathfinding.effective_agent_capacity);
+    try std.testing.expect(!pipeline.pathfinding.coversAgentCount(12));
+
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
     try std.testing.expectEqual(grownPopulationCapacity(12), pipeline.pathfinding.agentBudget());
     try std.testing.expectEqual(@as(usize, 48), pipeline.pathfinding.agentBudget());
     // max(12, 2 x the floor 8).
     try std.testing.expectEqual(@as(usize, 16), pipeline.pathfinding.effective_agent_capacity);
-    try std.testing.expectEqual(@as(u64, 0), pipeline.pathfinding.agent_budget_raise_refused);
     try std.testing.expect(pipeline.pathfinding.coversAgentCount(12));
 }
 

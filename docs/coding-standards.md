@@ -287,6 +287,13 @@ The only fixed caps:
 - presentation-only pools that no simulation reads (particles, text labels),
   with deterministic overflow drop.
 
+**Load-time platform validation** (e.g. the dense GPU byte budget, the nav
+memory estimate `max_nav_memory_bytes`) is allowed: it checks the loaded world
+and configuration once and fails loudly at load. It never runs during play:
+runtime-growing data that later outgrows the estimate (population, level links,
+the pathfinding agent budget) grows at its seam, and only an allocator OOM can
+fail that growth, as an ordinary error that leaves state intact for a retry.
+
 **Heuristic thresholds** (e.g. "build a group flow field above N agents") derive
 from the cost of the operation they gate (its own bounded region or input),
 never from the whole world's size.

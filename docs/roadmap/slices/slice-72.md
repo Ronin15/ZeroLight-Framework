@@ -263,7 +263,7 @@ Memory at 2053 agents, measured as the live bytes a byte-counting allocator hold
 
 Success criteria:
 
-- **Behavior.** No live behavior may depend on a physical `.capacity`, on allocation history, or on a load-time pool that runtime growth can outrun. That covers iteration order, deferral, refusal, drops, truncation, cache flushes and query reach. The exceptions are named work budgets, layout bounds, presentation budgets and the loud platform memory ceiling. Each exception is justified at its own site (Batch K).
+- **Behavior.** No live behavior may depend on a physical `.capacity`, on allocation history, or on a load-time pool that runtime growth can outrun. That covers iteration order, deferral, refusal, drops, truncation, cache flushes and query reach. The exceptions are named work budgets, layout bounds, presentation budgets and load-time platform validation (e.g. `max_nav_memory_bytes`, the dense GPU byte budget), which fails loudly at load only; there is no runtime memory ceiling. Each exception is justified at its own site (Batch K).
 - **Population.** Capacities sized by population grow at one point: the main-thread structural-commit seam. Growth is geometric and ahead of need. Hot paths stay allocation-free between growth points, and `std.testing.FailingAllocator` proves it.
 - **World extent.** World-extent arrays are sized exactly once per world at load.
 - **Assumed capacity.** No `appendAssumeCapacity` is protected only by a Debug assert.
@@ -372,7 +372,7 @@ Out of scope (each item has a named owner):
     2. `ensureEventAppendCapacity` returns `EventCapacityExceeded` through `Engine.update`, and the app exits.
     3. Other gathers grow in the middle of a stage.
   - The "sum init caps" model used by 62/56B/61 is correct only while every create source is counted.
-- **Change:** add `pub fn syncPopulationCapacity(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem) !PopulationSyncStats` (landed with `world`, so `raiseAgentBudget` charges the live reserved link limit).
+- **Change:** add `pub fn syncPopulationCapacity(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem) !PopulationSyncStats` (landed with a `world` parameter for the raise's nav-memory check; dropped 2026-10-07 when the raise stopped being refusable).
   - **Call site.** `GameDemoState.applyStructuralCommandsAndPostCommitEvents` calls it right after `applyStructuralCommandsBudgeted` (the all-or-fail commit preflighted against its `StructuralCommitBudget`: the structural share plus the post-commit nav reaction's slot) and before `reactToPostCommitNavEvents`, so the post-commit reactions see grown capacities.
   - **Fast path.** Four compares, then return:
     - movement-body rows ≤ `movement_body_capacity`;
@@ -393,9 +393,7 @@ Out of scope (each item has a named owner):
       - `collision_triggers`: `estimateTriggerCapacity` (since C6: in `reserve`, one range);
       - `structural_commands`: new_cap + the whole `.structural_commit` share (`structuralCommandHeadroom()`: the pipeline's destructible share + `structural_headroom`) (B1).
   - **Event limit.** Then `self.reserve(frame, new_cap)` raises the event limit. That also re-runs every reserve the other slices attach to it: 64E `reserveNavDirty`, 68A `reserveAiRowMap`, 56B's projectile bitset.
-  - **Pathfinding.** It calls a new `pathfinding.growForAgentCount(steering_rows)`. This is the grow half of `adjustCapacityForAgentCount` (`system.zig:315-337`), moved to the seam. Shrink stays in `beginUpdate` with its hysteresis, and `beginUpdate`'s grow remains the safety net. If `steering_rows > capacity.max_agent_budget`, `raiseAgentBudget(grown)` re-runs `nav_memory.budgetForCapacity(...).check`:
-    - if admitted, the ceiling rises. A raise never moves the group-field threshold (71B.1): `groupFieldThreshold` clamps to the ceiling frozen at reserve;
-    - if refused, the old ceiling stays, `agent_budget_raise_refused` is counted with one warn, and the pending backpressure (K2) applies. That gate is the loud platform-memory ceiling.
+  - **Pathfinding.** It calls a new `pathfinding.growForAgentCount(steering_rows)`. This is the grow half of `adjustCapacityForAgentCount` (`system.zig:315-337`), moved to the seam. Shrink stays in `beginUpdate` with its hysteresis, and `beginUpdate`'s grow remains the safety net. If `steering_rows > capacity.max_agent_budget`, `raiseAgentBudget(grown)` raises the ceiling. It is never refused (owner decision, 2026-10-07: population is runtime-growing; `max_nav_memory_bytes` is checked only at load). An OOM in the following grow restores the old ceiling, and the next seam retries. A raise never moves the group-field threshold (71B.1): `groupFieldThreshold` clamps to the ceiling frozen at reserve.
 - **Benefit:**
   - removes a ReleaseFast corruption path and a crash caused by capacity;
   - gives every population-sized capacity a single growth point;
@@ -1012,7 +1010,7 @@ Out of scope (each item has a named owner):
   - Tests in `simulation_pipeline.zig`, on `testMinimalMultiLevelWorld`:
     - **Growth proof:** build with `movement_body_capacity = 4` and warm one step. Create 8 AI movers through structural commands, commit, and sync. Install `std.testing.FailingAllocator` on the pipeline, frame-stream, data and pathfinding allocators. Run a step where all 12 bodies cross dug holes. Expect zero allocations, `events.stats.dropped == 0`, and every landing carved.
     - Sync at an unchanged population allocates nothing (FailingAllocator), and the spatial window is not re-memset (its pointer and contents are unchanged).
-    - A raise refused by a tight `max_nav_memory_bytes` keeps the ceiling, counts `agent_budget_raise_refused == 1`, and the dropped requests are counted.
+    - A raise past a tight load-time `max_nav_memory_bytes` lands; an OOM in its grow keeps the old ceiling and the retry lands (the refusal path was removed 2026-10-07).
     - The reserve-then-run proofs and the dig plane-traversal tests (`:3395-3500`) still pass.
   - Cross-edits:
     - `slice-62.md:355`: the state-init spawn terms are initial sizes, and sync is the growth point;

@@ -190,14 +190,6 @@ pub const PathfindingSystem = struct {
     // acceptRequests overwrites the step stats; folded into stats.dropped_requests in
     // beginUpdate and then cleared.
     resize_dropped: usize = 0,
-    /// Telemetry: `raiseAgentBudget` calls the nav-memory gate refused (Slice 72 C3).
-    agent_budget_raise_refused: u64 = 0,
-    /// The `agentBudget()` ceiling at which a raise was refused (0 = none). A refused
-    /// ceiling is not retried: `coversAgentCount` treats it as final and the pending
-    /// backpressure applies. Behavior-affecting history (future intake depends on it).
-    agent_budget_raise_refused_at: usize = 0,
-    /// Once-only flag for the refused-raise warn.
-    agent_budget_raise_warned: bool = false,
     /// Upper clamp for `groupFieldThreshold`: the configured agent ceiling, frozen at
     /// `reserve` (floored at `min_capacity_floor`), so a seam raise (`raiseAgentBudget`)
     /// never moves a per-query policy. Behavior follows configuration, not capacity history.
@@ -347,50 +339,20 @@ pub const PathfindingSystem = struct {
         return @max(min_capacity_floor, self.capacity.max_agent_budget);
     }
 
-    /// O(1): true when the live pools already cover `agent_count` steering agents (or
-    /// the ceiling below it was refused and is final), so the population seam has no
-    /// pathfinding growth to do.
+    /// O(1): true when the live pools and the ceiling already cover `agent_count` steering
+    /// agents, so the population seam has no pathfinding growth to do.
     pub fn coversAgentCount(self: *const PathfindingSystem, agent_count: usize) bool {
         if (self.effective_agent_capacity == 0) return true;
-        const budget = self.agentBudget();
-        if (agent_count > budget and self.agent_budget_raise_refused_at != budget) return false;
+        if (agent_count > self.agentBudget()) return false;
         return deriveCapacity(self.capacity, agent_count).max_pending_requests <= self.effective_agent_capacity;
     }
 
-    /// Raises `max_agent_budget` to `requested` when the nav-memory gate admits the
-    /// raised ceiling (same `budgetForCapacity` the build gate uses, charged against the
-    /// live reserved link limit). A refusal keeps the old ceiling, is counted, warns once,
-    /// and is final for that ceiling (see `coversAgentCount`). Main thread, population seam.
-    /// Never writes `group_field_threshold_ceiling`: a raise lifts capacity, not policy.
-    pub fn raiseAgentBudget(self: *PathfindingSystem, requested: usize, link_count: usize) bool {
-        const budget = self.agentBudget();
-        if (requested <= budget) return true;
-        var raised = self.capacity;
-        raised.max_agent_budget = requested;
-        const memory_budget = nav_memory.budgetForCapacity(raised, @max(@as(usize, 1), self.graph.levelCount()), link_count);
-        memory_budget.check(self.graph.width, self.graph.height) catch {
-            self.agent_budget_raise_refused += 1;
-            self.agent_budget_raise_refused_at = budget;
-            if (!self.agent_budget_raise_warned) {
-                self.agent_budget_raise_warned = true;
-                if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
-                    "pathfinding: agent budget raise to {d} refused ({d} bytes needed, max_nav_memory_bytes {d}); keeping {d}",
-                    .{ requested, memory_budget.requiredBytes(self.graph.width, self.graph.height), memory_budget.max_bytes, budget },
-                );
-            }
-            return false;
-        };
-        self.capacity.max_agent_budget = requested;
-        return true;
-    }
-
-    /// Whether the nav-memory gate admits a world level-link limit of `link_limit`: the same
-    /// `budgetForCapacity` check the build and `raiseAgentBudget` use, charged against the
-    /// live agent ceiling. Pure; the dig commit seam's link growth asks it first.
-    pub fn admitsLinkLimit(self: *const PathfindingSystem, link_limit: usize) bool {
-        const memory_budget = nav_memory.budgetForCapacity(self.capacity, @max(@as(usize, 1), self.graph.levelCount()), link_limit);
-        memory_budget.check(self.graph.width, self.graph.height) catch return false;
-        return true;
+    /// Raises `max_agent_budget` to `requested` (never lowers it). Population is
+    /// runtime-growing, so the raise is never refused: `max_nav_memory_bytes` is checked
+    /// only at the nav build. Main thread, population seam. Never writes
+    /// `group_field_threshold_ceiling`: a raise lifts capacity, not policy.
+    pub fn raiseAgentBudget(self: *PathfindingSystem, requested: usize) void {
+        self.capacity.max_agent_budget = @max(self.capacity.max_agent_budget, requested);
     }
 
     /// Reserves every pathfinding store sized per world level link for `link_limit` links
@@ -516,8 +478,8 @@ pub const PathfindingSystem = struct {
         // The world's RESERVED link limit (not just today's count): the graph reserves its link
         // edges to the same number, so the gate admits exactly what the build reserves.
         const link_count: usize = if (world) |world_system| world_system.levelLinkLimit() else 0;
-        // Gates against the elastic-CEILING caps (see budgetForCapacity), so a later
-        // adjustCapacityForAgentCount growth can never reserve past the admitted budget.
+        // Load-time gate against the configured elastic-ceiling caps (see budgetForCapacity).
+        // Runtime growth past it (population raises, dig link growth) is never refused.
         const budget = nav_memory.budgetForCapacity(self.capacity, level_count, link_count);
         try self.graph.rebuild(data, world, bounds_width, bounds_height, cell_size, self.capacity.nav_chunk_tiles, budget, thread_system);
         // The init per-level builds (inside rebuild) grow each level's portal/edge
@@ -4886,14 +4848,10 @@ test "coversAgentCount compares the live pools and the ceiling" {
     try system.rebuildStaticNavGrid(&data, 512, 512, 32);
     try std.testing.expect(system.coversAgentCount(0));
     try std.testing.expect(system.coversAgentCount(8));
-    // Past the ceiling and never refused: the seam must try a raise.
+    // Past the ceiling: the seam must raise it.
     try std.testing.expect(!system.coversAgentCount(9));
-    // A refused ceiling is final: the floor pools cover everything they can.
-    system.agent_budget_raise_refused_at = system.agentBudget();
-    try std.testing.expect(system.coversAgentCount(9));
 
-    system.agent_budget_raise_refused_at = 0;
-    try std.testing.expect(system.raiseAgentBudget(64, 0));
+    system.raiseAgentBudget(64);
     try std.testing.expectEqual(@as(usize, 64), system.agentBudget());
     try std.testing.expect(!system.coversAgentCount(9));
     try system.growForAgentCount(9);
@@ -4902,7 +4860,7 @@ test "coversAgentCount compares the live pools and the ceiling" {
     try std.testing.expect(!system.coversAgentCount(17));
 }
 
-test "a refused agent budget raise keeps the ceiling, counts once, and drops past it" {
+test "an agent budget raise past the load-time nav memory limit admits the whole crowd" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var requesters: [12]EntityId = undefined;
@@ -4919,20 +4877,18 @@ test "a refused agent budget raise keeps the ceiling, counts once, and drops pas
     try system.reserve(capacity);
     try system.rebuildStaticNavGrid(&data, 512, 512, 32);
 
-    try std.testing.expect(!system.raiseAgentBudget(48, 0));
-    try std.testing.expectEqual(@as(usize, 8), system.agentBudget());
-    try std.testing.expectEqual(@as(u64, 1), system.agent_budget_raise_refused);
-    try std.testing.expectEqual(@as(usize, 8), system.agent_budget_raise_refused_at);
-    try std.testing.expect(system.agent_budget_raise_warned);
-    try std.testing.expect(system.coversAgentCount(12));
-    // The seam never retries a refused ceiling; a direct second call is refused again.
-    try std.testing.expect(!system.raiseAgentBudget(48, 0));
-    try std.testing.expectEqual(@as(u64, 2), system.agent_budget_raise_refused);
+    system.raiseAgentBudget(48);
+    try std.testing.expectEqual(@as(usize, 48), system.agentBudget());
+    // A raise never lowers the ceiling.
+    system.raiseAgentBudget(16);
+    try std.testing.expectEqual(@as(usize, 48), system.agentBudget());
+    try system.growForAgentCount(requesters.len);
+    try std.testing.expect(system.coversAgentCount(requesters.len));
 
-    // 12 distinct requests against the 8-request logical intake cap.
+    // All 12 distinct requests are accepted; none drop.
     const stats = try submitDistinctGoalBurst(&system, &requesters, requesters.len, requesters.len);
-    try std.testing.expectEqual(@as(usize, 4), stats.dropped_requests);
-    try std.testing.expectEqual(@as(usize, 8), stats.accepted_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.dropped_requests);
+    try std.testing.expectEqual(@as(usize, 12), stats.accepted_requests);
 }
 
 test "a grow that runs out of memory mid-resize keeps logical limits within every pool" {
@@ -5024,13 +4980,13 @@ test "group-field threshold is capped by the population ceiling" {
 
 test "a seam raise never moves the group-field threshold" {
     // Below min_group_field_agents the threshold clamps to the configured ceiling (8). A
-    // gate-admitted raise lifts the live agent ceiling, but the threshold stays on the
+    // seam raise lifts the live agent ceiling, but the threshold stays on the
     // ceiling frozen at reserve, so group-field policy never follows capacity history.
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 8 });
     try std.testing.expectEqual(@as(usize, 8), system.groupFieldThreshold());
-    try std.testing.expect(system.raiseAgentBudget(48, 0));
+    system.raiseAgentBudget(48);
     try std.testing.expectEqual(@as(usize, 48), system.agentBudget());
     try std.testing.expectEqual(@as(usize, 8), system.groupFieldThreshold());
 }
