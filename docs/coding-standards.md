@@ -435,6 +435,12 @@ implementation comments near the block they explain.
 Avoid comments that merely repeat the identifier, describe obvious assignment,
 carry stale roadmap intent, or make broad claims not enforced by code or tests.
 
+Keep each comment as short as its contract allows. State the rule or invariant
+and, when non-obvious, the one reason it holds; put proofs, worked arithmetic,
+rejected alternatives, and design history in the owning slice doc or the
+commit message, not in code. Slice docs record decisions and checklists, not
+the full reasoning trail that produced them.
+
 ## Tests
 
 Use Zig `test` blocks and `std.testing`. Put reusable module tests beside the

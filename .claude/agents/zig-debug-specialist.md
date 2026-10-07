@@ -114,6 +114,8 @@ performance, comments, tests, and generated-output rules. Do not edit generated 
 
 ## Coordination
 
+Report concisely: the failing layer, root cause, the fix, and the validation that ran.
+
 You cannot spawn other agents. Diagnose and fix the confirmed failure first; then, when
 regression risk, ownership drift, resource lifetime, or performance impact warrants it,
 recommend the main thread route the diff to **zig-review-specialist**. For larger redesigns

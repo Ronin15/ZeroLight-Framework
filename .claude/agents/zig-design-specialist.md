@@ -146,6 +146,10 @@ yourself — you may reference an existing entry as the owner of out-of-scope wo
 
 ## Coordination
 
+Size the plan to the decision: stay decision-complete and state every invariant, but do not
+restate code the implementer will read, give rejected alternatives a line or two each, and
+leave exact fixture numbers for the implementer to verify by running.
+
 You cannot spawn other agents. End your design with explicit handoff recommendations to the
 main thread, e.g. "ready for **zig-specialist** to implement", "have **zig-debug-specialist**
 reproduce assumption X first", or "route the finished diff to **zig-review-specialist**".

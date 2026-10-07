@@ -210,6 +210,13 @@ preserve current behavior; never document deferred runtime behavior as complete.
 Default optimize mode is Debug; use `--release=...` only for release candidates. Report any
 validation that could not run, especially display-gated GPU checks.
 
+Cost discipline (never at the expense of proof): in a multi-commit batch run `check` + `test`
++ `idiom-lint` per commit and the full `verify` once at the end. Bench only changes that can
+move a hot path — targeted groups, 3 interleaved reps. Keep every proof test, FailingAllocator
+proof, and the fails-with-the-fix-reverted check. Keep new comments terse (see
+`docs/coding-standards.md` Comments) and the final report concise: commits, tests, changed
+numbers, decisions, deviations.
+
 ## Coordination
 
 You cannot spawn other agents. When a task changes architecture, `DataSystem`, processor
