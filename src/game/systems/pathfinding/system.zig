@@ -4420,7 +4420,7 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     for (system.graph.level_graphs.items[0].chunk_edge_cap.items) |*cap| cap.* = 0;
     const stats = try system.applyNavUpdates(&data, &world, edits.items);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    // The overflowing chunks grew their edge windows in place: still an incremental patch,
+    // The overflowing chunks' level was repacked with grown windows: still an incremental patch,
     // so nav_version is unchanged.
     try std.testing.expect(stats.edge_windows_grown > 0);
     try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);

@@ -1586,7 +1586,8 @@ pub const NavGraph = struct {
                 logging.game.debug("nav level {d} edge arena repacked: {d} window(s) grown, {d} slots", .{ level, windows_grown, new_base });
         }
 
-        // Step 3: re-patch the flagged chunks.
+        // Step 3: re-patch the flagged chunks. Step 1's build is not reused: scratch slot 0 holds
+        // only the last flagged chunk's edges.
         for (self.dirty_set.items) |chunk| {
             if (!self.chunk_edge_overflow.items[chunk]) continue;
             const overflowed = try self.patchChunk(level, world, chunk, scratch);
