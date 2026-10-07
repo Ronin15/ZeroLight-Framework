@@ -375,7 +375,12 @@ so merge order stays deterministic.
 Structural mutation is deferred. Worker ranges and hot processors write
 `StructuralCommand` records into `SimulationFrame.structural_commands`; the
 gameplay state commits them through `SimulationFrame.applyStructuralCommands`
-or `applyStructuralCommandsWithExtraEvents`.
+or `applyStructuralCommandsBudgeted`, which takes a `StructuralCommitBudget`
+(usually `SimulationPipeline.structuralCommitBudget(extra_required_events)`). The
+budgeted commit is all-or-fail: its preflight rejects, before any mutation, a
+commit whose events exceed its own `.structural_commit` share or that, together
+with the `extra_required_events` reserved for after it (the post-commit nav
+reaction), would not fit the shared event bound.
 
 Commit behavior:
 

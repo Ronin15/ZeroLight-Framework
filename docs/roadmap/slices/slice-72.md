@@ -339,7 +339,7 @@ Out of scope (each item has a named owner):
     3. Other gathers grow in the middle of a stage.
   - The "sum init caps" model used by 62/56B/61 is correct only while every create source is counted.
 - **Change:** add `pub fn syncPopulationCapacity(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem) !PopulationSyncStats` (landed with `world`, so `raiseAgentBudget` charges the live reserved link limit).
-  - **Call site.** `GameDemoState.applyStructuralCommandsAndPostCommitEvents` calls it right after `applyStructuralCommandsWithExtraEvents` and before `reactToPostCommitNavEvents`, so the post-commit reactions see grown capacities.
+  - **Call site.** `GameDemoState.applyStructuralCommandsAndPostCommitEvents` calls it right after `applyStructuralCommandsBudgeted` (the all-or-fail commit preflighted against its `StructuralCommitBudget`: the structural share plus the post-commit nav reaction's slot) and before `reactToPostCommitNavEvents`, so the post-commit reactions see grown capacities.
   - **Fast path.** Four compares, then return:
     - movement-body rows ≤ `movement_body_capacity`;
     - AiPerception rows × 2 ≤ the perception share (C4);

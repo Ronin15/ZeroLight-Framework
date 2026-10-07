@@ -172,7 +172,9 @@ pub const AudioController = struct {
     }
 };
 
-/// Whether `entity` is either side of `contact`.
+/// Deterministic per-contact pitch ratio for a collision SFX: hashes the contact's
+/// pair key, normal, and clamped penetration into one of nine buckets in
+/// [0.92, 1.08], so repeated hits vary in pitch without a random source.
 fn collisionSfxFrequencyRatio(contact: CollisionContact) f32 {
     var hash = CollisionSfxCooldown.keyFor(contact.a, contact.b);
     hash ^= hashBitsFromFloat(@abs(contact.normal_x) * 31.0);

@@ -28,9 +28,9 @@ world depth, or cognition-track scope.
 
 **Simulation scale**
 
-- [ ] **World-gate SIMD.** `world_gate.apply` stays scalar (Slice 48 kept the
-      structural move off the perf change). Thread and SIMD it only as its own
-      benched follow-up.
+- [x] **World-gate SIMD** — promoted into [Slice 35](slices/slice-35.md)
+      (a `world-gate` bench item, then a SIMD + threading item gated on that
+      bench's trigger).
 - [x] **Interest marker consumers beyond investigate** — promoted into
       [Slice 61](slices/slice-61.md) (`resource`), [Slice 71A](slices/slice-71a.md)
       (`patrol`), and [Slice 71C](slices/slice-71c.md) (`cover`); closed.
