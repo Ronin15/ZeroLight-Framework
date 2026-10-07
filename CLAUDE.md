@@ -38,7 +38,7 @@ Read the doc that owns the area before editing — these are canonical, not note
   in `docs/roadmap/archive/`, indexed by
   `docs/framework-implementation-slices-archive.md`.
 - `docs/changelogs/` — per-branch feature changelog summaries (latest:
-  `docs/changelogs/zig_0_17_upgrade.md`).
+  `docs/changelogs/ai_update3.md`).
 - `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).
 
 ## Module Ownership (`src/`)
