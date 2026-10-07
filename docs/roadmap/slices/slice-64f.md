@@ -3,8 +3,9 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: 64E · Before: 65B · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: implemented (2026-10-07).** Per-level edge windows, a level repack on
-overflow, and the edge arena out of the nav memory gate. All checklist items
-below are checked.
+overflow, and the edge arena out of the nav memory gate. The checklist is
+done; three small review follow-ups stay open below (a bench record, a cheap
+repack trim, and a threaded repack gated on a soak trigger).
 
 ### Why
 
@@ -131,7 +132,7 @@ that outgrows a window. Scattered and pathfinding are within noise.
 Cave-in (`nav-update-cave-in`, 1024×1024 tiles, 32 levels, 16-tile chunks, a
 4×4-chunk lattice carved on 3 levels in one step, every caved level repacks):
 exploratory ReleaseFast serial-direct run (1 warmup, 5 iterations, 1 rep)
-1.99 ms per step, over the ~1 ms main-thread target. The per-iteration full
+1.99 ms per step: a scaling stress test on one rare growth step, not a frame-budget target (see the gated follow-up below). The per-iteration full
 rebuild that resets the windows costs ~50 s at this size, so one serial case
 took ~6 min.
 
