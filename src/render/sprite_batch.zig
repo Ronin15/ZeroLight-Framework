@@ -402,9 +402,11 @@ pub const SpriteBatch = struct {
         self.reservation_drift.markReserved(command_reservation, self.commands.items.len);
     }
 
-    /// Lifetime count of reserved frames whose submits exceeded the frame's command
-    /// reservation (perf metric `sprite_command_overflow_grows`). Always 0 in shipping
-    /// builds, where drift is not tracked.
+    /// Lifetime diagnostic count of reserved frames whose submits exceeded the frame's
+    /// command reservation (`ReservationDrift`). Tracked only in Debug/ReleaseSafe
+    /// (`runtime_perf_log.enabled`); always 0 in ReleaseFast/ReleaseSmall. Not the perf
+    /// metric: `sprite_command_overflow_grows` records the per-frame
+    /// `SpritePrepStats.command_overflow_grows` (0 or 1) from `finishPrepStats`.
     pub fn commandOverflowGrows(self: *const SpriteBatch) u64 {
         return self.reservation_drift.lifetimeGrows();
     }
