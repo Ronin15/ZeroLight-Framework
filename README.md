@@ -20,9 +20,17 @@ simulation, richer emergent AI, and production-friendly asset workflows.
 - **Worlds and tilemaps** — procedural multi-level worlds, chunk visibility,
   dig and plane traversal between floors, and tile edits that feed navigation
   and gameplay.
-- **Fixed-step simulation** — 60Hz gameplay with a pipeline of movement,
-  collision, AI, pathfinding, particles, and small domain controllers (dig,
-  audio, early interactables).
+- **Fixed-step simulation** — 60Hz gameplay on an ordered stage pipeline
+  (perception, memory, emotion drives, AI decisions, steering, pathfinding,
+  movement, collision, tile gating, floor traversal) plus particles and small
+  domain controllers (dig, audio, interactables). Stage reads and writes are
+  checked at compile time.
+- **Scoped simulation** — entities near the camera simulate in full, while
+  distant ones drop to cheaper tiers and staggered AI thinking. Scope follows
+  the fixed-step camera, so it never depends on the frame rate.
+- **Dig-aware pathfinding** — hierarchical chunk-portal pathfinding across
+  levels. Digs, ramps, and other terrain edits patch navigation incrementally
+  in the same step, so NPCs route through new tunnels immediately.
 - **Emergent AI (in progress)** — early substrate, not a finished AI game
   layer. Agents can see and hear, keep short-term memory, carry simple emotion
   drives, and choose among a few locomotion behaviors; personalities and
@@ -34,9 +42,10 @@ simulation, richer emergent AI, and production-friendly asset workflows.
   combat or interaction system yet.
 - **Atlas-backed assets** — packed runtime atlases with stable IDs so art and
   audio can be swapped without rewriting game code.
-- **Performance discipline** — threaded processors, benchmarks, and tests that
-  keep hot paths allocation-free and behavior deterministic as the framework
-  grows.
+- **Multithreaded and deterministic** — hot systems run serial or threaded
+  with identical results. Hot paths are allocation-free after warmup, and tests
+  prove it; storage grows only at safe points in the step. Benchmarks track
+  scaling to large populations.
 
 For design detail and ownership boundaries, start with
 [architecture](docs/architecture.md). Topic guides cover
@@ -83,7 +92,7 @@ zig build check     # compile game, benchmark, and GPU smoke executables
 zig build test      # run unit tests
 zig build bench     # run CPU gameplay and render-prep benchmarks
 zig build verify    # check + test + shaders + atlas + idiom lint (local gate)
-zig build package   # install binaries and runtime assets for the selected mode
+zig build package   # install selected-mode binaries and runtime assets
 zig build gpu-smoke # display-gated renderer pipeline smoke test
 ```
 
@@ -97,8 +106,9 @@ zig build assets-lint # lint runtime atlases and optional source sprite consiste
 zig build idiom-lint  # lint Zig naming, stdlib currency, and unsafe catch patterns
 ```
 
-See [development workflow](docs/development-workflow.md) for release modes, build
-options, and packaging notes.
+Releases are packaged with `--release=fast` (ReleaseFast). See
+[development workflow](docs/development-workflow.md) for the ReleaseSafe soak
+gate that implies, release modes, build options, and packaging notes.
 
 ## Project Layout
 
@@ -121,8 +131,10 @@ Generated output lives under `zig-out/` and should not be committed.
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
 - [Atlas Asset Workflow](docs/atlas-asset-workflow.md)
 - [Simulation Tiers And Pipeline](docs/simulation-tiers-and-pipeline.md)
+- [Coding Standards](docs/coding-standards.md)
+- [Roadmap](docs/framework-implementation-slices.md) (implementation slices)
+- [Changelogs](docs/changelogs/) and [module reviews](docs/reviews/)
 
 ## License
-
 
 MIT — see [LICENSE](LICENSE).
