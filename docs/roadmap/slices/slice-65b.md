@@ -849,6 +849,26 @@ copied at submit") gains one clause:
   - `docs/development-workflow.md`: the `nav-update-deferred` group, and
     `background-lane` plus `nav-update-deferred` in the Thread Sanitizer
     group list.
+- [ ] Non-fatal failure states (64E M8–M13 review, 2026-10-07; required
+  because 65B makes a failed apply non-fatal):
+  - A relabel now allocates per-level `edge_scratch` staging every time
+    (64E M9 frees it after each build), so an OOM can stop a relabel with
+    level k partly rebuilt and `link_edges` not rebuilt. Make the failed
+    relabel leave a solve-safe graph (every level's adjacency empty or
+    complete, links resolving through the `no_cell` guard) and add a
+    relabel OOM sweep asserting `expectNoEdgeTargetsTombstone` plus parity
+    after the retry.
+  - `rebuild()` writes `width`/`height`/`chunk_tiles` before
+    `memory_budget.check` can fail, so `chunkCount()` can outrun
+    `chunk_edge_base` and `build_u32_scratch`, and the now-infallible
+    `compactEdgeArena` is reachable from a seam on that state. Validate
+    into locals and commit the dimensions only after the check passes;
+    test that a refused `rebuild` leaves the prior graph's dimensions.
+  - Restate the planned test "a full abstract rebuild that fits its
+    high-water mark is allocation-free": `FailingAllocator` counts every
+    allocation, so it cannot exempt `edge_scratch`. Use a counting
+    allocator wrapper that records allocation sizes and assert the only
+    allocations are the per-level staging lists.
 
 ### Acceptance checks
 

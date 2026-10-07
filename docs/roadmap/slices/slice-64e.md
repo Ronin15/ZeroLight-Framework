@@ -568,6 +568,17 @@ multi-worker patch path and the serial one.
     deferral;
   - `docs/reviews/` pathfinder note if present;
   - drop the "deferred until full rebuild" wording.
+- [ ] **M14 · Threaded parity of an unslacked relocation** (M8–M13 review,
+  2026-10-07). The ladder test runs serial only and the existing parity test
+  never reaches rung 2. Add a multi-chunk fixture (3×3 chunks of 8, 3-worker
+  pool, `items_per_range = 1`) where one chunk's slacked growth needs a
+  compaction and then lands unslacked; assert `expectSameEdgeLayout` serial
+  vs threaded and `edge_arena_unslacked_total == 1` on both.
+- [ ] **M15 · Count unslacked landings only once they land** (same review).
+  `edge_arena_unslacked_total` is bumped before `ensureEdgeArenaCapacity`
+  (relocation) and before `placeLevelEdges` (build), so an OOM after the bump
+  over-counts. Move both bumps after the fallible call; extend the existing
+  OOM sweep to assert the counter is unchanged on a failed step.
 
 ### Acceptance checks
 
