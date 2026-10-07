@@ -79,6 +79,7 @@ const perception_events_per_observer_max = @import("simulation.zig").perception_
 const affect_events_per_row_max = @import("simulation.zig").affect_events_per_row_max;
 const ActionIntent = @import("simulation.zig").ActionIntent;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
+const pipeline_structural_event_share = @import("simulation.zig").pipeline_structural_event_share;
 const WorldStimulus = @import("simulation.zig").WorldStimulus;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_capacity;
@@ -401,12 +402,15 @@ pub const SimulationPipelineConfig = struct {
     /// When set, the one-time static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
-    /// The per-step `.structural_commit` event share, in events: size it with
-    /// `structuralEventHeadroom(creates, destroys + component sets)` from fixed
-    /// per-step producer budgets (a create costs up to
-    /// `max_structural_events_per_create`; tier changes cost none). Enforced on its own
-    /// at the commit (`structuralCommitBudget`), never borrowed from other producers.
-    /// Also sizes the structural-command stream beyond one tier command per body.
+    /// The caller's part of the per-step `.structural_commit` event share, in events:
+    /// size it with `structuralEventHeadroom(creates, destroys + component sets)` from
+    /// the caller's own fixed per-step producer budgets (a create costs up to
+    /// `max_structural_events_per_create`; tier changes cost none). Covers only
+    /// commands the caller queues: the pipeline adds its own `action_react`
+    /// destructible share (`pipeline_structural_event_share`) on top. The total is
+    /// enforced on its own at the commit (`structuralCommitBudget`), never borrowed
+    /// from other producers, and sizes the structural-command stream beyond one tier
+    /// command per body (`structuralCommandHeadroom`).
     structural_headroom: usize = 0,
     stimuli: StimulusConfig = .{},
 };
@@ -882,13 +886,21 @@ pub const SimulationPipeline = struct {
         return sum;
     }
 
-    /// The budget for this step's structural commit: this pipeline's own
-    /// `.structural_commit` share, plus `extra_required_events` preflighted for after it.
+    /// The budget for this step's structural commit: the whole `.structural_commit`
+    /// share (the pipeline's destructible share plus the caller's
+    /// `structural_headroom`), plus `extra_required_events` preflighted for after it.
     pub fn structuralCommitBudget(self: *const SimulationPipeline, extra_required_events: usize) StructuralCommitBudget {
         return .{
             .extra_required_events = extra_required_events,
             .structural_event_share = maxEventsPerStep(.structural_commit, self.eventBudgets()),
         };
+    }
+
+    /// Structural-command stream room beyond one `set_simulation_tier` per body: the
+    /// whole `.structural_commit` event share. Every non-tier command emits at least one
+    /// event, so the event share bounds the command count.
+    pub fn structuralCommandHeadroom(self: *const SimulationPipeline) usize {
+        return maxEventsPerStep(.structural_commit, self.eventBudgets());
     }
 
     pub fn eventBudgets(self: *const SimulationPipeline) EventBudgetInputs {
@@ -985,7 +997,7 @@ pub const SimulationPipeline = struct {
             const range_count = self.eventCapacitySum();
             try frame.navigation_intents.reserve(range_count, body);
             try frame.intents.reserve(range_count, body);
-            try frame.structural_commands.reserve(range_count, body + self.structural_headroom);
+            try frame.structural_commands.reserve(range_count, body + self.structuralCommandHeadroom());
             try frame.reservePathRequests(1, body);
             // Raises the event limit, re-runs the cognition reserves and the contact
             // streams + response reserves to the grown pair bound (and every reserve
@@ -2029,8 +2041,8 @@ test "eventCapacitySum equals capacity_limit after reserve" {
     try pipeline.reserve(&frame, 8);
 
     // dig 1 + perception 0 + affect 0 (no AiPerception/AiAffect rows) + plane (8 + 1) +
-    // action_react 64 + structural 4 + nav 1.
-    try std.testing.expectEqual(@as(usize, 79), pipeline.eventCapacitySum());
+    // action_react 64 + structural (pipeline destructible 64 + caller 4) + nav 1.
+    try std.testing.expectEqual(@as(usize, 143), pipeline.eventCapacitySum());
     try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
 }
 
@@ -6561,9 +6573,12 @@ const StructuralBurstOutcome = struct {
     bodies: usize,
 };
 
-/// Commits `create_count` 4-event creates against a 15-event structural share
-/// (`structuralEventHeadroom(1, 0)`) on a minimal pipeline with 2 perception/affect
-/// observers. With `saturate_other_producers`, every other producer's share is filled
+const structural_burst_max_creates: usize = 20;
+
+/// Commits `create_count` 4-event creates against the structural share of a
+/// `structuralEventHeadroom(1, 0)` caller headroom (15) plus the pipeline's own
+/// `pipeline_structural_event_share` (64) = 79 events, on a minimal pipeline with 2
+/// perception/affect observers. With `saturate_other_producers`, every other producer's share is filled
 /// first, so only the structural share is left in the shared bound.
 fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !StructuralBurstOutcome {
     var world = try minimalSyncWorld();
@@ -6586,10 +6601,11 @@ fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !S
         .pathfinding = sync_test_pathfinding,
     });
     defer pipeline.deinit();
-    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + headroom);
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + pipeline.structuralCommandHeadroom());
     try pipeline.reserve(&frame, 4);
     const structural_share = maxEventsPerStep(.structural_commit, pipeline.eventBudgets());
-    try std.testing.expectEqual(@as(usize, 15), structural_share);
+    try std.testing.expectEqual(pipeline_structural_event_share + headroom, structural_share);
+    try std.testing.expectEqual(@as(usize, 79), structural_share);
     try std.testing.expect(pipeline.perception_max_events_per_step > 0 and pipeline.affect_max_events_per_step > 0);
 
     frame.beginStep();
@@ -6600,7 +6616,8 @@ fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !S
         };
         for (0..pipeline.eventCapacitySum() - structural_share) |_| try frame.events.appendRequired(filler);
     }
-    var commands: [4]StructuralCommand = undefined;
+    var commands: [structural_burst_max_creates]StructuralCommand = undefined;
+    std.debug.assert(create_count <= commands.len);
     for (commands[0..create_count], 0..) |*command, index| command.* = responderTemplate(index, .dynamic);
     try writeStructuralCommands(&frame, commands[0..create_count]);
     const events_before = frame.events.mergedItems().len;
@@ -6617,19 +6634,52 @@ fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !S
 }
 
 test "a structural burst over its own event share fails the same whether other producers are idle or saturated" {
-    // 4 creates x 4 events = 16 > 15: rejected at the structural boundary in both cases,
+    // 20 creates x 4 events = 80 > 79: rejected at the structural boundary in both cases,
     // never admitted by borrowing idle perception/affect/action shares.
-    const over_idle = try commitStructuralBurst(4, false);
-    const over_saturated = try commitStructuralBurst(4, true);
+    const over_idle = try commitStructuralBurst(20, false);
+    const over_saturated = try commitStructuralBurst(20, true);
     try std.testing.expect(over_idle.failed);
     try std.testing.expectEqual(over_idle, over_saturated);
 
-    // 3 creates x 4 events = 12 <= 15 commits in both cases.
-    const within_idle = try commitStructuralBurst(3, false);
-    const within_saturated = try commitStructuralBurst(3, true);
+    // 19 creates x 4 events = 76 <= 79 commits in both cases.
+    const within_idle = try commitStructuralBurst(19, false);
+    const within_saturated = try commitStructuralBurst(19, true);
     try std.testing.expect(!within_idle.failed);
-    try std.testing.expectEqual(@as(usize, 5), within_idle.bodies);
+    try std.testing.expectEqual(@as(usize, 21), within_idle.bodies);
     try std.testing.expectEqual(within_idle, within_saturated);
+}
+
+test "a destructible destroy commits through structuralCommitBudget with zero caller structural headroom" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const crate = try data.createEntity();
+    try data.setMovementBody(crate, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setDestructible(crate, .{ .hit_points = 1 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 0,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + pipeline.structuralCommandHeadroom());
+    try pipeline.reserve(&frame, 4);
+    // The caller budgets nothing; the share is the pipeline's own destructible part.
+    try std.testing.expectEqual(pipeline_structural_event_share, maxEventsPerStep(.structural_commit, pipeline.eventBudgets()));
+
+    frame.beginStep();
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact, .target = crate });
+    // The pipeline's own `action_react` producer (what `stageActionReact` runs).
+    const stats = try pipeline.destructible.process(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
+    try std.testing.expect(data.isAlive(crate));
+
+    _ = try frame.applyStructuralCommandsBudgeted(&data, pipeline.structuralCommitBudget(0));
+    try std.testing.expect(!data.isAlive(crate));
 }
 
 test "a full-template create costs max_structural_events_per_create events" {

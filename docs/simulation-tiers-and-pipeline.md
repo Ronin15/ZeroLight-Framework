@@ -352,7 +352,11 @@ diagnostic events only for optional observability.
 `maxEventsPerStep` over every `EventProducerId` (`SimulationPipeline.eventCapacitySum()`),
 set by `SimulationPipeline.reserve` at state init. A new producer adds one arm. A
 required-append failure means a producer exceeded its declared budget, which is a bug, not
-a capacity condition.
+a capacity condition. The `.structural_commit` arm is the pipeline's own share
+(`pipeline_structural_event_share`: one single-event `destroy_entity`/`set_destructible`
+per live action intent from the `action_react` stage) plus the caller's
+`SimulationPipelineConfig.structural_headroom`, which covers only the structural commands
+the caller itself queues.
 
 Events are for low-volume notable changes and transitions, not high-volume
 per-frame per-entity data. Dense per-step results — for example AI separation,

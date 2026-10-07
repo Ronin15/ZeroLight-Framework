@@ -69,8 +69,10 @@ pub const EventBudgetInputs = struct {
     perception_max_events_per_step: usize = 0,
     affect_max_events_per_step: usize = 0,
     movement_body_capacity: usize = 0,
-    /// The `.structural_commit` event share, in events (`structuralEventHeadroom`).
-    /// See `SimulationPipelineConfig.structural_headroom`.
+    /// The caller-owned part of the `.structural_commit` event share, in events
+    /// (`structuralEventHeadroom`); `maxEventsPerStep` adds the pipeline's own
+    /// `pipeline_structural_event_share` on top. See
+    /// `SimulationPipelineConfig.structural_headroom`.
     structural_headroom: usize = 0,
 };
 
@@ -83,6 +85,12 @@ pub fn structuralEventHeadroom(creates_per_step: usize, single_event_commands_pe
     return creates_per_step * max_structural_events_per_create + single_event_commands_per_step;
 }
 
+/// The pipeline-owned part of the `.structural_commit` share: the `action_react` stage
+/// (`DestructibleController.process`) queues at most one single-event structural command
+/// (`destroy_entity` / `set_destructible`) per live action intent. Always counted, so a
+/// caller's `structural_headroom` covers only the commands the caller itself queues.
+pub const pipeline_structural_event_share: usize = structuralEventHeadroom(0, action_intent_live_capacity);
+
 pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) usize {
     return switch (producer) {
         .dig_world_edit => 1,
@@ -92,8 +100,9 @@ pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) u
         .action_react => action_intent_live_capacity,
         // A fixed per-step share sized in events; tier changes emit no structural
         // event, so the share never follows population. Enforced on its own by the
-        // budgeted commit (`StructuralCommitBudget`).
-        .structural_commit => budgets.structural_headroom,
+        // budgeted commit (`StructuralCommitBudget`). The pipeline's own destructible
+        // share plus the caller's headroom.
+        .structural_commit => pipeline_structural_event_share + budgets.structural_headroom,
         // The single post-commit `nav_region_invalidated`.
         .nav_reaction => 1,
     };

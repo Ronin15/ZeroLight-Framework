@@ -130,8 +130,9 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // The per-step `frame.events` bound is not derived here: it is the exhaustive
     // `EventProducerId` table (`simulation.zig`), summed by
     // `SimulationPipeline.eventCapacitySum()`. The perception/affect shares derive from
-    // committed `AiPerception`/`AiAffect` rows inside the pipeline; this demo only
-    // supplies `demo_structural_headroom`.
+    // committed `AiPerception`/`AiAffect` rows inside the pipeline, as does the
+    // destructible part of the structural share; this demo only supplies
+    // `demo_structural_headroom` for its own creates.
     return .{
         .mover_count = mover_count,
         .surface_movers = surface_movers,
@@ -146,10 +147,11 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
 /// step; this is the one runtime create-burst slot.
 const demo_creates_per_step: usize = 1;
 
-/// The demo's `.structural_commit` event share: `demo_creates_per_step` full creates
-/// plus one `entity_destroyed`/`set_destructible` per destructible action intent
-/// (Slice 45). Tier changes emit no structural event.
-const demo_structural_headroom: usize = structuralEventHeadroom(demo_creates_per_step, action_intent_live_capacity);
+/// The demo's own part of the `.structural_commit` event share: `demo_creates_per_step`
+/// full creates. The pipeline adds its own destructible share (one
+/// `entity_destroyed`/`set_destructible` per action intent, Slice 45) on top, and tier
+/// changes emit no structural event.
+const demo_structural_headroom: usize = structuralEventHeadroom(demo_creates_per_step, 0);
 
 /// Per-step audio bound for demo tests: movers can emit collision SFX alongside
 /// ambient music, listener, and the player jet loop. Not scaled 1:1 with mover count —
@@ -473,10 +475,11 @@ pub const GameDemoState = struct {
         errdefer pipeline.deinit();
         // The shared `range_count` equals the event bound: one range per required append
         // is the worst case. The last arg sizes the structural-command stream: one
-        // `set_simulation_tier` per movement body plus the burst/destroy headroom, so the
-        // commit seam stays allocation-free on churn frames. The event value capacity and
+        // `set_simulation_tier` per movement body plus the whole structural share (the
+        // demo's create burst and the pipeline's destructible commands), so the commit
+        // seam stays allocation-free on churn frames. The event value capacity and
         // limit are set by `pipeline.reserve` below.
-        try simulation_frame.reserveStreams(pipeline.eventCapacitySum(), 0, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.intent_capacity + demo_structural_headroom);
+        try simulation_frame.reserveStreams(pipeline.eventCapacitySum(), 0, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.intent_capacity + pipeline.structuralCommandHeadroom());
         // Raises `frame.events.capacity_limit` to the exhaustive producer sum.
         try pipeline.reserve(&simulation_frame, pop_cap.intent_capacity);
 
@@ -2238,7 +2241,7 @@ const DemoConfigPipelineFixture = struct {
         errdefer self.pipeline.deinit();
         // The demo's init order: streams sized from the producer sum, then `reserve`
         // raises the event limit to it.
-        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + demo_structural_headroom);
+        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + self.pipeline.structuralCommandHeadroom());
         try self.pipeline.reserve(&self.frame, 4);
     }
 

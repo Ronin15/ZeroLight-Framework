@@ -357,7 +357,7 @@ Out of scope (each item has a named owner):
       - `navigation_intents`, `intents`: new_cap;
       - `contacts`: estimateContactCapacity (since C6: `CollisionSystem.reserveContactStream` in `reserve`, ranges to `maxRangeCount` of the pair bound);
       - `collision_triggers`: `estimateTriggerCapacity` (since C6: in `reserve`, one range);
-      - `structural_commands`: new_cap + `structural_headroom` (B1).
+      - `structural_commands`: new_cap + the whole `.structural_commit` share (`structuralCommandHeadroom()`: the pipeline's destructible share + `structural_headroom`) (B1).
   - **Event limit.** Then `self.reserve(frame, new_cap)` raises the event limit. That also re-runs every reserve the other slices attach to it: 64E `reserveNavDirty`, 68A `reserveAiRowMap`, 56B's projectile bitset.
   - **Pathfinding.** It calls a new `pathfinding.growForAgentCount(steering_rows)`. This is the grow half of `adjustCapacityForAgentCount` (`system.zig:315-337`), moved to the seam. Shrink stays in `beginUpdate` with its hysteresis, and `beginUpdate`'s grow remains the safety net. If `steering_rows > capacity.max_agent_budget`, `raiseAgentBudget(grown)` re-runs `nav_memory.budgetForCapacity(...).check`:
     - if admitted, the ceiling rises. A raise never moves the group-field threshold (71B.1): `groupFieldThreshold` clamps to the ceiling frozen at reserve;
@@ -384,12 +384,12 @@ Out of scope (each item has a named owner):
   - A forgotten demo term causes an `EventCapacityExceeded` exit.
 - **Change:**
   - (a) The `EventProducerId` table gains two arms:
-    - `.structural_commit => budgets.structural_headroom`, a fixed per-step share sized in events with `structuralEventHeadroom(creates, destroys + component sets)` (a create costs up to `max_structural_events_per_create` = 1 + the `EntityTemplate` component count; `set_simulation_tier` emits no event, so tier changes take no share and the share never follows population). The new field is `SimulationPipelineConfig.structural_headroom`; the demo passes `structuralEventHeadroom(1, action_intent_live_capacity)` = 79. The budgeted commit (`SimulationPipeline.structuralCommitBudget` → `StructuralCommitPreparer`) enforces the share on its own before any mutation, so an over-share burst fails with `EventCapacityExceeded` whatever other producers appended that step (final-review fix M2; the original arm `movement_body_capacity + structural_headroom` let bursts borrow idle perception/affect shares).
+    - `.structural_commit => budgets.structural_headroom`, a fixed per-step share sized in events with `structuralEventHeadroom(creates, destroys + component sets)` (a create costs up to `max_structural_events_per_create` = 1 + the `EntityTemplate` component count; `set_simulation_tier` emits no event, so tier changes take no share and the share never follows population). The new field is `SimulationPipelineConfig.structural_headroom`. Branch-review fix: the arm is `pipeline_structural_event_share + budgets.structural_headroom`, where `pipeline_structural_event_share = structuralEventHeadroom(0, action_intent_live_capacity)` = 64 is the pipeline's own `action_react` destructible commands, so a caller's headroom covers only its own commands; the demo passes `structuralEventHeadroom(1, 0)` = 15, and the share stays 79. The budgeted commit (`SimulationPipeline.structuralCommitBudget` → `StructuralCommitPreparer`) enforces the share on its own before any mutation, so an over-share burst fails with `EventCapacityExceeded` whatever other producers appended that step (final-review fix M2; the original arm `movement_body_capacity + structural_headroom` let bursts borrow idle perception/affect shares).
     - `.nav_reaction => 1`, the post-commit `nav_region_invalidated`.
   - (b) Add `pub fn eventCapacitySum(self) usize`, the exhaustive sum. `reserve` uses it, as does the demo's shared `range_count`.
   - (c) The demo init order becomes:
     1. `SimulationPipeline.init`;
-    2. `reserveStreams(pipeline.eventCapacitySum(), 0, intent, contact, trigger, intent_capacity + structural_headroom)`;
+    2. `reserveStreams(pipeline.eventCapacitySum(), 0, intent, contact, trigger, intent_capacity + pipeline.structuralCommandHeadroom())`;
     3. `try pipeline.reserve(&simulation_frame, pop_cap.mover_count + obstacle_count + 1)`.
 
     `reserve` only raises the limit. This keeps the "shared range_count equals the event bound" semantics that are recorded as kept.
