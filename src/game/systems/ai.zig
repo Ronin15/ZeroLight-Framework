@@ -161,6 +161,12 @@ const RowInterest = struct {
     y: f32 = 0,
     /// World level sampled at gather. The separation job reads it when it scans markers.
     level: u16 = 0,
+    /// Whether the agent carries a real faction component. The gathered
+    /// `faction` column falls back to `.neutral` for stance math, but the
+    /// marker scan must pass `null` for a factionless agent so a
+    /// faction-restricted marker never accepts it (`factionAccepts`). Packs
+    /// into this struct's existing padding, so the job layout does not grow.
+    has_faction: bool = false,
 };
 
 /// Explicit opt-in fallback target (see `AiConfig.focus_target`'s doc
@@ -633,7 +639,8 @@ pub const AiSystem = struct {
                 continue;
             };
 
-            const ent_faction = data.factionConst(ent) orelse .neutral;
+            const maybe_faction = data.factionConst(ent);
+            const ent_faction = maybe_faction orelse .neutral;
             appendAiCandidateRow(&self.candidates, &candidate_slice, .{
                 .entity = ent,
                 .faction = ent_faction,
@@ -756,7 +763,10 @@ pub const AiSystem = struct {
                 }
             }
 
-            row.interest = .{ .level = data.worldLevelConst(ent) orelse 0 };
+            row.interest = .{
+                .level = data.worldLevelConst(ent) orelse 0,
+                .has_faction = maybe_faction != null,
+            };
 
             appendAiGatherRow(&self.rows, &row_slice, row);
             spatial_row_index += 1;
@@ -1085,7 +1095,8 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
         if (job.markers) |markers| {
             if (job.gains[index].investigate > 0) {
                 const interest = &job.interest[index];
-                if (markers.findBestInvestigateMarker(interest.level, job.pos_x[index], job.pos_y[index], interest_marker_query_radius, job.faction[index])) |hit| {
+                const agent_faction: ?Faction = if (interest.has_faction) job.faction[index] else null;
+                if (markers.findBestInvestigateMarker(interest.level, job.pos_x[index], job.pos_y[index], interest_marker_query_radius, agent_faction)) |hit| {
                     interest.present = true;
                     interest.x = hit.x;
                     interest.y = hit.y;
@@ -2352,6 +2363,53 @@ test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
         } else {
             try std.testing.expect(marker.present);
             try std.testing.expectApproxEqAbs(@as(f32, 200), marker.x, 1e-3);
+        }
+    }
+}
+
+test "ai factionless agent never discovers a faction-restricted marker" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    // In range, but restricted to `.neutral`: the gathered stance column's
+    // `.neutral` fallback must not masquerade as a real neutral faction.
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 200, .y = 50, .radius = 256, .faction_filter = .neutral });
+
+    const factionless = try data.createEntity();
+    try data.setMovementBody(factionless, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(factionless, 0);
+    try data.setAiAgent(factionless, .{ .active_behavior = .investigate, .gain_investigate = 2.0, .gain_wander = 0 });
+
+    // Control: a real `.neutral` agent at the same spot does pass the filter.
+    const neutral = try data.createEntity();
+    try data.setMovementBody(neutral, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(neutral, 0);
+    try data.setFaction(neutral, .neutral);
+    try data.setAiAgent(neutral, .{ .active_behavior = .investigate, .gain_investigate = 2.0, .gain_wander = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, null, &markers);
+    ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
+
+    const rows = ai_sys.rows.slice();
+    const entities = rows.items(.entity);
+    const interest = rows.items(.interest);
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    for (entities, interest) |ent, marker| {
+        if (ent.index == factionless.index) {
+            try std.testing.expect(!marker.has_faction);
+            try std.testing.expect(!marker.present);
+        } else {
+            try std.testing.expect(marker.has_faction);
+            try std.testing.expect(marker.present);
         }
     }
 }
