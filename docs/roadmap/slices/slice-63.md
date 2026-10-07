@@ -225,11 +225,27 @@ adds, clamps to `[-100, 100]`, narrows, and recomputes the 16-entry
 consumers are stats and the Slice 67B event-log feed. Perception holds
 no stance cache, so no post-commit cache reaction is needed.
 
-**Reserves.** The demo's `demo_structural_headroom` adds, as named terms: ≤ 12
-`adjust_faction_standing` commands plus ≤ `maxEventsPerStep(.action_react) +
-maxEventsPerStep(.combat_resolve)` `set_social_ledger` commands (one `component_changed`
-event each at commit). `faction_stance_changed` gets its own `EventProducerId` arm (its
-producing stage) with budget 12, summed by `SimulationPipeline.eventCapacitySum()`. The
+**Reserves.** `social_react` is a pipeline stage, so its structural commands are
+pipeline-owned: they add a fixed per-step term to `pipeline_structural_event_share`
+(`simulation.zig`), and callers add nothing (`demo_structural_headroom` is unchanged).
+New constants in `simulation.zig`, beside `pipeline_structural_event_share`:
+- `social_standing_commands_per_step = faction_count * (faction_count - 1)` (12, the
+  off-diagonal directed pairs): `adjust_faction_standing` commands, each emitting at most
+  one event at commit (`faction_stance_changed`, only when a stance band flips);
+- `social_ledger_commands_per_step = action_intent_live_capacity +
+  combat_max_hits_per_step + combat_max_kills_per_step` (the `.action_react` plus
+  `.combat_resolve` arm budgets, spelled through their constants rather than a
+  `maxEventsPerStep` call, because `pipeline_structural_event_share` feeds
+  `maxEventsPerStep` itself; still symbolic when Slice 56B raises the combat budget):
+  `set_social_ledger` commands, one `component_changed` event each at commit;
+- `social_structural_event_share = structuralEventHeadroom(0,
+  social_standing_commands_per_step + social_ledger_commands_per_step)`, added as a term of
+  `pipeline_structural_event_share`.
+
+`faction_stance_changed` is appended by the structural commit, so it is counted in the
+`.structural_commit` share through `social_standing_commands_per_step` and takes no
+separate `EventProducerId` arm (the budgeted commit enforces the structural share on its
+own, so a separate arm would only inflate the bound without admitting the event). The
 demo's `capacity_limit` literal test is re-pinned deliberately.
 
 **Stage contract**
@@ -320,9 +336,19 @@ impulses 128 per step. None scale with world or population.
   - auto-close on an invalid session, decided in the fixed `update` through a queued pop.
 - [ ] `SocialController` + `StageId.social_react` (after `inventory_update`, before `tier_policy`) + contract + `runStage` arm; delta table above; `.social` impulse producer. Raise `@setEvalBranchQuota` at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
 - [ ] Combat rows wired to Slice 56's `combat_events`.
-- [ ] Reserves: standing and ledger commands added to `demo_structural_headroom`; an
-  `EventProducerId` arm with budget 12 for `faction_stance_changed`; demo `capacity_limit`
-  literal re-pinned.
+- [ ] Reserves: `social_standing_commands_per_step`, `social_ledger_commands_per_step`, and
+  `social_structural_event_share = structuralEventHeadroom(0,
+  social_standing_commands_per_step + social_ledger_commands_per_step)` in `simulation.zig`,
+  added as a term of the pipeline-owned `pipeline_structural_event_share`;
+  `demo_structural_headroom` unchanged (callers add nothing); no separate
+  `faction_stance_changed` arm (counted in the standing term); demo `capacity_limit`
+  literal re-pinned. Test (in `simulation_pipeline.zig`): on a pipeline with
+  `structural_headroom = 0`, `social_react`'s maximal per-step command set, written with
+  the test file's `writeStructuralCommands` helper (`social_standing_commands_per_step`
+  standing commands, each flipping a stance band so each emits `faction_stance_changed`,
+  plus `social_ledger_commands_per_step` ledger commands on distinct `SocialLedger` rows),
+  commits through `applyStructuralCommandsBudgeted(&data,
+  pipeline.structuralCommitBudget(0))` and applies every command.
 - [ ] Bench group `social-react` (one `BenchmarkGroup` in `src/benchmarks/social.zig`, default items 128 events, registered in `runner.zig`). Re-run `--group perception` and `--group ai` for the relations-table indirection.
 - [ ] Docs:
   - `architecture.md` (relations, ledger, merchant, `SocialController`);

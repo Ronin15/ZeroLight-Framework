@@ -82,10 +82,14 @@ game-over flow.
 - `AudioController` (`src/game/audio_controller.zig`). `collision_sfx` is the
   only SFX asset (`src/assets/manifest.zig:14-18`). `ParticleSystem.emitBurst`
   (`systems/particle.zig:341`).
-- Event and structural bounds: the exhaustive `EventProducerId` table
-  (`src/game/simulation.zig:45-70`), summed by `SimulationPipeline.eventCapacitySum()`, and
-  the demo's `demo_structural_headroom` (`SimulationPipelineConfig.structural_headroom`)
-  (Slice 72 B1).
+- Event and structural bounds: the exhaustive `EventProducerId` table and `maxEventsPerStep`
+  (`src/game/simulation.zig`), summed by `SimulationPipeline.eventCapacitySum()` (Slice 72
+  B1). The `.structural_commit` arm is `pipeline_structural_event_share` (the fixed
+  per-step structural commands of the pipeline's own stages; today the `action_react`
+  destructible share) plus the caller's `SimulationPipelineConfig.structural_headroom`,
+  which covers only commands the caller itself queues (the demo's
+  `demo_structural_headroom`: its own create slot). The budgeted commit
+  (`SimulationPipeline.structuralCommitBudget`) enforces that whole share on its own.
 
 ### Architecture notes
 
@@ -280,7 +284,8 @@ phase 0's single dense, branch-light pass over the `hit_points` column.
   - `combat_max_kills_per_step = combat_max_hits_per_step`: at most one kill
     per hit.
   - `PendingHit` / `PendingTarget` arrays, the `.combat_resolve` event budget,
-    and the structural headroom are all sized from these two constants, never
+    and the pipeline-owned structural term (`combat_structural_event_share`)
+    are all sized from these two constants, never
     from `action_intent_live_capacity` directly. Comptime asserts tie each
     array length to its constant and check that `combat_max_hits_per_step`
     equals the sum of every hit-source cap (one term per source; 56B adds
@@ -484,12 +489,21 @@ applied at `apply_ai_movement_intents` (Slice 68B; distinct from Slice 61's
 | `max_health_hit_points` / `max_damage_per_hit` | 1_000_000 | Keeps u32 headroom and exact integer math |
 | `combat_sfx_per_step` | 4 | Audible ceiling, not scaled by population |
 | Event budget `.combat_resolve` | `combat_max_hits_per_step + combat_max_kills_per_step` | At most 1 hit per intent and 1 kill per hit |
-| Structural headroom | `+ combat_max_kills_per_step` destroys | At most 1 kill per hit |
+| `combat_structural_event_share` | `structuralEventHeadroom(0, combat_max_kills_per_step)` | Pipeline-owned structural term: at most 1 single-event `destroy_entity` per kill |
 
 The `.combat_resolve` arm is summed into the frame event bound by
-`SimulationPipeline.eventCapacitySum()` (Slice 72 B1). The demo adds
-`combat_max_kills_per_step` to `demo_structural_headroom` (one `entity_destroyed` per
-kill) and re-pins its `capacity_limit` literal test by hand.
+`SimulationPipeline.eventCapacitySum()` (Slice 72 B1). `combat_resolve` is a pipeline
+stage, so its kill destroys are pipeline-owned structural commands: the new
+`combat_structural_event_share` (in `simulation.zig`, beside
+`pipeline_structural_event_share`) is added as a term of `pipeline_structural_event_share`
+(`structuralEventHeadroom(0, action_intent_live_capacity) +
+combat_structural_event_share`), one `entity_destroyed` per kill (a
+`destroy_on_death = false` kill queues nothing). Callers add nothing:
+`demo_structural_headroom` stays `structuralEventHeadroom(demo_creates_per_step, 0)`. The
+`.structural_commit` share, the structural-command stream room
+(`structuralCommandHeadroom()`), and the demo's pinned `capacity_limit` all grow by the
+term through the pipeline; the demo re-pins its `capacity_limit` literal test by hand
+with the `.combat_resolve` arm and the combat structural term itemized in its comment.
 
 **FailingAllocator proofs.**
 
@@ -585,8 +599,16 @@ kill) and re-pins its `capacity_limit` literal test by hand.
       Otherwise 67E migrates it.
 - [ ] `AudioController.queueCombat`, wired in `GameDemoState.update`.
 - [ ] `EventProducerId.combat_resolve` arm with budget `combat_max_hits_per_step +
-      combat_max_kills_per_step`; `combat_max_kills_per_step` added to `demo_structural_headroom`;
-      demo `capacity_limit` literal re-pinned.
+      combat_max_kills_per_step`. `combat_structural_event_share =
+      structuralEventHeadroom(0, combat_max_kills_per_step)` added as a term of the
+      pipeline-owned `pipeline_structural_event_share`; `demo_structural_headroom`
+      unchanged (callers add nothing); demo `capacity_limit` literal re-pinned. Test (in
+      `simulation_pipeline.zig`): on a pipeline with `structural_headroom = 0`, one step
+      whose `combat_resolve` kills `combat_max_kills_per_step` `destroy_on_death` targets
+      commits through `applyStructuralCommandsBudgeted(&data,
+      pipeline.structuralCommitBudget(0))` and destroys every victim, and
+      `maxEventsPerStep(.structural_commit, pipeline.eventBudgets())` equals
+      `pipeline_structural_event_share`, which includes `combat_structural_event_share`.
 - [ ] (If 55 landed) Test: a coasting `idle_far` timid row with
       `gain_flee > 0`, hit by a visible attacker, decides on its next sense
       tick.

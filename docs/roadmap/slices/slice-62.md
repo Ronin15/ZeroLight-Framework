@@ -306,8 +306,12 @@ in `data_system/system.zig` today; this slice adds it, with a
 and cognition reserves add the term
 `spawn_population_cap + persistent_population_capacity`, and so does the
 demo's body count feeding contact, trigger, and intent capacity
-(`game_demo_state.zig:127-135`). Structural stream headroom is
-`spawn_creates_per_step + despawn_destroys_per_step`.
+(`game_demo_state.zig:127-135`). `population_update` is a pipeline stage, so its creates
+and despawn destroys are pipeline-owned structural commands: `simulation.zig` adds
+`population_structural_event_share = structuralEventHeadroom(spawn_creates_per_step,
+despawn_destroys_per_step)` as a term of `pipeline_structural_event_share`, and callers add
+nothing (`demo_structural_headroom` is unchanged). Structural-command stream room follows
+from that share (`structuralCommandHeadroom()`), so it needs no separate reserve.
 `persistent_population_capacity` is computed after load-time anchor placement,
 before these reserves. Spawned inventories and projectiles need no term here:
 Slice 57's slot arena grows at the structural-commit seam, and Slice 56B's
@@ -352,7 +356,7 @@ anchor precedence, leash, `return_home`); witness-gated or proximity-triggered s
 - [ ] Time filter via the pipeline's current Slice 59 `EnvironmentSnapshot.day_phase`; `population_update` reads `environment`.
 - [ ] Merchant roster entry spawns `Merchant` + `SocialLedger` + Slice 57 stock.
 - [ ] `StageId.population_update` + `PipelineResource.spawn_anchors` + contract + `runStage` arm; stats and perf metrics. Raise `@setEvalBranchQuota` at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
-- [ ] `DataSystem.reserveComponentRows(mask, rows)`; spawn-population reserves at state init for `spawn_population_cap + persistent_population_capacity` rows, including that term in contact, trigger, intent, `movement_body_capacity`, and spatial-index reserves. Test: `persistent_population_capacity` equals the hand sum of `persistentBound` over a fixture's anchors. `FailingAllocator` churn proof (spawn to cap → despawn all → respawn to cap allocates nothing after the state-init reserve). These state-init terms are initial sizes only: `SimulationPipeline.syncPopulationCapacity` (Slice 72 C3), called at the commit seam, is the growth point for every population-sized pipeline capacity, so an omitted term costs one seam growth, never correctness. Per-step create bursts must fit `structural_headroom` in events (`1 + templateComponentCount` per create).
+- [ ] `DataSystem.reserveComponentRows(mask, rows)`; spawn-population reserves at state init for `spawn_population_cap + persistent_population_capacity` rows, including that term in contact, trigger, intent, `movement_body_capacity`, and spatial-index reserves. Test: `persistent_population_capacity` equals the hand sum of `persistentBound` over a fixture's anchors. `FailingAllocator` churn proof (spawn to cap → despawn all → respawn to cap allocates nothing after the state-init reserve). These state-init terms are initial sizes only: `SimulationPipeline.syncPopulationCapacity` (Slice 72 C3), called at the commit seam, is the growth point for every population-sized pipeline capacity, so an omitted term costs one seam growth, never correctness. Per-step create bursts are pipeline-owned: `population_structural_event_share = structuralEventHeadroom(spawn_creates_per_step, despawn_destroys_per_step)` in `simulation.zig` (a create costs up to `max_structural_events_per_create` events, a destroy one) is added as a term of `pipeline_structural_event_share`; `demo_structural_headroom` is unchanged (callers add nothing) and the demo `capacity_limit` literal is re-pinned. Test (in `simulation_pipeline.zig`): on a pipeline with `structural_headroom = 0`, one step whose `population_update` queues `spawn_creates_per_step` full-template creates and `despawn_destroys_per_step` despawn destroys commits through `applyStructuralCommandsBudgeted(&data, pipeline.structuralCommitBudget(0))` and lands every create and destroy.
 - [ ] Bench groups (one `BenchmarkGroup` per workload in `src/benchmarks/population.zig`, sizes in `defaultItemCounts`, registered in `runner.zig`):
   - `population-anchor-sweep` (4096 world anchors with 256 in the band × 512 population; internal assert that each band pass visits at most the fixed row bound);
   - `population-spawn-burst` (creates at the per-step budget).
