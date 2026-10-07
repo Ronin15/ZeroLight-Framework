@@ -53,6 +53,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     nav_update.entity_obstacle_group,
     nav_update.links_group,
     nav_update.links_dense_group,
+    nav_update.cave_in_group,
+    nav_update.cave_in_warm_group,
     render_prep.group,
     render_game_prep.group,
     render_game_prep.dense_surface_group,

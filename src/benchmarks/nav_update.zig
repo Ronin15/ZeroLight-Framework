@@ -28,6 +28,11 @@
 //! folded in through the link cursor (fixed interior slot + both endpoint levels dirtied) and the
 //! buffered incremental apply. The 8-link row is the same dirty-footprint order as the scattered
 //! group's 16-chunk row (8 chunks on each of 2 levels).
+//!
+//! A fifth pair, `nav-update-cave-in` / `nav-update-cave-in-warm` (Slice 64F), times one step
+//! that carves a 4x4-chunk lattice on `item_count` levels of a 1024x1024-tile, 32-level world:
+//! cold outgrows the windows and repacks each caved level, warm reuses grown windows. Cold minus
+//! warm is the repack cost.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -42,6 +47,9 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
+const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
+const autoSizedMaxNavMemoryBytes = @import("../game/systems/pathfinding.zig").autoSizedMaxNavMemoryBytes;
 const TileId = @import("../game/world_system.zig").TileId;
 const suite = @import("suite.zig");
 
@@ -179,6 +187,8 @@ pub fn deinitCaches() void {
     entity_obstacle_fixture = null;
     if (links_fixture) |*fixture| fixture.deinit();
     links_fixture = null;
+    if (cave_in_fixture) |*fixture| fixture.deinit();
+    cave_in_fixture = null;
 }
 
 // Returns the variant's reusable fixture, building it once (world + nav sized for the maximum
@@ -861,6 +871,243 @@ fn runLinksCaseWithLayout(allocator: std.mem.Allocator, io: std.Io, options: sui
     var accumulator = suite.StatsAccumulator.init(n);
     for (0..options.iterations) |_| {
         accumulator.record(try timeLinkBatch(fixture, io, n, layout, thread_ptr), suite.serialBatch(n, 1));
+    }
+    var stats = accumulator.finish();
+    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_patch_tuner.report(), patch_settled);
+    }
+    return stats;
+}
+
+// ----------------------------------------------------------------------------
+// Cave-in repack (Slice 64F): one step outgrows edge windows on several levels.
+// ----------------------------------------------------------------------------
+
+// A large world: 1024x1024 tiles, 32 levels, default 16-tile nav chunks (64x64 per level). A
+// 4x4-chunk region of rock at the world center, on levels 1..n (n = item count), is carved into
+// a 1-wide lattice in one step: its chunks and their border neighbors outgrow their build-sized
+// windows, so each caved level repacks once (cold). The warm group carves into windows a prior
+// carve already grew (no repack), so cold minus warm is the repack cost.
+const cave_in_world_tiles: u16 = 1024;
+const cave_in_world_bounds: f32 = @as(f32, @floatFromInt(cave_in_world_tiles)) * tile_size;
+const cave_in_level_count: usize = 32;
+const cave_in_region_tiles: u16 = 4 * nav_chunk_tiles;
+// Chunk aligned (world_tiles / 2 and region_tiles / 2 are both multiples of the chunk size).
+const cave_in_region_lo: u16 = cave_in_world_tiles / 2 - cave_in_region_tiles / 2;
+const cave_in_counts = [_]usize{3};
+
+pub const cave_in_group = suite.BenchmarkGroup{
+    .name = "nav-update-cave-in",
+    .defaultItemCounts = caveInItemCounts,
+    .runCase = runCaveInColdCase,
+};
+
+pub const cave_in_warm_group = suite.BenchmarkGroup{
+    .name = "nav-update-cave-in-warm",
+    .defaultItemCounts = caveInItemCounts,
+    .runCase = runCaveInWarmCase,
+};
+
+pub fn caveInItemCounts(profile: suite.Profile) []const usize {
+    _ = profile;
+    return &cave_in_counts;
+}
+
+pub fn runCaveInColdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCaveInCase(allocator, io, options, case, item_count, .cold);
+}
+
+pub fn runCaveInWarmCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCaveInCase(allocator, io, options, case, item_count, .warm);
+}
+
+// cold: every timed carve starts from build-sized windows; warm: from windows already grown.
+const CaveInMode = enum { cold, warm };
+
+const CaveInFixture = struct {
+    // Stored at build time — see Fixture's matching field for why.
+    allocator: std.mem.Allocator,
+    data: DataSystem,
+    world: WorldSystem,
+    system: PathfindingSystem,
+    // Obstacle layer of each level (index 0 unused: the surface never caves).
+    obstacle_layers: [cave_in_level_count]usize,
+    grass: TileId,
+    tree: TileId,
+    // Levels 1..carved_levels currently hold the carved lattice.
+    carved_levels: usize = 0,
+    edits: std.ArrayList(NavCellEdit) = .empty,
+
+    fn deinit(self: *CaveInFixture) void {
+        self.edits.deinit(self.allocator);
+        self.system.deinit();
+        self.world.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+// OWNERSHIP: mirrors shared_fixtures above — freed by deinitCaches.
+var cave_in_fixture: ?CaveInFixture = null;
+
+fn sharedCaveInFixture(allocator: std.mem.Allocator, io: std.Io) !*CaveInFixture {
+    if (cave_in_fixture == null) {
+        var probe = try ThreadSystem.init(allocator, io, .{});
+        const max_participants = probe.participantSlotCount();
+        probe.deinit();
+        cave_in_fixture = try buildCaveInFixture(allocator, io, max_participants);
+    }
+    return &cave_in_fixture.?;
+}
+
+fn buildCaveInFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usize) !CaveInFixture {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+
+    const asset_store = AssetStore.init(allocator, io, "assets");
+    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const grass = try requireTile(&meta, "grass");
+    const tree = try requireTile(&meta, "tree_0");
+
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, cave_in_world_bounds, cave_in_world_bounds);
+    errdefer world.deinit();
+    // Underground levels: open grass with the cave-in region solid rock.
+    var obstacle_layers: [cave_in_level_count]usize = undefined;
+    obstacle_layers[0] = 0;
+    for (1..cave_in_level_count) |level_index| {
+        const level = try world.addLevel(0);
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+        obstacle_layers[level_index] = try world.addDenseLayer(level, 0, .obstacle, grass);
+        var y = cave_in_region_lo;
+        while (y < cave_in_region_lo + cave_in_region_tiles) : (y += 1) {
+            var x = cave_in_region_lo;
+            while (x < cave_in_region_lo + cave_in_region_tiles) : (x += 1) {
+                _ = try world.setDenseTile(obstacle_layers[level_index], x, y, tree);
+            }
+        }
+    }
+
+    var capacity: PathfindingCapacity = .{ .worker_participant_count = @max(@as(usize, 1), participant_count) };
+    capacity.max_nav_memory_bytes = autoSizedMaxNavMemoryBytes(capacity, cave_in_level_count, cave_in_world_tiles, cave_in_world_tiles, 0);
+    var system = PathfindingSystem.init(allocator);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, cave_in_world_bounds, cave_in_world_bounds, tile_size, null);
+
+    return .{ .allocator = allocator, .data = data, .world = world, .system = system, .obstacle_layers = obstacle_layers, .grass = grass, .tree = tree };
+}
+
+// Sets the region's lattice (1-wide corridors on its odd rows and columns) to `tile` on levels
+// 1..level_count (grass carves, tree fills), recording every changed cell in fixture.edits.
+fn setCaveInLattice(fixture: *CaveInFixture, level_count: usize, tile: TileId) !void {
+    fixture.edits.clearRetainingCapacity();
+    const lo = cave_in_region_lo;
+    const hi = lo + cave_in_region_tiles;
+    for (1..level_count + 1) |level| {
+        var corridor: u16 = lo + 1;
+        while (corridor < hi) : (corridor += 2) {
+            var along: u16 = lo;
+            while (along < hi) : (along += 1) {
+                for ([_][2]u16{ .{ along, corridor }, .{ corridor, along } }) |xy| {
+                    const changed = (try fixture.world.setDenseTile(fixture.obstacle_layers[level], xy[0], xy[1], tile)) orelse continue;
+                    try fixture.edits.append(fixture.allocator, .{ .level = changed.level, .x = changed.x, .y = changed.y });
+                }
+            }
+        }
+    }
+    // Mirror production: the dirty buffers are reserved before any step marks them.
+    try fixture.system.reserveNavDirty(fixture.edits.items.len);
+}
+
+// One nav update over fixture.edits, through the buffered path when threaded (as in
+// timeNavUpdate).
+fn applyCaveIn(fixture: *CaveInFixture, thread_system: ?*ThreadSystem) !NavUpdateStats {
+    if (thread_system) |ts| {
+        fixture.system.clearNavDirty();
+        for (fixture.edits.items) |edit| try fixture.system.markNavDirty(edit.level, edit.x, edit.y);
+        return fixture.system.applyBufferedNavUpdates(&fixture.data, &fixture.world, ts);
+    }
+    return fixture.system.applyNavUpdates(&fixture.data, &fixture.world, fixture.edits.items);
+}
+
+// Untimed reset, then the timed carve on levels 1..n. Reset: fill any carved lattice back, then
+// (cold) a full build so every window is back at its build size, or (warm) an incremental fill,
+// which keeps the grown windows. Fails if the carve's repack count is not the mode's.
+fn timeCaveIn(fixture: *CaveInFixture, io: std.Io, n: usize, mode: CaveInMode, thread_system: ?*ThreadSystem) !u64 {
+    try setCaveInLattice(fixture, @max(n, fixture.carved_levels), fixture.tree);
+    fixture.carved_levels = 0;
+    switch (mode) {
+        .cold => {
+            // A full build resets the stage tuners; carry the case's trained ones across it.
+            const remask_tuner = fixture.system.nav_remask_tuner;
+            const patch_tuner = fixture.system.nav_patch_tuner;
+            try fixture.system.rebuildStaticNavGridWithWorld(&fixture.data, &fixture.world, cave_in_world_bounds, cave_in_world_bounds, tile_size, null);
+            fixture.system.nav_remask_tuner = remask_tuner;
+            fixture.system.nav_patch_tuner = patch_tuner;
+        },
+        .warm => _ = try applyCaveIn(fixture, thread_system),
+    }
+    try setCaveInLattice(fixture, n, fixture.grass);
+    fixture.carved_levels = n;
+    const t0 = suite.nowNs(io);
+    const stats = try applyCaveIn(fixture, thread_system);
+    const elapsed = suite.elapsedNs(t0, suite.nowNs(io));
+    const expected_repacks: usize = if (mode == .cold) n else 0;
+    if (stats.edge_repacks != expected_repacks) return error.UnexpectedCaveInRepackCount;
+    return elapsed;
+}
+
+fn runCaveInCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, mode: CaveInMode) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
+    const fixture = try sharedCaveInFixture(allocator, io);
+    // Underground levels only.
+    const n = std.math.clamp(item_count, 1, cave_in_level_count - 1);
+
+    if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
+        fixture.system.nav_remask_tuner = tuner;
+        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
+    } else {
+        fixture.system.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
+        fixture.system.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
+    }
+    fixture.system.nav_thread_adaptive = case.adaptive;
+    fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
+
+    // Warm mode needs windows a carve of these n levels already grew.
+    if (mode == .warm) {
+        try setCaveInLattice(fixture, @max(n, fixture.carved_levels), fixture.grass);
+        _ = try applyCaveIn(fixture, thread_ptr);
+        fixture.carved_levels = @max(n, fixture.carved_levels);
+    }
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try timeCaveIn(fixture, io, n, mode, thread_ptr);
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while ((!fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try timeCaveIn(fixture, io, n, mode, thread_ptr);
+        }
+    }
+    const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
+    const patch_settled = if (case.adaptive) fixture.system.nav_patch_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(n);
+    for (0..options.iterations) |_| {
+        accumulator.record(try timeCaveIn(fixture, io, n, mode, thread_ptr), suite.serialBatch(n, 1));
     }
     var stats = accumulator.finish();
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);

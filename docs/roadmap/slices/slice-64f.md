@@ -128,6 +128,47 @@ a copy of the live edges, rebasing moved chunks' starts), about 5.6 us per
 level: the one-level-copy cost the decision accepted. It runs only on a step
 that outgrows a window. Scattered and pathfinding are within noise.
 
+Cave-in (`nav-update-cave-in`, 1024×1024 tiles, 32 levels, 16-tile chunks, a
+4×4-chunk lattice carved on 3 levels in one step, every caved level repacks):
+exploratory ReleaseFast serial-direct run (1 warmup, 5 iterations, 1 rep)
+1.99 ms per step, over the ~1 ms main-thread target. The per-iteration full
+rebuild that resets the windows costs ~50 s at this size, so one serial case
+took ~6 min.
+
+### Review follow-ups (open)
+
+- [ ] **Cave-in bench, finished measurement.** Run `nav-update-cave-in` and
+  `nav-update-cave-in-warm` (ReleaseFast, 3 interleaved reps, serial-direct and
+  the tuned threaded case; `--iterations 10 --warmup 1` is enough given the
+  rebuild cost). Record per-step time, and per-level repack time as
+  (cold − warm) / 3, in Measurements above.
+- [ ] **Cut redundant repack work.** In `repackLevelEdges`, start the copy and
+  rebase at the first chunk whose base moves (the prefix before the first grown
+  window keeps its bases: copy it with one `@memcpy` and skip its start rebase).
+  Measure step 1 cheaply for that prefix too. Keep allocate-before-mutate.
+  Tests: the existing repack, OOM-sweep and parity tests keep passing; add a case
+  where the first grown chunk is not chunk 0 and assert the result equals a full
+  rebuild.
+- [ ] **Threaded level repack (owner requirement).** One step's repacks run
+  after all affected levels are patched, serial or threaded across levels
+  through the same `patch_threads` (adaptive tuner, inline fallback, the
+  existing pre-select + dual-assert job pattern). Main thread first measures
+  every affected level and allocates every new arena (an OOM leaves every
+  level's old layout intact), plus per-participant patch scratch already
+  reserved at the build; workers then do disjoint per-level copy, rebase and
+  re-patch of flagged chunks; stats merge in level order. The per-level
+  measure scratch (`new_caps` / `edge_counts`) becomes per level (2 × chunk
+  count × affected levels, reserved at the build for the level count). Note the
+  level loop in `applyNavUpdates` then patches every affected level before any
+  repack, so the failure-state comments change (a failed repack leaves every
+  affected level patched with flagged chunks at empty adjacency). Tests: serial
+  == threaded layout and graph for a multi-level cave-in step (real 3-worker
+  `ThreadSystem`); a FailingAllocator proof that a warmed threaded repack step
+  that fits allocates nothing except the arenas, and a steady step allocates
+  zero; an OOM before dispatch leaves every level's caps, bases, arena pointer
+  and length intact, no flag set, no edge into a tombstone, and the retry equals
+  a full rebuild. Bench both paths on the cave-in case and record before/after.
+
 ### Acceptance checks
 
 - [x] `zig build verify` passes, and `zig build test -Doptimize=ReleaseFast`
