@@ -6,141 +6,95 @@ these rules.
 
 ## Zig Style
 
-Follow `zig fmt`. Naming: camelCase for functions and other callables; snake_case for
-variables, struct fields, enum members, and non-type constants; PascalCase for
-types and type-returning functions; short descriptive names.
-
-Write the plain, obvious form first, in production and test code alike: names
-that say what a value is (`corridor`, not `i`/`xy`), arithmetic over bit tricks
-(`x % 2 == 1`, not `x | 1`), small named helpers over inline tuple arrays. Use a
-clever form only where a bench shows it matters on a hot path, and name what it
-does in a one-line comment.
-
-Keep error sets explicit when practical (`error{SdlError}`). The accepted
-exception is the `*anyopaque` + `anyerror!T` function-pointer vtables at
-type-erased service boundaries (state adapters, asset upload, audio/text
-backends): the error set cannot be named across the erased boundary, and they
-sit on cold setup/service paths, so they are not the "broad dynamic dispatch"
-banned in [Dispatch And Lookup](#dispatch-and-lookup).
-
-Prefer direct declaration imports for project types and constants
-(`const Engine = @import("app/engine.zig").Engine;`). Use a concise snake_case
-file namespace only when the call site reads better as a namespace lookup
-(`input_file.actionForKey(...)`, `assets.validateRelativePath(...)`). No `_mod`
-suffixes, no `const Type = file.Type` bridge aliases, no double names such as
-`thread.ThreadSystem`. Do not rewrite SDL/C symbols, generated build-option
-names, or `std.Build` field names.
-
-Use current standard-library and builtin spellings:
-
-- `std.ArrayList` is the unmanaged list in Zig 0.17 (explicit allocator per
-  call, initialized as `.empty`); never the deprecated `std.ArrayListUnmanaged`.
-  Prefer `= .empty` / `.{}` over removed managed constructors.
-- `@backingInt` / `@fromBackingInt`, not `@intFromEnum` / `@enumFromInt`.
-- `@splat`, not the removed `**` array repeat (prefer
-  `var a: [N]T = @splat(x);`).
-- `@typeInfo(T).<kind>.field_names` / `field_types` or `std.meta.tags(E)`, not
-  the removed `std.meta.fields`.
-- `allocator.dupeSentinel(u8, bytes, 0)`, not `dupeZ`.
-- `std.builtin.Optimize` (`.debug`/`.safe`/`.fast`/`.small`), not `OptimizeMode`.
-- C headers go through `build.zig`'s shared TranslateC step, never `@cImport`.
-
-Small idioms: `std.math.isNan(x)`, not `x != x`; `EntityId.eql`, not a free
-equality helper; `try`, not a no-op `catch |e| return e`. `idiom-lint` exempts
-function-pointer-typed fields from the camelCase check, so a camelCase
-fn-pointer field that should match the snake_case production vtables
-(`state.zig`, `audio.zig`, `cache.zig`) is a review-only catch.
-
-Never gate behavior hooks on `@hasDecl`: since Zig 0.17 it sees only `pub`
-declarations, so a private hook is silently skipped. Make the hook part of the
-required contract and call it unconditionally (as the state stack does for
-`onPause`/`onResume`).
-
-`Renderer` is the render facade for app/game code. Never import
-`src/render/gpu/*` outside the render/platform boundary.
+- Follow `zig fmt`: camelCase callables; snake_case variables, fields, enum
+  members, and non-type constants; PascalCase types and type-returning
+  functions.
+- Write the plain form first in all code: names that say what a value is
+  (`corridor`, not `i`), arithmetic over bit tricks, named helpers over inline
+  tuple arrays; a clever form needs a bench-shown hot-path win and a one-line
+  comment.
+- Keep error sets explicit (`error{SdlError}`), except `*anyopaque` +
+  `anyerror!T` vtables at cold type-erased service boundaries.
+- Import declarations directly
+  (`const Engine = @import("app/engine.zig").Engine;`), or a snake_case file
+  namespace where the call reads better.
+- No `_mod` suffixes, bridge aliases (`const Type = file.Type`), or double
+  names (`thread.ThreadSystem`); never rename SDL/C, build-option, or
+  `std.Build` names.
+- Use current spellings:
+  - `std.ArrayList` (unmanaged, `.empty`), not `std.ArrayListUnmanaged` or
+    managed constructors.
+  - `@backingInt`/`@fromBackingInt`, not `@intFromEnum`/`@enumFromInt`.
+  - `@splat(x)`, not `**`.
+  - `@typeInfo(T).<kind>.field_names`/`field_types` or `std.meta.tags(E)`, not
+    `std.meta.fields`.
+  - `dupeSentinel(u8, bytes, 0)`, not `dupeZ`; `std.builtin.Optimize`, not
+    `OptimizeMode`.
+  - `build.zig`'s TranslateC step, never `@cImport`.
+  - `std.math.isNan(x)`, `EntityId.eql`, and `try`, not `x != x`, a free
+    equality helper, or `catch |e| return e`.
+- Fn-pointer fields are snake_case like the production vtables (lint-exempt, so
+  review catches it).
+- Never gate a hook on `@hasDecl` (0.17 sees only `pub` decls); make it
+  required and call it unconditionally.
+- App/game code uses `Renderer`; never import `src/render/gpu/*` outside
+  render/platform.
 
 ## Performance
 
-Performance is correctness on hot and frame-adjacent paths (fixed-step
-update, input dispatch, render submission, asset lookup, text/debug overlay).
-
-Hot paths are allocation-free after init, reserve, or warmup. An exception needs
-an explicit owner, a measured and bounded cost, and a reason the allocation
-cannot move to init, load, a state transition, reserve/warmup, or another cold
-boundary.
+Performance is correctness on hot and frame-adjacent paths (fixed-step update,
+input dispatch, render submission, asset lookup, text/debug overlay). Hot paths
+are allocation-free after init, reserve, or warmup; an exception needs an owner,
+a measured bounded cost, and a reason it cannot move to init, load, a state
+transition, reserve/warmup, or another cold boundary.
 
 ### Allocator Discipline
 
-Mandatory, not advisory. Every `reserve`/`ensureTotalCapacity` +
-`assumeCapacity` (or `addOneAssumeCapacity`) pairing ships, in the same change,
-with a `std.testing.FailingAllocator` (or `std.testing.failing_allocator`) test
-proving the warmed hot path allocates zero times; a comment or review claim is
-not proof. **ReleaseFast** ships, and it strips the assert behind
-`assumeCapacity` and bounds/overflow checks, so an unproven reserve is silent
-memory corruption. When reserve and commit live in separate functions or entry
-points, the proof exercises the reserved-then-push **success** branch (reserve,
-arm the allocator to fail on the next allocation, assert the push completes),
-not only the reserve-fails cleanup branch. Threaded paths add a proof
-requirement ([Threading](#threading)).
-
-Behavior gates compare stored **logical** limits, never a container's physical
-`.capacity` (`ensureTotalCapacity` and `MultiArrayList.resize` round up, and
-shrink hysteresis keeps slack, so a `.capacity` gate makes refusal, drops,
-truncation, spills, or query reach depend on allocation history). Store the
-limit beside the reserve, assign it only after the reserve succeeds, gate on
-it, and `std.debug.assert(list.capacity >= limit)`. A `.capacity` read that only
-picks `appendAssumeCapacity` vs a growing `append`, with the same result, is not
-a gate. An appendable pool tracking a separately reserved fixed-capacity
-dedup/probe table gates its append on the shared logical cap and honors the
-probe's insert-bool. A reserve/overflow contract's assert and its overflow check
-bound the same quantity.
-
-The same strip applies to `unreachable`, `catch unreachable`, and
-`orelse unreachable` (including `.?`): in ReleaseFast a reached `unreachable` is
-undefined behavior. Use them only where the state is impossible by construction
-(the established case: generational-handle constructors bounded by capacity,
-`TextureId.init(...) catch unreachable`, `EntityId.init(...) catch unreachable`).
-A recoverable or data-influenced failure returns an error or asserts instead. A
-`.?` on an optional field in a hot or worker loop is invisible to `idiom-lint`:
-capture it as a non-optional local at dispatch or assert non-null at entry; never
-rely on cross-thread ordering to keep it non-null. Narrowing casts are unsafe the
-same way: widen signed coordinate/cell spans to `i64`/`usize` before subtracting
-and `@intCast`-ing to an unsigned width, clamp while wide, then narrow (a
-saturated float→`i32` makes `@intCast(max - min + 1)` UB).
-
-`zig build idiom-lint` (part of `verify`; rules in `tools/lint_idioms.py`)
-rejects `catch unreachable` / `orelse unreachable` outside `test` blocks unless
-on a sanctioned handle constructor or annotated
-`// lint:allow catch-unreachable: <reason>`. Never annotate a recoverable
-failure; propagate it (reference: `SpriteBatch.buildSerial` returns `!void`
-rather than folding `ensureFrameStorage`'s error into UB). The lint also
-enforces snake_case fields/parameters, `k_snake_case` constants, and current
-spellings (no `std.ArrayListUnmanaged`, `usingnamespace`, `std.mem.copy`/`set`,
-`std.BoundedArray`, `@intFromEnum`, `@enumFromInt`, `std.meta.fields`, `dupeZ`,
-`OptimizeMode`, `@cImport`, `**` array repeat, or `@hasDecl` in `src/`).
-
-Allocators are explicit: every allocating struct takes an `std.mem.Allocator`
-at `init` and stores it as a field immediately, never left `undefined`. Never
-reach for `std.heap.page_allocator`, `std.heap.c_allocator`, or a fresh
-`GeneralPurposeAllocator` inside a function body, even on a cold path; thread
-the caller's allocator through. A local `ArenaAllocator` over the passed-in
-allocator is fine for short-lived allocations freed as one unit.
-
-`errdefer` rules:
-
-- Register narrowly, right after each owning field is validly constructed. Never
-  a blanket `self.deinit()` `errdefer` before every owned field exists (it runs
-  over `undefined` memory, or double-frees a field whose own `errdefer` fired).
-- A caller that `defer`s cleanup of an allocated container (e.g.
-  `allocator.create(T)`) registers that `defer` only after the fallible `init`
-  succeeds, with a narrower `errdefer` for the window before it.
-- A function taking ownership of an already-constructed by-value resource
-  registers `errdefer <res>.deinit()` as its **first** statement.
-- After a step transfers ownership onward (map `put`, list `append`, lease-slot
-  commit), disarm the earlier free-`errdefer` with a per-iteration bool set
-  right after the transfer, so exactly one path frees it.
-- A handle-owning setter that overwrites an owned slot asserts the slot empty
-  (or closes the prior handle first).
+- Every `reserve`/`ensureTotalCapacity` + `assumeCapacity` (or
+  `addOneAssumeCapacity`) pairing ships in the same change with a
+  `std.testing.FailingAllocator` test proving the warmed hot path allocates
+  nothing; ReleaseFast strips the assert, so a comment is not proof.
+- With reserve and commit in separate functions, the proof covers the success
+  branch: reserve, arm the allocator to fail, assert the push completes.
+- Threaded paths add a proof rule ([Threading](#threading)).
+- Behavior gates compare a stored logical limit, never physical `.capacity`;
+  assign the limit only after its reserve succeeds and
+  `std.debug.assert(list.capacity >= limit)`.
+- A `.capacity` read that only picks `appendAssumeCapacity` vs `append` with
+  identical results is not a gate.
+- A pool backed by a separately reserved dedup/probe table gates appends on the
+  shared logical cap and honors the probe's insert-bool.
+- A reserve/overflow contract's assert and overflow check bound the same
+  quantity.
+- Use `unreachable`, `catch`/`orelse unreachable`, and `.?` only where the state
+  is impossible by construction (capacity-bounded handle constructors such as
+  `TextureId.init(...) catch unreachable`); recoverable or data-influenced
+  failures return an error or assert.
+- In hot or worker loops, capture an optional as a non-optional local at
+  dispatch or assert it non-null at entry; never rely on cross-thread ordering.
+- Widen signed spans to `i64`/`usize` before subtracting, clamp while wide, then
+  `@intCast`.
+- `idiom-lint` (in `verify`; `tools/lint_idioms.py`) rejects non-test
+  `catch`/`orelse unreachable` unless on a sanctioned handle constructor or
+  annotated `// lint:allow catch-unreachable: <reason>`; never annotate a
+  recoverable failure, propagate it.
+- The lint also enforces snake_case fields/parameters, `k_snake_case`
+  constants, the [Zig Style](#zig-style) spellings, and no `@hasDecl`, and bans
+  `usingnamespace`, `std.mem.copy`/`set`, and `std.BoundedArray`.
+- Allocating structs take a `std.mem.Allocator` at `init` and store it
+  immediately, never `undefined`.
+- Never use `page_allocator`, `c_allocator`, or a fresh
+  `GeneralPurposeAllocator` inside a function, even cold; thread the caller's (a
+  local `ArenaAllocator` over it is fine).
+- Register each `errdefer` right after its field is constructed, never a
+  blanket `errdefer self.deinit()` before all fields exist.
+- A caller's `defer` cleanup of an allocated container follows the fallible
+  `init`, with a narrower `errdefer` before it.
+- A function taking ownership of a by-value resource opens with
+  `errdefer <res>.deinit()`.
+- After ownership transfers (`put`, `append`, lease commit), disarm the earlier
+  `errdefer` with a per-iteration bool.
+- A handle-owning setter asserts its slot empty or closes the prior handle.
 
 ### Dispatch And Lookup
 
@@ -158,47 +112,27 @@ unless the cap preserves a named boundary and is measured.
 
 ### Dense SoA Storage
 
-Use `std.MultiArrayList` (MAL) when several columns grow, shrink, append, or
-swap-remove **together** as one logical row: the default for persistent
-`DataSystem` component stores, state-owned dense pools (e.g. `ParticleSystem`),
-and per-step gather/scratch buffers of matching lengths (collision proxies, AI
-gather rows, steering selected-work columns, collision-response intent rows).
-
-Pattern:
-
-- A row struct with one field per column (`MovementBodyRow`, `ProxyRow`,
-  `AiGatherRow`); store `rows: std.MultiArrayList(Row)`; expose hot paths via
-  `slice()`/`sliceConst()` helpers returning the column-slice structs
-  (`ConstMovementBodySlice`, `ParticleSlice`).
-- Reserve with `rows.ensureTotalCapacity(allocator, hotStoreCapacity(n))` where
-  threading/SIMD ranges need item alignment (`alignItemCount`,
-  `thread_system.zig`).
-- Cold emit/setup may use `rows.appendAssumeCapacity(row)` after reserving; hot
-  gather loops must not (use `appendMalRow` below).
-- A per-row store append uses a private `ensureCapacityForOne` +
-  `appendAssumeCapacity`, never `ensureCapacity(n)` + plain `append`.
-- Compact with `rows.swapRemove(index)` when unordered removal is fine.
-- Keep `deinit`, `clearRetainingCapacity`, and capacity helpers on the owning
-  store.
-
-Do not migrate to MAL when the layout is intentionally different: hot/cold
-column splits (e.g. pathfinding result-cache probe slots vs cold payloads),
-striped or arena buffers (`capacity × stride`), cache-line-padded thread range
-slots, spatial hash grids (`cell_entries` + `cell_ranges`), pair/contact output
-streams, existing AoS `ArrayList(Struct)` pools, and sparse slot maps
-(`EntitySlot` tables).
-
-MAL hot-path rules (mandatory):
-
-- Call `rows.slice()` **once** per stage or function and reuse its column slices
-  (`const ages = s.items(.age)`). Never `rows.items(.field)` in a loop (it
-  rebuilds slice pointers; large Debug and Release regressions). Single-index
-  cold accessors also call `rows.slice()` once.
-- A per-row render/collect helper takes const column slices from its caller and
-  never calls `.slice()`/`.sliceConst()` itself.
-- Per-step gather loops append with this helper, capturing
-  `var row_slice = rows.slice()` once before the loop (`appendAssumeCapacity`
-  calls `set()`/`slice()` per row: ~45% Debug regressions measured):
+- Use `std.MultiArrayList` (MAL) when columns grow, shrink, and swap-remove
+  together as one row: `DataSystem` stores, dense pools, and same-length
+  per-step gather/scratch buffers.
+- Keep intentionally different layouts off MAL: hot/cold splits, striped or
+  arena buffers, padded range slots, spatial hash grids, pair streams, existing
+  AoS pools, sparse slot maps.
+- Store `rows: std.MultiArrayList(Row)` with one field per column and expose
+  hot paths through `slice()`/`sliceConst()` column-slice helpers.
+- Reserve with `hotStoreCapacity(n)` where threading/SIMD ranges need item
+  alignment.
+- Hot gather loops never call `appendAssumeCapacity` (use `appendMalRow`); a
+  per-row store append uses a private `ensureCapacityForOne` +
+  `appendAssumeCapacity`, never `ensureCapacity(n)` + `append`.
+- Compact with `swapRemove` when order does not matter; keep `deinit`,
+  `clearRetainingCapacity`, and capacity helpers on the owning store.
+- Call `rows.slice()` once per stage, function, or accessor; never
+  `rows.items(.field)` in a loop.
+- Per-row helpers take const column slices from the caller and never call
+  `.slice()`.
+- Per-step gather loops capture `var row_slice = rows.slice()` once and append
+  with:
 
 ```zig
 fn appendMalRow(
@@ -212,217 +146,133 @@ fn appendMalRow(
 }
 ```
 
-- Publish hot float columns as plain `[]f32` / `[]const f32`, never
-  `[]align(64) f32` (MAL does not guarantee 64-byte column bases). 16-item range
-  alignment is for threading chunk boundaries; wide aligned loads need their own
-  planning.
+- Publish hot float columns as `[]f32`, never `[]align(64) f32`; MAL does not
+  guarantee aligned column bases.
 
 ### SIMD And Core Math
 
-All vector and named math operations go through `core`: `src/core/simd.zig`
-(vector types/ops) and `src/core/math.zig` (reusable scalar/vector math),
-unconditionally, however domain-specific the caller. Never declare raw
-`@Vector` in a system or hand-roll a named primitive inline (gather/scatter,
-reciprocal/inverse sqrt, length/normalize, trig, interpolation,
-clamp/saturating conversions). A missing primitive is added to `core` with
-scalar-vs-SIMD parity tests, scalar and SIMD forms kept paired. A one-system
-composite kernel may stay in its system, built from `core` primitives; promote
-a kernel reused across systems. Plain operator arithmetic (`+ - * /`, including
-on `simd` types) is fine inline.
-
-Use the `simd.zig` helpers for dense, uniform, branch-light float math over
-contiguous SoA columns, always with a scalar tail (movement, collision
-broad/narrowphase, collision response, particles, the flow field). Prefer
-codegen-friendly scalar-to-`@Vector` loads unless a target-specific aligned load
-is measured and owned. Prefer scalar code for tiny batches or simple logic.
-
-Judge per-agent and per-neighbor loops (AI decision, separation, steering
-avoidance) at target scale (large battles, late-game worlds), never as "low
-count". Vectorizability is a layout property: restructure a
-gather-bound or branchy hot loop by gathering into packed local SoA scratch,
-then running the math across lanes with masked `select` for branches. That is
-the default plan for hot per-agent math. Leave genuinely irreducible loops
-scalar (BFS/A* frontier traversal, swap-remove compaction, rare branch-heavy
-setup) and say why. A new or restructured hot float loop goes through the shared
-helpers with scalar/SIMD and serial/threaded parity tests.
+- All vector and named math goes through `src/core/simd.zig` and
+  `src/core/math.zig`; plain operators are fine inline.
+- Never declare raw `@Vector` in a system or hand-roll a named primitive
+  (gather/scatter, inverse sqrt, normalize, trig, interpolation, clamp or
+  saturating conversion).
+- Add a missing primitive to `core` as a paired scalar and SIMD form with parity
+  tests.
+- A one-system kernel built from `core` primitives may stay local; promote it
+  once reused.
+- Use `simd.zig` helpers, with a scalar tail, for dense uniform float math over
+  SoA columns; prefer scalar for tiny batches or simple logic.
+- Prefer scalar-to-`@Vector` loads unless an aligned load is measured and
+  owned.
+- Judge per-agent and per-neighbor loops at target scale, never as "low
+  count".
+- Vectorize a gather-bound or branchy hot per-agent loop by gathering into
+  packed local SoA scratch and masking branches with `select`.
+- Leave scalar only irreducible loops (A*/BFS frontier, compaction, rare
+  setup), stating why.
+- A new or restructured hot float loop ships scalar/SIMD and serial/threaded
+  parity tests.
 
 ## Budgets, Capacities, And Thresholds
 
-Three different things. Size and bound for dense, multi-chunk terrain change in
-one step.
-
-**Per-step / per-query work budgets** (search node caps, solves per step,
-links/spawns folded per step) **are fixed counts, never derived from world, map,
-level, cell, portal, or band count or any measured current scale**, so frame
-time and behavior do not depend on the map. Counts, not milliseconds (time
-budgets are nondeterministic). Work that does not fit is deferred
-deterministically. This is a tested invariant (grep `independent of` /
-`regardless of world size`, e.g. the pathfinder's abstract A* node budget,
-`nav_graph.zig`'s incremental-dig chunk-patch tests). A chronically
-insufficient budget is fixed by graceful degradation (deterministic deferral, a
-bounded retry ladder) or an algorithmic change, never a bigger number picked
-for one map.
-
-**Data-structure capacities are right-sized per world instance**, never one
-size for every world:
-
-- *World-extent data* (tiles, per-chunk nav, chunk tables, per-level data):
-  sized exactly from the loaded world at init/load, never grown. Dig/build
-  changes contents, not extent.
-- *Runtime-growing data* (population, items, particles, nodes, spawned
-  structures, runtime links): start at the world/content-derived size plus
-  headroom, then **grow only at the main-thread structural-commit seam**,
-  outside threaded stages, geometrically and ahead of need (e.g. at a fill
-  threshold), or use paged/chunked storage where a large realloc would spike a
-  frame. Growth on a hot path or inside a threaded stage is a defect.
-
-Between growth points hot paths stay allocation-free, proven per
-[Allocator Discipline](#allocator-discipline). Capacity never changes behavior:
-no iteration order, deferral, refusal, or result depends on how much is
-reserved. No dig, build, cave-in, or explosion is ever refused for capacity.
-The only fixed caps:
-
-- index/format widths (`u16`/`u32` indices, save/replay layouts) proven
-  unreachable for the loaded world extent, failing loudly at load;
-- presentation-only pools that no simulation reads (particles, text labels),
-  with deterministic overflow drop.
-
-**Load-time platform validation** (e.g. the dense GPU byte budget, the nav
-memory estimate `max_nav_memory_bytes`) is allowed: it checks the loaded world
-and configuration once and fails loudly at load. It never runs during play:
-runtime-growing data that later outgrows the estimate (population, level links,
-the pathfinding agent budget) grows at its seam, and only an allocator OOM can
-fail that growth, as an ordinary error that leaves state intact for a retry.
-
-**Heuristic thresholds** (e.g. "build a group flow field above N agents") derive
-from the cost of the operation they gate (its own bounded region or input),
-never from the whole world's size.
-
-**Decide per data structure, as an experienced engine programmer would:** size
-by lifetime and growth (world-extent exact; growing stores amortized-geometric
-at a safe point, or paged); pools, free lists, and generational handles for
-churn; SoA contiguity over minimal footprint; a fixed cap only where it buys
-something (index width, stable format, per-frame work bound); back changes with
-a bench or memory number.
-
-**Never change a constant just to satisfy this rule.** Default is keep. A change
-to an existing budget, capacity, or threshold states a concrete benefit (memory
-saved, an artificial limit removed, fewer allocations or cache misses, simpler
-code) weighed against cost and risk (hot-path cost, layout/format churn,
-proof/test churn, determinism).
+- Size and bound for dense, multi-chunk terrain change in one step.
+- Per-step and per-query work budgets are fixed counts, never milliseconds and
+  never derived from world, map, cell, or portal count or any measured scale.
+- Over-budget work defers deterministically, tested as such (grep
+  `independent of` / `regardless of world size`).
+- Fix a chronically short budget with deterministic deferral, a bounded retry
+  ladder, or a better algorithm, never a bigger number for one map.
+- Capacities are right-sized per world instance, never one size for all.
+- World-extent data (tiles, per-chunk nav, chunk tables) is sized exactly at
+  load and never grown; dig/build changes contents, not extent.
+- Runtime-growing data (population, items, nodes, links) starts at
+  content-derived size plus headroom and grows only at the main-thread
+  structural-commit seam, geometrically ahead of need, or uses paged storage.
+- Growth on a hot path or in a threaded stage is a defect; between seams
+  [Allocator Discipline](#allocator-discipline) applies.
+- No order, deferral, refusal, or result depends on reserved capacity.
+- No dig, build, cave-in, or explosion is ever refused for capacity.
+- The only fixed caps are index/format widths (`u16`/`u32`, save/replay
+  layouts) proven unreachable for the loaded world (failing loudly at load) and
+  presentation-only pools no simulation reads (particles, text labels), with
+  deterministic overflow drop.
+- Load-time platform validation (GPU byte budget, `max_nav_memory_bytes`) runs
+  once at load, fails loudly there, and never runs during play.
+- Data outgrowing a load-time estimate grows at its seam; only allocator OOM
+  fails it, as an ordinary error leaving state intact for retry.
+- Heuristic thresholds derive from the cost of the operation they gate, never
+  world size.
+- Pick per structure as an engine programmer would: pools, free lists, and
+  generational handles for churn; SoA contiguity over footprint; fixed caps only
+  where they buy index width, a stable format, or a work bound.
+- Never change a constant just to satisfy this section; default is keep.
+- Changing a budget, capacity, or threshold states a concrete, measured benefit
+  weighed against hot-path cost, format churn, proof churn, and determinism.
 
 ## Threading
 
-A collection written from more than one thread satisfies both, verifiably at the
-call site:
-
-1. Writes are partitioned into disjoint per-worker or per-range slots, never a
-   shared appendable collection written concurrently.
-2. The matching reserve happens on the main thread strictly before dispatch,
-   sized from the same selection/profile value the dispatch uses. Never reserve
-   during or after dispatch.
-
-Each threaded hot-path worker job opens with a `std.debug.assert` on **both** its
-write range against the buffer length and `range.index` against the dispatched
-range count captured at dispatch (a cloned stage often drops one, and the
-missing guard is a silent OOB write in ReleaseFast). The `FailingAllocator`
-proof exercises the real multi-worker `ThreadSystem`, not only the
-serial/inline branch.
-
-Merged output is deterministic from stable input and range order (count per
-range → prefix offsets → contiguous write → range-index merge → batch commit),
-never from worker timing, worker IDs, or per-command global atomics. Drive a
-batched `RangeOutputStream`/`SimulationEvents` producer once per commit: write
-every range, then call `finishWrite` once (`SimulationEvents.finishWrite`
-rebuilds stats over all ranges and survives ReleaseFast, so a per-record publish
-loop is O(N²)).
-
-A pass emitting **at most one output per input item** (gather, compaction,
-per-item command or contact) uses no per-range buffers: each range writes its
-`[range.start, range.end)` window of one cache-line-aligned buffer sized by item
-capacity, with its count (and diagnostics) in a cache-line-padded tally sized by
-`thread_system.maxRangeCount(capacity, alignment)`; the main thread compacts
-the windows in range order or streams them to the consuming
-`RangeOutputStream`. One seam reserve then covers every partition. Only a pass with
-data-dependent output per item (collision broadphase pairs) keeps per-range
-slots, reserved at the seam to the per-item bound times the most items any range
-index can cover under any partition (never clamped to the total), with overflow
-handled by a counted grow-and-replay. References: `simulation_scope.zig`
-gathers and tier policy, `spatial_index.zig` gather, `collision.zig`
-narrowphase.
-
-A pass whose events are a pure function of per-row state its workers already
-write (perception's nearest-threat columns, affect's crossing bits) keeps no
-event scratch: the main thread derives and emits them in row order after the
-join.
-
-A partitioned processor that **emits an event stream** under a per-step cap
-emits in a canonical, partition-independent key order (per row, a row's
-sub-kinds grouped, as `PerceptionSystem.emitTransitionEvents` and
-`AffectSystem.emitCrossingEvents` do) before applying the cap. Its parity tests
-cross two or more event kinds for entities in different ranges and include a
-capped case.
-
-Threaded/SIMD processors iterate dense SoA columns directly; component masks are
-for membership/query, never dynamic joins, string lookup, or hash-map dispatch
-in hot loops. Worker ranges write disjoint rows without sharing writable cache
-lines in hot SoA columns. Use 64-byte padding only for concurrently written
-thread-shared records with real false-sharing risk, never on cold entity slot
-metadata.
-
-Keep state transitions, entity structural changes, SDL/GPU/audio calls, asset
-loading, save/load streaming, and renderer/mixer resource ownership out of
-threaded processors unless an explicit deferred or main-thread boundary is
-designed. Workers never mutate `DataSystem` structurally; structural commits
-batch at the commit seam.
-
-The main thread is not a fallback owner: main-thread code preserves a concrete
-boundary (those above, or light orchestration). Work that scales with entity, event, asset, or draw count, map
-or file size, or tool complexity gets a named owner; when it can get expensive,
-use immutable inputs plus deterministic owned outputs.
-
-Work that scales with population, terrain change, or world size ships serial and
-threaded paths in its first implementation, with serial/threaded parity tests.
-The serial path also covers small batches, tests, and unsupported thread
-targets. Small fixed-size or cold one-off work may stay serial; ask the owner if
-unsure. Multi-stage processors have per-stage tuners and visible timing/tuning
-stats. Worker participation is driven by measured batch timing and structural
-constraints, never static item-count floors.
+- Multi-threaded writes go, verifiably at the call site, to disjoint per-worker
+  or per-range slots, never a shared appendable collection.
+- Reserve on the main thread strictly before dispatch, sized from the value the
+  dispatch uses.
+- Each worker job opens by asserting its write range against buffer length and
+  `range.index` against the dispatched range count.
+- The `FailingAllocator` proof exercises the real multi-worker `ThreadSystem`.
+- Merged output is deterministic from range order (count, prefix offsets,
+  write, range-index merge, batch commit), never worker timing, IDs, or global
+  atomics.
+- Call a batched `RangeOutputStream`/`SimulationEvents` `finishWrite` once per
+  commit, after every range writes.
+- A pass with at most one output per item writes its `[range.start, range.end)`
+  window of one aligned item-capacity buffer, counting into a padded tally
+  sized by `thread_system.maxRangeCount`; the main thread compacts or streams
+  the windows in range order.
+- Only data-dependent output (broadphase pairs) keeps per-range slots, reserved
+  at the seam to the per-item bound times the most items any range can cover
+  (never clamped to the total), with counted grow-and-replay on overflow.
+- Events that are a pure function of worker-written row state are emitted by
+  the main thread in row order after the join, with no event scratch.
+- A partitioned processor with a capped event stream emits in canonical row and
+  sub-kind order before the cap, with parity tests crossing event kinds across
+  ranges plus a capped case.
+- Hot loops iterate dense SoA columns; component masks are membership only,
+  never dynamic joins.
+- Worker ranges never share writable cache lines; pad to 64 bytes only shared
+  records with real false-sharing risk.
+- Keep state transitions, structural changes, SDL/GPU/audio, asset and save
+  I/O, and resource ownership off workers unless a deferred boundary is
+  designed.
+- Workers never mutate `DataSystem` structurally; structural commits batch at
+  the commit seam.
+- The main thread is not a fallback owner: it holds only those boundaries and
+  light orchestration.
+- Work scaling with count, size, or complexity gets a named owner, with
+  immutable inputs and deterministic owned outputs once it can get expensive.
+- Work scaling with population, terrain change, or world size ships serial and
+  threaded paths with parity tests in its first implementation.
+- Small fixed or cold one-off work may stay serial; ask the owner if unsure.
+- Multi-stage processors have per-stage tuners and visible timing stats.
+- Worker participation follows measured timing and structural constraints,
+  never static item-count floors.
 
 ## Simulation Pipeline Stage Ordering
 
-Mandatory, not advisory. `SimulationPipeline.update()` runs a fixed stage order
-over per-step resources, and the ordering is enforced at comptime:
-`simulation_pipeline.zig`'s `stageContract()` declares each stage's reads,
-writes, and carried inputs; `stage_order` is a permutation of `StageId`; a
-`comptime` walk fails the build if a stage reads a resource no earlier stage
-writes. The pipeline is the only fixed-step scheduler: no scheduler beside it,
-and never promote it into a global ECS scheduler or app service.
-
-`carried` is a value the stage consumes that no earlier stage writes: input
-captured before `update` (`action_intents`), world authoring
-(`interest_markers`), or a column a later stage writes for the next step
-(`ai_behavior` carried by `affect_update`). It is disjoint from the stage's
-reads and writes; a resource an earlier stage writes is a read.
-
-Event payloads are four tags: a write of `world_events` does not satisfy a read
-of `perception_events`, `affect_events`, or `structural_events`.
-`structural_events` (`entity_created`, `entity_destroyed`, `component_changed`)
-are commit-seam payloads, external to the stage graph.
-
-Every new or reordered stage adds, in the same change:
-
-1. Its `PipelineResource` tag(s) (reuse an existing coarse tag; no redundant
-   one-off tags).
-2. Its `StageId` in `stage_order` at the position its real dependencies require.
-3. Its `stageContract()` arm.
-4. Its `runStage` arm (the `inline for` over `stage_order` in `update()`).
-
-An ordering dependency not expressible as a `PipelineResource` read/write gets a
-causal-effect test: a scenario where the wrong order gives an observably
-different result (see `simulation_pipeline.zig`'s "pipeline commits the dig
-stage's world edit before plane traversal reads it in the same step" and the
-ai_memory/affect ordering tests).
+- `SimulationPipeline.update()` is the only fixed-step scheduler; never add a
+  second or promote it to a global ECS scheduler or app service.
+- Stage order is comptime-enforced in `simulation_pipeline.zig`:
+  `stageContract()` declares reads, writes, and carried inputs, `stage_order`
+  permutes `StageId`, and reading an unwritten resource fails the build.
+- `carried` is a value no earlier stage writes (pre-`update` input, world
+  authoring, or next-step state from a later stage), disjoint from reads and
+  writes; anything an earlier stage writes is a read.
+- Event tags are distinct: `world_events` does not satisfy `perception_events`,
+  `affect_events`, or `structural_events`.
+- `structural_events` are commit-seam payloads outside the stage graph.
+- A new or reordered stage adds, in one change, its `PipelineResource` tags
+  (coarse, not one-off), `stage_order` position where its real dependencies
+  require, `stageContract()` arm, and `runStage` arm.
+- An ordering dependency not expressible as a resource gets a causal-effect
+  test where the wrong order observably changes the result.
 
 ## Resources And Error Handling
 
@@ -498,67 +348,41 @@ reasoning trail.
 
 ## Tests
 
-Tests are `test` blocks beside the code they cover, named by behavior
-(`test "player movement clamps to window bounds"`).
-
-Prefer focused contract tests that need no window: input routing, state policy,
-transition ordering, resource ID and descriptor validation, viewport math, asset
-path validation, timing decisions, pure gameplay/data contracts. Display/GPU
-checks belong in `gpu-smoke`.
-
-Where terrain is involved, contract tests cover a multi-chunk, one-step terrain
-change and repeated dig/fill.
-
-Keep `WorldSystem`/`DataSystem` fixtures at the smallest size that exercises the
-behavior. A `1x1` `WorldSystem` still yields one real chunk
-(`chunksX = ceilDiv(width, chunk_size_tiles)`), enough for chunk-gate and
-visibility tests. Reserve a larger populated world for the one test that needs
-growth/capacity behavior at scale (e.g. a `FailingAllocator` reserve proof).
-
-Never build production-scale worlds in `zig build test`. `initProcedural`,
-`initProceduralFromMeta`, `initProceduralWithRuntimeAssets`, and other full
-world-building load/gameplay paths may run only with a minimal config (at most
-16x16 tiles and 1 underground level, the `worldUsesCompactDemoSpawn` threshold)
-and only when that real path is under test (e.g. state-transition wiring).
-Otherwise use hand-built fixtures, small demo patches, or pure contract checks;
-full-world throughput belongs in `zig build bench`.
-
-Production contracts expose runtime concepts only: no test-only enum tags, union
-payloads, marker fields, fake stages, fixture hooks, service shortcuts, or
-test-only paths in production APIs. Tests use private helper types, local
-fixtures, test-only mocks, or real payloads.
-
-Test code never measures timing and never calls into `src/benchmarks/`
-([Benchmarks](#benchmarks)).
+- Tests are `test` blocks beside their code, named by behavior.
+- Prefer focused window-free contract tests; display/GPU checks belong in
+  `gpu-smoke`.
+- Terrain contract tests cover a multi-chunk one-step change and repeated
+  dig/fill.
+- Use the smallest `WorldSystem`/`DataSystem` fixture that exercises the
+  behavior (a `1x1` world still has one real chunk).
+- Only a test of growth or capacity at scale gets a larger populated world.
+- Full world-building paths (`initProcedural*`) run in tests only when under
+  test, with at most 16x16 tiles and 1 underground level.
+- Production APIs carry no test-only tags, payloads, fields, stages, hooks,
+  shortcuts, or paths; tests use private helpers, fixtures, mocks, or real
+  payloads.
+- Tests never time anything or call `src/benchmarks/`
+  ([Benchmarks](#benchmarks)).
 
 ## Benchmarks
 
-`zig build bench` is for performance and OOM/leak sweeps; `zig build test` is
-for fast contract checks only and never times anything, not even temporarily or
-under ReleaseFast. All performance numbers come from `zig build bench`
-(warmup, repetition, adaptive settle: `src/benchmarks/suite.zig`).
-
-Test code never calls `src/benchmarks/*.zig` functions (their fixture builders
-and case runners build large throughput fixtures). The one exception is
-`suite.zig`'s own tests of its pure utilities (arg parsing, formatting,
-alignment math) against hand-built stubs. A production correctness property is
-tested in the owning module with a small fixture; a bench-fixture property
-relies on the module's internal `std.debug.assert` firing during a real
-`zig build bench` run. A perf question with no covering case gets a new or
-extended case under `src/benchmarks/`.
-
-Run targeted groups: `zig build bench -- --group <name>` (optionally
-`--case`/`--items`). Never run the whole suite and filter its output; a
-full-suite sweep runs only when the owner asks or a slice names it. Bench only
-changes that can move a hot path, with targeted groups and 3 interleaved reps.
-
-Target-scale benches ship with a feature's first implementation. Where terrain
-change is involved, cover destruction-shaped workloads (an explosion region in
-one step, repeated dig/fill). Large-scale cases (e.g. the 50k item scales) are
-stress tests and throughput ceilings, not per-frame targets: weight a result by
-how often that workload occurs at that count. Population-driven systems (AI,
-perception, collision) are where large counts are real; rare growth steps such
-as nav repacks are not.
+- All performance numbers and OOM/leak sweeps come from `zig build bench`.
+- `zig build test` never times anything, even temporarily or in ReleaseFast.
+- Tests never call `src/benchmarks/*.zig`, except `suite.zig`'s tests of its
+  pure utilities against stubs.
+- Test production correctness in its owning module with a small fixture;
+  bench-fixture correctness relies on internal asserts firing during a real
+  bench run.
+- A perf question with no covering case gets a new case under
+  `src/benchmarks/`.
+- Run targeted groups (`zig build bench -- --group <name>`), never the full
+  suite filtered; full sweeps only when the owner or a slice asks.
+- Bench only changes that can move a hot path, with 3 interleaved reps.
+- Target-scale benches ship with the first implementation; terrain features
+  bench destruction-shaped workloads (a one-step explosion region, repeated
+  dig/fill).
+- Large cases are stress ceilings, not frame targets: weight results by how
+  often that count really occurs.
 
 ## Generated Output And Configuration
 
