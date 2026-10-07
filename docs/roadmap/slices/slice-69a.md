@@ -93,7 +93,9 @@ new features.
     relocated at twice its new edge count and re-patched in the same
     incremental update (`growChunkEdgeWindow` in
     `systems/pathfinding/nav_graph.zig`, counted as `edge_windows_grown`;
-    64E follow-up, 2026-10-06). The old full-rebuild fallback is gone.
+    64E follow-up, 2026-10-06). The old full-rebuild fallback is gone. The
+    vacated windows are holes (perf gauge `nav_edge_hole_slots`), compacted in
+    place at the post-patch seam, and growth stays under the nav memory gate.
 - **Tileset.**
   - `assets/sprites/world_tileset.json` already ships `autotile_sets`
     `grass_dirt`, `water_shore` and `path`, each `layout: "transition_16"` with
@@ -335,7 +337,9 @@ installed beside `worldgen.json`:
     load-time capacity (Slice 64E).
   - The only content-dependent cost is the measured per-chunk edge window. A
     window that outgrows its build size relocates in place (no rebuild); the
-    acceptance soak records `edge_windows_grown` at production size.
+    acceptance soak records `edge_windows_grown` and the hole gauge
+    `edge_hole_slots_max` at production size against the bounds in the
+    acceptance check.
 
 **Structures and villages.**
 
@@ -725,8 +729,23 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       levels, shipped caves) passes `budget.check` under
       `autoSizedMaxNavMemoryBytes` with `link_count` including entrances. A
       60 s ReleaseSafe soak shows:
-      - no `NavWorldTooLarge`;
-      - `edge_windows_grown` recorded (window relocations, no rebuilds);
+      - no `NavWorldTooLarge` (so `edge_growth_refused_total` stays 0);
+      - `edge_windows_grown` recorded (window relocations, no rebuilds,
+        `full_relabel=0`), at most 8 × the distinct nav chunks dug or ramped
+        during the soak: each growth at least doubles a window, from the
+        32-edge floor to the 4,588-edge layout maximum of a 16-tile chunk
+        (log2(4588/32) ≈ 7.2), so a chunk grows at most 8 times between full
+        builds;
+      - `edge_hole_slots_max` below half of one level's edge arena: each
+        relocation leaves its old cap as a hole and adds more than that to the
+        live windows, so holes stay below the live window slots. At build the
+        arena is at least 256 chunks × the 32-edge floor = 8,192 slots per
+        level, so a soak whose growths stay in the few dozen chunks around
+        the player stays in the low thousands;
+      - `edge_compactions=0`: compaction fires only when holes outnumber live
+        window slots (which at-least-doubling growth precludes) or a growth
+        reaches the nav memory gate's arena ceiling, and neither should happen
+        at production size. A nonzero value is a finding to explain;
       - `loading_build` recorded before and after.
 - [ ] Unit tests stay at 16×16 or smaller with 1 underground level.
 - [ ] Bench: new group `worldgen-breadth` (`src/benchmarks/worldgen.zig`,

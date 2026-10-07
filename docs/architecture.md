@@ -877,7 +877,16 @@ same-component portals, so a dig lattice or a few runtime ramps in one open chun
 has just that window relocated to the edge arena's tail at twice its new edge count and is
 re-patched on the main thread after the patch barrier (`growChunkEdgeWindow`, counted as
 `edge_windows_grown`): the step stays an incremental patch equal to a full rebuild, with no
-`nav_version` bump, and the next full build compacts the arena. Windows are not sized for
+`nav_version` bump. Relocation moves a window, never the order of a portal's edges, so
+abstract A* results match a full rebuild too. Vacated windows are holes
+(`edge_hole_slots`, perf gauge `nav_edge_hole_slots`); the main-thread post-patch seam
+compacts the arena in place (`compactEdgeArena`, no allocation, `nav_edge_compactions`) when
+holes outnumber the slots live windows own, and a full build re-measures it. Growth respects
+the nav memory gate: each level's arena may use the gate's own edge-arena estimate plus the
+headroom `max_nav_memory_bytes` leaves (`NavMemoryBudget.edgeArenaSlotLimit`); a growth past
+that compacts first and otherwise fails the step loudly (`NavWorldTooLarge`, counted in
+`edge_growth_refused_total`), and the agent-budget and level-link re-admissions charge the
+arena as grown. Windows are not sized for
 the layout maximum (every perimeter cell plus 8 link endpoints in one component, ~4.6k
 edges per 16-tile chunk-level, ~300 MB at 256x256x32) because measured topology needs
 ~2 MB. The per-participant patch scratch is likewise pre-reserved at

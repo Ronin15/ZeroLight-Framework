@@ -370,13 +370,29 @@ pub const NavGraph = struct {
     // its live topology (quadratic in same-component portals: border runs, dug openings, and
     // runtime ramp endpoints), so an incremental patch that outgrows a window relocates just
     // that chunk's window to the arena tail (growChunkEdgeWindow) instead of rebuilding the
-    // graph; the old window becomes an unreferenced hole until the next full build compacts.
+    // graph; the old window becomes an unreferenced hole (edge_hole_slots) until the arena is
+    // compacted (compactEdgeArena) or the next full build re-measures it.
     // Sizing every window for the layout maximum instead (all 4*ct-4 perimeter cells + K link
     // endpoints in one component, ~4.6k edges at ct = 16) would cost ~37 KB per chunk-level,
     // ~300 MB for a 256x256x32 world, against ~2 MB measured.
     chunk_edge_cap: std.ArrayList(u32) = .empty,
     chunk_edge_base: std.ArrayList(u32) = .empty,
     total_edge_slots: u32 = 0,
+    // Arena slots vacated by window relocations and referenced by no window: the same count in
+    // every level's arena (windows are shared). total_edge_slots - edge_hole_slots is the slots
+    // live windows own. Zeroed by a full build and by compactEdgeArena. Each relocation adds
+    // its old cap here and more than that to the live windows (growth at least doubles), so
+    // holes stay below live slots unless a future growth policy breaks that; the post-patch
+    // seam compacts when they do not (edgeArenaFragmented).
+    edge_hole_slots: u32 = 0,
+    // Per-level edge-arena slot ceiling from the nav memory gate the graph was last admitted
+    // under (NavMemoryBudget.edgeArenaSlotLimit, set at every full build and on re-admission).
+    // A window growth past it compacts first and otherwise fails loudly (NavWorldTooLarge,
+    // edge_growth_refused_total), so in-place growth never allocates past max_nav_memory_bytes.
+    edge_arena_slot_limit: u32 = std.math.maxInt(u32),
+    // Lifetime diagnostics: arena compactions run, and window growths the gate refused.
+    edge_compactions_total: u64 = 0,
+    edge_growth_refused_total: u64 = 0,
     // Per-chunk "outgrew its edge window this patch" flags, sized at every full build (before
     // any dispatch). The threaded patch writes only its own chunks' slots (disjoint); the
     // post-barrier serial pass in patchDirtyChunks reads and clears them.
@@ -491,6 +507,7 @@ pub const NavGraph = struct {
 
         // Fail loud at build instead of degrading at query time.
         try memory_budget.check(self.width, self.height);
+        self.edge_arena_slot_limit = memory_budget.edgeArenaSlotLimit(self.width, self.height);
 
         const level_count: u16 = if (world) |world_system|
             @intCast(@max(@as(usize, 1), world_system.levelCount()))
@@ -643,8 +660,11 @@ pub const NavGraph = struct {
     // sized so they never grow on a dig. The only growth is a chunk outgrowing its edge window
     // (a dig or runtime ramp adding same-component portals), which relocates that one chunk's
     // window to the arena tail at slack * its new edge count (growChunkEdgeWindow); each
-    // level's edge arena grows geometrically (ArrayList growth), so most relocations fit the
-    // existing capacity. That is acceptable per coding-standards.md allocation exceptions: a
+    // level's edge arena grows geometrically up to the nav memory gate's ceiling, so most
+    // relocations fit the existing capacity. Holes the relocations leave are compacted in place
+    // (no allocation) at the post-patch seam once they outnumber the live window slots, and a
+    // growth past the gate compacts first, then fails loudly. That is acceptable per
+    // coding-standards.md allocation exceptions: a
     // cold, event-triggered main-thread step (after the patch barrier) with NavGraph as the
     // explicit owner, whose cost cannot move to init because the topology is only known when
     // the edit arrives, and sizing every window for the layout maximum costs ~150x the memory
@@ -752,6 +772,13 @@ pub const NavGraph = struct {
                 stats.chunks_patched += self.dirty_set.items.len;
                 stats.edge_windows_grown += try self.patchDirtyChunks(level, world, patch_threads);
             }
+            // Main-thread seam after every patch barrier: reclaim relocation holes once they
+            // outnumber the slots live windows own (allocation-free, deterministic).
+            if (self.edgeArenaFragmented()) {
+                @branchHint(.cold);
+                try self.compactEdgeArena();
+                stats.edge_compactions += 1;
+            }
         }
         try self.rebuildLinkEdges(world);
 
@@ -804,6 +831,11 @@ pub const NavGraph = struct {
                     .range_alignment_items = 1,
                     .selected_profile = selection.profile,
                 });
+                // A failed growth below aborts this loop: clear every flag of the batch so no
+                // stale flag survives into a later patch (the retry re-patches the dirty set).
+                errdefer for (chunks) |chunk| {
+                    self.chunk_edge_overflow.items[chunk] = false;
+                };
                 var grown: usize = 0;
                 for (chunks) |chunk| {
                     if (!self.chunk_edge_overflow.items[chunk]) continue;
@@ -1434,19 +1466,30 @@ pub const NavGraph = struct {
 
     // Moves one chunk's edge window (shared by every level) to the tail of the edge arena with
     // cap = max(needed * default_edge_slack, chunk_edge_floor), copying every level's current
-    // window contents and rebasing that chunk's portal_edge_start entries. Every level's arena
-    // capacity is ensured BEFORE any mutation, so an OOM leaves the layout untouched (the
-    // overflowing chunk keeps the empty adjacency compactChunkEdges left it). The vacated window
-    // stays an unreferenced hole until the next full build re-measures and compacts the arena.
+    // window contents and rebasing that chunk's portal_edge_start entries. The vacated window
+    // becomes a hole (edge_hole_slots). The growth respects the nav memory gate
+    // (edge_arena_slot_limit): past it the arena is compacted first, and a growth that still
+    // does not fit is refused loudly (counted, NavWorldTooLarge) with the chunk left on the
+    // empty adjacency compactChunkEdges gave it. Every level's arena capacity is ensured BEFORE
+    // the relocation mutates anything, so an OOM leaves a valid layout (compacted at most).
     fn relocateChunkEdgeWindow(self: *NavGraph, chunk: u32, needed: usize) !void {
-        const old_base = self.chunk_edge_base.items[chunk];
         const old_cap = self.chunk_edge_cap.items[chunk];
         std.debug.assert(needed > old_cap);
         const needed_u32 = std.math.cast(u32, needed) orelse return error.NavWorldTooLarge;
         const new_cap = @max(needed_u32 *| default_edge_slack, chunk_edge_floor);
+        if (!self.edgeArenaAdmits(new_cap) and self.edge_hole_slots != 0) try self.compactEdgeArena();
+        if (!self.edgeArenaAdmits(new_cap)) {
+            @branchHint(.cold);
+            self.edge_growth_refused_total += 1;
+            if (comptime logging.enabled(.err) and !builtin.is_test)
+                logging.game.err("nav chunk {d} edge window growth to {d} refused: arena {d} + {d} slots per level exceeds the nav memory gate's {d}-slot ceiling (max_nav_memory_bytes); refusal {d}", .{ chunk, new_cap, self.total_edge_slots, new_cap, self.edge_arena_slot_limit, self.edge_growth_refused_total });
+            return error.NavWorldTooLarge;
+        }
+        // Read after any compaction above, which moves windows.
+        const old_base = self.chunk_edge_base.items[chunk];
         const new_base = self.total_edge_slots;
-        const new_total = std.math.add(u32, new_base, new_cap) catch return error.NavWorldTooLarge;
-        for (self.level_graphs.items) |*lg| try lg.portal_edges.ensureTotalCapacity(self.allocator, new_total);
+        const new_total = new_base + new_cap; // admitted, so within the u32 limit
+        for (self.level_graphs.items) |*lg| try self.ensureEdgeArenaCapacity(lg, new_total);
         const pbase = self.chunk_portal_base.items[chunk];
         const pcap = self.chunk_portal_cap.items[chunk];
         for (self.level_graphs.items) |*lg| {
@@ -1460,6 +1503,85 @@ pub const NavGraph = struct {
         self.chunk_edge_base.items[chunk] = new_base;
         self.chunk_edge_cap.items[chunk] = new_cap;
         self.total_edge_slots = new_total;
+        self.edge_hole_slots += old_cap;
+    }
+
+    // Whether appending a `new_cap`-slot window keeps every level's arena within the nav memory
+    // gate's per-level ceiling.
+    fn edgeArenaAdmits(self: *const NavGraph, new_cap: u32) bool {
+        return @as(u64, self.total_edge_slots) + new_cap <= self.edge_arena_slot_limit;
+    }
+
+    // Whether relocation holes outnumber the arena slots live windows own: the post-patch
+    // seam's compaction trigger.
+    fn edgeArenaFragmented(self: *const NavGraph) bool {
+        return self.edge_hole_slots > self.total_edge_slots - self.edge_hole_slots;
+    }
+
+    // Grows one level's edge arena to hold `needed` slots: geometrically (1.5x) so most later
+    // relocations fit without allocating, but never past the gated ceiling.
+    fn ensureEdgeArenaCapacity(self: *NavGraph, lg: *NavLevelGraph, needed: u32) !void {
+        if (lg.portal_edges.capacity >= needed) return;
+        const geometric = lg.portal_edges.capacity +| lg.portal_edges.capacity / 2;
+        const target = @min(@max(@as(usize, needed), geometric), @as(usize, self.edge_arena_slot_limit));
+        try lg.portal_edges.ensureTotalCapacityPrecise(self.allocator, target);
+    }
+
+    // Packs every chunk edge window toward the arena front in place, removing the holes window
+    // relocations left (edge_hole_slots -> 0). Windows are visited in ascending current base
+    // (arena order), so each one moves toward the front and a forward copy never overwrites a
+    // window that has not moved yet. Caps, per-slot adjacency order, and every level's content
+    // are unchanged; only window positions move (portal_edge_start is rebased). The arenas keep
+    // their capacity, so later growths reuse the freed tail. Allocation-free: the chunk order
+    // lives in build_u32_scratch, sized to total_slots (>= chunk count) at every full build.
+    // Main thread only, never under a patch dispatch. Deterministic: the result is a function of
+    // the current layout, which the serial and threaded patches build identically.
+    fn compactEdgeArena(self: *NavGraph) !void {
+        const order = try self.buildScratch(self.chunkCount());
+        for (order, 0..) |*chunk, index| chunk.* = @intCast(index);
+        std.sort.pdq(u32, order, ChunkEdgeBaseOrder{ .bases = self.chunk_edge_base.items }, ChunkEdgeBaseOrder.lessThan);
+        var running: u32 = 0;
+        for (order) |chunk| {
+            const old_base = self.chunk_edge_base.items[chunk];
+            const cap = self.chunk_edge_cap.items[chunk];
+            std.debug.assert(running <= old_base);
+            if (running != old_base) {
+                const pbase = self.chunk_portal_base.items[chunk];
+                const pcap = self.chunk_portal_cap.items[chunk];
+                for (self.level_graphs.items) |*lg| {
+                    std.mem.copyForwards(AbstractEdge, lg.portal_edges.items[running..][0..cap], lg.portal_edges.items[old_base..][0..cap]);
+                    for (lg.portal_edge_start.items[pbase .. pbase + pcap]) |*start| {
+                        std.debug.assert(start.* >= old_base and start.* <= old_base + cap);
+                        start.* = start.* - old_base + running;
+                    }
+                }
+                self.chunk_edge_base.items[chunk] = running;
+            }
+            running += cap;
+        }
+        std.debug.assert(running == self.total_edge_slots - self.edge_hole_slots);
+        for (self.level_graphs.items) |*lg| lg.portal_edges.items.len = running;
+        self.total_edge_slots = running;
+        self.edge_hole_slots = 0;
+        self.edge_compactions_total += 1;
+    }
+
+    // Re-derives the gated per-level edge-arena ceiling from a budget the system just
+    // re-admitted (agent-budget raise, link growth), and whether the arena as grown so far fits
+    // it: growth past the build-time estimate spends the same headroom those raises consume.
+    pub fn edgeArenaFitsBudget(self: *const NavGraph, budget: NavMemoryBudget) bool {
+        return self.edgeArenaCapacitySlots() <= budget.edgeArenaSlotLimit(self.width, self.height);
+    }
+
+    pub fn applyEdgeArenaBudget(self: *NavGraph, budget: NavMemoryBudget) void {
+        self.edge_arena_slot_limit = budget.edgeArenaSlotLimit(self.width, self.height);
+    }
+
+    // Largest per-level edge-arena capacity (the resident slots the gate charges).
+    fn edgeArenaCapacitySlots(self: *const NavGraph) usize {
+        var slots: usize = 0;
+        for (self.level_graphs.items) |*lg| slots = @max(slots, lg.portal_edges.capacity);
+        return slots;
     }
 
     // Tombstones a chunk's whole slot window and clears the cell_to_portal entries of the
@@ -1790,6 +1912,7 @@ pub const NavGraph = struct {
             running +|= cap;
         }
         self.total_edge_slots = running;
+        self.edge_hole_slots = 0;
     }
 
     // Local portal node index for a cell on `level`, or null when the cell is not a
@@ -1871,6 +1994,16 @@ pub fn interiorLinkSlotsAvailable(links: []const LevelLink, cell: CellCoord, geo
     return slotted_count < nav_interior_link_slots_per_chunk;
 }
 
+// Orders chunk ids by their current edge-window base (arena order) for compactEdgeArena.
+// Window bases are distinct, so the order is total and deterministic.
+const ChunkEdgeBaseOrder = struct {
+    bases: []const u32,
+
+    fn lessThan(self: ChunkEdgeBaseOrder, lhs: u32, rhs: u32) bool {
+        return self.bases[lhs] < self.bases[rhs];
+    }
+};
+
 // Orders a level's portal node indices by chunk-local component label (then cell index
 // for a deterministic build) so each label's portals form a contiguous sub-run that
 // abstract seeding can scan in isolation.
@@ -1908,6 +2041,7 @@ const PathRequest = @import("../../simulation.zig").PathRequest;
 const nav_new_links_per_step_max = types.nav_new_links_per_step_max;
 const budgetForCapacity = @import("nav_memory.zig").budgetForCapacity;
 const NavGridError = types.NavGridError;
+const TileId = @import("../../world_system.zig").TileId;
 
 // Normalized abstract edge identity for parity comparison: stable across the two
 // independent builds' portal-node numbering because it keys on (level, cell) endpoints.
@@ -2033,6 +2167,31 @@ fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
     try t.expectEqual(a_edges.items.len, b_edges.items.len);
     for (a_edges.items, b_edges.items) |ea, eb| {
         try t.expectEqual(ea, eb);
+    }
+    // (e) per-portal edge SEQUENCES: abstract A* relaxes a node's edges in its CSR order
+    // (solve.zig's abstractCorridor walks portal_edges[start..start+count]), so the order
+    // decides tie-breaking and must match too, not only the sorted set above.
+    try expectPortalEdgeSequencesEqual(a, b);
+}
+
+// Asserts every live portal of `a` has the same ordered adjacency as the same (level, cell)
+// portal of `b`, keyed by cell so it holds across different slot numberings and window
+// layouts: same edge count, then per position the same target cell and cost.
+fn expectPortalEdgeSequencesEqual(a: *const NavGraph, b: *const NavGraph) !void {
+    const t = std.testing;
+    for (a.level_graphs.items, b.level_graphs.items) |*la, *lb| {
+        for (la.cell_to_portal.items, lb.cell_to_portal.items) |slot_a, slot_b| {
+            try t.expectEqual(slot_a == no_cell, slot_b == no_cell);
+            if (slot_a == no_cell) continue;
+            const count = la.portal_edge_count.items[slot_a];
+            try t.expectEqual(count, lb.portal_edge_count.items[slot_b]);
+            const seq_a = la.portal_edges.items[la.portal_edge_start.items[slot_a]..][0..count];
+            const seq_b = lb.portal_edges.items[lb.portal_edge_start.items[slot_b]..][0..count];
+            for (seq_a, seq_b) |ea, eb| {
+                try t.expectEqual(la.portals.items[ea.target].cell_index, lb.portals.items[eb.target].cell_index);
+                try t.expectEqual(ea.cost, eb.cost);
+            }
+        }
     }
 }
 
@@ -2826,6 +2985,547 @@ test "incremental dig opening many border crossings in one chunk grows its edge 
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
 
+// A 24x24-cell level-0 world (768 px, 32 px cells) walled solid at init, so every 8-tile
+// chunk window builds at the floor. `digCorridorLattice` then opens every odd row and column,
+// giving every chunk 8-16 border runs in one component (64-256 edges): one batch outgrows all
+// nine chunk windows at once.
+const WalledWorld = struct {
+    world: WorldSystem,
+    wall_layer: usize,
+    grass: TileId,
+};
+
+fn initWalledWorld(meta: *const WorldTilesetMeta) !WalledWorld {
+    const tree = try requireTestTile(meta, "tree_0");
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, meta, 768, 768);
+    errdefer world.deinit();
+    const wall_layer = try world.addDenseLayer(0, 0, .obstacle, tree);
+    var y: u16 = 0;
+    while (y < 24) : (y += 1) {
+        var x: u16 = 0;
+        while (x < 24) : (x += 1) _ = try world.setDenseTile(wall_layer, x, y, tree);
+    }
+    return .{ .world = world, .wall_layer = wall_layer, .grass = try requireTestTile(meta, "grass") };
+}
+
+fn digCorridorLattice(walled: *WalledWorld, edits: *std.ArrayList(NavCellEdit)) !void {
+    var lane: u16 = 1;
+    while (lane < 24) : (lane += 2) {
+        var i: u16 = 0;
+        while (i < 24) : (i += 1) {
+            for ([_][2]u16{ .{ i, lane }, .{ lane, i } }) |xy| {
+                const opened = (try walled.world.setDenseTile(walled.wall_layer, xy[0], xy[1], walled.grass)) orelse continue;
+                try edits.append(std.testing.allocator, .{ .level = opened.level, .x = opened.x, .y = opened.y });
+            }
+        }
+    }
+}
+
+// Asserts two graphs built from one world share an identical edge-window LAYOUT, not just
+// equal adjacency: the same window bases, caps, arena size, hole count, per-slot CSR starts
+// and counts, and per-portal edge sequences.
+fn expectSameEdgeLayout(a: *const NavGraph, b: *const NavGraph) !void {
+    const t = std.testing;
+    try t.expectEqual(a.total_edge_slots, b.total_edge_slots);
+    try t.expectEqual(a.edge_hole_slots, b.edge_hole_slots);
+    try t.expectEqualSlices(u32, a.chunk_edge_base.items, b.chunk_edge_base.items);
+    try t.expectEqualSlices(u32, a.chunk_edge_cap.items, b.chunk_edge_cap.items);
+    for (a.level_graphs.items, b.level_graphs.items) |*la, *lb| {
+        try t.expectEqualSlices(u32, la.portal_edge_start.items, lb.portal_edge_start.items);
+        try t.expectEqualSlices(u32, la.portal_edge_count.items, lb.portal_edge_count.items);
+    }
+    try expectPortalEdgeSequencesEqual(a, b);
+}
+
+// The build capacity the edge-window tests share: 8-tile nav chunks, one patch-scratch slot per
+// participant of `threads`.
+fn windowGrowthCapacity(threads: *const ThreadSystem) types.PathfindingCapacity {
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    capacity.worker_participant_count = threads.participantSlotCount();
+    return capacity;
+}
+
+fn installFailingAllocator(system: *PathfindingSystem, failing: *std.testing.FailingAllocator) void {
+    system.allocator = failing.allocator();
+    system.graph.allocator = failing.allocator();
+}
+
+fn restoreTestingAllocator(system: *PathfindingSystem) void {
+    system.allocator = std.testing.allocator;
+    system.graph.allocator = std.testing.allocator;
+}
+
+test "an edge-window growth failing at any allocation retries to a full-rebuild graph" {
+    // Sweeps an OOM through every allocation of the post-commit step whose second ramp
+    // outgrows chunk (1,1)'s window (34 edges > 32), serial and through the real 3-worker
+    // patch. Whichever allocation fails, no overflow flag is left set, nav_version is
+    // unchanged, and the retry (the step's dirty marks stay buffered across a failed apply)
+    // yields the uninterrupted result: the 68-edge window and a graph equal to a full rebuild.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    const capacity = windowGrowthCapacity(&threads);
+    const cells = chunkOneOneRampCells(false);
+    for ([_]bool{ false, true }) |threaded| {
+        const thread_arg: ?*ThreadSystem = if (threaded) &threads else null;
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var data = DataSystem.init(std.testing.allocator);
+            defer data.deinit();
+            var world = try initTwoLevelOpenWorld(&meta, 768);
+            defer world.deinit();
+            var system = PathfindingSystem.init(std.testing.allocator);
+            defer system.deinit();
+            try system.reserve(capacity);
+            try system.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+            system.nav_thread_adaptive = false;
+            system.nav_thread_items_per_range = 1;
+            var frame = SimulationFrame.init(std.testing.allocator);
+            defer frame.deinit();
+            try world.addLevelLink(rampLink(cells[0].x, cells[0].y));
+            _ = try reactOneStep(&system, &frame, &data, &world, thread_arg);
+            try world.addLevelLink(rampLink(cells[1].x, cells[1].y));
+            const version = system.graph.version;
+            // Trim each arena to its length so the growth must allocate (the build's geometric
+            // capacity would otherwise hold the relocated window and no failure could land there).
+            for (system.graph.level_graphs.items) |*lg| lg.portal_edges.shrinkAndFree(std.testing.allocator, lg.portal_edges.items.len);
+
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+            installFailingAllocator(&system, &failing);
+            const result = reactOneStep(&system, &frame, &data, &world, thread_arg);
+            restoreTestingAllocator(&system);
+            for (system.graph.chunk_edge_overflow.items) |flag| try std.testing.expect(!flag);
+            const succeeded = if (result) |stats| blk: {
+                try std.testing.expect(!failing.has_induced_failure);
+                try std.testing.expectEqual(@as(usize, 1), stats.edge_windows_grown);
+                break :blk true;
+            } else |err| blk: {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                _ = try reactOneStep(&system, &frame, &data, &world, thread_arg);
+                break :blk false;
+            };
+            try std.testing.expectEqual(version, system.graph.version);
+            try std.testing.expectEqual(@as(u32, 68), system.graph.chunk_edge_cap.items[4]);
+            try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 768, capacity);
+            if (succeeded) break;
+        }
+        // The growth step allocates (the arena outgrows its build capacity), so the sweep
+        // really injected failures before the first clean run.
+        try std.testing.expect(fail_index > 0);
+    }
+}
+
+test "a threaded multi-chunk window growth that fails clears every overflow flag" {
+    // Regression: the post-barrier pass cleared a chunk's flag only when it reached it, so a
+    // growth that failed left every LATER flagged chunk of the batch flagged into the next
+    // patch. The lattice dig overflows several chunks in one threaded batch; an OOM at any
+    // allocation must leave no flag set, and the retried batch must equal a full rebuild.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    const capacity = windowGrowthCapacity(&threads);
+    var failures: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var walled = try initWalledWorld(&meta);
+        defer walled.world.deinit();
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&data, &walled.world, 768, 768, 32, null);
+        system.nav_thread_adaptive = false;
+        system.nav_thread_items_per_range = 1;
+        var edits = std.ArrayList(NavCellEdit).empty;
+        defer edits.deinit(std.testing.allocator);
+        try digCorridorLattice(&walled, &edits);
+        for (edits.items) |edit| try system.markNavDirty(edit.level, edit.x, edit.y);
+        for (system.graph.level_graphs.items) |*lg| lg.portal_edges.shrinkAndFree(std.testing.allocator, lg.portal_edges.items.len);
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        installFailingAllocator(&system, &failing);
+        const result = system.applyBufferedNavUpdates(&data, &walled.world, &threads);
+        restoreTestingAllocator(&system);
+        try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+        for (system.graph.chunk_edge_overflow.items) |flag| try std.testing.expect(!flag);
+        const succeeded = if (result) |stats| blk: {
+            try std.testing.expect(stats.edge_windows_grown > 1);
+            break :blk true;
+        } else |err| blk: {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            const retried = try system.applyBufferedNavUpdates(&data, &walled.world, &threads);
+            try std.testing.expectEqual(@as(usize, 0), retried.version_bumps);
+            break :blk false;
+        };
+        var rebuilt = PathfindingSystem.init(std.testing.allocator);
+        defer rebuilt.deinit();
+        try rebuilt.reserve(capacity);
+        try rebuilt.rebuildStaticNavGridWithWorld(&data, &walled.world, 768, 768, 32, null);
+        try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+        if (succeeded) break;
+    }
+    try std.testing.expect(failures > 0);
+}
+
+test "serial and threaded edge-window growth build identical layouts" {
+    // The threaded patch defers growth to a post-barrier pass in dirty-set order, the serial
+    // patch grows inline in the same order, so both must relocate windows to the same bases.
+    // Checked on a multi-chunk lattice dig (several windows grow in one batch) and on the
+    // per-step ramp sequence (two growths of one chunk), one world shared by both systems.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    const capacity = windowGrowthCapacity(&threads);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    {
+        var walled = try initWalledWorld(&meta);
+        defer walled.world.deinit();
+        var serial = PathfindingSystem.init(std.testing.allocator);
+        defer serial.deinit();
+        var threaded = PathfindingSystem.init(std.testing.allocator);
+        defer threaded.deinit();
+        for ([_]*PathfindingSystem{ &serial, &threaded }) |system| {
+            try system.reserve(capacity);
+            try system.rebuildStaticNavGridWithWorld(&data, &walled.world, 768, 768, 32, null);
+            system.nav_thread_adaptive = false;
+            system.nav_thread_items_per_range = 1;
+        }
+        var edits = std.ArrayList(NavCellEdit).empty;
+        defer edits.deinit(std.testing.allocator);
+        try digCorridorLattice(&walled, &edits);
+        const serial_stats = try serial.applyNavUpdates(&data, &walled.world, edits.items);
+        for (edits.items) |edit| try threaded.markNavDirty(edit.level, edit.x, edit.y);
+        const threaded_stats = try threaded.applyBufferedNavUpdates(&data, &walled.world, &threads);
+        try std.testing.expect(serial.graph.last_patch_batch.ran_inline);
+        try std.testing.expect(!threaded.graph.last_patch_batch.ran_inline);
+        try std.testing.expect(serial_stats.edge_windows_grown > 1);
+        try std.testing.expectEqual(serial_stats.edge_windows_grown, threaded_stats.edge_windows_grown);
+        try expectSameEdgeLayout(&serial.graph, &threaded.graph);
+    }
+
+    var world = try initTwoLevelOpenWorld(&meta, 768);
+    defer world.deinit();
+    var serial = PathfindingSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    var threaded = PathfindingSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    for ([_]*PathfindingSystem{ &serial, &threaded }) |system| {
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+        system.nav_thread_adaptive = false;
+        system.nav_thread_items_per_range = 1;
+    }
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    var threaded_frame = SimulationFrame.init(std.testing.allocator);
+    defer threaded_frame.deinit();
+    var grown: usize = 0;
+    for (chunkOneOneRampCells(false)) |cell| {
+        try world.addLevelLink(rampLink(cell.x, cell.y));
+        grown += (try reactOneStep(&serial, &serial_frame, &data, &world, null)).edge_windows_grown;
+        _ = try reactOneStep(&threaded, &threaded_frame, &data, &world, &threads);
+        try std.testing.expect(!threaded.graph.last_patch_batch.ran_inline);
+        try expectSameEdgeLayout(&serial.graph, &threaded.graph);
+    }
+    try std.testing.expectEqual(@as(usize, 2), grown);
+}
+
+// Solves one request on `system` (serial) and returns the cache slot holding its result.
+fn solveAndCache(system: *PathfindingSystem, requester: EntityId, request: PathRequest) !usize {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    var keyed = request;
+    keyed.entity = requester;
+    try appendPathRequest(&stream, keyed);
+    _ = try system.updateSerial(&stream, 8, .{});
+    return cachedSlot(system, request) orelse error.TestExpectedEqual;
+}
+
+fn cachedSlot(system: *const PathfindingSystem, request: PathRequest) ?usize {
+    const key = system.graph.keyForWorld(request.goal_level, request.goal, request.agent_class) orelse return null;
+    return system.completed.freshSlotIndex(key, system.step_counter, types.default_cache_ttl_steps);
+}
+
+// Asserts two cached results hold the same path: plain cells, level, and stitched corridor.
+fn expectSameCachedPath(a: *const PathfindingSystem, slot_a: usize, b: *const PathfindingSystem, slot_b: usize) !void {
+    const result_a = a.completed.resultAt(slot_a);
+    const result_b = b.completed.resultAt(slot_b);
+    try std.testing.expectEqual(result_a.path_level, result_b.path_level);
+    try std.testing.expectEqualSlices(u32, a.completed.pathSlice(slot_a, result_a.path_len), b.completed.pathSlice(slot_b, result_b.path_len));
+    try std.testing.expectEqualSlices(types.StitchedCell, a.completed.stitchedSlice(slot_a, result_a.stitched_len), b.completed.stitchedSlice(slot_b, result_b.stitched_len));
+}
+
+fn cellCenterRequest(start_level: u16, start: [2]u16, goal_level: u16, goal: [2]u16) PathRequest {
+    return .{
+        .entity = undefined,
+        .start_level = start_level,
+        .goal_level = goal_level,
+        .start = .{ .x = @as(f32, @floatFromInt(start[0])) * 32 + 16, .y = @as(f32, @floatFromInt(start[1])) * 32 + 16 },
+        .goal = .{ .x = @as(f32, @floatFromInt(goal[0])) * 32 + 16, .y = @as(f32, @floatFromInt(goal[1])) * 32 + 16 },
+    };
+}
+
+test "abstract A* after an edge-window growth returns the paths of a fresh full rebuild" {
+    // Window growth moves a chunk's edges to a new arena position; the abstract search walks
+    // each portal's edges in CSR order, so the incremental graph must yield the exact paths a
+    // fresh full rebuild yields: same-level paths across the grown chunk on both levels and
+    // cross-level paths through its ramps.
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = try initTwoLevelOpenWorld(&meta, 768);
+    defer world.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var grown: usize = 0;
+    for (chunkOneOneRampCells(false)[0..5]) |cell| {
+        try world.addLevelLink(rampLink(cell.x, cell.y));
+        grown += (try reactOneStep(&system, &frame, &data, &world, null)).edge_windows_grown;
+    }
+    try std.testing.expectEqual(@as(usize, 2), grown);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(capacity);
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const requests = [_]PathRequest{
+        cellCenterRequest(0, .{ 1, 12 }, 0, .{ 22, 12 }),
+        cellCenterRequest(1, .{ 12, 1 }, 1, .{ 12, 22 }),
+        cellCenterRequest(1, .{ 2, 2 }, 0, .{ 21, 21 }),
+        cellCenterRequest(0, .{ 20, 3 }, 1, .{ 3, 20 }),
+    };
+    for (requests) |request| {
+        const slot = try solveAndCache(&system, requester, request);
+        const fresh_slot = try solveAndCache(&rebuilt, requester, request);
+        try std.testing.expect(system.completed.resultAt(slot).stitched_len != 0);
+        try expectSameCachedPath(&system, slot, &rebuilt, fresh_slot);
+    }
+}
+
+test "a cached path outside the dirty batch survives an edge-window growth and equals a fresh solve" {
+    // Slice 64E (Slice 72 E4's surviving-cache case): a window growth stays an incremental
+    // patch, so nav_version (part of every cache key) is unchanged and scoped eviction drops
+    // only paths crossing the edited cells. A path along the top row (chunks 0-2) never
+    // touches the ramp cells in chunk (1,1), so it must stay cached, unchanged, through the
+    // step that grows chunk (1,1)'s window, and still equal a fresh solve on a full rebuild.
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = try initTwoLevelOpenWorld(&meta, 768);
+    defer world.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const cells = chunkOneOneRampCells(false);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try world.addLevelLink(rampLink(cells[0].x, cells[0].y));
+    _ = try reactOneStep(&system, &frame, &data, &world, null);
+
+    const request = cellCenterRequest(0, .{ 1, 1 }, 0, .{ 22, 2 });
+    const slot = try solveAndCache(&system, requester, request);
+    const before = system.completed.resultAt(slot);
+    try std.testing.expect(before.stitched_len != 0);
+    var stitched_before = std.ArrayList(types.StitchedCell).empty;
+    defer stitched_before.deinit(std.testing.allocator);
+    try stitched_before.appendSlice(std.testing.allocator, system.completed.stitchedSlice(slot, before.stitched_len));
+    const version = system.graph.version;
+
+    try world.addLevelLink(rampLink(cells[1].x, cells[1].y));
+    const stats = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.edge_windows_grown);
+    try std.testing.expectEqual(version, system.graph.version);
+    const kept = cachedSlot(&system, request) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(slot, kept);
+    try std.testing.expectEqualSlices(types.StitchedCell, stitched_before.items, system.completed.stitchedSlice(kept, system.completed.resultAt(kept).stitched_len));
+    const view = system.statusForWorld(request.start_level, request.start, request.goal_level, request.goal, .default, null);
+    try std.testing.expectEqual(types.PathStatus.available, view.status);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(capacity);
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+    const fresh_slot = try solveAndCache(&rebuilt, requester, request);
+    try expectSameCachedPath(&system, kept, &rebuilt, fresh_slot);
+}
+
+// Test-local fragmentation: moves `chunk`'s edge window (every level) to the arena tail at its
+// CURRENT cap, leaving its old window as a hole, the way a relocation does minus the growth.
+// Builds a consistent layout whose holes can outnumber the live window slots, which real
+// growth (at least doubling) never produces.
+fn moveEdgeWindowToTail(graph: *NavGraph, chunk: u32) !void {
+    const old_base = graph.chunk_edge_base.items[chunk];
+    const cap = graph.chunk_edge_cap.items[chunk];
+    const new_base = graph.total_edge_slots;
+    const pbase = graph.chunk_portal_base.items[chunk];
+    const pcap = graph.chunk_portal_cap.items[chunk];
+    for (graph.level_graphs.items) |*lg| {
+        try lg.portal_edges.ensureTotalCapacity(std.testing.allocator, new_base + cap);
+        lg.portal_edges.items.len = new_base + cap;
+        @memcpy(lg.portal_edges.items[new_base..][0..cap], lg.portal_edges.items[old_base..][0..cap]);
+        for (lg.portal_edge_start.items[pbase .. pbase + pcap]) |*start| start.* = start.* - old_base + new_base;
+    }
+    graph.chunk_edge_base.items[chunk] = new_base;
+    graph.total_edge_slots = new_base + cap;
+    graph.edge_hole_slots += cap;
+}
+
+fn sumEdgeCaps(graph: *const NavGraph) u32 {
+    var sum: u32 = 0;
+    for (graph.chunk_edge_cap.items) |cap| sum += cap;
+    return sum;
+}
+
+test "relocation holes past the live window slots compact in place at the post-patch seam" {
+    // Every chunk window is moved to the tail once and chunk 0's twice, so the holes (all
+    // nine original windows plus one) outnumber the live window slots. The next real patch
+    // step compacts the arena at the post-patch seam: holes drop to 0, the arena shrinks to
+    // the live windows, and the graph equals a full rebuild. The compaction runs under a
+    // FailingAllocator on the graph and system (zero allocations), serial and through the
+    // real 3-worker threaded patch.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    const capacity = windowGrowthCapacity(&threads);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = try initTwoLevelOpenWorld(&meta, 768);
+    defer world.deinit();
+    try world.reserveLevelLinks(4);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    // Warm: one serial and one threaded link step bring the dirty buffers to steady capacity.
+    try world.addLevelLink(rampLink(2, 2));
+    _ = try reactOneStep(&system, &frame, &data, &world, null);
+    try world.addLevelLink(rampLink(18, 2));
+    _ = try reactOneStep(&system, &frame, &data, &world, &threads);
+
+    // Interior cells of chunks 6 and 8 (one ramp each fits its floor window).
+    for ([_][2]u16{ .{ 2, 18 }, .{ 18, 18 } }, [_]bool{ false, true }) |cell, threaded| {
+        const chunk_count: u32 = @intCast(system.graph.chunkCount());
+        var chunk: u32 = 0;
+        while (chunk < chunk_count) : (chunk += 1) try moveEdgeWindowToTail(&system.graph, chunk);
+        try moveEdgeWindowToTail(&system.graph, 0);
+        const live = sumEdgeCaps(&system.graph);
+        try std.testing.expect(system.graph.edge_hole_slots > live);
+        try std.testing.expectEqual(live + system.graph.edge_hole_slots, system.graph.total_edge_slots);
+        const compactions = system.graph.edge_compactions_total;
+
+        try world.addLevelLink(rampLink(cell[0], cell[1]));
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        installFailingAllocator(&system, &failing);
+        const stats = reactOneStep(&system, &frame, &data, &world, if (threaded) &threads else null);
+        restoreTestingAllocator(&system);
+        const ok = try stats;
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+        try std.testing.expectEqual(threaded, !system.graph.last_patch_batch.ran_inline);
+        try std.testing.expectEqual(@as(usize, 0), ok.edge_windows_grown);
+        try std.testing.expectEqual(@as(usize, 1), ok.edge_compactions);
+        try std.testing.expectEqual(@as(usize, 0), ok.edge_hole_slots);
+        try std.testing.expectEqual(compactions + 1, system.graph.edge_compactions_total);
+        try std.testing.expectEqual(@as(u32, 0), system.graph.edge_hole_slots);
+        try std.testing.expectEqual(live, system.graph.total_edge_slots);
+        for (system.graph.level_graphs.items) |*lg| try std.testing.expectEqual(@as(usize, live), lg.portal_edges.items.len);
+        try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 768, capacity);
+    }
+}
+
+test "an edge-window growth past the nav memory gate compacts first, then refuses loudly" {
+    // The gate's per-level arena ceiling (edge_arena_slot_limit) is pinned just below what
+    // ramp 5's growth needs with the ramp-2 hole still in place, but enough once it is
+    // reclaimed: the growth compacts first and succeeds. Then, with the ceiling at the arena's
+    // current size, the next growth has no hole to reclaim and is refused: NavWorldTooLarge,
+    // counted once per attempt, identically on a retry, with no overflow flag left set; once
+    // the ceiling admits it, the retry grows and matches a full rebuild.
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = try initTwoLevelOpenWorld(&meta, 768);
+    defer world.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 768, 768, 32, null);
+    // The default ceiling leaves the gate's estimate plus headroom: far above this world's arena.
+    try std.testing.expect(system.graph.edge_arena_slot_limit > 4 * system.graph.total_edge_slots);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const cells = chunkOneOneRampCells(false);
+    for (cells[0..4]) |cell| {
+        try world.addLevelLink(rampLink(cell.x, cell.y));
+        _ = try reactOneStep(&system, &frame, &data, &world, null);
+    }
+    try std.testing.expectEqual(@as(u32, 68), system.graph.chunk_edge_cap.items[4]);
+    try std.testing.expectEqual(@as(u32, 32), system.graph.edge_hole_slots);
+
+    // Ramp 5 needs a 152-slot window: total + 152 overflows the ceiling, total - 32 + 152 fits.
+    system.graph.edge_arena_slot_limit = system.graph.total_edge_slots - 32 + 152;
+    try world.addLevelLink(rampLink(cells[4].x, cells[4].y));
+    const grown = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), grown.edge_windows_grown);
+    try std.testing.expectEqual(@as(u64, 1), system.graph.edge_compactions_total);
+    try std.testing.expectEqual(@as(u64, 0), system.graph.edge_growth_refused_total);
+    try std.testing.expectEqual(@as(u32, 68), system.graph.edge_hole_slots);
+    try std.testing.expectEqual(system.graph.edge_arena_slot_limit, system.graph.total_edge_slots);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 768, capacity);
+
+    // Ramps 6-8 fit the 152 window; a perimeter ramp then pushes chunk (1,1) past it with the
+    // only hole (68) too small to make room under a ceiling pinned at the arena size.
+    for (cells[5..8]) |cell| {
+        try world.addLevelLink(rampLink(cell.x, cell.y));
+        try std.testing.expectEqual(@as(usize, 0), (try reactOneStep(&system, &frame, &data, &world, null)).edge_windows_grown);
+    }
+    const version = system.graph.version;
+    const perimeter = chunkOneOneRampCells(true);
+    try world.addLevelLink(rampLink(perimeter[0].x, perimeter[0].y));
+    try std.testing.expectError(error.NavWorldTooLarge, reactOneStep(&system, &frame, &data, &world, null));
+    try std.testing.expectEqual(@as(u64, 1), system.graph.edge_growth_refused_total);
+    try std.testing.expectError(error.NavWorldTooLarge, reactOneStep(&system, &frame, &data, &world, null));
+    try std.testing.expectEqual(@as(u64, 2), system.graph.edge_growth_refused_total);
+    for (system.graph.chunk_edge_overflow.items) |flag| try std.testing.expect(!flag);
+    try std.testing.expectEqual(version, system.graph.version);
+
+    system.graph.edge_arena_slot_limit = std.math.maxInt(u32);
+    const retried = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), retried.edge_windows_grown);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 768, capacity);
+}
+
 test "new links beyond the per-step budget defer in link order" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -3014,6 +3714,50 @@ test "nav memory gate admits the world's reserved link limit, not just its curre
     try gated.reserve(abstractCapacity());
     gated.capacity.max_nav_memory_bytes = zero_link_bytes;
     try std.testing.expectError(NavGridError.NavWorldTooLarge, gated.rebuildStaticNavGridWithWorld(&data, &reserved, 384, 384, 32, null));
+}
+
+test "link growth and agent-budget raises charge an edge arena grown past its build estimate" {
+    // Window growth may spend the gate's headroom (edge_arena_slot_limit = the per-level arena
+    // estimate plus the bytes max_nav_memory_bytes leaves unused). A later re-admission (the
+    // dig seam's link growth, an agent-budget raise) spends the same headroom, so it must
+    // charge the arena as grown: with every arena at the ceiling, a re-admission that needs any
+    // headroom is refused; with the arena back under it, the raise is admitted and re-derives
+    // the (now lower) ceiling.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try initTwoLevelOpenWorld(&meta, 384);
+    defer world.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    const requested = system.agentBudget() * 2;
+    var raised = system.capacity;
+    raised.max_agent_budget = requested;
+    const base_bytes = budgetForCapacity(system.capacity, 2, 0).requiredBytes(12, 12);
+    const raised_bytes = budgetForCapacity(raised, 2, 0).requiredBytes(12, 12);
+    try std.testing.expect(raised_bytes > base_bytes);
+    // Headroom for exactly the raise plus 64 spare edge slots per level.
+    system.capacity.max_nav_memory_bytes = raised_bytes + 2 * 64 * @sizeOf(AbstractEdge);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
+    const build_limit = system.graph.edge_arena_slot_limit;
+    try std.testing.expect(system.admitsLinkLimit(8));
+
+    // Every level's arena grows to the ceiling: all headroom is spent on edges.
+    for (system.graph.level_graphs.items) |*lg| try lg.portal_edges.ensureTotalCapacityPrecise(std.testing.allocator, build_limit);
+    try std.testing.expect(system.admitsLinkLimit(0));
+    try std.testing.expect(!system.admitsLinkLimit(8));
+    try std.testing.expect(!system.raiseAgentBudget(requested, 0));
+    try std.testing.expectEqual(build_limit, system.graph.edge_arena_slot_limit);
+
+    // Back under the raised ceiling, the raise lands and lowers the growth ceiling to match.
+    for (system.graph.level_graphs.items) |*lg| lg.portal_edges.shrinkAndFree(std.testing.allocator, lg.portal_edges.items.len);
+    try std.testing.expect(system.raiseAgentBudget(requested, 0));
+    raised.max_nav_memory_bytes = system.capacity.max_nav_memory_bytes;
+    const raised_limit = budgetForCapacity(raised, 2, 0).edgeArenaSlotLimit(12, 12);
+    try std.testing.expect(raised_limit < build_limit);
+    try std.testing.expectEqual(raised_limit, system.graph.edge_arena_slot_limit);
 }
 
 test "interiorLinkSlotsAvailable refuses a cell that is an existing but unslotted endpoint" {

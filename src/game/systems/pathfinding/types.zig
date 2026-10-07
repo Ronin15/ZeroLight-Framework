@@ -326,6 +326,12 @@ pub const NavUpdateStats = struct {
     // (NavGraph.growChunkEdgeWindow): a cold, dig-triggered growth that keeps the update an
     // incremental patch (no rebuild, no version bump). 0 on the steady path.
     edge_windows_grown: usize = 0,
+    // Edge-arena compactions this batch ran at the post-patch seam (NavGraph.compactEdgeArena,
+    // when relocation holes outnumber the slots live windows own). Cold; 0 on the steady path.
+    edge_compactions: usize = 0,
+    // Gauge, not a per-batch delta: the graph's relocation holes (NavGraph.edge_hole_slots,
+    // per-level arena slots no window references) after this batch. Recorded as a max.
+    edge_hole_slots: usize = 0,
     // New LevelLinks left for a later step's reaction because this step already folded
     // nav_new_links_per_step_max of them (deterministic, link-order deferral).
     links_deferred: usize = 0,
@@ -343,6 +349,8 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_version_bumps, metric(self.version_bumps));
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
         perf.recordMetric(.nav_edge_windows_grown, metric(self.edge_windows_grown));
+        perf.recordMetric(.nav_edge_compactions, metric(self.edge_compactions));
+        perf.recordMetricMax(.nav_edge_hole_slots, metric(self.edge_hole_slots));
         perf.recordMetric(.pathfinding_links_deferred, metric(self.links_deferred));
         perf.recordMetric(.pathfinding_link_endpoints_unslotted, metric(self.link_endpoints_unslotted));
         perf.recordMetric(.nav_dirty_buffer_grown, metric(self.dirty_buffer_grown));

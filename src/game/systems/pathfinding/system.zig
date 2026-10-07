@@ -358,7 +358,9 @@ pub const PathfindingSystem = struct {
         var raised = self.capacity;
         raised.max_agent_budget = requested;
         const memory_budget = nav_memory.budgetForCapacity(raised, @max(@as(usize, 1), self.graph.levelCount()), link_count);
-        memory_budget.check(self.graph.width, self.graph.height) catch {
+        // The raise spends the same headroom an edge arena grown past its build estimate uses.
+        const admitted = if (memory_budget.check(self.graph.width, self.graph.height)) |_| self.graph.edgeArenaFitsBudget(memory_budget) else |_| false;
+        if (!admitted) {
             self.agent_budget_raise_refused += 1;
             self.agent_budget_raise_refused_at = budget;
             if (!self.agent_budget_raise_warned) {
@@ -369,25 +371,29 @@ pub const PathfindingSystem = struct {
                 );
             }
             return false;
-        };
+        }
         self.capacity.max_agent_budget = requested;
+        self.graph.applyEdgeArenaBudget(memory_budget);
         return true;
     }
 
     /// Whether the nav-memory gate admits a world level-link limit of `link_limit`: the same
     /// `budgetForCapacity` check the build and `raiseAgentBudget` use, charged against the
-    /// live agent ceiling. Pure; the dig commit seam's link growth asks it first.
+    /// live agent ceiling, plus the edge arena as grown so far (see `raiseAgentBudget`). Pure;
+    /// the dig commit seam's link growth asks it first.
     pub fn admitsLinkLimit(self: *const PathfindingSystem, link_limit: usize) bool {
         const memory_budget = nav_memory.budgetForCapacity(self.capacity, @max(@as(usize, 1), self.graph.levelCount()), link_limit);
         memory_budget.check(self.graph.width, self.graph.height) catch return false;
-        return true;
+        return self.graph.edgeArenaFitsBudget(memory_budget);
     }
 
     /// Reserves every pathfinding store sized per world level link for `link_limit` links
-    /// (today the nav graph's link edges). Grow-only. Called by the dig commit seam BEFORE the
+    /// (today the nav graph's link edges), then re-derives the edge-arena growth ceiling from
+    /// the budget charging that limit. Grow-only. Called by the dig commit seam BEFORE the
     /// world's limit rises, so an OOM leaves the world untouched.
     pub fn reserveLinkCapacity(self: *PathfindingSystem, link_limit: usize) !void {
         try self.graph.reserveLinkEdges(link_limit);
+        self.graph.applyEdgeArenaBudget(nav_memory.budgetForCapacity(self.capacity, @max(@as(usize, 1), self.graph.levelCount()), link_limit));
     }
 
     /// Grow half of the elastic resize: when `agent_count` derives more than the live
@@ -587,7 +593,7 @@ pub const PathfindingSystem = struct {
             }
         else
             null;
-        const stats = try self.graph.applyNavUpdates(
+        var stats = try self.graph.applyNavUpdates(
             data,
             world,
             edits,
@@ -615,6 +621,7 @@ pub const PathfindingSystem = struct {
             self.clearRequestStateKeepingCompleted();
             self.dropGroupFields();
         }
+        stats.edge_hole_slots = self.graph.edge_hole_slots;
         return stats;
     }
 
@@ -875,7 +882,8 @@ pub const PathfindingSystem = struct {
         // nav-invalidating event, yet its link must still join the graph on both levels.
         const link_stats = try self.markNewNavLinksDirty(world);
 
-        if (!self.hasPendingNavUpdates()) return .{};
+        // The hole gauge is reported every step, not only on steps that patch.
+        if (!self.hasPendingNavUpdates()) return .{ .edge_hole_slots = self.graph.edge_hole_slots };
         try frame.events.ensureCanAppend(1);
         var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
         stats.links_deferred = link_stats.deferred;

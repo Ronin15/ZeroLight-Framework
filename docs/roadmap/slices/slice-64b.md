@@ -57,11 +57,16 @@ serial or threaded; and (4) stays an allocation-free, same-build oracle.
     `unavailable`/`pending_keys` (`KeySet`), `group_fields` (4 fields of
     O(cells) arrays, `group_field.zig:38-57`), `group_requests`,
     `group_key_map`, `next_group_evict`, `effective_agent_capacity`,
-    `low_load_steps`, and `graph: NavGraph`. After **64E** the graph's portal
-    and edge *sets* equal a full rebuild, but the per-chunk edge-window layout
-    (`chunk_edge_cap`/`chunk_edge_base`, measured at the last full build and
-    relocated by later window growths) still depends on build history, and
-    A* expansion order follows that layout;
+    `low_load_steps`, and `graph: NavGraph`. After **64E** the graph's portals
+    and each portal's edge *sequence* equal a full rebuild. Only the per-chunk
+    edge-window layout (`chunk_edge_cap`/`chunk_edge_base`/`edge_hole_slots`,
+    measured at the last full build, then moved by window growths and arena
+    compactions) depends on build history. A relocation or compaction changes
+    where a window sits in the arena, never the order of a portal's edges, and
+    abstract A* walks each portal's edges in that order, so search results do
+    not depend on the layout (64E tests: `expectPortalEdgeSequencesEqual` and
+    "abstract A* after an edge-window growth returns the paths of a fresh full
+    rebuild");
   - `perception.level_blocked` + `step_counter` (`systems/perception.zig:500-518`):
     an LOS cache whose scoped patch is proven equal to a full rebuild
     (`perception.zig:2576-2793` tests);

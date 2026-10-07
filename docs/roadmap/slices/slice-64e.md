@@ -6,7 +6,9 @@
 2026-10-06** (nav dirty buffers sized by the structural-stage event bound;
 level links grow at the dig commit seam), and the edge-window overflow the
 manual run found is fixed (2026-10-06: in-place per-chunk window growth
-replaces the full-rebuild fallback). **Only the display-gated manual
+replaces the full-rebuild fallback; its review follow-ups add OOM, edge-order,
+A*-result, and cached-path proofs, in-place hole compaction, and a nav memory
+gate on growth). **Only the display-gated manual
 acceptance check remains open** (not run: no display in the implementing
 sessions). Every code, test, doc, and bench item below is checked.
 No open prerequisite. This
@@ -600,7 +602,8 @@ multi-worker patch path and the serial one.
       graph equals a full rebuild.
     - Growth is geometric (a window at least doubles each time, so a chunk
       grows at most about 8 times between full builds). Vacated windows are
-      holes until the next full build compacts the arena.
+      holes until the arena is compacted in place or the next full build
+      re-measures it (see the review follow-ups below).
     - `edge_slack` and the fallback are deleted. `NavUpdateStats.edge_cap_fallback`
       becomes `edge_windows_grown` (perf metric `nav_edge_windows_grown`), and
       growth logs one `debug` line.
@@ -649,6 +652,103 @@ multi-worker patch path and the serial one.
       256×256×32), so later growths usually allocate nothing.
     - The old fallback instead re-measured every window at slack 4, roughly
       doubling every busy chunk's window.
+  - [x] **Review follow-ups (2026-10-06) to the edge-window growth.** Each
+        behavior test below was confirmed to fail with its fix temporarily
+        reverted; the coverage tests pass on both.
+    - [x] **M1 · OOM at any allocation of a growth step.** `nav_graph.zig`
+          "an edge-window growth failing at any allocation retries to a
+          full-rebuild graph" sweeps `FailingAllocator.fail_index` 0..N over
+          the step whose second ramp relocates chunk (1,1)'s window (each
+          level's arena is trimmed to its length first, so the relocation
+          really allocates), serial and through the real 3-worker patch.
+          Every failure leaves no overflow flag set and `nav_version`
+          unchanged; the retry (the step's marks stay buffered) gives the
+          68-edge window and `expectLinkPatchMatchesFullRebuild` parity. Fix:
+          the threaded post-barrier grow loop now clears every flag of the
+          batch on a failed `try` (`errdefer` in `patchDirtyChunks`), so a
+          failed growth no longer leaves later chunks flagged into the next
+          patch. Behavior test: "a threaded multi-chunk window growth that
+          fails clears every overflow flag" (an odd-row/column lattice dig
+          overflows all nine chunks in one threaded batch; same sweep, then
+          full-rebuild parity).
+    - [x] **M2 · edge order, A* results, serial = threaded.**
+          `expectGraphsEquivalent` now also compares every portal's edge
+          SEQUENCE keyed by (level, cell) (`expectPortalEdgeSequencesEqual`):
+          abstract A* relaxes edges in CSR order (`solve.zig`
+          `abstractCorridor`), so order decides tie-breaks. Every existing
+          incremental-vs-full test passes the stricter compare. New: "abstract
+          A* after an edge-window growth returns the paths of a fresh full
+          rebuild" (after two growths, same-level paths across the grown
+          chunk on both levels and two cross-level paths through its ramps
+          give identical cached plain and stitched paths) and "serial and
+          threaded edge-window growth build identical layouts" (lattice dig
+          growing several windows in one batch, and the 8-ramp sequence:
+          `chunk_edge_base`/`cap`, arena size, holes, per-slot CSR starts and
+          counts, and edge sequences identical after every step).
+    - [x] **M3 · holes, memory, and the nav memory gate.**
+      - Hole metric: `NavGraph.edge_hole_slots` (per-level arena slots no
+        window references; zeroed by a full build or a compaction), reported
+        every step as `NavUpdateStats.edge_hole_slots` (perf gauge
+        `nav_edge_hole_slots`, printed as `edge_hole_slots_max`), plus the
+        counters `edge_compactions` (perf `nav_edge_compactions`),
+        `edge_compactions_total`, and `edge_growth_refused_total`.
+      - Compaction: `NavGraph.compactEdgeArena` packs the windows toward the
+        arena front in place, visiting chunks in ascending current base so a
+        forward copy never overwrites an unmoved window. It keeps caps and
+        edge order, rebases `portal_edge_start`, keeps each arena's capacity
+        for later growths, and allocates nothing (the chunk order reuses
+        `build_u32_scratch`, sized to `total_slots` at every full build). The
+        post-commit nav reaction runs it after the last patch barrier when
+        holes outnumber the slots live windows own. Each relocation adds its
+        old cap to the holes and more than that to the live windows (growth
+        at least doubles), so that trigger is a backstop that today's growth
+        policy does not reach on its own. Test: "relocation holes past the
+        live window slots compact in place at the post-patch seam" builds a
+        fragmented but consistent layout with a test-local window move, then
+        a real ramp step compacts it under a `FailingAllocator` (0
+        allocations), serial and threaded, with full-rebuild parity.
+      - Gate: the full build sets `edge_arena_slot_limit` from
+        `NavMemoryBudget.edgeArenaSlotLimit`, which is the gate's own
+        per-level edge-arena estimate plus the headroom `max_nav_memory_bytes`
+        (e.g. `autoSizedMaxNavMemoryBytes`) leaves. A relocation past it
+        compacts first. If it still does not fit, the step fails
+        deterministically with `NavWorldTooLarge`, counted in
+        `edge_growth_refused_total` with an `err` log, and the chunk keeps
+        empty adjacency. The arena's geometric growth is clamped to the
+        limit. `raiseAgentBudget`, `admitsLinkLimit`, and
+        `reserveLinkCapacity` charge the arena as grown and re-derive the
+        limit, so headroom spent on edges is not admitted twice. Tests: "an
+        edge-window growth past the nav memory gate compacts first, then
+        refuses loudly" (compaction admits ramp 5's growth under a pinned
+        ceiling, then a growth with no hole to reclaim is refused twice in a
+        row, counted, with no flag left set, and lands with parity once
+        admitted); "link growth and agent-budget raises charge an edge arena
+        grown past its build estimate"; `nav_memory.zig` "edgeArenaSlotLimit
+        is the per-level arena estimate plus the budget's headroom".
+      - Memory: steady state is unchanged (24 B of new `NavGraph` fields, no
+        per-chunk arrays). Holes stay below the live window slots, so an
+        arena is at most about 2× its live windows plus at most 1.5×
+        capacity growth. That growth is clamped to the gated ceiling, and a
+        compaction returns the holes to the free tail for reuse instead of
+        allocating.
+    - [x] **E4 · cached path survives a growth.** `nav_graph.zig` "a cached
+          path outside the dirty batch survives an edge-window growth and
+          equals a fresh solve": a top-row path (chunks 0–2) cached before
+          the step that grows chunk (1,1)'s window keeps its cache slot and
+          stitched cells unchanged, `nav_version` stays the same, it still
+          answers `available`, and it equals a fresh solve on a full rebuild.
+          This is the test Slice 72 E4 (closed as superseded) now points to.
+    - [x] Docs: `slice-64b.md` (relocation moves a window, not edge order),
+          `slice-69a.md` soak bounds for `edge_windows_grown` and the hole
+          gauge, `slice-72.md` E4 reference, `architecture.md`.
+    - [x] Bench: ReleaseFast, 3 interleaved runs against a `b39e016` export,
+          medians, serial-direct (the growth, compaction check, and gate
+          check are cold, main-thread, and off the per-chunk path). Every
+          case is within max(3%, spread): links-dense 8: 32.90 → 32.69 us;
+          links 1: 27.44 → 27.08 us; links 8: 212.61 → 213.41 us; scattered
+          16: 211.88 → 210.97 us; scattered 64: 838.06 → 839.60 us; scattered
+          256: 3.34 → 3.34 ms. The adaptive-tuned rows are tuner-noisy (up to
+          240% spread) and none regressed.
 - [x] Capacity audit: the dirty-buffer `FailingAllocator` test passes serial
       and threaded, and `nav-update-scattered` / `nav-update-links` stay
       within max(3%, noise) of their recorded medians. Recorded 2026-10-06
