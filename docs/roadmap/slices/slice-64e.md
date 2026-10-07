@@ -557,7 +557,7 @@ multi-worker patch path and the serial one.
       incremental patch" src/` is empty).
 - [x] Manual (display, procedural demo): dig a ramp at a non-border cell on
       level 1. NPCs on level 1 path up it within a second, with no
-      save/load or restart. Confirmed by the owner 2026-10-06 (ReleaseSafe
+      save/load or restart. Confirmed by the owner 2026-10-06 (Debug build,
       battle demo): NPCs followed dug ramps out; perf dump showed 14 tile
       changes → 13 incremental rebuilds, `full_relabel=0`, `links_deferred=0`,
       `link_endpoints_unslotted=0`, both ramp refusal counters 0.
