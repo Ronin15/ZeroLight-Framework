@@ -45,10 +45,14 @@
 //! the new value drops below threshold - ai_affect_threshold_hysteresis. A
 //! scalar tail repeats the same math for the remainder.
 //!
-//! Event emission (range-owned scratch, deterministic capped merge) mirrors
-//! perception.zig's mergePerceptionEvents almost exactly, except up to four
-//! events can fire per row per step (one per independent drive) rather than
-//! perception's two-per-row swap cap.
+//! Event emission (Slice 72 I2): workers only mark each row's per-drive
+//! "crossed"/"rising" bits in the gather rows' `crossing_bits` column; after
+//! the join the main thread popcounts the column, applies this system's own
+//! per-step cap, and emits the crossings in (gather row, drive declaration)
+//! order as one range (`AffectSystem.emitCrossingEvents`). That order is fixed
+//! by construction, so it is partition-independent with no event scratch and
+//! no sort. Up to four events can fire per row per step (one per independent
+//! drive) rather than perception's two-per-row swap cap.
 //!
 //! Deliberately deferred: fear and aggression share the same visible-hostile
 //! signal but use independent gain constants and are never cross-coupled;
@@ -63,6 +67,7 @@ const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -130,7 +135,8 @@ pub const AffectStats = struct {
 
 // Packed, contiguous per-row gather scratch (mirrors PerceptionGatherRow):
 // resolved once per row during the branchy gather pass, then read by the
-// vectorized compute pass with plain contiguous loads.
+// vectorized compute pass with plain contiguous loads. `crossing_bits` is the
+// one column the workers write.
 const AffectGatherRow = struct {
     entity: EntityId,
     // This row's own index into DataSystem.ai_affects -- scattered, gathered
@@ -142,7 +148,37 @@ const AffectGatherRow = struct {
     heard_stimulus_f: f32,
     familiarity: f32,
     behavior_exertion_f: f32,
+    // This step's threshold crossings for the row: bits 0..3 "crossed" and
+    // bits 4..7 "rising" per drive (`crossedBit`/`risingBit`), zeroed by the
+    // gather and set by the row's range job. u32 rather than u8 so a 16-row
+    // aligned range spans 64 bytes of the column: neighbouring ranges share
+    // at most a boundary line, the same posture as perception's 4-byte
+    // `final_nearest_threat_*` columns (a u8 column would put four ranges on
+    // one line).
+    crossing_bits: u32,
 };
+
+// A crossed and a rising bit per drive must fit the row word; widen
+// `crossing_bits` before the drive count passes 16.
+comptime {
+    std.debug.assert(2 * affect_events_per_row_max <= @bitSizeOf(u32));
+}
+
+/// Low `affect_events_per_row_max` bits of `crossing_bits`: one "crossed this
+/// step" bit per drive.
+const crossed_mask: u32 = (@as(u32, 1) << affect_events_per_row_max) - 1;
+
+/// "Crossed this step" bit for `drive` in `crossing_bits`, keyed by
+/// declaration order (fear, curiosity, aggression, fatigue).
+fn crossedBit(drive: AiAffectDrive) u32 {
+    return @as(u32, 1) << @intCast(@backingInt(drive));
+}
+
+/// "Rising edge" bit for `drive` in `crossing_bits` (meaningful only with its
+/// `crossedBit` set; clear = falling).
+fn risingBit(drive: AiAffectDrive) u32 {
+    return crossedBit(drive) << affect_events_per_row_max;
+}
 
 fn appendAffectGatherRow(
     rows: *std.MultiArrayList(AffectGatherRow),
@@ -154,45 +190,6 @@ fn appendAffectGatherRow(
     row_slice.set(rows.len - 1, row);
 }
 
-const thread_shared_record_alignment: usize = 64;
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
-const AffectEventRangeBuffer = struct {
-    events: std.ArrayList(SimulationEvent) = .empty,
-
-    fn clearRetainingCapacity(self: *AffectEventRangeBuffer) void {
-        self.events.clearRetainingCapacity();
-    }
-
-    fn appendAssumeCapacity(self: *AffectEventRangeBuffer, event: SimulationEvent) void {
-        self.events.appendAssumeCapacity(event);
-    }
-
-    fn deinit(self: *AffectEventRangeBuffer, allocator: std.mem.Allocator) void {
-        self.events.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-const AffectEventRangeSlot = struct {
-    // Each worker writes only its assigned slot. Padding keeps hot append
-    // state off shared cache lines across concurrently written range records.
-    buffer: AffectEventRangeBuffer = .{},
-    padding: [paddingForCacheLine(AffectEventRangeBuffer)]u8 = @splat(0),
-};
-
-const AffectEventRangeSlotList = std.ArrayListAligned(AffectEventRangeSlot, .fromByteUnits(thread_shared_record_alignment));
-
-fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usize) usize {
-    const start = range_index * items_per_range;
-    if (start >= item_count) return 0;
-    return @min(start + items_per_range, item_count) - start;
-}
-
 fn serialBatch(count: usize) BatchStats {
     return .{ .ran_inline = true, .item_count = count, .range_count = if (count > 0) 1 else 0, .items_per_range = count };
 }
@@ -200,29 +197,21 @@ fn serialBatch(count: usize) BatchStats {
 pub const AffectSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in
-    // job context, except their own reserved event scratch range).
+    // job context, except their own rows' `crossing_bits`).
     rows: std.MultiArrayList(AffectGatherRow) = .{},
-    event_ranges: AffectEventRangeSlotList = .empty,
-    // Gathers every range's emitted crossings for one canonical sort before the
-    // per-step cap, so merged order and cap membership are partition-independent.
-    // Reserved to the same worst case as the range buffers combined.
-    merge_scratch: std.ArrayList(SimulationEvent) = .empty,
-    /// Once-only flag for the merge-cap drop warn. The pipeline's derived share makes a
+    /// Once-only flag for the emit-cap drop warn. The pipeline's derived share makes a
     /// drop impossible by construction; the cap and `dropped_events` stay as the
     /// shared-frame safety net.
     dropped_events_warned: bool = false,
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
-    /// Sizes gather rows and per-range event scratch for `pop` agents, including
-    /// a single serial range that covers the whole population and enough ranges
-    /// for an alignment-sized split.
+    /// Sizes the gather rows (including the per-row crossing bits) for `pop`
+    /// agents; no partition-sized scratch exists, so `update`/`updateSerial`
+    /// allocate nothing after this under any `items_per_range`. Grow-only;
+    /// re-run by the pipeline's population seam.
     pub fn reserve(self: *AffectSystem, pop: usize) !void {
         if (pop == 0) return;
-        const cap = hotStoreCapacity(pop);
-        try self.rows.ensureTotalCapacity(self.allocator, cap);
-        const ranges = std.math.divCeil(usize, cap, affect_range_alignment_items) catch 1;
-        try self.prepareEventRangeBuffers(ranges, affect_range_alignment_items, cap);
-        try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * affect_events_per_row_max);
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(pop));
     }
 
     pub fn init(allocator: std.mem.Allocator) AffectSystem {
@@ -233,9 +222,6 @@ pub const AffectSystem = struct {
     }
 
     pub fn deinit(self: *AffectSystem) void {
-        self.merge_scratch.deinit(self.allocator);
-        for (self.event_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.event_ranges.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.* = undefined;
     }
@@ -262,8 +248,6 @@ pub const AffectSystem = struct {
             config.adaptive,
             active_tuner,
         );
-        try self.prepareEventRangeBuffers(selection.range_count, selection.items_per_range, count);
-
         var job = self.buildJobContext(data, selection.range_count);
         const batch = thread_system.parallelForWithOptions(count, &job, affectRangeJob, .{
             .max_worker_threads = selection.worker_threads,
@@ -272,7 +256,7 @@ pub const AffectSystem = struct {
             .selected_profile = selection.profile,
         });
 
-        const merge = try self.mergeAffectEvents(events, selection.range_count, config.max_events_per_step);
+        const merge = try self.emitCrossingEvents(events, config.max_events_per_step);
         return .{
             .processed_count = count,
             .threshold_crossed_count = merge.crossed,
@@ -292,12 +276,10 @@ pub const AffectSystem = struct {
         if (count == 0) return .{};
 
         const range_count: usize = 1;
-        try self.prepareEventRangeBuffers(range_count, count, count);
-
         var job = self.buildJobContext(data, range_count);
         processAffectRange(&job, .{ .index = 0, .start = 0, .end = count });
 
-        const merge = try self.mergeAffectEvents(events, range_count, config.max_events_per_step);
+        const merge = try self.emitCrossingEvents(events, config.max_events_per_step);
         return .{
             .processed_count = count,
             .threshold_crossed_count = merge.crossed,
@@ -316,8 +298,9 @@ pub const AffectSystem = struct {
             .heard_stimulus_f = rows.items(.heard_stimulus_f),
             .familiarity = rows.items(.familiarity),
             .behavior_exertion_f = rows.items(.behavior_exertion_f),
+            .crossing_bits = rows.items(.crossing_bits),
             .affect_slice = data.aiAffectSlice(),
-            .event_ranges = self.event_ranges.items[0..range_count],
+            .range_count = range_count,
         };
     }
 
@@ -373,50 +356,30 @@ pub const AffectSystem = struct {
                 .heard_stimulus_f = heard_stimulus_f,
                 .familiarity = familiarity,
                 .behavior_exertion_f = if (ai_agents.behaviors[i] == .pursue or ai_agents.behaviors[i] == .flee) 1 else 0,
+                .crossing_bits = 0,
             });
         }
     }
 
-    fn prepareEventRangeBuffers(self: *AffectSystem, range_count: usize, items_per_range: usize, item_count: usize) !void {
-        try self.event_ranges.ensureTotalCapacity(self.allocator, range_count);
-        while (self.event_ranges.items.len < range_count) self.event_ranges.appendAssumeCapacity(.{});
-        for (self.event_ranges.items[0..range_count], 0..) |*slot, range_index| {
-            slot.buffer.clearRetainingCapacity();
-            const range_len = rangeLenForIndex(item_count, items_per_range, range_index);
-            // Worst case: all four drives cross a threshold for the same row
-            // in the same step, so this exact reserve can never overflow.
-            try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * affect_events_per_row_max);
-        }
-        // Holds every range's crossings at once for the canonical sort; the same
-        // all-drives-cross-every-row worst case as the range buffers combined.
-        try self.merge_scratch.ensureTotalCapacity(self.allocator, item_count * affect_events_per_row_max);
-    }
-
-    /// Serial merge after the parallel/serial compute pass: sums each range's
-    /// real (not worst-case) event count, applies this system's own
-    /// deterministic per-step cap in range-ascending, within-range-write-order
-    /// (truncating the tail rather than letting SimulationEvents's own
-    /// capacity check throw), then re-walks each range's scratch into
-    /// events's shared range-output stream. Mirrors
-    /// PerceptionSystem.mergePerceptionEvents.
-    fn mergeAffectEvents(
+    /// Main-thread crossing emit after the parallel/serial compute pass
+    /// (Slice 72 I2): popcounts the "crossed" bits of every row's
+    /// `crossing_bits` for the uncapped total, applies this system's own
+    /// deterministic per-step cap (truncating the tail rather than letting
+    /// `SimulationEvents`'s own capacity check throw), then writes the first
+    /// `max_events_per_step` crossings in (gather row, drive declaration)
+    /// order as one range. The order is fixed by construction, independent of
+    /// the partition, so there is no event scratch and no sort.
+    fn emitCrossingEvents(
         self: *AffectSystem,
         events: *SimulationEvents,
-        range_count: usize,
         max_events_per_step: usize,
     ) !AffectEventMergeResult {
-        // Gather every range's crossings, then sort into one canonical order so the
-        // merged stream and the cap's surviving set are independent of how many
-        // ranges the tuner chose (serial == threaded byte-for-byte). Emission stays
-        // per-column in the hot compute pass; this pass only touches the crossings
-        // that actually fired, so the common no-event step sorts an empty slice.
-        self.merge_scratch.clearRetainingCapacity();
-        for (self.event_ranges.items[0..range_count]) |*slot| {
-            self.merge_scratch.appendSliceAssumeCapacity(slot.buffer.events.items);
-        }
-        std.mem.sort(SimulationEvent, self.merge_scratch.items, {}, lessThanCrossing);
+        const rows = self.rows.slice();
+        const crossing_bits = rows.items(.crossing_bits);
+        const entities = rows.items(.entity);
 
-        const total = self.merge_scratch.items.len;
+        var total: usize = 0;
+        for (crossing_bits) |bits| total += @popCount(bits & crossed_mask);
         const crossed = @min(total, max_events_per_step);
         const dropped = total - crossed;
 
@@ -425,7 +388,25 @@ pub const AffectSystem = struct {
         try events.prefixAppendedRanges(first_range);
 
         var writer = events.rangeWriter(first_range);
-        for (self.merge_scratch.items[0..crossed]) |event| writer.write(event);
+        var remaining = crossed;
+        if (remaining > 0) {
+            emit: for (crossing_bits, entities) |bits, entity| {
+                if ((bits & crossed_mask) == 0) continue;
+                inline for (comptime std.enums.values(AiAffectDrive)) |drive| {
+                    if ((bits & crossedBit(drive)) != 0) {
+                        writer.write(.{ .stage = .domain_reaction, .payload = .{ .affect_threshold_crossed = .{
+                            .entity = entity,
+                            .drive = drive,
+                            .rising = (bits & risingBit(drive)) != 0,
+                        } } });
+                        remaining -= 1;
+                        if (remaining == 0) break :emit;
+                    }
+                }
+            }
+        }
+        // Declared count == written count: the popcount and this pass read
+        // the same column (`RangeWriter.finish` asserts it).
         writer.finish();
         events.finishWrite();
         events.stats.dropped += dropped;
@@ -446,19 +427,6 @@ const AffectEventMergeResult = struct {
     dropped: usize,
 };
 
-/// Total order over affect crossings by (entity, drive): partition-independent
-/// and unique per event (a drive crosses at most once per entity per step), so
-/// the sort is deterministic regardless of the range partition that produced it.
-/// Affect only ever emits `affect_threshold_crossed`, so the payload access is
-/// total.
-fn lessThanCrossing(_: void, a: SimulationEvent, b: SimulationEvent) bool {
-    const ca = a.payload.affect_threshold_crossed;
-    const cb = b.payload.affect_threshold_crossed;
-    if (ca.entity.index != cb.entity.index) return ca.entity.index < cb.entity.index;
-    if (ca.entity.generation != cb.entity.generation) return ca.entity.generation < cb.entity.generation;
-    return @backingInt(ca.drive) < @backingInt(cb.drive);
-}
-
 const AffectJobContext = struct {
     entities: []const EntityId,
     affect_dense_index: []const u32,
@@ -468,8 +436,9 @@ const AffectJobContext = struct {
     heard_stimulus_f: []const f32,
     familiarity: []const f32,
     behavior_exertion_f: []const f32,
+    crossing_bits: []u32,
     affect_slice: AiAffectSlice,
-    event_ranges: []AffectEventRangeSlot,
+    range_count: usize,
 };
 
 fn affectRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -479,13 +448,18 @@ fn affectRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 
 /// Shared serial/threaded per-range compute function: one vectorized pass per
 /// drive column (fear, aggression, curiosity, fatigue), each over the same
-/// row range. Order across the four passes is fixed and does not matter for
-/// correctness (the drives are independent), only for event-append order
-/// within the range's scratch buffer.
+/// row range. Order across the four passes does not matter: the drives are
+/// independent and each pass only ORs its own drive's bits into the range's
+/// rows' `crossing_bits` (the passes run sequentially within one range, so the
+/// row words are single-writer). Event order is decided later, by row, in
+/// `AffectSystem.emitCrossingEvents`.
 fn processAffectRange(job: *AffectJobContext, range: ParallelRange) void {
-    std.debug.assert(range.index < job.event_ranges.len);
+    // Dual worker asserts: range.index vs dispatched range count AND
+    // range.end vs the row columns this job writes.
+    std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.entities.len);
+    std.debug.assert(range.end <= job.crossing_bits.len);
     processFearColumn(job, range);
     processAggressionColumn(job, range);
     processCuriosityColumn(job, range);
@@ -535,14 +509,6 @@ fn checkThresholdCrossing(above_threshold: *u8, bit: u8, final: f32, threshold: 
     return null;
 }
 
-fn appendCrossingEvent(buffer: *AffectEventRangeBuffer, entity: EntityId, drive: AiAffectDrive, rising: bool) void {
-    buffer.appendAssumeCapacity(.{ .stage = .domain_reaction, .payload = .{ .affect_threshold_crossed = .{
-        .entity = entity,
-        .drive = drive,
-        .rising = rising,
-    } } });
-}
-
 /// dist/vision_range gate shared by fear and aggression: closer visible
 /// hostile -> larger ratio, clamped so an absent/zero-range row degrades to
 /// zero rather than a negative or unbounded value.
@@ -559,11 +525,10 @@ fn visibilityRatioScalar(dist: f32, vision_range: f32) f32 {
 fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const dist = job.nearest_threat_dist;
     const vision_range = job.vision_range;
-    const buffer = &job.event_ranges[range.index].buffer;
+    const crossing_bits = job.crossing_bits;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -584,7 +549,7 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fear, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fear, simd.toFloatArray(final), simd.toFloatArray(threshold));
+        markCrossings(crossing_bits, indices, s.above_threshold_mask, k, .fear, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -595,7 +560,7 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
         const final = combineDriveScalar(prev, delta, s.baseline_fear[index], s.decay_rate_fear[index]);
         s.fear[index] = final;
         if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fear), final, s.threshold_fear[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .fear, rising);
+            crossing_bits[k] |= crossingBits(.fear, rising);
         }
     }
 }
@@ -603,11 +568,10 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
 fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const dist = job.nearest_threat_dist;
     const vision_range = job.vision_range;
-    const buffer = &job.event_ranges[range.index].buffer;
+    const crossing_bits = job.crossing_bits;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -628,7 +592,7 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.aggression, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .aggression, simd.toFloatArray(final), simd.toFloatArray(threshold));
+        markCrossings(crossing_bits, indices, s.above_threshold_mask, k, .aggression, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -639,7 +603,7 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
         const final = combineDriveScalar(prev, delta, s.baseline_aggression[index], s.decay_rate_aggression[index]);
         s.aggression[index] = final;
         if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.aggression), final, s.threshold_aggression[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .aggression, rising);
+            crossing_bits[k] |= crossingBits(.aggression, rising);
         }
     }
 }
@@ -647,11 +611,10 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
 fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const heard_stimulus_f = job.heard_stimulus_f;
     const familiarity = job.familiarity;
-    const buffer = &job.event_ranges[range.index].buffer;
+    const crossing_bits = job.crossing_bits;
 
     const one = simd.splatFloat4(1);
     const zero = simd.splatFloat4(0);
@@ -678,7 +641,7 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.curiosity, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .curiosity, simd.toFloatArray(final), simd.toFloatArray(threshold));
+        markCrossings(crossing_bits, indices, s.above_threshold_mask, k, .curiosity, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -690,7 +653,7 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
         const final = combineDriveScalar(prev, delta, s.baseline_curiosity[index], s.decay_rate_curiosity[index]);
         s.curiosity[index] = final;
         if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.curiosity), final, s.threshold_curiosity[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .curiosity, rising);
+            crossing_bits[k] |= crossingBits(.curiosity, rising);
         }
     }
 }
@@ -698,9 +661,8 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
 fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const behavior_exertion_f = job.behavior_exertion_f;
-    const buffer = &job.event_ranges[range.index].buffer;
+    const crossing_bits = job.crossing_bits;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -726,7 +688,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fatigue, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fatigue, simd.toFloatArray(final), simd.toFloatArray(threshold));
+        markCrossings(crossing_bits, indices, s.above_threshold_mask, k, .fatigue, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -736,14 +698,22 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
         const final = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
         s.fatigue[index] = final;
         if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fatigue), final, s.threshold_fatigue[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .fatigue, rising);
+            crossing_bits[k] |= crossingBits(.fatigue, rising);
         }
     }
 }
 
-fn emitCrossings(
-    buffer: *AffectEventRangeBuffer,
-    entities: []const EntityId,
+/// `crossing_bits` word for one `drive` crossing: its "crossed" bit plus its
+/// "rising" bit on a rising edge.
+fn crossingBits(drive: AiAffectDrive, rising: bool) u32 {
+    return crossedBit(drive) | (if (rising) risingBit(drive) else 0);
+}
+
+/// Per-lane Schmitt-trigger check for one drive over rows `k..k + lane_count`,
+/// recording each crossing in the row's own `crossing_bits` word (no events
+/// here; `AffectSystem.emitCrossingEvents` emits them after the join).
+fn markCrossings(
+    crossing_bits: []u32,
     dense_indices: []const u32,
     above_threshold_mask: []u8,
     k: usize,
@@ -755,7 +725,7 @@ fn emitCrossings(
     inline for (0..simd.lane_count) |lane| {
         const dense_index = dense_indices[k + lane];
         if (checkThresholdCrossing(&above_threshold_mask[dense_index], bit, final[lane], threshold[lane])) |rising| {
-            appendCrossingEvent(buffer, entities[k + lane], drive, rising);
+            crossing_bits[k + lane] |= crossingBits(drive, rising);
         }
     }
 }
@@ -1175,9 +1145,10 @@ test "serial and threaded emit identical order and cap membership when different
     // Agent 0 (range 0) crosses aggression only; agent 16 (range 1) crosses
     // fear only. Per-column emission would order these by drive (fear before
     // aggression), making the serial (one range) stream disagree with the
-    // threaded (range-ascending) stream; per-row emission must yield row order
-    // (aggression@0 before fear@16) in both — and the cap must then truncate
-    // the same tail element in both.
+    // threaded (range-ascending) stream. Crossings are emitted after the join
+    // from per-row bits, in row order by construction (no sort), so both
+    // yield aggression@0 before fear@16 — and the cap then truncates the same
+    // tail element in both.
     var data_serial = DataSystem.init(testing.allocator);
     defer data_serial.deinit();
     var data_threaded = DataSystem.init(testing.allocator);
@@ -1227,8 +1198,7 @@ test "serial and threaded emit identical order and cap membership when different
     try testing.expectEqual(AiAffectDrive.fear, serial_items[1].payload.affect_threshold_crossed.drive);
 
     // Cap membership must also be partition-independent: cap=1 keeps the row-0
-    // aggression crossing (not the range-ascending or column-first winner) in
-    // both paths.
+    // aggression crossing (not the column-first fear winner) in both paths.
     events_serial.clearRetainingCapacity();
     events_threaded.clearRetainingCapacity();
     // Reset the above-threshold masks so both drives re-cross this step.
@@ -1290,14 +1260,26 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
     try testing.expectEqual(@as(usize, 1), stats.processed_count);
 }
 
-test "threaded update has no steady-state allocation after warmup (FailingAllocator)" {
+test "after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
+    // Slice 72 I2: the only reserved store is the gather rows (crossing bits
+    // included), so `reserve` alone (no warm step) covers the tuner's 64-item
+    // initial profile and the 16-item alignment floor on the real multi-worker
+    // path. Every row crosses fear on step 1. 96 rows put 32 in the 64-item
+    // partition's second range, which the old per-range event slots (reserved
+    // for 16 rows past slot 0) grew in-stage.
+    const row_total: usize = 96;
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    for (0..64) |i| {
-        const pursue: AiBehavior = if (i % 2 == 0) .pursue else .wander;
-        _ = try addAgentWithAffect(&data, .{ .active_behavior = pursue }, .{});
+    for (0..row_total) |_| {
+        _ = try addAgentWithPerceptionMemoryAffect(
+            &data,
+            .{ .active_behavior = .wander },
+            .{ .vision_range = 100, .target_visible = true, .nearest_threat_dist = 0 },
+            .{ .familiarity = 1 },
+            .{ .baseline_fear = 0.9, .decay_rate_fear = 1.0, .threshold_fear = 0.1 },
+        );
     }
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = affect_range_alignment_items });
@@ -1309,22 +1291,99 @@ test "threaded update has no steady-state allocation after warmup (FailingAlloca
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const config = AffectConfig{
-        .items_per_range = affect_range_alignment_items,
-        .max_worker_threads = 2,
-        .adaptive = false,
+    try sys.reserve(row_total);
+    try events.reserve(1, row_total * affect_events_per_row_max);
+
+    // resize_fail_index = 0 also catches in-place growth (a resize/remap that
+    // would not count as an allocation).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const original_system_allocator = sys.allocator;
+    const original_events_allocator = events.stream.allocator;
+    sys.allocator = failing.allocator();
+    events.stream.allocator = failing.allocator();
+    defer {
+        sys.allocator = original_system_allocator;
+        events.stream.allocator = original_events_allocator;
+    }
+
+    const partitions = [_]usize{ (AdaptiveWorkTunerConfig{}).initial_range_items, affect_range_alignment_items };
+    for (partitions, 0..) |items, step| {
+        // Mirrors `SimulationFrame.beginStep`'s per-step reset of `events`.
+        events.clearRetainingCapacity();
+        const stats = try sys.update(data.aiAgentSliceConst(), &data, &events, &threads, .{
+            .items_per_range = items,
+            .max_worker_threads = 2,
+            .adaptive = false,
+        });
+        try testing.expectEqual(row_total, stats.processed_count);
+        try testing.expectEqual(rangeCount(row_total, items), stats.batch.range_count);
+        try testing.expect(!stats.batch.ran_inline);
+        if (step == 0) try testing.expectEqual(row_total, stats.threshold_crossed_count);
+    }
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "crossings are emitted in (gather row, drive declaration) order, not entity-index order" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    // Both entities cross fear and aggression on the first step.
+    const poised: AiAffect = .{
+        .baseline_fear = 0.9,
+        .baseline_aggression = 0.9,
+        .decay_rate_fear = 1.0,
+        .decay_rate_aggression = 1.0,
+        .threshold_fear = 0.1,
+        .threshold_aggression = 0.1,
+    };
+    var entities: [2]EntityId = undefined;
+    for (&entities) |*entity| {
+        entity.* = try addAgentWithPerceptionMemoryAffect(
+            &data,
+            .{ .active_behavior = .wander },
+            .{ .vision_range = 100, .target_visible = true, .nearest_threat_dist = 0 },
+            .{ .familiarity = 1 },
+            poised,
+        );
+    }
+
+    var sys = AffectSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    // The think set lists entity 1's row first, so it is gather row 0.
+    const scope = [_]u32{ 1, 0 };
+    const expected = [_]struct { entity: EntityId, drive: AiAffectDrive }{
+        .{ .entity = entities[1], .drive = .fear },
+        .{ .entity = entities[1], .drive = .aggression },
+        .{ .entity = entities[0], .drive = .fear },
+        .{ .entity = entities[0], .drive = .aggression },
     };
 
-    try sys.reserve(64);
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &scope });
+    try testing.expectEqual(@as(usize, 4), stats.threshold_crossed_count);
+    const items = events.mergedItems();
+    try testing.expectEqual(expected.len, items.len);
+    for (expected, items) |want, event| {
+        const crossing = event.payload.affect_threshold_crossed;
+        try testing.expectEqual(want.entity, crossing.entity);
+        try testing.expectEqual(want.drive, crossing.drive);
+        try testing.expect(crossing.rising);
+    }
 
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const original_allocator = sys.allocator;
-    sys.allocator = failing.allocator();
-    defer sys.allocator = original_allocator;
-
+    // The cap keeps the first three in that same order and drops the last.
+    @memset(data.aiAffectSlice().above_threshold_mask, 0);
     events.clearRetainingCapacity();
-    const stats = try sys.update(data.aiAgentSliceConst(), &data, &events, &threads, config);
-    try testing.expectEqual(@as(usize, 64), stats.processed_count);
+    const capped = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &scope, .max_events_per_step = 3 });
+    try testing.expectEqual(@as(usize, 3), capped.threshold_crossed_count);
+    try testing.expectEqual(@as(usize, 1), events.stats.dropped);
+    const capped_items = events.mergedItems();
+    try testing.expectEqual(@as(usize, 3), capped_items.len);
+    for (expected[0..3], capped_items) |want, event| {
+        try testing.expectEqual(want.entity, event.payload.affect_threshold_crossed.entity);
+        try testing.expectEqual(want.drive, event.payload.affect_threshold_crossed.drive);
+    }
 }
 
 test "a tight event capacity forces a graceful drop instead of a throw" {
@@ -1363,7 +1422,10 @@ test "a tight event capacity forces a graceful drop instead of a throw" {
 
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .max_events_per_step = 1 });
     try testing.expectEqual(@as(usize, 1), stats.threshold_crossed_count);
-    try testing.expectEqual(@as(usize, 1), events.mergedItems().len);
+    const items = events.mergedItems();
+    try testing.expectEqual(@as(usize, 1), items.len);
+    // Row 0's first drive in declaration order survives the cap.
+    try testing.expectEqual(AiAffectDrive.fear, items[0].payload.affect_threshold_crossed.drive);
     // All 4 drives cross for both entities (8 real events); capped to 1.
     try testing.expectEqual(@as(usize, 7), events.stats.dropped);
     try testing.expect(sys.dropped_events_warned);

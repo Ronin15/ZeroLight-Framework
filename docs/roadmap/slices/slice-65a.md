@@ -10,7 +10,7 @@ lane-thread loop. The checklist item that consolidates
 its own commit.
 
 Goal:
-- The 64-byte thread-shared record rule has one owner, used by seven modules.
+- The 64-byte thread-shared record rule has one owner, used by six modules.
   Every padded slot type is checked at comptime against it.
 - Each worker's wake semaphore sits on its own line.
 - Per-range `SimulationEvents` stats and `RangeOutputStream` cursors sit on
@@ -23,22 +23,21 @@ Goal:
 
 ### Current foundation (do not rebuild)
 
-- **Seven private copies** of `const thread_shared_record_alignment: usize = 64;`:
+- **Six private copies** of `const thread_shared_record_alignment: usize = 64;`:
   - `systems/pathfinding/scratch.zig` (added by the Slice 72 Batch A review
     follow-up, which moved `SearchScratch` from `std.atomic.cache_line` to the
     64 B rule by measurement; see the slice-72 Status)
-  - `systems/affect.zig:154`
   - `systems/simulation_scope.zig:66`
   - `systems/spatial_index.zig:76`
   - `systems/pathfinding/nav_graph.zig:137`
   - `systems/collision.zig:97`
   - `systems/perception.zig:327`
-- **Five identical private `paddingForCacheLine(comptime T)` helpers**:
-  `affect.zig:156-159`, `spatial_index.zig:887-890`,
+- **Four identical private `paddingForCacheLine(comptime T)` helpers**
+  (Slice 72 I2 deleted affect's copy, its constant and `AffectEventRangeSlot`):
+  `spatial_index.zig:887-890`,
   `simulation_scope.zig:848-851`, `collision.zig:994-997`,
   `perception.zig:339-342`.
 - **The padded slot types they guard**:
-  - `AffectEventRangeSlot` (`affect.zig:179-185`)
   - `GatherTallySlot` (`simulation_scope.zig:584-592`, already with a comptime
     size assert; runtime size test `:1552`). Slice 72 C5 replaced the old
     `IndexRangeSlot` / `CommandRangeSlot` with windows plus this tally.
@@ -139,16 +138,15 @@ pub fn assertThreadSharedRecord(comptime T: type) void {
 }
 ```
 
-- **Each of the seven sites** replaces its private literal with a
+- **Each of the six sites** replaces its private literal with a
   direct-declaration import:
   - `const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;`
     (`nav_graph.zig` uses `../../../`, and already imports `thread_system.zig`
     at `:16-20`).
-  - The five `paddingForCacheLine` helpers are deleted. Call sites become
+  - The four `paddingForCacheLine` helpers are deleted. Call sites become
     `threadSharedRecordPadding(...)`.
 - **Each site** gains one `comptime` block that calls
   `assertThreadSharedRecord` for every slot type it owns:
-  - affect: `AffectEventRangeSlot`;
   - simulation_scope: `GatherTallySlot`;
   - spatial_index: `RowCountTally`;
   - collision: `BroadphaseRangeSlot`, `ContactCountTally`;
@@ -344,7 +342,7 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
 - [ ] (a) Shared rule in `src/app/thread_system.zig`:
   `thread_shared_record_alignment`, `threadSharedRecordPadding`,
   `assertThreadSharedRecord`.
-  - All seven sites switch to the import, and the five helper copies are
+  - All six sites switch to the import, and the four helper copies are
     deleted.
   - Each site gets a comptime block with `assertThreadSharedRecord` over
     every slot type listed above.
@@ -405,8 +403,8 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
     `SimulationEventStats.record`). The record is 8-byte aligned and not a
     whole number of lines, so adjacent ranges share a line at every boundary.
   - Why: today every production producer writes its event ranges from the main
-    thread (perception and affect stage into their own padded slots and merge
-    serially), so this is latent. The first producer that calls
+    thread (perception and affect derive their events from per-row state on the
+    main thread after the join, Slice 72 I1/I2), so this is latent. The first producer that calls
     `events.rangeWriter` from workers false-shares on every event. No slice
     currently plans a threaded event producer, so this slice owns the fix.
   - Fix shape: a padded slot
@@ -465,7 +463,7 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
 
 ### Acceptance checks
 
-- [ ] `zig build check` passes with the comptime asserts at all seven sites and
+- [ ] `zig build check` passes with the comptime asserts at all six sites and
   on `WorkerRecord`. `grep -rn "thread_shared_record_alignment: usize" src`
   returns only `src/app/thread_system.zig`.
 - [ ] `zig build test` passes, and so does `zig build test -Dsanitize-thread=true`

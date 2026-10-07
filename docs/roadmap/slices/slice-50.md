@@ -52,10 +52,10 @@ Goal:
   ≤ 88 bytes (`:1315-1320`). Allocation-free submission tests exist at `:2270`
   and `:2292`.
 - **Padding convention.** Six private copies of
-  `thread_shared_record_alignment: usize = 64` exist: `systems/affect.zig:154`,
-  `systems/simulation_scope.zig:66`, `systems/spatial_index.zig:76`,
+  `thread_shared_record_alignment: usize = 64` exist:
+  `systems/pathfinding/scratch.zig`, `systems/simulation_scope.zig:66`, `systems/spatial_index.zig:76`,
   `systems/pathfinding/nav_graph.zig:137`, `systems/collision.zig:97`,
-  `systems/perception.zig:317`. The rule is in `docs/coding-standards.md:352-353`.
+  `systems/perception.zig:327` (Slice 72 I2 removed affect's copy). The rule is in `docs/coding-standards.md:352-353`.
 - **Build.**
   - The test artifact is defined at `build.zig:160-168` and the bench artifact
     at `:154-158`. Run steps are at `:225-234`. Modules are created in

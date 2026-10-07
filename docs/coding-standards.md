@@ -163,20 +163,21 @@ grow-and-replay. Reference: `simulation_scope.zig`'s gathers and tier policy,
 `spatial_index.zig`'s gather, `collision.zig`'s narrowphase (Slice 72 C5).
 
 A pass whose events are a pure function of per-row state its workers already
-write (perception's prev/final nearest-threat columns) keeps no event scratch at
-all: the main thread derives and emits them in row order after the join as one
-range, so nothing partition-sized exists to reserve (Slice 72 I1).
+write (perception's prev/final nearest-threat columns, affect's per-row crossing
+bits) keeps no event scratch at all: the main thread derives and emits them in
+row order after the join as one range, so nothing partition-sized exists to
+reserve (Slice 72 I1/I2).
 
 A partitioned processor that **emits an event stream** (not just scatters values
 into disjoint slots) under a per-step cap has a second requirement beyond
 disjoint writes: the merged emit order — and therefore which events survive the
 cap — is canonical and partition-independent. Such processors emit in a stable
 key order (per row, with a row's sub-kinds grouped, as
-`PerceptionSystem.emitTransitionEvents` and `AffectSystem`'s per-row crossing
-emit do), or sort the merged buffer by that key before applying the cap. Emitting
-one sub-kind or column at a time across a whole range makes both the merged order
-and the capped membership depend on how many ranges the tuner picked, so
-serial/threaded output diverges even though the scatter is race-free. Parity
+`PerceptionSystem.emitTransitionEvents` and `AffectSystem.emitCrossingEvents`
+do) before applying the cap. Emitting one sub-kind or column at a time across a
+whole range makes both the merged order and the capped membership depend on how
+many ranges the tuner picked, so serial/threaded output diverges even though the
+scatter is race-free. Parity
 tests for these processors cross two or more event kinds for entities in
 different ranges and include a capped case — a single-kind fixture is row-ordered
 identically in both paths and hides the divergence.
