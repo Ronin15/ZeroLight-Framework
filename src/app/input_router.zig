@@ -5,7 +5,7 @@
 //! Allocation-free input routing for gameplay, UI, app command, and debug contexts.
 
 const std = @import("std");
-const inputFile = @import("input.zig");
+const input_file = @import("input.zig");
 const Action = @import("input.zig").Action;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
@@ -87,12 +87,12 @@ pub fn routeEventWithGamepad(
 ) void {
     switch (event.type) {
         c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP => {
-            const action = inputFile.actionForKey(event.key.key) orelse return;
+            const action = input_file.actionForKey(event.key.key) orelse return;
             routeAction(policy, action, event.type == c.SDL_EVENT_KEY_DOWN, event.key.repeat, input, commands);
         },
         c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, c.SDL_EVENT_GAMEPAD_BUTTON_UP => {
             if (!isActiveGamepadEvent(active_gamepad_id, event.gbutton.which)) return;
-            const action = inputFile.actionForGamepadButton(@intCast(event.gbutton.button)) orelse return;
+            const action = input_file.actionForGamepadButton(@intCast(event.gbutton.button)) orelse return;
             // Gamepad buttons never repeat: SDL does not synthesize repeat
             // events for held gamepad buttons the way it does for keys.
             routeAction(policy, action, event.type == c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, false, input, commands);

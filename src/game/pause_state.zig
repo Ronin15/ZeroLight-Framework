@@ -14,7 +14,7 @@ const PreparedText = text.PreparedText;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
-const inputFile = @import("../app/input.zig");
+const input_file = @import("../app/input.zig");
 const c = @import("../platform/sdl.zig").c;
 
 pub const PauseState = struct {
@@ -156,8 +156,8 @@ test "pause handleEvent returns false for resume shapes so FrameCommands can obs
     try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
 }
 
-fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_key_bindings) |binding| {
+fn keyEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_key_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .key = .{
                 .type = c.SDL_EVENT_KEY_DOWN,
@@ -177,8 +177,8 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
     unreachable;
 }
 
-fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_gamepad_bindings) |binding| {
+fn gamepadButtonEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_gamepad_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .gbutton = .{
                 .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,

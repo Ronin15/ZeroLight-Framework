@@ -11,7 +11,7 @@ const WorldBuildConfig = @import("world_system.zig").WorldBuildConfig;
 const RuntimeAudioSettings = @import("settings_menu_state.zig").RuntimeAudioSettings;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
-const inputFile = @import("../app/input.zig");
+const input_file = @import("../app/input.zig");
 const RenderContext = @import("../app/state.zig").RenderContext;
 const State = @import("../app/state.zig").State;
 const StateStack = @import("../app/state.zig").StateStack;
@@ -91,7 +91,7 @@ pub const LoadingState = struct {
         // (confirm) replace back to the main menu with preserved audio settings.
         // Pending stays non-consuming so FrameCommands can still observe process quit.
         if (self.phase != .failed) return false;
-        const action = inputFile.actionForPressEvent(event) orelse return false;
+        const action = input_file.actionForPressEvent(event) orelse return false;
         switch (action) {
             .quit, .resume_game => {
                 try self.returnToMainMenu(transitions);
@@ -613,8 +613,8 @@ fn deinitRuntimeAssetMetadataForTest(runtime_assets: *RuntimeAssets) void {
     }
 }
 
-fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_key_bindings) |binding| {
+fn keyEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_key_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .key = .{
                 .type = c.SDL_EVENT_KEY_DOWN,
@@ -634,8 +634,8 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
     unreachable;
 }
 
-fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_gamepad_bindings) |binding| {
+fn gamepadButtonEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_gamepad_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .gbutton = .{
                 .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,

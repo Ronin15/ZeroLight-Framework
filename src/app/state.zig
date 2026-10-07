@@ -14,7 +14,7 @@ const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const runtime_perf_log = @import("runtime_perf_log.zig");
 const log = @import("../core/logging.zig").app;
-const inputRouter = @import("input_router.zig");
+const input_router = @import("input_router.zig");
 const InputRoutingPolicy = @import("input_router.zig").InputRoutingPolicy;
 const renderer_file = @import("../render/renderer.zig");
 const Renderer = renderer_file.Renderer;
@@ -1114,7 +1114,7 @@ test "consumed modal event suppresses routed frame command" {
     var event = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_ESCAPE, false);
     const routing_policy = stack.inputRoutingPolicy();
     const consumed = try stack.handleEvent(&event, &transitions);
-    if (!consumed) inputRouter.routeEvent(routing_policy, &event, &input, &commands);
+    if (!consumed) input_router.routeEvent(routing_policy, &event, &input, &commands);
 
     try std.testing.expect(consumed);
     try std.testing.expect(!commands.wasPressed(.quit));
@@ -1187,13 +1187,13 @@ test "state stack input routing follows active state policy" {
     var input = InputState{};
     var commands = FrameCommands{};
     var move_down = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
-    inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
     try std.testing.expect(!input.isHeld(.move_left));
 
     try std.testing.expect(stack.remove(modal_handle));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
-    inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
     try std.testing.expect(input.isHeld(.move_left));
 
     _ = try stack.pushOpaque(TestingState, .{});
