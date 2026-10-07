@@ -600,7 +600,7 @@ pub const PathfindingSystem = struct {
             }
         else
             null;
-        var stats = self.graph.applyNavUpdates(
+        const stats = self.graph.applyNavUpdates(
             data,
             world,
             edits,
@@ -635,7 +635,6 @@ pub const PathfindingSystem = struct {
             self.clearRequestStateKeepingCompleted();
             self.dropGroupFields();
         }
-        stats.edge_hole_slots = self.graph.edge_hole_slots;
         return stats;
     }
 
@@ -905,8 +904,7 @@ pub const PathfindingSystem = struct {
         // stats accumulate in nav_link_cursor_pending until an apply succeeds (below).
         _ = try self.markNewNavLinksDirty(world);
 
-        // The hole gauge is reported every step, not only on steps that patch.
-        if (!self.hasPendingNavUpdates()) return .{ .edge_hole_slots = self.graph.edge_hole_slots };
+        if (!self.hasPendingNavUpdates()) return .{};
         try frame.events.ensureCanAppend(1);
         var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
         stats.links_deferred = self.nav_link_cursor_pending.deferred;
@@ -4419,7 +4417,7 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     // "compactChunkEdges zeroes the chunk's edge counts on overflow..." does — the point
     // under test is the growth/no-further-allocation CONTRACT, not this specific
     // geometry's edge count.
-    for (system.graph.chunk_edge_cap.items) |*cap| cap.* = 0;
+    for (system.graph.level_graphs.items[0].chunk_edge_cap.items) |*cap| cap.* = 0;
     const stats = try system.applyNavUpdates(&data, &world, edits.items);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     // The overflowing chunks grew their edge windows in place: still an incremental patch,

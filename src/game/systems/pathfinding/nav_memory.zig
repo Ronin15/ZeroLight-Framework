@@ -181,15 +181,16 @@ pub const NavMemoryBudget = struct {
         // Per-slot buffers (summed across levels): portals + portal_edge_start +
         // portal_edge_count + portal_order + chunk_label_keys + chunk_label_starts.
         const slot_buffers = slots *| (portal_node_bytes +| 5 *| @sizeOf(u32));
-        // Per-chunk lens (chunk_order_len + chunk_label_len), NavGraph geometry arrays, and the
-        // fixed-stride K-entry interior link-endpoint table.
-        const chunk_aux = levels *| chunk_count *| 2 *| @sizeOf(u32) +|
-            chunk_count *| 8 *| @sizeOf(u32) +|
+        // Per-level per-chunk arrays (chunk_order_len, chunk_label_len, chunk_edge_cap,
+        // chunk_edge_base), NavGraph geometry arrays, and the fixed-stride K-entry interior
+        // link-endpoint table.
+        const chunk_aux = levels *| chunk_count *| 4 *| @sizeOf(u32) +|
+            chunk_count *| 6 *| @sizeOf(u32) +|
             chunk_count *| nav_interior_link_slots_per_chunk *| @sizeOf(u32);
-        // Edge arena (edgeArenaSlots); plus the per-level edge_scratch staging buffer sized to
-        // the level's edge count.
+        // Edge arena (edgeArenaSlots); plus the build's one-level edge staging buffer
+        // (NavGraph.build_edge_scratch, reused level by level).
         const edge_buffers = self.edgeArenaSlots(width, height, levels) *| portal_edge_bytes +|
-            slots *| abstract_degree *| edge_scratch_bytes;
+            (slots / @max(@as(usize, 1), levels)) *| abstract_degree *| edge_scratch_bytes;
         // Global live link edges: one LinkEdge and up to two LinkEdgeRefs per world link.
         const link_edge_bytes = self.link_count *| (@sizeOf(LinkEdge) +| 2 *| @sizeOf(LinkEdgeRef));
         return cell_to_portal_bytes +| slot_buffers +| chunk_aux +| edge_buffers +| link_edge_bytes;
@@ -404,14 +405,14 @@ test "abstract slot term is levels * chunks * (4*ct + K) and links add only the 
     try std.testing.expectEqual(no_links + 1000 * per_link, linked.requiredBytes(256, 256));
 
     // One level's slot-scaled share: (4*ct + K) slots per chunk, each carrying the per-slot
-    // buffers, its abstract-degree edge arena share (slack-padded), and edge staging; plus the
-    // level's cell_to_portal, per-chunk lens, and per-chunk edge floor.
+    // buffers and its abstract-degree edge arena share (slack-padded); plus the level's
+    // cell_to_portal, per-chunk arrays, and per-chunk edge floor. The build's edge staging holds
+    // one level at a time, so it does not scale with levels.
     const chunks: usize = (256 / 16) * (256 / 16);
     const level_slots: usize = chunks * (4 * 16 + nav_interior_link_slots_per_chunk);
     const per_slot: usize = @sizeOf(PortalNode) + 5 * @sizeOf(u32) +
-        8 * @sizeOf(AbstractEdge) * default_edge_slack +
-        8 * (@sizeOf(u32) + @sizeOf(AbstractEdge));
-    const per_level_fixed: usize = 256 * 256 * @sizeOf(u32) + chunks * 2 * @sizeOf(u32) +
+        8 * @sizeOf(AbstractEdge) * default_edge_slack;
+    const per_level_fixed: usize = 256 * 256 * @sizeOf(u32) + chunks * 4 * @sizeOf(u32) +
         chunks * chunk_edge_floor * default_edge_slack * @sizeOf(AbstractEdge);
     const one_level = budget.abstractGraphBytes(256, 256, 1);
     const two_levels = budget.abstractGraphBytes(256, 256, 2);
