@@ -555,9 +555,26 @@ multi-worker patch path and the serial one.
 - [x] `zig build verify` passes. All E tests pass in Debug and ReleaseFast.
       The replaced deferral test is gone (`grep -n "deferred by the
       incremental patch" src/` is empty).
-- [ ] Manual (display, procedural demo): dig a ramp at a non-border cell on
+- [x] Manual (display, procedural demo): dig a ramp at a non-border cell on
       level 1. NPCs on level 1 path up it within a second, with no
-      save/load or restart.
+      save/load or restart. Confirmed by the owner 2026-10-06 (ReleaseSafe
+      battle demo): NPCs followed dug ramps out; perf dump showed 14 tile
+      changes → 13 incremental rebuilds, `full_relabel=0`, `links_deferred=0`,
+      `link_endpoints_unslotted=0`, both ramp refusal counters 0.
+- [ ] **Edge-window overflow after runtime ramps (found in the 2026-10-06
+      manual run).** Later in the same run the log printed
+      `nav abstract-graph edge-cap fallback: per-chunk edge window overflow,
+      full rebuild with slack 4`. The fallback is graceful but performs a
+      full nav rebuild (a potential frame hitch). Likely cause: runtime ramp
+      links now really add cross-level abstract edges (this slice's fix), and
+      the per-chunk edge window is not sized for the 8 interior link slots per
+      chunk. That window is a per-chunk layout capacity, so under the
+      capacity rule it must be sized for its true per-chunk maximum (portals +
+      8 link endpoints) at build, not overflow into a full rebuild. Steps:
+      zig-debug-specialist reproduces with a tiny fixture (dig ramps in one
+      chunk up to the 8-slot limit, assert no `edge_cap_fallback`); fix the
+      window sizing; incremental==full parity and `nav-update-links` /
+      `nav-update-scattered` bench gates; a test that fails on the old sizing.
 - [x] Capacity audit: the dirty-buffer `FailingAllocator` test passes serial
       and threaded, and `nav-update-scattered` / `nav-update-links` stay
       within max(3%, noise) of their recorded medians. Recorded 2026-10-06
