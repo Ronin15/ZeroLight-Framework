@@ -330,10 +330,6 @@ pub const NavUpdateStats = struct {
     // NavGraph.edge_windows_grown_reported). A cold, dig-triggered growth that keeps the update
     // an incremental patch (no rebuild, no version bump). 0 on the steady path.
     edge_windows_grown: usize = 0,
-    // Edge-arena compactions (NavGraph.compactEdgeArena, run by a window growth that reached
-    // the nav memory gate's arena ceiling) since the last successful batch reported them, on
-    // the same carry rule as edge_windows_grown. Cold; 0 on the steady path.
-    edge_compactions: usize = 0,
     // Gauge, not a per-batch delta: the graph's relocation holes (NavGraph.edge_hole_slots,
     // per-level arena slots no window references) after this batch. Recorded as a max.
     edge_hole_slots: usize = 0,
@@ -354,7 +350,6 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_version_bumps, metric(self.version_bumps));
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
         perf.recordMetric(.nav_edge_windows_grown, metric(self.edge_windows_grown));
-        perf.recordMetric(.nav_edge_compactions, metric(self.edge_compactions));
         perf.recordMetricMax(.nav_edge_hole_slots, metric(self.edge_hole_slots));
         perf.recordMetric(.pathfinding_links_deferred, metric(self.links_deferred));
         perf.recordMetric(.pathfinding_link_endpoints_unslotted, metric(self.link_endpoints_unslotted));
@@ -507,7 +502,8 @@ pub const PathfindingCapacity = struct {
     // many levels, it relabels every level (a loud, counted fallback) rather than
     // only the affected ones.
     nav_full_relabel_level_threshold: usize = default_nav_full_relabel_level_threshold,
-    // Build-time nav memory ceiling. Exceeding it fails the rebuild loudly.
+    // Build-time nav memory ceiling over the reserve-time stores (estimates). Exceeding it fails
+    // the rebuild loudly; runtime edge-arena growth is never refused by it.
     max_nav_memory_bytes: usize = default_max_nav_memory_bytes,
     // Managed shared-goal flow fields.
     max_group_fields: usize = default_max_group_fields,

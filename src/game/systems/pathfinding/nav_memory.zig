@@ -2,9 +2,10 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Build-time nav memory budget gate. Estimates resident nav memory from world
-//! dimensions and reserve config and fails loud (NavGridError.NavWorldTooLarge)
-//! before a rebuild can allocate past the configured ceiling.
+//! Build-time nav memory budget gate. Estimates the reserve-time nav stores from
+//! world dimensions and reserve config and fails loud (NavGridError.NavWorldTooLarge)
+//! before a rebuild reserves past the configured ceiling. Runtime-growing data (the
+//! abstract edge arena) is estimated here but never refused after the build.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -195,28 +196,14 @@ pub const NavMemoryBudget = struct {
     }
 
     // The gate's edge-arena estimate summed over `levels` arenas: the slot count times the
-    // abstract degree plus a per-chunk floor, padded by the slack multiplier. Shared by
-    // abstractGraphBytes and edgeArenaSlotLimit so both read one formula.
+    // abstract degree plus a per-chunk floor, padded by the slack multiplier. A build-time
+    // estimate only: the arena is runtime-growing data (NavGraph grows it on demand at the
+    // patch seam), never refused by this gate.
     fn edgeArenaSlots(self: NavMemoryBudget, width: usize, height: usize, levels: usize) usize {
         const ct = @max(@as(usize, 1), self.chunk_tiles);
         const chunk_count = ((width + ct - 1) / ct) *| ((height + ct - 1) / ct);
         const slots = levels *| chunk_count *| ((4 *| ct) +| nav_interior_link_slots_per_chunk);
         return (slots *| abstract_degree +| levels *| chunk_count *| @as(usize, chunk_edge_floor)) *| @as(usize, default_edge_slack);
-    }
-
-    // Per-level edge-arena slot ceiling that incremental edge-window growth
-    // (NavGraph.relocateChunkEdgeWindow) must respect: the gate's own per-level arena estimate
-    // plus this budget's unused headroom (max_bytes - requiredBytes) spread over every level's
-    // arena. An arena within it keeps resident nav memory within max_bytes, so growth never
-    // allocates past the ceiling the build was admitted under. Saturates at the arena's u32
-    // index width; 0 when the gate itself rejects. Pure.
-    pub fn edgeArenaSlotLimit(self: NavMemoryBudget, width: usize, height: usize) u32 {
-        const required = self.requiredBytes(width, height);
-        if (required > self.max_bytes) return 0;
-        const levels = @max(@as(usize, 1), self.level_count);
-        const estimate_slots = self.edgeArenaSlots(width, height, levels) / levels;
-        const headroom_slots = (self.max_bytes - required) / (levels *| portal_edge_bytes);
-        return std.math.cast(u32, estimate_slots +| headroom_slots) orelse std.math.maxInt(u32);
     }
 
     // Pure validation helper: returns the error and stays log-free. A lifecycle
@@ -471,23 +458,4 @@ test "requiredBytes counts AbstractScratch memory: a bigger max_abstract_nodes r
     var large = testBudget(std.math.maxInt(usize));
     large.max_abstract_nodes = 8192;
     try std.testing.expect(large.requiredBytes(256, 256) > small.requiredBytes(256, 256));
-}
-
-test "edgeArenaSlotLimit is the per-level arena estimate plus the budget's headroom" {
-    // Window growth may use the gate's own per-level edge-arena share plus whatever the
-    // ceiling leaves unused, and no more: an exactly-admitted budget yields the estimate, each
-    // spare edge per level adds one slot, and a rejected budget yields 0.
-    var budget = testBudget(std.math.maxInt(usize));
-    budget.level_count = 2;
-    const required = budget.requiredBytes(64, 64);
-    budget.max_bytes = required;
-    const estimate = budget.edgeArenaSlots(64, 64, 2) / 2;
-    try std.testing.expect(estimate > 0);
-    try std.testing.expectEqual(@as(u32, @intCast(estimate)), budget.edgeArenaSlotLimit(64, 64));
-    budget.max_bytes = required + 2 * @sizeOf(AbstractEdge) * 10;
-    try std.testing.expectEqual(@as(u32, @intCast(estimate + 10)), budget.edgeArenaSlotLimit(64, 64));
-    budget.max_bytes = required - 1;
-    try std.testing.expectEqual(@as(u32, 0), budget.edgeArenaSlotLimit(64, 64));
-    budget.max_bytes = std.math.maxInt(usize);
-    try std.testing.expectEqual(std.math.maxInt(u32), budget.edgeArenaSlotLimit(64, 64));
 }
