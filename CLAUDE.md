@@ -1,8 +1,7 @@
 # CLAUDE.md
 
-Directory `CLAUDE.md` files hold area rules (`src/render/`,
-`src/game/`, `src/game/systems/pathfinding/`, `src/benchmarks/`,
-`docs/roadmap/`).
+Durable repo guidance. Rules are owned by the docs below; this file summarizes
+and points.
 
 ## Project Snapshot
 

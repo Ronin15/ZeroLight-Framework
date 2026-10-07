@@ -353,6 +353,8 @@ reasoning trail.
   `gpu-smoke`.
 - Terrain contract tests cover a multi-chunk one-step change and repeated
   dig/fill.
+- An incremental path (nav patch, repack) gets an incremental == full-rebuild
+  parity test.
 - Use the smallest `WorldSystem`/`DataSystem` fixture that exercises the
   behavior (a `1x1` world still has one real chunk).
 - Only a test of growth or capacity at scale gets a larger populated world.
