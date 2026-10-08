@@ -6,7 +6,7 @@ Range: `main..ai_update3`
 
 Base: `b39a46f` (`Merge pull request #10 from Ronin15/ai_update2`)
 
-Tip: the README commit `3d95821` plus this changelog commit
+Tip: the guidance and roadmap overhaul commits after `1580fe0`
 
 ## Summary
 
@@ -109,8 +109,9 @@ These contracts are unchanged:
 - **Slice 64E:**
   - runtime level links patch both levels incrementally, using interior link
     slots and a link cursor;
-  - a chunk's interior link capacity grows (floor 8, then doubling) through a
-    full relabel on the step a ramp needs it; the ramp refusal is gone;
+  - a chunk's interior link capacity grows in place (floor 8, then doubling)
+    on the step a ramp needs it: slot windows shift and slot indices are
+    remapped, with no relabel; the ramp refusal is gone;
   - incremental patches match a full rebuild, serial and threaded;
   - a failed growth still patches the whole dirty set;
   - link-cursor and growth stats survive a failed step;
@@ -118,6 +119,9 @@ These contracts are unchanged:
 - **Slice 64F:** per-level windows, `repackLevelEdges` on overflow (allocate
   before mutate, so an OOM leaves the old layout valid), and a level-by-level
   relabel.
+- Gameplay-reachable nav-memory refusals are removed.
+- **Slice 64G** (open) replaces the per-level terrain and nav storage with
+  chunk-owned storage, so a local change costs only the chunks it touches.
 - **New benches:** `nav-update-links`, `nav-update-links-dense`,
   `nav-update-cave-in` and `nav-update-cave-in-warm`.
 
@@ -133,27 +137,28 @@ These contracts are unchanged:
 ## Roadmap, Standards, And Tooling
 
 - The roadmap is split into an index, one file per slice, an archive and
-  tracks.
-- Slices 49–72 hold the VoidLight feature port. Full localization is under
-  Deferred By Owner.
-- **New rules:**
-  - budgets, capacities and thresholds are three separate rules;
-  - no backlog dumping, so every follow-up is a checklist item in a slice;
-  - comments stay as short as their contract allows;
-  - code takes the plain, obvious form over clever code.
-- **Agent definitions:**
-  - the implementer runs `check` + `test` + `idiom-lint` per commit and a full
-    `verify` once per batch;
-  - design plans are sized to the decision.
+  tracks. Slices 49–72 plan the next feature set (VoidLight is a feature
+  parity reference only). Full localization is under Deferred By Owner.
+- **Rules move to `.claude/rules/`:** `docs/coding-standards.md` is replaced
+  by one rule file per topic, path-scoped where a rule is area-specific, with
+  the conflicts between rule texts resolved. Docs describe and cite rules;
+  slices hold goals, specs, checklists, and acceptance only.
+- **Rules added or clarified:** the cost model and target scale come first;
+  the chunk owns terrain and nav storage and work; budgets, capacities, and
+  thresholds are separate; no backlog dumping; terse comments; plain code over
+  clever code; one bench comparison protocol.
+- **Tooling:** CLAUDE.md is a short index; the four specialists keep only role,
+  procedure, and output format and read the matching rule files; the review
+  workflows share one severity scale and a structural/local tag and propose
+  rule-file edits instead of agent guidance; a shared `settings.json` and a
+  `zig fmt` hook.
 - The README was updated to the current feature set.
 
 ## Known Open Items
 
 - **64E:** a post-fix manual ramp check on current code (display-gated).
-- **64F:**
-  - a recorded cave-in bench;
-  - a repack prefix trim;
-  - a threaded level repack, gated on the Slice 69A soak.
+- **64G:** chunk-owned terrain and nav, which supersedes 64F's open items
+  (cave-in bench record, repack prefix trim, threaded repack).
 - **65B:**
   - non-fatal failure states;
   - the swap rule on a refusal.
@@ -280,3 +285,16 @@ These contracts are unchanged:
 - `10e5d8c` README: keep feature bullets at overview level
 - `7ae6be1` README: one-line AI and interactables bullets; list Python 3 requirement
 - `3d95821` README: frame destructibles as the destruction/construction foundation
+- `c87b867` Add the ai_update3 changelog
+- `6a18c73` Align agent, workflow, and rule files with current owner decisions
+- `0b00252` Rename file-namespace imports to snake_case per coding standards
+- `d56e634` Give every guidance rule one owner and point everywhere else at it
+- `d6a7305` Concise, context-aware guidance: one owner per rule, directory CLAUDE.md files
+- `6aa0c72` Remove gameplay-reachable nav-memory refusals
+- `334e8d0` Drop slice and review references from code comments
+- `edba22b` Directory guidance fixes
+- `b6a5b5c` Coding standards: terse rule lists per section
+- `40064d5` Single root CLAUDE.md: fold directory guidance back into its owner docs
+- `61d2f6a` Grow nav interior link capacity per chunk; remove the ramp refusal
+- `ecbac6c` Guidance: design for target scale and multiple worlds; local changes cost local work
+- `1580fe0` tooling updates
