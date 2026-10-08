@@ -368,7 +368,7 @@ zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --detail
 zig build bench -- --group nav-update-scattered --details
 zig build bench -- --group nav-update-multichunk --details
 zig build bench -- --group scope --details
-zig build -Doptimize=ReleaseFast bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
+zig build bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
 zig build bench -- --details
 ```
 

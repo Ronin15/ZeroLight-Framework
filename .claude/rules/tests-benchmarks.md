@@ -44,7 +44,7 @@ paths:
 - Run targeted groups (`zig build bench -- --group <name>`), never the full
   suite filtered; full sweeps only when the owner or a slice asks.
 - Bench only changes that can move a hot path. Compare before/after on adjacent
-  commits in ReleaseFast with 3 interleaved reps and medians; a regression is a
+  commits in Debug with 3 interleaved reps and medians; a regression is a
   change beyond the run-to-run spread.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
