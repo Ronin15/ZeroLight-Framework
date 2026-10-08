@@ -7,11 +7,24 @@ ease work. Owner decisions are not reopened.
 
 ## Target scale
 
-- This is engine core for a large, growing, multi-world simulation; the demo is
-  a test harness. Its sizes, populations, and counts are never design, sizing,
-  or acceptance inputs.
+- This is engine core for a fully simulated, growing, multi-world game; the
+  demo is a test harness. Its sizes, populations, and counts are never design,
+  sizing, or acceptance inputs.
+- Everything that exists keeps advancing, in every world. Distance from
+  players lowers fidelity, never stops progress: far-off AI thinks on slower
+  ticks while cheap processors such as movement stay near full rate. Dormant is
+  for inert things only (items at rest), which still change slowly (decay
+  outdoors).
+- Population that matters (villagers, people, NPCs) persists and keeps
+  advancing wherever it is; only unimportant ambient spawns (stray monsters,
+  animals) may be recycled far from players.
+- The chunk `(level, cx, cy)` is the unit of terrain and nav storage, change,
+  work, threading, and save. Nav covers the whole world; residency is a
+  chunk's storage form, never whether it simulates.
+- Worlds (persistent worlds, dungeons) are created and destroyed in play and
+  own their storage.
 - Target scale is a floor: 2048² levels, deep stacks that grow in play, several
-  worlds created and destroyed in play, large populations.
+  worlds, large populations.
 - Dense multi-chunk terrain change in one step (cave-ins, explosions) is normal
   gameplay.
 
@@ -24,7 +37,8 @@ Every design, and every fix touching storage or per-change work, states:
   dense one-step change (an explosion region), and creating or destroying a
   world, level, or dungeon. Concrete sizes only illustrate an order.
 - Pass: local-change cost depends only on what changed; memory follows what
-  exists and is released with it; nothing is sized from demo constants.
+  exists and is released with it; nothing is sized from demo constants;
+  nothing stops advancing because no player is near.
 - The serial and threaded paths (`threading.md`).
 - Each order marked measured (bench group) or derived; a derived number is
   never presented as measured. Hot-path orders are measured

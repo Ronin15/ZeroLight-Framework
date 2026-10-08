@@ -8,8 +8,9 @@ atlas-backed assets addressed by stable IDs. Gameplay is data-oriented: dense
 **SoA** stores (`DataSystem`, `WorldSystem`), a state-owned
 `SimulationPipeline`, scoped simulation tiers, and multithreaded/SIMD
 processors. The game built on it is dig/build with cave-ins and explosions.
-This is engine core for a large multi-world simulation; the demo is a test
-harness (`.claude/rules/engine-design.md`).
+This is engine core for a fully simulated, multi-world game: everything that
+exists advances every step, with fidelity falling off with distance from
+players; the demo is a test harness (`.claude/rules/engine-design.md`).
 
 ## Rules And Docs
 
@@ -25,7 +26,8 @@ harness (`.claude/rules/engine-design.md`).
 - Roadmap: `docs/framework-implementation-slices.md` (index, ground rules,
   suggested order); one file per open slice in `docs/roadmap/slices/`; shared
   tables in `docs/roadmap/tracks/`; settled slices in `docs/roadmap/archive/`.
-  Slices hold goals, specs, checklists, and acceptance only, never rules.
+  Slices hold intent and data (goal, current foundation, constraints,
+  checklist, acceptance), never rules or designs.
 - `docs/changelogs/` (one per branch), `docs/reviews/`.
 
 ## Module Ownership
@@ -57,8 +59,9 @@ orchestrates, verifies every agent claim against live code, and reports.
 - Every non-trivial brief carries the cost model
   (`.claude/rules/engine-design.md`) and names the files in scope, so the agent
   reads the matching rule files.
-- `zig-design-specialist` when a design is open or the existing structure fails
-  the cost model; local fixes go straight to `zig-specialist`.
+- `zig-design-specialist` opens every slice, right before implementation, and
+  runs whenever a design is open or the existing structure fails the cost
+  model; local fixes go straight to `zig-specialist`.
 - `zig-review-specialist` once per batch. Every real finding is reported and
   checked against live code; structural findings go to design, local ones to
   `zig-specialist`; lows are fixed in the batch or become a checklist item in

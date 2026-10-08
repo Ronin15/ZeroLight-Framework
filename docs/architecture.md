@@ -7,18 +7,24 @@ built; the rules it follows live in `.claude/rules/`.
 
 ## Target Model
 
-The engine core serves a large simulation of many worlds that keeps growing;
-the demo state is a harness that exercises this model, not the model. Designs
-start here, then read the live structure below (cost model:
-`.claude/rules/engine-design.md`).
+The engine core serves a fully simulated game of many worlds that keeps
+growing; the demo state is a harness that exercises this model, not the model.
+Designs start here, then read the live structure below (rules:
+`.claude/rules/engine-design.md` § Target scale and § Cost model).
 
+- **Fully simulated:** everything that exists keeps advancing, in every
+  world; distance from players lowers fidelity (far-off AI thinks on slower
+  ticks, movement stays near full rate). `dormant` is for inert things only.
 - **World instance:** independent, created and destroyed in play (persistent
-  worlds, temporary dungeons); owns all its storage, released on unload.
+  worlds, temporary dungeons); owns all its storage, released on destroy.
 - **Level:** a world's stack grows in play; a level holds a directory of its
   chunks, never data sized to its area.
 - **Chunk** `(level, cx, cy)`: the unit of terrain and nav storage, change,
-  threading, residency, and save. A dig, ramp, or cave-in costs work in the
-  chunks it touches.
+  work, threading, and save. A dig, ramp, or cave-in costs work in the chunks
+  it touches. Nav covers the whole world; residency is a chunk's storage form,
+  never its presence in the simulation.
+- **Nav:** processed per chunk, so threading scales with any number of
+  requests under a fixed per-step budget.
 - **Populations, items, links:** grow in play at the structural-commit seam.
 - **Scale:** 2048² levels, deep stacks, and several worlds are a floor; work
   and memory follow what changed and what exists, never extent × world count.
@@ -477,10 +483,12 @@ ranges. Scope bounds active work per step; benches at large counts show how
 each stage scales (`.claude/rules/tests-benchmarks.md`).
 
 The durable tier model is capability-based, not visibility-based:
-`dormant` entities exist but do not enter normal active scope, `kinematic`
+`dormant` entities exist but do not enter normal active scope (today every
+row not `always_active` past `kinematic_halo_chunks` of the sim-view region;
+the Target Model keeps `dormant` for inert things), `kinematic`
 entities run movement integration, `locomotion` entities add collision
 detection/response, and `cognition` entities add AI, steering, and path
-requests. Scope then decides which loaded worlds, chunks, chunk halos, or
+requests. Scope then decides which worlds, chunks, chunk halos, or
 staggered/reduced-cadence groups enter those tiered stages for the current
 fixed step.
 

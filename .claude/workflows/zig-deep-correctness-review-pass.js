@@ -237,7 +237,7 @@ const synthesis = await agent(
     ``,
     `Split the output cleanly: top_bugs (confirmed real defects ranked by severity, each with a concrete fix direction), test_gaps (highest-value untested load-bearing invariants ranked by blast radius, each with the narrow scenario to add), and durable_items (only genuinely net-new lint rules or rule-file lines — read tools/lint_idioms.py and every .claude/rules/ file first and do not duplicate; a new technical rule targets the rule file that owns its topic and is consistent with every existing rule). Be precise and non-duplicative; a clean result with few items is fine.`,
     ``,
-    `Each top_bugs fix_direction and test_gaps scenario names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
+    `Each top_bugs fix_direction and test_gaps scenario names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>' stated as intent and constraints, never a design; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
     ``,
     `Verified findings:`,
     digest,

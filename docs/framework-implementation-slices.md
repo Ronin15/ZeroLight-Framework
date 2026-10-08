@@ -3,8 +3,8 @@
 The roadmap index and agent implementation contract. Work is organized as
 numbered **slices**: one complete, verifiable feature each, with a **Goal**,
 **Checklist**, and **Acceptance checks**. Technical rules live only in
-`.claude/rules/`; this file holds roadmap process, and slice files hold goals,
-specs, checklists, and acceptance, never rules.
+`.claude/rules/`; this file holds roadmap process, and slice files hold intent
+and data (section shape below), never rules or designs.
 
 **Layout.** Each open slice or sub-slice is one file under
 [`roadmap/slices/`](roadmap/slices/); settled slices are one file each under
@@ -38,7 +38,8 @@ files it links. Do not load the whole roadmap.
   Suggested Order annotation. Never delete acceptance history.
 - **No backlog dumping.** Design and review never park follow-ups as bare
   Scaling Gaps/backlog lines: each becomes a Checklist item in its owning slice
-  or a decision-complete new slice (Status may be "gated on <trigger>").
+  or a new slice stated as intent and constraints (Status may be "gated on
+  <trigger>").
   Scaling Gaps holds only measured pressure points awaiting a benchmark. "Out
   of scope" names the owning slice. Agent briefs never ask for Scaling Gaps
   lines. Only the owner adds [**Deferred By Owner**](#deferred-by-owner)
@@ -78,13 +79,19 @@ files it links. Do not load the whole roadmap.
    **Goal**, **Current foundation**, and **Architecture notes**, plus
    architecture.md, the header's track file, and any doc the slice links; no
    other slice files unless linked.
-3. **Implement only that slice's scope** in the owning `src/` modules.
-4. **Check off Checklist items** as each lands with its tests. Items marked
+3. **Design pass, right before implementation.** `zig-design-specialist`
+   designs the slice against the live code and current rules; the slice's Goal
+   and Architecture notes are fixed inputs, so it designs how, not what, and
+   live code wins over stale Current foundation facts. The main session writes
+   the plan's steps into the Checklist, one outcome per line, and checks those
+   off; the design itself stays out of the slice file.
+4. **Implement only that slice's scope** in the owning `src/` modules.
+5. **Check off Checklist items** as each lands with its tests. Items marked
    "(added by Slice N)" are part of this slice's scope.
-5. **Pass every Acceptance check.**
-6. **Update durable docs** (`architecture.md`, rendering/sim docs) when
+6. **Pass every Acceptance check.**
+7. **Update durable docs** (`architecture.md`, rendering/sim docs) when
    contracts change, and Tables T1–T6 when a number moves.
-7. **Set Status**, run `zig build verify`, and when complete archive the file
+8. **Set Status**, run `zig build verify`, and when complete archive the file
    (Ground Rules). Follow-ups go into a slice Checklist or a new slice file.
 
 ### Standard slice section shape
@@ -94,15 +101,19 @@ files it links. Do not load the whole roadmap.
 | Header line | Roadmap index link · Depends on (linked slices) · Track |
 | **Goal** | What "done" means for this chunk |
 | **Current foundation** | What already exists; build on it unless it fails the cost model (`.claude/rules/engine-design.md`), then replace it |
-| **Architecture notes** / **Problem** | Constraints and ownership boundaries |
-| **Checklist** | `[ ]` / `[x]` implementation steps — check off as you land each |
+| **Architecture notes** / **Problem** | Constraints and ownership boundaries, citing rule files; never an internal design |
+| **Checklist** | `[ ]` / `[x]` intent-level steps, refined by the design pass — check off as you land each |
 | **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
 | **Status** | One line near the top: open/partial note, or a completion record before the archive move |
 
-Some fields are optional for early foundation slices. Slices hold goals,
-design and spec data, checklists, and acceptance only: no rules, review logs,
-bench tables, dated status logs, or superseded designs (those go in commit
-messages and changelogs). A checked item is one line naming what landed. A
+Some fields are optional for early foundation slices. Slices hold intent and
+data only: goal, current-code facts, measured numbers, owner decisions,
+constraints, checklist, and acceptance. They carry no rules, internal designs
+(structs, field layouts, algorithms, batch scripts, other slices' internals),
+review logs, bench tables, dated status logs, or superseded designs (those go
+in commit messages and changelogs). A slice states what it needs from another
+slice as an outcome, never that slice's internals. Index rows are one short
+line of open work. A checked item is one line naming what landed. A
 slice may land across several commits, one per logical change.
 
 ## Open Frontier Slice Index
@@ -226,7 +237,7 @@ residual only); open work grows beside that loop.
 ## Deferred By Owner
 
 Product work the owner explicitly deferred: not slices, no design. When an
-entry's trigger trips, design a decision-complete slice and remove the entry.
+entry's trigger trips, write a slice for it and remove the entry.
 Only the owner adds entries (Ground Rules).
 
 - **Full localization.** Per-locale string tables with validation, a locale

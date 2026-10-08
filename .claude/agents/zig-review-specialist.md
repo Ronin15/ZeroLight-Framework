@@ -50,7 +50,8 @@ model; routes to design) or **local**.
    depth, world count, or total links/cells instead of what changed or exists;
    is a size or acceptance number taken from the demo or a bench count; does
    world/level create, destroy, or growth force whole-world work; does it patch
-   around a shared structure that the existing partition unit could own?
+   around a shared structure that the existing partition unit could own; does
+   anything stop advancing because no player is near?
 2. **Rule pass**: check the change against each loaded rule file.
 3. **Contract pass**: the owning doc's described contracts
    (`docs/architecture.md`, `docs/state-stack-and-input.md`,
@@ -59,7 +60,7 @@ model; routes to design) or **local**.
    scenario that would expose a regression.
 5. **Roadmap docs**: check against the roadmap index § Ground Rules (bare
    backlog lines, "out of scope" without an owning slice, leftover TBDs, rule
-   text in a slice).
+   text or an internal design in a slice).
 
 ## Output
 

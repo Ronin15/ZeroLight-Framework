@@ -27,7 +27,8 @@ touch. Follow them and cite them by file; never restate them.
 
 1. Read the owning file, its adjacent tests, and the doc that owns the area
    (`CLAUDE.md` § Rules And Docs). For a slice: the roadmap index, the slice
-   file, and the track files it links. Never rely on roadmap memory or chat
+   file, the track files it links, and the design pass's plan; implement from
+   the plan, never from slice prose alone. Never rely on roadmap memory or chat
    summaries for exact details.
 2. Restate the brief's cost model. If the existing structure cannot pass it,
    stop and say so instead of patching around it.

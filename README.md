@@ -23,7 +23,7 @@ simulation, richer emergent AI, and production-friendly asset workflows.
 - **Fixed-step simulation** — 60Hz gameplay with AI, steering, pathfinding,
   movement, collision, particles, and small domain controllers (dig, audio,
   interactables).
-- **Scoped simulation** — full detail near the camera, cheaper tiers farther
+- **Scoped simulation** — full detail near players, cheaper tiers farther
   out.
 - **Dig-aware pathfinding** — NPCs path across levels and use newly dug
   tunnels and ramps right away.

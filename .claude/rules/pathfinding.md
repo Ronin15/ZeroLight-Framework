@@ -10,6 +10,12 @@ paths:
 
 How it works: `docs/architecture.md` (pathfinding sections).
 
+- Nav is processed per chunk so threading scales with any number of requests:
+  updates fan out over dirty chunks, requests over request ranges against the
+  read-only graph, and a request's work and scratch follow the chunks it
+  touches, never level cells.
+- The per-step request budget is a fixed count, independent of worker count;
+  requests past it defer deterministically.
 - Path results are consumed on later steps and never stall same-step movement.
 - Cache and pending keys are goal-keyed (`nav_version`, `agent_class`,
   `goal_level`, `goal_cell`).

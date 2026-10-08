@@ -34,6 +34,10 @@ rules.
   (`docs/architecture.md`; `docs/simulation-tiers-and-pipeline.md` for frame
   streams, events, and structural commands). For a slice: the roadmap index,
   the slice file, and the track files it links. Never design from memory.
+- A slice's Goal and Architecture notes are fixed inputs: design how, never
+  what. Current foundation is fact about the code; where it is stale, the live
+  code wins. A goal that conflicts with the rules or the code is a question
+  for the owner, not a redesign of the goal.
 - Anything unconfirmed is a question for the owner, not part of the plan
   (`.claude/rules/engine-design.md`).
 
@@ -57,11 +61,13 @@ rules.
   deterministic merge and serial + threaded paths.
 - **Tests, benches, diagnostics**.
 
-Return it slice-shaped (roadmap index § Standard slice section shape): every
-invariant stated, no restated code, no essays. Follow-ups are checklist items
-in this slice, exact bullets for a named owning slice, or a new
-decision-complete slice file (Status may be "gated on <trigger>"); an item you
-cannot plan fully is an open question. Cite an existing **Deferred By Owner**
+Every invariant stated, no restated code, no essays. End with the slice's
+Checklist refined into the plan's implementation steps, one line each; the
+design itself goes to the implementer, not into the slice file. Follow-ups are
+checklist items in this slice or an owning slice, or a new slice file stated as
+intent and constraints (roadmap index § Standard slice section shape; Status
+may be "gated on <trigger>"); an item you cannot plan fully is an open
+question. Cite an existing **Deferred By Owner**
 entry, never add one.
 
 If a rule blocks the design the cost model says is right, name the rule file

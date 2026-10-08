@@ -120,7 +120,7 @@ const allFindings = {
 const report = await agent(
   `Assessment mode. Synthesize the following architectural analysis findings into a comprehensive assessment report for the ZeroLight-Framework.
 
-CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.17 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events. Judge against the engine's target (.claude/rules/engine-design.md, docs/architecture.md § Target Model): many worlds created and destroyed in play, growing levels and populations; the demo is a harness, never the yardstick.
+CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.17 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events. Judge against the engine's target (.claude/rules/engine-design.md, docs/architecture.md § Target Model): a fully simulated game where everything that exists advances every step at a fidelity set by distance from players, many worlds created and destroyed in play, growing levels and populations; the demo is a harness, never the yardstick.
 
 DOC ANALYSIS FINDINGS:
 ${JSON.stringify(allFindings.docs, null, 2)}
@@ -153,7 +153,7 @@ Write a structured assessment report covering:
 
 7. **Risk Register** (top 5 architectural risks with mitigation paths)
 
-Each follow-up (next step, risk, fix, or test gap) names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line.
+Each follow-up (next step, risk, fix, or test gap) names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>' stated as intent and constraints, never a design; never a Scaling Gaps/backlog line.
 
 Return the full report as plain markdown text.`,
   { label: 'synthesis:report', phase: 'Synthesis', agentType: 'zig-design-specialist' }

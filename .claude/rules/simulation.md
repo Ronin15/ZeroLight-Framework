@@ -57,12 +57,12 @@ paths:
 
 ## Scope and tiers
 
-- Simulation scope (participation, tiers, bands) derives only from the
+- Simulation scope (tiers, bands, cadence) derives only from the
   fixed-step `sim_view` through `simViewRegion`; simulation never reads the
   render window (`visibleChunkRegion()`).
-- Tiers are capability-based and control processor participation only; render
-  visibility controls draw construction only; a scope pin never bypasses render
-  visibility.
+- Tiers are capability-based and set fidelity, never whether an entity
+  advances (`engine-design.md` § Target scale); render visibility controls draw
+  construction only; a scope pin never bypasses render visibility.
 - Tests needing every agent active use a full-extent rect or `always_active`.
 
 ## Determinism

@@ -91,8 +91,9 @@ consuming the spatial index (see `docs/architecture.md`). It closes with
 `chunk_derive`, then `action_react` (destructible / action-intent consumer),
 then the **simulation-LOD tier policy**, which assigns each entity a
 cognition/locomotion/kinematic/dormant tier by cube distance and emits deferred
-`set_simulation_tier` commands at the commit seam. See `docs/architecture.md`
-for scope/tier ownership and the gating rules per stage.
+`set_simulation_tier` commands at the commit seam (the Target Model keeps
+`dormant` for inert things only). See `docs/architecture.md` for scope/tier
+ownership and the gating rules per stage.
 
 **Sim-view rule (Slice 49).** Every scope band (cognition halo, tier policy,
 and later coast/spawn bands) derives from the fixed-step

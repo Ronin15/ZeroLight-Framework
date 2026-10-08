@@ -203,7 +203,7 @@ const synthesis = await agent(
     ``,
     `Propose ONLY NET-NEW durable items justified by the findings below. For lint_rules: only propose a rule that a line-scanner can enforce with LOW false positives — give a concrete detection heuristic AND the exemptions it must carve out; if a pattern is real but not mechanically detectable without noise, route it to rule_edits (one line for the owning rule file, consistent with the existing rules). Keep everything concise and non-duplicative. Also list the top concrete one-off fixes (top_fixes) ranked by severity for the human to act on.`,
     ``,
-    `Each top_fixes fix_direction names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
+    `Each top_fixes fix_direction names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>' stated as intent and constraints, never a design; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
     ``,
     `Verified findings:`,
     digest,

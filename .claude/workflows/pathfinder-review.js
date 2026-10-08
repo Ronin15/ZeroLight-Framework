@@ -113,7 +113,7 @@ Produce a single, polished Markdown review report. Requirements:
 - A severity-ordered findings section (High -> Medium -> Low). Merge duplicate findings reported by multiple agents into one entry (note corroboration). Drop anything that is clearly spurious or contradicted by other reviewers, and say briefly what you dropped if notable.
 - Each finding: severity, structural/local tag, category, file:line, the problem, and a concrete suggested fix.
 - A "Cross-cutting themes" subsection for module-wide coherency/cohesion observations, led by any operation whose cost scales with level, depth, world count, or total links instead of the change (.claude/rules/engine-design.md).
-- End with a prioritized action list (top fixes first). Each follow-up (next step, risk, fix, or test gap) names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line.
+- End with a prioritized action list (top fixes first). Each follow-up (next step, risk, fix, or test gap) names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>' stated as intent and constraints, never a design; never a Scaling Gaps/backlog line.
 Be concise and concrete. Do not invent findings beyond the corpus. Return ONLY the Markdown report.`,
   { label: 'synthesize', phase: 'Synthesize', agentType: 'zig-review-specialist' }
 )
