@@ -15,6 +15,10 @@ processors.
 The game built on it is dig/build with cave-ins and explosions: dense,
 multi-chunk terrain change in one step is normal gameplay, not an edge case.
 
+Target scale, not the demo: several world instances at once (persistent worlds
+plus temporary procedural dungeons), levels up to 2048² tiles, deep and growing
+level counts, large populations. Design so cost is independent of that scale.
+
 ## Source Of Truth
 
 Read the owning doc before editing; these are canonical.
@@ -100,8 +104,8 @@ agent claims against live code, and reports; it never implements non-trivial cha
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for this repo's Zig work, instead of or alongside these.
 - Every brief opens with a standing-requirements check: growth model
-  (CS § Budgets, Capacities, And Thresholds), destruction scale and bench
-  weighting (CS § Benchmarks), serial + threaded paths (CS § Threading),
+  (CS § Budgets, Capacities, And Thresholds), target scale and destruction
+  (CS § Budgets, Capacities, And Thresholds; § Benchmarks), serial + threaded paths (CS § Threading),
   readable code and terse comments (CS § Zig Style, § Comments).
 - Stay lean: cap agent report length, keep docs terse, make reasonable
   engineering calls without asking approval for obvious next steps. When fixes

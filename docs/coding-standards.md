@@ -176,6 +176,11 @@ fn appendMalRow(
 ## Budgets, Capacities, And Thresholds
 
 - Size and bound for dense, multi-chunk terrain change in one step.
+- A local change (one dig, ramp, or chunk) costs work proportional to what it
+  changed, never to world width, depth, or world count. If shared storage would
+  force a world-wide shift or rebuild, use per-level or paged storage.
+- Everything is sized and stored per world instance; no global or cross-world
+  caps or tables. A world's memory is released when it unloads.
 - Per-step and per-query work budgets are fixed counts, never milliseconds and
   never derived from world, map, cell, or portal count or any measured scale.
 - Over-budget work defers deterministically, tested as such (grep
@@ -211,6 +216,8 @@ fn appendMalRow(
 
 ## Threading
 
+- Work that scales runs through the thread system: across chunks and levels,
+  and across world instances where they are independent.
 - Multi-threaded writes go, verifiably at the call site, to disjoint per-worker
   or per-range slots, never a shared appendable collection.
 - Reserve on the main thread strictly before dispatch, sized from the value the
@@ -383,8 +390,10 @@ reasoning trail.
 - Target-scale benches ship with the first implementation; terrain features
   bench destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
-- Large cases are stress ceilings, not frame targets: weight results by how
-  often that count really occurs.
+- Scaling benches check that an algorithm's cost grows as designed across
+  sizes (flat for a local change, linear where linear is right). A cost that
+  grows with world size on a local change is a design defect regardless of the
+  absolute number; never cite a scaling bench as a frame-time verdict.
 
 ## Generated Output And Configuration
 
