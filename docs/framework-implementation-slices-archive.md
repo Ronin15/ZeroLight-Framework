@@ -15,7 +15,7 @@ working; links to sibling open slices become `../slices/slice-<id>.md`), move
 its row from the index's Open Frontier table to the table below, and keep its
 acceptance history intact.
 
-**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48.
+**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48, 64E.
 
 > Residual follow-ups from archived slices are never incomplete archive
 > checklists. Where they live today: Slice 30's deferred `memory_expired`
@@ -77,6 +77,7 @@ acceptance history intact.
 | [45](roadmap/archive/slice-45.md) | First Action-Intent Consumer Domain Controller (Destructibles) | First action-intent consumer: destructibles controller. |
 | [47](roadmap/archive/slice-47.md) | Un-Stagger The Shared Sensing Substrate | Un-staggered shared sensing substrate (perception defect fix). |
 | [48](roadmap/archive/slice-48.md) | SimulationPipeline Thin-Composer Restoration | `SimulationPipeline` thin-composer restoration. |
+| [64E](roadmap/archive/slice-64e.md) | Incremental Nav Patch Ramp/Link Parity | Runtime ramps routable the same step on both levels; incremental equals full rebuild. |
 
 ## Historical Order
 

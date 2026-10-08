@@ -1,40 +1,34 @@
 ## Slice 71: AI Behavior Parity And Navigation/Collision Static Fast Paths
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 55](slice-55.md), [Slice 56](slice-56.md), [Slice 61](slice-61.md), [Slice 62](slice-62.md), [Slice 63](slice-63.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 71A](slice-71a.md), [Slice 71B](slice-71b.md), [Slice 71C](slice-71c.md), [Slice 71D](slice-71d.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: not started (umbrella over 71A, 71B, 71C, 71D).**
+**Status: not started (umbrella over 71A, 71B, 71C, 71D);** closes when all
+four are archived.
 
-Umbrella for two independently landable halves (same shape as Slice 52):
+Goal: close the VoidLight → ZeroLight AI behavior parity audit and add the
+static fast paths, as four independently landable sections:
 
-- **71A** closes the VoidLight → ZeroLight AI behavior parity audit: patrol,
-  follow, guard (home + leash + return-home), and the guard help call. Every
-  new behavior is an arbitration table row and a `resolveGoal` arm. No
-  exclusive FSMs and no per-agent cursor or timer state.
-- **71B** adds the static fast paths: one shared static-collider index
-  (consumed by steering, with a level gate), the collision static/dynamic
-  split, and fixed-budget group-field prewarm for authored shared goals. Its
-  ungated first part (71B.1) also fixes a live rule violation: the
-  world-scaled group-field threshold becomes a fixed constant.
+- **71A**: patrol, follow, guard (home, leash, return home), and the guard
+  help call, as Slice 73 behavior content plus the signals they need
+  (after 55, 56, 61, 62, 63, 73).
+- **71B**: one chunk-owned static-collider structure shared by steering and
+  collision, the collision static/dynamic split (bench-gated), and
+  fixed-budget path prewarm for authored shared goals; its fixed group-field
+  threshold has landed (after 62, 71A, 64G for the prewarm part).
+- **71C**: `cover` markers in flee and ranged-pursue goals (after 56B, 73).
+- **71D**: AI merchant selling on Slice 63's trade substrate (after 63, 61,
+  71A, 73).
 
-Two further sections remove the last unowned AI follow-ups:
+### Architecture notes
 
-- **71C** wires the reserved `cover` marker kind into flee and ranged-pursue
-  goal resolution.
-- **71D** adds AI merchant selling on Slice 63's trade substrate.
-
-None of the four sections reshapes the Slice 32 contract (`scoreBehaviors` /
-`selectSticky` / `resolveGoal`), and none adds a world-scaled budget.
-
-### Cross-slice pointers (applied to the owning slices)
-
-| Owner | Pointer |
-| --- | --- |
-| [62](slice-62.md) | **Deferred** home/leash signal → 71A |
-| [61](slice-61.md) | VoidLight merchant leash → 71A |
-| [63](slice-63.md) | **Deferred** guard theft alert → 71A; AI↔merchant trade emission → 71D |
-| [56](slice-56.md) | Future AI trade arm → 71D |
-
-Tables (VoidLight port track): 71A bumps the save `format_version` (v12) and
-`checksum_format_tag` and appends `ai_post` (25 of 32); 71D's `gain_trade`
-bumps both once (v13); 71B and 71C add no hashed or saved state; T4 places
-`guard_alarm` at position 26.
+- None of the four reshapes the utility contract (`scoreBehaviors` /
+  `selectSticky` / `resolveGoal`; `.claude/rules/simulation.md` § AI and
+  affect), and none adds a world-scaled budget
+  (`.claude/rules/budgets-capacities.md`).
+- Cross-slice pointers already applied in the owning slices: 62's home and
+  leash signal and 63's guard theft alert are 71A; 63's AI trade emission
+  and 56's AI trade action are 71D.
+- Version numbers, `stage_order` positions, and component tags follow
+  Tables T1–T6 (71A appends `ai_post` and the `guard_alarm` stage; 71A and
+  71D each bump the checksum tag and save format; 71B and 71C add no hashed
+  or saved state).

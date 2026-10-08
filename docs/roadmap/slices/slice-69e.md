@@ -1,101 +1,54 @@
 ## Slice 69E: Per-Zoom Weather Spawn Rect
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 59](slice-59.md), [Slice 60](slice-60.md) (gated on weather cost > 0.25 ms) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 59](slice-59.md), [Slice 60](slice-60.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started — gated.** Gate: in ReleaseFast, the sum of the median
-weather cost per step exceeds **0.25 ms** (1.5% of the 16.67 ms frame). The
-weather cost is `zig build bench -- --group particles-weather` (the full derived
-pool, Slice 59's `weather_particle_capacity`; drag + wind) plus `zig build bench -- --group render-game-prep-weather` (full
-pool). The measurement is taken on the machine that records Slice 59's bench
-baseline. Depends on **59** and **60** (`CameraRig`), and on **69B**'s
-region-sampled emission if landed.
+**Status: not started — gated** on the `particles-weather` and
+`render-game-prep-weather` benches showing that weather emitted outside the
+zoomed-in view is a measurable share of weather cost (owner call on the
+measurement). Uses 69B's region-sampled emission and 70B's zoom tween when
+landed.
 
 Goal: at zoom levels above 1, weather spawns only over what the presentation
-camera shows. The emitted count scales by area, so world-space density is
-unchanged at every zoom. Zooming out never shows an empty band. It stays
-presentation-only and never reads render-time state.
+camera shows, with counts scaled by area so world-space density is the same
+at every zoom, and zooming out never shows an empty band. Presentation only;
+it never reads render-time state.
+
+### Current foundation
+
+- Slice 59 (not landed): weather emits over the player's `sim_view` plus a
+  margin, from a fixed presentation seed, into a pool sized from the authored
+  emitter table.
+- Slice 60 (not landed): `CameraRig` keeps a fixed-step presentation center
+  and integer zoom levels; 70B adds a fixed-step zoom tween.
+- `systems/particle.zig` spawns always start at age 0.
 
 ### Architecture notes
 
-**Spawn rect.**
-
-- `CameraRig.presentationViewRect() Rect` returns
-  `{ center_current - view_size/(2z), view_size/z }` with
-  `z = zoom_levels[zoom_index]`. Once Slice 70B has landed (it lands earlier
-  in the merged order), the extent is 70B's fixed-step tweened visible extent
-  instead: `{ center_current - view_size·zoom_inv_current/2,
-  view_size·zoom_inv_current }`. That state advances in `step` regardless of
-  the render mode, so the spawn rect follows the zoom tween instead of
-  jumping to the target, and it equals the `1/z` form when settled. It is the
-  fixed-step, already-clamped presentation center: no alpha, no shake, no
-  wall clock.
-- At zoom index 0 (and, with 70B, a settled tween) the emitter keeps
-  `simViewRect()` (the zoom-1 anchor), which is Slice 59's behavior, bit for
-  bit. Otherwise, including a tween still running toward index 0, it uses
-  `presentationViewRect()`.
-- Both rects are expanded by `k_weather_spawn_margin_px = 96`, Slice 59's
-  value.
-
-**Area-scaled count.**
-
-- `area_scale = area(rect + margin) / area(anchorRect() + margin)`, computed
-  in f32 on the presentation side.
-- Per kind, `n = floor(share * max_emit * area_scale + u)`, with the same dither
-  stream as Slice 59. 69B's acceptance draw is unchanged.
-
-**Zoom-out prefill.**
-
-- On the fixed step where `captureZoomInput` lowers the zoom index,
-  `EnvironmentController.prefillWeatherParticles(pool, new_rect, old_rect,
-  ...)` emits per kind
-  `n = floor(steady_live(K) * (1 - area_old/area_new) + u)`, where
-  `steady_live(K) = share * max_emit * lifetime_steps(K) * area_scale_new`.
-- Positions are uniform over `new_rect`. A point inside `old_rect` is rejected,
-  with up to `k_prefill_attempts = 4` attempts per particle before it is
-  dropped.
-- `ParticleSpawn` gains `initial_age: f32 = 0`, validated to
-  `0 <= initial_age < lifetime`; `spawnToRow` sets `age = initial_age`. The
-  prefill draws `initial_age` uniformly in `[0, lifetime)` and sets velocity to
-  the terminal `air + a/drag`.
-- Draws come from `k_weather_particle_seed` under salt
-  `k_environment_salt_base + 0x500 + i`, part of Slice 49's weather-particle
-  exemption.
-- The prefill is bounded by `k_weather_prefill_max_per_step = 1024` and by
-  Slice 59's derived pool capacity (`weather_particle_capacity`, a per-kind
-  `max_emit × lifetime` bound). Zoom levels are ≥ 1, so `area_scale ≤ 1` and
-  `steady_live(K)` never exceeds the zoom-1 per-kind bound that capacity
-  already covers. Drops are counted.
-
-**Fixed budgets.**
-
-- `k_weather_prefill_max_per_step = 1024`: the worst steady-state fill is
-  storm 864 / snow 1080 × 3/4 of the area.
-- `k_prefill_attempts = 4`.
-- Pool capacity is Slice 59's derived `weather_particle_capacity`, unchanged
-  by this slice (area scaling only lowers live counts).
+- The spawn rect comes from the rig's fixed-step presentation state (center
+  and visible extent, following 70B's tween when landed), never alpha, shake,
+  or wall clock. At zoom 1 emission is bit-identical to Slice 59.
+- Area scaling only lowers live counts (zoom ≥ 1), so Slice 59's derived pool
+  capacity still bounds the pool; overflow drops stay counted
+  (`.claude/rules/budgets-capacities.md`, presentation pool).
+- A zoom-out prefills the newly visible band at steady-state density with
+  particles at random ages and terminal velocity, under a fixed per-step
+  count; draws use the presentation weather seed.
 
 ### Checklist
 
-- [ ] `CameraRig.presentationViewRect()`, with tests that it is invariant under
-      alpha and trauma and clamped like the center, and (with 70B) that it
-      tracks `zoom_inv_current` through a tween rather than the target index
-      and equals the `1/z` form once settled.
-- [ ] Emitter rect selection by zoom index, and area-scaled counts.
-- [ ] `ParticleSpawn.initial_age` with validation. Existing spawns default to
-      0 and stay bit-identical.
-- [ ] `prefillWeatherParticles`, triggered on a zoom-out edge.
+- [ ] Presentation view rect on the rig (tween-aware once 70B lands).
+- [ ] Emitter rect selection by zoom, area-scaled counts.
+- [ ] Particle spawns with an initial age (default 0, bit-identical).
+- [ ] Zoom-out prefill.
 - [ ] Docs: `docs/rendering-assets-shaders.md` (weather spawn rect per zoom).
 
 ### Acceptance checks
 
-- [ ] At zoom index 0, emission is bit-identical to the pre-slice baseline.
-- [ ] World-space density (live particles per world px² inside the visible
-      rect, over 600 steps) at zoom 4 matches zoom 1 within ±10%.
-- [ ] Zooming out from 4 to 1 during snow: the newly visible band reaches at
-      least 70% of steady-state density on the first step.
-- [ ] Emission, prefill and pool update allocate nothing after reserve
-      (`FailingAllocator`).
-- [ ] The gate metric drops: `particles-weather` at zoom 4 is recorded below
-      the zoom-1 value.
+- [ ] Zoom 1 emission is bit-identical to the pre-slice baseline.
+- [ ] Live particle density in the visible rect at zoom 4 matches zoom 1
+      within ±10% over 600 steps.
+- [ ] Zooming out from 4 to 1 during snow fills the new band to at least 70%
+      of steady-state density on the first step.
+- [ ] Emission, prefill, and pool update allocate nothing after reserve.
+- [ ] `particles-weather` at zoom 4 records below its zoom-1 value.
 - [ ] `zig build verify` passes.
-

@@ -73,7 +73,7 @@ init; `Pipeline.reserve` tops up frame events without lowering a higher limit.
       only when `gain_investigate > 0`.
 - [x] [architecture.md](../../architecture.md),
       [simulation-tiers-and-pipeline.md](../../simulation-tiers-and-pipeline.md), and
-      [coding-standards.md](../../coding-standards.md) record `carried`, the four
+      `docs/coding-standards.md` (since replaced by `.claude/rules/`) record `carried`, the four
       event tags, `runStage`, and `SensoryBus` stage placement. `stimuli` and
       `interest_markers` are tagged resources.
 

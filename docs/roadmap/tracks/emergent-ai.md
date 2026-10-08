@@ -1,13 +1,14 @@
-## Emergent AI Track Overview (Slices 26–33, +39–42, +45, +55, +56, +61, +68, +71)
+## Emergent AI Track Overview (Slices 26–33, 39–42, 45, 47, 55, 56, 61, 68, 71, 73, 75)
 
 > [Roadmap index](../../framework-implementation-slices.md) · Slice files:
 > [`../slices/`](../slices/) · Settled slices: [`../archive/`](../archive/)
 
-Goal: layer emergent NPC behavior — perception, memory, **feelings/emotions**,
-and richer behavior arbitration — on top of the navigation substrate, while
-staying allocation-free on hot paths, deterministic (serial == threaded, scalar
-== SIMD), and affordable at scale by running only under the cognition tier gated
-by Slice 24.
+Goal: emergent NPC behavior (perception, memory, feelings, and utility
+arbitration) on top of the navigation substrate, with many emotions and
+decisions defined as content. Cognition runs for every agent in every world;
+distance from the observer lowers its tick rate, never stops it (Slice 75,
+`.claude/rules/engine-design.md` § Target scale). Hot paths stay
+allocation-free and deterministic (serial == threaded, scalar == SIMD).
 
 **Track status (code-authoritative):**
 
@@ -15,123 +16,58 @@ by Slice 24.
 | --- | --- | --- | --- |
 | Faction / RNG / spatial index | 26–28 | Landed (archive) | Stance table, deterministic draws, shared neighbor index |
 | Perception | 29 | Landed (archive) | Vision/hearing columns + acquire/lose events |
-| Memory | 30 | Landed (archive) | Last-known + ring + familiarity; cold-seek retarget in AI |
-| **Emotion / affect** | **31** | **Landed (archive)** | **fear / curiosity / aggression / fatigue** SoA drives; **consumed by arbitration (32)** |
-| **Arbitration** | **32** | **Landed (archive)** | Utility over 29–31 → per-agent `NavigationIntent`, table-driven drive consumption, sticky selection |
-| Archetypes / debug | 33 | Landed (visual residual on frontier) | JSON personalities + overlay (drive bars / affect blocks) |
-| Stimulus ecosystem | 39 | Landed (archive) | Multi-producer bus (dig, footstep, deferred impact) |
-| World interest | 41 | Landed (archive) | Durable investigate/cover/resource/patrol markers; investigate wired |
-| Action intents | 40 | Landed (archive) | Non-locomotion intent stream (attack/interact/use); player R capture |
-| First action consumer | 45 | Landed (archive) | `DestructibleController` at `action_react`; deferred destroy + domain event |
-| Sensing substrate fix | 47 | **Landed (archive)** | Unstaggered halo spatial index + perception candidates; stagger gates observers/deciders only |
-| **Affect expansion** | **42** | **Open** | More drives, cross-drive coupling, data-driven appraisal gains, optional mood, environment caution as a per-entity fear gain (first new drive `need` lands in 61) |
-| Decision LOD | 55 | Open | Idle-agent decide coasting on fixed 8/32-step cadences; same-step wake from sensing; stagger unchanged |
-| Combat signal | 56 | Open | Damage → fear/aggression appraisal; AI actions emitted by `ai_action_select` |
-| Forage / `need` | 61 | Open | `need` drive + `forage` behavior; `resource` markers wired; `AffectImpulse` substrate |
-| Battle-scale hardening | 68A | Open | Shared halo table (no main-thread O(halo) AI/perception walks), deferral-age action-bus fairness, re-baseline procedure |
-| Knockback / retaliation | 68B | Open | Knockback column + `knockback_apply`; retaliation memory slot from `Health.last_attacker` |
-| Posts / guard | 71A | Open | Patrol / follow / guard, `guard_alarm` help call, own-level post goals; `patrol` markers wired |
-| Cover-aware movement | 71C | Open | Cover-aware flee and ranged pursue; `cover` markers wired |
-| AI selling | 71D | Open | `trade` behavior + `.sell` arm; closes forage → sell |
+| Memory | 30 | Landed (archive) | Last-known + ring + familiarity |
+| Emotion / affect | 31 | Landed (archive) | fear / curiosity / aggression / fatigue drives with Schmitt thresholds |
+| Arbitration | 32 | Landed (archive) | Utility scores + sticky selection → per-agent `NavigationIntent` |
+| Archetypes / debug | 33 | Landed (visual residual) | JSON personalities + introspection overlay |
+| Stimulus ecosystem | 39 | Landed (archive) | Multi-producer stimuli (dig, footstep, impact) |
+| Action intents | 40 | Landed (archive) | Non-locomotion intent stream |
+| World interest | 41 | Landed (archive) | investigate / cover / resource / patrol markers; investigate wired |
+| First action consumer | 45 | Landed (archive) | `DestructibleController` at `action_react` |
+| Sensing substrate | 47 | Landed (archive) | Unstaggered halo sensing; stagger gates observers/deciders only |
+| **Data-driven cognition** | **73** | **Open** | Drives, behaviors, couplings, tasks, and factions as content; the per-agent think interval; gates every slice below that adds a drive or behavior |
+| Affect expansion | 42 | Open (after 73) | New drives with real signals, authored coupling, mood, environment caution |
+| Decision coasting | 55 | Open (after 73) | Idle agents decide less often; same-step wake from sensing |
+| Combat | 56 | Open (after 73) | Damage → affect; AI actions through the one `ai_action_select` emitter |
+| Forage / `need` | 61 | Open (after 73) | `need` drive, `forage` behavior, `resource` markers, affect impulses |
+| Social / trade | 63 | Open (after 73) | Runtime stance, opinion ledger, social affect impulses |
+| Battle-scale hardening | 68A | Open | Shared per-step entity table, action-bus fairness, soak procedure |
+| Knockback / retaliation | 68B | Open (after 73) | Knockback column; retaliation memory |
+| Posts / guard | 71A | Open (after 73) | Patrol / follow / guard, help call; `patrol` markers wired |
+| Cover-aware movement | 71C | Open (after 73) | Cover goals for flee and ranged pursue; `cover` markers wired |
+| AI selling | 71D | Open (after 73) | `trade` behavior; closes forage → sell |
+| Far simulation | 75 | Open | Cognition at slower ticks far from the observer, in every world |
 
-### Open: cognition redesign for target scale (owner, 2026-10-08)
+### Cognition redesign
 
-The goal is emergent AI with many emotions and decisions. Utility scoring,
-sticky selection, and hysteresis drives are kept. The structure around them is
-demo-sized and needs a design pass (`zig-design-specialist`, with a cost model)
-before 42, 55, 56, 61, 63, 68B, 71A, 71C, or 71D add to it:
+The owner's cognition redesign (2026-10-08) is
+[Slice 73](../slices/slice-73.md): drives and behaviors defined by data
+with counts from content, no per-drive or per-behavior code, sparse
+couplings and per-archetype behavior sets, a data-driven task layer under
+utility selection, and the `.claude/rules/simulation.md` § AI and affect
+edit, keeping utility scoring, sticky selection, and hysteresis drives.
+Slices 42, 55, 56, 61, 63, 68B, 71A, 71C, and 71D add their drives and
+behaviors on it.
 
-- Emotions are named fields: four per drive on `AiAffect` (`baseline_*`,
-  `decay_rate_*`, `threshold_*`, value). `above_threshold_mask: u8` caps drives
-  at 8, a cap sized to today's count.
-- Decisions are hand-coded switch arms (`gainFor`, `perceptionTerm`,
-  `memoryTerm`, `resolveGoal`) plus a named `gain_*` field per behavior on
-  `AiAgent`.
-- Scoring is dense: every agent scores every drive × behavior pair.
-- There is no task/sequencing layer for multi-step work (dig, haul, build).
-- The add-a-feeling procedure below, and `.claude/rules/simulation.md` § AI and
-  affect ("its columns, one appraisal path, and one weight-table row"), encode
-  that hand-coded, one-at-a-time shape.
-
-The design should cover:
-
-- Drives and behaviors defined by data, with counts derived from content.
-- No per-drive or per-behavior code.
-- Sparse couplings and per-archetype behavior sets, so per-agent cost follows
-  what the agent uses, not catalog size.
-- A data-driven task/sequence layer under utility selection.
-- Orders in agent count, catalog size, and world count, with serial and
-  threaded paths.
-
-The rule edit lands in the same change as the design. The open AI slices
-above are then re-based on it.
-
-### Emotion / feelings model (landed + expandability)
-
-**What exists today:**
+### What exists today
 
 | Piece | Location | Role |
 | --- | --- | --- |
-| `AiAffectDrive` | `data_system/types.zig` | Closed enum: `fear`, `curiosity`, `aggression`, `fatigue` |
-| `AiAffect` component | same + `data_system/affect.zig` | Per-drive baseline / decay_rate / threshold (cold) + live value in `[0,1]` (hot) + `above_threshold_mask` |
-| `AffectSystem` | `systems/affect.zig` | Cognition-scoped appraisal from perception + memory + agent mode; decay; threshold events |
-| `affect_threshold_crossed` | `simulation.zig` | Scalar event `{ entity, drive, rising }` — panic onset / calm, etc. |
-| Pipeline slot | `affect_update` before `ai_decide` | Correct order for a consumer; wired to arbitration (32) via `AiConfig.affect_slice` |
+| `AiAffectDrive` | `data_system/types.zig` | Closed enum of four drives |
+| `AiAffect` | `data_system/types.zig`, `data_system/affect.zig` | Named per-drive baseline / decay / threshold (cold) + value (hot) + `above_threshold_mask: u8` |
+| `AffectSystem` | `systems/affect.zig` | Appraisal from perception, memory, and active behavior; decay; threshold events |
+| `affect_threshold_crossed` | `simulation.zig` | Scalar `{ entity, drive, rising }` event |
+| Arbitration | `systems/arbitration.zig` | `scoreBehaviors` / `selectSticky` / `resolveGoal` over `AiBehavior`'s five tags |
+| `AiSystem` | `systems/ai.zig` | Gathers `Signals`, runs arbitration, emits `NavigationIntent` at `ai_decide` |
+| Archetypes | `ai_archetypes.zig`, `assets/ai/archetypes.json` | Strict load-time personalities |
 
-Rules for drives, appraisal, arbitration, events, and component stores:
-`.claude/rules/simulation.md` (AI and affect, Events and streams, Persistent
-data). Headroom: `above_threshold_mask` is `u8`, so up to 8 drives fit the
-current packing; widening it belongs to Slice 42.
+Stage order `perception → ai_memory → affect → ai_decide → steering →
+pathfinding` (`simulation_pipeline.zig` `stage_order`). Pursue/flee prefer
+perception's faction-generic `nearest_threat`, then fresh memory, then the
+opt-in focus fallback; investigate prefers heard stimuli, then interest
+markers, then memory-ring contacts; cohere reads the shared spatial index.
 
-**How a new feeling is added (procedure for Slice 42):**
-
-1. Append a tag to `AiAffectDrive` (preserve existing `@backingInt` order —
-   append only).
-2. Add cold baseline/decay/threshold + hot value columns on `AiAffect` /
-   store / slices / template / validation (same pattern as existing drives).
-3. Add one appraisal path in `AffectSystem` (signal → delta → decay → clamp →
-   threshold bit). Prefer a shared `combineDrive` helper already used by the
-   four drives.
-4. Extend archetype JSON (33) and debug bars (33) for the new drive.
-5. Add **one row** to arbitration's drive→behavior weight table (32's
-   contract) rather than a `decideDir` special case.
-6. If drive count exceeds 8: widen `above_threshold_mask` and consider packing
-   drives as `[drive_count]f32` columns instead of named fields (Slice 42).
-
-**Closed-loop status: locomotion emergence landed.** Pipeline order
-`perception → ai_memory → affect → ai_decide → steering → pathfinding`
-(`simulation_pipeline.zig` `stage_order`) is unchanged — no new `StageId` was
-added for arbitration. `AiSystem`'s `ai_decide` scores `AiBehavior`'s five
-variants (`wander`/`pursue`/`flee`/`investigate`/`cohere`) via
-`arbitration.scoreBehaviors`'s table-driven drive×behavior weight matrix,
-sticky-selects one via `arbitration.selectSticky`, and resolves a per-agent
-goal via `arbitration.resolveGoal` — pursue/flee prefer perception's
-faction-generic `nearest_threat` or fresh `AiMemory` over the opt-in,
-gain-gated `AiConfig.focus_target`/`focus_entity` player fallback; investigate
-prefers heard stimuli, then world interest markers (41), then memory-ring
-contacts; cohere reads the shared spatial index for a friendly-neighbor mean.
-Demo spawns resolve named archetypes from `assets/ai/archetypes.json` (33).
-See the archive for full Slice 32 / 39 / 41 records.
-
-**Landed loop inputs:** multi-producer stimuli (39: dig /
-footstep / deferred impact) and world interest markers (41: investigate wired;
-`cover` / `resource` / `patrol` reserved for later consumers).
-
-**Sequencing rationale (what remains open on this track):**
-
-- Slices 26–28 — framework foundations (landed).
-- Slices 29–31 — composing signal stack (landed).
-- **Slice 32** — behavior arbitration (landed).
-- **Slice 33** — authoring/tuning infrastructure (landed; visual/`gpu-smoke`
-  residual only).
-- **Slices 39, 41** — richer senses + world-authored investigate POIs (landed).
-- **Open post-loop expandability:** **42** (more/coupled feelings, only with a
-  real appraisal signal). Action intents (**40**) and first consumer (**45**)
-  are landed. Sensing substrate (**47**) and thin-composer restoration (**48**)
-  are landed. Each remaining item is a full slice. Next open on this track is **42**, and only
-  once a real appraisal signal exists. **35** is the unblocked perf follow-up.
-
-Track-wide design contracts (component-store pattern, SIMD-first processor
-stages, scalar events, utility + sticky selection, optional signal components)
-are rules in `.claude/rules/simulation.md`, `.claude/rules/threading.md`, and
+Track-wide contracts (component stores, SIMD-first processors, scalar
+events, utility + sticky selection, optional signal components) are rules
+in `.claude/rules/simulation.md`, `.claude/rules/threading.md`, and
 `.claude/rules/memory-performance.md`.

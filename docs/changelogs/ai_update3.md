@@ -6,7 +6,7 @@ Range: `main..ai_update3`
 
 Base: `b39a46f` (`Merge pull request #10 from Ronin15/ai_update2`)
 
-Tip: the guidance and roadmap overhaul commits after `1580fe0`
+Tip: in progress; Slice 64G lands before merge
 
 ## Summary
 
@@ -141,8 +141,28 @@ These contracts are unchanged:
   parity reference only). Full localization is under Deferred By Owner.
 - **Rules move to `.claude/rules/`:** `docs/coding-standards.md` is replaced
   by one rule file per topic, path-scoped where a rule is area-specific, with
-  the conflicts between rule texts resolved. Docs describe and cite rules;
-  slices hold goals, specs, checklists, and acceptance only.
+  the conflicts between rule texts resolved. Docs describe and cite rules.
+- **Direction:** a fully simulated, multi-world colony-simulator base with an
+  optional player; one observer (the camera focus, or a player) is targeted.
+  Everything that exists keeps advancing in every world; distance from the
+  observer lowers fidelity
+  (far-off AI thinks on slower ticks, movement stays near full rate); dormant
+  is for inert things; important population persists, only ambient spawns may
+  be recycled far away; the chunk is the unit of terrain and nav storage,
+  work, threading, and save; nav is processed per chunk so threading scales
+  with requests under a fixed, worker-independent budget. Rules state these
+  as short guiding principles.
+- **Roadmap back to main's format:** slices hold intent and data only (goal,
+  current foundation, constraints, intent-level checklist, acceptance), never
+  internal designs; the design pass runs right before implementation. Open
+  slices went from about 26,800 lines to about 7,400; index rows and the
+  merged order are rebuilt from each slice's header dependencies. Prior text
+  is at tag `pre-main-shape`.
+- **New slices:** 73 (data-driven cognition), 74 (world instances), 75 (far
+  simulation). Slice 62 keeps villagers and NPCs and recycles only ambient
+  spawns; 69F's region paging became chunk storage forms that never leave
+  the simulation; 57's world items persist and decay outdoors. 64E is
+  archived (owner's manual check, Debug, 2026-10-08).
 - **Rules added or clarified:** the cost model and target scale come first;
   the chunk owns terrain and nav storage and work; budgets, capacities, and
   thresholds are separate; no backlog dumping; terse comments; plain code over
@@ -156,13 +176,12 @@ These contracts are unchanged:
 
 ## Known Open Items
 
-- **64E:** a post-fix manual ramp check on current code (display-gated).
-- **64G:** chunk-owned terrain and nav, which supersedes 64F's open items
-  (cave-in bench record, repack prefix trim, threaded repack).
-- **65B:**
-  - non-fatal failure states;
-  - the swap rule on a refusal.
-- **72:** batches D–H, J, K1–K5 and M are not started.
+- **64G:** chunk-owned terrain and nav lands on this branch before merge; it
+  supersedes 64F's open items.
+- **73, 74, 75:** the fully simulated direction's planning slices (cognition,
+  world instances, far simulation); not started.
+- **65B:** re-scoped against 64G's chunk storage at its design pass.
+- **72:** its open items, re-scoped against 64G and 75.
 
 ## Commit List
 
@@ -298,3 +317,8 @@ These contracts are unchanged:
 - `61d2f6a` Grow nav interior link capacity per chunk; remove the ramp refusal
 - `ecbac6c` Guidance: design for target scale and multiple worlds; local changes cost local work
 - `1580fe0` tooling updates
+- `ec362ea` Rules in .claude/rules; CLAUDE.md, agents, workflows, and docs point to them
+- `529d032` Roadmap: main's slice shape, no rules or logs in slices, Slice 64G
+- `fe4d63a` Changelog fixes; remove the accidentally committed seal notes
+- `bd8cf25` update for AI issue found
+- `53bc399` Direction and roadmap shape: fully simulated worlds, intent-only slices

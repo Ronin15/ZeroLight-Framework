@@ -1,110 +1,62 @@
 ## Slice 69D: Scripted Weather Override
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 59](slice-59.md) (gated on the first scripted weather consumer) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 59](slice-59.md), [Slice 69B](slice-69b.md) (when regions exist) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started — gated.** Gate: the first game-side scripted consumer
-lands. That is a quest, cutscene or world-event controller that must force a
-weather state for a time window, such as "a storm starts when the quest
-begins". That consumer's slice lands this checklist in the same change, so no
-request API ships without a producer. Depends on **59**, and on **69B** when
-regions exist (the override is per region; without 69B there is one region).
+**Status: not started — gated on the first scripted weather consumer** (a
+quest, cutscene, or world-event controller that must force weather for a
+window, such as "a storm starts when the quest begins"). That consumer's
+slice lands this checklist in the same change, so no request API ships
+without a producer.
 
 Goal: a deterministic, persistent, per-region weather override window that
-blends in and out over Slice 59's transition time. The weather stays a pure
-function of `(config, env_seed, game_ms, overrides)`.
+blends in and out over Slice 59's transition time. Weather stays a pure
+function of `(config, env_seed, game_ms, overrides)`, so an expired override
+needs no sweep.
+
+### Current foundation
+
+- Slice 59 (not landed): weather is a pure function of time; transitions blend
+  over a fixed transition time; `weather_changed` fires from the snapshot
+  diff. Slice 69B (not landed) makes it per region.
+- The commit seam already applies post-commit reactions in order
+  (`applyStructuralCommandsAndPostCommitEvents`); Slice 61 plans its affect
+  impulse drain there.
 
 ### Architecture notes
 
-**Persistent state.**
-
-- `WorldSystem.weather_overrides: [k_max_weather_regions]WeatherOverride` is a
-  fixed inline array indexed by region.
-- `WeatherOverride = struct { active: bool = false, kind: WeatherKind = .clear,
-  start_ms: u64 = 0, end_ms: u64 = 0 }`.
-- Slice 49 classifies it as hashed; Slice 46 saves it as one fixed section
-  (validated `kind`, `end_ms > start_ms` when active).
-
-**Request.**
-
-- `WeatherOverrideRequest = union(enum) { set: struct { region: u8, kind:
-  WeatherKind, duration_ms: u32 }, clear: struct { region: u8 } }` is
-  scalar-only.
-- Producers call `frame.tryAppendWeatherOverride(request) bool` into
-  `StepState.weather_override_requests`, a fixed
-  `[k_max_weather_override_requests_per_step = 8]` queue cleared in
-  `beginStep`. A full queue refuses the request and counts it as
-  `weather_override_requests_refused`.
-
-**Apply (commit seam).**
-
-- `EnvironmentController.applyOverrideRequests(world, frame)` runs from
-  `applyStructuralCommandsAndPostCommitEvents` after the structural commit, in
-  append order. This is the Slice 61 `AffectImpulse` seam precedent: nothing is
-  pending at a step boundary.
-- `set` writes `{active = true, kind, start_ms = clock.game_ms, end_ms =
-  start_ms + duration_ms}`.
-- `clear` writes `active = false`.
-- Validation: `region < region_count`, and `1 <= duration_ms <=
-  k_max_weather_override_ms = 7 * k_ms_per_day`. An invalid request is counted
-  and dropped. The next step's `environment_update` derives from the new value.
-
-**Pure blend.** `deriveSnapshot` covers region r at time t (in region r's time
-base from 69B) in four cases:
-
-1. Not active, or `t < start_ms`: the natural roll.
-2. `start_ms <= t < end_ms`: `from` is the natural `to` at `start_ms`, `to` is
-   `kind`, and `blend = clamp((t - start_ms) / weather_transition_ms, 0, 1)`.
-3. `end_ms <= t < end_ms + weather_transition_ms`: `from = kind`, `to` is the
-   natural `to` at `t`, and blend ramps the same way.
-4. Afterwards: the natural roll.
-
-An expired override needs no sweep, because the function handles expiry. A
-`weather_changed` event fires through the existing diff.
-
-**Pipeline contract.** `PipelineResource.weather_overrides` is written at the
-commit seam, so it is external to the stage graph. Add it to
-`external_resources`, and `environment_update` carries it.
-
-**Fixed budgets.**
-
-- `k_max_weather_override_requests_per_step = 8` (one per region);
-- `k_max_weather_override_ms = 7 days`;
-- one override slot per region.
+- One override slot per region per world, stored on `WorldSystem`, hashed and
+  saved (Slices 49 / 46); a load rejects an invalid override.
+- Producers append scalar set/clear requests during the step; they apply at
+  the commit seam in append order under a fixed per-step count, and requests
+  past it defer in order to the next step, never refused for queue capacity
+  (`.claude/rules/budgets-capacities.md`). Invalid requests (bad region,
+  out-of-range duration) are counted and dropped.
+- A request applied at the seam takes effect in the next step's snapshot;
+  nothing is pending at a step boundary that a save would miss.
+- The override blends from the natural weather into the forced kind, holds,
+  then blends back to the natural weather at the time it ends.
+- VoidLight: port forced weather with a transition time; do not port string
+  weather names, the no-op force path, or caller-thread dispatch.
 
 ### Checklist
 
-- [ ] `WeatherOverride` store on `WorldSystem`. Slice 49 classification
-      (hashed) and Slice 46 save section with validation.
-- [ ] `WeatherOverrideRequest`, the fixed per-step queue, and
-      `tryAppendWeatherOverride` with its refusal counter.
-- [ ] `applyOverrideRequests` at the commit seam, with validation and counters.
-- [ ] The `deriveSnapshot` override blend, in pure form.
-- [ ] `PipelineResource.weather_overrides` (external, carried by
-      `environment_update`).
-- [ ] The gating consumer's producer call, in the consumer's own slice.
+- [ ] Per-region override store on `WorldSystem`; classification and save
+      section with validation.
+- [ ] Scalar override requests with ordered seam application and in-order
+      deferral past the per-step count.
+- [ ] Pure override blend in the snapshot derivation.
+- [ ] Override resource external to the stage graph, carried by the
+      environment stage.
+- [ ] The gating consumer's producer call, in the consumer's slice.
 - [ ] Docs: `docs/simulation-tiers-and-pipeline.md` (override seam, purity).
 
 ### Acceptance checks
 
-- [ ] Pure tests: blend in, hold, blend out, and natural-after. An override
-      replaced mid-window; `clear` mid-blend. N steps equal one jump while an
-      override is active.
-- [ ] A request appended at step N takes effect in step N+1's snapshot.
-      Nothing is pending across the boundary.
-- [ ] Save/load round-trip (Slice 46) with an active override reproduces the
-      checksum trace. An invalid saved override is rejected.
-- [ ] `FailingAllocator`: queue append, apply and derive allocate nothing.
+- [ ] Blend in, hold, blend out, natural after; replaced and cleared
+      mid-window; N steps == one jump with an override active.
+- [ ] A request at step N shows in step N+1's snapshot; a burst past the
+      per-step count applies over later steps in order.
+- [ ] Save/load with an active override reproduces the checksum trace; an
+      invalid saved override is rejected.
+- [ ] `FailingAllocator`: append, apply, and derive allocate nothing.
 - [ ] `zig build verify` passes.
-
-### VoidLight reference
-
-- **Port:** forced weather with a transition time
-  (`EventManager::changeWeather(name, transition, mode)`,
-  `src/managers/EventManager.cpp:326-343`; the demo cycle at
-  `src/gameStates/EventDemoState.cpp:715-735`).
-- **Do not port:**
-  - string weather names and the `Custom` type;
-  - the no-op `WeatherEvent::forceWeatherChange`
-    (`src/events/WeatherEvent.cpp:377-383`);
-  - immediate dispatch from the caller's thread.
-

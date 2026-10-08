@@ -2,9 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status:** Landed; one post-fix manual acceptance check on current code is
-open (display-gated), and the edge storage moved to Slice 64F's per-level
-repack, which [Slice 64G](slice-64g.md) replaces with chunk-owned storage.
+**Status: complete** (owner's post-fix manual check in Debug, 2026-10-08). Its
+edge storage moved to Slice 64F's per-level repack, which
+[Slice 64G](../slices/slice-64g.md) replaces with chunk-owned storage.
 
 **Goal:** a `LevelLink` added at runtime (today only `DigController.digRamp`)
 joins the abstract nav graph in the same step's post-commit nav reaction, on
@@ -163,11 +163,8 @@ allocates nothing.
       the deferral test is gone.
 - [x] Manual (display, procedural demo): NPCs on level 1 path up a dug
       non-border ramp within a second; confirmed by the owner 2026-10-06.
-- [ ] **Post-fix manual check on current code** (display; Debug or
-      ReleaseSafe build). The run above predates the edge-window overflow fix
-      and interior link capacity growth. Dig several ramps in one open chunk:
-      the perf dump shows `edge_windows_grown > 0`, `edge_repacks > 0`, and
-      `full_relabel=0`, and NPCs route over the new ramps.
+- [x] Post-fix manual check on current code: confirmed by the owner in a Debug
+      build, 2026-10-08.
 - [x] Edge-window overflow after runtime ramps (found in the 2026-10-06
       manual run): the full-rebuild fallback is gone; overflow is now handled
       by Slice 64F's per-level repack.
