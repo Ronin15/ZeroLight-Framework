@@ -34,6 +34,38 @@ by Slice 24.
 | Cover-aware movement | 71C | Open | Cover-aware flee and ranged pursue; `cover` markers wired |
 | AI selling | 71D | Open | `trade` behavior + `.sell` arm; closes forage → sell |
 
+### Open: cognition redesign for target scale (owner, 2026-10-08)
+
+The goal is emergent AI with many emotions and decisions. Utility scoring,
+sticky selection, and hysteresis drives are kept. The structure around them is
+demo-sized and needs a design pass (`zig-design-specialist`, with a cost model)
+before 42, 55, 56, 61, 63, 68B, 71A, 71C, or 71D add to it:
+
+- Emotions are named fields: four per drive on `AiAffect` (`baseline_*`,
+  `decay_rate_*`, `threshold_*`, value). `above_threshold_mask: u8` caps drives
+  at 8, a cap sized to today's count.
+- Decisions are hand-coded switch arms (`gainFor`, `perceptionTerm`,
+  `memoryTerm`, `resolveGoal`) plus a named `gain_*` field per behavior on
+  `AiAgent`.
+- Scoring is dense: every agent scores every drive × behavior pair.
+- There is no task/sequencing layer for multi-step work (dig, haul, build).
+- The add-a-feeling procedure below, and `.claude/rules/simulation.md` § AI and
+  affect ("its columns, one appraisal path, and one weight-table row"), encode
+  that hand-coded, one-at-a-time shape.
+
+The design should cover:
+
+- Drives and behaviors defined by data, with counts derived from content.
+- No per-drive or per-behavior code.
+- Sparse couplings and per-archetype behavior sets, so per-agent cost follows
+  what the agent uses, not catalog size.
+- A data-driven task/sequence layer under utility selection.
+- Orders in agent count, catalog size, and world count, with serial and
+  threaded paths.
+
+The rule edit lands in the same change as the design. The open AI slices
+above are then re-based on it.
+
 ### Emotion / feelings model (landed + expandability)
 
 **What exists today:**
