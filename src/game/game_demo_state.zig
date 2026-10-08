@@ -41,7 +41,7 @@ const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedMaxNavMemoryBytes;
-const nav_interior_link_slots_per_chunk = @import("systems/pathfinding.zig").nav_interior_link_slots_per_chunk;
+const nav_interior_link_slots_floor = @import("systems/pathfinding.zig").nav_interior_link_slots_floor;
 const default_min_group_field_agents = @import("systems/pathfinding.zig").default_min_group_field_agents;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const DigIntent = @import("simulation.zig").DigIntent;
@@ -187,15 +187,14 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
 };
 
 /// Initial level-link reservation at load: a headroom estimate, not a bound. The loaded
-/// world's authored links plus one level's worth of runtime interior ramp slots
-/// (`nav_interior_link_slots_per_chunk` per chunk), counting world chunks as nav chunks
+/// world's authored links plus one level's worth of runtime interior ramps
+/// (`nav_interior_link_slots_floor` per chunk), counting world chunks as nav chunks
 /// (assumes the nav chunk equals the world chunk; the demo's 16-tile chunks match
-/// `default_nav_chunk_tiles`). Ramps stacked across several levels' chunks and perimeter
-/// ramps (which take no interior slot) can exceed it; they grow the pool at the dig commit
-/// seam (`SimulationPipeline.ensureLevelLinkRoom`, gated by the nav-memory ceiling).
+/// `default_nav_chunk_tiles`). More ramps grow the pool at the dig commit seam
+/// (`SimulationPipeline.ensureLevelLinkRoom`).
 fn demoLevelLinkLimit(world: *const WorldSystem) usize {
     const world_chunks = @as(usize, world.chunksX()) * @as(usize, world.chunksY());
-    return world.levelLinks().len + world_chunks * nav_interior_link_slots_per_chunk;
+    return world.levelLinks().len + world_chunks * nav_interior_link_slots_floor;
 }
 
 /// The demo's shared-flow-field threshold (see `proceduralPathfindingCapacity`'s

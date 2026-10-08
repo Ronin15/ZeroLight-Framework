@@ -25,9 +25,10 @@
 //!
 //! A fourth group, `nav-update-links`, measures the runtime LevelLink reaction: a
 //! batch of `item_count` new ramp links (one per distinct chunk, interior cell, levels 1<->0)
-//! folded in through the link cursor (fixed interior slot + both endpoint levels dirtied) and the
+//! folded in through the link cursor (interior slot + both endpoint levels dirtied) and the
 //! buffered incremental apply. The 8-link row is the same dirty-footprint order as the scattered
-//! group's 16-chunk row (8 chunks on each of 2 levels).
+//! group's 16-chunk row (8 chunks on each of 2 levels). `nav-update-links-capacity` times the
+//! one ramp that crosses a chunk's interior link capacity (an in-place slot growth).
 //!
 //! A fifth pair, `nav-update-cave-in` / `nav-update-cave-in-warm`, times one step
 //! that carves a 4x4-chunk lattice on `item_count` levels of a 1024x1024-tile, 32-level world:
@@ -71,6 +72,7 @@ const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 // stays one dirty cell per distinct chunk (its item_count equals the dirty-chunk count) even if
 // the default changes.
 const nav_chunk_tiles: u16 = @import("../game/systems/pathfinding.zig").default_nav_chunk_tiles;
+const nav_interior_link_slots_floor = @import("../game/systems/pathfinding.zig").nav_interior_link_slots_floor;
 const chunks_per_side: usize = @as(usize, world_tiles) / nav_chunk_tiles;
 const total_chunks: usize = chunks_per_side * chunks_per_side;
 
@@ -688,7 +690,7 @@ pub fn linkItemCounts(profile: suite.Profile) []const usize {
     return &link_counts;
 }
 
-// The full per-step cursor budget (8, which equals the fixed interior link slots per chunk)
+// The full per-step cursor budget (8, which equals the floor interior link capacity per chunk)
 // landing in ONE nav chunk: distinct interior cells of chunk (1,1). Every ramp endpoint joins the
 // chunk's open component, so its edges (4 + 12*11 = 136) outgrow the build-measured 32-edge
 // window and the timed step crosses it: an in-place window growth.
@@ -705,8 +707,46 @@ pub fn denseLinkItemCounts(profile: suite.Profile) []const usize {
     return &dense_link_counts;
 }
 
-// Where a batch's ramp links land: one per chunk (chunk centers, row-major) or all in one chunk.
-const LinkLayout = enum { spread, one_chunk };
+// One ramp past a nav chunk's interior link capacity: chunk (1,1) already holds the floor's
+// 8 interior endpoints (folded untimed), so the timed step grows the chunk's capacity to 16 in
+// place, shifting later chunks' slots on both levels. The cost of a capacity crossing (rare:
+// capacity doubles).
+const capacity_link_counts = [_]usize{1};
+
+pub const links_capacity_group = suite.BenchmarkGroup{
+    .name = "nav-update-links-capacity",
+    .defaultItemCounts = capacityLinkItemCounts,
+    .runCase = runCapacityLinksCase,
+};
+
+pub fn capacityLinkItemCounts(profile: suite.Profile) []const usize {
+    _ = profile;
+    return &capacity_link_counts;
+}
+
+// Where a batch's ramp links land: one per chunk (chunk centers, row-major), all in one chunk,
+// or in one chunk whose floor capacity a prior untimed batch filled.
+const LinkLayout = enum { spread, one_chunk, capacity_crossing };
+
+// Most links a timed batch's world holds: the full budget, or the floor plus one crossing ramp.
+const max_bench_links = link_counts[link_counts.len - 1] + capacity_link_counts[0];
+
+// Ramp cell of a batch's link `i` (see LinkLayout).
+fn linkCell(layout: LinkLayout, i: usize) [2]u16 {
+    return switch (layout) {
+        .spread => .{
+            @intCast((i % chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2),
+            @intCast((i / chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2),
+        },
+        // Chunk (1,1) spans tiles 16..31; cells 18..27 step 3 stay off its perimeter.
+        .one_chunk => .{ @intCast(nav_chunk_tiles + 2 + (i % 4) * 3), @intCast(nav_chunk_tiles + 2 + (i / 4) * 3) },
+        .capacity_crossing => linkCell(.one_chunk, i + nav_interior_link_slots_floor),
+    };
+}
+
+fn addBenchRamp(world: *WorldSystem, cell: [2]u16) !void {
+    try world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = cell[0], .y = cell[1] }, .level_b = 0, .cell_b = .{ .x = cell[0], .y = cell[1] }, .traversal_cost = 1, .bidirectional = true });
+}
 
 // Same world shape as the tile-edit fixture (256x256 tiles, 32 px cells, default 16-tile nav
 // chunks) with an open grass level 1 under the surface, so every ramp link joins two open levels.
@@ -750,7 +790,7 @@ fn buildLinkWorld(allocator: std.mem.Allocator, meta: *const world_tileset_meta.
     errdefer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
-    try world.reserveLevelLinks(link_counts[link_counts.len - 1]);
+    try world.reserveLevelLinks(max_bench_links);
     return world;
 }
 
@@ -800,25 +840,32 @@ fn resetLinkWorld(fixture: *LinksFixture) !void {
 // the post-commit reaction's link work.
 fn timeLinkBatch(fixture: *LinksFixture, io: std.Io, n: usize, layout: LinkLayout, thread_system: ?*ThreadSystem) !u64 {
     try resetLinkWorld(fixture);
-    for (0..n) |i| {
-        const x: u16, const y: u16 = switch (layout) {
-            .spread => .{
-                @intCast((i % chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2),
-                @intCast((i / chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2),
-            },
-            // Chunk (1,1) spans tiles 16..31; cells 18..27 step 3 stay off its perimeter.
-            .one_chunk => .{ @intCast(nav_chunk_tiles + 2 + (i % 4) * 3), @intCast(nav_chunk_tiles + 2 + (i / 4) * 3) },
-        };
-        try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = x, .y = y }, .level_b = 0, .cell_b = .{ .x = x, .y = y }, .traversal_cost = 1, .bidirectional = true });
+    if (layout == .capacity_crossing) {
+        for (0..nav_interior_link_slots_floor) |i| try addBenchRamp(&fixture.world, linkCell(.one_chunk, i));
+        fixture.system.clearNavDirty();
+        _ = try fixture.system.markNewNavLinksDirty(&fixture.world);
+        _ = try fixture.system.applyBufferedNavUpdates(&fixture.data, &fixture.world, thread_system);
     }
+    for (0..n) |i| try addBenchRamp(&fixture.world, linkCell(layout, i));
     fixture.system.clearNavDirty();
+    const slots_before = totalSlots(&fixture.system);
     const t0 = suite.nowNs(io);
     _ = try fixture.system.markNewNavLinksDirty(&fixture.world);
     const stats = try fixture.system.applyBufferedNavUpdates(&fixture.data, &fixture.world, thread_system);
     const elapsed = suite.elapsedNs(t0, suite.nowNs(io));
-    // The dense layout exists to time the step that outgrows a chunk's edge window.
+    // The dense layout exists to time the step that outgrows a chunk's edge window; the
+    // capacity layout, the step that crosses a chunk's interior link capacity.
     std.debug.assert(layout != .one_chunk or stats.edge_windows_grown != 0);
+    std.debug.assert((layout == .capacity_crossing) == (totalSlots(&fixture.system) != slots_before));
+    std.debug.assert(stats.full_relabel == 0);
     return elapsed;
+}
+
+// Nav node slots summed over every level.
+fn totalSlots(system: *const PathfindingSystem) u64 {
+    var total: u64 = 0;
+    for (system.graph.level_graphs.items) |*lg| total += lg.total_slots;
+    return total;
 }
 
 pub fn runLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -827,6 +874,10 @@ pub fn runLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 
 pub fn runDenseLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runLinksCaseWithLayout(allocator, io, options, case, item_count, .one_chunk);
+}
+
+pub fn runCapacityLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runLinksCaseWithLayout(allocator, io, options, case, item_count, .capacity_crossing);
 }
 
 fn runLinksCaseWithLayout(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, layout: LinkLayout) !suite.RunStats {

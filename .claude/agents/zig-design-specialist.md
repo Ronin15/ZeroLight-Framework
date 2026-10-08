@@ -44,6 +44,9 @@ never call SDL_GPU directly.
 
 - **Goal, success criteria, scope**, owning slice or subsystem, and the owner
   layer of every new piece.
+- **Simplest option first:** the smallest change that reuses existing
+  mechanisms. A plan that adds a new subsystem or any new limit must say why
+  that option fails.
 - **Frame/state call flow** preserving `main.zig → Engine` phase method `→
   StateStack` policy dispatch `→` eligible states. Gameplay logic lives in
   states/processors, never in `main.zig` or broad `Engine` conditionals.

@@ -1235,7 +1235,7 @@ Out of scope (each item has a named owner):
 - [ ] **K2 · Pending-queue backpressure justified** (pathfinding-11, `system.zig:1137-1164`).
   - Doc comment: deterministic backpressure gated on the logical `max_pending_requests`, which follows the live agent count.
   - Test, if none exists: submitting `max_pending + 3` distinct keys drops exactly 3, the accepted set is the first `max_pending` in request order, and dropped agents re-request on `.missing`.
-- [ ] **K3 · Interior link slots K = 8 justified** (pathfinding-27, `types.zig:131-140`). The doc names it a layout bound: slot ids are a pure function of the dimensions. Confirm that 64E's ninth-interior-ramp refusal test pins the counted refusal.
+- [x] **K3 · Interior link slots** (pathfinding-27) — resolved 2026-10-07: K = 8 is now a floor (`nav_interior_link_slots_floor`); a chunk's capacity doubles in place when a ramp needs it, so there is no refusal to justify.
 - [ ] **K4 · Particle pool justified** (gameplay-systems-29, `particle.zig:330-339`).
   - Doc: presentation-only; refusal is in emission order against the logical `capacity`; particles never feed simulation state.
   - Test, if none exists: emitting past capacity refuses and counts, and existing particle order is unchanged.

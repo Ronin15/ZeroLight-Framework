@@ -337,13 +337,9 @@ and build fingerprint** (from 64B/64C/64E):
 - [ ] Test: a replay recorded across a save (capture spanning the paused
       `SaveCapture`) verifies `matched` with no flag bits set, which proves
       the save is invisible to replay as well.
-- [ ] **Load-time link-slot validation (64E).** After `world_meta` restores
-      `level_links`, the loader checks every link endpoint with
-      `nav_graph.interiorLinkSlotsAvailable` over the links before it, using
-      the session's nav geometry; a violation (impossible from a save made
-      by this build, because `DigController` refuses it) fails the load with
-      `SaveCorrupt`, nothing installed. Test: a hand-built payload whose 9th
-      link exceeds one 8-tile nav chunk's interior slots is rejected.
+- [x] **Load-time link-slot validation (64E)** — dropped 2026-10-07: interior
+      link capacity is sized per chunk from the loaded link set, so no
+      restored link can exceed it.
 - [ ] `SaveSlotHeader.build_fingerprint` is
       `simulation_checksum.buildFingerprint()` (64B single owner), not a
       second Crc32.

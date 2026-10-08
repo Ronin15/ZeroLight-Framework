@@ -77,13 +77,13 @@ new features.
 - **Nav memory gate is structural.**
   - `NavMemoryBudget.requiredBytes` sizes per-level static arrays ×
     `level_count`, and abstract slots as `levels × chunks × (4·ct +
-    nav_interior_link_slots_per_chunk)` plus a `link_edges` term (Slice 64E),
+    nav_interior_link_slots_floor)` plus a `link_edges` term (Slice 64E),
     independent of how many cells are open
     (`systems/pathfinding/nav_memory.zig`).
   - `budgetForCapacity` takes the link count. Since Slice 64E it is
     `world.levelLinkLimit()`, the load-time link capacity the demo reserves
     with `reserveLevelLinks(levelLinks().len + world chunks ×
-    nav_interior_link_slots_per_chunk)` (`demoLevelLinkLimit`,
+    nav_interior_link_slots_floor)` (`demoLevelLinkLimit`,
     `src/game/game_demo_state.zig`) as the initial reservation; the dig commit
     seam raises it when a ramp needs room.
   - `NavGrid.markWorldObstacles` memsets uniform layers, walks non-uniform
@@ -494,7 +494,7 @@ are working capacities sized from the world in Phase 0 (rows marked
 
 | Constant | Value | Reasoning |
 | --- | --- | --- |
-| `max_cave_entrances` | 16 | Loud load-time ceiling on the authored `entrances.max`, a content count. It does not size link storage: the demo reserves `levelLinks().len + world chunks × nav_interior_link_slots_per_chunk` after generation (Slice 64E), and entrances are authored links inside that capacity. |
+| `max_cave_entrances` | 16 | Loud load-time ceiling on the authored `entrances.max`, a content count. It does not size link storage: the demo reserves `levelLinks().len + world chunks × nav_interior_link_slots_floor` after generation (Slice 64E), and entrances are authored links inside that capacity. |
 | cave `cell_size` / `threshold` | `8..=64` / `[0.50, 0.95]` | Blobby pockets, at most about half open. |
 | `max_cave_node_rules` | 4 | Same shape as the surface rules. |
 | `max_structure_templates` / `max_village_layouts` | 32 / 16 | Fixed spec tables. |
@@ -644,20 +644,9 @@ world (Slice 58 precedent). Nothing changes on hot paths.
         write (clearing `uniform_fill_tile` when `surface_tile` differs) and
         `addLevelLink` in `finish`;
       - the player-spawn skip.
-- [ ] (added by Slice 64) The entrance commit loop, in its existing rank order, skips an
-      entrance cell `c` for which
-      `nav_graph.interiorLinkSlotsAvailable(world.levelLinks(), c, .{
-      .chunk_tiles = capacity.nav_chunk_tiles, .width = width_tiles,
-      .height = height_tiles })` is false (the session's
-      `PathfindingCapacity.nav_chunk_tiles`; link endpoints are tile cells,
-      as `recordLinkEndpoint` already assumes), and counts
-      `worldgen_entrances_refused_link_slots`. The skip is deterministic
-      (a pure function of the ranked candidates), so the golden hashes stay
-      a pure function of seed and spec. Test: the private entrance-commit
-      helper, fed a test-local ranked list of 9 distinct interior cells in
-      one 8-tile nav chunk on a 16×16 fixture, commits 8 links and reports 1
-      refused. No generated world can then fail Slice 46's
-      load-time link-slot validation.
+- [x] (added by Slice 64) Entrance skip for full interior link slots — dropped
+      2026-10-07: interior link capacity grows per chunk, so every ranked
+      entrance commits.
 - [ ] `generate.zig`:
       - the jobs' footprint suppression;
       - socket outputs with authored-first selection and drop counters;

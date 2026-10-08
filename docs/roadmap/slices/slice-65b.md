@@ -7,7 +7,7 @@
 `UpdateContext.background_lane`) and **65A**, the first CPU-heavy in-game
 lane consumer, which needs the lowered-priority gate to hold. Uses **49**'s
 determinism stepper and `simulationChecksum()` for the lane-invariance test.
-Depends on **64E** (fixed interior link slots and the `nav_links_processed`
+Depends on **64E** (interior link slots and the `nav_links_processed`
 cursor, which the back-graph patch and the fence use) and **64B**
 (`PathfindingSystem.normalize`, which this slice extends with
 `abandonDeferred`). Edits roadmap text and adds checklist bullets in 46, 49,
@@ -90,16 +90,15 @@ Goal:
   Links grow at runtime (`dig_controller.digRamp`;
   `WorldSystem.addLevelLink`). The world's load-time `reserveLevelLinks`
   (sized by `GameDemoState` from the authored links plus
-  `nav_interior_link_slots_per_chunk` per world chunk) is only the initial
+  `nav_interior_link_slots_floor` per world chunk) is only the initial
   size: per Slice 64E's link-growth follow-up (landed 2026-10-06),
   `level_links`, `link_edges`, and `link_edge_refs` grow geometrically at the
   dig commit seam (main thread; `SimulationPipeline.ensureLevelLinkRoom` →
-  `PathfindingSystem.reserveLinkCapacity`), and only the 8-per-chunk interior
-  stride (a layout bound) refuses. Slice 64E removed `groupLinkCellRuns` and its per-build
+  `PathfindingSystem.reserveLinkCapacity`); nothing refuses a ramp (a chunk's
+  interior link capacity grows in place, 2026-10-07). Slice 64E removed `groupLinkCellRuns` and its per-build
   temporary `allocator.alloc`: interior link endpoints live in the
-  fixed-stride `chunk_link_cells` table (`chunk_count ×
-  nav_interior_link_slots_per_chunk`, sized from the dimensions in
-  `computePortalGeometry`), and the full build reserves `link_edges` /
+  `chunk_link_cells` table (each chunk's interior link capacity, sized from
+  the link set in `computePortalGeometry`), and the full build reserves `link_edges` /
   `link_edge_refs` to `levelLinkLimit()` / `2 × levelLinkLimit()`.
 - **Allocation contract.** The graph is allocation-free at steady state.
   Growth happens only in the cold, event-triggered topology blow-up
@@ -414,10 +413,8 @@ rule enforced structurally: the job cannot reach `parallelFor`.
       `edge_windows_grown_total`, `edge_windows_grown_reported`,
       `edge_repacks_total`, `edge_repacks_reported` (lifetime counters and
       their report cursors, carried across the swap; 64E M10, 64F),
-      `chunk_link_cells` (64E's
-      fixed-stride `[chunk_count * nav_interior_link_slots_per_chunk]`
-      table), `chunk_link_count`, `full_build_link_endpoints_unslotted`
-      (last-full-build diagnostic, recomputed by the copy's own build).
+      `chunk_link_cells` (sum of the chunks' interior link capacities),
+      `chunk_link_count`.
       (`chunk_link_base` and `edge_slack` no longer exist; 64E deletes
       them.)
     - `NavGrid`: `level`, `cell_size`, `width`, `height`, `chunk_tiles`,
@@ -795,9 +792,10 @@ copied at submit") gains one clause:
     submit on a real threaded lane, and swap.
   - `--details` reports the lane job's own duration and whether the swap
     waited.
-- [ ] (added by Slice 64) The lane's back-graph patch/relabel uses 64E's fixed interior link
+- [ ] (added by Slice 64) The lane's back-graph patch/relabel uses 64E's interior link
       slots, `assignLinkEndpointSlots`, and the `nav_links_processed`
-      cursor. Links added while a deferred rebuild is in flight are held by
+      cursor; an endpoint past its chunk's capacity grows that chunk in place
+      (`growChunkLinkCapacity`, which shifts later chunks' slot windows). Links added while a deferred rebuild is in flight are held by
       the fence and processed by the main-thread cursor from step `s + k`'s
       seam (≤ 8 per step), never dropped. 65B's equivalence-to-synchronous
       test includes a runtime ramp added before submit and one added during

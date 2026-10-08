@@ -142,13 +142,13 @@ pub const PathfindingSystem = struct {
     /// Once-only flag for the dirty-buffer overflow warn.
     nav_dirty_buffer_grown_warned: bool = false,
     // Cursor into the world's append-only `levelLinks()`: links before it are folded into the
-    // nav graph's interior slot table and patched on both endpoint levels. Set to
+    // nav graph's per-level interior slot tables and patched on both endpoint levels. Set to
     // `levelLinks().len` by every full build (which assigns the whole link set); advanced by
     // the post-commit reaction (markNewNavLinksDirty) by at most nav_new_links_per_step_max per
     // step. World-derived, so a non-blocking-flip ramp dig still patches the graph.
     nav_links_processed: usize = 0,
-    // Cursor stats of steps whose nav apply has not succeeded yet: `processed`/`unslotted`
-    // accumulate, `deferred` is the latest gauge. The cursor advances when its marks land, so a
+    // Cursor stats of steps whose nav apply has not succeeded yet: `processed` accumulates,
+    // `deferred` is the latest gauge. The cursor advances when its marks land, so a
     // failed apply would otherwise lose them (the retry's cursor call finds nothing new).
     // Consumed by reactToPostCommitNavEvents after a successful apply; reset by a full build.
     nav_link_cursor_pending: NavLinkCursorStats = .{},
@@ -728,8 +728,6 @@ pub const PathfindingSystem = struct {
         processed: usize = 0,
         // New links left for a later call (deterministic, link order).
         deferred: usize = 0,
-        // Endpoint cells of the processed links left unslotted by the K cap (inert).
-        unslotted: usize = 0,
     };
 
     // Folds up to nav_new_links_per_step_max new LevelLinks (in link order, from the
@@ -740,11 +738,12 @@ pub const PathfindingSystem = struct {
     // work is bounded by the fixed budget: 2 dirty cells per link, independent of world size.
     //
     // Success-path-only side effects: the fallible marks run FIRST. A failed mark returns before
-    // any slot is assigned, any unslotted endpoint is counted or warned, or the cursor moves, so
-    // the retry assigns, counts, and warns exactly once (a re-marked dirty cell is harmless). The
-    // assignment is infallible and completes before the apply that reads it. Main thread only,
-    // before the patch dispatch. Allocation-free while the dirty buffers stay within their
-    // reserved capacity (they grow rather than drop, like every other markNavDirty).
+    // any slot is assigned or the cursor moves, so the retry assigns exactly once (a re-marked
+    // dirty cell is harmless). An endpoint past its chunk's interior capacity grows that chunk in
+    // place (NavGraph.growChunkLinkCapacity); an OOM there keeps the layout and the cursor, and
+    // the retry skips endpoints already assigned. Main thread only, before the patch dispatch.
+    // Allocation-free while the dirty buffers stay within their reserved capacity (they grow
+    // rather than drop, like every other markNavDirty) and no chunk's capacity is crossed.
     pub fn markNewNavLinksDirty(self: *PathfindingSystem, world: *const WorldSystem) !NavLinkCursorStats {
         if (!self.graph.valid()) return .{};
         const links = world.levelLinks();
@@ -759,11 +758,10 @@ pub const PathfindingSystem = struct {
             try self.markNavDirty(link.level_a, link.cell_a.x, link.cell_a.y);
             try self.markNavDirty(link.level_b, link.cell_b.x, link.cell_b.y);
         }
-        const unslotted = self.graph.assignLinkEndpointSlots(links[0..end], first, .cursor);
+        try self.graph.assignLinkEndpointSlots(links[0..end], first);
         self.nav_links_processed = end;
-        const stats = NavLinkCursorStats{ .processed = end - first, .deferred = links.len - end, .unslotted = unslotted };
+        const stats = NavLinkCursorStats{ .processed = end - first, .deferred = links.len - end };
         self.nav_link_cursor_pending.processed += stats.processed;
-        self.nav_link_cursor_pending.unslotted += stats.unslotted;
         self.nav_link_cursor_pending.deferred = stats.deferred;
         return stats;
     }
@@ -804,7 +802,7 @@ pub const PathfindingSystem = struct {
     // changed. Cell-localizable tile/obstacle edits forward one dirty cell each; entity-driven
     // changes resolve their carried world-space rect to a nav-cell span and patch only the
     // affected chunks, same as tile edits. New world LevelLinks are folded in through the link
-    // cursor (markNewNavLinksDirty: fixed interior slot, both endpoint levels dirtied, at most
+    // cursor (markNewNavLinksDirty: interior slot, both endpoint levels dirtied, at most
     // nav_new_links_per_step_max per step). Returns the batch stats (zero when nothing was pending).
     //
     // Deliberately does NOT clear the dirty buffers at entry: applyBufferedNavUpdates only
@@ -870,13 +868,12 @@ pub const PathfindingSystem = struct {
         try frame.events.ensureCanAppend(1);
         var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
         stats.links_deferred = self.nav_link_cursor_pending.deferred;
-        stats.link_endpoints_unslotted = self.nav_link_cursor_pending.unslotted;
         self.nav_link_cursor_pending = .{};
         // A full relabel rebuilds the abstract graph from the whole link set
         // (computePortalGeometry assigns from index 0) but deliberately leaves the cursor alone:
         // deferred links are still visited by later steps' cursor (idempotent assignment plus
-        // a redundant bounded patch), so per-step link accounting and the warn-once rule do not
-        // depend on whether a relabel happened to fire.
+        // a redundant bounded patch), so per-step link accounting does not depend on whether a
+        // relabel happened to fire.
         // Only signal invalidation when the batch actually changed the graph: an incremental dig
         // keeps nav_version stable, so gate on real work too, not just a full-rebuild version bump.
         if (stats.version_bumps == 0 and stats.incremental_rebuilds == 0) return stats;

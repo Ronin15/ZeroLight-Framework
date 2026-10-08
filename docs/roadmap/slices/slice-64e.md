@@ -31,6 +31,18 @@ patch, M7, M10 (now also `edge_repacks`), M12 (kept for OOM), M13, and every
 parity, OOM-sweep, and cached-path test stand; the failure-path tests inject
 OOM instead of a pinned ceiling. See `slice-64f.md`.
 
+**Interior link capacity grows; ramp refusal removed (2026-10-07).** E1's fixed
+K = 8 is now a floor (`nav_interior_link_slots_floor`). Each chunk's capacity is
+the floor, else the next power of two of its distinct interior endpoint cells,
+set by `computePortalGeometry` at every full build and relabel. A cursor
+endpoint past it grows that chunk in place (`growChunkLinkCapacity`: later
+slot windows shift and stored slot indices are remapped, no relabel). `interiorLinkSlotsAvailable`,
+`NavLinkSlotGeometry`, `DigController.nav_link_geometry`,
+`ramp_refused_link_slots`, the unslotted path, and their metrics
+(`dig_ramp_refused_link_slots`, `pathfinding_link_endpoints_unslotted`) are
+deleted; E1's refusal and unslotted items below are superseded. See
+`slice-64f.md` Measurements.
+
 **Link-growth refusal removed (owner decision, 2026-10-07).** The dig seam's
 link growth is never refused: `ensureLevelLinkRoom` always grows to
 `grownLevelLinkLimit`, `max_nav_memory_bytes` is a load-time check only, and an
@@ -191,7 +203,7 @@ Existing parity infrastructure (reuse it, do not rebuild it):
     (`nav_graph.zig:1182-1191`) maps a link cell through level 0's grid and
     dedupes by cell, so K bounds the **distinct interior endpoint cells per
     nav chunk across all levels** (a ramp's two endpoints share one cell and
-    use one slot).
+    use one slot). (Superseded: 64F made the slot geometry per level.)
   - The runtime producer cannot exceed K (producer-side refusal below), and
     a load-time link set that exceeds it is rejected (Slice 46 addition
     (c)). The unslotted overflow path below is the deterministic

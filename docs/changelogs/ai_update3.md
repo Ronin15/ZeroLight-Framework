@@ -49,9 +49,10 @@ These contracts are unchanged:
   a fixed-step `sim_view` taken from the previous step's camera. It is a
   required field and never reads the interpolated render window.
 - **Runtime ramps are routable the same step (Slice 64E).**
-  - Runtime level links fold into the nav abstract tier, with 8 fixed interior
-    link slots per chunk, both-level dirtying, and a per-step link budget with
-    deterministic deferral.
+  - Runtime level links fold into the nav abstract tier, with per-chunk interior
+    link capacity (floor 8, doubled in place when a ramp needs more),
+    both-level dirtying, and a per-step link budget with deterministic deferral.
+    No ramp is refused.
   - Incremental patches match a full rebuild.
   - Nav dirty buffers and level links grow at the dig commit seam.
 - **Nav edge storage simplified (Slice 64F).**
@@ -106,9 +107,10 @@ These contracts are unchanged:
 ## Pathfinding
 
 - **Slice 64E:**
-  - runtime level links patch both levels incrementally, using fixed interior
-    link slots and a link cursor;
-  - the dig refuses a ninth distinct interior ramp per chunk;
+  - runtime level links patch both levels incrementally, using interior link
+    slots and a link cursor;
+  - a chunk's interior link capacity grows (floor 8, then doubling) through a
+    full relabel on the step a ramp needs it; the ramp refusal is gone;
   - incremental patches match a full rebuild, serial and threaded;
   - a failed growth still patches the whole dirty set;
   - link-cursor and growth stats survive a failed step;

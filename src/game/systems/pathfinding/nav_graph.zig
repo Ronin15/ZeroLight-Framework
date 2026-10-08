@@ -28,7 +28,7 @@ const default_cell_size = types.default_cell_size;
 const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
 const default_edge_slack = types.default_edge_slack;
 const chunk_edge_floor = types.chunk_edge_floor;
-const nav_interior_link_slots_per_chunk = types.nav_interior_link_slots_per_chunk;
+const nav_interior_link_slots_floor = types.nav_interior_link_slots_floor;
 const no_cell = types.no_cell;
 const no_component = types.no_component;
 const cardinal_cost = types.cardinal_cost;
@@ -76,12 +76,29 @@ pub const LinkEdgeRef = struct {
 
 // One level's chunk-portal abstract graph over GEOMETRIC, chunk-stable node slots. A
 // portal cell's node id is a pure function of its position (chunk slot base plus a fixed
-// perimeter/link slot), so it never moves for the life of the graph: a dig only toggles
-// whether a slot is live (a tombstone otherwise). Every per-slot array indexes that
-// stable slot space, and every per-chunk array is keyed by chunk, so one chunk can be
-// patched in isolation without renumbering or touching any other chunk or level.
+// perimeter/link slot): a dig only toggles whether a slot is live (a tombstone otherwise).
+// Slot ids are level-local (searches key them with packRef). Slots move only when an earlier
+// chunk's interior link capacity on this level grows (NavGraph.growChunkLinkCapacity), which
+// shifts and remaps them on the main thread before any patch. Every per-slot array indexes
+// that slot space, and every per-chunk array is keyed by chunk, so one chunk can be patched in
+// isolation without touching any other chunk or level.
 pub const NavLevelGraph = struct {
-    // Sized to NavGraph.total_slots. A tombstone slot has cell_index == no_cell.
+    // This level's slot layout, computed at every full build and relabel
+    // (NavGraph.computePortalGeometry) from this level's own link endpoints, grown in place for
+    // one chunk by the link cursor, invariant across patches. chunk_portal_cap[D] = 4*ct + chunk
+    // D's interior link capacity (interiorLinkCapacity of its distinct interior endpoint cells);
+    // chunk_portal_base is its exclusive prefix-sum; total_slots their sum.
+    chunk_portal_cap: std.ArrayList(u32) = .empty,
+    chunk_portal_base: std.ArrayList(u32) = .empty,
+    total_slots: u32 = 0,
+    // This level's interior link-endpoint cells: chunk D's run starts at chunkLinkBase(D), holds
+    // chunk_link_count[D] cells in assignment (link) order, and has room for its interior link
+    // capacity; unused entries hold no_cell. An endpoint's index within its run is its stable
+    // slot offset past the chunk's 4*ct perimeter slots. Sized at every full build and relabel;
+    // the link cursor (assignLinkEndpointSlots) fills entries and grows a full chunk's run.
+    chunk_link_cells: std.ArrayList(u32) = .empty,
+    chunk_link_count: std.ArrayList(u32) = .empty,
+    // Sized to total_slots. A tombstone slot has cell_index == no_cell.
     portals: std.ArrayList(PortalNode) = .empty,
     // cell_index -> node slot (no_cell when the cell is not a portal). Sized to cell_count.
     cell_to_portal: std.ArrayList(u32) = .empty,
@@ -126,6 +143,10 @@ pub const NavLevelGraph = struct {
     };
 
     pub fn deinit(self: *NavLevelGraph, allocator: std.mem.Allocator) void {
+        self.chunk_link_count.deinit(allocator);
+        self.chunk_link_cells.deinit(allocator);
+        self.chunk_portal_base.deinit(allocator);
+        self.chunk_portal_cap.deinit(allocator);
         self.chunk_edge_base.deinit(allocator);
         self.chunk_edge_cap.deinit(allocator);
         self.chunk_label_len.deinit(allocator);
@@ -141,6 +162,44 @@ pub const NavLevelGraph = struct {
         self.* = undefined;
     }
 
+    // Reserves this level's layout arrays, so setSlotLens and the link-cell table length
+    // (`link_slots`) cannot fail.
+    fn reserveSlots(self: *NavLevelGraph, allocator: std.mem.Allocator, cell_count: usize, total_slots: usize, chunk_count: usize, link_slots: usize) !void {
+        try self.chunk_portal_cap.ensureTotalCapacity(allocator, chunk_count);
+        try self.chunk_portal_base.ensureTotalCapacity(allocator, chunk_count);
+        try self.chunk_link_count.ensureTotalCapacity(allocator, chunk_count);
+        try self.chunk_link_cells.ensureTotalCapacity(allocator, link_slots);
+        try self.cell_to_portal.ensureTotalCapacity(allocator, cell_count);
+        try self.portals.ensureTotalCapacity(allocator, total_slots);
+        try self.portal_edge_start.ensureTotalCapacity(allocator, total_slots);
+        try self.portal_edge_count.ensureTotalCapacity(allocator, total_slots);
+        try self.portal_order.ensureTotalCapacity(allocator, total_slots);
+        try self.chunk_label_keys.ensureTotalCapacity(allocator, total_slots);
+        try self.chunk_label_starts.ensureTotalCapacity(allocator, total_slots);
+        try self.chunk_order_len.ensureTotalCapacity(allocator, chunk_count);
+        try self.chunk_label_len.ensureTotalCapacity(allocator, chunk_count);
+        try self.chunk_edge_cap.ensureTotalCapacity(allocator, chunk_count);
+        try self.chunk_edge_base.ensureTotalCapacity(allocator, chunk_count);
+    }
+
+    // Sets the slot and per-chunk lengths reserveSlots reserved (not the link-cell table's).
+    fn setSlotLens(self: *NavLevelGraph, cell_count: usize, total_slots: usize, chunk_count: usize) void {
+        self.chunk_portal_cap.items.len = chunk_count;
+        self.chunk_portal_base.items.len = chunk_count;
+        self.chunk_link_count.items.len = chunk_count;
+        self.cell_to_portal.items.len = cell_count;
+        self.portals.items.len = total_slots;
+        self.portal_edge_start.items.len = total_slots;
+        self.portal_edge_count.items.len = total_slots;
+        self.portal_order.items.len = total_slots;
+        self.chunk_label_keys.items.len = total_slots;
+        self.chunk_label_starts.items.len = total_slots;
+        self.chunk_order_len.items.len = chunk_count;
+        self.chunk_label_len.items.len = chunk_count;
+        self.chunk_edge_cap.items.len = chunk_count;
+        self.chunk_edge_base.items.len = chunk_count;
+    }
+
     // Live portal nodes summed across the level's per-chunk order windows.
     fn liveCount(self: *const NavLevelGraph) usize {
         var count: usize = 0;
@@ -150,7 +209,9 @@ pub const NavLevelGraph = struct {
 
     // Edges a packed chunk holds (see portal_edge_start): the last slot's run end minus the
     // window base, O(1) instead of summing the slot window.
-    fn packedChunkEdgeCount(self: *const NavLevelGraph, chunk: u32, portal_base: u32, portal_cap: u32) u32 {
+    fn packedChunkEdgeCount(self: *const NavLevelGraph, chunk: u32) u32 {
+        const portal_base = self.chunk_portal_base.items[chunk];
+        const portal_cap = self.chunk_portal_cap.items[chunk];
         const last_slot = portal_base + portal_cap - 1;
         const run_end = self.portal_edge_start.items[last_slot] + self.portal_edge_count.items[last_slot];
         const edge_count = run_end - self.chunk_edge_base.items[chunk];
@@ -344,8 +405,8 @@ fn levelIsFull(full_level_ids: []const u16, level_index: usize) bool {
 // NavGrid per level (Z-floor) sharing dimensions/cell_size. Built once at nav
 // rebuild; queried read-only afterward.
 pub const NavGraph = struct {
-    // Failures of one chunk's patch or a level repack: allocation only (the u32 edge index is
-    // proven at the build, see maxLevelEdgeSlots).
+    // Failures of one chunk's patch or a level repack: allocation only (an edge arena past the
+    // u32 edge index reports OutOfMemory).
     const ChunkPatchError = std.mem.Allocator.Error;
 
     allocator: std.mem.Allocator,
@@ -386,15 +447,6 @@ pub const NavGraph = struct {
     last_patch_batch: BatchStats = .{},
     last_remask_batch: BatchStats = .{},
 
-    // Geometric, chunk-stable slot layout, computed once per dimensions/chunk_tiles and
-    // invariant across applyNavUpdates (chunk geometry is identical across levels, so this
-    // lives on NavGraph, not per level). chunk_portal_cap[D] = 4*ct +
-    // nav_interior_link_slots_per_chunk for EVERY chunk (a pure function of the dimensions,
-    // never of the link set); chunk_portal_base is its exclusive prefix-sum; total_slots
-    // their sum.
-    chunk_portal_cap: std.ArrayList(u32) = .empty,
-    chunk_portal_base: std.ArrayList(u32) = .empty,
-    total_slots: u32 = 0,
     // Lifetime diagnostics: chunk edge windows grown and level arenas repacked
     // (repackLevelEdges). The `_reported` cursors mark how much a successful applyNavUpdates has
     // already reported (NavUpdateStats.edge_windows_grown / edge_repacks = total - reported), so
@@ -411,18 +463,6 @@ pub const NavGraph = struct {
     // any dispatch). The threaded patch writes only its own chunks' slots (disjoint); the level
     // repack after the barrier (repackLevelEdges) reads and clears them.
     chunk_edge_overflow: std.ArrayList(bool) = .empty,
-    // Fixed-stride table of interior link-endpoint cells (deduped by cell across all levels):
-    // chunk D's run is chunk_link_cells[D*K .. D*K + chunk_link_count[D]) with
-    // K = nav_interior_link_slots_per_chunk, in assignment (link) order; unused entries hold
-    // no_cell. An interior endpoint's index within its run is its stable slot offset past the
-    // chunk's 4*ct perimeter slots. Sized at every full build; the runtime link cursor
-    // (assignLinkEndpointSlots) only fills entries, never reallocates.
-    chunk_link_cells: std.ArrayList(u32) = .empty,
-    chunk_link_count: std.ArrayList(u32) = .empty,
-    // Unslotted link endpoints counted by the most recent full slot assignment
-    // (computePortalGeometry). Diagnostic only; the incremental cursor reports its own count
-    // through NavUpdateStats.link_endpoints_unslotted.
-    full_build_link_endpoints_unslotted: usize = 0,
     // Dirty-set scratch for incremental patching: the deduped chunk list to patch this
     // batch plus a per-chunk stamp (epoch-compared, never cleared) for O(1) membership.
     dirty_set: std.ArrayList(u32) = .empty,
@@ -437,12 +477,8 @@ pub const NavGraph = struct {
         self.dirty_stamp.deinit(self.allocator);
         self.dirty_set.deinit(self.allocator);
         self.changed_chunks.deinit(self.allocator);
-        self.chunk_link_count.deinit(self.allocator);
-        self.chunk_link_cells.deinit(self.allocator);
         self.chunk_edge_overflow.deinit(self.allocator);
         self.build_edge_scratch.deinit(self.allocator);
-        self.chunk_portal_base.deinit(self.allocator);
-        self.chunk_portal_cap.deinit(self.allocator);
         self.build_u32_scratch.deinit(self.allocator);
         for (self.patch_scratch.items) |*scratch| scratch.deinit(self.allocator);
         self.patch_scratch.deinit(self.allocator);
@@ -609,20 +645,6 @@ pub const NavGraph = struct {
         if (world) |world_system| try self.reserveLinkEdges(world_system.levelLinkLimit());
         try self.rebuildLinkEdges(world);
 
-        // Pre-reserve each slot's edge buffer and compaction cursor so a patch — serial OR
-        // threaded — never reallocates, including the overflow path that is detected only AFTER
-        // a chunk's full transient edge list is built. The transient list is bounded by a chunk's
-        // border edges (<= pcap) plus its same-component intra pairs (<= pcap*(pcap-1)), i.e.
-        // pcap^2; reserving that keeps a worker-thread append allocation-free even when a chunk's
-        // edges exceed its window (which the level repack after the barrier then grows).
-        var max_portal_cap: usize = 0;
-        for (self.chunk_portal_cap.items) |cap| max_portal_cap = @max(max_portal_cap, cap);
-        const max_transient_edges = max_portal_cap *| max_portal_cap;
-        for (self.patch_scratch.items) |*scratch| {
-            try scratch.edges.ensureTotalCapacity(self.allocator, max_transient_edges);
-            try scratch.cursor.ensureTotalCapacity(self.allocator, max_portal_cap);
-        }
-
         // Per-participant remask/re-flood scratch: a BFS queue sized to one chunk's cell count
         // (a chunk-local flood never leaves its chunk) so a threaded re-flood is allocation-free.
         try self.remask_scratch.ensureTotalCapacity(self.allocator, participant_count);
@@ -651,8 +673,9 @@ pub const NavGraph = struct {
     // leaves levels before L rebuilt; level L on its new mask with portals rebuilt up to the
     // failing chunk (later chunks tombstoned) and empty, packed adjacency; and later levels on
     // their old, self-consistent mask and abstract layer. Every level's label sub-index matches
-    // its grid and no edge targets a tombstone. The dirty marks stay buffered, so the retry is
-    // the same relabel, from the world.
+    // its grid and no edge targets a tombstone. When the relabel's geometry changed the slot
+    // layout, later levels are instead left empty (computePortalGeometry tombstones them). The
+    // dirty marks stay buffered, so the retry is the same relabel, from the world.
     fn relabelAllLevels(
         self: *NavGraph,
         data: *const DataSystem,
@@ -704,8 +727,8 @@ pub const NavGraph = struct {
     // one shared allocator.
     //
     // Allocation contract: allocation-free at steady state — the abstract buffers are reused
-    // at the prior build's high-water capacity, and the slot/order arrays are geometrically
-    // sized so they never grow on a dig. The only growth is a chunk outgrowing its edge window
+    // at the prior build's high-water capacity, and the slot/order arrays never grow on a dig
+    // (only the link cursor grows them, before this runs). The only growth is a chunk outgrowing its edge window
     // (a dig or runtime ramp adding same-component portals): that level's arena is repacked once
     // with grown windows (repackLevelEdges, one allocation per level). The edge arena is
     // runtime-growing data, never refused by the nav memory gate: only an OOM fails a step. A
@@ -799,8 +822,7 @@ pub const NavGraph = struct {
         // still correct. Deduped per chunk and byte-identical to a full mark. Past the threshold
         // a level-count blowup degenerates to a full graph rebuild; flag it loudly rather than
         // silently doing whole-world work.
-        const full_relabel = affected_level_count > full_relabel_level_threshold;
-        if (full_relabel) {
+        if (affected_level_count > full_relabel_level_threshold) {
             try self.relabelAllLevels(data, world, edits, cell_edits, full_level_ids, affected_levels.items, remask_threads);
             stats.full_relabel = 1;
         } else {
@@ -1182,195 +1204,365 @@ pub const NavGraph = struct {
         return @intCast(slot);
     }
 
-    // Geometric node slot for a portal cell: chunk slot base plus its fixed perimeter slot,
-    // or (for a non-perimeter interior link endpoint) base + 4*ct + its stable tail index.
-    fn slotForCell(self: *const NavGraph, cell_index: usize) u32 {
+    // Geometric node slot for a portal cell on `lg`'s level: chunk slot base plus its fixed
+    // perimeter slot, or (for a non-perimeter interior link endpoint) base + 4*ct + its stable
+    // tail index.
+    fn slotForCell(self: *const NavGraph, lg: *const NavLevelGraph, cell_index: usize) u32 {
         const chunk = self.chunkOf(cell_index);
-        const base = self.chunk_portal_base.items[chunk];
+        const base = lg.chunk_portal_base.items[chunk];
         if (self.isPerimeterCell(cell_index)) return base + self.perimeterSlot(cell_index);
         const ct: u32 = self.chunk_tiles;
-        return base + 4 * ct + self.linkTailIndex(chunk, cell_index);
+        return base + 4 * ct + self.linkTailIndex(lg, chunk, cell_index);
     }
 
-    // Chunk D's assigned interior link-endpoint run (at most K entries, link order).
-    fn chunkLinkRun(self: *const NavGraph, chunk: u32) []const u32 {
-        const lo = @as(usize, chunk) * nav_interior_link_slots_per_chunk;
-        return self.chunk_link_cells.items[lo .. lo + self.chunk_link_count.items[chunk]];
+    // Start of chunk D's run in chunk_link_cells: its portal base minus the perimeter slots of
+    // the chunks before it (the table holds interior capacity only).
+    fn chunkLinkBase(self: *const NavGraph, lg: *const NavLevelGraph, chunk: u32) usize {
+        return @as(usize, lg.chunk_portal_base.items[chunk]) - @as(usize, chunk) * 4 * @as(usize, self.chunk_tiles);
     }
 
-    // Tail index of an interior link-endpoint cell within its chunk's link-cell run: a linear
-    // scan of at most nav_interior_link_slots_per_chunk entries.
-    fn linkTailIndex(self: *const NavGraph, chunk: u32, cell_index: usize) u32 {
-        const run = self.chunkLinkRun(chunk);
+    // Chunk D's interior link capacity: its portal cap past the 4*ct perimeter slots.
+    fn chunkLinkCapacity(self: *const NavGraph, lg: *const NavLevelGraph, chunk: u32) u32 {
+        return lg.chunk_portal_cap.items[chunk] - 4 * @as(u32, self.chunk_tiles);
+    }
+
+    // Chunk D's assigned interior link-endpoint run (link order).
+    fn chunkLinkRun(self: *const NavGraph, lg: *const NavLevelGraph, chunk: u32) []const u32 {
+        return lg.chunk_link_cells.items[self.chunkLinkBase(lg, chunk)..][0..lg.chunk_link_count.items[chunk]];
+    }
+
+    // Tail index of an interior link-endpoint cell within its chunk's link-cell run (linear scan).
+    fn linkTailIndex(self: *const NavGraph, lg: *const NavLevelGraph, chunk: u32, cell_index: usize) u32 {
+        const run = self.chunkLinkRun(lg, chunk);
         // slotForCell only reaches here for a non-perimeter portal cell that was already
         // admitted as a portal. Border cells (tryBorderPair) are perimeter; link endpoints are
-        // gated by tryLinkPortal, which skips any interior cell absent from this run (an
-        // endpoint left unslotted by the K cap, or one a deferred link cursor has not reached),
-        // so a miss is an invariant violation (a Debug/ReleaseSafe panic; covered by the "ninth
-        // authored interior link endpoint ... stays unslotted" test) rather than a real path.
+        // gated by tryLinkPortal, which skips any interior cell absent from this run (one a
+        // deferred link cursor has not reached), so a miss is an invariant violation (a
+        // Debug/ReleaseSafe panic) rather than a real path.
         const rel = std.mem.indexOfScalar(u32, run, @as(u32, @intCast(cell_index))) orelse unreachable; // lint:allow catch-unreachable: interior portal cell provably present in run (see above)
         return @intCast(rel);
     }
 
-    // Computes the chunk-stable slot geometry (portal caps/base/total_slots and the fixed-stride
-    // per-chunk interior link-endpoint table) from the current dimensions, then assigns the
-    // world's whole link set into the table from index 0. The slot layout is a pure function of
-    // the dimensions (never of the link set), so the incremental link cursor and a full build
-    // share one layout and adding a link never renumbers a slot.
+    // Interior link capacity of a chunk with `distinct` interior endpoint cells: the floor, else
+    // the next power of two (headroom, so growths stay rare), capped at the chunk's interior
+    // cell count. f(d) == f(d0) for d0 <= d <= f(d0), so a run the cursor fills within its
+    // capacity keeps the capacity a full build computes.
+    fn interiorLinkCapacity(distinct: u32, ct: u32) u32 {
+        if (distinct <= nav_interior_link_slots_floor) return nav_interior_link_slots_floor;
+        const interior = (ct - 2) * (ct - 2);
+        return @min(std.math.ceilPowerOfTwo(u32, distinct) catch interior, interior);
+    }
+
+    // The distinct interior link-endpoint cells of `links` on `level`, chunk-major then by cell,
+    // written into `scratch` (at least 2 * links.len long).
+    fn levelInteriorLinkCells(self: *const NavGraph, level: u16, links: []const LevelLink, scratch: []u32) []u32 {
+        const level_grid = &self.levels.items[level];
+        var len: usize = 0;
+        for (links) |link| {
+            for ([2]u16{ link.level_a, link.level_b }, [2]CellCoord{ link.cell_a, link.cell_b }) |endpoint_level, coord| {
+                if (endpoint_level != level) continue;
+                const cell = level_grid.indexForCell(.{ .x = coord.x, .y = coord.y }) orelse continue;
+                if (self.isPerimeterCell(cell)) continue;
+                scratch[len] = @intCast(cell);
+                len += 1;
+            }
+        }
+        const cells = scratch[0..len];
+        std.sort.pdq(u32, cells, self, chunkMajorLessThan);
+        var unique: usize = 0;
+        for (cells) |cell| {
+            if (unique != 0 and cells[unique - 1] == cell) continue;
+            cells[unique] = cell;
+            unique += 1;
+        }
+        return cells[0..unique];
+    }
+
+    fn chunkMajorLessThan(self: *const NavGraph, a: u32, b: u32) bool {
+        const chunk_a = self.chunkOf(a);
+        const chunk_b = self.chunkOf(b);
+        return chunk_a < chunk_b or (chunk_a == chunk_b and a < b);
+    }
+
+    // Length of `chunk`'s run in chunk-major `cells` from `next.*`; advances `next` past it.
+    fn takeChunkRun(self: *const NavGraph, cells: []const u32, next: *usize, chunk: usize) u32 {
+        const start = next.*;
+        while (next.* < cells.len and self.chunkOf(cells[next.*]) == chunk) next.* += 1;
+        return @intCast(next.* - start);
+    }
+
+    // Computes every level's slot geometry from the current dimensions and link set: each
+    // chunk's interior link capacity (interiorLinkCapacity of its distinct interior endpoint
+    // cells on that level), the level's portal caps/base/total_slots, and its interior
+    // link-endpoint table, then assigns the whole link set into the tables from index 0 (the
+    // incremental cursor's rule and order, so both share one layout). Everything is reserved
+    // before the first write, so an OOM leaves the current layouts intact. A level whose layout
+    // changed has its abstract layer tombstoned (it is rebuilt next), so a level a failed
+    // relabel never reaches stays consistent (empty).
     fn computePortalGeometry(self: *NavGraph, world: ?*const WorldSystem) !void {
         const cell_count = self.cellCount();
         std.debug.assert(cell_count < no_cell);
         const chunk_count = self.chunkCount();
         const ct: u32 = self.chunk_tiles;
+        const links: []const LevelLink = if (world) |world_system| world_system.levelLinks() else &.{};
+        const scratch = try self.buildScratch(2 * links.len);
 
-        // Fixed-stride interior link-endpoint table: K entries per chunk, empty = no_cell.
-        try setLen(&self.chunk_link_count, self.allocator, chunk_count);
-        try setLen(&self.chunk_link_cells, self.allocator, chunk_count * nav_interior_link_slots_per_chunk);
-        @memset(self.chunk_link_count.items, 0);
-        @memset(self.chunk_link_cells.items, no_cell);
-        self.full_build_link_endpoints_unslotted = if (world) |world_system|
-            self.assignLinkEndpointSlots(world_system.levelLinks(), 0, .full_build)
-        else
-            0;
-
-        // Portal caps: 4*ct perimeter slots plus the fixed K interior link slots, every chunk.
-        try setLen(&self.chunk_portal_cap, self.allocator, chunk_count);
-        try setLen(&self.chunk_portal_base, self.allocator, chunk_count);
-        var running: u32 = 0;
-        for (0..chunk_count) |c| {
-            self.chunk_portal_base.items[c] = running;
-            const cap = 4 * ct + nav_interior_link_slots_per_chunk;
-            self.chunk_portal_cap.items[c] = cap;
-            // Saturating, matching the edge-cap prefix sum: the memory-budget gate rejects
-            // worlds anywhere near a u32 slot-count overflow, but keep the arithmetic loud
-            // rather than silently wrapping if one ever slips through.
-            running +|= cap;
+        // Size and reserve every level; a slot index past u32 reports OutOfMemory.
+        var max_portal_cap: usize = 0;
+        for (self.level_graphs.items, 0..) |*lg, level| {
+            const link_cells = self.levelInteriorLinkCells(@intCast(level), links, scratch);
+            var total_slots: u32 = 0;
+            var link_slots: usize = 0;
+            var next: usize = 0;
+            for (0..chunk_count) |chunk| {
+                const capacity = interiorLinkCapacity(self.takeChunkRun(link_cells, &next, chunk), ct);
+                const cap = std.math.add(u32, 4 * ct, capacity) catch return error.OutOfMemory;
+                total_slots = std.math.add(u32, total_slots, cap) catch return error.OutOfMemory;
+                link_slots += capacity;
+                max_portal_cap = @max(max_portal_cap, cap);
+            }
+            try lg.reserveSlots(self.allocator, cell_count, total_slots, chunk_count, link_slots);
         }
-        self.total_slots = running;
-        // rebuild rejected an extent whose edge index could overflow u32.
-        std.debug.assert(self.maxLevelEdgeSlots() <= std.math.maxInt(u32));
-
-        // Size the dirty-set scratch (bounded by chunk count) and per-chunk stamps.
         try self.dirty_set.ensureTotalCapacity(self.allocator, chunk_count);
         try self.changed_chunks.ensureTotalCapacity(self.allocator, chunk_count);
-        try setLen(&self.dirty_stamp, self.allocator, chunk_count);
+        try self.dirty_stamp.ensureTotalCapacity(self.allocator, chunk_count);
+        // One chunk patch's transient edges are bounded by its border edges (<= pcap) plus its
+        // same-component pairs (<= pcap*(pcap-1)), so a patch (serial or threaded, overflow
+        // included) never allocates.
+        for (self.patch_scratch.items) |*patch| {
+            try patch.edges.ensureTotalCapacity(self.allocator, max_portal_cap *| max_portal_cap);
+            try patch.cursor.ensureTotalCapacity(self.allocator, max_portal_cap);
+        }
+
+        // Commit.
+        for (self.level_graphs.items, 0..) |*lg, level_index| {
+            const level: u16 = @intCast(level_index);
+            const link_cells = self.levelInteriorLinkCells(level, links, scratch);
+            var layout_changed = lg.chunk_portal_cap.items.len != chunk_count;
+            lg.chunk_portal_cap.items.len = chunk_count;
+            lg.chunk_portal_base.items.len = chunk_count;
+            var next: usize = 0;
+            var running: u32 = 0;
+            for (0..chunk_count) |chunk| {
+                const cap = 4 * ct + interiorLinkCapacity(self.takeChunkRun(link_cells, &next, chunk), ct);
+                if (!layout_changed and lg.chunk_portal_cap.items[chunk] != cap) layout_changed = true;
+                lg.chunk_portal_cap.items[chunk] = cap;
+                lg.chunk_portal_base.items[chunk] = running;
+                running += cap;
+            }
+            lg.total_slots = running;
+            lg.setSlotLens(cell_count, running, chunk_count);
+            lg.chunk_link_cells.items.len = running - @as(u32, @intCast(chunk_count)) * 4 * ct;
+            @memset(lg.chunk_link_count.items, 0);
+            @memset(lg.chunk_link_cells.items, no_cell);
+            if (layout_changed) self.resetLevelAbstract(level);
+        }
+        // Never grows: every chunk's capacity covers its whole distinct run.
+        try self.assignLinkEndpointSlots(links, 0);
+
+        self.dirty_stamp.items.len = chunk_count;
         @memset(self.dirty_stamp.items, 0);
         self.dirty_epoch = 0;
-
-        // Size every level's slot-indexed arrays to total_slots and the cell map to cells.
-        for (self.level_graphs.items) |*lg| {
-            try setLen(&lg.cell_to_portal, self.allocator, cell_count);
-            try setLen(&lg.portals, self.allocator, self.total_slots);
-            try setLen(&lg.portal_edge_start, self.allocator, self.total_slots);
-            try setLen(&lg.portal_edge_count, self.allocator, self.total_slots);
-            try setLen(&lg.portal_order, self.allocator, self.total_slots);
-            try setLen(&lg.chunk_label_keys, self.allocator, self.total_slots);
-            try setLen(&lg.chunk_label_starts, self.allocator, self.total_slots);
-            try setLen(&lg.chunk_order_len, self.allocator, chunk_count);
-            try setLen(&lg.chunk_label_len, self.allocator, chunk_count);
-            try setLen(&lg.chunk_edge_cap, self.allocator, chunk_count);
-            try setLen(&lg.chunk_edge_base, self.allocator, chunk_count);
-        }
     }
 
-    // Worst-case edge slots of one level: every chunk's window at windowCap(pcap^2), the bound
-    // on one chunk's edges (border edges <= pcap plus same-component pairs <= pcap*(pcap-1)).
-    // Every window cap a build or repack sets is windowCap of a real edge count, so no level
-    // arena can exceed it.
+    // Worst-case edge slots of one level at the floor interior capacity: every chunk's window at
+    // windowCap(pcap^2), the bound on one chunk's edges (border edges <= pcap plus
+    // same-component pairs <= pcap*(pcap-1)). The load-time edge-index check; arenas that links
+    // grow past it are checked where they are sized.
     fn maxLevelEdgeSlots(self: *const NavGraph) u64 {
-        const portal_cap: u64 = 4 * @as(u64, self.chunk_tiles) + nav_interior_link_slots_per_chunk;
+        const portal_cap: u64 = 4 * @as(u64, self.chunk_tiles) + nav_interior_link_slots_floor;
         const max_chunk_edges = portal_cap * portal_cap;
         const max_window = @max(max_chunk_edges * default_edge_slack, chunk_edge_floor);
         return @as(u64, self.chunkCount()) * max_window;
     }
 
-    // The one fixed edge cap is the u32 edge index: rebuild fails before any allocation when
-    // this extent's worst case could overflow it, so runtime growth provably cannot.
+    // The load-time edge cap is the u32 edge index: rebuild fails before any allocation when
+    // this extent's floor-capacity worst case could overflow it.
     fn checkEdgeIndexFits(self: *const NavGraph) NavGridError!void {
         if (self.maxLevelEdgeSlots() > std.math.maxInt(u32)) return NavGridError.NavWorldTooLarge;
     }
 
-    // Who is assigning link-endpoint slots: a full build (count only) or the incremental link
-    // cursor (count, and warn once for a newly unslotted endpoint).
-    pub const LinkSlotAssignSource = enum { full_build, cursor };
-
     // The single slot-assignment rule shared by the full build and the incremental link cursor.
-    // Visits `links[first..]` in link order (endpoint a, then b when it is a different cell): an
-    // interior endpoint cell already in its chunk's run is skipped; otherwise it is appended at
-    // tail index chunk_link_count[D] while the run holds fewer than K entries; otherwise it stays
-    // UNSLOTTED (inert, exactly like a blocked endpoint). Links are append-only, so processing
-    // new links from a cursor yields exactly the table a full build computes from index 0, and
-    // an existing endpoint never loses its slot. Returns the unslotted endpoint cells visited.
-    // Allocation-free (the table is sized at the full build); main thread, before any dispatch.
-    pub fn assignLinkEndpointSlots(self: *NavGraph, links: []const LevelLink, first: usize, source: LinkSlotAssignSource) usize {
-        var unslotted: usize = 0;
-        for (links[first..], first..) |link, link_index| {
-            if (!self.assignLinkEndpointCell(link.cell_a)) {
-                unslotted += 1;
-                self.warnUnslottedLinkEndpoint(source, link_index, link.cell_a);
-            }
-            if (link.cell_b.x == link.cell_a.x and link.cell_b.y == link.cell_a.y) continue;
-            if (!self.assignLinkEndpointCell(link.cell_b)) {
-                unslotted += 1;
-                self.warnUnslottedLinkEndpoint(source, link_index, link.cell_b);
-            }
-        }
-        return unslotted;
-    }
-
-    // Assigns one endpoint cell per the shared rule. Returns false only when the cell is an
-    // interior cell absent from its chunk's run and the run is full (unslotted). Perimeter and
-    // out-of-grid endpoints need no interior slot.
-    fn assignLinkEndpointCell(self: *NavGraph, coord: CellCoord) bool {
-        const cell = self.levels.items[0].indexForCell(.{ .x = coord.x, .y = coord.y }) orelse return true;
-        if (self.isPerimeterCell(cell)) return true; // perimeter endpoints reuse their perimeter slot
-        const chunk = self.chunkOf(cell);
-        if (self.interiorLinkSlotExists(chunk, cell)) return true;
-        const count = self.chunk_link_count.items[chunk];
-        if (count >= nav_interior_link_slots_per_chunk) return false;
-        self.chunk_link_cells.items[@as(usize, chunk) * nav_interior_link_slots_per_chunk + count] = @intCast(cell);
-        self.chunk_link_count.items[chunk] = count + 1;
-        return true;
-    }
-
-    // Recovered degradation: a NEW link endpoint (first assigned by the incremental cursor)
-    // found its chunk's fixed interior slots full and stays inert. Full builds only count, so a
-    // world with one unslotted authored link warns once per session, not once per rebuild. Cold
-    // (per new link, never per step), main thread; kept out of test builds, which author this
-    // case on purpose.
-    fn warnUnslottedLinkEndpoint(self: *const NavGraph, source: LinkSlotAssignSource, link_index: usize, coord: CellCoord) void {
-        if (source != .cursor) return;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) {
-            const cell = self.levels.items[0].indexForCell(.{ .x = coord.x, .y = coord.y }) orelse return;
-            logging.game.warn("nav chunk {d} interior link slots full ({d}); link {d} endpoint ({d},{d}) stays inert", .{ self.chunkOf(cell), nav_interior_link_slots_per_chunk, link_index, coord.x, coord.y });
+    // Visits `links[first..]` in link order (endpoint a, then b), each in its own level's table:
+    // an interior endpoint cell already in its chunk's run is skipped; otherwise it is appended
+    // at tail index chunk_link_count[D], first growing that level's chunk in place when the run
+    // is full (growChunkLinkCapacity). Links are append-only, so processing new links from a
+    // cursor yields exactly the tables a full build computes from index 0, and an existing
+    // endpoint never loses its tail index. Each link is all-or-nothing: every growth it needs,
+    // on every level, is reserved before any write, so an OOM leaves that link's layouts
+    // untouched, and links assigned before it are skipped by the retry. Allocates only on a
+    // growth. Main thread, before any dispatch.
+    pub fn assignLinkEndpointSlots(self: *NavGraph, links: []const LevelLink, first: usize) std.mem.Allocator.Error!void {
+        for (links[first..]) |link| {
+            const plan = try self.reserveLinkEndpoints(link);
+            self.applyLinkEndpoints(plan);
         }
     }
 
-    // The slot geometry a link producer needs to predict assignment (see
-    // interiorLinkSlotsAvailable). Valid after any full build.
-    pub fn linkSlotGeometry(self: *const NavGraph) NavLinkSlotGeometry {
-        // An unbuilt graph has no slot geometry: report the sentinel so a producer fails loud
-        // (UnresolvedNavLinkGeometry) instead of predicting against default dimensions.
-        if (!self.valid()) return .unresolved;
-        return .{ .chunk_tiles = self.chunk_tiles, .width = @intCast(self.width), .height = @intCast(self.height) };
+    // A link's new interior endpoint cells and the chunk capacity growths they need, reserved.
+    const LinkEndpointPlan = struct {
+        endpoints: [2]InteriorLinkEndpoint = undefined,
+        endpoint_len: usize = 0,
+        growths: [2]LinkCapacityGrowth = undefined,
+        growth_len: usize = 0,
+    };
+    const InteriorLinkEndpoint = struct { level: u16, chunk: u32, cell: u32 };
+    const LinkCapacityGrowth = struct { level: u16, chunk: u32, new_cap: u32 };
+
+    // Plans `link`'s unassigned interior endpoints and reserves every growth they need; the only
+    // fallible step, and it mutates nothing visible. Perimeter and out-of-grid endpoints need no
+    // interior slot.
+    fn reserveLinkEndpoints(self: *NavGraph, link: LevelLink) std.mem.Allocator.Error!LinkEndpointPlan {
+        var plan: LinkEndpointPlan = .{};
+        for ([2]u16{ link.level_a, link.level_b }, [2]CellCoord{ link.cell_a, link.cell_b }) |level, coord| {
+            if (@as(usize, level) >= self.level_graphs.items.len) continue;
+            const cell = self.levels.items[level].indexForCell(.{ .x = coord.x, .y = coord.y }) orelse continue;
+            if (self.isPerimeterCell(cell)) continue; // perimeter endpoints reuse their perimeter slot
+            const endpoint = InteriorLinkEndpoint{ .level = level, .chunk = self.chunkOf(cell), .cell = @intCast(cell) };
+            if (self.interiorLinkSlotExists(&self.level_graphs.items[level], endpoint.chunk, cell)) continue;
+            if (plan.endpoint_len == 1 and std.meta.eql(plan.endpoints[0], endpoint)) continue;
+            plan.endpoints[plan.endpoint_len] = endpoint;
+            plan.endpoint_len += 1;
+        }
+        // One growth per chunk, sized for every new endpoint of the link in it.
+        const ct: u32 = self.chunk_tiles;
+        for (plan.endpoints[0..plan.endpoint_len], 0..) |endpoint, i| {
+            const lg = &self.level_graphs.items[endpoint.level];
+            const shares_chunk = i == 1 and plan.endpoints[0].level == endpoint.level and plan.endpoints[0].chunk == endpoint.chunk;
+            const needed = lg.chunk_link_count.items[endpoint.chunk] + 1 + @intFromBool(shares_chunk);
+            if (needed <= self.chunkLinkCapacity(lg, endpoint.chunk)) continue;
+            const growth = LinkCapacityGrowth{ .level = endpoint.level, .chunk = endpoint.chunk, .new_cap = 4 * ct + interiorLinkCapacity(needed, ct) };
+            if (shares_chunk and plan.growth_len == 1) {
+                plan.growths[0] = growth; // endpoint 0's growth, now sized for both
+            } else {
+                plan.growths[plan.growth_len] = growth;
+                plan.growth_len += 1;
+            }
+        }
+
+        // Reserve each affected level at its combined new total, and patch scratch for the
+        // largest new window.
+        const growths = plan.growths[0..plan.growth_len];
+        var max_cap: usize = 0;
+        for (growths, 0..) |growth, i| {
+            max_cap = @max(max_cap, growth.new_cap);
+            if (i == 1 and growths[0].level == growth.level) continue; // reserved with growth 0
+            const lg = &self.level_graphs.items[growth.level];
+            var added: u32 = 0;
+            for (growths[i..]) |same| {
+                if (same.level == growth.level) added += same.new_cap - lg.chunk_portal_cap.items[same.chunk];
+            }
+            const new_total = std.math.add(u32, lg.total_slots, added) catch return error.OutOfMemory;
+            try lg.reserveSlots(self.allocator, self.cellCount(), new_total, self.chunkCount(), lg.chunk_link_cells.items.len + added);
+        }
+        for (self.patch_scratch.items) |*scratch| {
+            try scratch.edges.ensureTotalCapacity(self.allocator, max_cap * max_cap);
+            try scratch.cursor.ensureTotalCapacity(self.allocator, max_cap);
+        }
+        return plan;
     }
 
-    // Full per-level build into the geometric slot space: tombstone every slot, rebuild each
-    // chunk's portals/order/labels, and accumulate the level's edges into build_edge_scratch
-    // (drained by placeLevelEdges).
-    fn buildLevelInit(self: *NavGraph, level: u16, world: ?*const WorldSystem) !void {
+    // Applies a reserved plan: the growths, then the endpoint appends. Infallible.
+    fn applyLinkEndpoints(self: *NavGraph, plan: LinkEndpointPlan) void {
+        for (plan.growths[0..plan.growth_len]) |growth| self.growChunkLinkCapacity(growth);
+        for (plan.endpoints[0..plan.endpoint_len]) |endpoint| {
+            const lg = &self.level_graphs.items[endpoint.level];
+            const count = lg.chunk_link_count.items[endpoint.chunk];
+            std.debug.assert(count < self.chunkLinkCapacity(lg, endpoint.chunk));
+            lg.chunk_link_cells.items[self.chunkLinkBase(lg, endpoint.chunk) + count] = endpoint.cell;
+            lg.chunk_link_count.items[endpoint.chunk] = count + 1;
+        }
+    }
+
+    // Grows a full chunk's interior link capacity on `growth.level` in place to growth.new_cap,
+    // the size a full build gives it. Slot windows are back to back, so this level's later chunk
+    // windows (and link-cell runs) shift up by the added slots, and every stored slot index past
+    // the chunk is remapped: edge targets, cell_to_portal, portal_order, label starts. Other
+    // levels are untouched. No cell walk, flood, or search. The new tail slots are tombstones;
+    // the cursor already dirtied the endpoint, so this step's patch fills the chunk (repacking
+    // its edge window if needed). Writes only into capacity reserveLinkEndpoints reserved.
+    fn growChunkLinkCapacity(self: *NavGraph, growth: LinkCapacityGrowth) void {
+        const level = growth.level;
+        const chunk = growth.chunk;
+        const lg = &self.level_graphs.items[level];
+        const ct: u32 = self.chunk_tiles;
+        const old_cap = lg.chunk_portal_cap.items[chunk];
+        const new_cap = growth.new_cap;
+        std.debug.assert(new_cap > old_cap);
+        const added = new_cap - old_cap;
+        const old_total = lg.total_slots;
+        const new_total = old_total + added;
+        // Slots from the chunk's old window end move up by `added`; likewise its link-cell run end.
+        const shift_from = lg.chunk_portal_base.items[chunk] + old_cap;
+        const link_from = self.chunkLinkBase(lg, chunk) + (old_cap - 4 * ct);
+        const old_link_len = lg.chunk_link_cells.items.len;
+        const cell_count = self.cellCount();
+        const chunk_count = self.chunkCount();
+        inline for (.{ &lg.portals, &lg.portal_edge_start, &lg.portal_edge_count, &lg.portal_order, &lg.chunk_label_keys, &lg.chunk_label_starts }) |list| {
+            std.debug.assert(list.capacity >= new_total);
+        }
+        std.debug.assert(lg.chunk_link_cells.capacity >= old_link_len + added);
+        for (self.patch_scratch.items) |*scratch| {
+            std.debug.assert(scratch.edges.capacity >= @as(usize, new_cap) * new_cap);
+            std.debug.assert(scratch.cursor.capacity >= new_cap);
+        }
+
+        // Shift.
+        lg.chunk_link_cells.items.len = old_link_len + added;
+        const link_cells = lg.chunk_link_cells.items;
+        std.mem.copyBackwards(u32, link_cells[link_from + added ..], link_cells[link_from..old_link_len]);
+        @memset(link_cells[link_from..][0..added], no_cell);
+        lg.chunk_portal_cap.items[chunk] = new_cap;
+        for (lg.chunk_portal_base.items[chunk + 1 ..]) |*base| base.* += added;
+        lg.total_slots = new_total;
+        lg.setSlotLens(cell_count, new_total, chunk_count);
+        inline for (.{ &lg.portals, &lg.portal_edge_start, &lg.portal_edge_count, &lg.portal_order, &lg.chunk_label_keys, &lg.chunk_label_starts }) |list| {
+            const items = list.items;
+            std.mem.copyBackwards(@TypeOf(items[0]), items[shift_from + added ..], items[shift_from..old_total]);
+        }
+        // Tombstone tail with empty runs at the chunk's packed run end.
+        const run_end = lg.portal_edge_start.items[shift_from - 1] + lg.portal_edge_count.items[shift_from - 1];
+        @memset(lg.portals.items[shift_from..][0..added], .{ .level = level, .cell_index = no_cell, .chunk = 0 });
+        @memset(lg.portal_edge_count.items[shift_from..][0..added], 0);
+        @memset(lg.portal_edge_start.items[shift_from..][0..added], run_end);
+        // Remap stored slot indices.
+        for (lg.portals.items[shift_from + added ..], shift_from + added..) |portal, slot| {
+            if (portal.cell_index != no_cell) lg.cell_to_portal.items[portal.cell_index] = @intCast(slot);
+        }
+        for (lg.portal_edge_start.items, lg.portal_edge_count.items) |start, count| {
+            for (lg.portal_edges.items[start..][0..count]) |*edge| {
+                if (edge.target >= shift_from) edge.target += added;
+            }
+        }
+        for (chunk + 1..chunk_count) |later| {
+            const base = lg.chunk_portal_base.items[later];
+            for (lg.portal_order.items[base..][0..lg.chunk_order_len.items[later]]) |*slot| slot.* += added;
+            for (lg.chunk_label_starts.items[base..][0..lg.chunk_label_len.items[later]]) |*start| start.* += added;
+        }
+    }
+
+    // Tombstones every slot of `level` and empties each chunk's adjacency at its window base,
+    // leaving the level consistent (and empty) under the current slot layout.
+    fn resetLevelAbstract(self: *NavGraph, level: u16) void {
         const lg = &self.level_graphs.items[level];
         @memset(lg.cell_to_portal.items, no_cell);
         @memset(lg.portals.items, .{ .level = level, .cell_index = no_cell, .chunk = 0 });
         @memset(lg.portal_edge_count.items, 0);
         @memset(lg.chunk_order_len.items, 0);
         @memset(lg.chunk_label_len.items, 0);
-        const chunk_count = self.chunkCount();
-        // Empty adjacency at each window base, so a failed build leaves every chunk packed.
-        for (0..chunk_count) |chunk_index| {
-            const starts = lg.portal_edge_start.items[self.chunk_portal_base.items[chunk_index]..][0..self.chunk_portal_cap.items[chunk_index]];
+        for (0..self.chunkCount()) |chunk_index| {
+            const starts = lg.portal_edge_start.items[lg.chunk_portal_base.items[chunk_index]..][0..lg.chunk_portal_cap.items[chunk_index]];
             @memset(starts, lg.chunk_edge_base.items[chunk_index]);
         }
+    }
+
+    // Full per-level build into the geometric slot space: tombstone every slot, rebuild each
+    // chunk's portals/order/labels, and accumulate the level's edges into build_edge_scratch
+    // (drained by placeLevelEdges).
+    fn buildLevelInit(self: *NavGraph, level: u16, world: ?*const WorldSystem) !void {
+        // Empty adjacency at each window base, so a failed build leaves every chunk packed.
+        self.resetLevelAbstract(level);
+        const chunk_count = self.chunkCount();
         self.build_edge_scratch.clearRetainingCapacity();
         // The init build is serial (never threaded), so slot 0 is always the right — and
         // only — patch scratch to use here.
@@ -1476,7 +1668,7 @@ pub const NavGraph = struct {
         const lg = self.levelGraph(level) orelse return &.{};
         const chunk: usize = @intCast(@as(u64, component) / self.labelStride());
         if (chunk >= self.chunkCount()) return &.{};
-        const pbase = self.chunk_portal_base.items[chunk];
+        const pbase = lg.chunk_portal_base.items[chunk];
         const klen = lg.chunk_label_len.items[chunk];
         const keys = lg.chunk_label_keys.items[pbase .. pbase + klen];
         const rel = std.sort.binarySearch(u32, keys, component, orderU32) orelse return &.{};
@@ -1526,7 +1718,8 @@ pub const NavGraph = struct {
         const level_graph = &self.level_graphs.items[level];
         const scratch = &self.patch_scratch.items[0];
         const chunk_count = self.chunkCount();
-        // Allocation-free after a build: build_u32_scratch then holds total_slots (> 2 * chunk count).
+        // Allocation-free after a build: build_u32_scratch then holds a level's total_slots
+        // (> 2 * chunk count).
         const u32_scratch = try self.buildScratch(2 * chunk_count);
         const new_caps = u32_scratch[0..chunk_count];
         const edge_counts = u32_scratch[chunk_count..];
@@ -1540,15 +1733,14 @@ pub const NavGraph = struct {
                 try self.buildChunkPatch(level, world, chunk, scratch);
                 edge_counts[chunk] = @intCast(scratch.edges.items.len);
             } else {
-                edge_counts[chunk] = level_graph.packedChunkEdgeCount(chunk, self.chunk_portal_base.items[chunk], self.chunk_portal_cap.items[chunk]);
+                edge_counts[chunk] = level_graph.packedChunkEdgeCount(chunk);
             }
             const old_cap = level_graph.chunk_edge_cap.items[chunk];
             new_caps[chunk] = if (edge_counts[chunk] <= old_cap) old_cap else windowCap(edge_counts[chunk]);
             if (new_caps[chunk] != old_cap) windows_grown += 1;
             new_total += new_caps[chunk];
         }
-        // rebuild proved this extent's worst case fits the u32 edge index.
-        std.debug.assert(new_total <= self.maxLevelEdgeSlots());
+        if (new_total > std.math.maxInt(u32)) return error.OutOfMemory;
 
         // Step 2: a new arena only when some window grew (an error-flagged chunk may still fit).
         if (windows_grown != 0) {
@@ -1559,8 +1751,8 @@ pub const NavGraph = struct {
             for (0..chunk_count) |chunk_index| {
                 const chunk: u32 = @intCast(chunk_index);
                 const old_base = level_graph.chunk_edge_base.items[chunk];
-                const portal_base = self.chunk_portal_base.items[chunk];
-                const starts = level_graph.portal_edge_start.items[portal_base..][0..self.chunk_portal_cap.items[chunk]];
+                const portal_base = level_graph.chunk_portal_base.items[chunk];
+                const starts = level_graph.portal_edge_start.items[portal_base..][0..level_graph.chunk_portal_cap.items[chunk]];
                 if (self.chunk_edge_overflow.items[chunk]) {
                     // Empty adjacency until step 3; keep its starts inside the new arena.
                     @memset(starts, new_base);
@@ -1605,8 +1797,8 @@ pub const NavGraph = struct {
     // cells it owned, so a patch starts from a clean chunk independent of its prior content.
     fn clearChunkSlots(self: *NavGraph, level: u16, chunk: u32) void {
         const lg = &self.level_graphs.items[level];
-        const pbase = self.chunk_portal_base.items[chunk];
-        const pcap = self.chunk_portal_cap.items[chunk];
+        const pbase = lg.chunk_portal_base.items[chunk];
+        const pcap = lg.chunk_portal_cap.items[chunk];
         const edge_base = lg.chunk_edge_base.items[chunk];
         var slot = pbase;
         while (slot < pbase + pcap) : (slot += 1) {
@@ -1721,8 +1913,8 @@ pub const NavGraph = struct {
         const n_cell: usize = @intCast(@as(isize, @intCast(c_cell)) + n_offset);
         self.addPortalCell(lg, level, c_cell, chunk);
         try scratch.edges.append(self.allocator, .{
-            .from = self.slotForCell(c_cell),
-            .edge = .{ .target = self.slotForCell(n_cell), .cost = cardinal_cost },
+            .from = self.slotForCell(lg, c_cell),
+            .edge = .{ .target = self.slotForCell(lg, n_cell), .cost = cardinal_cost },
         });
     }
 
@@ -1730,7 +1922,7 @@ pub const NavGraph = struct {
     // its chunk's borders keeps a single node.
     fn addPortalCell(self: *NavGraph, lg: *NavLevelGraph, level: u16, cell_index: usize, chunk: u32) void {
         if (lg.cell_to_portal.items[cell_index] != no_cell) return;
-        const slot = self.slotForCell(cell_index);
+        const slot = self.slotForCell(lg, cell_index);
         lg.portals.items[slot] = .{ .level = level, .cell_index = @intCast(cell_index), .chunk = chunk };
         lg.cell_to_portal.items[cell_index] = slot;
     }
@@ -1751,22 +1943,21 @@ pub const NavGraph = struct {
         const cell = level_grid.indexForCell(.{ .x = x, .y = y }) orelse return;
         if (self.chunkOf(cell) != chunk or level_grid.blocked.items[cell]) return;
         // Perimeter endpoints use their positional slot. An interior endpoint needs an entry in
-        // its chunk's fixed interior run, assigned by the shared rule (assignLinkEndpointSlots):
-        // for the whole link set at a full build, and at runtime by the post-commit link cursor
-        // (PathfindingSystem.markNewNavLinksDirty) BEFORE the patch that reaches here. A miss
-        // therefore means the endpoint is UNSLOTTED by the K cap (or not yet reached by a
-        // deferred cursor): skip it (no portal, so the abstract solver never traverses the link,
-        // exactly as with a blocked endpoint) rather than resolving against an absent run.
+        // its chunk's interior run, assigned by the shared rule (assignLinkEndpointSlots): for
+        // the whole link set at a full build or relabel, and at runtime by the post-commit link
+        // cursor (PathfindingSystem.markNewNavLinksDirty) BEFORE the patch that reaches here. A
+        // miss therefore means a deferred cursor has not reached the link yet: skip it (no
+        // portal, exactly as with a blocked endpoint) rather than resolving against an absent run.
         // Underground NPCs request cross-level paths to the surface, so this gate is live.
-        if (!self.isPerimeterCell(cell) and !self.interiorLinkSlotExists(chunk, cell)) return;
+        if (!self.isPerimeterCell(cell) and !self.interiorLinkSlotExists(lg, chunk, cell)) return;
         self.addPortalCell(lg, level_grid.level, cell, chunk);
     }
 
-    // Whether an interior cell has an assigned slot in its chunk's fixed link-endpoint run.
-    // Guards tryLinkPortal so an unslotted endpoint is skipped instead of reaching
+    // Whether an interior cell has an assigned slot in its chunk's link-endpoint run.
+    // Guards tryLinkPortal so an unassigned endpoint is skipped instead of reaching
     // linkTailIndex's `orelse unreachable` against a run it was never assigned into.
-    fn interiorLinkSlotExists(self: *const NavGraph, chunk: u32, cell_index: usize) bool {
-        return std.mem.indexOfScalar(u32, self.chunkLinkRun(chunk), @as(u32, @intCast(cell_index))) != null;
+    fn interiorLinkSlotExists(self: *const NavGraph, lg: *const NavLevelGraph, chunk: u32, cell_index: usize) bool {
+        return std.mem.indexOfScalar(u32, self.chunkLinkRun(lg, chunk), @as(u32, @intCast(cell_index))) != null;
     }
 
     // Connects this chunk's live same-chunk-component portals pairwise with octile cost. Both
@@ -1774,8 +1965,8 @@ pub const NavGraph = struct {
     fn connectChunkIntraEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !void {
         const lg = &self.level_graphs.items[level];
         const components = self.levels.items[level].components.items;
-        const pbase = self.chunk_portal_base.items[chunk];
-        const pcap = self.chunk_portal_cap.items[chunk];
+        const pbase = lg.chunk_portal_base.items[chunk];
+        const pcap = lg.chunk_portal_cap.items[chunk];
         var i = pbase;
         while (i < pbase + pcap) : (i += 1) {
             const cell_i = lg.portals.items[i].cell_index;
@@ -1799,8 +1990,8 @@ pub const NavGraph = struct {
     fn orderChunkPortals(self: *NavGraph, level: u16, chunk: u32) void {
         const lg = &self.level_graphs.items[level];
         const components = self.levels.items[level].components.items;
-        const pbase = self.chunk_portal_base.items[chunk];
-        const pcap = self.chunk_portal_cap.items[chunk];
+        const pbase = lg.chunk_portal_base.items[chunk];
+        const pcap = lg.chunk_portal_cap.items[chunk];
         var live: u32 = 0;
         var slot = pbase;
         while (slot < pbase + pcap) : (slot += 1) {
@@ -1830,8 +2021,8 @@ pub const NavGraph = struct {
     // the window) when the chunk's edges exceed its cap, so the caller can fall back.
     fn compactChunkEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !bool {
         const lg = &self.level_graphs.items[level];
-        const pbase = self.chunk_portal_base.items[chunk];
-        const pcap = self.chunk_portal_cap.items[chunk];
+        const pbase = lg.chunk_portal_base.items[chunk];
+        const pcap = lg.chunk_portal_cap.items[chunk];
         const ebase = lg.chunk_edge_base.items[chunk];
         const ecap = lg.chunk_edge_cap.items[chunk];
         // Per-slot write cursor (window-relative), this worker's own buffer. Sized before any
@@ -1885,7 +2076,7 @@ pub const NavGraph = struct {
     fn placeLevelEdges(self: *NavGraph, level: u16) !void {
         const lg = &self.level_graphs.items[level];
         const chunk_count = self.chunkCount();
-        const u32_scratch = try self.buildScratch(@as(usize, self.total_slots) + chunk_count);
+        const u32_scratch = try self.buildScratch(@as(usize, lg.total_slots) + chunk_count);
         const new_caps = u32_scratch[0..chunk_count];
         const cursor = u32_scratch[chunk_count..];
         // Count each chunk's edges, then size its window.
@@ -1896,8 +2087,7 @@ pub const NavGraph = struct {
             cap.* = windowCap(cap.*);
             new_total += cap.*;
         }
-        // rebuild proved this extent's worst case fits the u32 edge index.
-        std.debug.assert(new_total <= self.maxLevelEdgeSlots());
+        if (new_total > std.math.maxInt(u32)) return error.OutOfMemory;
         if (lg.portal_edges.capacity != new_total) {
             var new_arena: std.ArrayList(AbstractEdge) = .empty;
             try new_arena.ensureTotalCapacityPrecise(self.allocator, @intCast(new_total));
@@ -1916,8 +2106,8 @@ pub const NavGraph = struct {
         for (self.build_edge_scratch.items) |entry| lg.portal_edge_count.items[entry.from] += 1;
         var chunk: u32 = 0;
         while (chunk < chunk_count) : (chunk += 1) {
-            const pbase = self.chunk_portal_base.items[chunk];
-            const pcap = self.chunk_portal_cap.items[chunk];
+            const pbase = lg.chunk_portal_base.items[chunk];
+            const pcap = lg.chunk_portal_cap.items[chunk];
             var running = lg.chunk_edge_base.items[chunk];
             var slot = pbase;
             while (slot < pbase + pcap) : (slot += 1) {
@@ -1953,63 +2143,9 @@ pub const NavGraph = struct {
         };
     }
 };
-// Whether a chunk-local coordinate lies on its chunk's perimeter: the single predicate shared
-// by NavGraph.isPerimeterCell and interiorLinkSlotsAvailable.
+// Whether a chunk-local coordinate lies on its chunk's perimeter.
 fn isPerimeterLocal(local_x: usize, local_y: usize, chunk_tiles: usize) bool {
     return local_x == 0 or local_x == chunk_tiles - 1 or local_y == 0 or local_y == chunk_tiles - 1;
-}
-
-// Nav-grid slot geometry (in nav cells) a LevelLink producer needs to predict interior slot
-// assignment. Taken from NavGraph.linkSlotGeometry after a full build.
-pub const NavLinkSlotGeometry = struct {
-    chunk_tiles: u32,
-    width: u32,
-    height: u32,
-
-    // Unresolved sentinel: chunk_tiles 0 is never a built graph's geometry (it is >= 1).
-    pub const unresolved: NavLinkSlotGeometry = .{ .chunk_tiles = 0, .width = 0, .height = 0 };
-
-    pub fn isResolved(self: NavLinkSlotGeometry) bool {
-        return self.chunk_tiles != 0;
-    }
-};
-
-// Producer-side admission check for a NEW link endpoint at `cell`: true when `cell` is a
-// perimeter (or out-of-grid) cell, when it already HOLDS one of its chunk's interior slots, or
-// when its nav chunk still has a free interior slot. It replays the shared assignment rule
-// (assignLinkEndpointSlots: link order, endpoint a then b, deduped by cell across levels): the
-// first nav_interior_link_slots_per_chunk distinct interior endpoint cells of the chunk are
-// exactly the slotted ones. So a cell that is an existing but UNSLOTTED endpoint (past the cap)
-// is refused like any new cell, and an accepted link is never inert. Counts over the whole link
-// set (including links the incremental cursor has not reached yet), so a refusal agrees with the
-// assignment the cursor will make. O(links), allocation-free, cold (once per dig attempt). Pure.
-pub fn interiorLinkSlotsAvailable(links: []const LevelLink, cell: CellCoord, geometry: NavLinkSlotGeometry) bool {
-    std.debug.assert(geometry.isResolved());
-    const ct: usize = geometry.chunk_tiles;
-    if (cell.x >= geometry.width or cell.y >= geometry.height) return true;
-    if (isPerimeterLocal(cell.x % ct, cell.y % ct, ct)) return true;
-    const chunk_x = cell.x / ct;
-    const chunk_y = cell.y / ct;
-    var slotted: [nav_interior_link_slots_per_chunk]CellCoord = undefined;
-    var slotted_count: usize = 0;
-    outer: for (links) |link| {
-        for ([2]CellCoord{ link.cell_a, link.cell_b }) |endpoint| {
-            if (slotted_count == slotted.len) break :outer;
-            if (endpoint.x >= geometry.width or endpoint.y >= geometry.height) continue;
-            if (endpoint.x / ct != chunk_x or endpoint.y / ct != chunk_y) continue;
-            if (isPerimeterLocal(endpoint.x % ct, endpoint.y % ct, ct)) continue;
-            const already_slotted = for (slotted[0..slotted_count]) |prior| {
-                if (prior.x == endpoint.x and prior.y == endpoint.y) break true;
-            } else false;
-            if (already_slotted) continue;
-            slotted[slotted_count] = endpoint;
-            slotted_count += 1;
-        }
-    }
-    for (slotted[0..slotted_count]) |held| {
-        if (held.x == cell.x and held.y == cell.y) return true;
-    }
-    return slotted_count < nav_interior_link_slots_per_chunk;
 }
 
 // Orders a level's portal node indices by chunk-local component label (then cell index
@@ -2559,10 +2695,11 @@ test "a fully-open interior chunk yields at most one portal per border side, not
     const chunk_tiles = system.capacity.nav_chunk_tiles;
     const chunks_per_side = 3;
     const center_chunk: u32 = 1 * chunks_per_side + 1;
-    const pbase = system.graph.chunk_portal_base.items[center_chunk];
-    const pcap = system.graph.chunk_portal_cap.items[center_chunk];
+    const lg = &system.graph.level_graphs.items[0];
+    const pbase = lg.chunk_portal_base.items[center_chunk];
+    const pcap = lg.chunk_portal_cap.items[center_chunk];
     var live_count: usize = 0;
-    for (system.graph.level_graphs.items[0].portals.items[pbase .. pbase + pcap]) |portal| {
+    for (lg.portals.items[pbase .. pbase + pcap]) |portal| {
         if (portal.cell_index != no_cell) live_count += 1;
     }
     // One border-consolidated portal per side (4), well under one per open boundary cell
@@ -2633,6 +2770,11 @@ fn rampLink(x: u16, y: u16) LevelLink {
     return .{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = x, .y = y }, .level_b = 0, .cell_b = .{ .x = x, .y = y }, .traversal_cost = 1, .bidirectional = true };
 }
 
+// Interior link capacity of `chunk` on `level`.
+fn linkCapacity(graph: *const NavGraph, level: u16, chunk: u32) u32 {
+    return graph.chunkLinkCapacity(&graph.level_graphs.items[level], chunk);
+}
+
 // Adds one ramp link at each cell.
 fn addRamps(world: *WorldSystem, cells: []const CellCoord) !void {
     for (cells) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
@@ -2646,9 +2788,8 @@ fn reactOneStep(system: *PathfindingSystem, frame: *SimulationFrame, data: *cons
 }
 
 // Parity: the incremental graph equals a fresh full rebuild over the same world:
-// portals and cell_to_portal byte-identical per level, the shared interior link-slot table
-// identical, per-portal edge sets equal (expectGraphsEquivalent), and link_edges /
-// link_edge_refs equal.
+// portals, cell_to_portal, slot layout and interior link-slot table byte-identical per level,
+// per-portal edge sets equal (expectGraphsEquivalent), and link_edges / link_edge_refs equal.
 fn expectLinkPatchMatchesFullRebuild(system: *const PathfindingSystem, data: *const DataSystem, world: *const WorldSystem, extent: f32, capacity: types.PathfindingCapacity) !void {
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
     defer rebuilt.deinit();
@@ -2660,9 +2801,10 @@ fn expectLinkPatchMatchesFullRebuild(system: *const PathfindingSystem, data: *co
     for (full.level_graphs.items, inc.level_graphs.items) |*full_level, *inc_level| {
         try std.testing.expectEqualSlices(PortalNode, full_level.portals.items, inc_level.portals.items);
         try std.testing.expectEqualSlices(u32, full_level.cell_to_portal.items, inc_level.cell_to_portal.items);
+        try std.testing.expectEqualSlices(u32, full_level.chunk_portal_cap.items, inc_level.chunk_portal_cap.items);
+        try std.testing.expectEqualSlices(u32, full_level.chunk_link_count.items, inc_level.chunk_link_count.items);
+        try std.testing.expectEqualSlices(u32, full_level.chunk_link_cells.items, inc_level.chunk_link_cells.items);
     }
-    try std.testing.expectEqualSlices(u32, full.chunk_link_count.items, inc.chunk_link_count.items);
-    try std.testing.expectEqualSlices(u32, full.chunk_link_cells.items, inc.chunk_link_cells.items);
     try std.testing.expectEqualSlices(LinkEdge, full.link_edges.items, inc.link_edges.items);
     try std.testing.expectEqualSlices(LinkEdgeRef, full.link_edge_refs.items, inc.link_edge_refs.items);
     try expectGraphsEquivalent(inc, full);
@@ -2764,10 +2906,11 @@ test "runtime link patch matches a full rebuild" {
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 384, capacity);
 }
 
-test "a ninth authored interior link endpoint in one chunk stays unslotted in incremental and full builds" {
-    // Authored links only (DigController refuses this case before the world changes). An
-    // 8-tile nav chunk has 36 interior cells, so nine distinct interior endpoints fit the
-    // chunk but exceed K = nav_interior_link_slots_per_chunk.
+test "a ninth interior link endpoint grows its chunk in place without a relabel and matches a full build" {
+    // An 8-tile nav chunk has 36 interior cells; nine distinct interior endpoints exceed the
+    // floor capacity (8). Step 1 folds links 0..7 (the per-step budget); step 2's ninth finds
+    // the run full, so the cursor grows chunk (0,0) to 16 in place, shifting and remapping the
+    // three later chunks' slots on both levels, and the step stays an incremental patch.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2786,40 +2929,335 @@ test "a ninth authored interior link endpoint in one chunk stays unslotted in in
         .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 1 }, .{ .x = 3, .y = 1 }, .{ .x = 4, .y = 1 }, .{ .x = 5, .y = 1 },
         .{ .x = 6, .y = 1 }, .{ .x = 1, .y = 2 }, .{ .x = 2, .y = 2 }, .{ .x = 3, .y = 2 },
     };
-    comptime std.debug.assert(cells.len == nav_interior_link_slots_per_chunk + 1);
-    for (cells) |cell| try world.addLevelLink(rampLink(cell.x, cell.y));
+    comptime std.debug.assert(cells.len == nav_interior_link_slots_floor + 1);
+    try addRamps(&world, &cells);
 
-    // Nine new links exceed the per-step budget (8): step 1 folds links 0..7, step 2 the ninth.
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    var unslotted: usize = 0;
-    var steps: usize = 0;
-    while (system.hasPendingNavLinks(&world) and steps < 4) : (steps += 1) {
-        const stats = try reactOneStep(&system, &frame, &data, &world, null);
-        unslotted += stats.link_endpoints_unslotted;
-    }
-    try std.testing.expectEqual(@as(usize, 2), steps);
-    try std.testing.expectEqual(@as(usize, 1), unslotted);
-
-    const ninth: u32 = @intCast(system.graph.grid(1).?.indexForCell(.{ .x = 3, .y = 2 }).?);
-    try std.testing.expect(system.graph.portalIndex(1, ninth) == null);
-    try std.testing.expect(system.graph.portalIndex(0, ninth) == null);
+    const step1 = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 0), step1.full_relabel);
+    try std.testing.expectEqual(nav_interior_link_slots_floor, linkCapacity(&system.graph, 0, 0));
+    const step2 = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 0), step2.full_relabel);
+    try std.testing.expectEqual(@as(usize, 0), step2.version_bumps);
+    try std.testing.expectEqual(@as(usize, 1), step2.incremental_rebuilds);
+    for (0..2) |level| try std.testing.expectEqual(@as(u32, 16), linkCapacity(&system.graph, @intCast(level), 0));
+    try std.testing.expect(!system.hasPendingNavLinks(&world));
+    try expectLinksRoutable(&system.graph, world.levelLinks());
+    try expectNoEdgeTargetsTombstone(&system.graph);
+    try expectPackedEdgeWindows(&system.graph);
+    try expectLabelIndexMatchesGrid(&system.graph);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 384, capacity);
-
-    // The full build leaves the same ninth endpoint inert and counts it once.
-    var rebuilt = PathfindingSystem.init(std.testing.allocator);
-    defer rebuilt.deinit();
-    try rebuilt.reserve(capacity);
-    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
-    try std.testing.expectEqual(@as(usize, 1), rebuilt.graph.full_build_link_endpoints_unslotted);
-    try std.testing.expect(rebuilt.graph.portalIndex(1, ninth) == null);
-    try std.testing.expect(rebuilt.graph.portalIndex(0, ninth) == null);
 }
 
-// Ramp endpoint cells filling chunk (1,1)'s K interior slots (8-tile chunks over 24x24 cells),
+test "an interior link capacity growth leaves every unlinked level's slot arrays untouched" {
+    // Nine ramps between levels 2 and 1 cross chunk (0,0)'s floor capacity on those two levels
+    // only. Level 0 keeps the same buffers with the same contents, and the result still equals
+    // a full rebuild.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var world = try initOpenWorldLevels(&meta, 384, 3);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
+    for (0..nav_interior_link_slots_floor + 1) |i| try world.addLevelLink(levelRampLink(2, @intCast(1 + i % 6), @intCast(1 + i / 6)));
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    _ = try reactOneStep(&system, &frame, &data, &world, null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const level0 = &system.graph.level_graphs.items[0];
+    const shallow = level0.*;
+    const copy = try copyLevelGraph(arena.allocator(), level0);
+
+    const grown = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 0), grown.full_relabel);
+    try std.testing.expectEqual(nav_interior_link_slots_floor, linkCapacity(&system.graph, 0, 0));
+    for (1..3) |level| try std.testing.expectEqual(@as(u32, 16), linkCapacity(&system.graph, @intCast(level), 0));
+    const info = @typeInfo(NavLevelGraph).@"struct";
+    inline for (info.field_names, info.field_types) |name, field_type| {
+        const now = @field(level0, name);
+        if (field_type == u32) {
+            try std.testing.expectEqual(@field(copy, name), now);
+        } else {
+            try std.testing.expectEqual(@field(shallow, name).items.ptr, now.items.ptr);
+            try std.testing.expectEqualSlices(std.meta.Elem(@TypeOf(now.items)), @field(copy, name).items, now.items);
+        }
+    }
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 384, capacity);
+}
+
+// A level graph whose array contents are copies (into `arena`) of `lg`'s.
+fn copyLevelGraph(arena: std.mem.Allocator, lg: *const NavLevelGraph) !NavLevelGraph {
+    var copy = lg.*;
+    const info = @typeInfo(NavLevelGraph).@"struct";
+    inline for (info.field_names, info.field_types) |name, field_type| {
+        if (field_type == u32) continue;
+        const items = @field(lg, name).items;
+        @field(copy, name).items = try arena.dupe(std.meta.Elem(@TypeOf(items)), items);
+    }
+    return copy;
+}
+
+// `actual`'s scalars and array contents equal `expected`'s.
+fn expectLevelGraphContentsEqual(expected: *const NavLevelGraph, actual: *const NavLevelGraph) !void {
+    const info = @typeInfo(NavLevelGraph).@"struct";
+    inline for (info.field_names, info.field_types) |name, field_type| {
+        if (field_type == u32) {
+            try std.testing.expectEqual(@field(expected, name), @field(actual, name));
+        } else {
+            const items = @field(actual, name).items;
+            try std.testing.expectEqualSlices(std.meta.Elem(@TypeOf(items)), @field(expected, name).items, items);
+        }
+    }
+}
+
+// Open world of `level_count` levels: the demo surface (level 0) plus all-grass levels.
+fn initOpenWorldLevels(meta: *const WorldTilesetMeta, extent: f32, level_count: u16) !WorldSystem {
+    const grass = try requireTestTile(meta, "grass");
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, meta, extent, extent);
+    errdefer world.deinit();
+    for (1..level_count) |level| {
+        _ = try world.addLevel(0);
+        _ = try world.addDenseLayer(@intCast(level), 0, .floor, grass);
+    }
+    return world;
+}
+
+// A bidirectional ramp joining `level` to the level above at the same cell.
+fn levelRampLink(level: u16, x: u16, y: u16) LevelLink {
+    return .{ .kind = .ramp, .level_a = level, .cell_a = .{ .x = x, .y = y }, .level_b = level - 1, .cell_b = .{ .x = x, .y = y }, .traversal_cost = 1, .bidirectional = true };
+}
+
+// Every link is routable: both endpoints are portals on their levels and the link is live.
+fn expectLinksRoutable(graph: *const NavGraph, links: []const LevelLink) !void {
+    for (links) |link| {
+        try std.testing.expect(graph.portalIndex(link.level_a, try navCellIndex(graph, link.level_a, link.cell_a.x, link.cell_a.y)) != null);
+        try std.testing.expect(graph.portalIndex(link.level_b, try navCellIndex(graph, link.level_b, link.cell_b.x, link.cell_b.y)) != null);
+    }
+    try std.testing.expectEqual(links.len, graph.link_edges.items.len);
+}
+
+// Pit ramps in 8-tile chunk (0,0) around a 2x2 pit at (3..4, 2..3) (clear of the 16x16 demo
+// surface's (4,5) obstacle): a 12-cell ring on level 1, then 8 on level 2 (the pit floor, one
+// under rim cell (2,1), three more), then 4 on level 3. Level 1 holds the ring and the level 2
+// ramps' upper ends, 19 distinct interior cells: its chunk grows 8 -> 16 -> 32.
+const pit_ramps = [_]LevelLink{
+    levelRampLink(1, 2, 1), levelRampLink(1, 3, 1), levelRampLink(1, 4, 1), levelRampLink(1, 5, 1),
+    levelRampLink(1, 2, 2), levelRampLink(1, 5, 2), levelRampLink(1, 2, 3), levelRampLink(1, 5, 3),
+    levelRampLink(1, 2, 4), levelRampLink(1, 3, 4), levelRampLink(1, 4, 4), levelRampLink(1, 5, 4),
+    levelRampLink(2, 3, 2), levelRampLink(2, 4, 2), levelRampLink(2, 3, 3), levelRampLink(2, 4, 3),
+    levelRampLink(2, 2, 1), levelRampLink(2, 1, 1), levelRampLink(2, 6, 1), levelRampLink(2, 1, 6),
+    levelRampLink(3, 6, 6), levelRampLink(3, 1, 3), levelRampLink(3, 6, 3), levelRampLink(3, 3, 6),
+};
+
+// Runs the pit ramps in same-step bursts of the per-step link budget over a 4-level 16x16-cell
+// world (2x2 8-tile chunks), returning the system for cross-path comparison.
+fn runPitRampBursts(system: *PathfindingSystem, world: *WorldSystem, data: *const DataSystem, capacity: types.PathfindingCapacity, threads: ?*ThreadSystem) !void {
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(data, world, 512, 512, 32, null);
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    // Burst 2 crosses the floor (16 distinct cells), burst 3 crosses 16 (23); each grows the
+    // chunk in place, never relabeling.
+    const expected_capacity = [_]u32{ 8, 16, 32 };
+    for (0..3) |burst| {
+        for (pit_ramps[burst * nav_new_links_per_step_max ..][0..nav_new_links_per_step_max]) |link| try world.addLevelLink(link);
+        const stats = try reactOneStep(system, &frame, data, world, threads);
+        try std.testing.expectEqual(@as(usize, 0), stats.full_relabel);
+        try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+        try std.testing.expectEqual(@as(usize, 0), stats.links_deferred);
+        try std.testing.expectEqual(expected_capacity[burst], linkCapacity(&system.graph, 1, 0));
+        try expectLinksRoutable(&system.graph, world.levelLinks());
+        try expectLinkPatchMatchesFullRebuild(system, data, world, 512, capacity);
+    }
+}
+
+test "same-step bursts of pit ramps past a chunk's capacity are routable that step, serial and threaded" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    const capacity = windowGrowthCapacity(&threads);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var serial_world = try initOpenWorldLevels(&meta, 512, 4);
+    defer serial_world.deinit();
+    var serial = PathfindingSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    try runPitRampBursts(&serial, &serial_world, &data, capacity, null);
+
+    var threaded_world = try initOpenWorldLevels(&meta, 512, 4);
+    defer threaded_world.deinit();
+    var threaded = PathfindingSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    try runPitRampBursts(&threaded, &threaded_world, &data, capacity, &threads);
+    try std.testing.expect(!threaded.graph.last_patch_batch.ran_inline);
+
+    for (serial.graph.level_graphs.items, threaded.graph.level_graphs.items) |*serial_level, *threaded_level| {
+        try std.testing.expectEqualSlices(u32, serial_level.chunk_portal_cap.items, threaded_level.chunk_portal_cap.items);
+        try std.testing.expectEqualSlices(u32, serial_level.chunk_link_cells.items, threaded_level.chunk_link_cells.items);
+    }
+    try expectGraphsEquivalent(&serial.graph, &threaded.graph);
+}
+
+test "an interior link capacity growth failing at any allocation stays consistent, then retries to a full rebuild" {
+    // Chunk (0,0) holds the floor's 8 interior endpoints on both levels; one step adds a ninth,
+    // so the cursor grows the chunk in place on both levels. The slot reservations are trimmed
+    // first, so each level's growth reserve allocates. Whichever allocation fails, every
+    // level's layout is byte-identical and the cursor unchanged, and the retry is an
+    // incremental step equal to a full rebuild. Serial and threaded.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    const capacity = windowGrowthCapacity(&threads);
+    for ([_]bool{ false, true }) |threaded| {
+        const thread_arg: ?*ThreadSystem = if (threaded) &threads else null;
+        var failures: usize = 0;
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var data = DataSystem.init(std.testing.allocator);
+            defer data.deinit();
+            var world = try initTwoLevelOpenWorld(&meta, 512);
+            defer world.deinit();
+            var system = PathfindingSystem.init(std.testing.allocator);
+            defer system.deinit();
+            try system.reserve(capacity);
+            try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+            system.nav_thread_adaptive = false;
+            system.nav_thread_items_per_range = 1;
+            var frame = SimulationFrame.init(std.testing.allocator);
+            defer frame.deinit();
+            for (0..nav_interior_link_slots_floor) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+            _ = try reactOneStep(&system, &frame, &data, &world, thread_arg);
+            try world.addLevelLink(rampLink(3, 2));
+            try trimSlotReservations(&system.graph);
+            const version = system.graph.version;
+            const cursor = system.nav_links_processed;
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var before: [2]NavLevelGraph = undefined;
+            for (system.graph.level_graphs.items, &before) |*lg, *copy| copy.* = try copyLevelGraph(arena.allocator(), lg);
+
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+            installFailingAllocator(&system, &failing);
+            const result = reactOneStep(&system, &frame, &data, &world, thread_arg);
+            restoreTestingAllocator(&system);
+            const succeeded = if (result) |stats| blk: {
+                try std.testing.expect(!failing.has_induced_failure);
+                try std.testing.expectEqual(@as(usize, 0), stats.full_relabel);
+                break :blk true;
+            } else |err| blk: {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failures += 1;
+                // The step's only allocations are the link's growth reserves (the patch fits
+                // the chunk's edge window), all made before any write.
+                try std.testing.expectEqual(cursor, system.nav_links_processed);
+                for (system.graph.level_graphs.items, &before) |*lg, *copy| try expectLevelGraphContentsEqual(copy, lg);
+                try std.testing.expectEqual(version, system.graph.version);
+                const retried = try reactOneStep(&system, &frame, &data, &world, thread_arg);
+                try std.testing.expectEqual(@as(usize, 0), retried.full_relabel);
+                break :blk false;
+            };
+            for (0..2) |level| try std.testing.expectEqual(@as(u32, 16), linkCapacity(&system.graph, @intCast(level), 0));
+            try expectLinksRoutable(&system.graph, world.levelLinks());
+            try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
+            if (succeeded) break;
+        }
+        try std.testing.expect(failures > 0);
+    }
+}
+
+// Trims the slot-layout reservations to exactly what the layout uses (the state an exact
+// reserve leaves), so a capacity growth must allocate for each of them.
+fn trimSlotReservations(graph: *NavGraph) !void {
+    const allocator = graph.allocator;
+    var max_cap: usize = 0;
+    for (graph.level_graphs.items) |*lg| {
+        inline for (.{ &lg.portals, &lg.portal_edge_start, &lg.portal_edge_count, &lg.portal_order, &lg.chunk_label_keys, &lg.chunk_label_starts, &lg.chunk_link_cells }) |list| {
+            list.shrinkAndFree(allocator, list.items.len);
+        }
+        max_cap = @max(max_cap, std.mem.max(u32, lg.chunk_portal_cap.items));
+    }
+    for (graph.patch_scratch.items) |*scratch| {
+        scratch.edges.clearAndFree(allocator);
+        scratch.cursor.clearAndFree(allocator);
+        try scratch.edges.ensureTotalCapacityPrecise(allocator, max_cap * max_cap);
+        try scratch.cursor.ensureTotalCapacityPrecise(allocator, max_cap);
+    }
+}
+
+test "after an interior link capacity growth, ramps within it are allocation-free" {
+    // The ninth interior ramp grows chunk (0,0)'s capacity to 16 in place. Ramps 10-12 then
+    // fit both the capacity and the grown edge window: incremental patches with a
+    // FailingAllocator on the world, graph, and system, through the threaded and serial paths.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try initTwoLevelOpenWorld(&meta, 512);
+    defer world.deinit();
+    try world.reserveLevelLinks(16);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    const capacity = windowGrowthCapacity(&threads);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    for (0..nav_interior_link_slots_floor + 1) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+    _ = try reactOneStep(&system, &frame, &data, &world, &threads);
+    const grown = try reactOneStep(&system, &frame, &data, &world, &threads);
+    try std.testing.expectEqual(@as(usize, 0), grown.full_relabel);
+    try std.testing.expectEqual(@as(u32, 16), linkCapacity(&system.graph, 0, 0));
+
+    const world_original = world.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    installFailingAllocator(&system, &failing);
+    world.allocator = failing.allocator();
+    defer {
+        world.allocator = world_original;
+        restoreTestingAllocator(&system);
+    }
+    for ([_][2]u16{ .{ 4, 2 }, .{ 5, 2 }, .{ 6, 2 } }, [_]bool{ true, false, true }) |xy, threaded| {
+        try world.addLevelLink(rampLink(xy[0], xy[1]));
+        const stats = try reactOneStep(&system, &frame, &data, &world, if (threaded) &threads else null);
+        try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+        try std.testing.expectEqual(@as(usize, 0), stats.full_relabel);
+        try std.testing.expectEqual(@as(usize, 0), stats.edge_windows_grown);
+        try std.testing.expectEqual(threaded, !system.graph.last_patch_batch.ran_inline);
+    }
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    world.allocator = world_original;
+    restoreTestingAllocator(&system);
+    try expectLinksRoutable(&system.graph, world.levelLinks());
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
+}
+
+// Ramp endpoint cells filling chunk (1,1)'s floor interior capacity (8-tile chunks over 24x24 cells),
 // or eight of its perimeter cells off the border-run midpoints (index 4 of each fully-open
 // side), so every ramp adds a new portal to the chunk's one open component.
-fn chunkOneOneRampCells(perimeter: bool) [nav_interior_link_slots_per_chunk]CellCoord {
+fn chunkOneOneRampCells(perimeter: bool) [nav_interior_link_slots_floor]CellCoord {
     return if (perimeter) .{
         .{ .x = 8, .y = 9 }, .{ .x = 8, .y = 14 }, .{ .x = 15, .y = 9 }, .{ .x = 15, .y = 14 },
         .{ .x = 9, .y = 8 }, .{ .x = 14, .y = 8 }, .{ .x = 9, .y = 15 }, .{ .x = 14, .y = 15 },
@@ -2897,7 +3335,7 @@ test "after an edge-window growth, ramps that fit the grown window are allocatio
     defer meta.deinit();
     var world = try initTwoLevelOpenWorld(&meta, 768);
     defer world.deinit();
-    try world.reserveLevelLinks(nav_interior_link_slots_per_chunk);
+    try world.reserveLevelLinks(nav_interior_link_slots_floor);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
@@ -3067,7 +3505,7 @@ fn expectExactArena(lg: *const NavLevelGraph) !void {
 // within its cap (what packedChunkEdgeCount reads).
 fn expectPackedEdgeWindows(graph: *const NavGraph) !void {
     for (graph.level_graphs.items) |*lg| {
-        for (graph.chunk_portal_base.items, graph.chunk_portal_cap.items, lg.chunk_edge_base.items, lg.chunk_edge_cap.items) |portal_base, portal_cap, edge_base, edge_cap| {
+        for (lg.chunk_portal_base.items, lg.chunk_portal_cap.items, lg.chunk_edge_base.items, lg.chunk_edge_cap.items) |portal_base, portal_cap, edge_base, edge_cap| {
             var run_end = edge_base;
             const starts = lg.portal_edge_start.items[portal_base..][0..portal_cap];
             const counts = lg.portal_edge_count.items[portal_base..][0..portal_cap];
@@ -3819,8 +4257,8 @@ test "a failed edge-window growth still patches the rest of the dirty set, seria
         for (graph.chunk_edge_overflow.items) |flag| try std.testing.expect(!flag);
         // The failed chunk keeps its rebuilt live portals with empty adjacency.
         const lg = &graph.level_graphs.items[0];
-        const pbase = graph.chunk_portal_base.items[chunk];
-        for (lg.portal_edge_count.items[pbase..][0..graph.chunk_portal_cap.items[chunk]]) |count| {
+        const pbase = lg.chunk_portal_base.items[chunk];
+        for (lg.portal_edge_count.items[pbase..][0..lg.chunk_portal_cap.items[chunk]]) |count| {
             try std.testing.expectEqual(@as(u32, 0), count);
         }
         for ([_][2]u16{ .{ 9, 9 }, .{ 11, 9 }, .{ 8, 10 }, .{ 8, 14 } }) |xy| {
@@ -4076,7 +4514,7 @@ test "nav memory gate admits the world's reserved link limit, not just its curre
 }
 
 // The 36 ramp endpoint cells of the one-chunk 8x8 fixture (8-tile nav chunks): 8 interior
-// cells first (the chunk's K interior link slots), then all 28 perimeter cells (positional
+// cells first (the chunk's floor interior link capacity), then all 28 perimeter cells (positional
 // slots), so every ramp adds a portal to the chunk's one open component on the all-grass level.
 fn oneChunkRampCells() [36]CellCoord {
     var cells: [36]CellCoord = undefined;
@@ -4099,7 +4537,7 @@ fn oneChunkRampCells() [36]CellCoord {
 }
 
 test "the u32 edge index is the one fixed cap: a one-cell world past it fails the build" {
-    // Worst case per level = chunks * windowCap((4*ct + K)^2); for one chunk it crosses
+    // Worst case per level = chunks * windowCap((4*ct + floor)^2); for one chunk it crosses
     // maxInt(u32) between ct = 11583 and 11584. The gate runs before any allocation, under an
     // unlimited memory budget.
     var data = DataSystem.init(std.testing.allocator);
@@ -4167,58 +4605,10 @@ test "an edge arena past the nav memory gate's estimate builds and grows without
     try expectGraphsEquivalent(&grown.graph, &built.graph);
 }
 
-test "interiorLinkSlotsAvailable refuses a cell that is an existing but unslotted endpoint" {
-    // Nine distinct interior endpoints in chunk (0,0): the first K (link order) hold the slots,
-    // the ninth is an existing link endpoint that stays unslotted (inert). A new ramp at that
-    // ninth cell must be refused like any new cell, or the accepted link would be inert too.
-    const k = nav_interior_link_slots_per_chunk;
-    const geometry = NavLinkSlotGeometry{ .chunk_tiles = 8, .width = 16, .height = 16 };
-    var links: [k + 1]LevelLink = undefined;
-    for (&links, 0..) |*link, i| link.* = rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6));
-    const ninth = links[k].cell_a;
-    try std.testing.expect(!interiorLinkSlotsAvailable(&links, ninth, geometry));
-    // A slotted existing endpoint still admits.
-    try std.testing.expect(interiorLinkSlotsAvailable(&links, links[0].cell_a, geometry));
-    try std.testing.expect(interiorLinkSlotsAvailable(&links, links[k - 1].cell_a, geometry));
-
-    // Same answer the shared assignment rule gives: the graph leaves that cell unslotted.
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var world = try initTwoLevelOpenWorld(&meta, 512);
-    defer world.deinit();
-    for (links) |link| try world.addLevelLink(link);
-    var capacity = abstractCapacity();
-    capacity.nav_chunk_tiles = 8;
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
-    try std.testing.expectEqual(@as(usize, 1), system.graph.full_build_link_endpoints_unslotted);
-    const ninth_index: u32 = @intCast(system.graph.grid(1).?.indexForCell(.{ .x = ninth.x, .y = ninth.y }).?);
-    try std.testing.expect(system.graph.portalIndex(1, ninth_index) == null);
-    try std.testing.expectEqual(system.graph.linkSlotGeometry(), geometry);
-}
-
-test "linkSlotGeometry is unresolved on an unbuilt graph" {
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try std.testing.expect(!system.graph.valid());
-    try std.testing.expect(!system.graph.linkSlotGeometry().isResolved());
-    try std.testing.expectEqual(NavLinkSlotGeometry.unresolved, system.graph.linkSlotGeometry());
-
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGrid(&data, 384, 384, 32);
-    try std.testing.expectEqual(NavLinkSlotGeometry{ .chunk_tiles = 4, .width = 12, .height = 12 }, system.graph.linkSlotGeometry());
-}
-
-test "a failed link mark assigns, counts, and warns nothing; the retry does it exactly once" {
+test "a failed link mark assigns nothing; the retry assigns exactly once" {
     // Success-path-only side effects: markNewNavLinksDirty runs its fallible dirty marks BEFORE
-    // the infallible slot assignment, so a failed mark leaves the slot table, the unslotted
-    // count, and the cursor untouched, and the retry assigns and counts each endpoint once.
+    // the slot assignment, so a failed mark leaves the slot table, the slot layout, and the
+    // cursor untouched, and the retry assigns each endpoint once.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4233,14 +4623,14 @@ test "a failed link mark assigns, counts, and warns nothing; the retry does it e
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
 
-    // Fill chunk (0,0)'s K interior slots through the cursor.
+    // Fill chunk (0,0)'s floor interior capacity through the cursor.
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    for (0..nav_interior_link_slots_per_chunk) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+    for (0..nav_interior_link_slots_floor) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
     _ = try reactOneStep(&system, &frame, &data, &world, null);
     try std.testing.expect(!system.hasPendingNavLinks(&world));
 
-    // Next batch: a ninth interior cell in the full chunk (0,0) (unslotted) and an interior
+    // Next batch: a ninth interior cell in the full chunk (0,0) (capacity short) and an interior
     // cell of chunk (1,1) (would take that chunk's first slot).
     try world.addLevelLink(rampLink(3, 2));
     try world.addLevelLink(rampLink(9, 9));
@@ -4258,26 +4648,25 @@ test "a failed link mark assigns, counts, and warns nothing; the retry does it e
     try std.testing.expectError(error.OutOfMemory, system.markNewNavLinksDirty(&world));
     system.allocator = original;
     try std.testing.expectEqual(cursor_before, system.nav_links_processed);
-    try std.testing.expectEqual(@as(u32, 0), system.graph.chunk_link_count.items[chunk11]);
+    try std.testing.expectEqual(@as(u32, 0), system.graph.level_graphs.items[0].chunk_link_count.items[chunk11]);
+    try std.testing.expectEqual(nav_interior_link_slots_floor, linkCapacity(&system.graph, 0, 0));
 
-    // Retry: assigns chunk (1,1)'s slot and counts the unslotted endpoint exactly once.
+    // Retry: grows chunk (0,0) in place and assigns both slots; the apply stays incremental.
     system.clearNavDirty();
     const retry = try system.markNewNavLinksDirty(&world);
     try std.testing.expectEqual(@as(usize, 2), retry.processed);
-    try std.testing.expectEqual(@as(usize, 1), retry.unslotted);
-    try std.testing.expectEqual(@as(u32, 1), system.graph.chunk_link_count.items[chunk11]);
-    _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(u32, 1), system.graph.level_graphs.items[0].chunk_link_count.items[chunk11]);
+    try std.testing.expectEqual(@as(u32, 16), linkCapacity(&system.graph, 0, 0));
+    const applied = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 0), applied.full_relabel);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
 }
 
 test "link cursor stats of a failed apply are reported once by the successful retry" {
     // The cursor advances (and counts) when its dirty marks land, before the apply. A step whose
-    // apply then fails used to lose those counts: the retry's cursor call finds no new links and
-    // reported links_deferred = link_endpoints_unslotted = 0 for the links it actually folds.
-    // Step 2 adds a ninth interior ramp in the full chunk (0,0) (unslotted) and five interior
-    // ramps in chunk (1,1), which then needs 2 border + 5 link portals = 2 + 7*6 = 44 edges > its
-    // 32-edge window, and the growth's arena allocation fails (OOM). The retry reports the
-    // unslotted endpoint exactly once.
+    // apply then fails used to lose those counts: the retry's cursor call finds no new links.
+    // Step 2 adds five interior ramps in chunk (1,1), which then needs 2 border + 5 link portals
+    // = 2 + 7*6 = 44 edges > its 32-edge window, and the growth's arena allocation fails (OOM).
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4292,30 +4681,27 @@ test "link cursor stats of a failed apply are reported once by the successful re
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
 
-    // Step 1: fill chunk (0,0)'s K interior slots through the cursor.
+    // Step 1: fill chunk (0,0)'s floor interior capacity through the cursor.
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    for (0..nav_interior_link_slots_per_chunk) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
-    const step1 = try reactOneStep(&system, &frame, &data, &world, null);
-    try std.testing.expectEqual(@as(usize, 0), step1.link_endpoints_unslotted);
+    for (0..nav_interior_link_slots_floor) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+    _ = try reactOneStep(&system, &frame, &data, &world, null);
     try std.testing.expectEqual(NavLinkCursorStats{}, system.nav_link_cursor_pending);
 
-    // Step 2: six links in one step; level 0's repack for chunk (1,1) fails at the graph's first
+    // Step 2: five links in one step; level 0's repack for chunk (1,1) fails at the graph's first
     // allocation.
-    try world.addLevelLink(rampLink(3, 2));
     for ([_][2]u16{ .{ 9, 9 }, .{ 11, 9 }, .{ 13, 9 }, .{ 9, 11 }, .{ 11, 11 } }) |xy| try world.addLevelLink(rampLink(xy[0], xy[1]));
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.graph.allocator = failing.allocator();
     const failed = reactOneStep(&system, &frame, &data, &world, null);
     system.graph.allocator = std.testing.allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
-    try std.testing.expectEqual(nav_interior_link_slots_per_chunk + 6, system.nav_links_processed);
-    try std.testing.expectEqual(NavLinkCursorStats{ .processed = 6, .deferred = 0, .unslotted = 1 }, system.nav_link_cursor_pending);
+    try std.testing.expectEqual(nav_interior_link_slots_floor + 5, system.nav_links_processed);
+    try std.testing.expectEqual(NavLinkCursorStats{ .processed = 5, .deferred = 0 }, system.nav_link_cursor_pending);
 
-    // Step 3 (no new links): the retry folds them and reports the unslotted endpoint.
+    // Step 3 (no new links): the retry folds them.
     const step3 = try reactOneStep(&system, &frame, &data, &world, null);
     try std.testing.expectEqual(@as(usize, 2), step3.edge_windows_grown);
-    try std.testing.expectEqual(@as(usize, 1), step3.link_endpoints_unslotted);
     try std.testing.expectEqual(@as(usize, 0), step3.links_deferred);
     try std.testing.expectEqual(NavLinkCursorStats{}, system.nav_link_cursor_pending);
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
@@ -4384,10 +4770,10 @@ test "edge-window growths of a failed step are reported by the next successful s
 
 test "links deferred past the per-step budget across a full relabel stay on the cursor" {
     // A full relabel rebuilds the abstract graph from the WHOLE link set, including links the
-    // cursor deferred this step. The cursor must stay put, so the next step still visits the
-    // deferred links: parity holds and their unslotted endpoint is counted exactly once, by
-    // the cursor, on the step that folds it. (An edge-window growth is not a rebuild: it
-    // re-patches one chunk from the already-assigned slot table and never touches the cursor.)
+    // cursor deferred this step, sizing their chunk's capacity. The cursor must stay put, so the
+    // next step still visits the deferred links, finds them slotted, and stays incremental.
+    // (An edge-window growth is not a rebuild: it re-patches one chunk from the
+    // already-assigned slot table and never touches the cursor.)
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4404,10 +4790,10 @@ test "links deferred past the per-step budget across a full relabel stay on the 
     // Two affected levels exceed a threshold of 1.
     system.capacity.nav_full_relabel_level_threshold = 1;
 
-    // Ten links in one step: K fill chunk (0,0)'s interior slots; link 8 is a ninth distinct
-    // interior cell there (unslotted); link 9 is interior to chunk (1,1).
-    comptime std.debug.assert(nav_interior_link_slots_per_chunk == nav_new_links_per_step_max);
-    for (0..nav_interior_link_slots_per_chunk) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+    // Ten links in one step: eight fill chunk (0,0)'s floor capacity; link 8 is a ninth distinct
+    // interior cell there; link 9 is interior to chunk (1,1).
+    comptime std.debug.assert(nav_interior_link_slots_floor == nav_new_links_per_step_max);
+    for (0..nav_interior_link_slots_floor) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
     try world.addLevelLink(rampLink(3, 2));
     try world.addLevelLink(rampLink(9, 9));
 
@@ -4417,40 +4803,17 @@ test "links deferred past the per-step budget across a full relabel stay on the 
     try std.testing.expectEqual(@as(usize, 1), step1.version_bumps);
     try std.testing.expectEqual(@as(usize, 1), step1.full_relabel);
     try std.testing.expectEqual(@as(usize, 2), step1.links_deferred);
-    try std.testing.expectEqual(@as(usize, 0), step1.link_endpoints_unslotted);
     // The relabel assigned the whole link set but left the cursor on the deferred links.
     try std.testing.expectEqual(nav_new_links_per_step_max, system.nav_links_processed);
+    try std.testing.expectEqual(@as(u32, 9), system.graph.level_graphs.items[0].chunk_link_count.items[0]);
 
+    // Step 2 touches both levels again: lift the threshold so it stays incremental.
+    system.capacity.nav_full_relabel_level_threshold = 2;
     const step2 = try reactOneStep(&system, &frame, &data, &world, null);
     try std.testing.expectEqual(@as(usize, 0), step2.links_deferred);
-    try std.testing.expectEqual(@as(usize, 1), step2.link_endpoints_unslotted);
+    try std.testing.expectEqual(@as(usize, 0), step2.full_relabel);
     try std.testing.expect(!system.hasPendingNavLinks(&world));
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
-}
-
-test "interiorLinkSlotsAvailable admits perimeter and known cells and refuses a ninth distinct interior cell" {
-    const k = nav_interior_link_slots_per_chunk;
-    const geometry = NavLinkSlotGeometry{ .chunk_tiles = 8, .width = 16, .height = 16 };
-    var links: [k]LevelLink = undefined;
-    // K distinct interior cells of chunk (0,0) (interior = local 1..6).
-    for (&links, 0..) |*link, i| link.* = rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6));
-
-    // Perimeter cells always admit, even with the chunk's interior slots full.
-    try std.testing.expect(interiorLinkSlotsAvailable(&links, .{ .x = 0, .y = 3 }, geometry));
-    try std.testing.expect(interiorLinkSlotsAvailable(&links, .{ .x = 7, .y = 7 }, geometry));
-    // An already-present interior endpoint admits at a full chunk.
-    try std.testing.expect(interiorLinkSlotsAvailable(&links, links[3].cell_a, geometry));
-    // A ninth distinct interior cell is refused.
-    try std.testing.expect(!interiorLinkSlotsAvailable(&links, .{ .x = 6, .y = 6 }, geometry));
-    // A different chunk is unaffected.
-    try std.testing.expect(interiorLinkSlotsAvailable(&links, .{ .x = 10, .y = 10 }, geometry));
-
-    // Links on two different level pairs at the same cell count once (dedupe by cell).
-    var shared: [k]LevelLink = undefined;
-    for (shared[0 .. k - 1], 0..) |*link, i| link.* = rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6));
-    shared[k - 1] = .{ .kind = .stair, .level_a = 2, .cell_a = shared[0].cell_a, .level_b = 1, .cell_b = shared[0].cell_a, .traversal_cost = 1, .bidirectional = true };
-    // K-1 distinct cells: one more distinct interior cell still fits.
-    try std.testing.expect(interiorLinkSlotsAvailable(&shared, .{ .x = 6, .y = 6 }, geometry));
 }
 
 test "incremental underground dig leaves the surface level abstract graph byte-identical" {
@@ -4678,8 +5041,8 @@ test "compactChunkEdges zeroes the chunk's edge counts on overflow instead of le
     try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
 
     const chunk: u32 = 0;
-    const pbase = system.graph.chunk_portal_base.items[chunk];
-    const pcap = system.graph.chunk_portal_cap.items[chunk];
+    const pbase = system.graph.level_graphs.items[0].chunk_portal_base.items[chunk];
+    const pcap = system.graph.level_graphs.items[0].chunk_portal_cap.items[chunk];
     // Sanity: the init build gave this chunk real edges to lose on a forced overflow.
     var had_edges = false;
     for (system.graph.level_graphs.items[0].portal_edge_count.items[pbase .. pbase + pcap]) |count| {
@@ -4719,8 +5082,8 @@ test "compactChunkEdges keeps portal_edge_start in-bounds for the last chunk on 
 
     const lg = &system.graph.level_graphs.items[0];
     const chunk: u32 = @intCast(system.graph.chunkCount() - 1);
-    const pbase = system.graph.chunk_portal_base.items[chunk];
-    const pcap = system.graph.chunk_portal_cap.items[chunk];
+    const pbase = lg.chunk_portal_base.items[chunk];
+    const pcap = lg.chunk_portal_cap.items[chunk];
     const ebase = lg.chunk_edge_base.items[chunk];
     const ecap = lg.chunk_edge_cap.items[chunk];
     // Precondition for the OOB: this chunk's window ends at the very end of the arena, and

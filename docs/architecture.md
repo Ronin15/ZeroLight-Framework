@@ -821,13 +821,16 @@ re-solves. The dirty
 buffer GROWS rather than dropping, so any number of simultaneous diggers or
 obstacle edits in one step all reach the graph — a dropped cell would leave the
 graph stale. Unaffected chunks are never touched, and the whole-world build runs
-only at init. The abstract SLOT GEOMETRY — `4*ct` perimeter slots plus a FIXED
-`nav_interior_link_slots_per_chunk` (8) interior link-endpoint slots per chunk — is a pure
-function of the grid dimensions, never of the link set, so the incremental patch never
-renumbers a slot and the incremental and full builds share one layout. The interior slot
-table is shared by every level and deduped by cell (a ramp's two endpoints share one
-slot), so the cap bounds DISTINCT interior link-endpoint cells per nav chunk across all
-levels. One assignment rule (`NavGraph.assignLinkEndpointSlots`, link order) fills it:
+only at init. The abstract SLOT GEOMETRY is per level (`NavLevelGraph.chunk_portal_cap` /
+`chunk_portal_base` / `total_slots` and its interior link-endpoint table): `4*ct` perimeter
+slots plus each chunk's interior link capacity on that level. It is set at every full build
+and relabel (`computePortalGeometry`) and grows only when the link cursor crosses one chunk's
+capacity on one level, so the incremental patch never renumbers a slot. Slot ids are
+level-local (searches key them by `packRef(level, slot)`). A chunk's interior capacity is
+`nav_interior_link_slots_floor` (8), else the next power of two of its DISTINCT interior
+link-endpoint cells on that level (a ramp's two endpoints take one slot on each of their two
+levels); the same link set always yields the same layout, so the incremental and full builds
+share it. One assignment rule (`NavGraph.assignLinkEndpointSlots`, link order) fills it:
 a full build assigns the whole link set from index 0, and the post-commit reaction's LINK
 CURSOR (`PathfindingSystem.nav_links_processed`, reset to `levelLinks().len` by every full
 build) assigns each NEW `LevelLink` — e.g. `DigController.digRamp` carving a ramp — before
@@ -838,15 +841,15 @@ already-walkable cell flips no blocking state, so `eventInvalidatesNavigation` s
 yet the link still patches); `SimulationPipeline.hasPendingNavLinks` lets the state reserve
 the `nav_region_invalidated` slot. Per step the cursor folds at most
 `nav_new_links_per_step_max` (8) links — a fixed constant independent of world size; extra
-links DEFER in link order to the next step (`pathfinding_links_deferred`). An endpoint that
-finds its chunk's 8 interior slots full stays UNSLOTTED: `tryLinkPortal` skips it (no portal
-node), exactly as a blocked endpoint, so the inert `link_edges` entry is never relaxed (the
-abstract solver only relaxes a link whose partner resolves to a live portal); it is counted
-(`pathfinding_link_endpoints_unslotted`) and warned once when the cursor first visits it. The
-runtime producer never reaches that state: the ramp dig asks the pure
-`interiorLinkSlotsAvailable` helper first (geometry set by `SimulationPipeline` after every
-full nav build) and refuses a ramp that would exceed the cap before mutating the world
-(`dig_ramp_refused_link_slots`). Underground NPCs path cross-level to the surface, so a
+links DEFER in link order to the next step (`pathfinding_links_deferred`). A new endpoint
+whose chunk run is full grows that chunk in place first (`NavGraph.growChunkLinkCapacity`,
+main thread, before the patch): its capacity doubles to the size a full build would give it,
+that level's later chunk slot windows shift up, and the stored slot indices past it
+(edge targets, `cell_to_portal`, `portal_order`, label starts) are remapped, with no cell walk
+or relabel and no `nav_version` bump (slot ids are never kept across steps; caches hold cells).
+Levels without the endpoint are untouched. Reserves come first, so an OOM keeps that level's
+layout and the cursor for a retry. The step stays an
+incremental patch (~96 us on the 256x256x2 bench world). No ramp is refused. Underground NPCs path cross-level to the surface, so a
 player-dug ramp is routable by them the step it is dug. The reaction is recorded
 through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel` /
 `nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
@@ -878,13 +881,14 @@ rebuild, with no `nav_version` bump, and a repack never reorders a portal's edge
 A* results match a full rebuild too. The edge arena is runtime-growing data: the nav memory
 gate (`max_nav_memory_bytes`) budgets the reserve-time stores and only estimates the arena, so
 no dig is ever refused for density. The one fixed edge cap is the u32 edge index: the build
-fails loudly (`NavWorldTooLarge`) when a world extent's worst case (every chunk at
-windowCap((4·ct + 8)²)) could overflow it, so growth cannot. An OOM in a repack leaves that
+fails loudly (`NavWorldTooLarge`) when a world extent's floor-capacity worst case (every chunk
+at windowCap((4·ct + 8)²)) could overflow it; an arena or slot count that links grow past
+u32 reports `OutOfMemory`. An OOM in a repack leaves that
 level's old layout valid, later levels on their old layer, and the step retryable. Windows are not sized for
 the layout maximum (every perimeter cell plus 8 link endpoints in one component, ~4.6k
 edges per 16-tile chunk-level, ~300 MB at 256x256x32) because measured topology needs
-~2 MB. The per-participant patch scratch is likewise pre-reserved at
-the build to the largest chunk's caps. The system-owned dirty buffers are
+~2 MB. The per-participant patch scratch is likewise pre-reserved by every full build and
+relabel to the largest chunk's caps, before any threaded patch. The system-owned dirty buffers are
 reserved by `SimulationPipeline.reserve` from the structural-stage event bound
 (`structuralStageEventBound()`: the `.structural_commit` producers `eventStageOf`
 classifies, plus the link cursor's two endpoints per link), and the deduped level set to the
@@ -893,24 +897,24 @@ level count at the nav build; a step past the bound still grows rather than drop
 more portals than any prior build) does one bounded amortized growth, which is
 acceptable on this cold, event-triggered path. Level-link storage has a load-time
 initial reservation: the state reserves it with `WorldSystem.reserveLevelLinks` (the demo sizes
-it from the loaded world as authored links + world chunks × `nav_interior_link_slots_per_chunk`),
+it from the loaded world as authored links + world chunks × `nav_interior_link_slots_floor`),
 and the full nav build reserves `link_edges`/`link_edge_refs` to that same `levelLinkLimit`. A
 ramp press that finds the pool full grows it at the dig commit seam
 (`SimulationPipeline.ensureLevelLinkRoom`, main thread, before the dig mutates the world)
 geometrically to `grownLevelLinkLimit`, never refused (the nav-memory gate runs only at load),
 nav link edges first, then the world's limit (`reserveLevelLinks`). The seam runs only for a
-ramp `DigController.admit` let through (a no-op or refused press never grows the pool) and
+ramp `DigController.admit` let through (a no-op press never grows the pool) and
 before the step's stimulus promote, so a growth OOM leaves the step's state for the retry. On
 a reserved world `addLevelLink` / `ensureLevelLinkCapacity` never grow: past the limit they
-return `error.LevelLinkRoomUnreserved`, so the nav link edges never grow in-step. Only the 8-per-chunk interior stride (a layout
-bound, `dig_ramp_refused_link_slots`) refuses a ramp; links within the grown pool never
-allocate (FailingAllocator-proven over world, graph, and system). The
+return `error.LevelLinkRoomUnreserved`, so the nav link edges never grow in-step. Links within
+the grown pool and their chunks' interior capacity never allocate (FailingAllocator-proven
+over world, graph, and system). The
 load-time `max_nav_memory_bytes` gate
 estimates nav memory from realistic structure (portals bounded by chunk-border
 cells, CSR edges by portal count times a small abstract degree), not a per-chunk
 pairwise worst case, so large sparse worlds build instead of being falsely
-rejected. Its slot term is `levels * chunk_count * (4*ct + nav_interior_link_slots_per_chunk)`
-— independent of the link set — and the world's reserved link limit (the same
+rejected. Its slot term is `levels * chunk_count * (4*ct + nav_interior_link_slots_floor)`
+— capacity links grow past the floor is runtime-growing, never gated — and the world's reserved link limit (the same
 `levelLinkLimit` the build reserves, not just today's link count) sizes only the global
 `link_edges`/`link_edge_refs` term.
 

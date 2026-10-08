@@ -136,6 +136,51 @@ exploratory ReleaseFast serial-direct run (1 warmup, 5 iterations, 1 rep)
 rebuild that resets the windows costs ~50 s at this size, so one serial case
 took ~6 min.
 
+### Interior link capacity growth (2026-10-07)
+
+The last ramp refusal is gone: 64E's fixed 8 interior link slots per chunk are
+now a floor. `computePortalGeometry` sizes each chunk's capacity (floor, else
+the next power of two of its distinct interior endpoint cells) at every full
+build and relabel. A cursor endpoint past it grows that one chunk in place
+(`growChunkLinkCapacity`, main thread, before the patch): reserve the slot
+arrays and patch scratch first (an OOM keeps the layout and the cursor), shift
+later chunks' slot windows on that level (see per-level geometry below), remap stored slot indices (edge
+targets, `cell_to_portal`, `portal_order`, label starts), and tombstone the new
+tail; the cursor's dirty mark patches the chunk that step. No relabel and no
+`nav_version` bump: slot ids are never kept across steps (caches hold cells).
+
+Bench (ReleaseFast, serial-direct, vs `40064d5`):
+
+| Group | Before | After |
+| --- | --- | --- |
+| `nav-update-links` 1 / 8 | 26.53 us / 207.21 us | 26.85 us / 199.72 us |
+| `nav-update-links-dense` 8 | 45.66 us | 43.31 us |
+| `pathfinding` 512 (tuned) | 3.39 ms (472 us) | 3.38 ms (464 us) |
+| `nav-update-links-capacity` 1, 3 reps (relabel at `4ffbaf7` → in-place growth) | 5.20 / 5.10 / 5.22 ms | 95.4 / 96.8 / 95.5 us |
+
+The capacity step on the 256×256-tile, 2-level bench world (256 chunks per
+level) now shifts and remaps both levels' slots (O(slots + edges)) and patches
+the grown chunk, instead of relabeling the whole graph (−98%).
+It runs once per doubling of one chunk's distinct interior endpoints (at the
+9th, 17th, 33rd, ...). Same reps, before → after: `nav-update-links` 1 / 8
+26.4 / 208.0 us → 26.1 / 200.6 us, `-dense` 8 43.4 → 42.6 us, `pathfinding`
+512 3.39 ms → 3.27 ms (serial-direct medians; within noise).
+
+**Per-level slot geometry.** `chunk_portal_cap` / `chunk_portal_base` /
+`total_slots` and the interior link-endpoint table live on `NavLevelGraph`,
+sized per level from that level's own endpoints, so a growth shifts only the
+levels the new link touches (was: all levels, ~1.1 ms on the 32-level demo).
+Slot ids stay level-local (`packRef`). An OOM keeps the failing level's layout
+and the cursor; a level the same link already grew stays grown (retry skips
+it). Bench (ReleaseFast, 3 interleaved reps vs `8271ae5`, serial-direct;
+the 2-level bench world grows both levels either way, so this is a no-regression
+check): `nav-update-links-capacity` 1 96.3 / 95.2 / 99.8 → 99.5 / 96.8 / 96.2 us,
+`nav-update-links` 8 ~208 → ~200 us, `-dense` 8 ~42.7 → ~44 us, `pathfinding`
+512 ~3.3 → ~3.4 ms (noise). Demo memory (256 chunks × 32 levels, computed): a
+fresh build carries per-level link tables and cap/base/count arrays,
++~350 KB; each growth no longer adds its slots (32 B each) to the 30 unlinked
+levels, saving 7.7 KB at 8 → 16 and 15 KB at 16 → 32.
+
 ### Review follow-ups (open)
 
 - [ ] **Cave-in bench, finished measurement.** Run `nav-update-cave-in` and
