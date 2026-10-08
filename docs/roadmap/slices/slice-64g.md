@@ -30,9 +30,14 @@ level or world work:
 - The render path uploads terrain through a level-sized dense GPU window.
 - Chunk edge sizes differ by system (`chunk_size_tiles`, `nav_chunk_tiles`,
   demo fixtures at 4 and 8 tiles).
-- Untested from 64E/64F: two growths on one level from one link, both link
-  endpoints in one chunk, growth of the last chunk; `nav-update-links-capacity`
-  is benched only at 256².
+- 64E/64F churn (2026-10-05..07) is deleted, never extended: the growth,
+  repack, and relabel paths, their tests, and the bench groups
+  `nav-update-links`, `-links-dense`, `-links-capacity`, `-cave-in`, and
+  `-cave-in-warm` (the cave-in fixture runs a 1024² × 32-level full rebuild
+  per iteration).
+- Reference: main's chunk model (`main:src/game/systems/pathfinding/`), with
+  positional per-chunk slots, chunk-local components, the dirty-chunk patch,
+  and cell-keyed links; its level-sized arrays and global fallbacks go.
 
 ### Architecture notes
 
@@ -88,8 +93,10 @@ level or world work:
       allocates an `AutoHashMap` per call; the relabel OOM sweep.
 - [ ] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
       every allocation leaves state intact and the retry equals a rebuild; one
-      chunk's change leaves every other chunk untouched; the 64E/64F gaps above;
-      a multi-level cave-in in one step.
+      chunk's change leaves every other chunk untouched; a multi-level cave-in
+      in one step.
+- [ ] The 64E/64F churn tests and bench groups deleted with the paths they
+      cover.
 - [ ] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
       and 64B checked against chunk storage; archive 64F.
 
@@ -97,10 +104,13 @@ level or world work:
 
 - [ ] A `chunk-scale` bench group (dig, ramp, cave-in, explosion fill at
       256², 1024², 2048², and 8 / 32 / 128 levels) shows per-change cost flat
-      across sizes (`.claude/rules/tests-benchmarks.md`).
-- [ ] `pathfinding`, `nav-update-*`, and `render_game_prep` show no regression
-      against a baseline taken before the first change; an A\* path of the same
-      length costs the same at 2048² as at 256².
+      across sizes (`.claude/rules/tests-benchmarks.md`); fixtures build once
+      outside the timed loop and the group runs quickly in Debug.
+- [ ] Main's groups (`pathfinding*`, `nav-update-scattered`,
+      `nav-update-multichunk`, `nav-update-entity-obstacles`,
+      `render-game-prep*`) show no regression against the Debug baseline taken
+      before the first change; an A\* path of the same length costs the same at
+      2048² as at 256².
 - [ ] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
 - [ ] Manual (display, Debug): digs, ramps, and a cave-in in the demo; NPCs
       route over the changes.

@@ -49,7 +49,8 @@ Every design, and every fix touching storage or per-change work, states:
   design evaluated has that unit own its storage and work. A shared arena,
   global rebuild, or level-wide shift needs a cost model that beats it.
 - If the existing structure cannot pass, redesign that structure; never patch
-  around it.
+  around it. Code, tests, and benches built on a failing structure go with it
+  and are never references or baselines.
 
 ## Ownership boundaries
 
