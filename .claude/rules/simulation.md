@@ -63,7 +63,9 @@ paths:
 - Tiers are capability-based and set fidelity, never whether an entity
   advances (`engine-design.md` § Target scale); render visibility controls draw
   construction only; a scope pin never bypasses render visibility.
-- Tests needing every agent active use a full-extent rect or `always_active`.
+- A test that must exclude distance effects (every agent in the nearest band)
+  uses a full-extent rect or `always_active`; in play, fidelity falls with
+  distance.
 
 ## Determinism
 

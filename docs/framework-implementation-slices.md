@@ -57,9 +57,9 @@ files it links. Do not load the whole roadmap.
   and never restates or adds a rule. A slice that needs a new rule has a
   checklist item to add it to the owning rule file when it lands. The planned
   merged stage order is Table T4.
-- Do not promote threaded stage overlap, nav-remask cost changes, render-collect
-  scan changes, or persistence beyond Slice 46's stable-ID boundary into a
-  checklist until confirmed in the live modules. Slice 46 is the save/load
+- Do not promote threaded stage overlap, render-collect scan changes, or
+  persistence beyond Slice 46's stable-ID boundary into a checklist until
+  confirmed in the live modules. Slice 46 is the save/load
   slice; Slice 54 settings are app preferences, never save data. A slice adding
   persistent `DataSystem`/`WorldSystem` state classifies it in Slice 49's
   checksum completeness lists (and 64B's classification) and adds its Slice 46
@@ -108,10 +108,12 @@ files it links. Do not load the whole roadmap.
 
 Some fields are optional for early foundation slices. Slices hold intent and
 data only: goal, current-code facts, measured numbers, owner decisions,
-constraints, checklist, and acceptance. They carry no rules, internal designs
+constraints, checklist, and acceptance. A measured number is one line naming
+its bench group and the commit it was taken at, kept only while a decision or
+acceptance check depends on it. They carry no rules, internal designs
 (structs, field layouts, algorithms, batch scripts, other slices' internals),
-review logs, bench tables, dated status logs, or superseded designs (those go
-in commit messages and changelogs). A slice states what it needs from another
+review logs, bench tables or run logs, dated status logs, or superseded
+designs (those go in commit messages and changelogs). A slice states what it needs from another
 slice as an outcome, never that slice's internals. Index rows are one short
 line of open work. A checked item is one line naming what landed. A
 slice may land across several commits, one per logical change.
@@ -192,10 +194,10 @@ the [archive](framework-implementation-slices-archive.md).
 | [**71B**](roadmap/slices/slice-71b.md) | In progress | Static Collider Index, Collision Static Split, And Group-Field Prewarm — after 64G, 62, 71A |
 | [**71C**](roadmap/slices/slice-71c.md) | Not started | Cover-Aware Flee And Ranged Pursue (`cover` Interest Markers) — after 73, 56B |
 | [**71D**](roadmap/slices/slice-71d.md) | Not started | AI Merchant Selling (Forage → Sell Loop) — after 73, 63, 61, 57, 56, 55, 71A |
-| [**72**](roadmap/slices/slice-72.md) | In progress | Live Capacity Sizing Pass — after 64G |
+| [**72**](roadmap/slices/slice-72.md) | In progress | Live Capacity Sizing Pass — F and G re-scoped after 64G |
 | [**73**](roadmap/slices/slice-73.md) | Not started | Data-Driven Cognition — after 49 |
-| [**74**](roadmap/slices/slice-74.md) | Not started | World Instances — after 64G, 49 |
-| [**75**](roadmap/slices/slice-75.md) | Not started | Far Simulation — after 74, 64G, 73 |
+| [**74**](roadmap/slices/slice-74.md) | Not started | World Instances — after 64G, 49, 50, 75 |
+| [**75**](roadmap/slices/slice-75.md) | Not started | Far Simulation — after 64G, 73 |
 
 **Recently settled (archive only):** 64E, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
@@ -211,7 +213,7 @@ residual only); open work grows beside that loop.
 
 | Track | Slices | Focus |
 | --- | --- | --- |
-| **Fully simulated worlds** | **64G** → **73** → **74** → **75** | Chunk-owned terrain and nav, data-driven cognition, world instances created and destroyed in play, and fidelity by distance from players in every world. |
+| **Fully simulated worlds** | **64G** → **73** → **75** → **74** (74 after 50) | Chunk-owned terrain and nav, data-driven cognition, fidelity by distance from the observer, and world instances created, stepped, and destroyed in play. |
 | **Determinism & threading** | **49** → **50** → **52A–52D** → **64A** → **51** → **65A** → **64B** → **64C** → **65B** (65C after 58 and 74; 64D gated) | Seeded sessions, checksum and replay over every world, cross-machine determinism, and lane consumers. |
 | **Perf** | **72**, **55**, **35**, **70A**, **71B**, **68A** | Behavior independent of physical capacity, decision cadence, AI/steering math, sprite bandwidth, shared entity tables, static fast paths. |
 | **Release & platform** | **52A** → **52B** → **52C** → **66A**; **52D** after 52A; **66B–66E** gated | Pinned baseline, packaging, CI, crash triage; 52A before games fork, 66A before any build leaves the team. |
@@ -261,22 +263,23 @@ order.
 
 - **Residual verification (any time):** [33](roadmap/slices/slice-33.md)
   (visual/`gpu-smoke`), [43](roadmap/slices/slice-43.md) (hardware).
-- **Capacity sizing:** [72](roadmap/slices/slice-72.md), after 64G; its open
-  items cross-edit the slices they name in the same change.
+- **Capacity sizing:** [72](roadmap/slices/slice-72.md), any time; F and G
+  are re-scoped against 64G first. Its open items cross-edit the slices they
+  name in the same change.
 
 1. **64F** Nav Edge Storage Simplification.
 2. **64G** Chunk-Owned Terrain And Nav — after 64F.
 3. **49** Session Seed And Determinism Checksum Harness — after 64G.
 4. **73** Data-Driven Cognition — after 49.
-5. **74** World Instances — after 64G, 49.
+5. **75** Far Simulation — after 64G, 73.
 6. **50** Thread System Hardening.
-7. **52A** Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders.
-8. **52B** Platform Packaging Layouts — after 52A.
-9. **52C** CI Workflows And Release Performance Baseline — after 52A, 49, 50, 52B.
-10. **52D** SIMD Layer Codegen For The v2 Release Baseline — after 52A.
-11. **64A** Simulation-Invisible Pause, Float Min/Max Policy, And FP Environment Assertion — after 49, 52D.
-12. **55** Cognition Think-Interval Coasting (Decision LOD) — after 73.
-13. **75** Far Simulation — after 74, 64G, 73.
+7. **74** World Instances — after 64G, 49, 50, 75.
+8. **52A** Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders.
+9. **52B** Platform Packaging Layouts — after 52A.
+10. **52C** CI Workflows And Release Performance Baseline — after 52A, 49, 50, 52B.
+11. **52D** SIMD Layer Codegen For The v2 Release Baseline — after 52A.
+12. **64A** Simulation-Invisible Pause, Float Min/Max Policy, And FP Environment Assertion — after 49, 52D.
+13. **55** Cognition Think-Interval Coasting (Decision LOD) — after 73.
 14. **35** AI And Steering Hot-Loop SIMD Restructure — after 55, 52D.
 15. **51** Background Job Lane With Deterministic Step Handoff — after 49, 50, 64A.
 16. **65A** Thread-Shared Layout Consolidation And Background-Lane OS Priority — after 50, 51.

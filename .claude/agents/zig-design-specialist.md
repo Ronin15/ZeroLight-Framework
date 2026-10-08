@@ -59,7 +59,10 @@ rules.
   path, and proofs, checked against destruction-scale workloads.
 - **Main-thread and deferred boundaries**, threading and SIMD policy, with the
   deterministic merge and serial + threaded paths.
-- **Tests, benches, diagnostics**.
+- **Tests, benches, diagnostics**: each claimed growth order names the
+  scaling bench group and sizes that will measure it
+  (`.claude/rules/tests-benchmarks.md`); a slice that replaces a structure
+  measures the old one first, so the baseline is measured, not derived.
 
 Every invariant stated, no restated code, no essays. End with the slice's
 Checklist refined into the plan's implementation steps, one line each; the

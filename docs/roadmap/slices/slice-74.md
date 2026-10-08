@@ -1,6 +1,6 @@
 ## Slice 74: World Instances
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 49](slice-49.md) · Track: standalone (engine core; [Target Model](../../architecture.md#target-model))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 49](slice-49.md), [Slice 50](slice-50.md), [Slice 75](slice-75.md) · Track: standalone (engine core; [Target Model](../../architecture.md#target-model))
 
 **Status: not started.**
 
@@ -63,7 +63,9 @@ One world per gameplay state; nothing models a set of worlds.
 - Independent worlds step through the thread system with a serial path and a
   fixed merge order; no result depends on worker count or the order worlds
   finish (`.claude/rules/threading.md`, `.claude/rules/simulation.md`
-  § Determinism).
+  § Determinism). Under 50's reentrancy decision a batch nested in a job runs
+  inline, so the design pass chooses where parallelism lives (across worlds,
+  within each world, or both) with a cost model for each.
 - A world created in play is deterministic from the session seed and the
   step that created it (49's seed domains and `StepIndex`).
 - Create and destroy are structural: applied at a seam between steps,
@@ -74,16 +76,17 @@ One world per gameplay state; nothing models a set of worlds.
 - Presentation (render prep, audio, camera) follows the viewed world; worlds
   without a viewer run simulation only.
 - Creating a world in play is never refused for capacity; 64G retires the
-  level-sized load gates (dense GPU budget, nav memory). Any remaining
-  load-time check is reconciled with `.claude/rules/budgets-capacities.md` by
-  the design pass.
+  level-sized load gates (dense GPU budget, nav memory), and no platform check
+  refuses a world (`.claude/rules/budgets-capacities.md`).
 - Owner decision (2026-10-08): entities (NPCs, and a player when present)
   move between worlds; what identity crosses is decided at the design pass.
 - Needs from 64G: terrain, nav, and links owned per chunk, so a world is
   created and destroyed by its chunks. Needs from 49: session seed and
-  `StepIndex`.
-- Provides: 75 scopes every world from the observer; 65C generates worlds
-  in play; 46 and 64B save and hash every world.
+  `StepIndex`. Needs from 50: safe nested dispatch. Needs from 75: fidelity
+  bands from the observer, whose lowest band 74 applies to every world the
+  observer is not in.
+- Provides: 65C generates worlds in play; 46 and 64B save and hash every
+  world.
 
 ### Checklist
 
@@ -94,19 +97,17 @@ One world per gameplay state; nothing models a set of worlds.
 - [ ] Every world steps each fixed step, threaded across worlds with a
       serial path and a fixed merge order.
 - [ ] The observer (camera focus, or a player when present) and presentation
-      bound to the viewed world; other worlds step without presentation.
+      bound to the viewed world; other worlds step without presentation at
+      75's lowest band.
 - [ ] Entities (NPCs, and a player when present) move between worlds at a
       between-step seam.
 - [ ] Per-world GPU resource release through the render boundary, replacing
       the renderer-wide release.
-- [ ] Load-time platform checks reconciled for worlds created in play (rule
-      edit in `.claude/rules/budgets-capacities.md` in the same change if
-      needed).
 - [ ] Per-world state classified for 49/64B; included in 46's v1.
 - [ ] Tests: create, step, and destroy leak nothing; an entity moved
       between worlds keeps its identity as designed; one world's step is
-      unchanged by other worlds existing; serial equals threaded across
-      worlds; OOM during create leaves the set intact and the retry
+      unchanged by other worlds existing; a world the observer is not in
+      advances; serial equals threaded across worlds; OOM during create leaves the set intact and the retry
       succeeds; destroy releases only that world's GPU resources.
 - [ ] Bench `world-instances`: create, destroy, and step cost at three or
       more world counts and sizes.

@@ -2,8 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none (F and G re-scoped against [Slice 64G](slice-64g.md) first) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** A1–A4, B1, C1–C7, I1, I2, K3 landed; M1, D, E,
-F, G, H, J, K1, K2, K4, K5, X1 open.
+**Status: in progress.** A1–A4, B1, C1–C7, I1, I2, K3, K6 landed; M1, D,
+E, F, G, H, J, K1, K2, K4, K5, X1 open.
 
 Goal: no live behavior (iteration order, deferral, refusal, drops,
 truncation, cache flushes, query reach) depends on physical `.capacity`,
@@ -135,6 +135,7 @@ content across world sizes.
 - [x] K3 · Interior link slots: a per-chunk floor that grows in place.
 - [ ] K4 · Particle pool justified as presentation-only.
 - [ ] K5 · Collision-SFX cooldown table justified as audio policy.
+- [x] K6 · Owned-elsewhere sites carry an owner pointer.
 - [ ] X1 · Docs: `docs/architecture.md` population seam and event-bound
       owner; `docs/simulation-tiers-and-pipeline.md` producer table, sync
       step, destructible resolve; `docs/rendering-assets-shaders.md` GPU
@@ -149,8 +150,9 @@ content across world sizes.
       `.capacity` behavior gates in `src/game/systems/pathfinding/`.
 - [ ] Every capacity-dependent-behavior site is fixed or justified at its
       site.
-- [ ] Every bench named by an item shows no regression beyond run-to-run
-      spread; new groups record baselines.
+- [ ] Every item that can move a hot path is benched before and after on
+      adjacent commits (`.claude/rules/tests-benchmarks.md`) with no
+      regression beyond run-to-run spread; new groups record baselines.
 - [ ] `footprint-*` at three world sizes shows memory following content, not
       extent, before and after F and G; numbers in the landing commits.
 - [ ] `zig build gpu-smoke` passes on each available backend after H1, H2,

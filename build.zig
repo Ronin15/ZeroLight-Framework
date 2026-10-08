@@ -196,14 +196,14 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&gpu_smoke_exe.step);
     check_step.dependOn(&bench_exe.step);
 
+    const fmt_paths: []const std.Build.LazyPath = &.{
+        b.path("build.zig"),
+        b.path("build.zig.zon"),
+        b.path("src"),
+    };
     const fmt_step = b.step("fmt", "Format Zig source files");
-    fmt_step.dependOn(&b.addFmt(.{
-        .paths = &.{
-            b.path("build.zig"),
-            b.path("build.zig.zon"),
-            b.path("src"),
-        },
-    }).step);
+    fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths }).step);
+    const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
 
     const shaders_step = b.step("shaders", "Compile and install platform GPU shaders");
     for (shader_outputs.install_steps) |install_step| {
@@ -247,6 +247,7 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(shaders_step);
     verify_step.dependOn(&assets_lint_cmd.step);
     verify_step.dependOn(&idiom_lint_cmd.step);
+    verify_step.dependOn(&fmt_check.step);
 
     const gpu_smoke_run = b.addRunArtifact(gpu_smoke_exe);
     addWindowsSdlRunRuntime(gpu_smoke_run, windows_sdl_runtime);

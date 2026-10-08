@@ -1,6 +1,6 @@
 ## Slice 75: Far Simulation
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 74](slice-74.md), [Slice 64G](slice-64g.md), [Slice 73](slice-73.md) · Track: [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 73](slice-73.md) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
 **Status: not started.**
 
@@ -9,9 +9,10 @@ a player when a game has one), and nothing that exists stops advancing.
 Far-off AI thinks on slower ticks instead of being skipped; movement stays
 near full rate; `dormant` holds only inert things (items at rest), which
 still change slowly (decay outdoors); only unimportant ambient spawns may be
-recycled far from the observer, never important population; worlds the
-observer is not in still step at lower fidelity. Scope derives from the
-observer (`docs/architecture.md` § Target Model).
+recycled far from the observer, never important population. Scope derives
+from the observer (`docs/architecture.md` § Target Model). This slice covers
+the observer's world; 74 applies the lowest band to worlds the observer is
+not in.
 
 ### Current foundation
 
@@ -59,10 +60,10 @@ Scope comes from one camera and puts far entities to sleep.
   (`.claude/rules/simulation.md` § Determinism). Per-step work budgets are
   fixed counts with deterministic deferral
   (`.claude/rules/budgets-capacities.md`).
-- Scope derives from the observer's fixed-step view; a world the observer
-  is not in runs at its lowest fidelity instead of the full-active
-  fallback. The Scope-and-tiers rule names a single `sim_view` and is
-  updated in the same change.
+- Scope derives from the observer's fixed-step view and defines a lowest
+  band that 74 applies to worlds the observer is not in, instead of the
+  full-active fallback. The Scope-and-tiers rule names a single `sim_view`
+  and is updated in the same change.
 - Far agents path over the whole-world chunked nav within the fixed per-step
   request budget (`.claude/rules/pathfinding.md`; needs 64G).
 - 62 owns the important/ambient population classes and the recycling
@@ -73,20 +74,20 @@ Scope comes from one camera and puts far entities to sleep.
 - Per-step cost follows population divided by each band's cadence, never
   world extent × world count; serial and threaded paths with parity
   (`.claude/rules/threading.md`).
-- Needs from 74: every world steps each fixed step, wherever the observer
-  is. From 64G: whole-world chunked nav. From 73: the per-agent think
+- Needs from 64G: whole-world chunked nav. From 73: the per-agent think
   interval, which 75's distance bands feed as one input (55's idle coasting
   is another).
-- Provides: the far-from-observer signal 62's ambient recycling uses.
+- Provides: the far-from-observer signal 62's ambient recycling uses; the
+  lowest band 74 applies to worlds the observer is not in.
 - New persistent scope state is classified for 49/64B and included in 46's
   v1.
 
 ### Checklist
 
-- [ ] Fidelity bands from the observer; worlds the observer is not in at
-      the lowest fidelity; the § Scope and tiers rule in
-      `.claude/rules/simulation.md` updated in the same change.
-- [ ] Every agent in every world thinks, at a tick 73's interval derives
+- [ ] Fidelity bands from the observer, including a lowest band for 74; the
+      § Scope and tiers rule in `.claude/rules/simulation.md` updated in the
+      same change.
+- [ ] Every agent thinks, at a tick 73's interval derives
       with the band as an input; no agent is excluded from cognition by
       distance.
 - [ ] The spatial index covers the whole population in every band.
@@ -94,25 +95,24 @@ Scope comes from one camera and puts far entities to sleep.
       fidelity per band set by the design pass.
 - [ ] `dormant` reserved for inert rows, which still advance (57 schedules
       item decay); agents are never dormant.
-- [ ] A deterministic far-from-observer signal per world for 62's ambient
+- [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request
       budget.
 - [ ] New persistent scope state classified for 49/64B; included in 46's
       v1.
 - [ ] Tests: an agent in every band advances (thinks, moves, paths) at its
-      cadence; a world the observer is not in advances; the far signal is
-      deterministic; results are identical across render cadence and worker
+      cadence; the far signal is deterministic; results are identical across render cadence and worker
       count; serial equals threaded.
 - [ ] Bench `far-sim`: per-step cost at three or more populations and world
-      counts with most agents far from the observer.
+      sizes with most agents far from the observer.
 - [ ] Docs: `docs/architecture.md` tier model; `docs/simulation-tiers-and-pipeline.md`
       scope, bands, and cadences.
 
 ### Acceptance checks
 
-- [ ] No entity stops advancing because of distance or observer absence
-      (tests over every band and a world the observer is not in).
+- [ ] No entity stops advancing because of distance from the observer
+      (tests over every band).
 - [ ] `far-sim` matches the cost model (linear in population ÷ cadence);
       `scope`, `ai`, and `steering` show no near-observer regression beyond
       run-to-run spread.

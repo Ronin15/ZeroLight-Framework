@@ -67,8 +67,10 @@ orchestrates, verifies every agent claim against live code, and reports.
   checked against live code; structural findings go to design, local ones to
   `zig-specialist`; lows are fixed in the batch or become a checklist item in
   the owning slice.
-- A second fix to the same subsystem in a slice, or a second review round,
-  stops the work: the next step is design, not another patch.
+- A second fix or redesign of the same subsystem on a branch, in one slice
+  or across slices (a follow-up slice counts), or a second review round,
+  stops the work: the next step is a design pass with measured costs, not
+  another patch.
 - `zig-debug-specialist` for failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
@@ -91,7 +93,7 @@ zig build dev        # shaders + assets + run
 zig build check      # compile coverage (game, gpu-smoke, bench), no install
 zig build test       # unit tests
 zig build bench      # CPU benchmarks (target a group: -- --group <name>)
-zig build verify     # full gate: check + test + shaders + atlas + idiom lint
+zig build verify     # full gate: check + test + shaders + atlas + idiom lint + fmt check
 zig build fmt        # format build files and src/
 zig build shaders    # compile GLSL to platform shaders
 zig build gpu-smoke  # renderer smoke (needs a display)

@@ -34,10 +34,10 @@ pool.
 | Contract | Owner | Consumers |
 | --- | --- | --- |
 | Chunk-owned terrain and nav: the chunk is the unit of storage, change, work, threading, and save; nav covers the whole world | 64G | 38, 46, 49, 64B, 65B, 74, 75 |
-| World instances created, stepped, and destroyed in play, each owning its storage; every world steps whether or not the observer is in it | 74 | 46, 52C, 64B, 64C, 75 |
-| Far simulation: fidelity by distance from the observer in every world (slower AI ticks, never skipped progress; dormancy only for inert things; ambient recycling only for unimportant spawns) | 75 | 46, 49, 57, 62, 64B |
-| `SimulationSeed` (`root`), `seed.derive(SeedDomain)` once at `SimulationPipeline.init`; append-only `SeedDomain` registry (reserved: `combat = 3` 56, `loot = 4` 57, `dig_yield = 5` 58, `environment = 6` 59, `harvest = 7` 61, `population = 8` 62); per-world seeds derive from the root | 49 | 56–62, 74 |
-| Simulation scope from fixed-step simulation inputs (the observer's `sim_view` through `simViewRegion`), never the render window; scope sets fidelity, never whether anything advances | 49 (60 supplies the rect; 75 extends it to every world) | 55, 59, 62, 75 |
+| World instances created, stepped, and destroyed in play, each owning its storage; every world steps whether or not the observer is in it, at 75's lowest band when the observer is elsewhere | 74 | 46, 52C, 64B, 64C |
+| Far simulation: fidelity by distance from the observer (slower AI ticks, never skipped progress; dormancy only for inert things; ambient recycling only for unimportant spawns), with a lowest band for worlds the observer is not in | 75 | 46, 49, 57, 62, 64B, 74 |
+| `SimulationSeed` (`root`), `seed.derive(SeedDomain)` once at `SimulationPipeline.init`; append-only `SeedDomain` registry (`ai_wander = 1`, `worldgen_procedural = 2` land with 49; reserved: `combat = 3` 56, `loot = 4` 57, `dig_yield = 5` 58, `environment = 6` 59, `harvest = 7` 61, `population = 8` 62); per-world seeds derive from the root | 49 | 56–62, 74 |
+| Simulation scope from fixed-step simulation inputs (the observer's `sim_view` through `simViewRegion`), never the render window; scope sets fidelity, never whether anything advances | 49 (60 supplies the rect; 75 adds the bands; 74 applies the lowest band to other worlds) | 55, 59, 62, 75 |
 | `simulationChecksum()` same-binary oracle over every world instance, `checksum_format_tag`, `DataSystem`/`WorldSystem` completeness lists; replay frame with pinned gameplay bits (Table T1) | 49 | 46, 51, 52C, every persistent-state slice |
 | Background lane `submit`/`complete` with step-keyed handoff at `submit + k`; `isDone` for app-layer consumers only | 51 | 46 |
 | Absolute-step schedules through `stepAfter` / `stepReached` | 56 | 57, 59, 61, 62 |

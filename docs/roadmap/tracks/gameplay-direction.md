@@ -13,31 +13,15 @@ authoritative cross-slice tables: [VoidLight Port Track Overview](voidlight-port
 
 ### Direction (owner, fixed)
 
-- **Colony-simulator base, one observer.** The player entity is optional.
-  One observer is targeted: the camera focus, or a player when a game has
-  one. Fidelity is anchored on the observer; there is no multi-player
-  design.
-- **Fully simulated, multi-world.** Everything that exists keeps advancing in
-  every world. Distance from the observer lowers fidelity, never stops
-  progress: far-off AI thinks on slower ticks, movement stays near full rate.
-  Worlds the observer is not in still step at lower fidelity.
-- **Dormant means inert.** Only things at rest (items on the ground) are
-  dormant, and they still change slowly: items decay outdoors.
-- **Population.** People, villagers, and NPCs persist and advance wherever
-  they are. Only unimportant ambient spawns (stray monsters, animals) may be
-  recycled far from the observer; worlds the observer is not in keep ambient
-  life at their spawn tables' level.
-- **Chunks.** Chunk `(level, cx, cy)` is the unit of terrain and nav storage,
-  change, work, threading, and save. Nav covers the whole world; residency is
-  a chunk's storage form, never whether it simulates. Nothing is evicted from
-  the simulation.
-- **Worlds.** Persistent worlds and dungeons are created and destroyed in
-  play and own their storage.
-- **Composition.** Compose signals rather than hardcode stories: perception,
-  memory, and emotion drives feed utility arbitration; locomotion and action
-  stay separate streams; goals are per-agent and multi-source; authoring is
-  data resolved at load; domain controllers (combat, spawning, rules,
-  encounters) orchestrate while SoA processors scale.
+The direction is `.claude/rules/engine-design.md` § Target scale (summary:
+`docs/architecture.md` § Target Model). Owner decisions it does not state:
+
+- One observer only; there is no multi-player design.
+- Worlds the observer is not in keep ambient life at their spawn tables'
+  level.
+- Compose signals rather than hardcode stories; domain controllers (combat,
+  spawning, rules, encounters) orchestrate while SoA processors scale
+  (`.claude/rules/simulation.md`).
 
 ### Slices that carry it
 

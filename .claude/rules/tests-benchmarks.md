@@ -15,8 +15,8 @@ paths:
   test or `FailingAllocator` proof to save time.
 - Terrain contract tests cover a multi-chunk one-step change and repeated
   dig/fill.
-- An incremental path (nav patch, repack) gets an incremental == full-rebuild
-  parity test.
+- An incremental path (nav patch, terrain or link change) gets an
+  incremental == full-rebuild parity test.
 - Use the smallest `WorldSystem`/`DataSystem` fixture that exercises the
   behavior (a `1x1` world still has one real chunk); multi-chunk tests shrink
   `chunk_size_tiles` rather than grow the world.

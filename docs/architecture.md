@@ -518,8 +518,8 @@ aggression→pursue, curiosity→investigate, fatigue→wander), scaled by the
 agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
 threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
 `stageContract(.ai_decide)` reads `affect_drives` (written one stage earlier
-by `affect_update`, per `stage_order`). A new feeling is an `AiAffectDrive`
-tag plus a weight-table row (`.claude/rules/simulation.md`; roadmap
+by `affect_update`, per `stage_order`). Adding a feeling:
+`.claude/rules/simulation.md` § AI and affect (roadmap
 [Slice 42](roadmap/slices/slice-42.md)). See the
 [Emergent AI Track Overview](roadmap/tracks/emergent-ai.md).
 

@@ -9,7 +9,7 @@ zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
 zig build test      # run Zig unit tests
 zig build bench     # run CPU gameplay and render-prep benchmarks
-zig build verify    # run check, test, shader compilation, atlas + idiom lint
+zig build verify    # run check, test, shader compilation, atlas + idiom lint, fmt check
 zig build package   # install selected-mode binaries and runtime assets
 ```
 
@@ -275,7 +275,9 @@ Unit tests live beside the code they cover as `test` blocks. Run them with
 
 The cadence (which step when) is `.claude/rules/build-validation.md`.
 `zig build verify` runs compile coverage, unit tests, shader compilation, atlas
-lint, and idiom lint.
+lint, idiom lint, and a `zig fmt --check` over `build.zig`, `build.zig.zon`, and
+`src/` (files edited outside the format hook fail here; `zig build fmt` fixes
+them).
 
 ## Benchmarks
 

@@ -25,9 +25,11 @@ How it works: `docs/architecture.md` (pathfinding sections).
 - `PathfindingSystem` owns the post-commit nav reaction end to end.
 - Re-derive touched chunks whole from the world; the dirty buffer grows, never
   drops.
-- Incremental patches keep `nav_version` stable and never renumber slots; only
-  a full relabel bumps it. Slot ids never persist across steps; caches hold
-  cells.
+- Graph node ids are internal: they never persist across steps and are never
+  cache or pending keys; caches and results hold cells, so a patch may lay out
+  the chunks it touches freely.
+- A local nav change never invalidates cached results world-wide; a version
+  bump is reserved for changes that can invalidate every result.
 - Identical link sets yield identical layouts in incremental and full builds;
   links are append-only.
 - Level changes commit only by plane traversal against world geometry, never by

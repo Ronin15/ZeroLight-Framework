@@ -172,6 +172,23 @@ These contracts are unchanged:
   workflows share one severity scale and a structural/local tag and propose
   rule-file edits instead of agent guidance; a shared `settings.json` and a
   `zig fmt` hook.
+- **Governance review fixes:**
+  - The churn stop now counts a second fix or redesign of one subsystem
+    across slices.
+  - Rules stop describing today's implementation:
+    - nav node ids and versioning are principles;
+    - platform checks never refuse a world, level, or change;
+    - index caps are proven over growth;
+    - the tier test wording is fixed.
+  - Review and design agents require three-size scaling benches for claimed
+    orders and a measured baseline before replacing a structure.
+  - Roadmap:
+    - 75 (in-world far simulation) now precedes 74, and 74 depends on 50 and
+      75;
+    - 72's index row matches its header, and its K6 record is restored;
+    - the `SeedDomain` 1/2 values are back in the track table;
+    - the direction track cites the rule instead of copying it.
+  - `zig build verify` runs `zig fmt --check`.
 - The README was updated to the current feature set.
 
 ## Known Open Items

@@ -278,8 +278,9 @@ before append — this contract is unchanged by composite-draw bucketing.
 the window exceeds `k_max_dense_submit_stack_cap` (`DenseLayerWindowExceeded`)
 or `estimateDenseTileGpuBytes` exceeds `WorldBuildConfig.max_dense_tile_gpu_bytes`
 (`DenseTileGpuBudgetExceeded`) — this bounds GPU tile-data memory and the
-depth-ascending collection buffer, not draw count. Both caps are fixed: a world
-that does not fit is refused, never accommodated by a larger number. The demo
+depth-ascending collection buffer, not draw count. Today a world that does not
+fit is refused at build; `.claude/rules/budgets-capacities.md` forbids platform
+checks that refuse a world, and Slice 64G retires these gates. The demo
 assigns the fixed literal `world_system.k_max_dense_tile_gpu_bytes` (64 MiB);
 the byte budget is never computed from the world's own level or cell count, and
 `0` disables the gate, so it is not a budget. The separate

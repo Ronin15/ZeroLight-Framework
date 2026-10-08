@@ -23,11 +23,13 @@
   build, cave-in, or explosion is ever refused for capacity; a new limit or
   refusal is never a design tool.
 - The only fixed caps are index/format widths (`u16`/`u32`, save/replay
-  layouts) proven unreachable for the loaded world and failing loudly at load,
-  and presentation-only pools no simulation reads (particles, text labels) with
-  deterministic overflow drop.
-- Load-time platform checks (GPU byte budget, nav memory) run once at load,
-  never during play.
+  layouts) proven unreachable for everything the world can grow to (growth
+  paths included, not only initial sizes) and failing loudly when the world is
+  created or loaded, and presentation-only pools no simulation reads
+  (particles, text labels) with deterministic overflow drop.
+- Platform resource checks (GPU bytes, nav memory) never refuse a world,
+  level, or terrain change, whether loaded or created in play, and never run
+  per step; they report. Only allocator OOM fails, as above.
 - Heuristic thresholds derive from the cost of the operation they gate, never
   world size.
 - Pick per structure as an engine programmer would: pools, free lists, and
