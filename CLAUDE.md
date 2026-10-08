@@ -15,9 +15,11 @@ processors.
 The game built on it is dig/build with cave-ins and explosions: dense,
 multi-chunk terrain change in one step is normal gameplay, not an edge case.
 
-Target scale, not the demo: several world instances at once (persistent worlds
-plus temporary procedural dungeons), levels up to 2048² tiles, deep and growing
-level counts, large populations. Design so cost is independent of that scale.
+This is engine core for a large, growing, multi-world simulation; the demo is
+a test harness, never a design input. Target scale (several worlds created and
+destroyed in play, 2048² levels, deep and growing stacks, large populations)
+is a floor. Every design starts from CS § Architecture Decisions and
+`docs/architecture.md` § Target Model.
 
 ## Source Of Truth
 
@@ -57,19 +59,21 @@ convenience.
 
 **Code** (the cited CS section is the rule):
 
+- Cost model before code; extend the existing partition unit, redesign over
+  patching: § Architecture Decisions.
 - Plain readable form, explicit error sets: § Zig Style. Terse comments:
   § Comments.
 - Hot paths allocation-free after warmup; `FailingAllocator` proof for every
   reserve (ReleaseFast ships): § Performance, § Allocator Discipline.
-- Fixed work budgets; per-world capacities growing only at the commit seam; no
-  gameplay-reachable refusal; constants kept unless justified: § Budgets,
+- Storage owned by the unit of change (terrain/nav: the chunk); fixed work
+  budgets; growth only at the seam; no gameplay-reachable refusal: § Budgets,
   Capacities, And Thresholds.
 - Partitioned, pre-reserved threaded writes; serial + threaded paths:
   § Threading.
 - Relative traversal-safe asset paths; stable IDs in persistent data: § Assets
   And Persistent Data.
-- Small fixtures, no test-only production hooks: § Tests. Perf numbers only from
-  targeted `zig build bench`: § Benchmarks.
+- Small fixtures, no test-only production hooks: § Tests. Perf claims only
+  from targeted `zig build bench`, read as scaling shape: § Benchmarks.
 - Never edit `zig-out/` or `.zig-cache/`: § Generated Output And Configuration.
 
 **Process:**
@@ -95,24 +99,27 @@ All non-trivial Zig design, implementation, review, and debugging goes through
 the `.claude/agents/` specialists. The main session orchestrates, verifies
 agent claims against live code, and reports; it never implements non-trivial changes inline.
 
-- `zig-design-specialist` only for genuinely ambiguous designs; clear fixes go
-  straight to `zig-specialist` with a tight brief.
-- `zig-review-specialist` once per batch. Findings go back to `zig-specialist`;
-  at most one review-of-fixes round; lows go straight into slice checklists.
-  Adversarially verify only High/Critical findings.
+- Every non-trivial brief carries the cost model (CS § Architecture
+  Decisions).
+- `zig-design-specialist` when a design is open or the existing structure
+  fails the cost model; local fixes go straight to `zig-specialist`.
+- `zig-review-specialist` once per batch. The main session checks every
+  finding and agent claim against live code and the cost model before acting
+  on it; structural findings go to design, local ones to `zig-specialist`;
+  trivial lows are fixed in the batch, others become one-line slice checklist
+  items.
+- A second fix to the same subsystem in a slice, or a second review round,
+  stops the work: the next step is design, not another patch.
 - `zig-debug-specialist` for failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for this repo's Zig work, instead of or alongside these.
-- Every brief opens with a standing-requirements check: growth model
-  (CS § Budgets, Capacities, And Thresholds), target scale and destruction
-  (CS § Budgets, Capacities, And Thresholds; § Benchmarks), serial + threaded paths (CS § Threading),
-  readable code and terse comments (CS § Zig Style, § Comments).
-- Stay lean: cap agent report length, keep docs terse, make reasonable
-  engineering calls without asking approval for obvious next steps. When fixes
-  keep spawning review rounds, stop and question the design. No model/effort
-  overrides unless the owner asks.
-- Implementation agents run sequentially in the main tree with linear commits:
-  no `isolation: worktree`, no merge commits. Parallelize only read-only work.
+- Stay lean: terse agent reports and docs (never by dropping findings), make reasonable
+  engineering calls without asking approval; never reopen an owner decision.
+  No model/effort overrides unless the owner asks.
+- Implementation agents run sequentially in the main tree. One slice or one
+  logical change is one commit, review fixes folded in; no per-finding
+  commits, no `isolation: worktree`, no merge commits. Parallelize only
+  read-only work.
 
 ## Commands
 
@@ -138,7 +145,7 @@ zig build fetch-sdl  # fetch and validate pinned Windows SDL packages
 ## Claude Code Tooling (`.claude/`)
 
 - `agents/`: the four specialists; workflows use their names (`agentType`),
-  so keep them stable. All run `opus`, design at `xhigh` effort, others `high`.
+  so keep them stable. All run `opus` at `high` effort.
 - `workflows/`: `/pathfinder-review`, `/architecture-assessment`,
   `/zig-best-practices-review`, `/zig-deep-correctness-review-pass`; reports
   only, no edits.

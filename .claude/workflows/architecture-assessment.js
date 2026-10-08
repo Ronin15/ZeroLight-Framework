@@ -123,7 +123,7 @@ const allFindings = {
 const report = await agent(
   `You are a senior game engine architect. Synthesize the following architectural analysis findings into a comprehensive assessment report for the ZeroLight-Framework.
 
-CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.17 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events.
+CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.17 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events. Judge against the engine's target (docs/coding-standards.md § Architecture Decisions, docs/architecture.md § Target Model): many worlds created and destroyed in play, growing levels and populations; the demo is a harness, never the yardstick.
 
 DOC ANALYSIS FINDINGS:
 ${JSON.stringify(allFindings.docs, null, 2)}
@@ -140,7 +140,7 @@ Write a structured assessment report covering:
 3. **Critical Gaps and Risks** (what's missing or fragile, severity: High/Medium/Low)
 
 4. **Scalability Analysis**
-   - Entity/data scale ceiling
+   - Cost growth order per core operation (local change, dense change, world/level create and destroy); flag anything scaling with extent or world count
    - System interaction model scalability
    - Threading/parallelism headroom
    - World state dynamism

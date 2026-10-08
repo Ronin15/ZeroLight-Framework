@@ -144,7 +144,7 @@ function reviewPrompt(u) {
     `Review these files for **Zig 0.17 best practices and this codebase's coding standards** (read them fully first):`,
     u.files.map((f) => `  - ${f}`).join('\n'),
     ``,
-    `You are the zig-review-specialist — apply your full checklist, but weight this pass toward mechanizable / generalizable best-practice issues, NOT one-off gameplay logic bugs. Concretely hunt for:`,
+    `You are the zig-review-specialist — apply your full checklist, but weight this pass toward mechanizable / generalizable best-practice issues, NOT one-off gameplay logic bugs. Start with your Scale Pass (docs/coding-standards.md § Architecture Decisions), then concretely hunt for:`,
     `  - allocator discipline and ReleaseFast UB (docs/coding-standards.md § Allocator Discipline).`,
     `  - std.MultiArrayList hot paths (§ Dense SoA Storage).`,
     `  - SIMD/math through core (§ SIMD And Core Math).`,
@@ -195,13 +195,14 @@ const perUnit = await pipeline(
 )
 
 const allVerified = perUnit.filter(Boolean).flatMap((r) => r.verified)
-const confirmed = allVerified.filter((f) => f.verdict && (f.verdict.verdict === 'CONFIRMED' || f.verdict.verdict === 'PLAUSIBLE' || f.verdict.verdict === 'UNVERIFIED') && f.verdict.is_real)
+const confirmed = allVerified.filter((f) => f.verdict && (f.verdict.verdict === 'CONFIRMED' || f.verdict.verdict === 'PLAUSIBLE') && f.verdict.is_real)
+const unverified = allVerified.filter((f) => f.verdict && f.verdict.verdict === 'UNVERIFIED')
 const durable = confirmed.filter((f) => f.durable && f.verdict.durable_confirmed)
 
 log(`Reviewed ${REVIEW_UNITS.length} units; ${allVerified.length} raw findings, ${confirmed.length} confirmed/plausible, ${durable.length} confirmed-durable.`)
 
 if (confirmed.length === 0) {
-  return { confirmed: [], durable: [], synthesis: null, note: 'No findings survived verification.' }
+  return { confirmed: [], unverified, durable: [], synthesis: null, note: 'No findings survived verification.' }
 }
 
 phase('Synthesize')
@@ -220,7 +221,7 @@ const synthesis = await agent(
     ``,
     `Propose ONLY NET-NEW durable items justified by the findings below. For lint_rules: only propose a rule that a line-scanner can enforce with LOW false positives — give a concrete detection heuristic AND the exemptions it must carve out; if a pattern is real but not mechanically detectable without noise, route it to doc_updates (a rule for docs/coding-standards.md, naming its section) or, for a role-specific check only, agent_guidance. Keep everything concise and non-duplicative. Also list the top concrete one-off fixes (top_fixes) ranked by severity for the human to act on.`,
     ``,
-    `Each top_fixes fix_direction names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Findings marked UNVERIFIED were not adversarially checked (below high).`,
+    `Each top_fixes fix_direction names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
     ``,
     `Verified findings:`,
     digest,
@@ -231,5 +232,6 @@ const synthesis = await agent(
 return {
   counts: { units: REVIEW_UNITS.length, raw: allVerified.length, confirmed: confirmed.length, durable: durable.length },
   confirmed,
+  unverified,
   synthesis,
 }

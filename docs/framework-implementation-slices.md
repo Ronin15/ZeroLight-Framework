@@ -93,13 +93,15 @@ files it links. Do not load the whole roadmap.
 | --- | --- |
 | Header line | Roadmap index link · Depends on (linked slices) · Track |
 | **Goal** | What "done" means for this chunk |
-| **Current foundation** | What already exists — do not rebuild |
+| **Current foundation** | What already exists; build on it unless it fails the cost model (CS § Architecture Decisions), then replace it |
 | **Architecture notes** / **Problem** | Constraints and ownership boundaries |
 | **Checklist** | `[ ]` / `[x]` implementation steps — check off as you land each |
 | **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
 | **Status** | Open/partial note, or one-line completion record before the archive move |
 
-Some fields are optional for early foundation slices.
+Some fields are optional for early foundation slices. Slices hold decisions
+and checklists only; review logs, bench tables, and superseded designs go in
+commit messages and changelogs. One slice lands as one commit.
 
 ## Open Frontier Slice Index
 
@@ -183,9 +185,9 @@ the [archive](framework-implementation-slices-archive.md).
 **Residual non-slice notes:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) are measure-first notes in [Scaling Gaps](roadmap/scaling-gaps.md).
 
-**Bench policy:** coding-standards § Benchmarks (50k scales are ceilings).
-`frame-battle` (Slice 52C: 2048-mover production demo, full fixed step plus CPU
-render-prep) is the release full-frame baseline; 66E adds the authoritative
+**Bench policy:** coding-standards § Benchmarks (benches show scaling shape,
+never target counts). `frame-battle` (Slice 52C: full fixed step plus CPU
+render-prep) is the release regression baseline across commits; 66E adds the authoritative
 self-hosted perf runner.
 
 ## Next Priority Tracks

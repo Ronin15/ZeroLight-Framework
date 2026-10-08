@@ -36,7 +36,7 @@ by Slice 24.
 
 ### Emotion / feelings model (landed + expandability)
 
-**What exists today (do not rebuild):**
+**What exists today:**
 
 | Piece | Location | Role |
 | --- | --- | --- |
@@ -98,7 +98,7 @@ contacts; cohere reads the shared spatial index for a friendly-neighbor mean.
 Demo spawns resolve named archetypes from `assets/ai/archetypes.json` (33).
 See the archive for full Slice 32 / 39 / 41 records.
 
-**Landed loop inputs (do not rebuild):** multi-producer stimuli (39: dig /
+**Landed loop inputs:** multi-producer stimuli (39: dig /
 footstep / deferred impact) and world interest markers (41: investigate wired;
 `cover` / `resource` / `patrol` reserved for later consumers).
 

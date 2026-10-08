@@ -68,10 +68,8 @@ Release builds use the same pinned packages in `zig-pkg/` as Debug builds. They 
 not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
-**Packaged builds ship `ReleaseFast`.** It strips the assert behind every
-`assumeCapacity`/`addOneAssumeCapacity` and disables bounds/overflow checks, so
-hot-path reserves need the `FailingAllocator` proofs in
-`docs/coding-standards.md` § Allocator Discipline.
+**Packaged builds ship `ReleaseFast`** (no safety checks; why reserves need
+proofs: `docs/coding-standards.md` § Allocator Discipline).
 
 LTO: on Linux (ELF), `build.zig` enables `-flto=full` for the shipped **app
 executable only** in `ReleaseFast`, explicitly selecting LLVM + LLD (which LTO
@@ -187,7 +185,8 @@ Runtime diagnostics use Zig `std.log` filtering. The default `auto` level is:
 safety, behavior and unit work. Not the authority for scale timing.
 
 **Soaking / scale perf:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
-one 60s dump after load when you deliberately want ranking and absolute numbers.
+one 60s dump after load when you want a stage ranking (a diagnostic, not a
+perf claim; CS § Benchmarks).
 Longer compile; do not use for every edit. Multi-cycle soaks only when comparing
 settle vs load, not as the default.
 

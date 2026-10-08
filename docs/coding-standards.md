@@ -2,7 +2,34 @@
 
 The canonical source for every technical rule. `CLAUDE.md`, the agent files,
 the workflows, and the roadmap point here by section name and do not restate
-these rules.
+these rules. No two rules here may conflict; when one blocks a sound design,
+change it here and remove any restatement elsewhere in the same commit.
+
+## Architecture Decisions
+
+This is engine core for a large, growing, multi-world simulation. The demo is
+a test harness: its sizes, populations, and counts are never design, sizing,
+or acceptance inputs. Target scale (2048² levels, deep and growing stacks,
+several worlds created and destroyed in play) is a floor, not a ceiling.
+
+Every design, and every fix touching storage or per-change work, states a cost
+model before code:
+
+- Work and memory as growth orders in what changed, what exists, and extent
+  (level size, depth, world count), for a local change (one dig, ramp, chunk),
+  a dense one-step change (an explosion region), and creating or destroying a
+  world, level, or dungeon. Concrete sizes only illustrate an order.
+- Pass: local-change cost depends only on what changed; memory follows what
+  exists and is released with it; nothing is sized from demo constants.
+- The serial and threaded paths ([Threading](#threading)).
+- Each claimed order is checked by a scaling bench ([Benchmarks](#benchmarks))
+  and marked measured (with its group) or derived; a derived number is never
+  presented as measured.
+- Where code already partitions by a unit (chunk, level, world), the first
+  design evaluated has that unit own its storage and work. A shared arena,
+  global rebuild, or level-wide shift needs a cost model that beats it.
+- If the existing structure cannot pass, the fix redesigns that structure; it
+  never patches around it.
 
 ## Zig Style
 
@@ -44,9 +71,11 @@ these rules.
 
 Performance is correctness on hot and frame-adjacent paths (fixed-step update,
 input dispatch, render submission, asset lookup, text/debug overlay). Hot paths
-are allocation-free after init, reserve, or warmup; an exception needs an owner,
-a measured bounded cost, and a reason it cannot move to init, load, a state
-transition, reserve/warmup, or another cold boundary.
+are allocation-free after init, reserve, or warmup. Growth happens only at a
+named seam outside per-item loops (the structural-commit seam, or a
+main-thread pre-reserve before a submission pass), geometrically ahead of need
+and counted; growth anywhere else on a hot path or in a threaded stage is a
+defect.
 
 ### Allocator Discipline
 
@@ -175,49 +204,51 @@ fn appendMalRow(
 
 ## Budgets, Capacities, And Thresholds
 
-- Size and bound for dense, multi-chunk terrain change in one step.
+- The unit of change owns its storage and work: for terrain and nav, the
+  chunk. A level or world holds only a directory of its units; nothing is
+  sized to a level's area or a world's extent.
 - A local change (one dig, ramp, or chunk) costs work proportional to what it
-  changed, never to world width, depth, or world count. If shared storage would
-  force a world-wide shift or rebuild, use per-level or paged storage.
-- Everything is sized and stored per world instance; no global or cross-world
-  caps or tables. A world's memory is released when it unloads.
+  changed, never to level size, depth, or world count; dense multi-chunk change
+  in one step is normal gameplay.
+- Everything lives per world instance; no global or cross-world caps or
+  tables. Worlds, levels, and dungeons are created and released in play, and
+  their memory goes with them.
+- Extent is fixed when a world or level is created; units within it are
+  allocated and released by content and residency. Dig/build changes contents,
+  never extent.
+- Runtime-growing data (population, items, nodes, links, per-chunk storage)
+  starts at content-derived size and grows at the
+  [Performance](#performance) seam; only allocator OOM fails growth, as an
+  ordinary error leaving state intact for retry.
 - Per-step and per-query work budgets are fixed counts, never milliseconds and
   never derived from world, map, cell, or portal count or any measured scale.
 - Over-budget work defers deterministically, tested as such (grep
-  `independent of` / `regardless of world size`).
-- Fix a chronically short budget with deterministic deferral, a bounded retry
-  ladder, or a better algorithm, never a bigger number for one map.
-- Capacities are right-sized per world instance, never one size for all.
-- World-extent data (tiles, per-chunk nav, chunk tables) is sized exactly at
-  load and never grown; dig/build changes contents, not extent.
-- Runtime-growing data (population, items, nodes, links) starts at
-  content-derived size plus headroom and grows only at the main-thread
-  structural-commit seam, geometrically ahead of need, or uses paged storage.
-- Growth on a hot path or in a threaded stage is a defect; between seams
-  [Allocator Discipline](#allocator-discipline) applies.
-- No order, deferral, refusal, or result depends on reserved capacity.
-- No dig, build, cave-in, or explosion is ever refused for capacity.
+  `independent of` / `regardless of world size`). A chronically short budget
+  is fixed with deterministic deferral, a bounded retry ladder, or a better
+  algorithm, never a bigger number for one map.
+- No order, deferral, refusal, or result depends on reserved capacity, and no
+  dig, build, cave-in, or explosion is ever refused for capacity.
 - The only fixed caps are index/format widths (`u16`/`u32`, save/replay
-  layouts) proven unreachable for the loaded world (failing loudly at load) and
+  layouts) proven unreachable for the loaded world, failing loudly at load, and
   presentation-only pools no simulation reads (particles, text labels), with
   deterministic overflow drop.
-- Load-time platform validation (GPU byte budget, `max_nav_memory_bytes`) runs
-  once at load, fails loudly there, and never runs during play.
-- Data outgrowing a load-time estimate grows at its seam; only allocator OOM
-  fails it, as an ordinary error leaving state intact for retry.
+- Load-time platform checks (GPU byte budget, nav memory) run once at load and
+  never during play.
 - Heuristic thresholds derive from the cost of the operation they gate, never
   world size.
 - Pick per structure as an engine programmer would: pools, free lists, and
-  generational handles for churn; SoA contiguity over footprint; fixed caps only
-  where they buy index width, a stable format, or a work bound.
-- Never change a constant just to satisfy this section; default is keep.
-- Changing a budget, capacity, or threshold states a concrete, measured benefit
-  weighed against hot-path cost, format churn, proof churn, and determinism.
+  generational handles for churn; SoA contiguity over footprint.
+- Changing a budget, capacity, or threshold, in either direction, states its
+  benefit against hot-path cost, format churn, and determinism.
 
 ## Threading
 
-- Work that scales runs through the thread system: across chunks and levels,
-  and across world instances where they are independent.
+- Work scaling with population, terrain change, or world size runs through
+  the thread system (across chunks, levels, and independent world instances)
+  and ships serial and threaded paths with parity tests in its first
+  implementation, under a named owner with immutable inputs and deterministic
+  owned outputs. Small fixed or cold one-off work may stay serial; the cost
+  model ([Architecture Decisions](#architecture-decisions)) decides.
 - Multi-threaded writes go, verifiably at the call site, to disjoint per-worker
   or per-range slots, never a shared appendable collection.
 - Reserve on the main thread strictly before dispatch, sized from the value the
@@ -238,7 +269,8 @@ fn appendMalRow(
   at the seam to the per-item bound times the most items any range can cover
   (never clamped to the total), with counted grow-and-replay on overflow.
 - Events that are a pure function of worker-written row state are emitted by
-  the main thread in row order after the join, with no event scratch.
+  the main thread in row order after the join, with no event scratch; this is
+  an ordered merge, O(changed rows).
 - A partitioned processor with a capped event stream emits in canonical row and
   sub-kind order before the cap, with parity tests crossing event kinds across
   ranges plus a capped case.
@@ -251,13 +283,8 @@ fn appendMalRow(
   designed.
 - Workers never mutate `DataSystem` structurally; structural commits batch at
   the commit seam.
-- The main thread is not a fallback owner: it holds only those boundaries and
-  light orchestration.
-- Work scaling with count, size, or complexity gets a named owner, with
-  immutable inputs and deterministic owned outputs once it can get expensive.
-- Work scaling with population, terrain change, or world size ships serial and
-  threaded paths with parity tests in its first implementation.
-- Small fixed or cold one-off work may stay serial; ask the owner if unsure.
+- The main thread is not a fallback owner: it holds only those boundaries,
+  orchestration, and ordered merge/commit proportional to what changed.
 - Multi-stage processors have per-stage tuners and visible timing stats.
 - Worker participation follows measured timing and structural constraints,
   never static item-count floors.
@@ -363,37 +390,39 @@ reasoning trail.
 - An incremental path (nav patch, repack) gets an incremental == full-rebuild
   parity test.
 - Use the smallest `WorldSystem`/`DataSystem` fixture that exercises the
-  behavior (a `1x1` world still has one real chunk).
+  behavior (a `1x1` world still has one real chunk); multi-chunk tests shrink
+  `chunk_size_tiles` rather than grow the world.
 - Only a test of growth or capacity at scale gets a larger populated world.
 - Full world-building paths (`initProcedural*`) run in tests only when under
   test, with at most 16x16 tiles and 1 underground level.
 - Production APIs carry no test-only tags, payloads, fields, stages, hooks,
   shortcuts, or paths; tests use private helpers, fixtures, mocks, or real
   payloads.
-- Tests never time anything or call `src/benchmarks/`
-  ([Benchmarks](#benchmarks)).
 
 ## Benchmarks
 
-- All performance numbers and OOM/leak sweeps come from `zig build bench`.
-- `zig build test` never times anything, even temporarily or in ReleaseFast.
-- Tests never call `src/benchmarks/*.zig`, except `suite.zig`'s tests of its
-  pure utilities against stubs.
-- Test production correctness in its owning module with a small fixture;
-  bench-fixture correctness relies on internal asserts firing during a real
-  bench run.
+- All performance claims and OOM/leak sweeps come from `zig build bench`; the
+  ReleaseSafe runtime perf dump is a diagnostic ranking, never a perf claim.
+- Benches measure how an algorithm scales, never a target count. Bench sizes
+  are sample points on a curve, never capacities, budgets, acceptance
+  thresholds, or frame-time verdicts; never pick a size or cap because a bench
+  count fit, and never report "fast enough at N".
+- Tests never time anything and never call `src/benchmarks/` (except
+  `suite.zig`'s tests of its pure utilities); bench-fixture correctness relies
+  on internal asserts firing during a real bench run.
 - A perf question with no covering case gets a new case under
   `src/benchmarks/`.
 - Run targeted groups (`zig build bench -- --group <name>`), never the full
   suite filtered; full sweeps only when the owner or a slice asks.
 - Bench only changes that can move a hot path, with 3 interleaved reps.
-- Target-scale benches ship with the first implementation; terrain features
-  bench destruction-shaped workloads (a one-step explosion region, repeated
+- Scaling benches ship with the first implementation; terrain features bench
+  destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
-- Scaling benches check that an algorithm's cost grows as designed across
-  sizes (flat for a local change, linear where linear is right). A cost that
-  grows with world size on a local change is a design defect regardless of the
-  absolute number; never cite a scaling bench as a frame-time verdict.
+- A scaling bench runs at least three sizes far enough apart to show the
+  growth shape, and passes when the shape matches the cost model's order (flat
+  for a local change, linear where linear is right). A cost that grows with
+  world size on a local change is a design defect regardless of the absolute
+  number.
 
 ## Generated Output And Configuration
 

@@ -20,20 +20,37 @@ rewrite the change unless the user asks for fixes.** Prioritize correctness,
 ownership, resource lifetime, performance risk, test gaps, and regressions over
 style; skip architectural commentary that points to no bug, hazard, or violated
 boundary. `docs/coding-standards.md` (CS) owns every rule: cite the section.
+Report every real finding, ranked; tag each **structural** (a symptom of a
+design that fails the cost model; route to design) or **local**.
 
 ## Severity
 
 - **High**: crash, leak, use-after-free, broken build, state corruption, broken
   input/update/render contract, GPU misuse, visible gameplay regression,
-  hot-path or threaded-stage growth, gameplay-reachable refusal.
+  hot-path or threaded-stage growth, gameplay-reachable refusal, any Scale
+  pass failure.
 - **Medium**: missing validation, stale handles, hidden per-frame allocation,
   poor failure handling, untested changed contracts, bug-prone ownership drift,
   roadmap backlog parking.
 - **Low**: maintainability, naming, duplication, doc drift. Last or omitted.
 
+## Scale Pass (first)
+
+CS § Architecture Decisions, for each operation the change adds or touches:
+
+- Does work or memory scale with level size, depth, world count, or total
+  links/cells instead of what changed or exists?
+- Is a size, cap, or acceptance number taken from the demo
+  (`game_demo_state.zig`, demo populations) or from a bench count?
+- Is a bench read as "N fits in X ms" instead of a growth shape?
+- Does creating, destroying, or growing a world, level, or dungeon force
+  whole-world work (rebuild, relabel, copy, shift)?
+- Does it patch around a shared structure where the existing partition unit
+  could own the storage?
+
 ## What To Inspect
 
-Check every rule in each cited section; the notes name common misses.
+Then the rule pass; the notes name common misses.
 
 - **CS § Allocator Discipline**: missing or fail-branch-only `FailingAllocator`
   proofs; `.capacity` gates; mismatched assert/overflow bounds; unprovable

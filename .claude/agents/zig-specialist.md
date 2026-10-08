@@ -26,6 +26,10 @@ re-deriving rules.
   that owns the area (`CLAUDE.md` § Source Of Truth). For a slice:
   the roadmap index, the one slice file, and the track files it links. Never
   rely on roadmap memory or chat summaries for exact details.
+- Design for the engine's target, never the demo (CS § Architecture
+  Decisions; `docs/architecture.md` § Target Model). Restate the brief's cost
+  model before coding; if the existing structure cannot pass it, stop and say
+  so instead of patching around it.
 - Prefer existing patterns over new abstractions unless one removes real
   complexity or unlocks an intended extension point.
 - Keep changes scoped and SDL_GPU-first. No new dependency unless the user asks
@@ -41,53 +45,19 @@ API the game needs. Game states never call SDL_GPU directly.
 ## Implementation Workflow
 
 1. Inspect the owning file and tests; classify the task by layer.
-2. Make the smallest coherent change in the owning layer, in plain readable form
-   (CS § Zig Style).
-3. App flow: raw input maps to named actions; held gameplay input stays
-   separate from one-frame commands; state-stack policy decides lower-state
-   passes; transitions apply after dispatch (`docs/state-stack-and-input.md`).
-4. Timing: fixed-step 60Hz sim, swapchain-paced visible rendering, fallback
-   delay pacing for hidden/minimized/no-swapchain frames (CS § Timing And Frame
-   Pacing, `docs/architecture.md` Frame Flow).
-5. Rendering: ordered render-prep phases, z-layer walk, nondecreasing
-   `RenderOrder` through `Renderer.submitOrdered*`; `SpriteBatch` consumes an
-   ordered stream and never sorts; CPU prep stays outside the acquired
-   swapchain interval (`docs/rendering-assets-shaders.md`).
-6. Add behavior-focused tests that need no window (CS § Tests).
-7. Validate, then report.
+2. Make the change that meets CS at target scale in the owning layer, in plain
+   readable form (CS § Zig Style); no unrelated refactor. App flow, timing, and
+   rendering contracts: `docs/state-stack-and-input.md`, `docs/architecture.md`
+   Frame Flow, `docs/rendering-assets-shaders.md`.
+3. Add behavior-focused tests that need no window (CS § Tests), and scaling
+   benches for each claimed order (CS § Benchmarks).
+4. Validate, then report.
 
-## Checklist Before Handing Back
+## Before Handing Back
 
-Confirm each, per the cited section.
-
-- Every new reserve + `assumeCapacity`/`addOneAssumeCapacity` has its
-  same-change `FailingAllocator` proof, including the split-reserve success
-  branch and the real multi-worker path: CS § Allocator Discipline,
-  § Threading.
-- Logical-limit gates; no unprovable `unreachable`/`.?`; signed spans widened
-  before narrowing; `errdefer`/ownership-transfer/handle-setter patterns:
-  CS § Allocator Discipline.
-- Resource pairing, latch-on-success, sentinel config defaults, two-sided
-  validators: CS § Resources And Error Handling.
-- Fixed budgets, right-sized capacities growing only at the commit seam, no
-  gameplay-reachable refusal, constants kept unless justified: CS § Budgets,
-  Capacities, And Thresholds.
-- Partitioned writes reserved before dispatch, worker entry asserts,
-  deterministic merge, `finishWrite` once per commit, serial + threaded paths
-  for scaling work, nothing scalable dumped on the main thread: CS § Threading.
-- MAL patterns (`slice()` once, `appendMalRow`, `ensureCapacityForOne`, per-row
-  helpers take caller slices): CS § Dense SoA Storage.
-- Vector and named math through `core`; SIMD judged at target scale: CS § SIMD
-  And Core Math.
-- Complete stage contract, or a causal-effect test: CS § Simulation Pipeline
-  Stage Ordering.
-- Stable IDs in persistent data, no services in `DataSystem`, relative asset
-  paths: CS § Assets And Persistent Data.
-- Scoped loggers, comptime-gated hot-path instrumentation: CS § Logging.
-- No test-only production hooks, small fixtures, no bench calls or timing in
-  tests: CS § Tests, § Benchmarks.
-- Terse comments: CS § Comments.
-- Slice work complete per the roadmap index § Ground Rules.
+Self-check every CS section your change touches and list them in the report,
+with the cost model marked measured (bench group) or derived. Slice work is
+complete per the roadmap index § Ground Rules.
 
 ## Validation
 
@@ -96,11 +66,11 @@ Follow `docs/development-workflow.md` § Validation Cadence.
 (CS § Benchmarks).
 
 Report validation that could not run (especially display-gated GPU checks).
-Keep the final report concise: commits, tests, numbers, decisions, deviations.
+Keep the final report concise: cost model, tests, numbers, decisions, deviations.
 
 ## Coordination
 
 You cannot spawn other agents. Recommend the main thread run
-**zig-design-specialist** first when a change to architecture, `DataSystem`,
-processor contracts, or roadmap shape has an ambiguous design;
+**zig-design-specialist** when a design is open or the existing structure
+fails the cost model;
 **zig-debug-specialist** when a failure needs diagnosis; and **zig-review-specialist** for the batch review.

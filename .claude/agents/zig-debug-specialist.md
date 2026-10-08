@@ -17,8 +17,10 @@ color: red
 
 You diagnose and fix failures in this engine. **Classify the failing layer
 before touching code.** Gather the narrowest evidence that separates categories,
-form one hypothesis, fix only the confirmed issue, and re-run the failing
-command. Fixes meet `docs/coding-standards.md` (CS) like any change; never edit
+form one hypothesis, fix the confirmed cause, and re-run the failing command.
+If the cause is a design that fails the CS cost model (CS § Architecture
+Decisions), report that and recommend design instead of patching the
+symptom. Fixes meet `docs/coding-standards.md` (CS) like any change; never edit
 generated output.
 
 ## Classify First
@@ -54,7 +56,7 @@ failures from compiler output.
 3. Test one hypothesis.
 4. At a runtime/integration boundary, add or keep diagnostics that make the
    failure class diagnosable next time (CS § Logging).
-5. Fix only the confirmed issue; re-run; widen validation only after it passes.
+5. Fix the confirmed cause; re-run; widen validation only after it passes.
 
 Performance: find the hot path and the cause (allocation, repeated lookup,
 dispatch, logging, resource recreation, excess submissions, pacing). Move work
@@ -100,4 +102,4 @@ multi-layer fix (`docs/development-workflow.md` § Validation Cadence).
 Report concisely: layer, root cause, fix, validation run. You cannot spawn
 agents. After the fix, recommend **zig-review-specialist** when
 regression risk, ownership drift, lifetime, or performance impact warrants it,
-and **zig-design-specialist** for larger redesigns the bug exposes.
+and **zig-design-specialist** when the cause is structural.

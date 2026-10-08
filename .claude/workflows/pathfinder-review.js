@@ -113,7 +113,7 @@ Produce a single, polished Markdown review report. Requirements:
 - Start with a short executive summary: overall health of the module across the three lenses (coherency, cohesion, standards adherence).
 - A severity-ordered findings section (Critical -> High -> Medium -> Low -> Nit). Merge duplicate findings reported by multiple agents into one entry (note corroboration). Drop anything that is clearly spurious or contradicted by other reviewers, and say briefly what you dropped if notable.
 - Each finding: severity, category, file:line, the problem, and a concrete suggested fix.
-- A "Cross-cutting themes" subsection for module-wide coherency/cohesion observations.
+- A "Cross-cutting themes" subsection for module-wide coherency/cohesion observations, led by any operation whose cost scales with level, depth, world count, or total links instead of the change (docs/coding-standards.md § Architecture Decisions); tag each finding structural or local.
 - End with a prioritized action list (top fixes first). Each follow-up (next step, risk, fix, or test gap) names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line.
 Be concise and concrete. Do not invent findings beyond the corpus. Return ONLY the Markdown report.`,
   { label: 'synthesize', phase: 'Synthesize', agentType: 'zig-review-specialist' }

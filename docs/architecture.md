@@ -4,6 +4,23 @@ The project is organized for SDL_GPU-first 2D game work. Keep executable timing
 thin, app coordination under `src/app/`, GPU work under `src/render/`, and
 game-specific behavior under `src/game/`.
 
+## Target Model
+
+The engine core serves a large simulation of many worlds that keeps growing;
+the demo state is a harness that exercises this model, not the model. Designs
+start here, then read the live structure below (CS § Architecture Decisions).
+
+- **World instance:** independent, created and destroyed in play (persistent
+  worlds, temporary dungeons); owns all its storage, released on unload.
+- **Level:** a world's stack grows in play; a level holds a directory of its
+  chunks, never data sized to its area.
+- **Chunk** `(level, cx, cy)`: the unit of terrain and nav storage, change,
+  threading, residency, and save. A dig, ramp, or cave-in costs work in the
+  chunks it touches.
+- **Populations, items, links:** grow in play at the structural-commit seam.
+- **Scale:** 2048² levels, deep stacks, and several worlds are a floor; work
+  and memory follow what changed and what exists, never extent × world count.
+
 ## Source Layout
 
 - `src/main.zig` creates `AppConfig`, initializes `Engine`, and runs the fixed-step loop.
@@ -473,8 +490,8 @@ built from the unstaggered cognition halo so off-phase agents remain visible;
 steering inherits think-set scope transitively through the navigation-intent
 stream. Tier wake/sleep changes flow through deferred
 `set_simulation_tier` structural commands at the commit seam, never inside worker
-ranges. CPU benchmarks at 50k scale are throughput ceilings for rare spikes;
-typical frames scope active work far lower.
+ranges. Scope bounds active work per step; benches at large counts show how
+each stage scales (CS § Benchmarks).
 
 The durable tier model is capability-based, not visibility-based:
 `dormant` entities exist but do not enter normal active scope, `kinematic`
@@ -700,12 +717,8 @@ follows a two-tier attempt ladder (`PendingRequest.tier`) rather than retrying a
 budget-exhausted query at unchanged cost: a cheap tier-0 attempt uses the small fixed
 `tier0_abstract_node_cap`/`tier0_stitched_cell_cap`; exhausting it promotes the
 request to tier 1 exactly once, which retries against `max_abstract_nodes`/
-`max_stitched_path_cells` — a larger but still FIXED ceiling (`default_tier1_*` in
-`types.zig`), deliberately never derived from or scaled to world/graph size: per-query
-work stays bounded independent of world size, matching this module's other
-"independent of total cell count" invariants (portals scale with border-cell density,
-so a size-derived budget would have little margin on a larger or more-obstructed map
-and would silently depend on which map happens to be loaded). A tier-1 exhaustion
+`max_stitched_path_cells`, a larger fixed per-query budget (`default_tier1_*` in
+`types.zig`, CS § Budgets, Capacities, And Thresholds). A tier-1 exhaustion
 drops the request WITHOUT negative-caching — it does not fit either fixed budget,
 which is not the same as a definitive "no path exists" — so the next query falls
 through to `.missing` (retryable after the caller's own replan cooldown) rather than a

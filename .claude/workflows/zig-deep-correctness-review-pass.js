@@ -172,7 +172,7 @@ function reviewPrompt(u) {
     `Your focus for this unit:`,
     u.focus,
     ``,
-    `Read the files (and any adjacent test/helper they depend on) and REASON about behavior, not style. For each finding give the concrete failure: the inputs/state that trigger it and the wrong output/crash/leak/nondeterminism that results — a vague "could be risky" is not a finding. Cite real file:line. Prefer a few high-confidence, well-argued findings over a long speculative list. If, after genuinely digging, the unit is correct, say so and return few or no findings (that is a valid, valuable result — do not manufacture findings). For test-gap findings, name the exact untested invariant and the narrow scenario that would expose a regression, and rank by blast radius.`,
+    `Read the files (and any adjacent test/helper they depend on) and REASON about behavior, not style. Run your Scale Pass first (docs/coding-standards.md § Architecture Decisions). For each finding give the concrete failure: the inputs/state that trigger it and the wrong output/crash/leak/nondeterminism that results — a vague "could be risky" is not a finding. Cite real file:line. Prefer a few high-confidence, well-argued findings over a long speculative list. If, after genuinely digging, the unit is correct, say so and return few or no findings (that is a valid, valuable result — do not manufacture findings). For test-gap findings, name the exact untested invariant and the narrow scenario that would expose a regression, and rank by blast radius.`,
     ``,
     `Return the structured object: {unit: "${u.unit}", findings: [...]}.`,
   ].join('\n')
@@ -213,12 +213,13 @@ const perUnit = await pipeline(
 )
 
 const allVerified = perUnit.filter(Boolean).flatMap((r) => r.verified)
-const confirmed = allVerified.filter((f) => f.verdict && (f.verdict.verdict === 'CONFIRMED' || f.verdict.verdict === 'PLAUSIBLE' || f.verdict.verdict === 'UNVERIFIED') && f.verdict.is_real)
+const confirmed = allVerified.filter((f) => f.verdict && (f.verdict.verdict === 'CONFIRMED' || f.verdict.verdict === 'PLAUSIBLE') && f.verdict.is_real)
+const unverified = allVerified.filter((f) => f.verdict && f.verdict.verdict === 'UNVERIFIED')
 
 log(`Pass 3: reviewed ${REVIEW_UNITS.length} themes; ${allVerified.length} raw findings, ${confirmed.length} confirmed/plausible.`)
 
 if (confirmed.length === 0) {
-  return { counts: { units: REVIEW_UNITS.length, raw: allVerified.length, confirmed: 0 }, confirmed: [], synthesis: null, note: 'No findings survived verification — the deep-correctness surface reviewed is clean.' }
+  return { counts: { units: REVIEW_UNITS.length, raw: allVerified.length, confirmed: 0 }, confirmed: [], unverified, synthesis: null, note: 'No findings survived verification — the deep-correctness surface reviewed is clean.' }
 }
 
 phase('Synthesize')
@@ -234,7 +235,7 @@ const synthesis = await agent(
     ``,
     `Split the output cleanly: top_bugs (confirmed real defects ranked by severity, each with a concrete fix direction), test_gaps (highest-value untested load-bearing invariants ranked by blast radius, each with the narrow scenario to add), and durable_items (only genuinely net-new lint/agent-guidance/doc items — tools/lint_idioms.py and docs/coding-standards.md already cover allocator/threading/ReleaseFast/SIMD/errdefer/validation rules, so do not duplicate; a new technical rule targets a named docs/coding-standards.md section). Be precise and non-duplicative; a clean result with few items is fine.`,
     ``,
-    `Each top_bugs fix_direction and test_gaps scenario names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Findings marked UNVERIFIED were not adversarially checked (below high).`,
+    `Each top_bugs fix_direction and test_gaps scenario names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
     ``,
     `Verified findings:`,
     digest,
@@ -245,5 +246,6 @@ const synthesis = await agent(
 return {
   counts: { units: REVIEW_UNITS.length, raw: allVerified.length, confirmed: confirmed.length },
   confirmed,
+  unverified,
   synthesis,
 }
