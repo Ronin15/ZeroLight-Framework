@@ -7,10 +7,11 @@ A 2D game framework on **Zig 0.17** and **SDL3 / SDL_GPU**: a fixed-step
 atlas-backed assets addressed by stable IDs. Gameplay is data-oriented: dense
 **SoA** stores (`DataSystem`, `WorldSystem`), a state-owned
 `SimulationPipeline`, scoped simulation tiers, and multithreaded/SIMD
-processors. The game built on it is dig/build with cave-ins and explosions.
-This is engine core for a fully simulated, multi-world game: everything that
-exists advances every step, with fidelity falling off with distance from
-players; the demo is a test harness (`.claude/rules/engine-design.md`).
+processors. The game built on it is a colony simulator (dig/build with
+cave-ins and explosions); a player entity is optional. This is engine core for
+a fully simulated, multi-world game: everything that exists keeps advancing,
+with fidelity falling off with distance from the observer; the demo is a test
+harness (`.claude/rules/engine-design.md`).
 
 ## Rules And Docs
 

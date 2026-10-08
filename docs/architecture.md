@@ -13,8 +13,9 @@ Designs start here, then read the live structure below (rules:
 `.claude/rules/engine-design.md` § Target scale and § Cost model).
 
 - **Fully simulated:** everything that exists keeps advancing, in every
-  world; distance from players lowers fidelity (far-off AI thinks on slower
-  ticks, movement stays near full rate). `dormant` is for inert things only.
+  world; distance from the observer (the camera focus, or a player when a
+  game has one) lowers fidelity (far-off AI thinks on slower ticks, movement
+  stays near full rate). `dormant` is for inert things only.
 - **World instance:** independent, created and destroyed in play (persistent
   worlds, temporary dungeons); owns all its storage, released on destroy.
 - **Level:** a world's stack grows in play; a level holds a directory of its

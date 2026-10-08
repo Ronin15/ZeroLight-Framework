@@ -7,17 +7,19 @@ ease work. Owner decisions are not reopened.
 
 ## Target scale
 
-- This is engine core for a fully simulated, growing, multi-world game; the
-  demo is a test harness. Its sizes, populations, and counts are never design,
-  sizing, or acceptance inputs.
-- Everything that exists keeps advancing, in every world. Distance from
-  players lowers fidelity, never stops progress: far-off AI thinks on slower
+- This is engine core for a fully simulated, growing, multi-world colony
+  simulator; a player entity is optional (one observer is targeted: the camera
+  focus, or a player when a game has one). The demo is a test harness; its
+  sizes, populations, and counts are never design, sizing, or acceptance
+  inputs.
+- Everything that exists keeps advancing, in every world. Distance from the
+  observer lowers fidelity, never stops progress: far-off AI thinks on slower
   ticks while cheap processors such as movement stay near full rate. Dormant is
   for inert things only (items at rest), which still change slowly (decay
   outdoors).
 - Population that matters (villagers, people, NPCs) persists and keeps
   advancing wherever it is; only unimportant ambient spawns (stray monsters,
-  animals) may be recycled far from players.
+  animals) may be recycled far from the observer.
 - The chunk `(level, cx, cy)` is the unit of terrain and nav storage, change,
   work, threading, and save. Nav covers the whole world; residency is a
   chunk's storage form, never whether it simulates.
@@ -38,7 +40,7 @@ Every design, and every fix touching storage or per-change work, states:
   world, level, or dungeon. Concrete sizes only illustrate an order.
 - Pass: local-change cost depends only on what changed; memory follows what
   exists and is released with it; nothing is sized from demo constants;
-  nothing stops advancing because no player is near.
+  nothing stops advancing because the observer is far away.
 - The serial and threaded paths (`threading.md`).
 - Each order marked measured (bench group) or derived; a derived number is
   never presented as measured. Hot-path orders are measured
