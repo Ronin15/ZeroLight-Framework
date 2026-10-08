@@ -1,7 +1,7 @@
 export const meta = {
   name: 'zig-best-practices-review',
-  description: 'Review large ZeroLight systems for Zig best practices, verify findings, synthesize durable lint/agent guidance',
-  whenToUse: 'Deep Zig best-practice pass over the biggest hot subsystems, feeding durable items back into the linter and agents',
+  description: 'Review large ZeroLight systems for Zig best practices, verify findings, synthesize durable lint rules and rule-file edits',
+  whenToUse: 'Deep Zig best-practice pass over the biggest hot subsystems, feeding durable items back into the linter and .claude/rules/',
   phases: [
     { title: 'Review', detail: 'one review-specialist per large subsystem' },
     { title: 'Verify', detail: 'adversarial verification per finding' },
@@ -44,15 +44,16 @@ const FINDINGS_SCHEMA = {
           file: { type: 'string' },
           line: { type: 'integer' },
           severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+          tag: { type: 'string', enum: ['structural', 'local'] },
           category: { type: 'string', description: 'kebab-case slug e.g. allocator-discipline, unreachable-ub, mal-hot-path, simd-through-core, naming, stdlib-currency, error-handling' },
           title: { type: 'string' },
           detail: { type: 'string', description: 'what is wrong and why it matters for Zig best practice / this codebase' },
           fix_direction: { type: 'string' },
-          durable: { type: 'boolean', description: 'true if this reflects a generalizable pattern a lint rule or agent-guidance update could prevent recurring' },
-          durable_mechanism: { type: 'string', enum: ['lint-rule', 'agent-guidance', 'doc', 'none'] },
+          durable: { type: 'boolean', description: 'true if this reflects a generalizable pattern a lint rule or a .claude/rules/ edit could prevent recurring' },
+          durable_mechanism: { type: 'string', enum: ['lint-rule', 'rule-edit', 'none'] },
           durable_rationale: { type: 'string' },
         },
-        required: ['file', 'line', 'severity', 'category', 'title', 'detail', 'fix_direction', 'durable', 'durable_mechanism', 'durable_rationale'],
+        required: ['file', 'line', 'severity', 'tag', 'category', 'title', 'detail', 'fix_direction', 'durable', 'durable_mechanism', 'durable_rationale'],
       },
     },
   },
@@ -67,7 +68,7 @@ const VERDICT_SCHEMA = {
     is_real: { type: 'boolean' },
     reasoning: { type: 'string' },
     corrected_severity: { type: 'string', enum: ['high', 'medium', 'low'] },
-    durable_confirmed: { type: 'boolean', description: 'true if the durability claim (lint-rule/agent-guidance) holds up as a low-false-positive, generalizable rule' },
+    durable_confirmed: { type: 'boolean', description: 'true if the durability claim (lint-rule/rule-edit) holds up as a low-false-positive, generalizable rule' },
   },
   required: ['verdict', 'is_real', 'reasoning', 'corrected_severity', 'durable_confirmed'],
 }
@@ -92,31 +93,18 @@ const SYNTHESIS_SCHEMA = {
         required: ['name', 'description', 'detection_hint', 'rationale', 'source_findings', 'confidence'],
       },
     },
-    agent_guidance: {
+    rule_edits: {
       type: 'array',
       items: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          target_agent: { type: 'string', enum: ['zig-specialist', 'zig-review-specialist', 'both'] },
-          guidance: { type: 'string', description: 'concise durable rule to add, in the voice of the existing agent files' },
+          rule_file: { type: 'string', description: 'the .claude/rules/<file>.md that owns the topic' },
+          rule: { type: 'string', description: 'one terse imperative rule line, consistent with every existing rule' },
           rationale: { type: 'string' },
           source_findings: { type: 'array', items: { type: 'string' } },
         },
-        required: ['target_agent', 'guidance', 'rationale', 'source_findings'],
-      },
-    },
-    doc_updates: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          doc: { type: 'string' },
-          guidance: { type: 'string' },
-          rationale: { type: 'string' },
-        },
-        required: ['doc', 'guidance', 'rationale'],
+        required: ['rule_file', 'rule', 'rationale', 'source_findings'],
       },
     },
     top_fixes: {
@@ -129,14 +117,15 @@ const SYNTHESIS_SCHEMA = {
           line: { type: 'integer' },
           title: { type: 'string' },
           severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+          tag: { type: 'string', enum: ['structural', 'local'] },
           fix_direction: { type: 'string' },
         },
-        required: ['file', 'line', 'title', 'severity', 'fix_direction'],
+        required: ['file', 'line', 'title', 'severity', 'tag', 'fix_direction'],
       },
     },
     summary: { type: 'string' },
   },
-  required: ['lint_rules', 'agent_guidance', 'doc_updates', 'top_fixes', 'summary'],
+  required: ['lint_rules', 'rule_edits', 'top_fixes', 'summary'],
 }
 
 function reviewPrompt(u) {
@@ -144,16 +133,9 @@ function reviewPrompt(u) {
     `Review these files for **Zig 0.17 best practices and this codebase's coding standards** (read them fully first):`,
     u.files.map((f) => `  - ${f}`).join('\n'),
     ``,
-    `You are the zig-review-specialist — apply your full checklist, but weight this pass toward mechanizable / generalizable best-practice issues, NOT one-off gameplay logic bugs. Start with your Scale Pass (docs/coding-standards.md § Architecture Decisions), then concretely hunt for:`,
-    `  - allocator discipline and ReleaseFast UB (docs/coding-standards.md § Allocator Discipline).`,
-    `  - std.MultiArrayList hot paths (§ Dense SoA Storage).`,
-    `  - SIMD/math through core (§ SIMD And Core Math).`,
-    `  - error handling and resource lifetime (§ Resources And Error Handling).`,
-    `  - world-scaled work budgets and capacity misuse (§ Budgets, Capacities, And Thresholds).`,
-    `  - naming / stdlib currency the idiom-lint could catch but currently does not (§ Zig Style).`,
-    `  - threaded-write partitioning and serial + threaded paths (§ Threading).`,
+    `Follow your review procedure, but weight this pass toward mechanizable / generalizable best-practice issues, NOT one-off gameplay logic bugs. Hunt especially for: allocator discipline and ReleaseFast UB, MultiArrayList hot paths, SIMD/math through core, error handling and resource lifetime, world-scaled budgets and capacity misuse, threaded-write partitioning, and naming / stdlib currency the idiom-lint could catch but does not. Cite the rule file for each.`,
     ``,
-    `Use file:line references that actually exist. For each finding, set durable=true ONLY when a linter rule or a durable agent-guidance line could prevent the pattern recurring across the codebase, and say which mechanism (lint-rule vs agent-guidance vs doc) and why. A genuinely one-off local issue is durable=false. Report real findings only — no speculative filler. If a file is clean, return no findings for it.`,
+    `Use file:line references that actually exist. For each finding, set durable=true ONLY when a linter rule or a new .claude/rules/ line could prevent the pattern recurring across the codebase, and say which mechanism (lint-rule vs rule-edit) and why. A genuinely one-off local issue is durable=false. Report real findings only — no speculative filler. If a file is clean, return no findings for it.`,
     ``,
     `Return the structured object: {unit: "${u.unit}", findings: [...]}.`,
   ].join('\n')
@@ -170,7 +152,7 @@ function verifyPrompt(f) {
     `Detail: ${f.detail}`,
     `Claimed durable via: ${f.durable_mechanism} — ${f.durable_rationale}`,
     ``,
-    `Check: (1) Does the cited code actually do what the finding says at/near that line? (2) Is it genuinely a Zig best-practice violation for THIS codebase, or is it sanctioned by an existing convention (e.g. a documented handle constructor, a // lint:allow annotation, a deliberate scalar tail, a stated reason)? (3) If durable, would the proposed lint-rule/agent-guidance be low-false-positive and generalizable, or would it misfire on legitimate existing code?`,
+    `Check: (1) Does the cited code actually do what the finding says at/near that line? (2) Is it genuinely a Zig best-practice violation for THIS codebase, or is it sanctioned by an existing convention (e.g. a documented handle constructor, a // lint:allow annotation, a deliberate scalar tail, a stated reason)? (3) If durable, would the proposed lint rule or rule edit be low-false-positive and generalizable, or would it misfire on legitimate existing code?`,
     ``,
     `Verdict CONFIRMED only if the code truly exhibits the issue and it matters. PLAUSIBLE if likely but you cannot fully confirm from the code. REJECTED if the code does not exhibit it or it is sanctioned. Set durable_confirmed only if the durability claim survives scrutiny.`,
   ].join('\n')
@@ -208,7 +190,7 @@ if (confirmed.length === 0) {
 phase('Synthesize')
 
 const digest = confirmed.map((f) =>
-  `[${f.verdict.verdict}/${f.verdict.corrected_severity}] ${f.file}:${f.line} (${f.category}) ${f.title}` +
+  `[${f.verdict.verdict}/${f.verdict.corrected_severity}/${f.tag}] ${f.file}:${f.line} (${f.category}) ${f.title}` +
   (f.durable && f.verdict.durable_confirmed ? ` <<DURABLE:${f.durable_mechanism}>> ${f.durable_rationale}` : '') +
   `\n    ${f.detail}\n    fix: ${f.fix_direction}`
 ).join('\n\n')
@@ -217,9 +199,9 @@ const synthesis = await agent(
   [
     `You are consolidating verified Zig best-practice review findings for the ZeroLight-Framework into DURABLE guidance.`,
     ``,
-    `Existing enforcement you must not duplicate: tools/lint_idioms.py (read it for the current rule list) and docs/coding-standards.md, which owns every technical rule (allocator/FailingAllocator discipline, ReleaseFast unreachable UB, MultiArrayList hot-path rules, budgets/capacities, SIMD-through-core, threading, resources/errors, tests). Agent files only cite those sections.`,
+    `Existing enforcement you must not duplicate: tools/lint_idioms.py (read it for the current rule list) and every file in .claude/rules/ (read them all), which own every technical rule. Agent files and docs only cite rule files.`,
     ``,
-    `Propose ONLY NET-NEW durable items justified by the findings below. For lint_rules: only propose a rule that a line-scanner can enforce with LOW false positives — give a concrete detection heuristic AND the exemptions it must carve out; if a pattern is real but not mechanically detectable without noise, route it to doc_updates (a rule for docs/coding-standards.md, naming its section) or, for a role-specific check only, agent_guidance. Keep everything concise and non-duplicative. Also list the top concrete one-off fixes (top_fixes) ranked by severity for the human to act on.`,
+    `Propose ONLY NET-NEW durable items justified by the findings below. For lint_rules: only propose a rule that a line-scanner can enforce with LOW false positives — give a concrete detection heuristic AND the exemptions it must carve out; if a pattern is real but not mechanically detectable without noise, route it to rule_edits (one line for the owning rule file, consistent with the existing rules). Keep everything concise and non-duplicative. Also list the top concrete one-off fixes (top_fixes) ranked by severity for the human to act on.`,
     ``,
     `Each top_fixes fix_direction names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>'; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
     ``,

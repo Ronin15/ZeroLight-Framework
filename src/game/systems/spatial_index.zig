@@ -41,8 +41,7 @@
 //! gather job. Cell assignment is deliberately deferred to a separate dense
 //! pass (`assignCellsDense`) over the merged, contiguous `rows` columns, run 4
 //! rows at a time through `simd.floorToI4` with a scalar tail: gather into
-//! packed SoA scratch, then vectorize the dense math, per
-//! `docs/coding-standards.md`'s SIMD section.
+//! packed SoA scratch, then vectorize the dense math.
 //!
 //! Populated-cell lookup: a row-major dense grid over a bounded,
 //! camera-relative window (`DenseCellLookup`), direct-indexed rather than
@@ -678,7 +677,7 @@ pub const SpatialIndexSystem = struct {
     /// Derives every row's `SpatialCell` from its already-gathered, contiguous
     /// `pos_x`/`pos_y` columns: dense, uniform, branch-light float math over an
     /// SoA column, so it runs 4 rows at a time through `simd.floorToI4` with a
-    /// scalar tail, per `docs/coding-standards.md`'s SIMD section. Called after
+    /// scalar tail. Called after
     /// the scattered/branchy gather (`spatialGatherJob`/`buildSerial`'s loop)
     /// has finished — both leave `.cell` as a placeholder for this pass to fill.
     /// Uses `simd.divFloat4` (true division), not a precomputed reciprocal
@@ -862,9 +861,8 @@ const SpatialGatherContext = struct {
 /// body), so this stays scalar — the same shape as `AiSystem.gatherAiData`'s
 /// gather and `SimulationScopeSystem`'s AI gather job. Cell assignment is
 /// deliberately not done here; it runs afterward as one dense SIMD pass over
-/// the merged, contiguous `rows` columns (`assignCellsDense`), which is the
-/// "gather into packed SoA scratch, then vectorize the dense math" shape
-/// `docs/coding-standards.md`'s SIMD section calls for.
+/// the merged, contiguous `rows` columns (`assignCellsDense`): gather into
+/// packed SoA scratch, then vectorize the dense math.
 fn spatialGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpatialGatherContext = @ptrCast(@alignCast(context));
     // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs

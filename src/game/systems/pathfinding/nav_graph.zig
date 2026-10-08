@@ -736,7 +736,7 @@ pub const NavGraph = struct {
     // keeps live portals with empty adjacency, so no edge targets a tombstone), and later
     // affected levels keep their old, self-consistent mask and abstract layer until the retry
     // (a failed full relabel likewise: relabelAllLevels).
-    // That is acceptable per coding-standards.md allocation exceptions: a cold, event-triggered
+    // This growth runs on a cold, event-triggered
     // main-thread step (after the patch barrier) with NavGraph as the explicit owner, whose cost
     // cannot move to init because the topology is only known when the edit arrives, and sizing
     // every window for the layout maximum costs ~150x the memory (see
@@ -2813,7 +2813,7 @@ fn expectLinkPatchMatchesFullRebuild(system: *const PathfindingSystem, data: *co
 test "runtime interior ramp link is slotted and live after the incremental patch" {
     // A LevelLink added AFTER the init build (DigController.digRamp's runtime path) with an
     // INTERIOR endpoint joins the abstract tier in the same step's post-commit reaction, on
-    // BOTH levels: the link cursor assigns its fixed interior slot and dirties both endpoint
+    // BOTH levels: the link cursor assigns its interior slot and dirties both endpoint
     // levels, so the cross-level corridor is routable without any full rebuild.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

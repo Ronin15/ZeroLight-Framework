@@ -1,14 +1,16 @@
 # Architecture
 
-The project is organized for SDL_GPU-first 2D game work. Keep executable timing
-thin, app coordination under `src/app/`, GPU work under `src/render/`, and
-game-specific behavior under `src/game/`.
+The project is organized for SDL_GPU-first 2D game work: thin executable
+timing, app coordination under `src/app/`, GPU work under `src/render/`, and
+game-specific behavior under `src/game/`. This doc describes how the engine is
+built; the rules it follows live in `.claude/rules/`.
 
 ## Target Model
 
 The engine core serves a large simulation of many worlds that keeps growing;
 the demo state is a harness that exercises this model, not the model. Designs
-start here, then read the live structure below (CS § Architecture Decisions).
+start here, then read the live structure below (cost model:
+`.claude/rules/engine-design.md`).
 
 - **World instance:** independent, created and destroyed in play (persistent
   worlds, temporary dungeons); owns all its storage, released on unload.
@@ -146,13 +148,6 @@ start here, then read the live structure below (CS § Architecture Decisions).
   modules live in their matching `src/` area and import each other directly.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
 
-## Cross-Cutting Ownership Rules
-
-Two rules apply across every module below: the main thread is not a fallback
-owner for scalable work (`docs/coding-standards.md` § Threading), and
-production contracts expose runtime concepts only (`docs/coding-standards.md`
-§ Tests).
-
 ## Frame Flow
 
 `src/main.zig` keeps the high-level loop:
@@ -177,16 +172,15 @@ render-blocked gameplay pause before the next update, keeps using fallback
 pacing, and clears that policy after a later frame is submitted. Occluded or
 unfocused visible windows keep rendering but apply a 60Hz cap to avoid
 background render runaway.
-Frame pacing policy stays explicit and situational (frame-cap rule:
-`docs/coding-standards.md` § Timing And Frame Pacing).
+Frame pacing policy is explicit and situational
+(`.claude/rules/memory-performance.md`).
 
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
 transformed through that presentation into drawable pixels, then clipped to the
 logical viewport; drawable overlays use raw swapchain pixels. All presentation
-state stays in the SDL_GPU renderer path.
-Debug UI state belongs in the debug overlay and render-service path, not in
-gameplay state or persistent gameplay data.
+state lives in the SDL_GPU renderer path, and debug UI state in the debug
+overlay and render-service path (`.claude/rules/render.md`).
 
 ## Coordination Boundaries
 
@@ -194,13 +188,10 @@ Game states submit through `Renderer.submitOrdered*` only from explicit
 render-prep phases that already walk nondecreasing `RenderOrder`. World render
 submission is layer-owned: z/depth discovery happens in `WorldSystem` and
 state-owned dynamic render prep, then both streams are merged by world z before
-commands reach `SpriteBatch`. Game states should not call SDL_GPU directly.
-Window, GPU device, swapchain, shader, texture, text, and frame submission code
-stays under `src/render/` and `src/app/`.
-SDL, SDL_ttf, SDL_mixer, and SDL_GPU resources should pair creation and cleanup
-close to the owning site. Ownership wrappers may centralize cleanup, but generic
-state or gameplay teardown should not receive renderer, text, audio, or GPU
-services merely to recover escaped resource ownership.
+commands reach `SpriteBatch`. Window, GPU device, swapchain, shader, texture,
+text, and frame submission code lives under `src/render/` and `src/app/`;
+ownership wrappers may centralize cleanup at the owning site
+(`.claude/rules/engine-design.md`, `.claude/rules/zig-style.md`).
 
 `Renderer` preserves strict ordered submission while delegating sprite-specific
 CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition, swapchain
@@ -208,7 +199,7 @@ acquisition, vertex upload, render-pass encoding, and submit remain coordinated
 by `Renderer` on the main/render thread.
 `SpriteBatch` owns a render-specific adaptive tuner and can use the app
 `ThreadSystem` to expand prepared sprite commands into disjoint vertex spans.
-Texture metadata is snapshotted before worker dispatch, workers do not read
+Texture metadata is snapshotted before worker dispatch, workers read no
 live renderer resource slots, and draw groups are built on the main thread from
 the already ordered command stream. Small or cheap frames may stay inline
 through the same adaptive policy.
@@ -255,8 +246,8 @@ comes only from the fixed-step camera (`GameDemoState.simViewRect()` passed as
 `simViewRegion` / `WorldSystem.cognitionRegionForWorldRect`), never from the
 render visibility window, which follows the interpolated render camera and so
 depends on frame pacing. Scope pin metadata
-may keep an entity in a higher sim band off-camera; it must not bypass render
-visibility. Open scaling gaps (collect scan cost, dense-floor layer quads,
+may keep an entity in a higher sim band off-camera without bypassing render
+visibility (`.claude/rules/simulation.md`). Open scaling gaps (collect scan cost, dense-floor layer quads,
 movement contiguous-path vs dormant rows, per-entity depth alignment, component
 mask headroom) are consolidated under **Scaling Gaps And Hardening Frontier** in
 [`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
@@ -271,8 +262,8 @@ live cache/renderer owner, and exposes `SpriteAssetId` lookup as atlas-ready
 through this catalog and fall back to primitive rectangles when a declared actor
 sprite is unavailable. World tile rendering is strict: `WorldSystem` requires
 world atlas metadata during construction and the world tileset texture during
-render. Engine-owned services must not persist pointers to sibling service
-fields; release paths take the live owner explicitly. Cache lease tokens include
+render. Engine-owned services keep no pointers to sibling service fields;
+release paths take the live owner explicitly. Cache lease tokens include
 cache-owner identity, slot generation, and texture identity so release paths can
 reject stale, forged, or wrong-owner tokens. Missing declared startup content is
 logged and exposed as unavailable; fatal preload errors roll back partial sprite
@@ -283,15 +274,14 @@ SDL_ttf, loaded fonts, and generated renderer text textures for the app
 lifetime. UI states describe text intent during render and receive only
 non-owning prepared text views when the intent changes. Stable render frames
 draw those prepared views directly, without re-checking the text cache. State
-teardown stays service-free: do not pass renderer/text/audio services into
-generic state destruction to compensate for escaped resource ownership.
+teardown is service-free.
 
 Game states request SFX and music through `AudioCommandBuffer` in
 `UpdateContext` using stable `AudioAssetId` values. `AudioService` is app-owned
 because SDL_mixer device, mixer, track pool, loaded-audio cache, bus gains, and
 pause ducking are process-level runtime services. Startup preload resolves
 declared audio paths before command drain; fixed-step audio commands carry IDs,
-gain, priority, frequency, and position only. States do not own `MIX_Mixer`,
+gain, priority, frequency, and position only. States own no `MIX_Mixer`,
 `MIX_Track`, or loaded `MIX_Audio` handles. `Engine` drains audio commands on
 the main thread after fixed-step state updates and state transition application.
 Gameplay pause stops active SFX and ducks music; resume restores music gain.
@@ -329,11 +319,10 @@ color, audio settings, and thread-system settings. `src/main.zig` builds it from
 generated build options, then `Engine` validates it before creating SDL,
 renderer, asset, audio, text, state, pause, input, and thread-system services.
 
-Logging uses scoped `std.log` categories from `src/core/logging.zig`, with the
-default log level chosen from build options. Diagnostics should explain startup,
-configuration, fallback, lifecycle, and failure context. Per-frame, per-event,
-per-draw, and processor hot paths should stay quiet unless a log is measured,
-bounded, and intentionally useful.
+Logging uses the scoped categories in `src/core/logging.zig`, with the default
+log level chosen from build options; diagnostics cover startup, configuration,
+fallback, lifecycle, and failure context, and hot paths stay quiet
+(`.claude/rules/zig-style.md`).
 
 ## Thread System
 
@@ -357,14 +346,14 @@ distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
 owns the decision. The tuner starts inline, records that inline baseline for the
 owning batch, probes a threaded profile when the measured work is expensive
 enough, and only reports a best threaded profile after a threaded candidate wins.
-There are no static item-count floors (`docs/coding-standards.md` § Threading);
+There are no static item-count floors (`.claude/rules/threading.md`);
 slower hardware or expensive small-N processors train their own threaded
 profile.
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
 for the batch barrier.
 Production processors own their own tuner state so movement, particles,
-collision, and future systems do not train each other with unrelated batch
+collision, and future systems never train each other with unrelated batch
 timings; `ThreadSystem` keeps shared fallback state for generic callers. Batches
 can still force explicit fixed profiles through `items_per_range`,
 `max_worker_threads`, and `adaptive = false`. Worker threads are reused across
@@ -373,14 +362,10 @@ Processor-specific batches can align range starts to hot-column boundaries
 through `parallelForWithOptions`.
 
 Systems with multiple independently timed threaded stages own one tuner per
-stage. Do not train a shared stage profile across different work shapes, such as
-broadphase candidate generation and narrowphase contact validation, AI gather
-and decision emission, or future pathfinding frontier expansion and path
-reconstruction. If a stage preselects a profile before dispatch, it must pass
-the selected profile and the stage-owned tuner together so inline samples still
-train that stage before it decides whether to thread. Benchmark and diagnostics
-output should report inline stages as `inline`, not as a fake zero-worker range
-size.
+stage (broadphase and narrowphase, AI gather and decision emission). A stage
+that preselects a profile passes it with its own tuner, so inline samples still
+train that stage, and diagnostics report inline stages as `inline`
+(`.claude/rules/threading.md`).
 
 ## Gameplay Data
 
@@ -394,7 +379,7 @@ being inferred from render visuals.
 Hot gameplay data is stored as scalar columns. The movement-body store exposes
 64-byte-aligned `position_x`, `position_y`, `previous_x`, `previous_y`,
 `velocity_x`, `velocity_y`, and `speed` slices so update processors can load
-lanes directly with `src/core/simd.zig`. Movement processor ranges should align
+lanes directly with `src/core/simd.zig`. Movement processor ranges align
 to `data_system.movement_range_alignment_items`, which maps one cache line to
 sixteen `f32` elements. The same store carries the dense simulation-scope columns
 (`tier`, `chunk_x/y`, `stagger_phase`, `always_active`) as separate aligned arrays
@@ -421,15 +406,15 @@ procedural 512x512 tile world in deterministic chunk ranges. The gameplay state
 keeps viewport size separate from world bounds, follows the player with an
 interpolated sub-pixel camera, and asks `WorldSystem` to expose only
 camera-visible chunks to render prep. Future scoped simulation slices may
-consume its chunk/visibility view, but `SimulationPipeline` should not own tile
-storage, runtime atlas metadata, or camera policy.
+consume its chunk/visibility view; `SimulationPipeline` owns no tile storage,
+runtime atlas metadata, or camera policy.
 
 The current gameplay fixed-step pipeline is:
 
 1. Clear `SimulationFrame` and mark the step active.
 2. Apply main-thread player input and queue fixed-step audio commands.
 3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
-   "Simulation pipeline stage ordering" in `docs/coding-standards.md` and
+   `.claude/rules/simulation.md` and
    `docs/simulation-tiers-and-pipeline.md` for the full contract):
    at step open: dig admission and the level-link growth seam (before any other
    step-state change), promote prior-step deferred impacts onto the live bus, then
@@ -462,12 +447,10 @@ The current gameplay fixed-step pipeline is:
 
 `SimulationPipeline` owns the reusable fixed-step simulation systems, concrete
 stage order, scope stats, budgets, and processor handoff for one gameplay state
-instance, while `StateStack` remains the dispatch/lifetime owner. Future domain
-features should add concrete pipeline-owned controllers rather than growing
-`GameDemoState.update` — or, as controllers accumulate, the pipeline's own
-`update` — or introducing a global engine scheduler, reflection system, dynamic
-dependency graph, or callback registry. The pipeline stays a thin composer; each
-controller and system owns its own internals.
+instance, while `StateStack` remains the dispatch/lifetime owner. Domain
+features are concrete pipeline-owned controllers; the pipeline is a thin
+composer and each controller and system owns its own internals
+(`.claude/rules/simulation.md`).
 
 Simulation tiers and active scope belong in the same pipeline boundary. Tier and
 chunk metadata are dense SoA columns on the movement-body store
@@ -491,7 +474,7 @@ steering inherits think-set scope transitively through the navigation-intent
 stream. Tier wake/sleep changes flow through deferred
 `set_simulation_tier` structural commands at the commit seam, never inside worker
 ranges. Scope bounds active work per step; benches at large counts show how
-each stage scales (CS § Benchmarks).
+each stage scales (`.claude/rules/tests-benchmarks.md`).
 
 The durable tier model is capability-based, not visibility-based:
 `dormant` entities exist but do not enter normal active scope, `kinematic`
@@ -504,11 +487,9 @@ fixed step.
 Emergent NPC behavior layers on the cognition tier. Perception, memory, and
 **affect (feelings / emotion drives)** are durable per-entity concepts that live
 as SoA components in `DataSystem` and are advanced by cognition-gated processor
-stages in `src/game/systems/`, alongside AI, steering, and pathfinding. They
-follow the same rules as every other processor (`docs/coding-standards.md`
-§ Performance and § Threading): allocation-free hot paths,
-deterministic serial/threaded and scalar/SIMD parity, range-disjoint output, and
-explicit barriers. Dense per-step sensing/affect data stays in component columns
+stages in `src/game/systems/`, alongside AI, steering, and pathfinding, with
+allocation-free hot paths, serial/threaded and scalar/SIMD parity,
+range-disjoint output, and explicit barriers like every other processor. Dense per-step sensing/affect data stays in component columns
 or transient range streams; only notable transitions become low-volume domain
 events (`entity_perceived` / `entity_lost`, `affect_threshold_crossed`, and
 similar). Cross-entity classification (faction/stance), a deterministic
@@ -528,20 +509,17 @@ aggression→pursue, curiosity→investigate, fatigue→wander), scaled by the
 agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
 threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
 `stageContract(.ai_decide)` reads `affect_drives` (written one stage earlier
-by `affect_update`, per `stage_order`). New feelings append to
-`AiAffectDrive` and a new weight-table row (roadmap
-[Slice 42](roadmap/slices/slice-42.md)); they do not get a second parallel
-emotion subsystem. See the
+by `affect_update`, per `stage_order`). A new feeling is an `AiAffectDrive`
+tag plus a weight-table row (`.claude/rules/simulation.md`; roadmap
+[Slice 42](roadmap/slices/slice-42.md)). See the
 [Emergent AI Track Overview](roadmap/tracks/emergent-ai.md).
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay
 domains. Controllers own feature orchestration: small queues, budgets,
-cooldowns, priority/conflict policy, and handoff between processors. They should
+cooldowns, priority/conflict policy, and handoff between processors. They
 emit `SimulationFrame` outputs or deferred structural commands and call
-processors with typed `DataSystem` views. They should not become hidden
-per-entity stores, own renderer/audio/SDL handles, hide RNG, or replace SoA
-processors for hot/reusable loops.
+processors with typed `DataSystem` views (`.claude/rules/simulation.md`).
 
 Landed pipeline-owned domain controllers (beside processors):
 
@@ -718,7 +696,7 @@ budget-exhausted query at unchanged cost: a cheap tier-0 attempt uses the small 
 `tier0_abstract_node_cap`/`tier0_stitched_cell_cap`; exhausting it promotes the
 request to tier 1 exactly once, which retries against `max_abstract_nodes`/
 `max_stitched_path_cells`, a larger fixed per-query budget (`default_tier1_*` in
-`types.zig`, CS § Budgets, Capacities, And Thresholds). A tier-1 exhaustion
+`types.zig`; `.claude/rules/budgets-capacities.md`). A tier-1 exhaustion
 drops the request WITHOUT negative-caching — it does not fit either fixed budget,
 which is not the same as a definitive "no path exists" — so the next query falls
 through to `.missing` (retryable after the caller's own replan cooldown) rather than a
@@ -739,9 +717,8 @@ registries are fixed-capacity runtime structures with explicit eviction or
 saturation behavior rather than unbounded growth.
 
 The demo player is intentionally a special-case facade for player input and
-facing rules, backed by `DataSystem` data. Enemies and other world objects
-should normally be plain entities processed by enemy, movement, collision, AI,
-or render systems rather than copies of player behavior.
+facing rules, backed by `DataSystem` data. Enemies and other world objects are
+plain entities processed by enemy, movement, collision, AI, or render systems.
 
 `ParticleSystem` is the transient visual-effect exception. It is owned by the
 game state instead of `DataSystem`, because particles are short-lived effect
@@ -772,14 +749,13 @@ simulation data, not persistent `DataSystem` state.
 lower-volume system changes. Events are phase outputs, not immediate callbacks:
 a producer stage finishes, the event stream merges deterministically, and later
 explicit reaction points consume immutable event slices. Consumers may emit
-specialized outputs, later-phase events, or deferred structural commands, but
-they do not recursively redispatch events or mutate `DataSystem` structurally
-outside the commit boundary. The current event payloads cover structural
+specialized outputs, later-phase events, or deferred structural commands, without
+recursive redispatch or structural `DataSystem` mutation outside the commit
+boundary. The current event payloads cover structural
 entity/component changes, world tile/obstacle changes, and navigation-region
 invalidation. Event records carry only stable entity IDs, component enums,
-reason enums, compact coordinates, and small scalar payloads;
-they do not carry pointers, app/render/audio handles, asset paths, allocators,
-or service references.
+reason enums, compact coordinates, and small scalar payloads
+(`.claude/rules/simulation.md`).
 
 High-volume streams stay specialized. Collision contacts, collision triggers,
 navigation intents, movement intents, path requests, render-prep commands, and
@@ -790,9 +766,8 @@ per-stage counters deterministically after producer completion. A configured
 per-step event capacity is enforced for both appended and range-owned event
 producers: required events fail before structural mutation or domain reaction
 side effects, while diagnostic events are dropped and counted. Reaction work has
-explicit ownership rather than a generic main-thread fallback: light
-orchestration may run inline, and expensive consumers should split over
-immutable event slices and write range-owned outputs. After the commit point, the
+explicit ownership: light orchestration runs inline, and expensive consumers
+split over immutable event slices and write range-owned outputs. After the commit point, the
 post-commit nav reaction folds static obstacle-affecting changes into the
 pathfinding nav graph INCREMENTALLY rather than rebuilding the whole world.
 `PathfindingSystem` owns that reaction end to end (`reactToPostCommitNavEvents`):
@@ -931,10 +906,6 @@ rejected. Its slot term is `levels * chunk_count * (4*ct + nav_interior_link_slo
 `levelLinkLimit` the build reserves, not just today's link count) sizes only the global
 `link_edges`/`link_edge_refs` term.
 
-The cross-cutting ownership rules apply here too: event reactions may have
-main-thread commit points, but scalable reaction work still needs a named owner,
-and event/intent contracts must not grow test-only variants or marker payloads.
-
 ## SIMD Helpers
 
 `src/core/simd.zig` provides project-named four-lane vector aliases and helper
@@ -945,4 +916,4 @@ or NEON on ARM targets, when the target and optimization mode make that
 profitable. Platform intrinsics such as x86 or ARM-specific calls stay hidden
 from gameplay.
 
-When to use them is `docs/coding-standards.md` § SIMD And Core Math.
+When to use them: `.claude/rules/memory-performance.md`.

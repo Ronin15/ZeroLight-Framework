@@ -23,11 +23,10 @@ zig build assets-lint # lint runtime atlases and source sprite consistency
 zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreachable
 ```
 
-`zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) enforces
-the naming/currency/`catch unreachable` rules from `docs/coding-standards.md`:
-snake_case fields/params, `k_snake_case` constants, current stdlib spellings, and
-`catch`/`orelse unreachable` only on a sanctioned handle constructor, inside a
-`test` block, or with a `// lint:allow catch-unreachable: <reason>` annotation.
+`zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) checks
+the mechanical subset of `.claude/rules/zig-style.md` and
+`.claude/rules/memory-performance.md`; the script's docstring lists exactly what
+it enforces.
 
 `zig build package` installs the selected-mode game binary and runtime assets.
 It does not install the `gpu-smoke` development executable.
@@ -35,7 +34,7 @@ It does not install the `gpu-smoke` development executable.
 On Windows, `package`, `run`, `dev`, and normal build steps install the required
 `SDL3.dll`, `SDL3_ttf.dll`, and `SDL3_mixer.dll` beside the app binary when
 using the pinned package SDL path. Optional SDL_mixer codec DLLs are not copied
-by this slice because current runtime audio assets are WAV-based.
+because current runtime audio assets are WAV-based.
 
 `run`, `dev`, and `gpu-smoke` launch from the installed binary directory, so the
 default asset root resolves copied runtime assets and generated shader files
@@ -49,13 +48,13 @@ current working directory; (2) the same relative root resolved from the
 directory containing the executable (exe-relative fallback). The fallback fires
 only when the configured root directory does not exist at all, not when
 individual files are missing. To use it, place a full `assets/` tree beside
-the binary. The asset root must stay a **relative**, traversal-safe path
-(default `assets`); `AppConfig` rejects absolute roots at startup.
+the binary. The asset root is a relative, traversal-safe path (default
+`assets`); `AppConfig` rejects absolute roots at startup.
 
 ## Release Modes
 
-The default optimize mode is `Debug`. Use an explicit release mode only for a
-release candidate or shipping build:
+The default optimize mode is `Debug`. Release modes (when to use them:
+`.claude/rules/build-validation.md`):
 
 ```sh
 zig build --release=safe
@@ -69,7 +68,7 @@ not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
 **Packaged builds ship `ReleaseFast`** (no safety checks; why reserves need
-proofs: `docs/coding-standards.md` § Allocator Discipline).
+proofs: `.claude/rules/memory-performance.md`).
 
 LTO: on Linux (ELF), `build.zig` enables `-flto=full` for the shipped **app
 executable only** in `ReleaseFast`, explicitly selecting LLVM + LLD (which LTO
@@ -79,11 +78,8 @@ Windows skips it (under Zig 0.17, LTO with libc fails at `lld-link` on mingw
 libc/libm symbols, while non-LTO ReleaseFast links and emits its PDB). Debug,
 ReleaseSafe, and ReleaseSmall leave LTO off.
 
-**Release gate:** before cutting a ReleaseFast release candidate, run a
-multi-hour `--release=safe` soak (not just `zig build test`) across realistic
-to extreme entity counts and spawn/despawn churn. A clean ReleaseSafe run is the
-gate, because ReleaseFast corrupts memory silently instead of reporting a
-capacity or bounds violation.
+**Release gate:** a multi-hour `--release=safe` soak precedes every ReleaseFast
+release candidate (`.claude/rules/build-validation.md`).
 
 ## Build Options
 
@@ -184,11 +180,10 @@ Runtime diagnostics use Zig `std.log` filtering. The default `auto` level is:
 **Fix cycles:** Debug — `zig build dev` / `zig build run`. Fast compile, full
 safety, behavior and unit work. Not the authority for scale timing.
 
-**Soaking / scale perf:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
-one 60s dump after load when you want a stage ranking (a diagnostic, not a
-perf claim; CS § Benchmarks).
-Longer compile; do not use for every edit. Multi-cycle soaks only when comparing
-settle vs load, not as the default.
+**Soaks and stage ranking:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
+one 60s dump after load when you want a stage ranking (diagnostic trend data,
+not a perf claim; `.claude/rules/tests-benchmarks.md`). Longer compile; usage
+limits are in `.claude/rules/build-validation.md`.
 
 **Ship:** ReleaseFast packages (runtime perf fully compiled out).
 
@@ -273,23 +268,14 @@ intent); dig and move keep their existing keyboard / stick bindings — see
 
 ## Testing
 
-Tests follow Zig conventions: small unit tests live beside the code they cover
-as `test` blocks. Run them with `zig build test`. Test standards live in
-`docs/coding-standards.md` § Tests.
+Unit tests live beside the code they cover as `test` blocks. Run them with
+`zig build test`. Test rules: `.claude/rules/tests-benchmarks.md`.
 
 ## Validation Cadence
 
-- While iterating, prefer `zig build check` for fast compile feedback.
-- Per commit: `zig build check` + `zig build test` + `zig build idiom-lint`.
-- Once per multi-commit batch, and before a slice or broad change is
-  considered complete: `zig build verify` (compile coverage, unit tests,
-  shader compilation, atlas lint, idiom lint).
-- `zig build shaders` after shader source or shader build-wiring changes.
-- `zig build gpu-smoke` only when display/GPU validation is relevant and a
-  display exists; report it as not run otherwise.
-- Cost savings never drop proof: keep every proof test, every
-  `FailingAllocator` proof, and the fails-with-the-fix-reverted check.
-- Benchmarks follow `docs/coding-standards.md` § Benchmarks.
+The cadence (which step when) is `.claude/rules/build-validation.md`.
+`zig build verify` runs compile coverage, unit tests, shader compilation, atlas
+lint, and idiom lint.
 
 ## Benchmarks
 
@@ -362,7 +348,9 @@ Reading results:
   selected group; `--fallback-budget N` compares hard-fallback caps against the
   runtime default in ReleaseFast tuning.
 
-Use other optional arguments only to narrow or scale the run:
+Optional arguments narrow or scale the run. Day-to-day runs target a group
+(`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare
+`--details`) are for requested sweeps:
 
 ```sh
 zig build bench -- --profile quick

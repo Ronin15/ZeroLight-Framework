@@ -48,8 +48,8 @@ const docResults = await parallel([
     { label: 'docs:arch+sim', phase: 'Docs Scan', schema: DOCS_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
-    `Read and analyze docs/state-stack-and-input.md and docs/coding-standards.md.
-    Focus on: state stack contracts, transitions, input routing policy, performance constraints, coding standards for DOD patterns, SoA usage, SIMD policy, allocation rules, and how these constrain or enable emergent gameplay.
+    `Read and analyze docs/state-stack-and-input.md and every rule file in .claude/rules/.
+    Focus on: state stack contracts, transitions, input routing policy, performance constraints, the rules for DOD patterns, SoA usage, SIMD policy, allocation, budgets, and threading, and how these constrain or enable emergent gameplay.
     Return a structured analysis.`,
     { label: 'docs:state+standards', phase: 'Docs Scan', schema: DOCS_SCHEMA, agentType: 'zig-design-specialist' }
   ),
@@ -73,17 +73,15 @@ const codeResults = await parallel([
   () => agent(
     `Read these files and analyze the core simulation pipeline:
     - src/game/data_system.zig
-    - src/game/simulation_pipeline.zig (if exists, else check src/game/ for pipeline-related files)
-    Run: ls src/game/ to see all files first.
+    - src/game/simulation_pipeline.zig
     Focus on: SoA data layout, entity capacity, how processors are registered/ordered, whether new systems can be added without modifying the pipeline core, data dependencies between systems, and readiness for many interacting simulation layers.`,
     { label: 'code:data+pipeline', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
   () => agent(
     `Read these files:
-    - src/game/systems/movement.zig (or similar in src/game/systems/)
-    - src/game/systems/ai.zig (or similar)
-    - src/game/systems/collision.zig (or similar)
-    Run: ls src/game/systems/ first to see available systems.
+    - src/game/systems/movement.zig
+    - src/game/systems/ai.zig
+    - src/game/systems/collision.zig
     Focus on: per-system data access patterns, how they interact with the SoA store, whether they read/write shared state safely, SIMD usage, and how a new emergent system (e.g. resource spreading, fire propagation, crowd behavior) would slot in.`,
     { label: 'code:systems', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
@@ -99,7 +97,6 @@ const codeResults = await parallel([
     `Read these files related to pathfinding and world systems:
     - src/game/world_system.zig
     - src/game/systems/pathfinding.zig (and src/game/systems/pathfinding/)
-    Run: ls src/game/systems/pathfinding/ first if it exists.
     Focus on: world/map data model, how navigation mesh or grid is managed, whether the world model supports dynamic changes (terrain modification, destructibles), how spatial queries are done, and readiness for emergent world-state gameplay.`,
     { label: 'code:world+pathfinding', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
   ),
@@ -121,9 +118,9 @@ const allFindings = {
 }
 
 const report = await agent(
-  `You are a senior game engine architect. Synthesize the following architectural analysis findings into a comprehensive assessment report for the ZeroLight-Framework.
+  `Assessment mode. Synthesize the following architectural analysis findings into a comprehensive assessment report for the ZeroLight-Framework.
 
-CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.17 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events. Judge against the engine's target (docs/coding-standards.md § Architecture Decisions, docs/architecture.md § Target Model): many worlds created and destroyed in play, growing levels and populations; the demo is a harness, never the yardstick.
+CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.17 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events. Judge against the engine's target (.claude/rules/engine-design.md, docs/architecture.md § Target Model): many worlds created and destroyed in play, growing levels and populations; the demo is a harness, never the yardstick.
 
 DOC ANALYSIS FINDINGS:
 ${JSON.stringify(allFindings.docs, null, 2)}
@@ -137,7 +134,7 @@ Write a structured assessment report covering:
 
 2. **Architecture Strengths for Emergent Gameplay** (what's well-designed, with specific evidence)
 
-3. **Critical Gaps and Risks** (what's missing or fragile, severity: High/Medium/Low)
+3. **Critical Gaps and Risks** (what's missing or fragile, severity: High/Medium/Low, each tagged structural or local)
 
 4. **Scalability Analysis**
    - Cost growth order per core operation (local change, dense change, world/level create and destroy); flag anything scaling with extent or world count
@@ -146,7 +143,7 @@ Write a structured assessment report covering:
    - World state dynamism
 
 5. **Emergent Gameplay Readiness by Domain**
-   - AI & Behavior Trees
+   - AI (utility scoring + sticky selection, affect drives)
    - Physics / Collision / Spatial Queries
    - Dynamic World State (terrain, destructibles, spreading effects)
    - Multi-agent coordination (flocking, group AI, resource competition)

@@ -1,0 +1,64 @@
+# Engine Design
+
+Rules live only in `.claude/rules/`; docs describe and cite them. No two rules
+conflict. When a rule blocks a sound design, propose the edit with its reason;
+it changes in its rule file in the same change, never by loosening a rule to
+ease work. Owner decisions are not reopened.
+
+## Target scale
+
+- This is engine core for a large, growing, multi-world simulation; the demo is
+  a test harness. Its sizes, populations, and counts are never design, sizing,
+  or acceptance inputs.
+- Target scale is a floor: 2048² levels, deep stacks that grow in play, several
+  worlds created and destroyed in play, large populations.
+- Dense multi-chunk terrain change in one step (cave-ins, explosions) is normal
+  gameplay.
+
+## Cost model (before code)
+
+Every design, and every fix touching storage or per-change work, states:
+
+- Work and memory as growth orders in what changed, what exists, and extent
+  (level size, depth, world count) for a local change (one dig, ramp, chunk), a
+  dense one-step change (an explosion region), and creating or destroying a
+  world, level, or dungeon. Concrete sizes only illustrate an order.
+- Pass: local-change cost depends only on what changed; memory follows what
+  exists and is released with it; nothing is sized from demo constants.
+- The serial and threaded paths (`threading.md`).
+- Each order marked measured (bench group) or derived; a derived number is
+  never presented as measured. Hot-path orders are measured
+  (`tests-benchmarks.md`).
+- Where code already partitions by a unit (chunk, level, world), the first
+  design evaluated has that unit own its storage and work. A shared arena,
+  global rebuild, or level-wide shift needs a cost model that beats it.
+- If the existing structure cannot pass, redesign that structure; never patch
+  around it.
+
+## Ownership boundaries
+
+- `main.zig` is entry and fixed-step timing only; `root.zig` stays minimal.
+- App coordination lives in `src/app/`, SDL_GPU work in `src/render/`, gameplay
+  in `src/game/`, math/SIMD/logging in `src/core/`, SDL wrappers in
+  `src/platform/`. Never move a boundary for a local convenience.
+- Gameplay logic lives in states, controllers, and processors, never in
+  `main.zig` or `Engine` conditionals.
+- App and game code use `Renderer`; never import `src/render/gpu/*` outside
+  render/platform, and never call SDL_GPU, Vulkan, or Metal from game code.
+- Engine services never keep pointers to sibling service fields; release paths
+  take the live owner explicitly.
+- State and gameplay teardown never receive renderer, text, audio, or GPU
+  services to clean up escaped resources.
+- Debug overlays and introspection are read-only over simulation.
+- No new dependency unless stdlib or SDL3 cannot do it (PNG decode uses core
+  SDL3; no `SDL3_image`); never vendor SDL binaries.
+- Plan and build only confirmed features: no format, tool, or subsystem nobody
+  asked for.
+
+## Changes and docs
+
+- Search the owning module for an existing utility before adding one; keep
+  changes scoped; never reformat or refactor unrelated code.
+- `README.md` is an overview (what it is, one-line feature bullets,
+  requirements, quick start, commands, layout, doc links); how things work
+  belongs in `docs/`.

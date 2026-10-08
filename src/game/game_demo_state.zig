@@ -80,12 +80,8 @@ const demo_test_viewport_width: f32 = 256;
 const demo_test_viewport_height: f32 = 256;
 // Default mover count for every path EXCEPT the real battle-scale procedural entry
 // (initProceduralWithRuntimeAssets) — this is what initDemoForTest and every other test
-// in this file spawn through, so it stays small on purpose (coding-standards.md
-// § Tests: smallest fixture that still exercises the behavior). A prior pass bumped this GLOBALLY to battle-scale to exercise
-// the pathfinding group-field threshold live — that made every test in this file spawn
-// 2048 movers too, taking `zig build test` from ~6s to ~43s. Population is now a
-// runtime parameter (see DemoPopulationCapacity/deriveDemoPopulationCapacity) so the
-// running demo and fast tests don't have to share one global constant.
+// in this file spawn through, so it stays small. Battle-scale population is a
+// runtime parameter (DemoPopulationCapacity/deriveDemoPopulationCapacity).
 const default_demo_mover_count: usize = 32;
 // Only initProceduralWithRuntimeAssets (the real game, not tests) passes this.
 // Max battle-scale target for runtime perf / capacity tuning; tests stay on

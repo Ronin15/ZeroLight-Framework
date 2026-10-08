@@ -52,10 +52,8 @@ pub const GroupField = struct {
     // Fixed per-build cap on total distinct cells the flood may cover, set once in
     // beginBuild from the caller's config. Without this, the flood covers the WHOLE
     // reachable component from the goal — for an open world that is the whole grid,
-    // so build cost (and therefore group_service_ns) scales with WORLD SIZE, which
-    // violates this project's "per-query work budgets are fixed constants, never
-    // derived from or scaled to world size" rule (see coding-standards.md and the
-    // similar fixed budgets elsewhere in this package, e.g. max_abstract_nodes).
+    // so build cost (and therefore group_service_ns) would scale with world size;
+    // the cap keeps it a fixed per-query budget, like max_abstract_nodes.
     // A cell past the cap is simply never reached this build: sample() returns null
     // for it (stamp never set), which the caller already treats as "field does not
     // cover this cell" and falls through to an individual solve — never a false

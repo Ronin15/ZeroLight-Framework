@@ -1,5 +1,8 @@
 # State Stack And Input
 
+How states, transitions, and input routing work. Rules:
+`.claude/rules/input-state.md`.
+
 ## State Shape
 
 Create a state struct with the methods used by `src/app/state.zig`:
@@ -62,9 +65,9 @@ Return `true` from `handleEvent` when the state consumes an event.
 `onPause` and `onResume` are both required: `src/app/state.zig`'s adapter
 calls both unconditionally, so a state missing either fails to compile. Pure
 UI states implement them as no-ops; gameplay-owning states like
-`GameDemoState` put real pause/resume behavior there. Do not reintroduce an
-optional hook gated on `@hasDecl`: since Zig 0.17 it only sees `pub`
-declarations, so a private hook would be silently skipped.
+`GameDemoState` put real pause/resume behavior there. Hooks are never gated on
+`@hasDecl` (since Zig 0.17 it only sees `pub` declarations, so a private hook
+would be silently skipped).
 
 `UpdateContext` carries `asset_store` (an `assets.AssetStore` handle) so a state
 can load content catalogs at init from the traversal-safe asset root —
@@ -100,8 +103,8 @@ startup state in `src/app/engine.zig`.
 states are removed or replaced, and destroys remaining states from top to bottom
 when the stack shuts down.
 
-Menu activation should not directly construct gameplay states that require
-runtime catalogs. `MainMenuState` installs an opaque `LoadingState`; that state
+Menu activation never constructs gameplay states that require runtime catalogs
+directly. `MainMenuState` installs an opaque `LoadingState`; that state
 receives `UpdateContext.runtime_assets` and `UpdateContext.asset_store`, builds
 the `GameDemoState` world from Engine-owned runtime assets (and loads the AI
 archetype catalog through the asset store), and replaces itself with owned
@@ -195,8 +198,8 @@ Default bindings are:
 - Escape for quit (also used as back/cancel inside modal menus such as settings)
 - F2 for the debug overlay
 
-Gameplay code should read movement through `InputState`, usually from the
-`UpdateContext`. App-level commands should stay in `FrameCommands` and engine
+Gameplay code reads movement through `InputState`, usually from the
+`UpdateContext`; app-level commands stay in `FrameCommands` and engine
 coordination code. `State.handleEvent` still receives raw SDL events according
 to `events_below`; input routing only decides whether named actions mutate
 `InputState` or `FrameCommands`.

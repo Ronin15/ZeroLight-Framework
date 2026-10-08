@@ -1,7 +1,8 @@
 # Rendering, Assets, And Shaders
 
-The app uses SDL_GPU directly and does not call Vulkan or Metal APIs itself.
-SDL chooses the backend from the formats and drivers available at runtime.
+The app uses SDL_GPU directly and calls no Vulkan or Metal APIs itself. SDL
+chooses the backend from the formats and drivers available at runtime. Rules:
+`.claude/rules/render.md` and `.claude/rules/assets-audio.md`.
 
 ## Shader Build
 
@@ -49,9 +50,8 @@ To add a new GPU material (shader + pipeline):
 6. Call `create{Name}Pipeline()` in `Renderer.init()`.
 7. Add a bind case to the `switch (group.material)` in `Renderer.endFrame()`.
 
-Rule: game-facing draw calls reference `Material` enum tags only. No SDL_GPU
-handles, pipeline pointers, or shader format strings cross the renderer boundary
-into game code.
+Game-facing draw calls reference `Material` enum tags only; no SDL_GPU handles,
+pipeline pointers, or shader format strings cross the renderer boundary.
 
 ## Sprite Rendering
 
@@ -128,9 +128,8 @@ source rectangles. Tilemap batching follows the same stable-ID model rather than
 creating one texture per tile, storing atlas names in hot gameplay data, or
 persisting live renderer handles/source rectangles in `DataSystem`.
 
-Large sprite, tile, or particle scenes should reserve or surface render-prep and
-sprite-batch capacity before relying on allocation-free render frames. The
-warmed path avoids per-frame allocation only inside the currently reserved
+Large sprite, tile, or particle scenes reserve render-prep and sprite-batch
+capacity ahead of submission. The warmed path avoids per-frame allocation only inside the currently reserved
 ordered-command, prepared-command, vertex, and draw-group capacity.
 
 `drawSprite` never refuses. A submit past the batch's physical capacity grows the
@@ -328,7 +327,7 @@ Gates before interpolation and `PreparedDraw` construction (in order):
 **Simulation tier is not consulted.** Slice 24 LOD (`dormant`/`kinematic`/etc.)
 controls fixed-step processor participation only. Render visibility is camera
 policy only — an on-screen `dormant` row still draws; an off-screen `cognition`
-row does not. Do not add `allowsRender`-style predicates on `SimulationTier`.
+row does not.
 
 **Dense floors (separate cost model):** in-window dense layers submit as a small,
 bounded number of composite tilemap quads (see GPU-Driven Tilemap), not one draw
@@ -469,9 +468,7 @@ Asset paths are relative to the configured asset root and reject empty paths,
 absolute paths, `.` components, and `..` traversal.
 
 PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
-project does not require `SDL3_image`. Do not add `SDL3_image` unless that
-dependency is explicitly chosen for a feature that core SDL3 PNG loading cannot
-reasonably cover.
+project does not use `SDL3_image` (`.claude/rules/engine-design.md`).
 
 The asset cache maps validated relative PNG paths to renderer `TextureId`
 values. Loading the same path decodes PNG data through `AssetStore`, uploads
@@ -481,10 +478,9 @@ texture token; it does not store an `AssetCache` pointer or renderer/backend
 context. It still carries enough identity for the cache to reject stale,
 forged, or wrong-owner releases before retiring a slot. Owners that hold leases
 release them through `AssetCache.releaseTexture(renderer, &lease)` before
-renderer teardown. Gameplay and render prep should store or pass
-`SpriteAssetId`, not paths, `TextureId`, `TextureLease`, or prepared sprite
-records. Cache lookup and retain/release are setup-time operations; per-frame
-rendering should use the startup catalog and retained IDs directly.
+renderer teardown. Gameplay and render prep pass `SpriteAssetId`; cache
+lookup and retain/release happen at setup, and per-frame rendering uses the
+startup catalog and retained IDs directly.
 
 `RuntimeAssets` owns startup sprite leases. Missing declared content marks that
 asset unavailable and keeps startup moving; fatal preload errors release partial
@@ -525,7 +521,7 @@ pipeline module, such as `src/render/gpu/sprite_pipeline.zig` (or
 `tilemap_pipeline.zig` for the storage-buffer example), while keeping `Renderer`
 as the game-facing facade.
 
-Keep shader resource bindings aligned with SDL_GPU's layout rules:
+Shader resource bindings follow SDL_GPU's layout:
 
 - vertex sampled textures/samplers, then storage textures, then storage buffers:
   set 0

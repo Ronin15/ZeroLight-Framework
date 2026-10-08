@@ -14,7 +14,11 @@ native target and do not require an external MinGW or Visual Studio toolchain.
 - `glslc` for GLSL to SPIR-V compilation
 - `spirv-cross` on macOS for SPIR-V to Metal shader conversion
 - `spirv-cross` and `dxc` on Windows for SPIR-V to HLSL to DXIL shader conversion
-- Python 3 plus Pillow for atlas packing, source-art export, and placeholder generation
+- Python 3 for `zig build verify` (`idiom-lint` and `assets-lint` are Python
+  scripts); Pillow as well for atlas packing, source-art export, and
+  placeholder generation
+- `jq` for the Claude Code `zig fmt` hook (`.claude/hooks/zig-fmt.sh` does
+  nothing without it)
 
 The app uses core SDL3 PNG loading through `SDL_LoadPNG`; it does not require
 `SDL3_image`.

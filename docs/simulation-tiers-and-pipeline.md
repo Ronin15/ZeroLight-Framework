@@ -3,11 +3,10 @@
 This document describes the implemented fixed-step simulation support in
 `src/game/simulation.zig`. It is a current-code contract for
 `SimulationFrame`, typed transient streams, structural command publication, and
-domain events. Future pipeline/tier roadmap status belongs in the roadmap
-(index `docs/framework-implementation-slices.md`, one file per slice under
-`docs/roadmap/slices/`; the planned merged `stage_order` is Table T4 in
-`docs/roadmap/tracks/voidlight-port.md`); durable ownership guidance belongs in
-`docs/architecture.md`.
+domain events. Rules: `.claude/rules/simulation.md` and
+`.claude/rules/threading.md`. Roadmap status is in the roadmap (index
+`docs/framework-implementation-slices.md`; the planned merged `stage_order` is
+Table T4 in `docs/roadmap/tracks/voidlight-port.md`).
 
 Related docs:
 
@@ -23,8 +22,8 @@ Related docs:
 
 `simulation.zig` owns state-local transient fixed-step data. The state-owned
 `SimulationPipeline` owns fixed-step processor orchestration and reusable
-systems. Persistent gameplay facts stay in `DataSystem`; app, render, audio,
-SDL, allocator, and thread service ownership stay outside simulation payloads.
+systems. Persistent gameplay facts live in `DataSystem`; app, render, audio,
+SDL, allocator, and thread services are never part of simulation payloads.
 
 The module currently provides:
 
@@ -44,7 +43,7 @@ calls `beginStep()`, runs main-thread input writes, delegates ordered processor
 dispatch to its state-owned `SimulationPipeline`, and applies deferred
 structural commands at the explicit commit point.
 
-`SimulationFrame` is transient. Callers should expect stream contents to be
+`SimulationFrame` is transient. Stream contents are
 valid only for the current fixed step after the producing stage has finished
 and before the next `beginStep()`.
 
@@ -221,11 +220,9 @@ threaded and serial processors:
 5. Finish writes and consume `mergedItems()`.
 
 Output order comes from range index and per-range write order, not worker
-timing or worker IDs. Producers must finish all writes for a stream before any
-later system consumes it.
-
-Writers assert that the producer writes exactly the count it declared. This is
-part of the contract: count and write phases must stay consistent.
+timing or worker IDs. Producers finish all writes for a stream before any
+later system consumes it, and writers assert that the producer writes exactly
+the count it declared.
 
 ## Frame Streams
 
@@ -261,7 +258,7 @@ part of the contract: count and write phases must stay consistent.
   (one range slot per sequential append, same shape as stimuli). Optional
   producers use `tryAppendActionIntent` so a full bus drops cleanly.
 - `intents`: movement intents (`SimulationIntent.movement` only). Non-locomotion
-  producers must use `action_intents` — never dual-write here.
+  producers use `action_intents` instead.
 - `path_requests`: frame-delayed pathfinding requests.
 - `contacts`: collision contacts for same-step response.
 - `collision_triggers`: collision trigger records.
@@ -289,9 +286,9 @@ part of the contract: count and write phases must stay consistent.
   `simulation.zig`). Callers warm `stimuli` to `stimulus_live_capacity` during
   state init (demo/pipeline), not scene-scale-derived counts.
 
-High-volume data should stay in its specialized stream. Do not collapse
-contacts, movement intents, navigation intents, path requests, render-prep
-commands, or structural commands into generic events just for uniformity.
+High-volume data stays in its specialized stream: contacts, movement intents,
+navigation intents, path requests, render-prep commands, and structural
+commands are not events.
 
 Use `reserveStreams`, `reservePathRequests`, `reserveNavigationIntents`, and
 `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
@@ -328,9 +325,8 @@ Current event stages are:
 - `structural_commit`
 - `domain_reaction`
 
-Events carry stable IDs, enum tags, and small value payloads only. They must not
-carry pointers, app/render/audio handles, asset paths, allocators, loaded
-resources, or service references.
+Events carry stable IDs, enum tags, and small value payloads only
+(`.claude/rules/simulation.md`).
 
 World tile and obstacle events carry compact level/cell regions plus old/new
 tile and obstacle flags. They wake explicit reaction points such as pathfinding
@@ -366,9 +362,8 @@ per-frame per-entity data. Dense per-step results — for example AI separation,
 or perception/memory/affect state — belong in component columns or transient
 range streams; only state transitions (such as acquiring or losing a target,
 or a drive crossing a threshold) become events. This keeps the event stream
-bounded and the per-frame data path allocation-free. New signal payloads must
-still follow the scalar-only rule above and emit through the per-range writers
-so merge order stays deterministic.
+bounded and the per-frame data path allocation-free. Emission order rules are
+in `.claude/rules/threading.md`.
 
 ## Structural Commands
 
@@ -468,14 +463,14 @@ pipeline-owned controller modules.
 
 ## Test Expectations
 
-Tests for this module should prove the stream contracts directly:
+Tests for this module prove the stream contracts directly:
 
 - range streams merge in stable range order;
-- range writers must write the declared count;
+- range writers write the declared count;
 - appended ranges preserve existing merged data;
 - event stats are deterministic by type and stage;
 - capacity overflow distinguishes required events from diagnostic drops;
 - structural command commits publish events only after successful `DataSystem`
   mutation;
 - no test-only payload tags or fake stages in production contracts
-  (`docs/coding-standards.md` § Tests).
+  (`.claude/rules/tests-benchmarks.md`).

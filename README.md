@@ -123,7 +123,7 @@ Generated output lives under `zig-out/` and should not be committed.
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
 - [Atlas Asset Workflow](docs/atlas-asset-workflow.md)
 - [Simulation Tiers And Pipeline](docs/simulation-tiers-and-pipeline.md)
-- [Coding Standards](docs/coding-standards.md)
+- [Rules](.claude/rules/) (coding standards, one file per topic)
 - [Roadmap](docs/framework-implementation-slices.md) (implementation slices)
 - [Changelogs](docs/changelogs/) and [module reviews](docs/reviews/)
 

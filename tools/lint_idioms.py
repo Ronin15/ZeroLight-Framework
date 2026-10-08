@@ -159,7 +159,7 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(r"\b(?:pub\s+)?const\s+k[A-Z][A-Za-z0-9]*\b"),
-        "C++-style camelCase `k` constant; use k_snake_case to match the codebase convention",
+        "C++-style camelCase `k` constant; non-type constants are snake_case",
     ),
 ]
 
@@ -176,9 +176,10 @@ SRC_ONLY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # A struct field or function parameter declared camelCase (`ident: Type`). Zig
 # names fields/vars snake_case; callables stay camelCase but are never declared
 # with a leading `ident:` type annotation. Function-pointer-typed fields (type
-# contains `fn (`) are exempt: naming them for the callable they store is a
-# defensible convention and flagging them would push toward snake_case function
-# names. Data fields/params (e.g. `assetStore: AssetStore`) are still caught.
+# contains `fn (`) are skipped because a line regex cannot tell them from
+# callables; they are snake_case by convention (the vtables in `state.zig`) and
+# review checks them. Data fields/params (e.g. `assetStore: AssetStore`) are
+# still caught.
 CAMEL_FIELD_OR_PARAM = re.compile(r"^\s*([a-z][a-z0-9]*[A-Z][A-Za-z0-9]*)\s*:")
 FN_POINTER_TYPE = re.compile(r"\bfn\s*\(")
 

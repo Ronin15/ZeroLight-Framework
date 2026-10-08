@@ -60,13 +60,13 @@ tools/
 
 ## Identity Contract
 
-| Concept | Rule |
+| Concept | Meaning |
 |---------|------|
 | Sprite/tile name | PNG filename without extension (`grass.png` → `"grass"`) |
 | Category | Subfolder under the source root (`terrain_base/grass.png` → `"terrain_base"`) |
 | Atlas handle | Stable `SpriteAssetId` in `manifest.zig` (`.world_tileset`, `.grim_characters`, `.grim_items`) |
 | Grid slot | Position in the order manifest; drives `id`, `column`, `row`, and `x/y` rects |
-| Uniqueness | Names must be **globally unique within an atlas** |
+| Uniqueness | Names are **globally unique within an atlas** |
 
 Gameplay should store stable `SpriteAssetId` values plus numeric tile or atlas
 entry IDs. Names such as `"grass"` or `"adventurer"` are authoring/setup
@@ -87,7 +87,7 @@ guessing grid positions.
 through `RuntimeAssets.preload(...)`. Gameplay reads prepared textures by
 `SpriteAssetId`, and world/entity construction can translate authoring names to
 stable tile or atlas entry IDs through `worldTilesetMeta()` /
-`spriteAtlasMeta(...)`. Every registered metadata sidecar must parse at startup;
+`spriteAtlasMeta(...)`. Every registered metadata sidecar is parsed at startup;
 optional character/item textures may fall back to primitive rendering, but their
 metadata remains required so numeric gameplay IDs can be validated.
 
@@ -232,8 +232,8 @@ exist.
 - `metadata_path` — JSON sidecar
 - `metadata_kind` — loader dispatch (`world_tileset` or `sprite_atlas`)
 
-JSON `atlas.sprite_asset_id` and `atlas.path` must match the manifest entry.
-The metadata loaders call `validateAtlasMetadata` at load time to catch mismatches.
+JSON `atlas.sprite_asset_id` and `atlas.path` match the manifest entry; the
+metadata loaders call `validateAtlasMetadata` at load time to catch mismatches.
 
 ## Validation
 
