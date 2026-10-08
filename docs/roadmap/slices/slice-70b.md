@@ -32,7 +32,7 @@ Goal:
 
 None of this touches Slice 49's `sim_view` or the checksum.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Live code:**
   - `src/app/engine.zig`:
@@ -127,12 +127,14 @@ None of this touches Slice 49's `sim_view` or the checksum.
     `upgradeVNToVN+1` step. The step copies every field and fills
     `video.scene_resolution` from the defaults; part 2 adds the binding
     migration to the same step.
-  - **Version (consistency Table T2).** The relative rule governs. In the
-    merged order this is **v5**: 54 v1, 44 v2 (list-form bindings), 60 v3
-    (`zoom_index`), 67A v4 (keyboard scancodes, freeze rule), 70B v5. Slice
-    67E adds no settings version; a locale setting is deferred
-    ([Deferred By Owner → Full localization](../../framework-implementation-slices.md#deferred-by-owner)) and takes the next version at landing. 67A's freeze rule applies to this step: any
-    upgrade sets `save_requested`.
+  - **Version (consistency Table T2).** Live + 1
+    (`.claude/rules/simulation.md`). In the merged order this is **v5**: 54
+    v1, 44 v2 (list-form bindings), 60 v3 (`zoom_index`), 67A v4 (keyboard
+    scancodes, migration freeze), 70B v5. Slice 67E adds no settings version;
+    a locale setting is deferred
+    ([Deferred By Owner → Full localization](../../framework-implementation-slices.md#deferred-by-owner))
+    and takes the next version at landing. 67A's migration freeze applies to
+    this step: any upgrade sets `save_requested`.
 - **Renderer facade**, all render-owned and main-thread:
   - `sceneResolution() SceneResolution`.
   - `sceneResolutionSupported(mode) bool`: `.drawable` is always true;
@@ -234,8 +236,8 @@ None of this touches Slice 49's `sim_view` or the checksum.
   input is explicitly bound to a different action in the file, the default is
   dropped (`.none` for a pad slot, `SDL_SCANCODE_UNKNOWN` for a keyboard slot,
   since keyboard bindings are scancodes from Slice 67A) with one `debug` log,
-  never rejected. This rule applies to every later settings version, not
-  only v5 (consistency F8).
+  never rejected. The loader applies this to every settings version it
+  reads, not only v5 (consistency F8).
 - **Unchanged (consistency Table T1).** Replay `held_gameplay_bits` record
   Actions, not inputs, so moving pad bindings changes no bit: `attack` stays
   bit 8 (56), `use_item` bit 9 (57), `camera_zoom_in`/`camera_zoom_out` bits
@@ -632,6 +634,8 @@ Nothing scales with world, map, or window size.
     runtime (consistency L3).
   - **Slice 69E:** `presentationViewRect()` states that it uses 70B's tweened
     rendered zoom once 70B has landed (consistency L3).
+- [ ] Add the explicit-beats-default-fill rule to
+      `.claude/rules/input-state.md` when this lands.
 
 ### Acceptance checks
 

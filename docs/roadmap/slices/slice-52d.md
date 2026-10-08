@@ -38,7 +38,7 @@ Out of scope, with owners:
 - AVX2/256-bit paths or a lane-width change: v3 is not a shipping baseline.
 - Vector `atan2`: **Slice 64D** (consumer-gated).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/core/simd.zig` (647 lines, 19 importers):
   - `:8-12` declares `lane_count = 4` and `Float4`/`Int4`/`Uint4`/`Mask4`.
@@ -182,7 +182,7 @@ Out of scope, with owners:
 - There is no rcp/rsqrt estimate anywhere, and no hardware gather.
 - Unaligned `movups` is already optimal. It costs the same as `movaps` on
   aligned data on every v2+ CPU, and MAL column bases are not guaranteed
-  64-byte aligned (`docs/coding-standards.md`). No aligned-load variant.
+  64-byte aligned (`.claude/rules/memory-performance.md`). No aligned-load variant.
 - `equalUint4` is a sign-agnostic `pcmpeqd`. No unsigned *ordered* compare
   exists or is needed. If one is ever added, it costs a sign-flip plus
   `pcmpgtd` on SSE2 (5 ops), `pmaxud`+`pcmpeqd`+not on v2 (4 ops), and one
@@ -388,7 +388,8 @@ pub const UniformDivisor = struct {
 - `sinFloat4`/`cosFloat4` return the matching member.
 - `math.sinCos(angle)` returns lane 0 of `simd.sinCosFloat4(@splat(angle))`.
   This adds a top-level `math → simd` import; the cycle is fine in Zig.
-- The op order is normative. Strict float mode keeps LLVM from reordering it.
+- The kernel's op order is as written below. Strict float mode keeps LLVM
+  from reordering it.
 
 ```zig
 // Cody-Waite pi/2 split: k*pio2_1 exact for |k| < 2^16, k*pio2_2 for |k| < 2^13.
@@ -434,7 +435,7 @@ Documented contract:
 - NaN or ±inf input yields NaN. The NaN sign and payload are unspecified: x86
   produces `0xffc00000`.
 
-Golden bits, normative (inputs → sin, cos):
+Golden bits (inputs → sin, cos):
 
 | input | sin | cos |
 | --- | --- | --- |
@@ -451,8 +452,8 @@ Golden bits, normative (inputs → sin, cos):
 | `0x3f333333` (0.7) | `0x3f24eb73` | `0x3f43ccb2` |
 | `0x40800000` (4) | `0xbf41bdcf` | `0xbf275530` |
 
-If an implementation does not reproduce these bits, its op order differs from
-the spec. Fix the code, do not regenerate the table.
+These are the kernel's golden bits; an implementation that differs has the
+wrong op order.
 
 Determinism impact (flagged): last-bit changes against today's libm/compiler-rt
 values, on 1.87% of inputs, by at most 2 ulp. Affected callers:
@@ -464,8 +465,8 @@ values, on 1.87% of inputs, by at most 2 ulp. Affected callers:
 
 Golden data: no test pins these bits today (scratch suite 1131/1131), and no
 simulation checksum golden exists yet. If Slice 49 lands first, its
-`simulationChecksum` golden values re-baseline in 52D's sin/cos commit, and
-the commit message names that change.
+`simulationChecksum` golden values are re-baselined in 52D's sin/cos commit,
+and the commit message names that change.
 
 **D6. Kept by decision. Each is recorded in a doc comment.**
 - `divFloat4` stays a true division. `spatial_index.zig:640` already relies
@@ -478,15 +479,17 @@ the commit message names that change.
 - The SSE2 integer emulations (`mulInt4` 8 ops, `clampInt4` 10 ops) are
   acceptable on `compat`.
 - No unsigned ordered compare is added.
-- `lerpFloat4`/`dotFloat4` stay sub/mul/add, never FMA.
+- `lerpFloat4`/`dotFloat4` stay sub/mul/add, with no FMA.
 
 **D7. Enforcement.**
-1. **Determinism contract.** A `//!` header on `simd.zig` states the contract:
-   - Only IEEE basic ops and `@sqrt`, exact conversions
+1. **Determinism header.** A `//!` header on `simd.zig` documents what the
+   module, after this slice, is built from and guarantees:
+   - IEEE basic ops and `@sqrt`, exact conversions
      (`@intFromFloat`/`@floatFromInt`), `@floor`, compares, selects, and
-     integer/bit ops.
-   - No `@mulAdd`, no `@setFloatMode`, no estimates, no libm calls.
-   - Every Mask4 helper is `inline`.
+     integer/bit ops only.
+   - No `@mulAdd` or `@setFloatMode` (`.claude/rules/simulation.md`), no
+     estimates, no libm calls.
+   - Every Mask4 helper is `inline` (D1, `MASK_FN_NOT_INLINE`).
    - Results are bit-identical across `x86_64`/v2/v3/`apple_m1`/Debug for
      finite inputs.
    - NaN payload is unspecified.
@@ -705,10 +708,6 @@ only with the new measured table in the commit message.
       `divFloat4`, `reciprocalSqrtFloat4`, `gatherFloat4`, and the
       `floorToI4`/`worldPosToCell4` lowering notes.
 - [ ] **Docs:**
-  - `docs/coding-standards.md` SIMD section (after `:330`): add "SIMD codegen
-    and determinism rules". It covers inline Mask4 helpers, select-form float
-    min/max, no libm builtins in `src/`, no `@mulAdd`/`@setFloatMode`/
-    estimates, and enforcement by `simd-asm-check`.
   - `docs/simulation-tiers-and-pipeline.md`, Determinism Contract (Slice 49's
     section; if 49 has not landed, add a short "Float determinism" note that
     49 merges):
@@ -721,6 +720,7 @@ only with the new measured table in the commit message.
     below.
   - `docs/architecture.md`: one line in the `src/core` section.
   - `CLAUDE.md`: add `simd-asm-check` to the command list.
+- [ ] Add the SIMD codegen and determinism (inline Mask4 helpers, select-form float min/max, no libm builtins or estimates, `simd-asm-check`, cross-target bit identity) rule to `.claude/rules/memory-performance.md` when this lands.
 
 ### Acceptance checks
 

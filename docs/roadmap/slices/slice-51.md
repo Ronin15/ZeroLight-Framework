@@ -38,7 +38,7 @@ Consumer decision:
   to the lane in Slice 65B (front/back double buffer, fence, swap at
   `submit + 30`).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Archive Slice 7 says: "Long-lived async work such as asset streaming or file
   IO should use a separate service later instead of sharing this frame-bounded
@@ -228,18 +228,18 @@ pub const BackgroundLane = struct {
   the lane has no thread (where `complete` runs the job inline). It never runs
   a job and never frees a slot. A stale ticket returns
   `StaleBackgroundTicket`.
-- **Polling rules (the contract other slices reference).**
-  - **Simulation consumers never poll.** They observe a job only through
+- **Polling surface.**
+  - Simulation consumers (replay capture here) observe a job only through
     `complete` at its due step via `background_handoff`, which is what makes
-    outcomes timing-independent.
-  - `isDone` exists only for **app-layer** consumers whose result never enters
-    a running simulation: Slice 46 save-write status, load staging in
+    outcomes timing-independent; they do not call `isDone`.
+  - `isDone` serves **app-layer** consumers whose result never enters a
+    running simulation: Slice 46 save-write status, load staging in
     `LoadingState`, slot scan, and any cold load-time value handoff (for
-    example off-main-thread worldgen).
-  - Review rejects `isDone` in `src/game/simulation*`, pipeline, or controller
-    code, and in any per-step path of a gameplay state.
-  - `stats()` is diagnostics only, for the perf log, and is documented as "must
-    not feed simulation".
+    example off-main-thread worldgen). Its doc comment names these, and no
+    `src/game/simulation*`, pipeline, controller, or per-step gameplay-state
+    code calls it.
+  - `stats()` is diagnostics for the perf log; its doc comment says "must not
+    feed simulation".
 
 **Deterministic step handoff (`src/game/background_handoff.zig`)**
 
@@ -252,10 +252,10 @@ pub fn submitWithHandoff(lane: *BackgroundLane, job: BackgroundJob, submit_step:
 pub fn isDue(pending: PendingBackgroundJob, executing_step: StepIndex) bool; // executing_step >= due_step
 ```
 
-- **Contract.**
+- **Handoff behavior.**
   - A consumer submits from a deterministic simulation point at step `s`, with
-    a fixed per-consumer latency `k`. `k` is a named constant, never derived
-    from measured time or world size.
+    a fixed per-consumer latency `k`: a named constant, not derived from
+    measured time or world size.
   - The consumer completes and applies the result at the start of step `s + k`,
     in the main-thread input phase before `pipeline.update`. Due jobs are
     handled in ascending (`due_step`, submit order).
@@ -266,30 +266,32 @@ pub fn isDue(pending: PendingBackgroundJob, executing_step: StepIndex) bool; // 
 - **Bounds on `k`.** At least 1: a same-step result is just a synchronous call.
   At most 120 steps (2 s): longer work should be split into pieces, and the bound
   also limits how long a slot stays pinned.
-- **Job inputs and outputs.**
+- **Job inputs and outputs** (the `BackgroundJob` doc comment states these;
+  replay capture's job follows them):
   - A job reads only data it owns: an immutable snapshot copied at submit. It
     writes only its own output buffers.
   - The main thread does not touch a job's context between submit and complete.
-  - Jobs never receive a `ThreadSystem`, renderer, SDL handle, or
-    `DataSystem`/`WorldSystem` pointer. A job never calls `parallelFor`; the
-    lane thread is a foreign thread to every `ThreadSystem` and panics there
-    (Slice 50). Data-parallel work on the lane uses a serial code path.
+  - A job context holds no `ThreadSystem`, renderer, SDL handle, or
+    `DataSystem`/`WorldSystem` pointer. The lane thread is a foreign thread to
+    every `ThreadSystem`, so `parallelFor` from a job panics (Slice 50);
+    data-parallel work on the lane uses a serial code path.
   - **Frozen borrow (Slice 65B amendment).** A job may also read a structure
     it does not own when its consumer freezes it from submit until
     `complete`/`cancel` returns; see Slice 65B's "Slice 51 contract
     amendment" for the full clause.
-- **Refusal.** `BackgroundLaneFull` is deterministic. The prescribed fallback is
-  to run the job inline immediately and still apply it at `s + k`, so only the
-  cost moves.
+- **Refusal.** `BackgroundLaneFull` is deterministic. A consumer's fallback
+  (replay capture's included) runs the job inline immediately and still
+  applies it at `s + k`, so only the cost moves.
 - **Pause.** Due steps do not advance while paused. Jobs may finish in the
   meantime, but nothing is applied until the step runs. App-layer work that
   must progress while paused (Slice 46 saves from the pause menu) therefore
   uses `submit` / `isDone` / `complete` directly, never `background_handoff`.
 - **Lifetime.**
-  - Every consumer completes or cancels its tickets in its own `deinit`. States
-    deinit before the lane. Engine-owned app-layer tickets (Slice 46 save/load)
-    are completed in `Engine.deinit` **before** `background_lane.deinit`, so
-    quitting during a save finishes the atomic write instead of dropping it.
+  - Each consumer (replay capture here) completes or cancels its tickets in
+    its own `deinit`. States deinit before the lane. Engine-owned app-layer
+    tickets (Slice 46 save/load) are completed in `Engine.deinit` **before**
+    `background_lane.deinit`, so quitting during a save finishes the atomic
+    write instead of dropping it.
   - Lane `deinit` with outstanding slots is an owner bug. It stops accepting
     work, waits for the running job, and never runs queued jobs, because their
     contexts may already be freed. It counts them in `dropped_on_shutdown`,
@@ -522,13 +524,14 @@ pub fn isDue(pending: PendingBackgroundJob, executing_step: StepIndex) bool; // 
 - [ ] Docs:
   - `docs/architecture.md`: new "## Background Lane" after Thread System
     (ownership, heap-allocated `LaneShared`, thread policy, handoff contract,
-    polling rules and app-layer `isDone`, job rules including no
+    polling surface and app-layer `isDone`, job inputs including no
     `parallelFor`, shutdown and Engine-owned tickets); the Cross-Cutting rule
     naming the lane as the owner for long-lived async work.
   - `docs/simulation-tiers-and-pipeline.md` Determinism Contract: the handoff
     rule.
   - `docs/development-workflow.md`: `-Dreplay-capture-dir`, where files land,
     and `background-lane` added to the Thread Sanitizer group list.
+- [ ] Add the background lane (polling, step handoff, job inputs, refusal fallback, pause, ticket lifetime) rule to `.claude/rules/threading.md` when this lands.
 
 ### Acceptance checks
 

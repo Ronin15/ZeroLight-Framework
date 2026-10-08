@@ -12,7 +12,7 @@ result against a committed baseline with fixed regression thresholds, and
 fails on regression. Release tags must pass it before Steam `staging` is
 promoted to `default`.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/benchmarks/suite.zig`:
   - `Options` (`:38-47`) and `parseOptions` (`:411`).
@@ -48,7 +48,7 @@ promoted to `default`.
 - `docs/development-workflow.md`.
 
 There is no production `src/` change. All numbers come from `zig build bench`
-(coding-standards § Benchmarks), driven through `bench_run.py`.
+(`.claude/rules/tests-benchmarks.md`), driven through `bench_run.py`.
 
 **Machine-readable records (`suite.zig`):**
 - New `Options.records: bool = false`, set by `--records` (also listed in
@@ -62,7 +62,7 @@ There is no production `src/` change. All numbers come from `zig build bench`
 
 - Formatting is a pure `formatRecordLine(writer, group_name, result)` over
   `std.Io.Writer`. Tests sit in `suite.zig`'s own test block, against
-  hand-built `CaseResult` stubs (allowed by coding-standards § Benchmarks for suite utilities):
+  hand-built `CaseResult` stubs (allowed by `.claude/rules/tests-benchmarks.md` for suite utilities):
   - a measured line golden;
   - a skipped line golden;
   - `parseOptions(&.{"--records"})` sets the flag.
@@ -92,8 +92,8 @@ row yields `serial-direct` and `thread-adaptive-tuned-range`.
 - `improvement_notice = 0.10`. An improvement of 10% or more prints "consider
   promoting the baseline" and never fails.
 
-These are fixed numbers, and the thresholds are never raised. The noise
-ladder has exactly two rungs and a terminal outcome:
+These are fixed constants; noise is handled by the ladder, not by changing
+a threshold. The noise ladder has exactly two rungs and a terminal outcome:
 1. `perf_repetitions = 3` (default).
 2. If any row's noise exceeds half its threshold, `perf_repetitions = 5` for
    every row, then re-run the noise check.
@@ -133,9 +133,9 @@ pinned runs only execute the cached bench binary.
   - Otherwise it prints a table (row, baseline, candidate, delta%, verdict).
   - It exits 1 on any regression and 0 otherwise.
 - `promote --from <summary> --to perf/baselines/zl-perf-ref.txt`: copies the
-  file and adds the commit, date, and kernel to the header. A human commits it
-  in a PR whose description justifies the change. CI never writes the
-  baseline.
+  file and adds the commit, date, and kernel to the header. The promoted file
+  lands through a PR whose description justifies the change; `perf.yml` has
+  no write path to the baseline.
 - `--self-test`: synthetic summaries covering a pass, a 12% regression on a
   system row, a 6% regression on `frame-battle`, a sub-floor delta, a header
   mismatch (exit 2), and median selection. Appended to `tools-selftest`.
@@ -202,6 +202,8 @@ pinned runs only execute the cached bench binary.
       policy, the "trend data vs authoritative" distinction replacing 52C's
       sentence), the Release Checklist line, and the frame-battle row in the
       roadmap control table sourced from this runner.
+- [ ] Add the perf-gate threshold and baseline-promotion rule to
+      `.claude/rules/build-validation.md` when this lands.
 
 ### Acceptance checks
 
@@ -210,8 +212,8 @@ pinned runs only execute the cached bench binary.
       its threshold (frame-battle < 2.5%, others < 5%), and the maximum
       deltas are recorded in the docs. If any row exceeds half its threshold,
       apply the noise ladder above (5 repetitions, then removal of the row
-      from `GATE` with its recorded noise). The thresholds are never
-      raised.
+      from `GATE` with its recorded noise). The thresholds stay at their
+      constants.
 - [ ] `perf_gate.py --self-test` covers the 12% / 6% regression exits and the
       header-mismatch exit 2.
 - [ ] With `boost=1`, preflight fails with "runner not in reference state".

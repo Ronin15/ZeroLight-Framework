@@ -19,7 +19,7 @@ calendar clock, and it does so inside the clock's only writer
 snapshot diff. Every other system's behavior across a skip is decided and
 deterministic. Replays reproduce a skip from the recorded input bit.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Slice 59 (planned).**
   - `WorldClock.game_ms: u64` is written only by `environment_update`.

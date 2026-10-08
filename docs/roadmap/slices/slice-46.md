@@ -1,6 +1,6 @@
 ## Slice 46: Save/Load Persistence
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 49](slice-49.md), [Slice 51](slice-51.md), [Slice 53B](slice-53b.md), [Slice 54](slice-54.md), [Slice 64B](slice-64b.md), [Slice 64E](slice-64e.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 49](slice-49.md), [Slice 51](slice-51.md), [Slice 53B](slice-53b.md), [Slice 54](slice-54.md), [Slice 64B](slice-64b.md), [Slice 64G](slice-64g.md) (per-chunk save sections) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: not started.** Completes the design intent from archive **Slice
 10** (`DataSystem` as the save/load streaming boundary). Depends on Slice 49
@@ -8,9 +8,9 @@
 (background lane; inline fallback when threadless), Slice 53B (widgets,
 `ConfirmDialogState`), and Slice 54 (`UserStorage`: pref dir + atomic
 write). Independent of Slice 44: settings and input bindings belong to
-Slice 54 and are never in a save. Every later slice that adds a
-`DataSystem`/`WorldSystem` field classifies it in Slice 49's completeness
-lists and adds its save section here in the same change. The merged order
+Slice 54, and the save format has no section for them. The format covers
+every `DataSystem`/`WorldSystem` field in Slice 49's completeness lists at
+landing, one save section per classified field. The merged order
 also places it after **Slice 64B** (it saves exactly 64B's hashed set and
 writes 64B's `buildFingerprint()`) and **Slice 64E** (load-time link-slot
 validation); when **Slice 65B** has landed, its mid-job trace test is part of
@@ -23,7 +23,7 @@ into one of `k_save_slot_count = 8` manual slots with readable metadata, through
 a Save/Load menu on 53B widgets, and file I/O never blocks the main thread when
 the background lane has a thread.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `DataSystem` holds default-initialized SoA stores (`movement_bodies`,
   `facings`, `asset_refs`, `collision_*`, `ai_agents`, `steering_agents`,
@@ -55,7 +55,7 @@ the background lane has a thread.
 
 - Serialize by **stable asset IDs, entity slot + generation, and enum/scalar
   columns** — never file paths, live SDL/GPU/mixer handles, or prepared draw
-  records (coding-standards § Assets And Persistent Data). This is what makes `DataSystem` the correct
+  records (`.claude/rules/simulation.md`). This is what makes `DataSystem` the correct
   boundary rather than the renderer or asset layer.
 - Versioned container: header (magic + format version) and per-store
   length-prefixed sections; strict validation on load (reject unknown version,
@@ -148,7 +148,7 @@ the background lane has a thread.
     `state.zig:457-466`).
   - `State.VTable` gains a required `capture_save: *const fn (*anyopaque,
     *SaveCapture) anyerror!bool`. Menus return `false`. No `@hasDecl` gating
-    (`docs/coding-standards.md:48-51`).
+    (`.claude/rules/zig-style.md`).
 - **Encoding.**
   - Runs on the main thread at the paused quiescent point. Save is offered
     only from the pause menu, so no update is in flight and no structural
@@ -247,7 +247,7 @@ the background lane has a thread.
       confirm flows. `playtime_steps` from the persisted `step_count`.
 - [ ] Bench groups `save-encode` and `save-decode` (one group per workload,
       `suite.zig` convention) on a mid-size fixture.
-- [ ] Save buffer capacity (coding-standards § Budgets, Capacities, And Thresholds): `encodedSaveBytes`
+- [ ] Save buffer capacity (`.claude/rules/budgets-capacities.md`): `encodedSaveBytes`
       equals the bytes `encode` writes for a hand-built minimal fixture
       (including an empty store), and with `std.testing.FailingAllocator`
       installed after the one reserve, `encode` allocates nothing. A load
@@ -260,6 +260,8 @@ the background lane has a thread.
 - [ ] Docs: `docs/architecture.md` records the save/load boundary contract
       (what is persisted, by which stable identifiers, and what is deliberately
       excluded).
+- [ ] Add the new-field save-section rule to `.claude/rules/simulation.md`
+      when this lands.
 
 **Added by Slice 64 — `WorldSystem.clock.game_ms` and `level_sky_exposed`** (lands with
 whichever of 46 and 59 lands second):

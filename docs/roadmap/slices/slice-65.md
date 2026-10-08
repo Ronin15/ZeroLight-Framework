@@ -2,6 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 50](slice-50.md), [Slice 51](slice-51.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
+**Status: not started (umbrella over 65A, 65B, 65C).**
+
 Slice 65 is split into three subslices. Each one verifies on its own and has
 different prerequisites:
 

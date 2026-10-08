@@ -21,7 +21,7 @@ block is left in Scaling Gaps.
 | **67C** | Save slot presentation: world-only GPU thumbnail capture, a header-only save `format_version` bump (relative; v2 in the merged order: thumbnail section plus slot name), slot-list thumbnails, `text_field` widget with IME composition and the `SDL_StartTextInput` lifecycle | 46, 60, 67A |
 | **67E** | Localization roots: comptime `StringId` registry with per-ID arg counts, one compiled-in English table, `text(id)` and an English-only fixed-buffer `format(id, args, out)`, every existing UI string migrated (byte-identical English), a written (not linted) UI text rule; no settings field or version | 53B (merged order: after 67C) |
 
-**Contracts shared by every 67 sub-slice (settled):**
+**Design shared by the 67 sub-slices (settled):**
 
 - **No simulation surface.** 67 adds no `StageId`, `PipelineResource`,
   `stage_order` entry, `Component` tag, `SeedDomain`, or persistent
@@ -58,10 +58,10 @@ block is left in Scaling Gaps.
   };
   ```
 
-- **Allocation.** Every per-event and per-frame 67 path allocates nothing. UI
-  state lives in fixed arrays inside `UiScreen` / `EventLog` /
-  `MenuRepeat` / `TextInputController`. Each sub-slice ships its own
-  `std.testing.FailingAllocator` proofs (listed in its Checklist).
+- **Allocation.** Per-event and per-frame 67 paths are allocation-free
+  (`.claude/rules/memory-performance.md`). UI state lives in fixed arrays
+  inside `UiScreen` / `EventLog` / `MenuRepeat` / `TextInputController`. Each
+  sub-slice lists its `FailingAllocator` proofs in its Checklist.
 
 ### Cross-slice additions (folded into the owning slices)
 
@@ -71,13 +71,18 @@ block is left in Scaling Gaps.
 | [53B](slice-53b.md) | Text input / pointer / tooltips / event log owned by 67A/67B/67C; VoidLight mouse line → 67A |
 | [44](slice-44.md) | Scancodes are 67A (v4); `RebindCaptureState` repeat/stick-press rule (Checklist) |
 | [46](slice-46.md) | No-thumbnail note → 67C header-only bump + `SaveNameDialogState`; `render_below = true` requirement |
-| [54](slice-54.md) | Load freeze rule (`save_requested` after an upgrade) |
+| [54](slice-54.md) | Load migration freeze (`save_requested` after an upgrade) |
 | [56](slice-56.md), [57](slice-57.md), [59](slice-59.md), [61](slice-61.md), [63](slice-63.md) | Event-log feed arms per 67B (Checklist); 63's stats/event-log consumer text |
 | [56](slice-56.md), [56B](slice-56b.md), [57](slice-57.md), [57B](slice-57b.md), [59](slice-59.md), [60](slice-60.md), [61](slice-61.md), [62](slice-62.md), [63](slice-63.md) | `StringId` / English `StringSpec` / `strings.format` item when landing after 67E |
 | [56](slice-56.md), [57](slice-57.md), [69C](slice-69c.md) | Keyboard defaults are `SDL_SCANCODE_*` after 67A |
 | [67A](slice-67a.md) | `UiTooltipTooLong` kept by 67E (measures the resolved English hint) |
 | [70B](slice-70b.md) | 67C gpu-smoke thumbnail probe per `scene_resolution` mode |
 
-Standing rules for every later slice: a new `SimulationEventPayload` arm adds
-its `event_log_feed.lineFor` line or `=> null` in the same change; a new
-`Action` adds its `action_<name>` `StringId` through `actionNameId`.
+Coverage: 67B's `event_log_feed.lineFor` has a line or `=> null` for every
+`SimulationEventPayload` arm, and 67E's `actionNameId` maps every `Action` to
+its `action_<name>` `StringId`.
+
+### Checklist
+
+- [ ] Add the event-log line and action-name `StringId` coverage rule to
+      `.claude/rules/render.md` when this lands.

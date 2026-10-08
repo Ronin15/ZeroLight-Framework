@@ -17,7 +17,7 @@ Goal:
 - The new `frame-battle` bench gives one reproducible full-frame number at the
   production battle-scale population.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `.github/` holds only `CODEOWNERS` and `FUNDING.yml`; there are no
   workflows. VoidLight has none either.
@@ -144,7 +144,7 @@ Goal:
     - `frame-battle --iterations 36000`: 10 minutes of 60 Hz simulation per
       case, the deterministic battle soak.
     - The full suite with `--profile stress`. This is the one sanctioned
-      full-suite run: coding-standards § Benchmarks allows a full-suite sweep only
+      full-suite run: `.claude/rules/tests-benchmarks.md` allows a full-suite sweep only
       when a slice names it, and this slice names this one.
     - A serial-versus-threaded digest check: one `frame-battle` run with
       `--case thread-adaptive-tuned-range`. The suite adds the `serial-direct`
@@ -227,10 +227,11 @@ Goal:
     - CI asserts, in `soak-bench.yml`, that `serial-direct` and
       `thread-adaptive-tuned-range` produce equal digests within one run, and
       that `compat` and `ship` produce equal digests.
-    - A mismatch is a determinism defect. Route it to
-      **zig-debug-specialist** before 52C closes; never widen the check.
+    - A mismatch fails the job. 52C closes only with equal digests: the
+      mismatch is diagnosed (**zig-debug-specialist**) and fixed at its
+      cause, and the assertion stays exact equality.
   - Internal `std.debug.assert`s cover the population and frame-stream
-    capacities, as coding-standards § Benchmarks requires for bench-fixture correctness. No
+    capacities, as `.claude/rules/tests-benchmarks.md` requires for bench-fixture correctness. No
     `zig build test` code calls this file.
   - **Cost:** the default `zig build bench` run includes frame-battle. In
     Debug, that adds a production world build per case. This is documented.
@@ -584,6 +585,7 @@ jobs:
     reference machine).
   - Mark the 0.17 changelog's Windows `test`/`bench` residual as closed by
     CI. `run` and `gpu-smoke` on a real Windows host stay manual.
+- [ ] Add the determinism mismatch handling rule to `.claude/rules/simulation.md` when this lands.
 
 ### Acceptance checks
 

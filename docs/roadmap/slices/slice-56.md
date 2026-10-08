@@ -25,7 +25,7 @@ equipment modifiers (57 adds them as an optional input), knockback and
 retaliation memory (Slice 68B), loot (57), stamina, status effects, regen,
 game-over flow.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Action bus: `ActionKind` / `ActionIntent` / `action_intent_live_capacity = 64`
   (`src/game/simulation.zig:478-501`); `ensureActionIntentAppendCapacity`,
@@ -157,7 +157,7 @@ pinned here.
   save sections, same change): `HealthStore` and `CombatStatsStore` are hashed
   MALs with their own save sections. `AiAffect.appraised_damage_total` is
   covered by the existing `ai_affects` MAL. The player `attack_held_last` latch
-  is controller state, excluded under Slice 49's rule (listed in its
+  is controller state, excluded per Slice 49's classification (listed in its
   "Controller state in the checksum" gap).
 
 **Authoring.**
@@ -238,7 +238,7 @@ into explicit-target action intents. This slice lands the `.attack` arm.
     closest point of the target's collision AABB is `<= attack_range²`.
     Missing bounds means the body position with zero extent.
 - Deterministic emit follows the capped partitioned-emitter rule
-  (`docs/coding-standards.md:136-148`):
+  (`.claude/rules/threading.md`):
   1. Pass 1 runs threaded ranges over the think set (adaptive tuner with a
      serial fallback). It writes a per-row `target` into a system-owned row
      scratch and records per-range counts.

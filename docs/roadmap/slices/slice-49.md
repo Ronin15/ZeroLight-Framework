@@ -2,20 +2,22 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** Render→sim scope decoupling (defect 1) landed
-2026-10-05; seed, checksum, and replay work remain open. No open prerequisite. Land first among the new
-gameplay slices: every later one derives its seed and its scope band from this
-slice's contracts.
+**Status:** In progress: render→sim scope decoupling landed; seed, checksum,
+replay, harness, bench, and docs are open.
+
+No open prerequisite. Lands first among the new gameplay slices: it delivers
+the session seed, the `SeedDomain` registry, the checksum, and the
+`simViewRegion` scope band that later gameplay slices consume.
 - Prerequisite for **51**: its first lane consumer streams this slice's replay
   format.
 - **46** (save/load) reuses the checksum as its same-build oracle and persists
   `seed.root` (see "Slice 46 coordination").
 - **52C** uses `simulationChecksum()` as its `frame-battle` digest.
-- **55** and **62** read scope bands only through this slice's
-  `simViewRegion(context)`. **60** supplies the `sim_view` rect by changing the
-  body of `GameDemoState.simViewRect()`.
-- **56, 57, 58, 59, 61, 62** each append one reserved `SeedDomain` tag when they
-  land (registry below).
+- **55** and **62** read scope bands through `simViewRegion(context)`. **60**
+  supplies the `sim_view` rect by changing the body of
+  `GameDemoState.simViewRect()`.
+- **56, 57, 58, 59, 61, 62** hold reserved `SeedDomain` values (registry
+  below).
 - This slice adds one field to `src/app/thread_system.zig`. **50** edits the
   same file, so whichever slice lands second rebases.
 
@@ -30,7 +32,7 @@ checksums. Which entities participate in the simulation no longer depends on
 render timing.
 
 In scope: the seed type and its plumbing, `SimulationChecksum`, the render→sim
-scope decoupling (a live determinism defect, described below), the replay format
+scope decoupling (defect 1 below), the replay format
 with an in-memory recorder and a verifier, `ThreadSystemConfig.adaptive`, the
 determinism tests, a checksum bench, and docs.
 
@@ -44,7 +46,7 @@ Out of scope, with owners:
   deferred nav state is part of `PathfindingSystem`, which Slice 64B
   classifies `normalized` (never hashed, never saved).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/core/rng.zig:21` `mix64(seed, entity_index, step, salt)` is a stateless
   splitmix64-style mixer. Built on it: `:39` `uniformF32`, `:48` `boundedU32`,
@@ -95,24 +97,11 @@ Out of scope, with owners:
     already drives the real `GameDemoState.update` with a hand-built
     `UpdateContext`.
 
-**Defects found while grounding this slice (fixed or recorded here):**
+**Determinism defects:**
 
-1. **Render→sim coupling (fixed in this slice).** `GameDemoState.render`
-   (`game_demo_state.zig:575`) writes the world visibility window from the
-   **interpolated** camera. The interpolation alpha depends on the wall clock.
-   The pipeline then derives simulation participation from that window in two
-   places:
-   - `stageScopeAdvanceAndAiGather` → `world.cognitionActiveRegion`
-     (`simulation_pipeline.zig:1057` → `world_system.zig:1592` →
-     `visibleChunkRegion`, `:1576`).
-   - `stageTierPolicy` → `world.visibleChunkRegion()`
-     (`simulation_pipeline.zig:1298`).
-
-   So which agents think, and which tier commands get queued, depends on frame
-   pacing and on how many fixed updates ran between renders
-   (`TimeLoop.max_updates_per_frame = 5`). Headless tests never render, so they
-   hide this. A live recording could never verify. It also breaks the settled
-   policy boundary "render visibility controls draw-record construction only".
+1. **Render→sim coupling (fixed).** Simulation scope used to derive from the
+   render visibility window, which follows the wall-clock-interpolated camera;
+   it now comes from the fixed-step `sim_view` (section 3).
 2. **Pause/resume mutates sim-visible state (recorded, not changed).**
    `onPause`/`onResume` call `syncInterpolatedState`
    (`game_demo_state.zig:606-619`), which runs
@@ -183,10 +172,10 @@ pub const SimulationSeed = struct {
   time-based seeding. A random per-session root belongs to Slice 64C, which
   chooses the root once on the main thread at session creation and records it
   in the replay header and the save.
-- **`SeedDomain` tag values** are explicit and append-only. Renumbering a domain
-  would silently change every recorded replay and save. This slice lands exactly
-  `ai_wander = 1` and `worldgen_procedural = 2`. Later slices append one tag each
-  **when they land**, with these reserved values:
+- **`SeedDomain` tag values** are explicit and append-only: renumbering a
+  domain would silently change every recorded replay and save. This slice
+  lands exactly `ai_wander = 1` and `worldgen_procedural = 2`. Reserved values,
+  each appended by its slice:
 
   | Value | Tag | Slice |
   | --- | --- | --- |
@@ -197,17 +186,17 @@ pub const SimulationSeed = struct {
   | 7 | `harvest` | 61 |
   | 8 | `population` | 62 |
 
-  - No placeholder tags. Value gaps are allowed, and a value is never reused.
-  - Each consumer derives its seed once, at `SimulationPipeline.init`, as
-    `self.seed.derive(.x)`, never per step. No consumer mixes a raw salt into
-    the root (`rng.mix64(root, 0, 0, salt)` is not a derivation).
+  - The enum carries no placeholder tags. Value gaps are allowed; a value is
+    never reused.
+  - The AI wander consumer derives its seed once, at `SimulationPipeline.init`,
+    as `self.seed.derive(.ai_wander)`, never per step, and mixes no raw salt
+    into the root (`rng.mix64(root, 0, 0, salt)` is not a derivation).
   - Worldgen field seeds (elevation, moisture, veins, and so on) are internal
     derivations of `WorldBuildConfig.seed` (the `.worldgen_procedural` value),
     not domains.
-  - Exempt from session seeding, and named in the Determinism Contract:
-    presentation-only streams (Slice 60 camera shake, Slice 59 weather-particle
-    placement) and fixed load-spread schedule hashes (Slice 55
-    `decision_coast_phase_seed`).
+  - Exempt from session seeding (section 2): presentation-only streams (Slice
+    60 camera shake, Slice 59 weather-particle placement) and fixed load-spread
+    schedule hashes (Slice 55 `decision_coast_phase_seed`).
 - **`deriveSubSeed(root, domain)`** is a splitmix64 finalizer over
   `root ^ (@as(u64, domain) *% 0x9e3779b97f4a7c15)`. It is pure and documented.
   Its result depends only on `(root, domain)`, never on call order.
@@ -240,8 +229,10 @@ pub const SimulationSeed = struct {
     tools that build worlds directly keep their own literals. `WorldSystem`
     does not learn about sessions.
 
-**2. Determinism contract.** This is normative. It is documented in a new
-`docs/simulation-tiers-and-pipeline.md` section, "## Determinism Contract".
+**2. Determinism contract.** The guarantee this slice's harness proves,
+documented in a new `docs/simulation-tiers-and-pipeline.md` section,
+"## Determinism Contract". The base guarantee and simulation inputs are in
+`.claude/rules/simulation.md` § Determinism; this slice pins its scope.
 
 - **Guarantee.** Hold these fixed:
   - the same executable: same target triple, CPU feature set, Zig/compiler-rt
@@ -269,34 +260,30 @@ pub const SimulationSeed = struct {
     `math.atan2` is implemented in Zig.
   - Cross-machine determinism (lockstep play, shared replays) needs
     deterministic trig: **Slice 52D** (sin/cos) and **Slice 64D** (atan2).
-- **Simulation rules.**
-  - No wall-clock value, worker ID, `BatchStats` or tuner state, or render state
-    may feed simulation state.
-  - SIMD and scalar-tail paths must produce bit-identical per-item results.
-    Today they use IEEE operations only, so they do.
-  - If the harness finds a partition-dependent processor, fix it in its owning
-    module and add a serial-vs-threaded parity test there. Never weaken the
-    harness instead.
+- **Simulation inputs.**
+  - Wall-clock, worker-ID, tuner, and render inputs:
+    `.claude/rules/simulation.md` § Determinism.
+  - SIMD and scalar-tail paths produce bit-identical per-item results. Today
+    they use IEEE operations only, so they do.
+  - A partition-dependent processor the harness finds is fixed in its owning
+    module with a parity test (`.claude/rules/simulation.md` § Determinism);
+    the harness is not weakened.
   - Every sim-affecting random stream derives from `SimulationSeed` through a
     registered `SeedDomain`. **Named exemptions** (fixed literals, not varied by
     the session seed, still deterministic):
     - presentation-only streams that never feed simulation state: Slice 60
       camera shake, Slice 59 weather-particle placement;
     - fixed load-spread schedule hashes: Slice 55 `decision_coast_phase_seed`.
-
-    A new exemption is added to this list in the slice that introduces it.
-  - Simulation scope (participation, tiers, coast bands, spawn bands) comes
-    only from the fixed-step `sim_view` through `simViewRegion` (section 3),
-    never from the render visibility window.
+  - Simulation scope comes from the fixed-step `sim_view` through
+    `simViewRegion` (section 3; `.claude/rules/simulation.md` § Scope and
+    tiers).
 
 **3. Render→sim decoupling (defect 1)**
 
-- Add `SimulationPipelineUpdateContext.sim_view: ?Rect = null`. It is the
-  fixed-step camera rect the simulation uses for scope. `null` keeps today's
-  full-active fallback for bare-world pipeline tests that never set a window.
-  (Branch-review follow-up: `sim_view` is now a required `Rect`; tests pass a
-  full-world-extent rect, and only a chunkless world yields the null-region
-  full-active fallback.)
+- Add `SimulationPipelineUpdateContext.sim_view: Rect` (required). It is the
+  fixed-step camera rect the simulation uses for scope. Tests pass a
+  full-world-extent rect; only a chunkless world yields the null-region
+  full-active fallback.
 - Add `pub fn chunkRegionForWorldRect(self: *const WorldSystem, rect: Rect,
   overscan_chunks: u16) ?ActiveRegion`. It is pure and returns `null` when
   `chunks.len == 0`. Factor the tile/chunk math out of
@@ -320,13 +307,12 @@ pub const SimulationSeed = struct {
   `camera_current` is the fixed-step camera that `updateCamera` computes from the
   player body at the end of the previous step, so it is deterministic. Render
   keeps calling `setVisibleChunksForWorldRect`, for draw culling only.
-- **Shared scope-band helper (the sim-view contract other slices reference).**
-  Add the private helper
+- **Shared scope-band helper.** Add the private helper
 
   ```zig
   fn simViewRegion(context: SimulationPipelineUpdateContext) ?ActiveRegion {
       var region = context.world.chunkRegionForWorldRect(
-          context.sim_view orelse return null,
+          context.sim_view,
           sim_view_overscan_chunks,
       ) orelse return null;
       region.level = context.player.current_level;
@@ -334,13 +320,14 @@ pub const SimulationSeed = struct {
   }
   ```
 
-  - `stageTierPolicy` uses it. Every later scope-band reader must call this
-    helper: Slice 55 `ai_decide_gather`, Slice 62 `population_update`.
-  - `GameDemoState.simViewRect()` is the only sim-view source. Slice 60 changes
-    only its body (to `camera_rig.anchorRect()`).
-  - No slice adds a second anchor store or a `PipelineResource` for the sim
-    view. `sim_view` stays a borrowed update-context input.
-  - A `null` `sim_view` returns `null`, which keeps every existing null-region
+  - `stageTierPolicy` uses it; Slice 55 `ai_decide_gather` and Slice 62
+    `population_update` read scope bands through it
+    (`.claude/rules/simulation.md` § Scope and tiers).
+  - `GameDemoState.simViewRect()` is the single sim-view source; Slice 60
+    changes only its body (to `camera_rig.anchorRect()`).
+  - The sim view has no anchor store and no `PipelineResource`; `sim_view` is a
+    borrowed update-context input.
+  - A chunkless world returns `null`, which keeps every existing null-region
     fallback (full active, no stagger filter, no coasting).
 - **Migrating existing window-setting pipeline tests.** The two tests that set a
   window before `pipeline.update` use different overscans today:
@@ -376,10 +363,10 @@ pub const StateHasher = struct {
   - It is what the repo's test-local precedent uses.
 - **Not a persisted identifier.** Wyhash's output may change across Zig
   releases, and the checksum layout changes with `checksum_format_tag`, so this
-  checksum is a same-build equality oracle only. It is never persisted as an
-  identifier that outlives the build:
-  - nothing may reject data, or treat it as corrupt, because a checksum stored
-    by a different build differs;
+  checksum is a same-build equality oracle only, not an identifier that
+  outlives the build:
+  - no consumer rejects data, or treats it as corrupt, because a checksum
+    stored by a different build differs;
   - a stored copy (Slice 46's `sim_checksum`) is compared only when the stored
     `build_fingerprint` matches the running build (see "Slice 46
     coordination");
@@ -401,8 +388,8 @@ pub const StateHasher = struct {
     - `enum` → `@backingInt` widened to `u32`;
     - `?T` with `T` an int or enum → a presence `u8` plus the value (or 0).
   - **Anything else** →
-    `@compileError("StateHasher: no fold rule for " ++ @typeName(T))`. A new
-    column type forces an explicit decision.
+    `@compileError("StateHasher: no fold rule for " ++ @typeName(T))`, so a
+    column type outside this table fails compilation.
 - **Sections.** `beginSection(name, len)` hashes the name bytes and `len` as a
   `u64`, so rows cannot alias across sections.
 - **`multiArrayList`.** Iterates the `std.meta.FieldEnum(Row)` tags in
@@ -416,7 +403,7 @@ pub const StateHasher = struct {
 pub const checksum_format_tag = "zl-sim-checksum-v1";
 pub const ChecksumInput = struct {
     seed: SimulationSeed,
-    step: StepIndex, // u64; hashed as u64 in "header" (Slices 68A–68C addition)
+    step: StepIndex, // u64; hashed as u64 in "header"
     data: *const DataSystem,
     world: *const WorldSystem,
     player: Player,
@@ -424,7 +411,7 @@ pub const ChecksumInput = struct {
 pub fn compute(input: ChecksumInput) u64;
 ```
 
-The order below is fixed. Changing it is a format change: bump
+The section order below is part of the checksum format; changing it bumps
 `checksum_format_tag`.
 
 1. **Section `"header"`**: `checksum_format_tag`, `seed.root`, and `step`
@@ -450,11 +437,10 @@ The order below is fixed. Changing it is a format change: bump
      uses. Each name must be in `checksum_hashed_fields` or in
      `checksum_excluded_fields = .{"allocator"}`. A new field fails compilation
      until someone classifies it.
-   - **Classification rule for later slices.** Every later slice that adds a
-     `DataSystem` or `WorldSystem` field classifies it here (hashed, or excluded
-     with a reason) **and** adds its Slice 46 save section in the same change.
-     A column type with no fold rule (for example `?bool`) is changed to a
-     foldable type (an explicit enum) rather than given a new fold rule.
+   - **Classification.** Each `DataSystem` or `WorldSystem` field is listed
+     here as hashed or excluded with a reason, and has a matching Slice 46 save
+     section. A column type with no fold rule (for example `?bool`) becomes a
+     foldable type (an explicit enum) rather than gaining a new fold rule.
 3. **`world.hashSimulationState(&hasher)`**:
    - **Hashed**: `width`, `height`, `tile_size`, `chunk_size_tiles`,
      `level_base_z`, `level_links` (field by field), `dense_layers` (MAL rows;
@@ -502,8 +488,8 @@ Further notes:
   - all adaptive tuners; `SimulationFrame` streams (transient);
   - particles (effect state).
 
-  Whichever slice makes one of these persistent (46, or the controller's own
-  slice) adds it here under a bumped `checksum_format_tag`, in the same change.
+  One that becomes persistent (in 46, or the controller's own slice) joins the
+  checksum under a bumped `checksum_format_tag`.
 - **Cost.** Serial, on the main thread, cold paths only: tests, replay
   checkpoints (record and verify), and Slice 46's round trip. It never runs in
   the normal frame loop. The bench gate below measures it. Slice 64B hashes
@@ -556,10 +542,10 @@ comptime { std.debug.assert(@sizeOf(ReplayInputFrame) == 8); }
   bits 0–7: bit0 `move_left`, 1 `move_right`, 2 `move_up`, 3 `move_down`,
   4 `dig_hole`, 5 `dig_ramp`, 6 `dig_down`, 7 `interact`.
   - The field is `u16` now, so the gameplay actions planned by later slices fit
-    without a format bump. Reserved bit values, appended by the slice that adds
-    the action, in the same change: **8 `attack` (56), 9 `use_item` (57),
+    without a format bump. Reserved bit values, each pinned by the slice that
+    adds the action: **8 `attack` (56), 9 `use_item` (57),
     10 `camera_zoom_in` (60), 11 `camera_zoom_out` (60), 12 `rest` (69C).**
-  - Bits not in the pinned table must be 0 (in v1 files, bits 8–15). `decode`
+  - Bits not in the pinned table are 0 (in v1 files, bits 8–15). `decode`
     rejects a set unpinned bit with `InvalidReplayFrame`. Appending a bit needs
     no version bump: an older binary rejects the newly set bit as unpinned,
     which is correct for a same-binary format.
@@ -576,8 +562,8 @@ comptime { std.debug.assert(@sizeOf(ReplayInputFrame) == 8); }
 - **`flags`**: bit0 is `resync_before_step` (defect 2; renamed
   `pause_boundary_before_step` by Slice 64A). It means `onPause` or
   `onResume` ran since the previous recorded step, and the verifier replays the
-  resync before that step. Bits 1-7 must be 0. Appending a flag bit needs no
-  version bump (pinned-bit rule); Slice 69F pins bit1
+  resync before that step. Bits 1-7 are 0. Appending a flag bit needs no
+  version bump, as for held bits; Slice 69F pins bit1
   `normalized_before_step` (Table T1 in the
   [VoidLight port track](../tracks/voidlight-port.md)).
 - **`reserved`** must be 0; `decode` rejects anything else with
@@ -586,7 +572,7 @@ comptime { std.debug.assert(@sizeOf(ReplayInputFrame) == 8); }
   - `replay_format_version: u16 = 1`, with magics `"ZLRP"`, `"ZLRC"`, `"ZLRE"`.
   - `replay_checkpoint_interval_steps: u32 = 60`: one checksum per simulated
     second. That localizes a divergence to ≤ 1 s and bounds checkpoint cost to
-    1/60 of steps. It is fixed and never scaled to world size.
+    1/60 of steps. It is a fixed count (`.claude/rules/budgets-capacities.md`).
   - `replay_max_frames_per_chunk: u32 = 4096`: about 68 s, or 32 KiB of frames.
     It bounds per-chunk decode and Slice 51's chunk buffer.
   - `replay_max_checkpoints_per_chunk = replay_max_frames_per_chunk /
@@ -596,8 +582,8 @@ comptime { std.debug.assert(@sizeOf(ReplayInputFrame) == 8); }
     unbounded memory. Producers stop recording at this bound (the recorder
     refuses; Slice 51's capture seals and closes), so every file they write
     decodes.
-- **Wire format.** All fields are little-endian and written one field at a time,
-  never with an `@memcpy` of a struct.
+- **Wire format.** Every field is little-endian and written one field at a
+  time, not with an `@memcpy` of a struct.
   - **Header, 48 bytes**:
 
     | Field | Type / value |
@@ -697,13 +683,12 @@ pub fn verify(stepper: anytype, log: *const ReplayLog) !ReplayVerifyResult;
     services, so the test adapter (and the future runner) implements them by
     calling `update` and `onPause`/`onResume`.
 
-**`StepIndex` (added by Slices 68A–68C; owner moved here by the cross-slice
-consistency review F5).** Slice 56 is the first slice that *stores* absolute
-steps, but 49, 51, 64B, 64C, 65B, 46, and 67B all land earlier in the merged
-order and already carry steps. So the type and the counter land in this
-slice, and every later field (51, 46, 56, 56B, 57, 61, 62, 65B, 67B, 71A,
-71B.3) is born `StepIndex`. Slice 56 keeps `stepAfter` / `stepReached`, its
-own fields, and the boundary pipeline test.
+**`StepIndex`.** Slice 56 is the first slice that *stores* absolute steps, but
+49, 51, 64B, 64C, 65B, 46, and 67B all land earlier in the merged order and
+already carry steps. So the type and the counter land in this slice, and the
+absolute-step fields of 51, 46, 56, 56B, 57, 61, 62, 65B, 67B, 71A, and 71B.3
+are typed `StepIndex`. Slice 56 keeps `stepAfter` / `stepReached`, its own
+fields, and the boundary pipeline test.
 
 **Decision: `step_count` is `u64` from Slice 49.** The alternative, a `u32` with
 a refusal at `maxInt(u32)`, would end a session with an error after about 2.27
@@ -719,8 +704,8 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
   `GameDemoState.simulationChecksum()`) as its oracle.
 - It persists `seed.root` (header field `seed_root: u64`) and
   `SimulationScopeSystem.step_count`.
-- **Checksum persistence rule.** A save may carry `sim_checksum: u64` only
-  together with `build_fingerprint: u32`, a `std.hash.Crc32` over the zon
+- **Checksum persistence.** A save carries `sim_checksum: u64` only together
+  with `build_fingerprint: u32`, a `std.hash.Crc32` over the zon
   `.version` string, `builtin.zig_version_string`, and `checksum_format_tag`
   (Slice 64B makes this `simulation_checksum.buildFingerprint()`, its single
   owner).
@@ -731,19 +716,19 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
   N = 120 steps with this slice's determinism input script, and require the
   per-step `simulationChecksum()` trace to equal the uninterrupted run's steps
   S+1…S+120. A single post-load checksum cannot catch omitted controller state.
-- Every later slice that adds a `DataSystem`/`WorldSystem` field adds its 46
-  save section with its checksum classification (section 5).
+- Each `DataSystem`/`WorldSystem` field's 46 save section pairs with its
+  checksum classification (section 5).
 
 ### Checklist
 
-- [ ] (added by Slices 68A–68C) `pub const StepIndex = u64` in `src/game/simulation_scope.zig`.
+- [ ] `pub const StepIndex = u64` in `src/game/simulation_scope.zig`.
       - `SimulationScopeSystem.step_count: StepIndex`
         (`systems/simulation_scope.zig:99`) and `currentStep() StepIndex`
         (`:180-182`).
       - `advanceStep` keeps a plain `+= 1` (`:168`), with a comment that
         2^64 steps at 60 Hz is about 9.7 billion years.
       - `staggerStep()` math is unchanged.
-- [ ] (added by Slices 68A–68C) `pub fn stepKey(step: StepIndex) u32 { return @truncate(step); }`.
+- [ ] `pub fn stepKey(step: StepIndex) u32 { return @truncate(step); }`.
       - Every `core/rng.zig` call passes `stepKey(step)`. That includes the
         `AiConfig.step` (`ai.zig:312`) feed at `simulation_pipeline.zig:1169`,
         and later 56's combat rolls and rotation, 57's loot, and 61/62's rolls.
@@ -752,25 +737,25 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
         That is harmless, because the step is one hash input among seed,
         entity, and salt; no schedule compares step keys.
       - Test: `stepKey(@as(StepIndex, maxInt(u32)) + 1) == 0`.
-- [ ] (added by Slices 68A–68C) Slice 55's `senseTick()` stays `u32 = @truncate(step_count / cognition_stagger_n)`.
+- [ ] Slice 55's `senseTick()` stays `u32 = @truncate(step_count / cognition_stagger_n)`.
       - That is exact for `decidesOnSenseTick`, because every coast interval
         is a power of two dividing 2^32.
       - Add the comptime assert
         `std.math.isPowerOfTwo(decision_coast_cycle_ticks)` if 55 has not.
-- [ ] (added by Slices 68A–68C) `ChecksumInput.step: StepIndex`, hashed as `u64` in the `"header"`
+- [ ] `ChecksumInput.step: StepIndex`, hashed as `u64` in the `"header"`
       section. This is checksum v1's own layout, so it needs **no**
       `checksum_format_tag` bump.
-- [ ] (added by Slices 68A–68C) Replay format v1 is **unchanged** (`start_step` / `first_step` /
+- [ ] Replay format v1 is **unchanged** (`start_step` / `first_step` /
       checkpoint `step` stay `u32`; see this slice's replay section).
       - `ReplayRecorder.init` returns `error.ReplayStepRangeExceeded` when
         `start_step + max_frames > maxInt(u32)`.
       - `GameDemoState.replaySession()` passes
         `std.math.cast(u32, currentStep())`.
       - Test the refusal at `start_step = maxInt(u32) - 10`.
-- [ ] (added by Slices 68A–68C) Step-derived cursors (`(step * budget) % len`, used by 61/62/71B.3) are
+- [ ] Step-derived cursors (`(step * budget) % len`, used by 61/62/71B.3) are
       computed directly in `StepIndex`. The product overflows only after
       2^64 / budget steps.
-- [ ] (added by Slices 68A–68C) Leave the internal wrapping TTL clocks untouched and say so in a
+- [ ] Leave the internal wrapping TTL clocks untouched and say so in a
       comment: `PathfindingSystem.step_counter +%=`
       (`pathfinding/system.zig:860`) and `PerceptionSystem.step_counter +%=`
       (`perception.zig:735`). They are cache clocks, not absolute-step
@@ -784,8 +769,8 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
     is caught.
 - [ ] `simulation_seed.zig` plus tests:
   - `test "seed domains keep their pinned values"`: pinned values for every
-    landed tag (`ai_wander == 1`, `worldgen_procedural == 2` here; each later
-    slice extends the test when it appends its reserved tag);
+    landed tag (`ai_wander == 1`, `worldgen_procedural == 2` here; extended as
+    reserved tags land);
   - `derive` is stable for a fixed root.
 - [ ] Seed plumbing:
   - `SimulationPipelineConfig.seed` and `SimulationPipeline.ai_intent_seed`
@@ -795,33 +780,9 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
   - `LoadingState.init` derives `world_build_config.seed` and asserts the
     incoming seed is the default;
   - existing loading and demo tests compile and pass.
-- [x] Render→sim decoupling: (done 2026-10-05; sim-view rule also added to
-  `docs/simulation-tiers-and-pipeline.md` and `docs/architecture.md` — the
-  slice's broader Docs item stays open)
-  - `WorldSystem.chunkRegionForWorldRect` and `cognitionRegionForWorldRect`,
-    sharing one chunk-math helper with `setVisibleChunksForWorldRect`;
-  - `cognitionActiveRegion` removed;
-  - `SimulationPipelineUpdateContext.sim_view`;
-  - `simViewRegion` helper used by `stageTierPolicy`;
-  - both pipeline stages switched;
-  - `GameDemoState.simViewRect()` passed into `update`;
-  - comptime assert that `sim_view_overscan_chunks` equals
-    `world_render_overscan_chunks`;
-  - existing window-dependent pipeline tests (`simulation_pipeline.zig:2632`,
-    `:4395`) migrated to `.sim_view`, each asserting its resulting
-    `ActiveRegion` once, or documenting the region change in its comment;
-  - new `test "simulation scope region ignores the render visibility window"`
-    in `simulation_pipeline.zig`: a 64×16-tile, chunk-16 world (4 chunks) with
-    agents spread across it. Run two `pipeline.update` steps with a fixed
-    `sim_view`. Between them, set the render window to a far rect in run A and
-    leave it alone in run B. Movement/AI columns and queued tier commands must
-    be identical.
-    (Landed as a 4-step run: run A rewrites the render window before each step
-    with varying rects/call counts — including none and a far rect — and run B
-    never sets it, so the old coupling would also flip the null-window
-    full-active fallback; also compares per-step cognition region, think-set
-    size, and stagger skips. `GameDemoState`'s camera test pins
-    `simViewRect()` to `camera_current` across interpolation alphas.)
+- [x] Render→sim decoupling: `chunkRegionForWorldRect` /
+  `cognitionRegionForWorldRect`, required `sim_view`, `simViewRegion`, migrated
+  window tests, and the render-window independence test.
 - [ ] `src/core/state_hash.zig` plus tests:
   - swapping two rows changes the hash;
   - moving a row between sections changes it;
@@ -918,10 +879,11 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
   - Item ladder: `suite.eventScaleCounts`.
 - [ ] Docs:
   - `docs/simulation-tiers-and-pipeline.md`: "## Determinism Contract"
-    (guarantee, cross-baseline extension, caveat, rules, the `SeedDomain`
-    registry and named exemptions, checksum scope, exclusions, and the
-    classification rule, the never-persisted-across-builds rule, replay frame
-    semantics and pinned bits, the sim-view rule and `simViewRegion`).
+    (guarantee, cross-baseline extension, caveat, the `SeedDomain` registry
+    and named exemptions, checksum scope, exclusions, field classification,
+    same-build-only checksum comparison, replay frame semantics and pinned
+    bits, the sim view and `simViewRegion`), citing the
+    `.claude/rules/simulation.md` rules rather than restating them.
   - `docs/architecture.md`:
     - Gameplay Data: seed ownership, checksum and replay owners,
       `core/state_hash.zig`;
@@ -930,6 +892,14 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
       never from the render window.
   - `docs/development-workflow.md` Testing: name the determinism harness tests
     and the `simulation-checksum` bench.
+- [ ] Add the determinism contract rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the seed domain registry rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the SIMD/scalar bit-identity rule to `.claude/rules/memory-performance.md` when this lands.
+- [ ] Add the checksum field classification rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the checksum persistence rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the replay pinned-bit rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the wire-format rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the `StepIndex` rule to `.claude/rules/simulation.md` when this lands.
 
 ### Acceptance checks
 
@@ -949,9 +919,10 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
 - [ ] `FailingAllocator` proofs pass for `ReplayRecorder.recordStep` and
   `recordCheckpoint`, including the post-overflow refusal.
   `SimulationChecksum.compute` takes no allocator.
-- [ ] Bench gate: run `zig build -Doptimize=ReleaseFast bench -- --group
-  simulation-checksum --details` and record the mean at 10,000 items in this
-  slice's Status. Slice 64B's gate supersedes this threshold.
+- [ ] Bench gate: `zig build -Doptimize=ReleaseFast bench -- --group
+  simulation-checksum --details` runs and shows the checksum's scaling shape
+  across the item ladder (`.claude/rules/tests-benchmarks.md`); report it in
+  the landing commit. Slice 64B's gate supersedes this one.
 - [ ] Docs updated as listed. `zig build verify` passes.
 
 ### VoidLight reference
@@ -963,8 +934,8 @@ format v1 is unchanged (`start_step` / `first_step` / checkpoint `step` stay
   `thread_local std::mt19937 s_rng{std::random_device{}()};` is a stateful
   per-thread generator seeded from hardware entropy. Its results depend on which
   worker runs an entity and change on every launch. ZeroLight's stateless keyed
-  `rng.mix64`, plus session sub-seeds, replaces it. Never add a stateful or
-  thread-local generator to simulation code.
+  `rng.mix64`, plus session sub-seeds, replaces it
+  (`.claude/rules/simulation.md` § Controllers and processors).
 
 ---
 

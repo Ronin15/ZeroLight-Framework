@@ -17,7 +17,7 @@ gifts) every later producer uses. All of it goes through `DataSystem` plus one
 pipeline stage, is deterministic, is allocation-free after reserve, and has
 fixed per-step budgets.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Strict JSON-to-table authoring: `ai_archetypes.zig:155-244` and the tileset
   and sprite metadata loaders.
@@ -495,6 +495,10 @@ fixed per-step constant or by the fixed `world_item_live_capacity`.
 
 ### Checklist
 
+- [ ] **Redesign before implementing** (design pass): the fixed
+      `world_item_live_capacity` that refuses item creates conflicts with
+      `.claude/rules/budgets-capacities.md`; world items grow at the
+      structural-commit seam, with only the per-step create budget fixed.
 - [ ] `ItemId` / `LootTableId`, plus `ItemCatalog` and the loot-table loader
       with strict validation (including `value <= max_item_value`), icon
       resolution, both `fingerprint`s, and `deinit`. Add

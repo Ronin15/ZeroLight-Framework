@@ -18,7 +18,7 @@ Goal:
   ThreadSanitizer, with a documented workflow.
 - Dispatch cost does not regress.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Fork-join pool.**
   - `ThreadSystem` is defined at `thread_system.zig:707-714`. Workers are
@@ -56,8 +56,8 @@ Goal:
   `systems/pathfinding/scratch.zig`, `systems/simulation_scope.zig`, `systems/spatial_index.zig`,
   `systems/pathfinding/nav_graph.zig`, `systems/collision.zig`, and
   `systems/perception.zig` (Slice 72 I2 removed affect's copy). The rule is the
-  `docs/coding-standards.md` sentence "Use 64-byte padding only for concurrently
-  written thread-shared records".
+  `.claude/rules/threading.md` line "pad to 64 bytes only shared records with
+  real false-sharing risk".
 - **Build.**
   - The test artifact is defined at `build.zig:160-168` and the bench artifact
     at `:154-158`. Run steps are at `:225-234`. Modules are created in
@@ -107,9 +107,9 @@ Foreign threads get a panic, not a fallback, because no safe execution exists
 for them. The caller owns no participant scratch slot, so running inline as slot
 0 would race the owner's slot-0 scratch. A loud crash beats silent memory
 corruption in ReleaseFast. Slice 51's lane thread falls in this class, so a
-background job that reaches `parallelFor` fails loudly. A lane job that wants
-data-parallel work (for example off-main-thread worldgen, Slice 58) must call a
-serial code path with no `ThreadSystem`.
+background job that reaches `parallelFor` panics; data-parallel work on the
+lane (for example off-main-thread worldgen, Slice 58) runs a serial code path
+with no `ThreadSystem`.
 
 - **Detection** uses no locks and happens before any tuner access:
   - `threadlocal var participant_role: ParticipantRole = .none;` where
@@ -148,8 +148,9 @@ serial code path with no `ThreadSystem`.
   - It runs through a `runInline` variant that passes the caller's
     `WorkerId{ .index = participant_worker_index }`, so per-participant scratch
     is the caller's own slot.
-  - Documented rule: a processor must not nest a batch that reuses *its own*
-    per-worker scratch.
+  - Because the nested batch runs on the caller's own slot, a nested batch
+    that reuses the outer processor's *own* per-worker scratch would alias it;
+    the `parallelFor` doc comment states this.
 - **`selectBatchProfile` while participating** returns the same fixed,
   tuner-free selection. Stage pre-sizing helpers therefore stay safe inside
   jobs.
@@ -176,10 +177,10 @@ serial code path with no `ThreadSystem`.
 - `const batch_line_bytes = std.atomic.cache_line;` This is 128 on x86_64 and
   aarch64 (covering the x86 adjacent-line prefetch pair and 128-byte Apple
   cores) and 64 elsewhere.
-  - This deliberately deviates from the repo's 64-byte per-slot convention.
-    `Batch` is a singleton costing 3 lines (384 B) in total. The 64-byte rule
-    governs per-worker slot arrays, where size multiplies.
-  - `docs/coding-standards.md` gets one sentence noting this.
+  - `Batch` is a singleton costing 3 lines (384 B) in total, so it takes the
+    full `cache_line` rather than the 64-byte padding
+    (`.claude/rules/threading.md`) used for per-worker slot arrays, where size
+    multiplies.
 - Split `Batch` into three line-aligned parts:
 
 ```zig
@@ -263,9 +264,9 @@ comptime {
     to the test and bench steps instead of silently ignoring the flag.
   - Run steps set `TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1` through
     `setEnvironmentVariable`, so the first report fails the step.
-- **Suppressions.** None for framework code. A `tools/tsan.supp` may be added
-  only for uninstrumented third-party code (SDL), with a cited root cause per
-  entry, wired through `TSAN_OPTIONS=suppressions=...`.
+- **Suppressions.** This slice ships none. A `tools/tsan.supp`, if one is
+  added, holds entries only for uninstrumented third-party code (SDL), each
+  with a cited root cause, wired through `TSAN_OPTIONS=suppressions=...`.
 - **First implementation step: probe the toolchain.** Build and run
   `zig build test -Dsanitize-thread=true` on x86_64 Linux with this exact Zig
   0.17. If Zig rejects a backend, linker, or target combination, record the
@@ -347,10 +348,11 @@ comptime {
 - [ ] Docs:
   - `docs/architecture.md` Thread System: the reentrancy and ownership rule,
     forced-inline semantics, the foreign-thread panic, worker names.
-  - `docs/coding-standards.md`: one sentence on the `std.atomic.cache_line`
-    singleton exception.
   - `docs/development-workflow.md`: "## Thread Sanitizer" and the
     `thread-dispatch` group in Benchmarks.
+- [ ] Add the `ThreadSystem` nesting and foreign-thread rule to `.claude/rules/threading.md` when this lands.
+- [ ] Add the singleton `std.atomic.cache_line` padding rule to `.claude/rules/threading.md` when this lands.
+- [ ] Add the TSan suppression rule to `.claude/rules/threading.md` when this lands.
 
 ### Acceptance checks
 
@@ -383,9 +385,9 @@ comptime {
 - **Do not port**:
   - `tests/tsan_suppressions.txt` (130 lines) suppresses races in VoidLight's
     own managers (for example `race:ParticleManager::updateParticleRange`),
-    justified by "hours of stable runtime". ZeroLight never suppresses its own
-    code. Each report is either fixed or shown false by a concrete
-    happens-before edge.
+    justified by "hours of stable runtime". ZeroLight's setup (above) has no
+    suppressions for its own code; each report is fixed or shown false by a
+    concrete happens-before edge.
   - VoidLight exposes `enqueueTaskWithResult` futures (`ThreadSystem.hpp:577`)
     to any caller, including code already running on a pool worker, with no
     rule. Blocking on such a future from a worker occupies the worker it waits

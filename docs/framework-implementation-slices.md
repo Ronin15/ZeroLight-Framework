@@ -2,9 +2,9 @@
 
 The roadmap index and agent implementation contract. Work is organized as
 numbered **slices**: one complete, verifiable feature each, with a **Goal**,
-**Checklist**, and **Acceptance checks**. Technical rules live in
-[coding-standards.md](coding-standards.md); this file holds roadmap process
-only.
+**Checklist**, and **Acceptance checks**. Technical rules live only in
+`.claude/rules/`; this file holds roadmap process, and slice files hold goals,
+specs, checklists, and acceptance, never rules.
 
 **Layout.** Each open slice or sub-slice is one file under
 [`roadmap/slices/`](roadmap/slices/); settled slices are one file each under
@@ -27,8 +27,8 @@ files it links. Do not load the whole roadmap.
 - **A slice is complete only when every Checklist and Acceptance item in its
   file is `[x]`** and runtime behavior, diagnostics, owning-module docs, and
   tests are integrated. Partial wiring stays `[ ]` with remaining notes in the
-  slice file. Landed slices awaiting manual/`gpu-smoke` confirmation (33, 43)
-  stay open until that residual closes.
+  slice file. Landed slices awaiting manual/`gpu-smoke` confirmation (33, 43,
+  64E) stay open until that residual closes.
 - **One file per slice or sub-slice** (`slices/slice-<id>.md`, lowercase id;
   umbrellas such as `slice-64.md` summarize their sub-slices), each with exactly
   one row in the Open Frontier Slice Index that links to it.
@@ -52,9 +52,10 @@ files it links. Do not load the whole roadmap.
 - Read [architecture.md](architecture.md) and the live owning modules first;
   code wins over stale slice prose. Module placement follows architecture.md
   § Source Layout.
-- Every slice follows [coding-standards.md](coding-standards.md), in particular
-  § Budgets, Capacities, And Thresholds, § Threading, and § Simulation Pipeline
-  Stage Ordering. The planned merged stage order is Table T4.
+- Every slice follows the rules in `.claude/rules/`; a slice cites a rule file
+  and never restates or adds a rule. A slice that needs a new rule has a
+  checklist item to add it to the owning rule file when it lands. The planned
+  merged stage order is Table T4.
 - Do not promote threaded stage overlap, nav-remask cost changes, render-collect
   scan changes, or persistence beyond Slice 46's stable-ID boundary into a
   checklist until confirmed in the live modules. Slice 46 is the save/load
@@ -64,11 +65,10 @@ files it links. Do not load the whole roadmap.
   save section in the same change.
 - Version numbers (replay format and flag bits, settings schema, save format,
   checksum tag), `stage_order` positions, and component tags follow Tables
-  T1–T6 in the [VoidLight port track](roadmap/tracks/voidlight-port.md). Every
-  bump is relative (live value + 1); a slice that changes one updates the table
-  in the same change.
-- Validate per [development-workflow.md](development-workflow.md) § Validation
-  Cadence; `zig build verify` passes before a slice is complete.
+  T1–T6 in the [VoidLight port track](roadmap/tracks/voidlight-port.md); a slice
+  that changes one updates the table in the same change.
+- Validate per `.claude/rules/build-validation.md`; `zig build verify` passes
+  before a slice is complete.
 
 ## Agent Workflow: Implementing A Slice
 
@@ -87,21 +87,23 @@ files it links. Do not load the whole roadmap.
 7. **Set Status**, run `zig build verify`, and when complete archive the file
    (Ground Rules). Follow-ups go into a slice Checklist or a new slice file.
 
-### Standard slice file shape
+### Standard slice section shape
 
 | Block | Agent use |
 | --- | --- |
 | Header line | Roadmap index link · Depends on (linked slices) · Track |
 | **Goal** | What "done" means for this chunk |
-| **Current foundation** | What already exists; build on it unless it fails the cost model (CS § Architecture Decisions), then replace it |
+| **Current foundation** | What already exists; build on it unless it fails the cost model (`.claude/rules/engine-design.md`), then replace it |
 | **Architecture notes** / **Problem** | Constraints and ownership boundaries |
 | **Checklist** | `[ ]` / `[x]` implementation steps — check off as you land each |
 | **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
-| **Status** | Open/partial note, or one-line completion record before the archive move |
+| **Status** | One line near the top: open/partial note, or a completion record before the archive move |
 
-Some fields are optional for early foundation slices. Slices hold decisions
-and checklists only; review logs, bench tables, and superseded designs go in
-commit messages and changelogs. One slice lands as one commit.
+Some fields are optional for early foundation slices. Slices hold goals,
+design and spec data, checklists, and acceptance only: no rules, review logs,
+bench tables, dated status logs, or superseded designs (those go in commit
+messages and changelogs). A checked item is one line naming what landed. A
+slice may land across several commits, one per logical change.
 
 ## Open Frontier Slice Index
 
@@ -116,7 +118,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**42**](roadmap/slices/slice-42.md) | Not started | Affect expansion — data-driven appraisal gains, cross-drive coupling, optional mood, optional `pain` drive on Slice 56's damage watermark, environment caution as a per-entity fear gain (needs 59); the first new drive (`need`) lands in Slice 61 — after 56, 61 |
 | [**43**](roadmap/slices/slice-43.md) | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
 | [**44**](roadmap/slices/slice-44.md) | Not started | Input rebinding: Controls screen + press-any-key capture on 53B (`list` widget), persisted via Slice 54 settings (next schema version), gamepad family + button labels, right stick/triggers; later-slice actions become rows automatically — after 43, 53B, 54 |
-| [**46**](roadmap/slices/slice-46.md) | Not started | Save/load: 8 stable-ID binary slots, `seed_root` + build-gated checksum parity + N-step trace test (normalized reference), content fingerprint, `world_environment` + `pipeline_history` sections, load-time link-slot validation, `buildFingerprint()` from 64B, Slice 51 lane via `isDone` (inline fallback), Save/Load menu on 53B; settings excluded — after 49, 51, 53B, 54, 64B, 64E |
+| [**46**](roadmap/slices/slice-46.md) | Not started | Save/load: 8 stable-ID binary slots, `seed_root` + build-gated checksum parity + N-step trace test (normalized reference), content fingerprint, `world_environment` + `pipeline_history` sections, load-time link-slot validation, `buildFingerprint()` from 64B, Slice 51 lane via `isDone` (inline fallback), Save/Load menu on 53B; settings excluded — after 49, 51, 53B, 54, 64B, 64G |
 | [**49**](roadmap/slices/slice-49.md) | In progress (render→sim decoupling landed) | Session `SimulationSeed` + `SeedDomain` registry, `SimulationChecksum` oracle, `StepIndex = u64`, render→sim scope decoupling via `sim_view`/`simViewRegion` (live determinism defect), replay format (u16 action bits) + recorder/verifier, repeat/partition/seed determinism tests, `simulation-checksum` bench |
 | [**50**](roadmap/slices/slice-50.md) | Not started | ThreadSystem hardening: release-safe forced-inline reentrancy + foreign-thread panic, claim-counter cache-line isolation, self-named workers, `-Dsanitize-thread` + TSan workflow, `thread-dispatch` bench |
 | [**51**](roadmap/slices/slice-51.md) | Not started | Background lane (1 thread, 32 slots) with step-keyed handoff at `submit + k` and app-layer `isDone`; first consumer live replay capture; lane-start FP assertion (64A) — after 49, 50 |
@@ -130,26 +132,27 @@ the [archive](framework-implementation-slices-archive.md).
 | [**54**](roadmap/slices/slice-54.md) | Not started | Persistent settings: Engine-owned `SettingsStore`, versioned ZON at `SDL_GetPrefPath`, atomic write, defaults + backup on corrupt, apply before window/audio/renderer, live apply, upgrade freeze rule; settings + pause menu on 53B (toggle/choice widgets); `-Dorg-name` + derived `-Dbundle-id` default; later slices append fields by schema bump (Table T2) — after 53B |
 | [**55**](roadmap/slices/slice-55.md) | Not started | Cognition decision coasting: idle agents decide every 8/32 steps, same-step wake from sensing, new scope-owned `ai_decide_gather` stage on Slice 49's `simViewRegion`; sensing never coasts; no new persistent columns — after 49 |
 | [**56**](roadmap/slices/slice-56.md) | Not started | Health/damage/combat: `health` + `combat_stats`, generic threaded `ai_action_select` emitter (rotating deferral; deferral-age priority from Slice 68A), `ActionClaimSet`, simultaneous `combat_resolve` rolls on `seed.derive(.combat)`, deferred death, damage→affect watermark, `stepAfter`/`stepReached` on `StepIndex`, `attack_held_last` hashed — after 49 |
-| [**56B**](roadmap/slices/slice-56b.md) | Not started | Projectiles and ranged combat: `projectile` component, `projectile_update` stage, collision-trigger hits (one per projectile per step) resolved in `combat_resolve`, fixed live/spawn/hit caps resized through `combat_max_hits_per_step` — after 56 |
-| [**57**](roadmap/slices/slice-57.md) | Not started | Items/inventory/equipment: stable `ItemId` keys, pooled size-class slot runs (arena grows at the structural-commit seam, logical checksum), equipment modifiers, world items + single-winner overlap pickup, loot on `seed.derive(.loot)`, `inventory_update` stage + `TransferBatch`/`canAccept`/`canRemove`/`canRemoveCoins` transfer substrate — after 56 |
+| [**56B**](roadmap/slices/slice-56b.md) | Not started | Projectiles and ranged combat: `projectile` component, `projectile_update` stage, collision-trigger hits (one per projectile per step) resolved in `combat_resolve`, content-sized live store with fixed per-step spawn/hit budgets — after 56 |
+| [**57**](roadmap/slices/slice-57.md) | Not started | Items/inventory/equipment: stable `ItemId` keys, pooled size-class slot runs (arena grows at the structural-commit seam, logical checksum), equipment modifiers, world items + single-winner overlap pickup, loot on `seed.derive(.loot)`, `inventory_update` stage + `TransferBatch`/`canAccept`/`canRemove`/`canRemoveCoins` transfer substrate; world-item capacity redesign is its first checklist item — after 56 |
 | [**57B**](roadmap/slices/slice-57b.md) | Not started | Inventory/equipment UI on 53B, `drop`/`unequip` kinds, `PendingPlayerActions`, `live_modal_overlay`, toasts, replay format v3 action records — after 53B, 57, 64C |
 | [**58**](roadmap/slices/slice-58.md) | Not started | Seeded data-driven worldgen (`worldgen.json`: biomes, strata, veins, nodes, spawns, resource interest markers), integer noise, golden hashes, load-time only, `uniform_blocking` enum, `chunk_biomes`, dig yields on `seed.derive(.dig_yield)` — after 49, 57, 61 |
 | [**59**](roadmap/slices/slice-59.md) | Not started | Game clock (`WorldSystem.clock.game_ms`), calendar/seasons/day phase, weather on `seed.derive(.environment)`, environment modifiers → perception range + AI speed, weather particles, `environment_transition` events, env → `SceneGrade` (visuals need 60) — after 49 |
 | [**60**](roadmap/slices/slice-60.md) | Not started | Deterministic fixed-step camera rig (lag, dead zone, catch-up, clamp, integer zoom, presentation shake) whose zoom-1 `anchorRect()` feeds Slice 49's `sim_view`; scene-texture composite pass (`drawable`/`world_pixel`, grade); screen fade-in; zoom setting; pause does not resync the rig (64A) — after 49 (zoom setting on 54) |
-| [**61**](roadmap/slices/slice-61.md) | Not started | Harvesting + resource nodes: `resource_node` (fixed 4096 cap), kind catalog, commit-rebuilt node index, `HarvestController` in `action_react` claims, step-scheduled regrowth, yields via 57 transfers (lands the `inventory_transfers` wiring), `need` drive + `AffectImpulse` substrate (commit-seam drain), `forage` + `.harvest` arm in `ai_action_select` — after 56, 57 |
-| [**62**](roadmap/slices/slice-62.md) | Not started | NPC population: `SpawnAnchorStore` (256) on `WorldSystem`, `spawn_origin`, weighted/roster tables, `population_update` stage on `simViewRegion`, spawn band + despawn hysteresis, fixed caps (512), worldgen anchor placement — after 49, 58, 59, 63 |
+| [**61**](roadmap/slices/slice-61.md) | Not started | Harvesting + resource nodes: `resource_node` (content-sized store), kind catalog, commit-rebuilt node index, `HarvestController` in `action_react` claims, step-scheduled regrowth, yields via 57 transfers (lands the `inventory_transfers` wiring), `need` drive + `AffectImpulse` substrate (commit-seam drain), `forage` + `.harvest` arm in `ai_action_select` — after 56, 57 |
+| [**62**](roadmap/slices/slice-62.md) | Not started | NPC population: content-sized `SpawnAnchorStore` on `WorldSystem`, `spawn_origin`, weighted/roster tables, `population_update` stage on `simViewRegion`, spawn band + despawn hysteresis, fixed per-step spawn budgets, worldgen anchor placement — after 49, 58, 59, 63 |
 | [**63**](roadmap/slices/slice-63.md) | Not started | Social + trade: `FactionRelations` runtime stance, 4-slot `social_ledger`, `merchant` profiles, integer pricing, buy/sell/give via 57 transfer batches (`canRemoveCoins` funds preflight), `social_react` stage, trade screen on 53B/57B overlay, replay v4 — after 53B, 57, 57B, 61 (combat rows need 56) |
-| [**64**](roadmap/slices/slice-64.md) | Not started (umbrella) | Cross-machine determinism completion and replay tooling: 64A–64E; closes when 64A, 64B, 64C, 64E are archived (64D consumer-gated) |
+| [**64**](roadmap/slices/slice-64.md) | Not started (umbrella) | Cross-machine determinism completion and replay tooling: 64A–64G; closes when 64A, 64B, 64C, 64E, 64F, 64G are archived (64D consumer-gated) |
 | [**64A**](roadmap/slices/slice-64a.md) | Not started | Pause becomes simulation-invisible (presentation alpha hold); `math.min`/`max`/`clamp` select forms plus `RAW_MINMAX_GAME`/`STD_MATH_CLAMP_GAME`/`STD_MATH_TRANSCENDENTAL` lint; `math.floatKeyBits`; `core/fp_env.zig` assertion at step entry, worker start, and lane start — after 49, 52D |
 | [**64B**](roadmap/slices/slice-64b.md) | Not started | Checksum v2: NaN-canonical, fixed sections + threaded 64 KiB dense blocks, comptime field classification, `"pipeline_history"`, `normalizeDerivedState` (pathfinding incl. 64E cursor, 65B deferred job, dirty marks, 71B.3 prewarm) as the load-parity reference — saves never normalize the live session; `buildFingerprint()` owner — after 49, 50, 64A; before 46 |
 | [**64C**](roadmap/slices/slice-64c.md) | Not started | `zig build replay` headless runner (`HeadlessSession`), replay v2 80-byte header (`GameSessionDescriptor`, `build_fingerprint`), New Game random seed (`SessionSeedSource`, `-Dsession-seed`) — after 49, 51, 53B, 64B; before 57B |
 | [**64D**](roadmap/slices/slice-64d.md) | Not started — gated on the first sim `atan2` consumer | Deterministic `simd.atan2Float4`, `math.atan2` delegates — after 52D |
-| [**64E**](roadmap/slices/slice-64e.md) | Landed 2026-10-05; capacity-audit follow-ups (nav dirty buffers, level-link growth at the dig commit seam) landed 2026-10-06; manual ramp check passed 2026-10-06; edge-window overflow fixed 2026-10-06 (in-place per-chunk window growth replaces the full-rebuild fallback); review follow-ups M4–M7 and M8–M13 landed 2026-10-07; open: post-fix manual ramp check on current code | Live defect: runtime ramps routable the same step (per-chunk interior link capacity, floor 8, doubled in place since 2026-10-07; both-level dirtying, ≤ 8 links/step deferral; no ramp refusal), incremental == full parity, `nav-update-links` bench — no prerequisite |
-| [**64F**](roadmap/slices/slice-64f.md) | Implemented 2026-10-07; open: cave-in bench record, repack prefix trim, threaded repack (gated on 69A soak) | Nav edge storage simplification: per-level edge windows, one repack per level on overflow, edge arena out of the memory gate (only the u32 index is a fixed cap) — after 64E; before 65B |
+| [**64E**](roadmap/slices/slice-64e.md) | Landed; open: post-fix manual ramp check on current code | Runtime ramps routable the same step (both-level dirtying, ≤ 8 links/step deferral, no ramp refusal), incremental == full parity, `nav-update-links` bench; its storage is replaced by 64G — no prerequisite |
+| [**64F**](roadmap/slices/slice-64f.md) | Implemented 2026-10-07; open items superseded by 64G | Per-level nav edge windows with one repack per level on overflow; its per-level storage is replaced by 64G — after 64E |
+| [**64G**](roadmap/slices/slice-64g.md) | Not started (design draft; batch 0 confirms) | Chunk-owned terrain and nav: per-chunk storage, staged all-or-nothing apply, per-chunk GPU pages, simulation-derived residency; local change costs O(touched chunks) — after 64F; before 65B and 46 |
 | [**65**](roadmap/slices/slice-65.md) | Not started (umbrella) | Threading layout cleanup and background-lane heavy consumers: 65A, 65B, 65C |
 | [**65A**](roadmap/slices/slice-65a.md) | Not started | One `thread_shared_record_alignment` (+ `assertThreadSharedRecord`, lint), padded `WorkerRecord`, per-OS lane priority (`src/platform/thread_priority.zig`; terminating fallback ladder), fixed pool `cpu_count − 1` — after 50, 51 |
-| [**65B**](roadmap/slices/slice-65b.md) | Not started | Deferred nav rebuild on the lane (classification, frozen front + fence incl. 64E link cursor, back-graph patch over the processed link prefix, swap at `submit + 30` via the shared cache-reaction helper); saves never persist or disturb it (64B `normalize` abandons the job); Slice 51 frozen-borrow clause; `nav-update-deferred` bench — after 51, 65A, 64E, 64F |
-| [**65C**](roadmap/slices/slice-65c.md) | Not started | Streaming worldgen via `WorldGenStream` lane batches, ≤ 512 commits per step (terminating ladder to 64), golden parity across lane speeds — after 58, 53B, 65B |
+| [**65B**](roadmap/slices/slice-65b.md) | Not started | Deferred nav rebuild on the lane (classification, frozen front + fence incl. 64E link cursor, back-graph patch over the processed link prefix, swap at `submit + 30` via the shared cache-reaction helper); saves never persist or disturb it (64B `normalize` abandons the job); Slice 51 frozen-borrow clause; `nav-update-deferred` bench — after 51, 65A, 64G (64G's docs batch rewrites it) |
+| [**65C**](roadmap/slices/slice-65c.md) | Not started | Streaming worldgen via `WorldGenStream` lane batches, a fixed 512 commits per step, golden parity across lane speeds — after 58, 53B, 65B |
 | [**66**](roadmap/slices/slice-66.md) | Not started (umbrella) | Distribution, signing, symbols, and store delivery: 66A ungated, 66B–66E gated |
 | [**66A**](roadmap/slices/slice-66a.md) | Not started | Shipped-build crash triage: split symbols (ELF build-id + `.debug`, macOS `strip -S` after 52B's `dsymutil`, Windows PDBs), symbols archives on every GitHub Release, `tools/symbols.py`, `src/platform/crash_report*.zig` v1 reports in `<pref>/crashes/`, `crash-probe` + CI crash matrix, Linux runtime window icon — after 52B, 52C, 54 |
 | [**66B**](roadmap/slices/slice-66b.md) | Not started — gated per target | macOS universal2 (with a cross-arch `zl-replay` CI check), aarch64-linux, aarch64-windows — after 66A, 64C |
@@ -161,9 +164,9 @@ the [archive](framework-implementation-slices-archive.md).
 | [**67B**](roadmap/slices/slice-67b.md) | Not started | Debug overlays on labels + `PreparedText` deletion, HUD event log, text-atlas telemetry + Western-corpus probe, UI navigation SFX — after 53A, 53B, 44 |
 | [**67C**](roadmap/slices/slice-67c.md) | Not started | Offscreen world thumbnails, save header v2 (relative bump, header-only), named saves, `text_field` + IME — after 46, 60, 67A |
 | [**67E**](roadmap/slices/slice-67e.md) | Not started | Localization roots: comptime `StringId` registry, compiled-in English table, `text(id)` + English-only `format`, existing UI strings migrated (byte-identical); no settings change — after 53B (merged order: after 67C); preferred before 56 |
-| [**68A**](roadmap/slices/slice-68a.md) | Not started | Shared halo table (removes perception/AI main-thread O(halo) walks), deferral-age action-bus fairness on the fixed 64/48 bus (amends 56's rotation), normative 3×60 s ReleaseSafe re-baseline procedure + row schema, `halo-consumers` bench — after 55, 56 |
+| [**68A**](roadmap/slices/slice-68a.md) | Not started | Shared halo table (removes perception/AI main-thread O(halo) walks), deferral-age action-bus fairness on the fixed 64/48 bus (amends 56's rotation), 3×60 s ReleaseSafe re-baseline procedure (trend data) + row schema, `halo-consumers` bench — after 55, 56 |
 | [**68B**](roadmap/slices/slice-68b.md) | Not started | Knockback column + `knockback_apply` stage (after `movement_integrate`); retaliation memory slot from `Health.last_attacker` — after 55, 56, 56B |
-| [**68C**](roadmap/slices/slice-68c.md) | Not started | Lossless carried death drop: admission-gated `pending_drops` FIFO (512, 32/step), kill deferral when not admissible, coin piles; ammo via 57's `TransferBatch.consume` — after 56B, 57, 61 |
+| [**68C**](roadmap/slices/slice-68c.md) | Not started | Lossless carried death drop through a `pending_drops` FIFO drained 32/step (fixed-FIFO redesign is its first checklist item), coin piles; ammo via 57's `TransferBatch.consume` — after 56B, 57, 61 |
 | [**69**](roadmap/slices/slice-69.md) | Not started (umbrella) | World generation breadth and regional environment: 69A–69C ungated, 69D–69F gated |
 | [**69A**](roadmap/slices/slice-69a.md) | Not started | Caves, structures/villages, autotile edge sets as 65C jobs; own-level AI goals; entrances respect nav link slots — after 58, 61, 62, 65C |
 | [**69B**](roadmap/slices/slice-69b.md) | Not started | Regional weather (≤ 8 biome-mapped regions, `forPosition` lookup, player-region presentation); no new persistent state — after 58, 59 |
@@ -185,10 +188,9 @@ the [archive](framework-implementation-slices-archive.md).
 **Residual non-slice notes:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) are measure-first notes in [Scaling Gaps](roadmap/scaling-gaps.md).
 
-**Bench policy:** coding-standards § Benchmarks (benches show scaling shape,
-never target counts). `frame-battle` (Slice 52C: full fixed step plus CPU
-render-prep) is the release regression baseline across commits; 66E adds the authoritative
-self-hosted perf runner.
+**Benches:** `.claude/rules/tests-benchmarks.md`. `frame-battle` (Slice 52C:
+full fixed step plus CPU render-prep) tracks scaling shape across commits; 66E
+adds the self-hosted perf runner.
 
 ## Next Priority Tracks
 
@@ -203,17 +205,14 @@ residual only); open work grows beside that loop.
 | **Feelings growth** | **42** (after 56, 61; caution needs 59) | Gains as data, coupling, optional mood; `need` lands in 61, `pain` reads 56's watermark. |
 | **World / render verticality** | archive 37 → **38** | Elevation inside the existing submit cap, deriving `level_sky_exposed`. |
 | **Perf** | **72** (Batch A first), **55**, **35**, **70A** → **68A** → **71B** | 72 removes behavior's dependence on physical capacity; 55 and 35 cut AI/steering rows and math; 70A cuts sprite bandwidth; 68A removes O(halo) walks; 71B adds static fast paths. |
-| **Determinism & threading** | **64E** → **49** → **50** → **52A–52D** → **64A** → **55** → **51** → **65A** → **64B** → … → **64C** → **65B** (65C after 58; 64D gated) | 64E first (runtime ramps are inert for NPC pathing); then seeded sessions, checksum/replay, cross-machine determinism, and lane consumers. |
+| **Determinism & threading** | **64E** → **64F** → **64G** → **49** → **50** → **52A–52D** → **64A** → **55** → **51** → **65A** → **64B** → … → **64C** → **65B** (65C after 58; 64D gated) | 64E–64G first (runtime ramps, then chunk-owned terrain and nav); then seeded sessions, checksum/replay, cross-machine determinism, and lane consumers. |
 | **Release & platform** | **52A** → **52B** → **52C** → **66A**; **52D** after 52A; **66B–66E** gated | Pinned baseline, packaging, CI, crash triage; land 52A before games fork, 66A before any build leaves the team. |
 | **Shipping UI / settings / input / persistence** | **53A** → **53B** → **54** → **44** → **46** → **67A** / **67B** → (60) → **67C** → **67E** | VoidLight's UI, settings, rebinding, and saves on ZL contracts; bindings live in settings, never saves; no 67 work touches simulation, replay, or the checksum. |
 | **Gameplay domains** | **56** → **56B** → **57** → **57B** → **61** → **58** → **63** → **62** → **71A** → **71C** / **71D** → **69A**; **68B** → **68C** | Every roll keys off `seed.derive(.<domain>)`; reuse the one action bus, claim set, transfer substrate, impulse queue, and `PendingPlayerActions`, never a second. |
 | **World presentation** | **60** → **59** → **69B** / **69C** → **70B** (69D–69F gated) | Camera rig + scene composite first (its `anchorRect()` feeds 49's `sim_view`), then environment, regional weather, rest, and presentation polish. |
 
-- **Slice 32 contract (standing rule):** `scoreBehaviors` / `selectSticky` /
-  `resolveGoal` stay the expandable path. Emotion → behavior is **table-driven
-  over `AiAffectDrive`**, not a permanent `if (fear) flee` tree. Goals stay
-  per-agent and multi-source (not broadcast player-only). Utility + sticky
-  select over exclusive FSMs. No test-only production API tags.
+- **AI expandability:** Slice 32's arbitration path is a rule in
+  `.claude/rules/simulation.md` (AI and affect).
 - **Component headroom:** 14 of 32 `Component` tags used (`enum(u5)` +
   `ComponentMask = u32`); the VoidLight port projects 10 more and Slice 71A one
   (`ai_post`): **25 of 32** (Table T5).
@@ -258,11 +257,12 @@ position N") and by the planned version numbers in Tables T1–T6.
   prerequisite; Batch A first. Batch order is internal (see its batch table);
   Batch F lands after 64E's nav dirty-buffer capacity item (which needs 72 B1).
   It cross-edits the owner slices it references (53B, 56, 56B, 59, 60, 61, 62,
-  63, 64B, 64E, 65A, 65B, 67B, 68A, 69B, 71B, 71D) in the same change as each
-  item.
+  63, 64B, 64E, 64G, 65A, 65B, 67B, 68A, 69B, 71B, 71D) in the same change as
+  each item; Batches F, D2, and G are re-scoped against 64G first.
 
-1. **64E.** Incremental nav patch ramp/link parity (live defect; no
-   prerequisite). Right after 48, before 49.
+1. **64E → 64F → 64G.** Incremental nav patch ramp/link parity (no
+   prerequisite), per-level edge windows, then chunk-owned terrain and nav.
+   Before 49.
 2. **49.** Session seed, determinism checksum/replay harness, `StepIndex = u64`,
    and render→sim scope decoupling (live defect; every gameplay slice derives
    its seed and scope band from it).
@@ -306,10 +306,10 @@ position N") and by the planned version numbers in Tables T1–T6.
     Game random seed (after 49, 51, 53B, 64B; before 57B, which takes replay
     v3).
 14. **65B.** Deferred nav rebuild on the background lane (after 51, 65A, and
-    64E; uses 49's checksum stepper and 64B's normalize; no longer gates 46,
+    64G; uses 49's checksum stepper and 64B's normalize; no longer gates 46,
     which follows it and adds 65B's mid-job trace test; before any other
     in-game CPU-heavy lane consumer).
-15. **46.** Save/load persistence (after 49, 51, 53B, 54, 64B, 64E; save v1;
+15. **46.** Save/load persistence (after 49, 51, 53B, 54, 64B, 64G; save v1;
     every later persistent-state slice adds its save section with its
     checksum classification).
 16. **70A.** Sprite vertex compaction: indexed `u16` quads + `UBYTE4_NORM`

@@ -8,23 +8,9 @@
 > not add a "later" or "deferred" bullet to this file; a `[x] … promoted into
 > Slice N` line records where a former backlog item now lives.
 
-**Backlog, not a slice.** Items here are architectural pressure points waiting
-to be **promoted into a numbered slice** (new section or added Checklist items).
-Agents implement only from slice **Checklist** / **Acceptance checks**; use this
-section for planning and to avoid duplicating gap lists inside landed slice
-sections. When work starts, copy items into a slice Checklist and check off there.
-
 Measure with `zig build bench` and scope stats before raising entity counts,
-world depth, or cognition-track scope.
-
-**Policy boundaries (settled — do not regress)**
-
-- Simulation LOD (tier, halos, stagger, scope gathers) controls fixed-step
-  processor participation only.
-- Render visibility (camera chunk window, pixel AABB, render overscan margin)
-  controls draw-record construction only.
-- Scope pin metadata may keep an entity in a higher sim band off-camera; it must
-  not bypass render visibility.
+world depth, or cognition-track scope. Simulation LOD versus render visibility:
+`.claude/rules/simulation.md` (Scope and tiers).
 
 **Simulation scale**
 
@@ -59,8 +45,8 @@ world depth, or cognition-track scope.
       [VoidLight port track](tracks/voidlight-port.md)). Slices 49–55, 58,
       59, 60, and 64–71 other than 71A add none: worldgen, clock, and anchor
       state live on `WorldSystem`, and `FactionRelations` is a `DataSystem`
-      field. Tags are appended in landing order and never pinned in slice
-      text. Promote a widening slice only when the first new tag would exceed
+      field. Tags are appended in landing order and slice text does not pin
+      their values. Promote a widening slice only when the first new tag would exceed
       32.
 - [ ] **Multi-world scope policy.** Inactive world instances stay out of
       pipeline scope; the active world uses chunk + halo rules (Slice 22
@@ -68,14 +54,12 @@ world depth, or cognition-track scope.
 
 **Battle-scale perf watch (2048 movers)**
 
-**How to use:** fix cycles in **Debug**; intentional soaks in **ReleaseSafe**
-(`zig build run -Doptimize=ReleaseSafe`), **one** 60s dump after load (not
-multi-minute dual cycles unless comparing load vs settle). Same pop
-(`battle_scale_demo_mover_count = 2048`), similar play. Diff new dumps against
-the control table below: if stage lines move while selected/observer counts
-stay similar → suspect **net-new code**; if selected/observers jump → **scope
-density of the feature**. Sub-stage lines `steering_setup` / `collision_setup`
-separate setup from batch. Do not min-max sub-ms when gameplay stays in band.
+**How to read it:** the table is diagnostic trend data from ReleaseSafe dumps
+(`.claude/rules/tests-benchmarks.md`), captured per Slice 68A §3. Diff a new
+dump against it: if stage lines move while selected/observer counts stay
+similar, suspect net-new code; if selected/observers jump, suspect the
+feature's scope density. Sub-stage lines `steering_setup` / `collision_setup`
+separate setup from batch.
 
 **ReleaseSafe control baseline (post-load, ~60s, 2048 movers)**
 
@@ -101,8 +85,8 @@ avoidance batch (~0.40 ms → Slice 35); collision gather (~0.09 ms Safe).
 After the Slice 55 soak, add control rows `ai decide / coast_skips (per step)`
 and `ai_decide_gather stage`; from then on `ai_stage_entities` ("cognition
 selected") counts decided rows, not the think set. Slices 56, 56B, 57, 58, 61,
-and 62 change the soak population; each re-baselines with the normative
-procedure and row schema in [Slice 68A](slices/slice-68a.md) §3.
+and 62 change the soak population; each re-baselines per
+[Slice 68A](slices/slice-68a.md) §3 (procedure and row schema).
 
 - [x] **Steering main-thread setup + event-driven caches.** Instrumented
       select / snapshot / directions; select one-slot resolve; path start from
@@ -128,8 +112,7 @@ procedure and row schema in [Slice 68A](slices/slice-68a.md) §3.
       that pending-dedup/cache already serves shared-goal bursts (see
       `proceduralPathfindingCapacity`). Re-measure eviction rate (~20k/min)
       and group payoff only when simultaneous same-goal demand from
-      relationships/ships exists — do not lower the pin without a fresh 60s
-      capture. Shared-goal prewarm is [Slice 71B](slices/slice-71b.md) (71B.3,
+      relationships/ships exists. Shared-goal prewarm is [Slice 71B](slices/slice-71b.md) (71B.3,
       A/B acceptance; the pin is unchanged). (`game_demo_state.zig`,
       pathfinding capacity)
 - [ ] **Perception tail.** Stage avg ~0.16ms, max ~2.4ms. Only if denser
@@ -242,22 +225,15 @@ Nothing below is open backlog.
 - [x] **Path prewarm for shared goals (fixed budget)** — promoted into [Slice 71B](slices/slice-71b.md) (71B.3)
 - [x] **Static-collider split path** — promoted into [Slice 71B](slices/slice-71b.md) (71B.1 shared index, 71B.2 split)
 
-**Sequencing guardrails**
+**Sequencing notes**
 
-- Raise entity stress counts and world depth only after `validateDenseRenderBudget`
-  passes and scope stats show typical participation stays below bench ceilings.
 - Per-entity depth alignment (archive 25E) is settled before multi-floor
   gameplay scenarios that depend on cross-level entity presence.
 - Slice 32 (arbitration + per-agent goals) and multi-source investigate inputs
-  (39, 41) are landed; Slice 33 authoring is landed (close the visual residual
-  before shipping heavily data-tuned demo personalities as a product claim).
-- Do not scale cognition population (archetype swarm stress) until arbitration
-  is gated by the existing cognition-scope dense indices and benches report
-  intent-selection cost separately from pathfinding, and Slice 55 decision
-  coasting is landed and benched on an idle-heavy population.
-- Keep locomotion emergence (32–33 + 39 + 41) independent of action/combat
-  emergence (40+): `NavigationIntent` stays stable while action intents grow
-  beside it, not inside it. (Historical: the reserved interest kinds are all
-  wired after Slice 71C — investigate 41, resource 61, patrol 71A, cover 71C;
-  none is half-wired into investigate scoring.)
+  (39, 41) are landed; Slice 33 authoring is landed (its visual residual is
+  open).
+- Cognition population stress follows Slice 55 decision coasting and benches
+  that report intent-selection cost separately from pathfinding.
+- The reserved interest kinds are all wired after Slice 71C (investigate 41,
+  resource 61, patrol 71A, cover 71C).
 

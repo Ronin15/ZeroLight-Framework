@@ -21,7 +21,7 @@ Goal:
   reserved for the lane.
 - No dispatch regression.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Six private copies** of `const thread_shared_record_alignment: usize = 64;`
   (file-scope symbol `thread_shared_record_alignment` in each):
@@ -54,14 +54,13 @@ Goal:
   - `SearchScratch` (`pathfinding/scratch.zig`, the per-participant
     `PathfindingSystem.scratch_slots` entries): field `align(...)` on
     `generation` plus comptime `@alignOf`/`@sizeOf` asserts, like nav_graph.
-- **Out of scope by contract** (different concepts, not thread-shared
-  records):
+- **Out of scope** (different concepts, not thread-shared records):
   - `hot_soa_column_alignment` (`data_system/types.zig:21`) and
     `hot_particle_column_alignment` (`systems/particle.zig:24`) are SIMD
     column-base alignments.
-  - Slice 50's `batch_line_bytes = std.atomic.cache_line` is the documented
-    singleton exception.
-- **Rule text:** `docs/coding-standards.md:352-353` ("64-byte padding only
+  - Slice 50's `batch_line_bytes = std.atomic.cache_line` sizes a singleton,
+    not a slot array.
+- **Rule text:** `.claude/rules/threading.md` ("64-byte padding only
   for concurrently written thread-shared records").
 - **`WorkerRecord`** (`thread_system.zig:1059-1064`):
   - Fields: `{ id, shared, wake: std.Io.Semaphore, thread: ?std.Thread }`.
@@ -117,10 +116,9 @@ Goal:
 
 ```zig
 /// Size/alignment quantum for records written concurrently by different threads:
-/// per-range output slots, per-participant scratch, and `WorkerRecord`. 64 bytes
-/// is the per-slot convention (docs/coding-standards.md); slot arrays multiply,
-/// so this deliberately stays 64, not `std.atomic.cache_line` (128 on
-/// x86_64/aarch64), which Slice 50 reserves for singletons.
+/// per-range output slots, per-participant scratch, and `WorkerRecord`. Slot
+/// arrays multiply, so this stays 64, not `std.atomic.cache_line` (128 on
+/// x86_64/aarch64), which sizes singleton records such as the batch lines.
 pub const thread_shared_record_alignment: usize = 64;
 
 /// Bytes of trailing padding that round `@sizeOf(T)` up to a whole number of
@@ -458,9 +456,8 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
     owner, `WorkerRecord` line padding, and the fixed pool rule.
   - `docs/architecture.md` Background Lane (Slice 51 section): the OS
     priority policy per OS, and why SDL's call is not used.
-  - `docs/coding-standards.md:352-353`: name the owner constant,
-    `assertThreadSharedRecord`, and the lint rule.
   - `docs/development-workflow.md` Benchmarks: `background-lane-inherit`.
+- [ ] Add the thread-shared record alignment (owner constant, `assertThreadSharedRecord`, lint) rule to `.claude/rules/threading.md` when this lands.
 
 ### Acceptance checks
 

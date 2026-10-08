@@ -26,7 +26,7 @@ Goal:
   main-thread path and the serial path, regardless of lane timing.
 - With no lane thread, Slice 58's threaded main-thread path runs unchanged.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **`LoadingState` today** (`loading_state.zig:100-126`, `:186-214`):
   - It latches `rendered_once` after one drawn frame, then calls
@@ -54,13 +54,13 @@ Goal:
   no `RuntimeAssets`, renderer, or SDL.
 - **Slice 50:** a lane job reaching any `ThreadSystem` panics, including one
   with 0 workers, because the owner check runs first.
-- **Slice 51 polling rules:** `isDone` is allowed for load staging in
+- **Slice 51 polling surface:** `isDone` is allowed for load staging in
   `LoadingState` and cold load-time value handoff.
 - **`WorldSystem.addSparseTile`** (`world_system.zig:1699-1739`) touches only
   `sparse_tiles`, the sparse level and chunk indices, and
   `render_index_dirty`, never dense-layer storage.
-- **The test fixture rule** (`docs/coding-standards.md:414-427`): procedural
-  entry points are at most 16×16 with 1 underground level.
+- **Test fixtures** stay within the procedural fixture cap
+  (`.claude/rules/tests-benchmarks.md`).
 
 ### Architecture notes
 
@@ -379,20 +379,13 @@ const LaneBatchContext = struct { gen: *const ChunkGenContext, first_job: usize,
 - [ ] The `FailingAllocator` proof for the lane batch body passes.
 - [ ] Bench gate in ReleaseFast:
   `zig build -Doptimize=ReleaseFast bench -- --group worldgen-stream --details`.
-  - At 256/32 (production), the max per-`step()` main-thread time is ≤ 4 ms,
-    a quarter of a 16.67 ms step.
-  - If it is not, halve the `commit_chunk_jobs_per_step` default (512 →
-    256 → 128 → 64, never below 64) until it holds, and record the value.
-    **Final outcome:** if 64 still exceeds 4 ms, the default stays 64, the
-    measured max per-step time at every rung is recorded in Status as an
-    accepted deviation, and the check closes. The per-step bound is then
-    the fixed 64-job commit, which is still independent of world size.
-    (Adjusting the default also keeps the config-validation rule
-    `max_lane_jobs_in_flight * chunk_jobs_per_lane_job >=
-    commit_chunk_jobs_per_step` satisfied, since 8 × 64 ≥ every rung.)
+  - `commit_chunk_jobs_per_step` is a fixed count (default 512); the max
+    per-`step()` main-thread time, run at three world sizes, stays flat across
+    sizes (independent of world size; `.claude/rules/budgets-capacities.md`).
+    The measured values go in the commit message.
   - Record the adoption step (`finish` + `initFromGeneratedWorld`, timed by
     `loading_build`) at 256/32 in Status beside the stream gate. It is a
-    single main-thread update by design (below) and has no ≤ 4 ms gate.
+    single main-thread update by design (below) and is recorded, not gated.
   - Record total stream time against Slice 58's `worldgen` `thread-fixed-auto`
     time at the same size in Status. The stream trades throughput for a
     responsive loading frame by design, so there is no ratio gate.

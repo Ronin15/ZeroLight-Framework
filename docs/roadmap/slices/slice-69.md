@@ -16,9 +16,9 @@ regional through Slice 58's `chunk_biomes` (69B). Add a deterministic time skip
 with a real consumer (69C). Fully specify the three environment and world
 features that have no consumer or measured need yet: scripted weather override
 (69D), a per-zoom weather spawn rect (69E), and worlds larger than one bounded
-`WorldSystem` (69F). Every value stays a pure function of seed, spec and clock.
-Every per-step work budget is a fixed constant; data-structure capacities are
-sized from the loaded world and content (coding-standards § Budgets, Capacities, And Thresholds).
+`WorldSystem` (69F). Every generated and environment value is a pure function
+of seed, spec and clock (`.claude/rules/simulation.md` § Determinism); budgets
+and capacities follow `.claude/rules/budgets-capacities.md`.
 
 **Why six sub-slices.** Each one has its own owner files, dependencies and
 acceptance evidence. The three gated ones must not keep an ungated slice open.
@@ -45,9 +45,10 @@ acceptance evidence. The three gated ones must not keep an ungated slice open.
 - Per-region calendars, seasons or day length. There is one global calendar.
 - Temperature. It has no consumer (Slice 59's ruling stands).
 - NPCs crossing a 69F region seam. Only the player crosses.
-- AI agents choosing navigation goals on another level. AI goals are own-level
-  (69A writes `goal_level` = the row's level); levels change only through
-  plane traversal and ramps. Slice 71A's out-of-scope line points here.
+- AI agents choosing navigation goals on another level. AI navigation goals
+  stay on the agent's own level (69A "AI goal level" writes `goal_level` = the
+  row's level); levels change only through plane traversal and ramps. Slice
+  71A's out-of-scope line points here.
 - Per-row weather air velocity. The pool-wide, player-region air velocity of
   69B is the decided model (see 69B Presentation).
 

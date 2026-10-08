@@ -14,7 +14,7 @@ notarized, stapled `.dmg`; Linux additionally ships a single-file AppImage.
 Release tags refuse to publish unsigned Windows or un-notarized macOS
 packages. Flatpak is a recorded "no".
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - 52B signs the macOS bundle ad-hoc (`codesign --force --deep --sign -`) as
   the last package step; Linux ships a tarball directory; the `.desktop` has

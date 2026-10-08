@@ -2,6 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 55](slice-55.md), [Slice 56](slice-56.md), [Slice 61](slice-61.md), [Slice 62](slice-62.md), [Slice 63](slice-63.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
 
+**Status: not started (umbrella over 71A, 71B, 71C, 71D).**
+
 Umbrella for two independently landable halves (same shape as Slice 52):
 
 - **71A** closes the VoidLight → ZeroLight AI behavior parity audit: patrol,

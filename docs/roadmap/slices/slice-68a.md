@@ -31,7 +31,7 @@ Out of scope: per-row SIMD math (Slice 35), steering avoidance (Slice 35),
 collision full-sort retune (Scaling Gaps watch row), coasting sensing (Slice
 55 rejects it).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Spatial index build** (`src/game/systems/spatial_index.zig`):
   - The threaded gather `spatialGatherJob` (`:842-859`) already walks the
@@ -327,12 +327,13 @@ selection, on the main thread and serial.
 - No per-step logging. One `logging.game` debug line at
   `SimulationPipeline.init` prints the bus constants.
 
-#### 3. Battle-scale control re-baseline procedure (normative)
+#### 3. Battle-scale control re-baseline procedure
 
-This procedure is the only way rows in the Scaling Gaps control table change.
-Any slice that adds a pipeline stage or changes the soak population runs it
-when it lands (56, 56B, 57, 58, 61, 62, 68A, 68B, 68C). It runs on the
-reference machine; the numbers are machine-specific trend data, not CI gates.
+This procedure updates the rows of the Scaling Gaps control table. It runs
+when a slice that adds a pipeline stage or changes the soak population lands
+(56, 56B, 57, 58, 61, 62, 68A, 68B, 68C), on the reference machine. The
+numbers are machine-specific trend data for locating regressions, never perf
+claims or CI gates (`.claude/rules/tests-benchmarks.md`).
 
 1. **Build:** `zig build run -Doptimize=ReleaseSafe` at the slice's final
    commit. Perf logging is enabled in ReleaseSafe.
@@ -495,6 +496,7 @@ reference machine; the numbers are machine-specific trend data, not CI gates.
         outputs and the action-bus fairness policy.
       - `docs/development-workflow.md`: the `halo-consumers` bench example and
         the re-baseline procedure (a short pointer).
+- [ ] Add the battle-scale re-baseline procedure pointer to `.claude/rules/tests-benchmarks.md` when this lands.
 
 ### Acceptance checks
 
@@ -531,8 +533,8 @@ reference machine; the numbers are machine-specific trend data, not CI gates.
 - [ ] The re-baseline procedure is executed on the reference machine:
       - Three hands-off ReleaseSafe soaks, counts agreeing within ±2%.
       - The new control table is recorded and the old one moved to History.
-      - AI and perception stage bands are at or below the pre-slice bands
-        recorded under the same procedure on the parent commit.
+      - AI and perception stage bands are recorded beside the parent commit's
+        bands as diagnostic trend data (not a gate).
 - [ ] `zig build check` and `zig build verify` pass.
 
 ### VoidLight reference

@@ -13,7 +13,7 @@ pickup toasts. Use, equip, unequip, and drop are issued through
 `action_intents`, so UI code never mutates gameplay state directly, and every
 UI-originated intent is replayable.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - From Slice 57: catalog names and `grim_items` icon entries, `.use` with
   `ActionIntent.item`, `InventoryController`, `item_picked_up` events, the
@@ -34,7 +34,7 @@ UI-originated intent is replayable.
   `*const DataSystem`, `*const ItemCatalog`, and a borrowed
   `*PendingPlayerActions`. It owns no gameplay state and has no path to a
   mutable `DataSystem`. A comptime test asserts those parameter types, so the
-  "no direct writes" rule is checked by signature, not by review alone.
+  panel's lack of direct writes is checked by signature, not by review alone.
 - **`PendingPlayerActions`.** Requests flow through a fixed FIFO of 8
   `ActionIntent`s (`pending_player_action_capacity = 8`) owned by
   `GameDemoState`. `pipeline.capturePendingPlayerActions` drains it in
@@ -50,9 +50,9 @@ UI-originated intent is replayable.
   `pending_player_action_capacity`. A record mirrors every scalar
   `ActionIntent` field present at landing (kind, target index + generation,
   cell, level, `has_cell`, item). The verifier re-enqueues the records into
-  `PendingPlayerActions` before `replayStep`. A later slice that adds an
-  `ActionIntent` field (63: quantity, `price_limit`) extends the record and
-  bumps the format version in the same change.
+  `PendingPlayerActions` before `replayStep`. Slice 63 extends the record
+  with its new `ActionIntent` fields (quantity, `price_limit`) and a format
+  bump.
 - Append `ActionKind.drop` and `ActionKind.unequip` only together with this
   producer, so no dead tags ship.
 - `InventoryController` handlers:
@@ -95,6 +95,10 @@ UI-originated intent is replayable.
       toasts from `item_picked_up` events.
 - [ ] Docs: `docs/state-stack-and-input.md` (preset, queue) and
       `docs/architecture.md` (UI → gameplay boundary, replay v3).
+- [ ] Add the read-only UI panel signature rule to `.claude/rules/render.md`
+      when this lands.
+- [ ] Add the replay-record-mirrors-`ActionIntent` rule to
+      `.claude/rules/simulation.md` when this lands.
 
 ### Acceptance checks
 

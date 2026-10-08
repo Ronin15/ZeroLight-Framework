@@ -23,7 +23,7 @@ Goal:
   - **A reusable `text_field` widget.** It uses SDL3 text input, inline IME
     composition, and fixed UTF-8 buffers. Save naming is its first consumer.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/render/renderer.zig`:
   - `:669-832` `endFrame`

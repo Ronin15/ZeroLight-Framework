@@ -25,7 +25,7 @@ wall clock, render cadence, interpolation alpha, or measured cost. Sensing
 (spatial index, perception candidates and observers, memory, affect) never
 coasts.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Stagger:** `cognition_stagger_n = 4` (`src/game/simulation_scope.zig:11-13`).
   `stagger_phase` is assigned as `dense_index % 4` at movement-body append
@@ -94,18 +94,9 @@ coasts.
   - `scope` group (`src/benchmarks/scope.zig:285-356`): halo/think gathers, then
     AI on `ai_cognition_indices`.
 
-Baselines below are for the `ai` group, captured 2026-10-05 on the reference
-machine (Ryzen 9 7900X3D, 23 workers). They are machine-specific: they inform
-estimates but are not portable gates. The fixture has every agent thinking on a
-dense 11×9 px grid (about 112 separation checks per agent), so these are
-throughput ceilings, not frame targets.
-
-| Build / profile | Items | serial-direct | Best threaded |
-| --- | --- | --- | --- |
-| Debug, quick | 1,024 | 2.53 ms | 1.09 ms (adaptive-tuned) |
-| Debug, quick | 4,096 | 11.28 ms | 4.66 ms (adaptive-fixed) |
-| Debug, quick | 10,000 | 27.94 ms | 11.23 ms (adaptive-fixed) / 11.27 ms (tuned) |
-| ReleaseFast | 25,000 | 6.48–6.60 ms | 3.09 ms (adaptive-tuned, 14 workers) |
+The `ai` group's fixture has every agent thinking on a dense 11×9 px grid
+(about 112 separation checks per agent); its current numbers come from a fresh
+run, not this file.
 
 ### Architecture notes
 
@@ -568,11 +559,6 @@ list. Separation caps 32/128, `decideDir`, the avoidance kernels, and the
         decide ratio, but AI cost is not linear in decided rows (the O(halo)
         candidate walk stays). **Fallback if missed:** Slice 68A closes it;
         record the halo-walk share.
-      - **Reference-machine estimates (Ryzen 9 7900X3D, 23 workers; record
-        actuals, not pass/fail):** `ai-idle-coast` at 25k `serial-direct`
-        around 1.65 ms (about 25% of the current all-think `ai` 6.48–6.60 ms),
-        and `thread-adaptive-tuned-range` around 1.08 ms (about 35% of
-        3.09 ms). Record the measured values in Status.
       - The existing `ai` group (code path untouched) stays within the run's
         noise band versus a same-session pre-change capture.
       - Commands:
@@ -580,10 +566,9 @@ list. Separation caps 32/128, `decideDir`, the avoidance kernels, and the
         then the same with `ai-idle-coast`, then both with
         `--case thread-adaptive-tuned-range`. The 10k figures come from the quick
         profile.
-- [ ] **Battle soak:** the AI and steering stages are at or below the control
-      band measured in the same session (reference-machine estimates: AI
-      ~0.15–0.20 ms, steering ~0.65–0.70 ms, `ai_decide_gather` ≤ 0.03 ms;
-      record actuals), and decide/`coast_skips` counts are recorded in the
+- [ ] **Battle soak**, recorded as diagnostic trend data
+      (`.claude/rules/tests-benchmarks.md`): AI, steering, and
+      `ai_decide_gather` stage lines and decide/`coast_skips` counts go in the
       control table.
 - [ ] `zig build check` (comptime stage-contract checks) and `zig build verify`
       pass.

@@ -19,7 +19,7 @@ bundle, replacing 52C's arm64-only `.app`), an aarch64 Linux tarball, and an
 aarch64 Windows zip, each with its symbols archive. CI builds and tests each
 architecture on a native or emulating runner.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - 52A's SDL contract: Linux/macOS build pinned SDL from source with
   `tools/build_sdl.py` only when host os+arch equals the target; Windows uses

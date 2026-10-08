@@ -19,7 +19,7 @@ The existing main menu, settings menu (interim), pause screen, and loading
 screen move onto it; `menu_view.zig` is deleted; a demo HUD proves the HUD
 primitives.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/game/menu_view.zig:21-104` — the only "toolkit" today: wrap-around
   `changeSelection` (`:21-27`) and a fixed vertical `renderList` with
@@ -61,8 +61,8 @@ primitives.
     1. `State.handleEvent` must return `consumed` at event time
        (`engine.zig:239-242`), but an IMGUI only resolves focus and hits during
        the next declaration pass.
-    2. IMGUI identity relies on per-frame ID or label hashing, which the
-       no-per-frame-hash rule forbids.
+    2. IMGUI identity relies on per-frame ID or label hashing
+       (`.claude/rules/memory-performance.md`).
     3. IMGUI re-runs layout every frame.
   - Not VoidLight's retained tree: it uses string IDs, `std::function`
     callbacks, `shared_ptr` components, and a singleton.

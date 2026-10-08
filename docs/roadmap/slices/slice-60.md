@@ -28,7 +28,7 @@ Goal:
   - frames-in-flight-safe resource and uniform handling
 - Add an app-level screen fade-in on state replacement.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/render/camera.zig:10-13`: `Camera2D { position (top-left world), zoom }`. There
   is no CPU transform. `renderer.zig:1566-1602` (`frameUniformForPresentation`) folds
@@ -345,7 +345,7 @@ body of `simViewRect()`. No second anchor store or `PipelineResource` is added.
   (validated `< zoom_level_count`), a schema bump by one with the
   `upgradeVNToVN+1` step this slice adds. The rig reads it at init as its starting
   `zoom_index`; a zoom change writes it back through the store's normal dirty path.
-- Fixed constants, classified (coding-standards § Budgets, Capacities, And Thresholds):
+- Fixed constants, classified (`.claude/rules/budgets-capacities.md`):
   - `k_max_zoom_levels = 8`: format (the inline `zoom_levels` array;
     `zoom_index: u8`)
   - `k_shake_max_offset_px = 8`: presentation tuning amplitude, not a cap

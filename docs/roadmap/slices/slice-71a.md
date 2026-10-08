@@ -67,7 +67,7 @@ by a named section; none is a backlog line:
   code after commit. 62 group spawns do not auto-assign, because entity ids
   do not exist until commit.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Arbitration** (`src/game/systems/arbitration.zig`):
   - `behavior_count` (`:24`; Slice 61 makes it `@typeInfo`-derived) and
@@ -342,9 +342,9 @@ holds pure functions only:
   `interest.level` column, already gathered). `writeAiIntentsJob` writes
   `goal_level = row_levels[i]` when the resolved behavior is `.patrol`,
   `.follow`, or `.return_home`, and leaves the default 0 otherwise. A
-  pure `postGoalLevel(behavior, row_level) u16` helper with an exhaustive
-  switch holds the rule, so a later behavior must classify itself. Slice 69A
-  later replaces it with "every behavior is own-level".
+  pure `postGoalLevel(behavior, row_level) u16` helper holds the mapping;
+  its exhaustive switch fails to compile until a new behavior is classified.
+  Slice 69A later replaces it with "every behavior is own-level".
 - Row work stays scalar, as gather is. The new signal math is a handful of
   compares and one normalize, inside the existing threaded intent job.
 

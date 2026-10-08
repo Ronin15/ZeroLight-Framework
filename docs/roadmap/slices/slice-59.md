@@ -21,7 +21,7 @@ lightning flash). Every environment value is a pure function of
 `(EnvironmentConfig, env_seed, game_ms)`, so save/load and replays need only the
 clock (the seed root is already in the Slice 49 header).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/app/time_loop.zig:8-11` sets the fixed step: 60 Hz, `fixed_delta_ns`,
   `fixed_delta_seconds`. `interpolationAlpha` (`:58-61`) is render-only.
@@ -244,10 +244,10 @@ time or weather. The game knows nothing about GPU layouts.
   - VoidLight's "caution" scale (night or storm raises fear) is **not** half-wired as a
     global fear multiplier. It belongs to Slice 42's "appraisal gains become data" (Slice
     69 addition (b), folded into [Slice 42](slice-42.md)).
-- Sim-affecting outputs use only integer math and IEEE basic ops (`+ − × ÷`, min/max,
-  the smoothstep polynomial). That covers modifiers, phase, weather kind/blend, and
-  events, so they stay bit-reproducible under Slice 49's determinism contract. Trig
-  (gust, wind direction, particle spawn) appears only in presentation outputs.
+- This slice computes its sim-affecting outputs (modifiers, phase, weather kind/blend,
+  events) with integer math and IEEE basic ops (`+ − × ÷`, min/max, the smoothstep
+  polynomial) only, so they are bit-reproducible under Slice 49's determinism contract.
+  Its trig (gust, wind direction, particle spawn) feeds presentation outputs only.
 
 **Pipeline placement.**
 

@@ -20,7 +20,7 @@ Goal:
 - UI navigation plays fixed SFX through stable `AudioAssetId`s that survive
   the pause SFX stop.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/render/fps_counter.zig:21-29`: prefix + 10 digit `PreparedText`s.
   - `:73-96`: per-DPI `loadFont` and full glyph re-prepare.

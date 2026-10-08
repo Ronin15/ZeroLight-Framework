@@ -22,7 +22,7 @@ Goal:
   and Dvorak. Existing `settings.zon` keycode bindings migrate once, under a
   settings schema bump, with no data loss.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/app/resolution.zig:100-128`: pure `windowToDrawable`,
   `drawableToLogical` (returns `null` in letterbox/pillarbox bars), and
@@ -404,7 +404,7 @@ amended):
       focus event; X11, Windows, and Cocoa build it synchronously at video
       init), so no key press is ever resolved against the defaults.
     - The file write waits for completion: `save_requested` set by the
-      upgrade (freeze rule below) is held while `pending_key_migration` is
+      upgrade (migration freeze below) is held while `pending_key_migration` is
       set. A session that never gains focus (headless, or closed first)
       never writes, so the old file survives and the next launch migrates
       again. Settings changed by mouse before focus are applied and written
@@ -419,8 +419,8 @@ amended):
       ("keyboard bindings reset during scancode migration")
     - audio, video, accessibility, and other sections are kept
     - this replaces 54's whole-file rejection for this specific failure
-- **Freeze rule (54 amendment, applies to every upgrade).** A load that ran
-  any `upgradeVNToVN+1` step sets `save_requested = true`. The first
+- **Migration freeze (amends 54's load path).** A load that ran any
+  `upgradeVNToVN+1` step sets `save_requested = true`. The first
   `applyPendingSettings` after any deferred step has completed (today only
   this slice's keymap-ready migration) writes the latest version. Migration
   runs once, and a later OS layout change cannot re-migrate the old file
@@ -543,7 +543,7 @@ amended):
       - each default resolves by scancode
       - an event whose `.key` disagrees with its `.scancode` resolves by
         scancode (the AZERTY case)
-- [ ] Settings schema bump + migration step + freeze rule. `settings_file.zig`
+- [ ] Settings schema bump + migration step + migration freeze. `settings_file.zig`
       tests use a local table-driven `KeyToScancode`:
       - a previous-version file migrates `.key = 'a'` to `.scancode = 4`
         (audio/video kept)
@@ -576,12 +576,14 @@ amended):
       `UiScreen.handlePointer`.
 - [ ] Docs:
       - `docs/state-stack-and-input.md`: new `## Pointer`, `## Menu
-        repeat`, `## Scancode bindings` (layout behavior, migration, freeze
-        rule); update `## Input Model` default-bindings wording to physical
+        repeat`, `## Scancode bindings` (layout behavior, migration, migration
+        freeze); update `## Input Model` default-bindings wording to physical
         keys
       - `docs/architecture.md`: input-flow sentence covers pointer and
         synthesized repeats
       - `src/tests.zig` registers the new modules
+- [ ] Add the settings migration-freeze rule to `.claude/rules/input-state.md`
+      when this lands.
 
 ### Acceptance checks
 

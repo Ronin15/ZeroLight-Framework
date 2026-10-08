@@ -12,7 +12,7 @@ depots with `steamcmd`, setting a fixed branch live: prereleases → `beta`,
 releases → `staging`. Promotion to `default` stays a human action in
 Steamworks after the Release Checklist.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - 52C/66A produce `package-<os>-<arch>` artifacts. Archives preserve Unix
   modes (`tar`; macOS `ditto` zips record Unix attributes), and

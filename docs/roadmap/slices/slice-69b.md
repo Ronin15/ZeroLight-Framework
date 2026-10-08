@@ -19,7 +19,7 @@ in, and region borders cross-fade. Weather stays a pure function of
 persisted. A single-region world (every `initDemo*` world, and any spec without
 `weather_regions`) is identical to Slice 59.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Slice 59 (planned contract).**
   - Model and constants:

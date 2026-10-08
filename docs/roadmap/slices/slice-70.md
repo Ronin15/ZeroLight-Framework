@@ -42,7 +42,7 @@ tracks.
 | Owner | Amendment |
 | --- | --- |
 | [60](slice-60.md) | Out-of-scope items point to 70B; `world_pixel` init error superseded by 70B's fallback; `drawGroupRange` binds 70A's index buffer; `CompositeParams` 80 B and coverage `+2`; fade `advance` at the top of `renderFrame`; tweened clamp replaces `captureZoomInput`'s re-clamp |
-| [44](slice-44.md) | Pad defaults and the explicit-beats-default-fill loader rule (binds every later settings step) |
+| [44](slice-44.md) | Pad defaults and the explicit-beats-default-fill loader behavior |
 | [56](slice-56.md), [57](slice-57.md) | Interim stick-click pad defaults end at 70B (RT/LT) |
 | [67C](slice-67c.md), [69E](slice-69e.md) | Thumbnails work in both scene modes; the presentation view rect uses the tweened zoom |
 

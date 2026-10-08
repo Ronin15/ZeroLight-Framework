@@ -25,7 +25,7 @@ Goal: bounded, deterministic social state.
 - Merchants trade through action intents with integer pricing in Slice 57
   coins, under a live-modal trade screen built on Slice 53B and 57B.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `Faction` closed enum (4 tags) and const symmetric `relationship_matrix` /
   `stance()` (`src/game/faction.zig:7-28`). Hot call sites are
@@ -126,7 +126,7 @@ fingerprint joins Slice 46's `content_fingerprint`.
   this adds `ActionIntent` fields, this slice extends Slice 57B's
   `ReplayActionRecord` with `quantity` and `price_limit` and bumps
   `replay_format_version` to the live value + 1 (v4 in the merged order) in the
-  same change (57B's rule).
+  same change, so the record keeps mirroring every `ActionIntent` field.
 - `TradeController` runs first at `action_react`, per Slice 56's fixed claim
   order trade → harvest → destructible. Within `action_react`, social
   interaction outranks gathering, which outranks breaking.
@@ -176,7 +176,7 @@ fingerprint joins Slice 46's `content_fingerprint`.
 - The state borrows `*PendingPlayerActions` (Slice 57B) plus `*const
   DataSystem` for render-time read-only inventory and quote views. This follows
   the settings-menu borrowed-pointer precedent and 57B's read-only panel
-  signature rule.
+  signature.
 - Confirm pushes a request carrying the previewed `price_limit`.
 - Session validity (alive, reach, level) is checked by the pure check in the
   menu state's **fixed `update`**, not per render frame. When invalid, it queues

@@ -1,8 +1,10 @@
 ## Slice 65B: Deferred Nav Rebuild On The Background Lane
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 51](slice-51.md), [Slice 65A](slice-65a.md), [Slice 64E](slice-64e.md), [Slice 64F](slice-64f.md), [Slice 49](slice-49.md), [Slice 64B](slice-64b.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 51](slice-51.md), [Slice 65A](slice-65a.md), [Slice 64G](slice-64g.md) (rewrites this slice's nav model), [Slice 49](slice-49.md), [Slice 64B](slice-64b.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** Depends on **51** (`BackgroundLane`,
+**Status:** Not started.
+
+Depends on **51** (`BackgroundLane`,
 `background_handoff.submitWithHandoff`/`isDue`, and the lane passed through
 `UpdateContext.background_lane`) and **65A**, the first CPU-heavy in-game
 lane consumer, which needs the lowered-priority gate to hold. Uses **49**'s
@@ -28,7 +30,7 @@ Goal:
 - The swapped graph is equivalent to what the synchronous path would have
   produced for the same batch.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Post-commit nav reaction.** `PathfindingSystem.reactToPostCommitNavEvents`
   (`systems/pathfinding/system.zig:617-673`):
@@ -91,15 +93,16 @@ Goal:
   `WorldSystem.addLevelLink`). The world's load-time `reserveLevelLinks`
   (sized by `GameDemoState` from the authored links plus
   `nav_interior_link_slots_floor` per world chunk) is only the initial
-  size: per Slice 64E's link-growth follow-up (landed 2026-10-06),
-  `level_links`, `link_edges`, and `link_edge_refs` grow geometrically at the
-  dig commit seam (main thread; `SimulationPipeline.ensureLevelLinkRoom` →
+  size: per Slice 64E, `level_links`, `link_edges`, and `link_edge_refs` grow
+  geometrically at the dig commit seam (main thread;
+  `SimulationPipeline.ensureLevelLinkRoom` →
   `PathfindingSystem.reserveLinkCapacity`); nothing refuses a ramp (a chunk's
-  interior link capacity grows in place, 2026-10-07). Slice 64E removed `groupLinkCellRuns` and its per-build
-  temporary `allocator.alloc`: interior link endpoints live in the
-  `chunk_link_cells` table (each chunk's interior link capacity, sized from
-  the link set in `computePortalGeometry`), and the full build reserves `link_edges` /
-  `link_edge_refs` to `levelLinkLimit()` / `2 × levelLinkLimit()`.
+  interior link capacity grows in place). Slice 64E removed
+  `groupLinkCellRuns` and its per-build temporary `allocator.alloc`: interior
+  link endpoints live in the `chunk_link_cells` table (each chunk's interior
+  link capacity, sized from the link set in `computePortalGeometry`), and the
+  full build reserves `link_edges` / `link_edge_refs` to `levelLinkLimit()` /
+  `2 × levelLinkLimit()`.
 - **Allocation contract.** The graph is allocation-free at steady state.
   Growth happens only in the cold, event-triggered topology blow-up
   (`nav_graph.zig:623-629`). The established `FailingAllocator` pattern swaps
@@ -166,9 +169,9 @@ comptime {
   field.
 - The value 64 is a fixed constant. If the bench gate below fails at 64, the
   constant moves to the smallest of {128, 256} that passes, and the chosen
-  value is recorded in Status. **Final outcome:** if 256 also fails, the
-  constant is set to 256 and kept, and every rung's numbers are recorded in
-  Status as an accepted deviation. Batches below 256 changed chunks then
+  value is reported in the landing commit. **Final outcome:** if 256 also
+  fails, the constant is set to 256 and kept, and every rung's numbers are
+  reported in the landing commit as an accepted deviation. Batches below 256 changed chunks then
   stay on the synchronous threaded path, which is today's behavior, so the
   fallback never regresses anything; the gate closes. It is never derived
   from a map's chunk count.
@@ -205,7 +208,7 @@ because of the fence below.
     to `k = nav_deferred_rebuild_latency_steps` steps of marks (seams
     `s+1 … s+k`), so the dirty buffers are sized for the window, not for
     one step. 65B scales Slice 64E's `reserveNavDirty` by the fence window:
-    64E (landed 2026-10-06) sizes `nav_dirty_edits` to
+    64E sizes `nav_dirty_edits` to
     `structuralStageEventBound() + 2 × nav_new_links_per_step_max`,
     `nav_dirty_cell_spans` to `2 × structuralStageEventBound()`, and the
     synchronous eviction scratch `nav_changed_spans` to their sum, from
@@ -213,8 +216,9 @@ because of the fence below.
     That scratch consumes the same held marks when the swap step's batch
     classifies `.synchronous`. `nav_dirty_levels` is already reserved to
     the nav level count `L` at the nav build (landed by 64E): the deduped
-    level set holds every level whatever the window. The reserve is a pure function of the structural-stage event bound,
-    the fixed latency, and the loaded world. Marks within it never allocate. A
+    level set holds every level whatever the window. The reserve is a pure
+    function of the structural-stage event bound, the fixed latency, and the
+    loaded world. Marks within it never allocate. A
     step whose marks exceed its per-step share keeps pathfinding's
     grow-rather-than-drop overflow on the main thread (never a drop, never
     on the lane).
@@ -371,7 +375,7 @@ rule enforced structurally: the job cannot reach `parallelFor`.
        synchronous serial path.
    - `stats.edge_windows_grown` / `stats.edge_repacks` are reported as
      `total - reported` after every fallible step succeeds, advancing the
-     two `_reported` cursors (64E M10), so a failed lane job's growths are
+     two `_reported` cursors (64E), so a failed lane job's growths are
      reported by the next successful apply.
    - Then `rebuildLinkEdges(links)`.
    - On a full relabel, bump `version` (skipping 0) and set
@@ -412,7 +416,7 @@ rule enforced structurally: the job cannot reach `parallelFor`.
       `chunk_portal_cap`, `chunk_portal_base`, `total_slots`,
       `edge_windows_grown_total`, `edge_windows_grown_reported`,
       `edge_repacks_total`, `edge_repacks_reported` (lifetime counters and
-      their report cursors, carried across the swap; 64E M10, 64F),
+      their report cursors, carried across the swap; 64E, 64F),
       `chunk_link_cells` (sum of the chunks' interior link capacities),
       `chunk_link_count`.
       (`chunk_link_base` and `edge_slack` no longer exist; 64E deletes
@@ -523,7 +527,8 @@ is called through `SimulationPipeline.serviceDeferredNavRebuild` by
 - The budget is always counted, because deferral is always on. A world
   admitted before this slice can now fail the default 512 MiB gate only if
   it was already above about 45% of it. The production 256×256×32 config is
-  far below; record its before and after `requiredBytes` in Status.
+  far below; report its before and after `requiredBytes` in the landing
+  commit.
 - Existing `nav_memory.zig` expected-byte tests are updated in the same
   change.
 
@@ -542,23 +547,20 @@ is called through `SimulationPipeline.serviceDeferredNavRebuild` by
 - `FailingAllocator` proofs therefore run the job on a thread-less lane or
   with no lane. `FailingAllocator`'s counters are not atomic.
 
-**Slice 51 contract amendment (this slice owns it): frozen borrow**
+**Slice 51 contract amendment: frozen borrow**
 
-The job-input rule ("a job reads only data it owns: an immutable snapshot
-copied at submit") gains one clause:
-
-> A job may also read a structure it does not own when its consumer
-> **freezes** it.
-> - From submit until `complete`/`cancel` returns, no thread writes that
->   structure. Concurrent readers are allowed.
-> - The consumer enforces the freeze with a state check at every mutating
->   entry point, which defers or panics, never silently proceeds.
-> - The consumer names the frozen structure in the job context's doc comment
->   and covers it with a `-Dsanitize-thread` test.
->
-> Jobs still never receive a `ThreadSystem`, renderer, SDL handle, or live
-> `DataSystem`/`WorldSystem` pointer. Slices into a world that is under
-> construction and not yet live are allowed (65C).
+Slice 51's lane job reads only data it owns (an immutable snapshot copied at
+submit). This slice adds the frozen borrow: the nav job also reads the front
+graph, which it does not own, because `NavDeferredRebuild` freezes it.
+- From submit until `complete`/`cancel` returns, no thread writes the front.
+  Concurrent readers are allowed.
+- The fence's state check at every mutating entry point defers or panics,
+  never silently proceeds.
+- The job context's doc comment names the frozen front, and a
+  `-Dsanitize-thread` test covers it (Acceptance).
+- The job still receives no `ThreadSystem`, renderer, SDL handle, or live
+  `DataSystem`/`WorldSystem` pointer. Slice 65C uses the same clause for
+  slices into a world that is under construction and not yet live.
 
 **Determinism, checksum, and saves**
 
@@ -623,10 +625,12 @@ copied at submit") gains one clause:
     incremental-matches-full-rebuild and edge-cap tests.
   - New tests:
     - `test "a full abstract rebuild that fits its high-water mark is allocation-free"`:
-      `FailingAllocator` on `graph.allocator` after one warm rebuild, then a
-      second `buildAbstractGraphs(links)`, counting allocations other than
-      the one-level `build_edge_scratch` staging (freed after every build)
-      as failures.
+      after one warm rebuild, a counting allocator wrapper on
+      `graph.allocator` records allocation sizes during a second
+      `buildAbstractGraphs(links)`; the only allocations are the one-level
+      `build_edge_scratch` staging (freed after every build).
+      (`FailingAllocator` counts every allocation, so it cannot exempt the
+      staging list.)
     - `test "copyGraphFrom produces an equivalent graph"`:
       `expectGraphsEquivalent` plus `expectSameEdgeLayout` and equal
       `version` / `edge_windows_grown_total` / `edge_windows_grown_reported` /
@@ -792,12 +796,13 @@ copied at submit") gains one clause:
     submit on a real threaded lane, and swap.
   - `--details` reports the lane job's own duration and whether the swap
     waited.
-- [ ] (added by Slice 64) The lane's back-graph patch/relabel uses 64E's interior link
-      slots, `assignLinkEndpointSlots`, and the `nav_links_processed`
-      cursor; an endpoint past its chunk's capacity grows that chunk in place
-      (`growChunkLinkCapacity`, which shifts later chunks' slot windows). Links added while a deferred rebuild is in flight are held by
-      the fence and processed by the main-thread cursor from step `s + k`'s
-      seam (≤ 8 per step), never dropped. 65B's equivalence-to-synchronous
+- [ ] The lane's back-graph patch/relabel uses 64E's interior link slots,
+      `assignLinkEndpointSlots`, and the `nav_links_processed` cursor; an
+      endpoint past its chunk's capacity grows that chunk in place
+      (`growChunkLinkCapacity`, which shifts later chunks' slot windows).
+      Links added while a deferred rebuild is in flight are held by the fence
+      and processed by the main-thread cursor from step `s + k`'s seam (≤ 8
+      per step), never dropped. 65B's equivalence-to-synchronous
       test includes a runtime ramp added before submit and one added during
       the job.
 - [ ] Roadmap cross-edits (same change):
@@ -833,8 +838,7 @@ copied at submit") gains one clause:
   - `docs/development-workflow.md`: the `nav-update-deferred` group, and
     `background-lane` plus `nav-update-deferred` in the Thread Sanitizer
     group list.
-- [ ] Non-fatal failure states (64E M8–M13 review, 2026-10-07; required
-  because 65B makes a failed apply non-fatal):
+- [ ] Non-fatal failure states (65B makes a failed apply non-fatal):
   - A relabel allocates its one-level `build_edge_scratch` staging every
     time, so an OOM can stop a relabel at level k with `link_edges` not
     rebuilt. 64F commits each level on its own (arena allocated before any
@@ -848,11 +852,7 @@ copied at submit") gains one clause:
     indexes them). Validate
     into locals and commit the dimensions only after the check passes;
     test that a refused `rebuild` leaves the prior graph's dimensions.
-  - Restate the planned test "a full abstract rebuild that fits its
-    high-water mark is allocation-free": `FailingAllocator` counts every
-    allocation, so it cannot exempt `build_edge_scratch`. Use a counting
-    allocator wrapper that records allocation sizes and assert the only
-    allocations are the staging list's.
+- [ ] Add the frozen-borrow rule to `.claude/rules/threading.md` when this lands.
 
 ### Acceptance checks
 
@@ -878,9 +878,10 @@ copied at submit") gains one clause:
     the constants note and re-run; its final outcome (256 kept, recorded as
     an accepted deviation) also closes this check.
   - The lane job for the full-relabel row and for the 256-chunk row finishes
-    in ≤ 250 ms (half the `k` window), with no swap wait recorded.
-  - Record every number and the 256×256×32 `requiredBytes` before and after
-    in Status.
+    within half the `k` window, so no swap wait is recorded (a deadline the
+    handoff needs, not a perf target).
+  - Report every number and the 256×256×32 `requiredBytes` before and after
+    in the landing commit.
 - [ ] `zig build bench -Dsanitize-thread=true -- --profile quick --group nav-update-deferred`
   is clean.
 - [ ] Review check: `applyNavUpdatesImpl` begins with the

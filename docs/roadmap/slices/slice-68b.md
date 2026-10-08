@@ -41,7 +41,7 @@ Out of scope (decisions, not deferrals):
 - Sharing retaliation with allies. That is Slice 71A's `guard_alarm` help-call
   (an `AffectImpulse` producer on Slice 61's substrate), not this slice.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Motion:**
   - `MovementSystem.applyIntents` (`systems/movement.zig:59-71`) overwrites

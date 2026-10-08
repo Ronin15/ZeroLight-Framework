@@ -2,9 +2,10 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 49](slice-49.md), [Slice 50](slice-50.md), [Slice 51](slice-51.md), [Slice 52D](slice-52d.md), [Slice 53B](slice-53b.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** Umbrella for five verifiable chunks. Each sub-slice has
-its own Status, Checklist, and Acceptance checks; the umbrella closes when
-64A, 64B, 64C, and 64E are archived (64D is consumer-gated and may stay open).
+**Status: not started.** Umbrella for seven verifiable chunks. Each sub-slice
+has its own Status, Checklist, and Acceptance checks; the umbrella closes when
+64A, 64B, 64C, 64E, 64F, and 64G are archived (64D is consumer-gated and may
+stay open).
 
 | Sub-slice | Status | Hard prerequisites | Delivers |
 | --- | --- | --- | --- |
@@ -12,7 +13,9 @@ its own Status, Checklist, and Acceptance checks; the umbrella closes when
 | **64B** | Not started | 49, 50, 64A; land before 46 | Checksum format tag = live + 1 (`"zl-sim-checksum-v2"` in the merged order): NaN-canonical float folding with a NaN counter (`simd.nanMaskFloat4`), section digests with an ordered combine, threaded dense-tile block hashing (fixed 256-slot rounds), pipeline-history coverage with a comptime completeness classification over every `SimulationPipeline` field, the `normalizeDerivedState` API that backs the `normalized` class (including 64E's cursor, 65B's deferred job, the dirty marks, and 71B.3's prewarm fields), and the single owner of `buildFingerprint()` + the `app_version` option |
 | **64C** | Not started | 49, 51, 53B, 64B; before 57B | `zig build replay -- <file>` headless runner on an app-layer `HeadlessSession` (no Engine mode), session descriptor + `build_fingerprint` in the replay header (`replay_format_version` = live + 1, v2 in the merged order), `GameSessionDescriptor`, New Game flow with a random root chosen once on the main thread (`SessionSeedSource`, `-Dsession-seed`) |
 | **64D** | Not started — gated on the first simulation consumer of `atan2` | 52D (+ the gate) | Deterministic polynomial `simd.atan2Float4`, `math.atan2` delegating to lane 0, golden bits, `simd-asm-check` probe, `simd-atan2` bench |
-| **64E** | Not started (live defect; no prerequisite; before 46 and 65B) | — | Runtime ramp/stair links are routable the same step: per-chunk interior link slots (floor 8, doubled in place since 2026-10-07; no ramp refusal), new links dirty both endpoints on both levels via a link cursor (≤ 8 links/step, deterministic deferral), incremental == full-rebuild parity, `nav-update-links` bench |
+| **64E** | Landed; manual ramp check open | — | Runtime ramp/stair links are routable the same step: new links dirty both endpoints on both levels via a link cursor (≤ 8 links/step, deterministic deferral), incremental == full-rebuild parity, `nav-update-links` bench; no ramp refusal |
+| **64F** | Implemented; superseded by 64G | 64E | Per-level nav edge windows, one repack per level on overflow |
+| **64G** | Not started | 64F; before 65B, 46 | [Chunk-owned terrain and nav](slice-64g.md): per-chunk storage, staged all-or-nothing apply, per-chunk GPU pages, simulation-derived residency |
 
 **What 64 adds to Slice 49's Determinism Contract.** After 52D and 64A–64C,
 the guarantee "same seed + same initial state + same per-step input →

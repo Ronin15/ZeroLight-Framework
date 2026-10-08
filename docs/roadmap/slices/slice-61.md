@@ -31,7 +31,7 @@ affect drive scores a new `forage` behavior, nearby available nodes and
 next step's appraisal reads it). No sessions, timers, or per-harvester state
 live in the controller.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Action-intent bus: `ActionKind` / `ActionIntent` / `action_intent_live_capacity = 64`
   (`src/game/simulation.zig:478-501`), `tryAppendActionIntent` one range per

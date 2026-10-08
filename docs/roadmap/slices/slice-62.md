@@ -28,7 +28,7 @@ Ambient NPCs despawn far beyond the dormant band with hysteresis. Merchants are 
 despawn decisions read only committed state and Slice 49's fixed-step sim view,
 never the render window.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Tier bands: `cognition/locomotion/kinematic_halo_chunks = 16/32/48`,
   `SimulationTier`, `tierForChunkDistance`, `ActiveRegion.lodDistance`

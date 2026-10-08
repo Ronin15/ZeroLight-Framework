@@ -31,7 +31,7 @@ Out of scope:
   appended with its first weapon.
 - Player death drops: the player has `destroy_on_death = false` (Slice 56).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Slice 57 Loot (phase 3 of `inventory_update`):**
   - One loot-table roll per `entity_killed` creates one world item at the
@@ -334,6 +334,11 @@ changing through `ItemCatalog.fingerprint()`. Kill deferral adds no state:
 
 ### Checklist
 
+- [ ] **Redesign before implementing** (design pass): the fixed 512-entry
+      `pending_drops` FIFO that defers kills under overload conflicts with
+      `.claude/rules/budgets-capacities.md` (no deferral or refusal depends on
+      capacity); the FIFO grows at the seam, with only the per-step drain
+      budget fixed.
 - [ ] Catalog: `ItemKind.ammo`, `AmmoClass`, the `ammo_class` /
       `requires_ammo` columns, strict validation, the fingerprint fold, and
       `weaponAmmo`. `items.json` v2 with `coin_pile_icon`, `arrows`, and

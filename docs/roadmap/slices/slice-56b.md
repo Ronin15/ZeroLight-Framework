@@ -11,7 +11,7 @@ through the existing collision-trigger stream, and deal damage through
 spawn/hit/expiry budgets, a content-derived live projectile capacity, and every combat array and reserve is resized from
 Slice 56's named caps.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Slice 56: `AiActionSelectSystem` (`.attack` arm), `CombatController`'s
   two-phase accumulation sized by `combat_max_hits_per_step` /

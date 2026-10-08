@@ -17,21 +17,21 @@ SIMD lanes and scalar tail. It must never go through `std.math.atan`'s vector
 path, which uses `@mulAdd` (`lib/std/math/atan.zig:621-628`) and lowers to
 per-lane `fmaf` compiler-rt calls on `x86_64_v2`.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Audit (grep of `src/` at design time): `math.atan2` (`core/math.zig:
   160-162`, `std.math.atan2`, scalar musl port with IEEE basic ops only) has
   one caller, `ai_debug_overlay.zig:112` (render-only facing angle). No
   simulation module calls `atan2`/`atan`. 64A's `STD_MATH_TRANSCENDENTAL` lint
   keeps every arc-tangent behind `core/math.zig`.
-- 52D's conventions apply: `simd.zig` determinism header, select-form
-  helpers, golden-bit tables that fix the op order, and `simd-asm-check`
-  budgets of measured + max(2, 25%).
+- The kernel is built on 52D's pieces: the `simd.zig` determinism header,
+  the select-form helpers, a golden-bit table that fixes its op order, and a
+  `simd-asm-check` budget of measured + max(2, 25%).
 
 ### Architecture notes
 
-**Kernel (`src/core/simd.zig`; op order is normative).** Constants are the
-ARM optimized-routines `atanf` minimax set already used by
+**Kernel (`src/core/simd.zig`; the op order below is the spec).** Constants
+are the ARM optimized-routines `atanf` minimax set already used by
 `std.math.atan`'s vector path, evaluated unfused in strict mode:
 
 ```zig
@@ -81,7 +81,7 @@ pub fn atan2Float4(y: Float4, x: Float4) Float4 {
 - **Contract** (measured on the design-time probe, Zig 0.17.0 ReleaseFast):
   - `atan(t)` stage: exhaustive over every `f32` in `[0, 1]`, ≤ 1 ulp, max
     absolute error 7.44e-8 (the `t + t*(t2*p)` association measured the
-    same; the form above is normative);
+    same; the form above is the spec);
   - `atan2`: 64M random pairs in `[-4096, 4096]²`, ≤ 2 ulp, max absolute
     error 2.88e-7;
   - special values are bit-exact with `std.math.atan2`: `atan2(±0, +0) = ±0`,
@@ -93,8 +93,8 @@ pub fn atan2Float4(y: Float4, x: Float4) Float4 {
   - a Wyhash digest of 2 × 4M-lane sweeps (random bit patterns, and finite
     values in ±1000) was identical (`0x98491af42b960ab2`) at `-mcpu=x86_64`,
     `x86_64_v2`, `x86_64_v3`, native Zen 4, and Debug (self-hosted backend).
-- Golden bits (normative; `y`, `x` → result). If an implementation differs,
-  its op order is wrong. Fix the code, never the table:
+- Golden bits (`y`, `x` → result). These are the kernel's golden bits; an
+  implementation that differs has the wrong op order:
 
   | y | x | atan2 |
   | --- | --- | --- |
@@ -146,7 +146,7 @@ pub fn atan2Float4(y: Float4, x: Float4) Float4 {
       tail uses `math.atan2` (parity by construction). The consumer adds its
       own serial-vs-threaded parity test.
 - [ ] Docs: Determinism Contract (atan2 is deterministic polynomial);
-      `docs/coding-standards.md` SIMD determinism rules list `atan2Float4`.
+      `.claude/rules/memory-performance.md` SIMD rules list `atan2Float4`.
 
 ### Acceptance checks
 

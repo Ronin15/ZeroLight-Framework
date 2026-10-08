@@ -7,8 +7,8 @@
 simulation tracks.
 
 Settings are app-level user preferences, not simulation state. They are not
-the "persistence beyond Slice 46" that the Ground Rules gate, and saves
-(Slice 46) never contain them.
+the "persistence beyond Slice 46" that the Ground Rules gate. They live in
+`settings.zon`; the Slice 46 save format has no settings section.
 
 Goal: an Engine-owned, typed `RuntimeSettings` (audio, video, accessibility;
 Slice 44 adds input bindings) that:
@@ -21,7 +21,7 @@ Slice 44 adds input bindings) that:
 - applies live when changed from the settings menu (now on 53B widgets),
   which the pause menu can also open
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/config.zig:15-37` `AppConfig` (`app_name`, `frames_in_flight`,
   `present_mode`, `resolution_policy`, `audio`) and `:39-68` `AudioConfig`
@@ -110,14 +110,13 @@ Slice 44 adds input bindings) that:
   - "Resolution scale" means `ScaleMode`. The renderer draws straight to the
     swapchain with no internal render target, so there is no render-resolution
     percentage to persist.
-  - No field without a runtime consumer. Later slices append their own
-    fields, each with its consumer, a schema bump by one, and an
-    `upgradeVNToVN+1` step: Slice 44 adds `input` bindings, and Slice 60 owns
-    its camera options (`VideoSettings.zoom_index: u8`, validated against its
-    zoom level count). Slice 67A switches keyboard bindings to scancodes,
-    Slice 70B adds `video.scene_resolution`. An appending slice bumps
-    whatever the current version is at landing; no slice hard-codes a target
-    version number (planned chain: Table T2 in the
+  - Every v1 field has a runtime consumer. The schema grows by appending
+    fields, each with its consumer and an `upgradeVNToVN+1` step, bumping
+    the live version (`.claude/rules/simulation.md`): Slice 44 adds `input`
+    bindings, and Slice 60 owns its camera options (`VideoSettings.zoom_index:
+    u8`, validated against its zoom level count). Slice 67A switches keyboard
+    bindings to scancodes, Slice 70B adds `video.scene_resolution` (planned
+    chain: Table T2 in the
     [VoidLight port track](../tracks/voidlight-port.md)).
   - `RuntimeAudioSettings` and its 0..10 scale are deleted.
 - **Format: ZON.**
@@ -160,7 +159,7 @@ Slice 44 adds input bindings) that:
   6. (Added by Slice 67.) Any load that ran an upgrade step sets
      `save_requested` so the latest version is written once, after any
      deferred step (Slice 67A's keymap-ready key migration) completes (Slice
-     67A freeze rule).
+     67A's migration freeze).
 
   Parse scratch uses a local `ArenaAllocator` wrapping the store allocator.
 
@@ -335,6 +334,8 @@ Slice 44 adds input bindings) that:
         table row, per-platform settings location, how to reset (delete
         `settings.zon`)
       - `src/tests.zig` registers the new modules
+- [ ] Add the settings-field append rule to `.claude/rules/input-state.md`
+      when this lands.
 
 ### Acceptance checks
 

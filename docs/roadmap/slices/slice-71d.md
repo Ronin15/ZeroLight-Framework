@@ -47,7 +47,7 @@ Out of scope, decided rather than deferred:
 - **Prewarm of merchant goals.** Merchants walk, so a field keyed to a
   merchant's current cell goes stale as it moves; see 71B.3.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Slice 63:**
   - `ActionKind.sell` with `ActionIntent.item`, `quantity: u16`, and
@@ -228,8 +228,8 @@ forage.
 **Checksum and determinism:**
 
 - `AiAgent.gain_trade` is inside the hashed `ai_agents` MAL. That adds
-  hashed and saved state, so under the normative rule of Tables T3/T6
-  ("every slice that adds hashed state") 71D bumps `checksum_format_tag`
+  hashed and saved state, so per Tables T3/T6 ("every slice that adds
+  hashed state") 71D bumps `checksum_format_tag`
   (v+1) and the save `format_version` (live + 1; v13 in the merged order)
   once each. Tables T3/T6 list it.
 - The snapshot and `RowTrade` are per-step scratch and are excluded.

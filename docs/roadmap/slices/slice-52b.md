@@ -13,7 +13,7 @@ assets, the target's shaders, an icon, licenses, and platform metadata. The
 `package` step refuses configurations that are not distributable, and it
 validates its own layout before the build passes.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `build.zig:263-264`: `package` is just the install step.
   `docs/development-workflow.md:32-38` describes it: exe plus assets, with

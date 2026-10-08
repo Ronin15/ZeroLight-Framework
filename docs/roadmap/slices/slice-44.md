@@ -14,7 +14,7 @@ Custom bindings persist across launches in Slice 54's `settings.zon`, and every
 prompt and binding cell shows the active device's own key or button names
 (Xbox / PlayStation / Nintendo / keyboard).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/app/input.zig`'s `default_key_bindings` / `default_gamepad_bindings` are
   compile-time `pub const` tables; `actionForKey` / `actionForGamepadButton` /
@@ -58,19 +58,18 @@ prompt and binding cell shows the active device's own key or button names
     `InputState.handleEvent`/`FrameCommands.handleEvent` take the table too.
   - `toggle_debug_overlay` is not rebindable (dev tool; F2 / Back stay fixed):
     `isRebindable(action)`.
-  - **Later actions.** The table is `[action_count]`, so an `Action` appended
-    by a later slice (56 `attack`, 57 `use_item`, 60 `camera_zoom_in` /
+  - **Later actions.** The table is `[action_count]`, so an appended
+    `Action` (56 `attack`, 57 `use_item`, 60 `camera_zoom_in` /
     `camera_zoom_out`) becomes a Controls row, rebindable and persisted, with
-    no change here and no schema bump: the appending slice adds its defaults
-    to the const tables, and the list form keeps defaults for entries a file
-    omits. A later slice may ship an empty pad slot; Slice 60 does so for
-    zoom, and players bind a gamepad zoom button on this screen. Slice 70B
-    sets the R3/L3 defaults and moves 56/57 to the triggers (pad defaults
-    and the explicit-beats-default-fill loader rule — `.none` /
-    `SDL_SCANCODE_UNKNOWN` — owned by Slice 70B, bind every later settings
-    step). A test
-    asserts the default tables satisfy the one-action-per-input invariant, so
-    a colliding default added later fails `zig build test`.
+    no change here and no schema bump: its defaults are entries in the const
+    tables, and the list form keeps defaults for entries a file omits. A pad
+    slot may ship empty; Slice 60 does so for zoom, and players bind a
+    gamepad zoom button on this screen. Slice 70B sets the R3/L3 defaults
+    and moves 56/57 to the triggers (pad defaults and the
+    explicit-beats-default-fill loader behavior — `.none` /
+    `SDL_SCANCODE_UNKNOWN` — owned by Slice 70B). A test asserts the default
+    tables satisfy the one-action-per-input invariant, so a colliding default
+    fails `zig build test`.
 - **Controls screen.** `ControlsMenuState` (modal), opened from Slice 54's
   Settings screen through a new **Controls** button.
   - It holds one **`list`** widget, which lands in this slice as its first
@@ -223,6 +222,8 @@ prompt and binding cell shows the active device's own key or button names
         adds, prompt labels); remove "no
         rebind UI yet" (`:280`)
       - `docs/architecture.md`: input bullets
+- [ ] Add the new-action binding-defaults rule to
+      `.claude/rules/input-state.md` when this lands.
 
 ### Acceptance checks
 

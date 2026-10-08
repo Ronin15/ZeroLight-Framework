@@ -2,6 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 34](../archive/slice-34.md), [Slice 24](../archive/slice-24.md), [Slice 32](../archive/slice-32.md), [Slice 55](slice-55.md), [Slice 52D](slice-52d.md) (measure after 55; land after 52D) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
+**Status: not started.** Measure at battle scale after Slice 55 and 52D.
+
 Goal: restructure the existing scalar per-agent / per-neighbor loops in AI and
 steering into packed-SoA-scratch vectorized kernels, so they hold up in heavy
 scenes, large battles, and late-game worlds where they become the dominant cost.
@@ -102,7 +104,7 @@ Acceptance checks:
       is still 128 after the restructure.
 - [ ] Only irreducibly scalar loops inside this slice (pathfinding frontier
       traversal/portal linking, particle swap-remove) remain scalar, each
-      documented with the reason per the coding-standards policy.
+      documented with the reason per `.claude/rules/memory-performance.md`.
       `world_gate.apply` stays scalar until the `world-gate` trigger fires
       (Checklist item above). The bench item still lands with this slice.
 - [ ] `zig build verify` passes.

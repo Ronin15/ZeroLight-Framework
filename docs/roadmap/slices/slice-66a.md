@@ -21,7 +21,7 @@ Goal:
 - On Linux, the game window carries its icon at runtime (X11 `_NET_WM_ICON`,
   and Wayland `xdg-toplevel-icon` where the compositor supports it).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **No crash handling exists in either framework.** `src/main.zig:12` re-exports
   `logging.std_options` (`src/core/logging.zig:8-10`, `log_level` only); there
@@ -212,10 +212,10 @@ Goal:
     their current `std_options` and get no hooks: tests and benches are dev
     tools. The new dev executable `src/crash_probe.zig` (below) uses the same
     three declarations as `main.zig`.
-- **Process-global state (the slice's only globals, by necessity: signal
-  handlers and exception filters get no context argument).** All are
-  module-level in `crash_report.zig`, fixed-size, and documented as the
-  exception to the explicit-allocator/state rule:
+- **Process-global state (the slice's only globals: signal handlers and
+  exception filters get no context argument).** All are module-level in
+  `crash_report.zig`, fixed-size, and documented at the site
+  (`.claude/rules/budgets-capacities.md`):
 
   ```zig
   var installed: ReportTarget = .{};                      // every field defaulted (dir_fd = -1, lengths 0)

@@ -17,7 +17,7 @@ call and no indirect call per draw), and dynamic text (counters, values) updates
 without creating or destroying renderer textures. `LoadingState` is the first
 consumer; debug overlays stay on the old path (Slice 67B).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `src/render/text.zig:188-210` — `TextService` owns `TTF_Init`/`TTF_Quit`,
   generational `FontId` slots, default font `fonts/NotoSansMono-Regular.ttf`
@@ -32,7 +32,7 @@ consumer; debug overlays stay on the old path (Slice 67B).
   this does not scale to high-cardinality text.
 - `src/render/text.zig:311-317`, `:641-653` — `TextService.initWithBackend` +
   `TextBackend` fn-pointer table: the accepted type-erased backend boundary used
-  for headless tests (`docs/coding-standards.md:14-19`).
+  for headless tests (`.claude/rules/zig-style.md`).
 - `src/render/renderer.zig:432` `submitOrderedSprite`, `:439-453`
   `reserveSpriteCommands` (grow-only high-water), `:459`
   `submitOrderedRectInSpace`, `:562-569` `drawablePixelScale` (drawable/window
@@ -88,7 +88,7 @@ consumer; debug overlays stay on the old path (Slice 67B).
   could wrap after 65,536 reuses of one slot). Slots are allocated once at
   init (`allocator.alloc(LabelSlot, k_max_text_labels)`) and use a free list.
   This is a generational slot map, the named exception to the
-  `std.MultiArrayList` default (`docs/coding-standards.md:270-278`). Each
+  `std.MultiArrayList` default (`.claude/rules/memory-performance.md`). Each
   `LabelSlot` holds: `text: ?*anyopaque` (backend `TTF_Text`), `role`,
   `generation`, `alive`, `next_free`, `content_hash: u64` (Wyhash),
   `wrap_width_logical: u16`, `size_px: [2]u16`, `quad_count: u16`,
@@ -137,7 +137,7 @@ consumer; debug overlays stay on the old path (Slice 67B).
   (production = SDL_ttf; tests = a local fake), following the `TextBackend`
   precedent. It is called only from `create`, `setText`, `destroy`, realize,
   and rebuild, which are the cold setup/service paths that
-  `docs/coding-standards.md:14-19` accepts for fn-pointer tables; it is never
+  `.claude/rules/zig-style.md` accepts for fn-pointer tables; it is never
   called per frame. The production adapter copies the
   `TTF_GPUAtlasDrawSequence` linked list into a stack array
   `[k_max_sequences_per_label = 16]GlyphSequenceView { atlas: *anyopaque,

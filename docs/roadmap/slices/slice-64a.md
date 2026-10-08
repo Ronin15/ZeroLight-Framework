@@ -17,7 +17,7 @@ semantics on x86, arm64, runtime, and comptime; float bits used as keys are
 canonical; and a changed MXCSR/FPCR is caught at the step boundary instead of
 silently desynchronizing.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Pause resync mutates the pre-step pose (Slice 49 defect 2, live).**
   `GameDemoState.onPause`/`onResume` (`game_demo_state.zig:606-613`) call
@@ -176,12 +176,12 @@ lowering. Compare/select forms are exact everywhere.
   `std.debug.assert(!(lower > upper));`, keeping the range check
   `std.math.clamp` performs (written as a negated `>` so a NaN bound does not
   trip it).
-- Documented policy (`docs/coding-standards.md` "Simulation float rules"):
+- After migration, `src/game/` spells these as:
   - float min/max → `math.min`/`math.max`;
   - float clamp → `math.clamp` (NaN propagates) or `math.clampMinMax` (NaN →
     `lower`); SIMD → `simd.minFloat4`/`maxFloat4`/`clampFloat4`;
-  - integer min/max also uses `math.min`/`math.max` in `src/game/` (uniform
-    rule, so the lint needs no type inference).
+  - integer min/max also uses `math.min`/`math.max` in `src/game/` (uniform,
+    so the lint needs no type inference).
 - **Enforcement, `tools/lint_idioms.py`** — a new `GAME_ONLY_PATTERNS` list
   applied to `src/game/**` outside `test` blocks (reusing the existing
   `TEST_DECL` / `in_test` tracking, `lint_idioms.py:185,198-211`):
@@ -216,10 +216,10 @@ lowering. Compare/select forms are exact everywhere.
   payloads differ between x86 (`0xffc00000`) and arm64/LLVM folding
   (`0x7fc00000`).
 - Migrate `pathfinding/types.zig:825` (`key.goal.x`/`.y`) to `floatKeyBits`.
-- Rule (coding standards, review-enforced; a regex cannot see float
-  operands of `@bitCast`): any float→bits conversion feeding a hash, map key,
-  sort key, or dedup goes through `floatKeyBits`. The checksum is separate:
-  64B canonicalizes NaN only and keeps ±0 distinct.
+- After migration, every float→bits conversion in `src/` feeding a hash, map
+  key, sort key, or dedup goes through `floatKeyBits` (review-checked; a regex
+  cannot see float operands of `@bitCast`). The checksum is separate: 64B
+  canonicalizes NaN only and keeps ±0 distinct.
 
 **A4. FP environment debug assertion (`src/core/fp_env.zig`, new).**
 
@@ -270,9 +270,9 @@ pub fn assertDefault(comptime site: []const u8) void;
      second rebases. If 51 has not landed when 64A lands, 51 adds this call
      in its own change (Checklist additions (k)).
   4. 64C `HeadlessSession.init` (by that slice).
-- An observed failure is a defect. The fix is to restore the environment at
-  the dependency boundary that changed it, cited in a code comment. The check
-  is never widened.
+- An assertion trip is fixed by restoring the environment at the dependency
+  boundary that changed it, cited in a code comment; the masks above stay as
+  specified.
 
 **Allocation and threading.** No allocation is added. Every helper is pure or
 reads one register. The alpha hold is a main-thread presentation field.
@@ -341,10 +341,11 @@ reads one register. The alpha hold is a main-thread presentation field.
     simulation-invisible; the pause boundary flag; the float min/max/clamp
     rules; `floatKeyBits`; the FP environment assumption and where it is
     asserted.
-  - `docs/coding-standards.md`: "Simulation float rules" (A2/A3) and the
-    three lint rules.
   - `docs/architecture.md` Coordination Boundaries: pause freezes
     presentation, never simulation state.
+- [ ] Add the float min/max/clamp and transcendental routing rule to `.claude/rules/memory-performance.md` when this lands.
+- [ ] Add the float key bits rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the pause invisibility and FP environment rule to `.claude/rules/simulation.md` when this lands.
 
 ### Acceptance checks
 

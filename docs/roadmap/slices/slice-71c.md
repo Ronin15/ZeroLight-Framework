@@ -25,7 +25,7 @@ Out of scope:
   perception rule. This slice changes goal choice only.
 - Cover for melee pursue. A melee attacker in cover cannot reach its target.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Markers:**
   - `InterestMarkerKind.cover` is reserved with no consumer

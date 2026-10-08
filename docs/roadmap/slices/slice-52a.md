@@ -14,7 +14,7 @@ for a normal build.
 Forward reference: Slice 52D (SIMD layer codegen for the v2 baseline) depends on
 this slice's `-Dcpu-baseline` option.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - `build.zig:76` calls `b.standardTargetOptions(.{})`. With no `-Dtarget` or
   `-Dcpu`, the query's `cpu_model` is `.determined_by_arch_os`, which resolves
@@ -26,7 +26,7 @@ this slice's `-Dcpu-baseline` option.
   `Cpu.Model.baseline`). So today a Windows cross package and a native Linux
   package ship different ISAs.
 - `src/core/simd.zig:8-12` fixes `lane_count = 4` (`@Vector(4, f32)`).
-  `docs/coding-standards.md:310-320` mandates one lane width through `core`.
+  `.claude/rules/memory-performance.md` mandates one lane width through `core`.
 - `src/` contains no `@setFloatMode` and no `@mulAdd`, so Zig's default strict
   float mode applies. LLVM never contracts `a*b+c` into FMA, so float results
   are bit-identical across `x86_64`, `x86_64_v2`, and native.
@@ -101,7 +101,7 @@ this slice's `-Dcpu-baseline` option.
   Pinning glibc 2.31 here would break local release builds: a glibc-2.31 exe
   linked against a host-built `libSDL3.so` that carries newer symbol versions
   fails under LLD's executable default `--no-allow-shlib-undefined`.
-- **`native` is dev/bench only and is never packaged.** On the reference dev
+- **`package` refuses `native` and `-Dcpu` builds.** On the reference dev
   host (Zen 4, AVX-512) a `native` build crashes with SIGILL on Zen 2 and the
   Steam Deck. `zig build package` fails at configure (`addFail` on the
   `package` step only) when the resolved baseline is `native` or when an
@@ -136,24 +136,26 @@ this slice's `-Dcpu-baseline` option.
 - **Per-game opt-down:** a game that wants maximum reach sets
   `-Dcpu-baseline=compat` (`x86_64`, SSE2; every x86_64 CPU). CI
   compile-checks `compat` so this path never rots.
-- **One shipped baseline per game.** Every OS package of one game release uses
-  the same `-Dcpu-baseline`, so replays, saves, and any future lockstep peers
-  never depend on cross-baseline equality beyond what 52C proves. A game that
-  switches baseline does so at a release boundary and documents it.
+- **One baseline per game release.** The CPU Baseline doc section states that
+  every OS package of one game release uses the same `-Dcpu-baseline`, so
+  replays, saves, and any future lockstep peers depend on cross-baseline
+  equality no further than 52C proves; a baseline switch happens at a release
+  boundary and is documented there.
 - **No runtime CPU check.** It would need code compiled without v2 to run
   before any v2 instruction executes, but Zig's start code and compiler_rt are
   compiled for the target. The minimum spec is documented instead: SSE4.2 +
   POPCNT class CPUs (`x86_64_v2`; Intel Nehalem 2008+, AMD Bulldozer/Jaguar
   2011+) for `ship`, any x86_64 CPU for `compat`, and any Apple Silicon Mac for
   `apple_m1`.
-- **Determinism stays a contract.**
+- **Float-mode lint.**
   - `tools/lint_idioms.py` gains a `src/`-only rule rejecting
     `@setFloatMode(.optimized)`, which is the Zig spelling of `-ffast-math`,
-    and a rule rejecting `@mulAdd` in `src/`. Strict float mode with
-    no `@mulAdd` is what keeps results identical across baselines.
-  - `docs/coding-standards.md` gains a rule that simulation float results must
-    be bit-identical across `native`/`ship`/`compat`. This extends Slice 49's
-    Determinism Contract; 52C proves it at battle scale.
+    and a rule rejecting `@mulAdd` in `src/` (enforcing
+    `.claude/rules/simulation.md`). Strict float mode with no `@mulAdd` is
+    what keeps results identical across baselines.
+  - Simulation float results are bit-identical across
+    `native`/`ship`/`compat`, extending Slice 49's Determinism Contract; 52C
+    proves it at battle scale.
 
 **Zig toolchain pin**
 
@@ -175,12 +177,13 @@ this slice's `-Dcpu-baseline` option.
   with no result type, and `minimum_zig_version` reads back `"0.17.0"`. No
   fallback is needed. "`@import("build.zig.zon")` still works" stays on the
   upgrade re-check list below.
-- **Upgrade policy** (new `docs/development-workflow.md` section "Toolchain
-  Pins And Upgrades"):
-  1. Upgrade one Zig minor at a time, deliberately. Never track master.
-  2. Upgrade the framework first, on a `zig-<ver>-upgrade` branch. Games follow
-     after the framework branch merges, never mid-milestone. A shipped game may
-     stay on its Zig version indefinitely.
+- **Upgrade procedure** (described in the new `docs/development-workflow.md`
+  section "Toolchain Pins And Upgrades"):
+  1. An upgrade moves one Zig minor at a time, deliberately, never tracking
+     master.
+  2. The framework upgrades first, on a `zig-<ver>-upgrade` branch. Games
+     follow after the framework branch merges, not mid-milestone. A shipped
+     game may stay on its Zig version indefinitely.
   3. Bump `build.zig.zon` and `mise.toml` together. CI picks up the new version
      from zon.
   4. Commit order follows the 0.17 changelog:
@@ -398,9 +401,6 @@ this slice's `-Dcpu-baseline` option.
       `native` baseline or an explicit `-Dcpu`, with the fix-it.
 - [ ] **Float-mode lint.** `tools/lint_idioms.py` gains `src/`-only rules
       rejecting `@setFloatMode(.optimized)` and `@mulAdd`.
-      `docs/coding-standards.md` gains the rule that results are bit-identical
-      across CPU baselines (extending Slice 49's Determinism Contract) and the
-      one-shipped-baseline-per-game rule.
 - [ ] **Zig pin.** Add the `@import("build.zig.zon")` pin guard,
       `mise.toml`, and `tools/check_build_pins.py` wired into `verify`.
 - [ ] **Windows SDL bump.** Add `sdl_pin`. Bump the Windows zon deps to 3.4.18
@@ -430,8 +430,8 @@ this slice's `-Dcpu-baseline` option.
 - [ ] **Docs.**
   - `docs/development-workflow.md`: new sections CPU Baseline (the
     `compat`/`ship` A/B table with the informational v3 column, the
-    minimum-spec CPUs, the never-packaged `native` rule, the
-    one-shipped-baseline-per-game rule, and the per-game opt-down), SDL
+    minimum-spec CPUs, the `native` package refusal, one baseline per game
+    release, and the per-game opt-down), SDL
     Versions And Sources
     (replacing Windows SDL Packages), Shader Artifacts, and Toolchain Pins And
     Upgrades.
@@ -460,6 +460,9 @@ this slice's `-Dcpu-baseline` option.
       Done 2026-10-05 (this commit): `ltoSupportedForTarget` excludes `.coff`; x86_64/aarch64 windows-gnu ReleaseFast `check` pass.
 - [ ] (added by Slice 66) Add "windows-gnu LTO links (`-flto` hello-world with `-lc`)" to the
       Toolchain Pins And Upgrades re-check list beside "macOS LTO".
+- [ ] Add the release CPU baseline rule to `.claude/rules/build-validation.md` when this lands.
+- [ ] Add the cross-baseline float bit-identity rule to `.claude/rules/simulation.md` when this lands.
+- [ ] Add the toolchain upgrade policy rule to `.claude/rules/build-validation.md` when this lands.
 
 ### Acceptance checks
 

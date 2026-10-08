@@ -23,7 +23,7 @@ Goal:
 - No game-facing API is renamed. Game code changes only its corner-array
   length and the `VertexColor` element type.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **`src/render/sprite_batch.zig`:**
   - **SoA vertex types and views (`:126-147`):** `Position = [2]f32`,

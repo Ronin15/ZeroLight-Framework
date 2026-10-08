@@ -37,7 +37,7 @@ existing fixed refusals (`k_max_dense_submit_stack_cap`,
 `k_max_dense_tile_gpu_bytes`). Generation cost is load-time work on that
 already-bounded world, not a per-step budget.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 Current generator:
 
@@ -80,9 +80,9 @@ Content and test rules:
 - Tileset: 224 named tiles with `walkable` / `blocks_movement` / `blocks_vision`
   flags (`assets/sprites/world_tileset.json`); strict loader
   `src/assets/world_tileset_meta.zig`.
-- Unit tests may call procedural entry points only at 16×16 or smaller with at
-  most 1 underground level (`docs/coding-standards.md:414-427`). The loading
-  test config is 8×8 (`loading_state.zig:242-247`).
+- Unit tests of procedural entry points stay within the fixture cap
+  (`.claude/rules/tests-benchmarks.md`). The loading test config is 8×8
+  (`loading_state.zig:242-247`).
 
 ### Architecture notes
 
@@ -177,8 +177,8 @@ targets.**
 - Generate-time refusals (no partial result):
   - a world deeper than the authored strata: `error.WorldGenStratumMissing`
   - `config.chunk_size_tiles % feature_block_cells != 0`:
-    `error.WorldGenChunkFeatureMisaligned`. Feature/node blocks must not
-    straddle chunks, or the "features are chunk-local" rule below breaks.
+    `error.WorldGenChunkFeatureMisaligned`. Aligned feature/node blocks never
+    straddle chunks, which keeps features chunk-local (below).
 
 **Fixed caps and budgets.** All are fixed constants, independent of world size.
 None is a working data-structure capacity; the classification and the
@@ -206,7 +206,7 @@ world-sized working capacities follow the table.
   bigger world produces more candidates, not more spawns.
   `max_worldgen_resource_nodes` is the same kind of per-step-cost population
   budget; the node store itself is a world-sized capacity (Slice 61).
-- **Classification (coding-standards § Budgets, Capacities, And Thresholds).**
+- **Classification (`.claude/rules/budgets-capacities.md`).**
   - Entity-population budgets: the population cap and
     `max_worldgen_resource_nodes`. Every spawn and node is a live entity with
     per-step cost (AI and steering for spawns; a static collision proxy and
@@ -557,7 +557,8 @@ worldgen's job. Slice 61 already wires the `resource` kind
 - [ ] Dig yield: digging a yield tile creates exactly one world item with a
       deterministic count; the same cell index on two levels rolls
       independently. A non-yield tile creates none.
-- [ ] Unit tests stay at 16×16 or smaller with 1 underground level.
+- [ ] Unit tests stay within the fixture cap
+      (`.claude/rules/tests-benchmarks.md`).
 - [ ] (capacity audit) `levelBlocksMovement` reads one chunk's sparse list and
       one level's dense bands (the parity test passes), and
       `zig build bench -- --group nav-update-scattered` stays within

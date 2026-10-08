@@ -6,12 +6,11 @@
 text and hint columns). In the merged order it lands after Slice 67C, so one
 change migrates the UI literals of 53B, 54, 44, 46, and 67A–67C. It may land
 earlier, any time after 53B: it then migrates whatever UI text exists at
-landing, and every later slice uses `StringId`s from day one. It is preferred
-before Slice 56. If any of 56–63 land first, 67E also migrates their UI and
-event-log strings in the same change, extending its Inventory. Every slice
-that adds UI text after 67E uses `StringId`s from day one (Slice 67 rule; see
-the ledger in [Slice 67](slice-67.md)). It adds no simulation surface (see the
-shared 67 contracts) and no settings field or schema version.
+landing. It is preferred before Slice 56. If any of 56–63 land first, 67E
+also migrates their UI and event-log strings in the same change, extending
+its Inventory; those that land after it carry a `StringId` item (see the
+ledger in [Slice 67](slice-67.md)). It adds no simulation surface (see the
+shared 67 design) and no settings field or schema version.
 
 This is the root of localization only: the pieces that are costly to
 retrofit (string identity at every call site and one argument convention).
@@ -29,10 +28,10 @@ Goal:
   frame.
 - **Migration:** every existing hard-coded menu and widget string goes
   through an ID, and the English output is byte-identical.
-- **Rule:** new UI-facing text in later slices uses `StringId` (a written
-  coding-standards rule, not a lint). Debug overlays stay English.
+- **Scope:** UI-facing text is `StringId`-backed; debug overlays stay
+  English. No lint enforces it.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Hard-coded strings today:
   - `src/game/main_menu_state.zig:37-41` ("Start Game", "Settings", "Quit")
@@ -106,7 +105,7 @@ per-locale loader only adds runtime tables beside it and swaps the bodies of
   3. On overflow, truncate on a UTF-8 code-point boundary and set
      `truncated`.
   - English only: it reads `spec.en`.
-- **Argument convention (the only rule 67E fixes for value-bearing text).**
+- **Argument convention (value-bearing text).**
   A string that shows a runtime value is one ID whose English text carries
   `{N}` placeholders, rendered only through `format`. Call sites never
   concatenate an ID's text with a value or build a sentence from fragments.
@@ -201,12 +200,12 @@ allocator and allocate nothing; the English table is static data.
         `strings.zig` ownership, the compiled-in English table, the argument
         convention, what stays unlocalized, and a link to the deferred full
         localization entry
-      - `docs/coding-standards.md`: the written UI text rule (user-facing UI
-        text uses `StringId`, value-bearing text goes through `format`,
-        debug tooling stays English; no lint enforces it)
       - `docs/development-workflow.md`: adding a string
       - `docs/state-stack-and-input.md`: screens declare `text_id`s
       - `src/tests.zig` registrations
+- [ ] Add the UI text rule (user-facing text uses `StringId`, value-bearing
+      text goes through `format`, debug tooling stays English) to
+      `.claude/rules/render.md` when this lands.
 
 ### Acceptance checks
 

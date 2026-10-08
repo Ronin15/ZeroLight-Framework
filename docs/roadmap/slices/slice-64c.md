@@ -21,7 +21,7 @@ Goal:
   thread. That root is recorded in the replay header (and in the save,
   Slice 46).
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - Session entry (live): `main_menu_state.zig:36-41` (items "Start Game",
   "Settings", "Quit"), `:145-170` (`activate` → `LoadingState.init(...,
@@ -56,10 +56,9 @@ Goal:
   - Tests seed metadata by hand (`loading_state.zig:575-596`). `AssetStore`
     resolves the installed asset root with an executable-directory fallback
     (`assets/assets.zig:40-70`).
-- Test fixture rule (`docs/coding-standards.md:414-427`): a procedural entry
-  point under `zig build test` uses at most 16×16 tiles and 1 underground
-  level. The existing `LoadingState` fixture is 8×8 tiles, chunk 8, 0
-  underground levels (`loading_state.zig:241-246`).
+- Tests stay within the procedural fixture cap
+  (`.claude/rules/tests-benchmarks.md`). The existing `LoadingState` fixture
+  is 8×8 tiles, chunk 8, 0 underground levels (`loading_state.zig:241-246`).
 - `UpdateContext` (`state.zig:62-73`) is the full set of services a gameplay
   state reads. `Engine` (`engine.zig:42-63`) owns SDL, window, renderer, and
   audio, and builds `UpdateContext` per step.
@@ -211,7 +210,7 @@ is appended:
 
 - The world seed is not stored: it is `seed_root` derived through
   `.worldgen_procedural`. Fields are little-endian and written one at a time
-  (49's rule).
+  (Slice 49's wire-format spec).
 - `decode` validates: the zero reserved fields, the 0/1 byte, a known
   `session_kind`, and the descriptor passing `validate()`
   (`InvalidReplayHeader`, a new `ReplayDecodeError` tag).
@@ -368,8 +367,8 @@ pub const SessionSeedSource = struct {
   - [ ] the encoder writes 64B's `buildFingerprint()` at offset 44.
 - [ ] **C1.** `headless_session.zig` + `RuntimeAssets.loadMetadataOnly` +
       the `UpdateContext` field-completeness comptime block. Tests in
-      `headless_session.zig` (tiny descriptor inside the coding-standards
-      fixture cap: 16×16 tiles, chunk 8, `underground_level_count = 1`,
+      `headless_session.zig` (tiny descriptor inside the
+      `.claude/rules/tests-benchmarks.md` fixture cap: 16×16 tiles, chunk 8, `underground_level_count = 1`,
       `mover_count = 8`, seed `default_root`):
   - [ ] `test "headless session replays a recorded run to a match"`: session
         A records 120 steps of Slice 49's input script (pause boundary at

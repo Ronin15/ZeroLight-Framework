@@ -3,33 +3,22 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Slice files:
 > [`../slices/`](../slices/) · Backlog: [Scaling Gaps](../scaling-gaps.md)
 
-Origin: a feature comparison between ZeroLight and the older C++ VoidLight
-framework chose ZeroLight as the go-forward base for every game. Slices 49–63
-bring VoidLight's best shipping features (combat, items, harvesting, worldgen,
-time/weather, camera, UI, settings, saves, packaging, CI) onto ZeroLight's
-contracts: determinism (serial == threaded, scalar == SIMD, same seed → same
-checksum), fixed budgets, world-sized capacities, and allocation-free hot
-paths. Each slice ends with a
-**VoidLight reference** block listing what to port and what not to. Slices
-64–71 finish the track: cross-machine determinism and replay tooling (64),
-lane-heavy consumers (65), distribution (66), UI/input/text completion (67),
-battle-scale hardening (68), worldgen breadth and regional environment (69),
-presentation polish (70), and AI behavior parity (71). Every former
-"VoidLight port residuals" Scaling Gap is owned by one of these slices.
+Slices 49–63 add shipping features (combat, items, harvesting, worldgen,
+time/weather, camera, UI, settings, saves, packaging, CI); Slices 64–71 finish
+the track: cross-machine determinism and replay tooling (64), lane-heavy
+consumers (65), distribution (66), UI/input/text completion (67), battle-scale
+hardening (68), worldgen breadth and regional environment (69), presentation
+polish (70), and AI behavior parity (71). The older C++ VoidLight framework is
+reference material only: a feature parity map of what these slices cover. Each
+slice's **VoidLight reference** block is that slice's parity entry; it never
+sets design or rules.
 
-**Port rule.** Port features, never VoidLight's nondeterminism: no
-`thread_local` `random_device`-seeded RNG, no `steady_clock` (or any wall time)
-in gameplay, no completion-order application of path/job results, no
-atomic-sequence conflict resolution, no `-ffast-math`
-(`@setFloatMode(.optimized)`). Never port a world-scaled work budget (for
-example VoidLight's `worldW / 200` pathfinding sectors). Budgets, capacities,
-and caps follow coding-standards § Budgets, Capacities, And Thresholds; in this
-track that means world/content-sized anchor and node stores, projectile live
+Sizing in this track: content-sized anchor and node stores, projectile live
 store, populations, and plan buffers; commit-seam growth for the inventory slot
-arena, level links, and later runtime node producers; and the 512-slot
-text-label pool with idle reclaim as a presentation pool.
+arena, level links, and later runtime node producers; the 512-slot text-label
+pool with idle reclaim is a presentation pool.
 
-**Shared contracts later slices rely on (one owner each; never fork them):**
+**Shared contracts later slices rely on (one owner slice each):**
 
 | Contract | Owner | Consumers |
 | --- | --- | --- |
@@ -67,7 +56,7 @@ appends: 56 `health`, `combat_stats`; 56B `projectile`; 57 `inventory`,
 (7 spare)** when all land (Table T5). Slices 49–55, 58, 59, 60, and 64–71
 except 71A add none (worldgen, clock, and anchor state live on `WorldSystem`;
 `FactionRelations` is a `DataSystem` field). Tags are appended in landing order
-and never pinned in slice text.
+and slice text does not pin their values.
 
 ## Authoritative Cross-Slice Tables (T1–T6)
 
@@ -94,7 +83,7 @@ defect: fix the slice text and the table together.
 | 13–15 | must be 0 | — |
 
 70B moves only pad *bindings* (R3/L3 zoom; RT/LT `attack`/`use_item`). No bit
-changes. Appending a bit needs no version bump (49's rule).
+changes. Appending a bit needs no version bump (Slice 49 replay format).
 
 | `flags` bit | Meaning | Owner |
 | --- | --- | --- |
@@ -120,8 +109,8 @@ adds `replayNormalize()` in its own change (Slice 64 addition (m)). 64B owns
 | 4 | `ReplayActionRecord` gains `quantity`, `price_limit` | 63 |
 | 5 | 88-byte header: `region_x` i16 @80, `region_y` i16 @82, `reserved3` u32 @84 | 69F (gated) |
 
-Normative rule: live value + 1, cumulative (Slice 64 addition (d)); a bump
-keeps every earlier header and frame extension. The edge 64C → 57B keeps the
+Each bump is live value + 1, cumulative (Slice 64 addition (d)), and keeps
+every earlier header and frame extension. The edge 64C → 57B keeps the
 numbering correct.
 
 ### T2. Settings `k_settings_format_version` chain (relative, `upgradeVNToVN+1`)
@@ -131,7 +120,7 @@ numbering correct.
 | 1 | 54 | audio / video / accessibility |
 | 2 | 44 | `.input.bindings` list form (keys as `SDL_Keycode`) |
 | 3 | 60 | `video.zoom_index` |
-| 4 | 67A | keyboard entries become `.scancode` (keymap-dependent migration step; freeze rule: any upgrade sets `save_requested`) |
+| 4 | 67A | keyboard entries become `.scancode` (keymap-dependent migration step; migration freeze: any upgrade sets `save_requested`) |
 | 5 | 70B | `video.scene_resolution`, plus the pad-default migration (attack→RT, use_item→LT when old default; zoom→R3/L3 when absent or `.none`) and the explicit-beats-default loader rule |
 
 69C `rest`, 56 `attack`, and 57 `use_item` add Controls rows without a bump

@@ -2,7 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 58](slice-58.md), [Slice 61](slice-61.md), [Slice 62](slice-62.md), [Slice 65C](slice-65c.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** Depends on:
+**Status:** Not started.
+
+Depends on:
 
 - **58**: the generator, the spec loader, `noise.valueNoise2`, field seeds,
   per-(level, chunk) jobs, the striped arena and `JobSummary`, `UniformBlocking`,
@@ -17,7 +19,7 @@
   69A pass runs inside that job shape and keeps golden parity across lane
   speeds.
 - **71A** (when landed; merged order puts it first): its post goals already
-  write `NavigationIntent.goal_level = row level`. 69A generalizes that rule
+  write `NavigationIntent.goal_level = row level`. 69A extends own-level goals
   to every behavior (see "AI goal level").
 
 It also includes the resource-marker cap from the Slice 58 addition below.
@@ -39,7 +41,7 @@ a pure function of `(WorldBuildConfig.seed, spec, structures, dimensions)`.
 Slice 58's three pinned goldens stay unchanged, and three new goldens cover the
 new features.
 
-### Current foundation (do not rebuild)
+### Current foundation
 
 - **Slice 58 (planned contract)**:
   - Modules: `worldgen/spec.zig` (strict, `ignore_unknown_fields = false`,
@@ -68,7 +70,7 @@ new features.
   - A fall carves its landing cell to the tunnel tile (`:294-297`).
   - Level links: `WorldSystem.ensureLevelLinkCapacity` / `addLevelLink` /
     `rampLinkOtherLevel` (`src/game/world_system.zig:1485-1514,1447-1454`).
-    Since Slice 64E's link-growth review follow-up, `ensureLevelLinkCapacity`
+    Since Slice 64E, `ensureLevelLinkCapacity`
     and `addLevelLink` grow only an unreserved world; on a reserved world they
     return `error.LevelLinkRoomUnreserved` past the limit (only the dig commit
     seam's admitted growth, `reserveLevelLinks`, raises it).
@@ -283,9 +285,9 @@ installed beside `worldgen.json`:
     construction. It still never seeds the player's plane, so the
     `stageAiDecide` comment at `simulation_pipeline.zig:1148-1152` stays true;
     it gains one sentence: "AI goals are own-level (Slice 69A)."
-  - It generalizes Slice 71A's post-goal rule (patrol / follow /
-    return_home already write the row level) to every behavior. If 71A has
-    not landed, 69A lands the rule alone.
+  - Slice 71A's post goals (patrol / follow / return_home) already write the
+    row level; this extends own-level goals to every behavior. If 71A has not
+    landed, 69A lands own-level goals alone.
   - Surface agents write 0 exactly as today, so every existing level-0 test is
     bit-identical.
   - **Decided:** a same-level goal in another pocket of the agent's level is
@@ -562,7 +564,7 @@ these fields:
 
 **Persistence and checksum.** Slice 69A adds no new `WorldSystem` or
 `DataSystem` field. `NavigationIntent.goal_level` is per-step output, so the
-own-level rule needs no checksum or save change. Dense and sparse tiles, `level_links`, interest markers,
+own-level goals need no checksum or save change. Dense and sparse tiles, `level_links`, interest markers,
 spawn anchors and `chunk_biomes` are already classified as hashed and saved
 (Slices 49, 46, 58, 62).
 
@@ -644,9 +646,8 @@ world (Slice 58 precedent). Nothing changes on hot paths.
         write (clearing `uniform_fill_tile` when `surface_tile` differs) and
         `addLevelLink` in `finish`;
       - the player-spawn skip.
-- [x] (added by Slice 64) Entrance skip for full interior link slots — dropped
-      2026-10-07: interior link capacity grows per chunk, so every ranked
-      entrance commits.
+- [x] Entrance skip for full interior link slots dropped: interior link
+      capacity grows per chunk, so every ranked entrance commits.
 - [ ] `generate.zig`:
       - the jobs' footprint suppression;
       - socket outputs with authored-first selection and drop counters;
@@ -658,6 +659,7 @@ world (Slice 58 precedent). Nothing changes on hot paths.
 - [ ] `GameDemoState.initProceduralWithRuntimeAssets` adopts the authored
       records through the existing Slice 58, 61 and 62 adoption paths. No new
       adoption code path is added.
+- [ ] Add the AI own-level goal rule to `.claude/rules/simulation.md` when this lands.
 - [ ] Docs:
       - `docs/architecture.md`: worldgen breadth, the site model, the
         socket priority rule, and "AI navigation goals are own-level";
@@ -719,8 +721,8 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       - `edge_windows_grown` recorded (level repacks, no rebuilds,
         `full_relabel=0`), its summed per-step values (and those of
         `edge_repacks`) equal to `edge_windows_grown_total` /
-        `edge_repacks_total` even across a failed step (64E M10: a
-        failed step's work is reported by the next successful one), at most
+        `edge_repacks_total` even across a failed step (64E: a failed
+        step's work is reported by the next successful one), at most
         8 × the distinct nav chunks dug or ramped
         during the soak: each growth at least doubles a window, from the
         32-edge floor to the 4,588-edge layout maximum of a 16-tile chunk
@@ -734,8 +736,8 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       registered in `runner.zig`, using Slice 58's side-length/level table)
       with the shipped breadth spec, run as
       `zig build bench -- --group worldgen-breadth`. Tiles/s across the shared
-      `serial-direct` and `thread-fixed-auto` cases is recorded beside
-      `--group worldgen`.
+      `serial-direct` and `thread-fixed-auto` cases is reported beside
+      `--group worldgen` in the landing commit.
 - [ ] `zig build verify` passes.
 
 ### VoidLight reference

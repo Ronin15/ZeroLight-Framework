@@ -2,6 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 37](../archive/slice-37.md) · Track: [Long-term gameplay direction](../tracks/gameplay-direction.md)
 
+**Status: not started.** Prerequisite Slice 37 is landed.
+
 Goal: let a world represent levels above the surface (not just underground
 depth below it) as an explicit, stable per-level fact, and generalize the
 dense render window to a symmetric above/below policy — so elevation, not
@@ -42,7 +44,7 @@ Problem (current envelope):
   case (exactly one level above the active level, whole-layer-only —
   "cannot do per-cell shaft cull") — not a pattern to generalize from.
 
-Current foundation (landed, do not rebuild):
+Current foundation (landed):
 
 - Slice 37 (archive): `k_max_dense_submit_stack_cap` is 32, shader/host layer
   offsets are tied to that cap, and the demo's byte budget is the literal
