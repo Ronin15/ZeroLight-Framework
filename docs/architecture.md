@@ -84,8 +84,9 @@ Designs start here, then read the live structure below (rules:
 - `src/game/world_test_support.zig` holds test-only `WorldSystem` fixtures shared
   across modules (a demo surface at any chunk edge, terrain pool warmup).
 - `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
-  renderer-owned GPU tile store: resident layers' directory slots, the block
-  allocator, and the queued cell edits it plans and commits each frame.
+  renderer-owned GPU tile store: the store's non-owning id, resident layers'
+  directory slots, the block allocator, and the queued cell edits it plans and
+  commits each frame; reset when the renderer retires the store.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, destructible, structural, system) and owns state-local persistent
@@ -243,6 +244,14 @@ acquisition: a level entering the window uploads its directories and mixed
 blocks, a dig uploads one element, a pan uploads nothing, and everything goes
 in the frame's one batched copy pass. Store uploads always use
 `cycle=false`; vertex ring buffers alone use `cycle=true` on the final upload.
+The world holds only a generational `TileDataId` and claims the store each sync
+(`Renderer.claimTileStore`); `Renderer.endFrame` first retires every store no
+world claimed since the last frame, so a destroyed or replaced world's store
+goes at the next frame with no teardown call and no device drain (sweep
+O(store-slot high water), derived). A world whose claim fails re-uploads its
+resident layers into a new store: currently whole-level directories plus mixed
+blocks per resident layer, O(resident layers × chunks per level), derived;
+O(window) once residency is windowed.
 Multi-level compositing requires back-to-front dense-layer depth order at
 submit and in `mergeDrawList`. Sparse tiles cull to the window's levels and
 the camera chunk window separately.

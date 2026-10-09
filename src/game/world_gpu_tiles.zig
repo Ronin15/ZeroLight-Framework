@@ -139,6 +139,25 @@ pub const GpuTileMirror = struct {
         self.* = undefined;
     }
 
+    /// Forgets the store after the renderer retired it: no layer resident (each
+    /// resident layer's entry in `layer_slots` back to `no_slot`), an empty block
+    /// region, and no queued edits; keeps every capacity for the next store.
+    /// O(slots).
+    pub fn reset(self: *GpuTileMirror, layer_slots: []u8) void {
+        for (&self.slot_layer) |*layer| {
+            if (layer.* == no_layer) continue;
+            layer_slots[layer.*] = no_slot;
+            layer.* = no_layer;
+        }
+        self.store = .invalid;
+        self.block_count = 0;
+        self.block_free.clearRetainingCapacity();
+        self.pending.clearRetainingCapacity();
+        self.regions.clearRetainingCapacity();
+        self.spans.clearRetainingCapacity();
+        self.values.clearRetainingCapacity();
+    }
+
     pub fn residentLayerCount(self: *const GpuTileMirror) usize {
         var count: usize = 0;
         for (self.slot_layer) |layer| count += @intFromBool(layer != no_layer);

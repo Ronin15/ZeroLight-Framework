@@ -225,8 +225,9 @@ pub const DrawGroup = struct {
     order: RenderOrder = .{},
     first_vertex: u32,
     vertex_count: u32,
-    // Tilemap-material groups only: the world's tile store handle. The grid/atlas
-    // uniform lives in the renderer keyed by this id.
+    // Tilemap-material groups only: the world's non-owning tile store id. The
+    // grid/atlas uniform lives in the renderer keyed by this id; a stale id (store
+    // retired) skips the draw.
     tile_data: resources.TileDataId = .invalid,
     // Tilemap-material groups only: indexes the renderer's per-frame
     // TilemapWindowLayers side table (populated by appendStaticTilemapSpan),

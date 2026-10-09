@@ -274,7 +274,7 @@ const Fixture = struct {
             .block_elements = 1,
             .params = std.mem.zeroes(TilemapParams),
         });
-        self.world.gpu_tiles.store = @fromBackingInt(0);
+        self.world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
         self.world.render_window = .{ .levels_below = gpu_window_levels_below };
     }
 

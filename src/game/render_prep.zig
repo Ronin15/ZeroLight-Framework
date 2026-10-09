@@ -1411,7 +1411,8 @@ fn fakeTileStoreForTest(renderer: *Renderer, world: *WorldSystem) !void {
         .block_elements = 1,
         .params = std.mem.zeroes(renderer_mod.TilemapParams),
     });
-    world.gpu_tiles.store = @fromBackingInt(@intCast(renderer.tile_stores.items.len - 1));
+    // A test renderer holds a handful of fresh slots, all at generation 1.
+    world.gpu_tiles.store = .{ .index = @intCast(renderer.tile_stores.items.len - 1), .generation = 1 };
 }
 
 fn deinitFakeTileStoresForTest(renderer: *Renderer) void {

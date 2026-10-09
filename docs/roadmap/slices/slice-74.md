@@ -39,9 +39,11 @@ One world per gameplay state; nothing models a set of worlds.
 - `WorldSystem` adds levels at runtime (`addLevel`, `u16` index,
   `WorldLevelOverflow`) and keeps one world-wide `level_links` list (64G moves
   links into their chunks).
-- Render: each world has its own renderer-owned GPU tile store, released by
-  id (`Renderer.releaseTileStore`); nothing in game code releases it, so a
-  world's store lives until `Renderer.deinit`.
+- Render: each world has its own renderer-owned GPU tile store under a
+  generational id the world claims every frame it renders
+  (`Renderer.claimTileStore`); `endFrame` retires a store nobody claimed, so a
+  destroyed or replaced world's store is released at the first frame its world
+  does not render, with no game-side release call.
 - Load-time checks that refuse: `NavMemoryBudget.check` (`NavWorldTooLarge`
   at `max_nav_memory_bytes`). `DenseLayerWindowExceeded` still refuses
   world creation past `k_max_dense_submit_stack_cap` or

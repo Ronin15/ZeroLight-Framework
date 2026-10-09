@@ -1255,7 +1255,11 @@ pub const WorldSystem = struct {
     /// once per frame on the main thread before `submitStaticDenseGeometry` and
     /// swapchain acquisition. O(1) when nothing changed; never depends on levels
     /// outside the window. An error leaves residency and queued edits for a retry.
+    /// Claims the store for this frame; the renderer retires it the first frame
+    /// this is not called, and the next call re-uploads every resident layer into
+    /// a new store.
     pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16) !void {
+        if (self.gpu_tiles.store.isValid() and !renderer.claimTileStore(self.gpu_tiles.store)) self.resetGpuResidency();
         if (self.levelCount() == 0) return;
         const sync_plan = try self.planDenseGpuSync(active_level);
         if (sync_plan.isEmpty()) {
@@ -1263,7 +1267,7 @@ pub const WorldSystem = struct {
             return;
         }
         const geom = self.chunkGeometry();
-        if (self.gpu_tiles.store == .invalid) {
+        if (!self.gpu_tiles.store.isValid()) {
             var params = self.tilemap_params;
             params.layer_meta[2] = geom.shift;
             params.layer_meta[3] = @intCast(geom.chunks_x);
@@ -1285,6 +1289,14 @@ pub const WorldSystem = struct {
                 geom.chunkCount(),
             });
         }
+    }
+
+    // The renderer retired the store: nothing is resident any more, so the next
+    // sync re-enters every window layer and the draws re-submit. O(resident layers).
+    fn resetGpuResidency(self: *WorldSystem) void {
+        self.gpu_tiles.reset(self.dense_layers.items(.gpu_slot));
+        self.gpu_residency_dirty = true;
+        self.dense_quads_dirty = true;
     }
 
     // Sizes this frame's GPU tile sync and reserves its growth; re-derives the
@@ -3139,6 +3151,125 @@ test "a synced GPU tile store reads back every resident tile through splits, edi
         try expectGpuStoreMatches(&world, &gpu);
         _ = try world.setDenseTile(layer, 3, 3, grass);
     }
+}
+
+test "a reset GPU mirror re-enters every resident layer at the next sync" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 8x8 tiles in 4x4 chunks on two levels, one layer each.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const surface = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    const below = try world.addDenseLayer(try world.addLevel(-level_z_step), 0, .floor, grass);
+    var before = TestGpuStore{};
+    defer before.deinit();
+    _ = try testSyncGpuTiles(&world, 0);
+    try before.apply(&world);
+    // Split one chunk on each layer, sync, then queue one more edit.
+    _ = try world.setDenseTile(surface, 1, 1, water);
+    _ = try world.setDenseTile(below, 6, 6, water);
+    _ = try testSyncGpuTiles(&world, 0);
+    try before.apply(&world);
+    try std.testing.expectEqual(@as(u32, 2), world.gpu_tiles.block_count);
+    _ = try world.setDenseTile(surface, 5, 1, water);
+    try std.testing.expect(world.gpu_tiles.pending.items.len > 0);
+    world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
+    world.dense_quads_dirty = false;
+
+    // The renderer retired the store: nothing stays resident or queued.
+    world.resetGpuResidency();
+    try std.testing.expect(!world.gpu_tiles.store.isValid());
+    for (world.dense_layers.items(.gpu_slot)) |slot| try std.testing.expectEqual(world_gpu_tiles.no_slot, slot);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.residentLayerCount());
+    try std.testing.expectEqual(@as(u32, 0), world.gpu_tiles.block_count);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.block_free.items.len);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.pending.items.len);
+    try std.testing.expect(world.gpu_residency_dirty and world.dense_quads_dirty);
+
+    // A new store starts empty: the next sync uploads every window layer whole,
+    // edits since the last sync included, into a block region of the same size.
+    var after = TestGpuStore{};
+    defer after.deinit();
+    const sync_plan = try testSyncGpuTiles(&world, 0);
+    try std.testing.expectEqual(@as(usize, 2), sync_plan.enter_count);
+    try after.apply(&world);
+    try std.testing.expectEqual(@as(usize, 2), world.gpu_tiles.residentLayerCount());
+    try std.testing.expectEqual(@as(u32, 3), world.gpu_tiles.block_count);
+    try expectGpuStoreMatches(&world, &after);
+}
+
+test "syncDenseTileStore claims its live store every frame and drops a retired one with its residency" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+        .render_window = .{ .levels_below = 0 },
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    // Level 1 holds no layer, so syncing there needs no store and never creates one.
+    _ = try world.addLevel(-level_z_step);
+
+    // Headless renderer with one fake store: syncs only validate and queue.
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.tile_stores.deinit(allocator);
+    defer renderer.tile_merge_spans.deinit(allocator);
+    defer renderer.tile_merge_values.deinit(allocator);
+    try renderer.tile_stores.append(allocator, .{
+        .buffer = @ptrFromInt(0x1000),
+        .element_capacity = 1 << 10,
+        .directory_elements = 0,
+        .block_elements = 1,
+        .params = std.mem.zeroes(TilemapParams),
+    });
+    const store = &renderer.tile_stores.items[0];
+    defer store.pending_spans.deinit(allocator);
+    defer store.pending_values.deinit(allocator);
+    world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
+
+    // Every sync claims the live store, even one with nothing to upload.
+    try world.syncDenseTileStore(&renderer, 0);
+    try std.testing.expect(store.claimed);
+    try std.testing.expect(world.dense_layers.items(.gpu_slot)[layer] != world_gpu_tiles.no_slot);
+    store.claimed = false;
+    try world.syncDenseTileStore(&renderer, 0);
+    try std.testing.expect(store.claimed);
+
+    // The renderer retired the store (generation advanced): the next sync drops
+    // the stale id and every resident layer, and re-submits the draws.
+    store.generation = 2;
+    world.dense_quads_dirty = false;
+    try world.syncDenseTileStore(&renderer, 1);
+    try std.testing.expect(!world.gpu_tiles.store.isValid());
+    try std.testing.expectEqual(world_gpu_tiles.no_slot, world.dense_layers.items(.gpu_slot)[layer]);
+    try std.testing.expect(world.dense_quads_dirty);
 }
 
 test "setDenseTile queues a GPU edit only on a layer resident in the GPU tile store" {

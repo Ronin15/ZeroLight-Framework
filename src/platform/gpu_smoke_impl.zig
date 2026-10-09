@@ -21,6 +21,11 @@ const Uv = @import("../render/renderer.zig").Uv;
 const VertexColor = @import("../render/renderer.zig").VertexColor;
 const writeWorldSpriteQuad = @import("../render/renderer.zig").writeWorldSpriteQuad;
 const TextureDesc = @import("../render/resources.zig").TextureDesc;
+const TileDataId = @import("../render/resources.zig").TileDataId;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const manifest = @import("../assets/manifest.zig");
+const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const sdl = @import("sdl.zig");
 const c = sdl.c;
 
@@ -124,6 +129,84 @@ pub fn main(init: std.process.Init) !void {
         window_layers,
     );
 
+    // Frame 1 claims the store and draws it. Frame 2 does not claim it, so its
+    // `endFrame` retires the store (no device drain; SDL frees the buffer after
+    // frame 1 completes), the retained tilemap draw resolves to nothing and is
+    // skipped, and the id is stale afterwards.
+    if (!renderer.claimTileStore(tile_store)) return error.TileStoreNotLive;
+    try submitSmokeFrame(&renderer, app_config, "sprite and tilemap");
+    try submitSmokeFrame(&renderer, app_config, "sprite after tile store sweep");
+    if (renderer.claimTileStore(tile_store)) {
+        log.err("SDL_GPU smoke tile store survived a frame without a claim", .{});
+        return error.TileStoreNotSwept;
+    }
+    try smokeWorldTileStoreAcrossHiddenFrame(init.gpa, &renderer, app_config, assets);
+}
+
+// A world renders, is hidden for one frame (no sync, so its store is swept), and
+// renders again: its next sync creates a new store and the re-submitted static
+// tilemap draws name that store, which draws live.
+fn smokeWorldTileStoreAcrossHiddenFrame(
+    allocator: std.mem.Allocator,
+    renderer: *Renderer,
+    app_config: config.AppConfig,
+    assets: AssetStore,
+) !void {
+    var meta = try world_tileset_meta.load(allocator, assets, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 96, 64);
+    defer world.deinit();
+    // A blank texture at the atlas size stands in for the tileset; the smoke checks
+    // store lifetime, not tile art.
+    const atlas = meta.atlas();
+    const pixels = try allocator.alloc(u8, @as(usize, atlas.width) * atlas.height * 4);
+    defer allocator.free(pixels);
+    @memset(pixels, 255);
+    const atlas_texture = try renderer.createTextureFromPixels(pixels, atlas.width, atlas.height, @as(usize, atlas.width) * 4);
+    var runtime_assets = RuntimeAssets.init(allocator);
+    runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available, .lease = .{ .id = atlas_texture } };
+
+    const first = try submitWorldSmokeFrame(renderer, app_config, &world, &runtime_assets);
+    try submitSmokeFrame(renderer, app_config, "world hidden");
+    if (renderer.claimTileStore(first)) return error.TileStoreNotSwept;
+    const second = try submitWorldSmokeFrame(renderer, app_config, &world, &runtime_assets);
+    if (first.index == second.index and first.generation == second.generation) return error.TileStoreNotRecreated;
+}
+
+// One frame drawing `world`; returns its store after checking every static tilemap
+// draw names it and it is live.
+fn submitWorldSmokeFrame(
+    renderer: *Renderer,
+    app_config: config.AppConfig,
+    world: *WorldSystem,
+    runtime_assets: *const RuntimeAssets,
+) !TileDataId {
+    renderer.beginFrame(app_config.clear_color);
+    try world.syncDenseTileStore(renderer, 0);
+    try world.submitStaticDenseGeometry(renderer, runtime_assets, 0, &.{});
+    const store = world.gpu_tiles.store;
+    var tilemap_draws: usize = 0;
+    for (renderer.static_groups.items) |group| {
+        if (group.material != .tilemap) continue;
+        tilemap_draws += 1;
+        if (group.tile_data.index != store.index or group.tile_data.generation != store.generation) {
+            log.err("SDL_GPU smoke static tilemap draw names a stale tile store", .{});
+            return error.StaleTileStoreDraw;
+        }
+    }
+    if (tilemap_draws == 0) return error.NoWorldTilemapDraw;
+    if (!renderer.claimTileStore(store)) return error.TileStoreNotLive;
+    switch (try renderer.endFrame(null)) {
+        .submitted => log.debug("SDL_GPU smoke submitted world frame on tile store {d}:{d}", .{ store.index, store.generation }),
+        .skipped_no_swapchain => {
+            log.err("SDL_GPU smoke could not acquire a swapchain texture", .{});
+            return error.NoSwapchain;
+        },
+    }
+    return store;
+}
+
+fn submitSmokeFrame(renderer: *Renderer, app_config: config.AppConfig, comptime label: []const u8) !void {
     renderer.beginFrame(app_config.clear_color);
     try renderer.submitOrderedRectInSpace(
         .{ .x = 96, .y = 32, .w = 64, .h = 64 },
@@ -132,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
         .world,
     );
     switch (try renderer.endFrame(null)) {
-        .submitted => log.debug("SDL_GPU smoke submitted sprite and tilemap frame", .{}),
+        .submitted => log.debug("SDL_GPU smoke submitted " ++ label ++ " frame", .{}),
         .skipped_no_swapchain => {
             log.err("SDL_GPU smoke could not acquire a swapchain texture", .{});
             return error.NoSwapchain;

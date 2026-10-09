@@ -268,8 +268,25 @@ changing nothing a retry depends on), then commits and queues one upload batch
 The first sync with work creates the store at its content size and logs its
 resident bytes once per world. A batch still pending from a skipped frame folds
 into the next (`mergeTileStoreSpans`), newer values winning, so a copy pass never
-writes an element twice. `Renderer.releaseTileStore` releases one world's store;
-the renderer frees any remaining stores at shutdown.
+writes an element twice.
+
+The world holds only a non-owning, generational `TileDataId` (slot index plus
+generation, the `TextureId` pattern); no game teardown releases the store.
+`syncDenseTileStore` claims it every frame (`Renderer.claimTileStore`), and the
+first statement of `Renderer.endFrame` sweeps the stores: a live store nobody
+claimed since the previous sweep is retired, its slot's generation advances so
+every issued id goes stale, and SDL frees the buffer once in-flight frames
+finish (no device drain). So a destroyed or replaced world's store goes at the
+next `endFrame`, as does the store of a world whose state stops rendering
+(`render_below = false`). Retained tilemap draws naming a stale id resolve to no
+store and are skipped. When a claim fails, the world resets its mirror (no
+layer resident, empty block region, no queued edits, capacity kept) and the
+next sync re-uploads every window layer into a new store. Cost (derived): O(1)
+claim per frame; the sweep walks the store-slot high water (peak concurrent
+stores), O(stores) per frame. A reset currently re-uploads each resident layer
+whole, O(resident layers × chunks per level + resident mixed blocks), since
+directories still span the level; it becomes O(window) once residency is
+windowed. `Renderer.deinit` releases any stores still live.
 
 Two pipelines share the ordered draw list. The renderer binds the **sprite** or
 **tilemap** pipeline on a `DrawGroup.material` change; tilemap groups additionally

@@ -649,7 +649,7 @@ fn benchStaticGroups(
         .order = sprite_batch.RenderOrder.world(benchDenseFloorDepth(start_level)),
         .first_vertex = 0,
         .vertex_count = 6,
-        .tile_data = @fromBackingInt(0),
+        .tile_data = .{ .index = 0, .generation = 1 },
     };
     const sprite_index = tilemap_group_count;
     out[sprite_index] = .{

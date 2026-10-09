@@ -184,8 +184,8 @@ Failure and limits:
       replaced world releases all its storage.
 - [x] Render terrain uploaded per chunk for the render window; dense layers
       added in play; GPU byte gate replaced by a report (`9bbfdc0`).
-- [ ] A world's GPU tile store is released when its world is destroyed or
-      replaced, never only at renderer shutdown.
+- [x] A world's GPU tile store is released when its world is destroyed or
+      replaced, never only at renderer shutdown (render step (a)).
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
       the thread system, serial equals threaded (S3b). Their gameplay
       producers are [Slice 76](slice-76.md) and [Slice 77](slice-77.md).

@@ -245,9 +245,15 @@ fn mergeTileStoreSpans(
     }
 }
 
-// One world's GPU tile store. A released slot has a null buffer.
+// One world's GPU tile store. A retired slot has a null buffer and a generation
+// already advanced past every id issued for it.
 const TileStore = struct {
     buffer: ?*c.SDL_GPUBuffer,
+    // Generation the slot's current (or next) store is issued under.
+    generation: u32 = 1,
+    // Set by `createTileStore` and `claimTileStore`; cleared by the `endFrame`
+    // sweep, which retires a live store still unclaimed.
+    claimed: bool = false,
     element_capacity: u32,
     directory_elements: u32,
     block_elements: u32,
@@ -268,6 +274,12 @@ const TileStore = struct {
         .block_elements = 0,
         .params = std.mem.zeroes(TilemapParams),
     };
+};
+
+// GPU buffers a retired tile store held, for the caller to release.
+const RetiredTileStore = struct {
+    buffer: *c.SDL_GPUBuffer,
+    growth_source: ?*c.SDL_GPUBuffer,
 };
 
 // One GPU vertex buffer + its upload transfer buffer per SoA column. The three
@@ -407,8 +419,8 @@ pub const Renderer = struct {
     vertex_streams: VertexStreams,
     batch_capacity_vertices: usize,
     texture_slots: std.ArrayList(TextureSlot) = .empty,
-    // Per-world GPU tile stores (`createTileStore`), indexed by `TileDataId`.
-    // Renderer-owned so a world keeps only its opaque handle. Released slots are
+    // Per-world GPU tile stores (`createTileStore`), indexed by `TileDataId.index`.
+    // Renderer-owned so a world keeps only its non-owning handle. Retired slots are
     // reused from `tile_store_free`, whose capacity always covers every slot.
     tile_stores: std.ArrayList(TileStore) = .empty,
     tile_store_free: std.ArrayList(u32) = .empty,
@@ -524,7 +536,8 @@ pub const Renderer = struct {
         }
         self.texture_slots.deinit(self.allocator);
         for (self.tile_stores.items, 0..) |store, index| {
-            if (store.buffer != null) self.releaseTileStore(@fromBackingInt(@intCast(index)));
+            // Slot indices fit u32: `reserveTileStoreSlot` refuses past it.
+            if (store.buffer != null) self.releaseTileStoreSlot(@intCast(index));
         }
         self.tile_stores.deinit(self.allocator);
         self.tile_store_free.deinit(self.allocator);
@@ -803,7 +816,10 @@ pub const Renderer = struct {
         };
     }
 
+    /// Retires every tile store no owner claimed since the previous `endFrame`
+    /// (`claimTileStore`), then prepares, uploads, and draws the frame.
     pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
+        self.sweepUnclaimedTileStores();
         try self.ensureFrameBatchCapacity();
         const window_size = try self.currentWindowSize();
         // Cheap pre-acquire probe: a zero/invalid drawable means there is no
@@ -1127,32 +1143,33 @@ pub const Renderer = struct {
     }
 
     /// Creates a world's GPU tile store (layout: `tile_store_directory_slots`) with
-    /// `desc.element_capacity` elements and returns its handle. Contents are
-    /// undefined until uploads are queued; draws must read only directories and
-    /// blocks the owner has written. Release with `releaseTileStore`.
+    /// `desc.element_capacity` elements and returns its non-owning id, claimed for
+    /// the current frame. Contents are undefined until uploads are queued; draws
+    /// must read only directories and blocks the owner has written. The owner
+    /// claims it every frame it renders (`claimTileStore`); `endFrame` retires it
+    /// the first frame nobody does, and its id goes stale.
     pub fn createTileStore(self: *Renderer, desc: TileStoreDesc) !TileDataId {
         try validateTileStoreDesc(desc);
-        const reused = self.tile_store_free.pop();
-        errdefer if (reused) |index| self.tile_store_free.appendAssumeCapacity(index);
-        const index: u32 = reused orelse blk: {
-            const appended = std.math.cast(u32, self.tile_stores.items.len) orelse return error.TooManyTileStores;
-            if (appended == @backingInt(TileDataId.invalid)) return error.TooManyTileStores;
-            try self.tile_stores.ensureUnusedCapacity(self.allocator, 1);
-            // Release pushes the slot back infallibly.
-            try self.tile_store_free.ensureTotalCapacity(self.allocator, self.tile_stores.items.len + 1);
-            break :blk appended;
-        };
+        try self.reserveTileStoreSlot();
         const buffer = try gpu_buffer.createStorageBuffer(self.device, desc.element_capacity);
-        const store = TileStore{
+        const id = self.installTileStore(.{
             .buffer = buffer,
             .element_capacity = desc.element_capacity,
             .directory_elements = desc.directory_elements,
             .block_elements = desc.block_elements,
             .params = desc.params,
-        };
-        if (reused == null) self.tile_stores.appendAssumeCapacity(store) else self.tile_stores.items[index] = store;
-        log.debug("created tile store {d}: {d} elements", .{ index, desc.element_capacity });
-        return @fromBackingInt(index);
+        });
+        log.debug("created tile store {d}: {d} elements", .{ id.index, desc.element_capacity });
+        return id;
+    }
+
+    /// Keeps the store alive through the next `endFrame`; returns false when `id`
+    /// is stale (its store was retired), in which case the owner's GPU contents are
+    /// gone and it must create a new store. O(1).
+    pub fn claimTileStore(self: *Renderer, id: TileDataId) bool {
+        const store = self.tileStore(id) orelse return false;
+        store.claimed = true;
+        return true;
     }
 
     /// Grows the store to `required_elements` when it is smaller (a new buffer; the
@@ -1201,21 +1218,92 @@ pub const Renderer = struct {
         std.mem.swap(std.ArrayList(u32), &store.pending_values, &self.tile_merge_values);
     }
 
-    /// Releases a world's tile store. SDL frees its GPU buffers once in-flight
-    /// frames finish; retained static draws that reference it stop drawing. A no-op
-    /// for a released or invalid handle.
-    pub fn releaseTileStore(self: *Renderer, id: TileDataId) void {
-        const store = self.tileStore(id) orelse return;
-        c.SDL_ReleaseGPUBuffer(self.device, store.buffer.?);
-        if (store.growth_source) |source| c.SDL_ReleaseGPUBuffer(self.device, source);
+    // Makes the next `installTileStore` infallible: a retired slot, or room for a
+    // new one in both the store list and the free list (which retire pushes to).
+    fn reserveTileStoreSlot(self: *Renderer) error{ OutOfMemory, TooManyTileStores }!void {
+        if (self.tile_store_free.items.len > 0) return;
+        const appended = std.math.cast(u32, self.tile_stores.items.len) orelse return error.TooManyTileStores;
+        if (appended == TileDataId.invalid.index) return error.TooManyTileStores;
+        try self.tile_stores.ensureUnusedCapacity(self.allocator, 1);
+        try self.tile_store_free.ensureTotalCapacity(self.allocator, self.tile_stores.items.len + 1);
+    }
+
+    // Places `store` in a retired slot under that slot's generation, or appends it
+    // at generation 1, claimed. Requires `reserveTileStoreSlot`.
+    fn installTileStore(self: *Renderer, store: TileStore) TileDataId {
+        std.debug.assert(store.buffer != null);
+        if (self.tile_store_free.pop()) |index| {
+            const slot = &self.tile_stores.items[index];
+            std.debug.assert(slot.buffer == null);
+            const generation = slot.generation;
+            slot.* = store;
+            slot.generation = generation;
+            slot.claimed = true;
+            return .{ .index = index, .generation = generation };
+        }
+        // `reserveTileStoreSlot` bounded the length below `TileDataId.invalid.index`.
+        const index: u32 = @intCast(self.tile_stores.items.len);
+        std.debug.assert(self.tile_store_free.capacity >= self.tile_stores.items.len + 1);
+        self.tile_stores.appendAssumeCapacity(store);
+        const slot = &self.tile_stores.items[index];
+        slot.generation = 1;
+        slot.claimed = true;
+        return .{ .index = index, .generation = 1 };
+    }
+
+    // Returns the first live store at or after `cursor` that nobody claimed since
+    // the last sweep, clearing the claim of every claimed store it passes. Touches
+    // no SDL state.
+    fn nextUnclaimedTileStore(self: *Renderer, cursor: u32) ?u32 {
+        var index: usize = cursor;
+        while (index < self.tile_stores.items.len) : (index += 1) {
+            const store = &self.tile_stores.items[index];
+            if (store.buffer == null) continue;
+            if (store.claimed) {
+                store.claimed = false;
+                continue;
+            }
+            // Below the slot count, which fits u32 (`reserveTileStoreSlot`).
+            return @intCast(index);
+        }
+        return null;
+    }
+
+    // Retires every store unclaimed since the last sweep, so a destroyed or
+    // replaced world's store goes at the first frame it does not render. O(live
+    // stores); SDL frees the buffers once in-flight frames finish, so no drain.
+    fn sweepUnclaimedTileStores(self: *Renderer) void {
+        var cursor: u32 = 0;
+        while (self.nextUnclaimedTileStore(cursor)) |index| {
+            self.releaseTileStoreSlot(index);
+            cursor = index + 1;
+        }
+    }
+
+    // Retires a live slot without touching SDL: frees its pending upload lists,
+    // advances its generation so every issued id goes stale (the
+    // `retireTextureSlotForReuse` pattern), and returns it to the free list.
+    // Retained draws naming it are skipped from the sweeping `endFrame`'s draw
+    // loop onward.
+    fn retireTileStoreSlot(self: *Renderer, index: u32) RetiredTileStore {
+        const store = &self.tile_stores.items[index];
+        const retired = RetiredTileStore{ .buffer = store.buffer.?, .growth_source = store.growth_source };
         store.pending_spans.deinit(self.allocator);
         store.pending_values.deinit(self.allocator);
+        const generation = resources.nextGeneration(store.generation);
         store.* = TileStore.released;
-        for (self.static_groups.items) |*group| {
-            if (group.tile_data == id) group.tile_data = .invalid;
-        }
+        store.generation = generation;
         std.debug.assert(self.tile_store_free.items.len < self.tile_store_free.capacity);
-        self.tile_store_free.appendAssumeCapacity(@backingInt(id));
+        self.tile_store_free.appendAssumeCapacity(index);
+        return retired;
+    }
+
+    // Retires a live slot and releases its GPU buffers; SDL defers the free past
+    // in-flight frames.
+    fn releaseTileStoreSlot(self: *Renderer, index: u32) void {
+        const retired = self.retireTileStoreSlot(index);
+        c.SDL_ReleaseGPUBuffer(self.device, retired.buffer);
+        if (retired.growth_source) |source| c.SDL_ReleaseGPUBuffer(self.device, source);
     }
 
     fn growTileStore(self: *Renderer, store: *TileStore, required_elements: u32) !void {
@@ -1287,11 +1375,10 @@ pub const Renderer = struct {
     }
 
     fn tileStore(self: *const Renderer, id: TileDataId) ?*TileStore {
-        if (id == .invalid) return null;
-        const index = @backingInt(id);
-        if (index >= self.tile_stores.items.len) return null;
-        const store = &self.tile_stores.items[index];
-        if (store.buffer == null) return null;
+        if (!id.isValid()) return null;
+        if (id.index >= self.tile_stores.items.len) return null;
+        const store = &self.tile_stores.items[id.index];
+        if (store.buffer == null or store.generation != id.generation) return null;
         return store;
     }
 
@@ -2344,7 +2431,7 @@ test "queueTileStoreUploads folds a carried batch allocation-free after reserve"
     const store = &renderer.tile_stores.items[0];
     defer store.pending_spans.deinit(allocator);
     defer store.pending_values.deinit(allocator);
-    const id: TileDataId = @fromBackingInt(0);
+    const id = TileDataId{ .index = 0, .generation = 1 };
 
     const first_spans = [_]TileStoreSpan{ .{ .dst_element = 3, .count = 1 }, .{ .dst_element = 32, .count = 8 } };
     const first_values = [_]u32{ 7, 0, 1, 2, 3, 4, 5, 6, 7 };
@@ -2375,8 +2462,129 @@ test "queueTileStoreUploads folds a carried batch allocation-free after reserve"
     try std.testing.expectEqualSlices(u32, &.{ 8, 0, 1, 22, 3, 4, 5, 6, 7, 9, 9, 9, 9, 9, 9, 9, 9 }, store.pending_values.items);
     // Out of bounds, unsorted, or a stale handle never reaches the queue.
     try std.testing.expectError(error.GpuUploadOutOfBounds, renderer.queueTileStoreUploads(id, &.{.{ .dst_element = 63, .count = 2 }}, &.{ 1, 2 }));
-    try std.testing.expectError(error.InvalidTileStore, renderer.queueTileStoreUploads(@fromBackingInt(1), &.{}, &.{}));
+    try std.testing.expectError(error.InvalidTileStore, renderer.queueTileStoreUploads(.{ .index = 1, .generation = 1 }, &.{}, &.{}));
+    try std.testing.expectError(error.InvalidTileStore, renderer.queueTileStoreUploads(.{ .index = 0, .generation = 2 }, &.{}, &.{}));
     try std.testing.expectEqual(@as(usize, 3), store.pending_spans.items.len);
+}
+
+// Installs a store with a fake GPU handle; the sweep and retire tests only
+// record and compare it, never pass it to SDL.
+fn testInstallTileStore(renderer: *Renderer, buffer_address: usize) !TileDataId {
+    try renderer.reserveTileStoreSlot();
+    return renderer.installTileStore(.{
+        .buffer = @ptrFromInt(buffer_address),
+        .element_capacity = 64,
+        .directory_elements = 32,
+        .block_elements = 8,
+        .params = std.mem.zeroes(TilemapParams),
+    });
+}
+
+fn deinitTileStoreTestRenderer(renderer: *Renderer) void {
+    for (renderer.tile_stores.items) |*store| {
+        store.pending_spans.deinit(renderer.allocator);
+        store.pending_values.deinit(renderer.allocator);
+    }
+    renderer.tile_stores.deinit(renderer.allocator);
+    renderer.tile_store_free.deinit(renderer.allocator);
+    renderer.tile_merge_spans.deinit(renderer.allocator);
+    renderer.tile_merge_values.deinit(renderer.allocator);
+    renderer.batch.deinit();
+}
+
+test "an unclaimed tile store is retired by the sweep and its id goes stale; a claimed store survives with its claim cleared" {
+    var renderer = testRenderer(std.testing.allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const kept = try testInstallTileStore(&renderer, 0x1000);
+    const dropped = try testInstallTileStore(&renderer, 0x2000);
+    // Uploads still pending on a retired store are freed with it.
+    try renderer.reserveTileStoreUploads(dropped, 8, 1, 2);
+    try renderer.queueTileStoreUploads(dropped, &.{.{ .dst_element = 0, .count = 2 }}, &.{ 1, 2 });
+
+    // First sweep: creation claimed both for their first frame.
+    try std.testing.expectEqual(@as(?u32, null), renderer.nextUnclaimedTileStore(0));
+    // Second sweep: only `kept` was claimed again.
+    try std.testing.expect(renderer.claimTileStore(kept));
+    try std.testing.expectEqual(@as(?u32, dropped.index), renderer.nextUnclaimedTileStore(0));
+    const retired = renderer.retireTileStoreSlot(dropped.index);
+    try std.testing.expectEqual(@as(usize, 0x2000), @intFromPtr(retired.buffer));
+    try std.testing.expectEqual(@as(?*c.SDL_GPUBuffer, null), retired.growth_source);
+    try std.testing.expectEqual(@as(?u32, null), renderer.nextUnclaimedTileStore(dropped.index + 1));
+
+    try std.testing.expect(renderer.tileStore(dropped) == null);
+    try std.testing.expect(!renderer.claimTileStore(dropped));
+    try std.testing.expectError(error.InvalidTileStore, renderer.queueTileStoreUploads(dropped, &.{}, &.{}));
+    const survivor = renderer.tileStore(kept).?;
+    try std.testing.expect(!survivor.claimed);
+    // Third sweep: `kept` was not claimed this time.
+    try std.testing.expectEqual(@as(?u32, kept.index), renderer.nextUnclaimedTileStore(0));
+}
+
+test "a tile store retired mid-growth hands back both buffers and leaves a clean slot" {
+    var renderer = testRenderer(std.testing.allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const id = try testInstallTileStore(&renderer, 0x1000);
+    // A growth no frame recorded yet: the replaced buffer still holds the contents.
+    renderer.tileStore(id).?.growth_source = @ptrFromInt(0x2000);
+    renderer.tileStore(id).?.growth_source_elements = 32;
+
+    const retired = renderer.retireTileStoreSlot(id.index);
+    try std.testing.expectEqual(@as(usize, 0x1000), @intFromPtr(retired.buffer));
+    try std.testing.expectEqual(@as(usize, 0x2000), @intFromPtr(retired.growth_source.?));
+    const slot = renderer.tile_stores.items[id.index];
+    try std.testing.expectEqual(@as(?*c.SDL_GPUBuffer, null), slot.buffer);
+    try std.testing.expectEqual(@as(?*c.SDL_GPUBuffer, null), slot.growth_source);
+    try std.testing.expectEqual(@as(u32, 0), slot.growth_source_elements);
+    // Nothing is left for the frame copy pass to stage or record.
+    try std.testing.expect(!renderer.tileStoreUploadsPending());
+    try std.testing.expectEqual(@as(?u32, null), renderer.nextUnclaimedTileStore(0));
+}
+
+test "a retired tile store slot is reused under a new generation and the old id stays stale" {
+    const allocator = std.testing.allocator;
+    var renderer = testRenderer(allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const first = try testInstallTileStore(&renderer, 0x1000);
+    _ = renderer.retireTileStoreSlot(first.index);
+
+    // Reuse, retire, and reuse again allocate nothing once a slot is reserved.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    renderer.allocator = failing.allocator();
+    const second = try testInstallTileStore(&renderer, 0x2000);
+    _ = renderer.retireTileStoreSlot(second.index);
+    const third = try testInstallTileStore(&renderer, 0x3000);
+    renderer.allocator = allocator;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    try std.testing.expectEqual(first.index, second.index);
+    try std.testing.expectEqual(first.index, third.index);
+    try std.testing.expectEqual(resources.nextGeneration(first.generation), second.generation);
+    try std.testing.expectEqual(resources.nextGeneration(second.generation), third.generation);
+    try std.testing.expectEqual(@as(usize, 1), renderer.tile_stores.items.len);
+    try std.testing.expect(renderer.tileStore(first) == null);
+    try std.testing.expect(renderer.tileStore(second) == null);
+    try std.testing.expect(!renderer.claimTileStore(first));
+    try std.testing.expectEqual(@as(usize, 0x3000), @intFromPtr(renderer.tileStore(third).?.buffer.?));
+    try std.testing.expect(renderer.claimTileStore(third));
+
+    // A fresh slot is reserved up front, so installing it and retiring it later
+    // allocate nothing.
+    try renderer.reserveTileStoreSlot();
+    failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    renderer.allocator = failing.allocator();
+    const fresh = renderer.installTileStore(.{
+        .buffer = @ptrFromInt(0x4000),
+        .element_capacity = 64,
+        .directory_elements = 32,
+        .block_elements = 8,
+        .params = std.mem.zeroes(TilemapParams),
+    });
+    _ = renderer.retireTileStoreSlot(fresh.index);
+    _ = renderer.retireTileStoreSlot(third.index);
+    renderer.allocator = allocator;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(u32, 1), fresh.index);
+    try std.testing.expectEqual(@as(u32, 1), fresh.generation);
 }
 
 test "tileDataElementCount halves cell counts rounding up" {
@@ -2449,7 +2657,7 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
         var window = Renderer.TilemapWindowLayers{};
         window.count = 1;
         window.offsets[0] = @intCast(i);
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(0), window);
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
     }
 
     try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layer_count);
@@ -2466,7 +2674,7 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
     var window = Renderer.TilemapWindowLayers{};
     window.count = 1;
     window.offsets[0] = 99;
-    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, @fromBackingInt(0), window);
+    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
     try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
     try std.testing.expectEqual(@as(u8, 0), renderer.static_groups.items[0].window_slot);
 }
@@ -2485,13 +2693,13 @@ test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composi
 
     renderer.beginStaticGeometry();
     for (0..Renderer.k_max_dense_composite_draws) |i| {
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(0), window);
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
     }
     try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
 
     try std.testing.expectError(
         error.TooManyTilemapWindowDraws,
-        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, @fromBackingInt(0), window),
+        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, TileDataId{ .index = 0, .generation = 1 }, window),
     );
     // The fixed-size table stayed exactly at the cap; the failed call past it
     // neither corrupted it nor grew past bounds.
@@ -2527,7 +2735,7 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
             texture,
             RenderOrder.world(@intCast(i)),
             vertices,
-            @fromBackingInt(0),
+            TileDataId{ .index = 0, .generation = 1 },
             window,
         );
     }
