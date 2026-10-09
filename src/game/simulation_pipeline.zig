@@ -5413,7 +5413,7 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         tuner.best_profile = profile;
         tuner.candidate_profile = null;
         // Forget the pre-pin item count so the first pinned batch does not reset.
-        tuner.last_item_count = 0;
+        tuner.learned_item_count = 0;
     }
 }
 

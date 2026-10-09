@@ -215,14 +215,17 @@ Failure and limits:
       own tuners, serial equals threaded, solve outputs sit at the fallback
       ordinal, pending compaction costs the solve window. Remaining: the items
       below, so the stages engage under varying load.
-- [ ] Tuner resets learning when an inline batch's item count changes
+- [x] Tuner resets learning when an inline batch's item count changes
       (`thread_system.zig:1134-1137`, `:229-237`: the inline shape's range size
       is the item count, so `record` sees a new profile): nav intake and group
       fields stay inline whenever the request or field count varies, e.g. the
       elastic ramp at 4,000 agents runs intake inline every ramp step.
-- [ ] Tuner window-minimum demotion (`thread_system.zig:241-249`, `:399-410`,
+      Landed (TS1): inline batches are one profile; an out-of-band batch is
+      not sampled; a sustained same-side shift re-tunes a threaded stage.
+- [x] Tuner window-minimum demotion (`thread_system.zig:241-249`, `:399-410`,
       `:599-610`): four lockstep group fields finish in one near-empty batch, the
       advance pass demotes to inline and stays there for 360 batches.
+      Landed (TS1): windows read the median batch.
 - [ ] The runtime perf log records only the solve batch
       (`simulation_pipeline.zig:584`); the intake and group-field batches are
       visible only in benches.

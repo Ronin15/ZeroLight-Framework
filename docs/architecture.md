@@ -385,7 +385,12 @@ distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
 owns the decision. The tuner starts inline, records that inline baseline for the
 owning batch, probes a threaded profile when the measured work is expensive
 enough, and only reports a best threaded profile after a threaded candidate wins.
-There are no static item-count floors (`.claude/rules/threading.md`);
+Each decision reads the median of a short sample window, so one spike or one
+near-free batch never decides alone. A batch outside the learned item-count band
+runs with the current profile without being sampled; a full window of them in a
+row on the same side is a sustained shift, which re-tunes a threaded stage at the
+new count and relearns an inline one. There are no static item-count floors
+(`.claude/rules/threading.md`);
 slower hardware or expensive small-N processors train their own threaded
 profile.
 Reported `worker_threads` counts are background worker threads only; the main
