@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** Last work on `ai_update3`, before merge.
+**Status: in progress.** Last work on `ai_update3`, before merge.
 
 Goal: terrain and nav storage and work owned per chunk `(level, cx, cy)`, so a
 dig, ramp, cave-in, or explosion costs work only in the chunks it touches,
@@ -148,17 +148,15 @@ Failure and limits:
 
 ### Checklist
 
-- [ ] One chunk edge size and one cell resolution shared by terrain, nav, and
-      scope; test fixtures are multi-chunk (fixture rule in
-      `.claude/rules/tests-benchmarks.md` updated in the same change if it
-      moves).
-- [ ] Terrain storage owned per chunk behind the existing accessors; a cell's
-      blocked query costs its chunk, independent of level count, dense layers,
-      and the level's sparse tiles.
+- [x] One chunk edge size (power of two, at most 16) and tile-sized nav cells
+      shared by terrain, nav, and scope (`23c24ec`).
+- [x] Terrain stored per chunk behind the existing accessors; the blocked
+      query costs its chunk (`453993f`).
 - [ ] Uniform and all-solid chunks stay cheap after edits elsewhere on their
-      level.
+      level. Terrain landed (`453993f`); nav remains.
 - [ ] Level links stored with their endpoint chunks; a link lookup, including
-      on entity cell entry, costs the chunk, not the world's links.
+      on entity cell entry, costs the chunk, not the world's links. World side
+      landed (`453993f`); nav side remains.
 - [ ] Nav storage per chunk; a level holds only a directory of its chunks,
       and nothing in nav is sized to level cells.
 - [ ] Runtime ramps routable the same step on both levels, perimeter or
@@ -186,9 +184,9 @@ Failure and limits:
 - [ ] Level-sized load gates retired, so creating a world in play (74) and
       adding a link are never refused for capacity; index and format widths
       (cell, chunk, label, slot, edge offsets, level) fail loudly at world
-      create, load, and growth.
-- [ ] The replaced branch nav code is gone, with its tests, as each part is
-      replaced.
+      create, load, and growth. Index widths landed (`23c24ec`); gates remain.
+- [x] Replaced branch nav code and its tests removed; main's nav restored
+      (`2c09cec`).
 - [ ] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
       every allocation leaves state intact and the retry equals a rebuild; one
       chunk's change leaves every other chunk untouched; a multi-level cave-in
