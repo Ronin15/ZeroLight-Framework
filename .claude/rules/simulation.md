@@ -46,6 +46,8 @@ paths:
   thread-local.
 - Enemies, hazards, pickups, and world objects are plain entities processed by
   systems. Collision bounds are dedicated data, never inferred from visuals.
+- A static body changes position, bounds, or level only through structural
+  commands; consumers of the static-collider rows rely on it.
 - Neighbor queries use the shared `SpatialIndexSystem`, never a private grid
   (collision sweep-and-prune is the exception).
 - Locomotion flows `navigation_intents` → steering → `intents`; non-locomotion

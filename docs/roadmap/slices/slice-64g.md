@@ -210,6 +210,22 @@ Failure and limits:
 - [x] A nav-apply failure leaves that step's perception and steering
       reactions intact (nav N1: steering runs before the nav error returns;
       perception has no reaction).
+- [ ] Nav's request side threads like other systems. Delivered (nav T1):
+      request intake and group-field expansion are threaded stages with their
+      own tuners, serial equals threaded, solve outputs sit at the fallback
+      ordinal, pending compaction costs the solve window. Remaining: the items
+      below, so the stages engage under varying load.
+- [ ] Tuner resets learning when an inline batch's item count changes
+      (`thread_system.zig:1134-1137`, `:229-237`: the inline shape's range size
+      is the item count, so `record` sees a new profile): nav intake and group
+      fields stay inline whenever the request or field count varies, e.g. the
+      elastic ramp at 4,000 agents runs intake inline every ramp step.
+- [ ] Tuner window-minimum demotion (`thread_system.zig:241-249`, `:399-410`,
+      `:599-610`): four lockstep group fields finish in one near-empty batch, the
+      advance pass demotes to inline and stays there for 360 batches.
+- [ ] The runtime perf log records only the solve batch
+      (`simulation_pipeline.zig:584`); the intake and group-field batches are
+      visible only in benches.
 - [ ] One shared static-collider structure, synced once per entity per step,
       with nav as its first consumer; a static add, move, or destroy costs its
       own rows and chunks. Steering and collision move onto it in 71B.1.

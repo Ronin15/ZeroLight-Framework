@@ -462,10 +462,21 @@ pub const ResultCache = struct {
     // actual eviction. Without this, an agent that only polls statusForWorld (never enqueues)
     // is served a path older than the TTL forever. ttl 0 disables expiry.
     pub fn freshSlotIndex(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?usize {
+        const found = self.lookup(key, step, ttl) orelse return null;
+        return if (found.fresh) found.slot else null;
+    }
+
+    pub const SlotLookup = struct {
+        slot: usize,
+        fresh: bool,
+    };
+
+    /// The key's slot and whether its result is within `ttl` at `step`, from one probe;
+    /// null when absent. ttl 0 disables expiry. Const: never evicts.
+    pub fn lookup(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?SlotLookup {
         const index = self.slotIndex(key) orelse return null;
         const payload_index = self.slots.items[index].payload_index;
-        if (ttl != 0 and (step -% self.payloads.items[payload_index].stamp) >= ttl) return null;
-        return index;
+        return .{ .slot = index, .fresh = ttl == 0 or (step -% self.payloads.items[payload_index].stamp) < ttl };
     }
 
     // find, but a result older than `ttl` steps is dropped (returns null) so the caller

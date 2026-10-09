@@ -34,12 +34,16 @@ touch. Follow them and cite them by file; never restate them.
    If the existing structure cannot pass it, stop and say so instead of
    patching around it.
 3. Make the change in the owning module (`docs/architecture.md` § Source
-   Layout), with no unrelated refactor or reformat.
+   Layout), with no unrelated refactor or reformat. Touch only the files the
+   brief lists; a needed file outside the list stops the work and is
+   reported, never edited first.
 4. Add the tests and scaling benches the rules require for the change.
-5. Validate per `.claude/rules/build-validation.md`. A change that can move a
-   hot path gets its before/after from `tools/bench_ab.py` on the groups that
-   cover it (targeted groups only, never the full suite); the brief's
-   bench list is the minimum, not a reason to skip it.
+5. Validate per `.claude/rules/build-validation.md`. Write `zig build test`
+   output to a file and judge it by the exit code; a "failed command:" line
+   echoing warn output is not a failure; on a real failure keep the failing
+   test's name and message. A change that can move a hot path gets its
+   before/after from `tools/bench_ab.py`, targeted to the code being tested
+   or changed, never the full suite.
 
 ## Report
 

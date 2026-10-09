@@ -15,10 +15,12 @@ const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const cached_results_per_agent = @import("../game/systems/pathfinding/types.zig").cached_results_per_agent;
+const intake_range_alignment_items = @import("../game/systems/pathfinding/types.zig").intake_range_alignment_items;
 const AiDir = @import("../game/systems/ai.zig").AiDir;
 const computeRequantizedGoal = @import("../game/systems/ai.zig").computeRequantizedGoal;
 const default_goal_requantization_hysteresis_distance = @import("../game/systems/ai.zig").default_goal_requantization_hysteresis_distance;
@@ -208,11 +210,24 @@ pub const cross_level_teleport_group = suite.BenchmarkGroup{
 // (the item count) of short paths: the cell turns blocking and the nav reaction runs,
 // eviction included. The dig crosses the same few paths at every count, so it passes
 // when flat in cached results. `outputs` is the results evicted. An untimed reset
-// reopens the cell and re-solves the evicted results.
+// reopens the cell and re-solves the evicted results. A region config (item count
+// region chunks * 10^7 + cached results) instead fills a chunk-aligned square of that
+// many chunks in one step, crossing the routes of its rows: the dense-change reaction.
 pub const evict_group = suite.BenchmarkGroup{
     .name = "pathfinding-evict",
     .defaultItemCounts = evictItemCounts,
     .runCase = runEvictCase,
+};
+
+// Moving packs of 24 agents (the item count is the pack count) on an open 256² nav grid,
+// each with its own goal marching one nav cell per rekey cycle. Fields per pack and a
+// threshold of 8 make the packs' fields build at the same time, one
+// `group_field_expand` item per building field. Times every step of the measured
+// cycles; `outputs` is the fields built and `candidates` the field samples.
+pub const group_field_packs_group = suite.BenchmarkGroup{
+    .name = "pathfinding-group-field-packs",
+    .defaultItemCounts = groupFieldPacksItemCounts,
+    .runCase = runGroupFieldPacksCase,
 };
 
 // The agent count ramps linearly to 1,000, 4,000, or 16,000 (the item count) over 64
@@ -427,7 +442,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize, workload: Workl
 // budget is the full count so the per-frame ceiling (not a bench-imposed budget) does the
 // capping, and items_per_second reports solves actually serviced, not the requested count.
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .cold_solve, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, group.name, item_count, .unique_open, .cold_solve, item_count, item_count);
 }
 
 // Shared-goal dedup path: every agent requests the SAME goal cell, so all but the first hash
@@ -442,9 +457,7 @@ pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     defer fixture.deinit();
     var system = PathfindingSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
-        system.fallback_tuner = tuner;
-    }
+    setPathStageTuners(&system, case);
 
     const grid_side = fixtureGridSide(item_count, .common_goal);
     const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
@@ -514,40 +527,38 @@ pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 }
 
 pub fn runFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, fallback_group.name, item_count, .unique_open, .hot_cache, item_count, item_count);
 }
 
 pub fn runFallbackDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, item_count, .blocked_detour, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, fallback_detour_group.name, item_count, .blocked_detour, .hot_cache, item_count, item_count);
 }
 
 pub fn runFallbackUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, item_count, .blocked_unreachable, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, fallback_unreachable_group.name, item_count, .blocked_unreachable, .hot_cache, item_count, item_count);
 }
 
 pub fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, hard_fallback_group.name, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
 }
 
 pub fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     const fallback_budget = @min(options.fallback_budget orelse hardFallbackBudget(item_count), item_count);
-    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
+    return runWorkloadCase(allocator, io, options, case, hard_fallback_budget_group.name, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
 }
 
 fn hardFallbackBudget(item_count: usize) usize {
     return @min(item_count, default_max_fallback_requests_per_step);
 }
 
-fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
+fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var fixture = try createFixture(allocator, item_count, workload);
     defer fixture.deinit();
     var system = PathfindingSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
-        system.fallback_tuner = tuner;
-    }
+    setPathStageTuners(&system, case);
 
     const grid_side = fixtureGridSide(item_count, workload);
     const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
@@ -575,6 +586,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     system.clearRuntimeState();
     _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+    if (mode == .hot_cache) try warmHotCache(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, options, case, item_count);
 
     // Cold modes re-solve the full per-frame ceiling every frame, so they use the tighter cold
     // measurement budget; the hot_cache mode is a cheap probe and keeps the full suite budget.
@@ -596,13 +608,16 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
+    var stage_report = StageReport{};
     for (0..measure_count) |_| {
         if (mode.isCold()) system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+        stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
+    stage_report.print(options, group_name, item_count, case);
 
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
@@ -656,9 +671,7 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     defer fixture.deinit();
     var system = PathfindingSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
-        system.fallback_tuner = tuner;
-    }
+    setPathStageTuners(&system, case);
 
     const grid_side = fixtureGridSide(item_count, .unique_open);
     const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
@@ -696,29 +709,32 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     for (0..@max(@as(usize, 1), coldWarmup(options))) |_| {
         try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
         var guard: usize = drain_frame_budget;
-        while (system.pending.items.len > 0 and guard > 0) : (guard -= 1) {
-            const before = system.pending.items.len;
+        while (system.pending.len > 0 and guard > 0) : (guard -= 1) {
+            const before = system.pending.len;
             _ = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
-            if (system.pending.items.len >= before) break; // no progress: stop draining this cycle
+            if (system.pending.len >= before) break; // no progress: stop draining this cycle
         }
     }
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
+    var stage_report = StageReport{};
     while (accumulator.iterations < drain_samples) {
         // Refill is untimed: clears completed/pending then accepts all N (this frame also
         // solves the first ceiling). The timed samples below are pure drain frames.
         try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
         var guard: usize = drain_frame_budget;
-        while (system.pending.items.len > 0 and accumulator.iterations < drain_samples and guard > 0) : (guard -= 1) {
-            const before = system.pending.items.len;
+        while (system.pending.len > 0 and accumulator.iterations < drain_samples and guard > 0) : (guard -= 1) {
+            const before = system.pending.len;
             const start_ns = suite.nowNs(io);
             last_stats = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
             const end_ns = suite.nowNs(io);
             accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
-            if (system.pending.items.len >= before) break; // no progress: refill next cycle
+            stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
+            if (system.pending.len >= before) break; // no progress: refill next cycle
         }
     }
+    stage_report.print(options, drain_group.name, item_count, case);
 
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
@@ -744,6 +760,22 @@ fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(Pat
     _ = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
 }
 
+// Steps until every request is a cache hit and, for an adaptive case, the intake tuner
+// has settled (bounded), so the timed steps are the hit path only.
+fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !void {
+    const fill_limit = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
+    const settle_limit = fill_limit + suite.adaptiveSettleIterationLimit(options);
+    var steps: usize = 0;
+    while (true) {
+        const stats = try runColdOnce(system, requests, thread_system, case, item_count, item_count, item_count);
+        steps += 1;
+        const all_hits = stats.cache_hits == item_count;
+        if (!all_hits and steps > fill_limit) return error.HotCacheNotWarm;
+        const tuner_ready = !case.adaptive or system.intake_tuner.isSettled() or steps >= settle_limit;
+        if (all_hits and tuner_ready) return;
+    }
+}
+
 fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
     if (!case.usesThreadSystem()) {
         return try system.updateSerial(requests, agent_count, .{
@@ -758,6 +790,100 @@ fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequ
         .max_solved_requests_per_step = solve_budget,
         .max_fallback_requests_per_step = fallback_budget,
     });
+}
+
+// Gives every pathfinding update stage this case's tuner, as `fallback_tuner` gets its own.
+fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
+    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.fallback_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, intake_range_alignment_items)) |tuner| system.intake_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_begin_tuner = tuner;
+}
+
+// Worker-side time of an update's threaded stages; stages that ran inline add nothing.
+fn offMainStageNs(stats: PathfindingStats) u64 {
+    var total: u64 = 0;
+    for ([_]BatchStats{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.fallback_batch }) |batch| {
+        total += offMainNs(batch);
+    }
+    return total;
+}
+
+fn offMainNs(batch: BatchStats) u64 {
+    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
+}
+
+// Stage shapes and the main-thread share of the timed pathfinding updates, printed
+// under --details: each stage's shape is its busiest timed batch, and main time is each
+// timed span minus its stages' worker-side time.
+const StageReport = struct {
+    main_ns: u128 = 0,
+    timed_ns: u128 = 0,
+    samples: usize = 0,
+    // Main-thread time per update phase: the phase timer minus its stages' worker time.
+    accept_main_ns: u128 = 0,
+    group_main_ns: u128 = 0,
+    solve_main_ns: u128 = 0,
+    publish_ns: u128 = 0,
+    // Intake, group-field advance, group-field begin, solve: each stage's busiest
+    // batch, and how many of its non-empty batches ran on workers.
+    busiest: [4]BatchStats = @splat(.{}),
+    threaded: [4]usize = @splat(0),
+    dispatched: [4]usize = @splat(0),
+
+    fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
+        self.samples += 1;
+        self.timed_ns += elapsed_ns;
+        self.main_ns += elapsed_ns -| offMainStageNs(stats);
+        self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
+        self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.group_field_batch) + offMainNs(stats.group_field_begin_batch));
+        self.solve_main_ns += stats.solve_ns -| offMainNs(stats.fallback_batch);
+        self.publish_ns += stats.publish_ns;
+        const batches = [_]BatchStats{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.fallback_batch };
+        for (batches, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
+            if (batch.item_count == 0) continue;
+            dispatched.* += 1;
+            const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
+            if (on_workers) threaded.* += 1;
+            const busier = batch.item_count > busiest.item_count or
+                (batch.item_count == busiest.item_count and on_workers and (busiest.ran_inline or busiest.active_worker_threads == 0));
+            if (busier) busiest.* = batch;
+        }
+    }
+
+    fn print(self: StageReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
+        if (!options.details or self.timed_ns == 0) return;
+        var shapes: [4][48]u8 = undefined;
+        var labels: [4][]const u8 = undefined;
+        for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
+            label.* = stageShape(buffer, batch, threaded, dispatched);
+        }
+        const samples: u128 = self.samples * std.time.ns_per_us;
+        std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us\n", .{
+            group_name,
+            item_count,
+            case.name,
+            labels[0],
+            labels[1],
+            labels[2],
+            labels[3],
+            @as(u64, @intCast(self.main_ns / self.samples / std.time.ns_per_us)),
+            @as(u64, @intCast(self.main_ns * 100 / self.timed_ns)),
+            @as(u64, @intCast(self.accept_main_ns / samples)),
+            @as(u64, @intCast(self.group_main_ns / samples)),
+            @as(u64, @intCast(self.solve_main_ns / samples)),
+            @as(u64, @intCast(self.publish_ns / samples)),
+        });
+    }
+};
+
+// A stage's busiest batch as `inline` or workers/ranges, with its item count, then
+// threaded/non-empty batch counts.
+fn stageShape(buffer: []u8, batch: BatchStats, threaded: usize, dispatched: usize) []const u8 {
+    if (batch.ran_inline or batch.active_worker_threads == 0) {
+        return std.fmt.bufPrint(buffer, "inline({})[{}/{}]", .{ batch.item_count, threaded, dispatched }) catch "inline";
+    }
+    return std.fmt.bufPrint(buffer, "{}w/{}r({})[{}/{}]", .{ batch.active_worker_threads, batch.range_count, batch.item_count, threaded, dispatched }) catch "stage";
 }
 
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
@@ -985,8 +1111,8 @@ pub fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options:
             sys.clearRuntimeState();
             const setup_stats = try runColdOnce(sys, fixture_requests, threads_ptr, bench_case, 1, 1, 1);
             std.debug.assert(setup_stats.budget_exhausted == 1);
-            std.debug.assert(sys.pending.items.len == 1);
-            std.debug.assert(sys.pending.items[0].tier == 1);
+            std.debug.assert(sys.pending.len == 1);
+            std.debug.assert(sys.pending.at(0).tier == 1);
         }
     }.run;
 
@@ -1079,9 +1205,7 @@ pub fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options
     defer fixture.deinit();
     var system = PathfindingSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
-        system.fallback_tuner = tuner;
-    }
+    setPathStageTuners(&system, case);
 
     const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
     var threads: ?ThreadSystem = null;
@@ -1123,12 +1247,15 @@ pub fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options
     }
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+        stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
+    stage_report.print(options, group_field_detour_group.name, item_count, case);
 
     // Regression guard: once ready, the pinned threshold keeps the field engaged —
     // every step samples it, none fall back to a per-agent A* re-solve.
@@ -1262,7 +1389,6 @@ pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, o
     // this case simulates a fixed number of real re-key cycles rather than repeating one
     // op, so --warmup/--iterations do not apply the way they do to the cold single-solve
     // cases.
-    _ = options;
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = group_field_detour_grid_side;
 
@@ -1270,9 +1396,7 @@ pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, o
     defer fixture.deinit(allocator);
     var system = PathfindingSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
-        system.fallback_tuner = tuner;
-    }
+    setPathStageTuners(&system, case);
 
     const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
     var threads: ?ThreadSystem = null;
@@ -1305,6 +1429,7 @@ pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, o
     var built_total: usize = 0;
     var samples_total: usize = 0;
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
 
     const total_cycles = group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles;
     for (0..total_cycles) |cycle_index| {
@@ -1325,6 +1450,7 @@ pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, o
             const end_ns = suite.nowNs(io);
             if (measured) {
                 accumulator.record(suite.elapsedNs(start_ns, end_ns), stats.solveBatch());
+                stage_report.add(suite.elapsedNs(start_ns, end_ns), stats);
                 escalated_total += stats.escalated_solves;
                 throttled_total += stats.group_field_rebuild_throttled;
                 built_total += stats.group_fields_built;
@@ -1332,6 +1458,7 @@ pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, o
             }
         }
     }
+    stage_report.print(options, group_field_detour_moving_group.name, item_count, case);
 
     // Regression guard: the tuned throttle must let the field actually reach `.ready` and
     // serve part of the run. A regression that leaves the throttle at/above the real cadence
@@ -1365,9 +1492,7 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
     defer fixture.deinit(allocator);
     var system = PathfindingSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
-        system.fallback_tuner = tuner;
-    }
+    setPathStageTuners(&system, case);
 
     const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
     var threads: ?ThreadSystem = null;
@@ -1473,7 +1598,9 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
 const level_case_encoding: usize = 1000;
 const level_size_item_counts = [_]usize{ 256_001, 1_024_001, 2_048_001 };
 const cross_level_item_counts = [_]usize{ 256_008, 256_032, 256_128 };
-const evict_item_counts = [_]usize{ 1_000, 10_000, 50_000 };
+const evict_region_encoding: usize = 10_000_000;
+const evict_item_counts = [_]usize{ 1_000, 10_000, 50_000, 64 * evict_region_encoding + 10_000 };
+const group_field_packs_item_counts = [_]usize{4};
 const elastic_ramp_item_counts = [_]usize{ 1_000, 4_000, 16_000 };
 
 fn levelSizeItemCounts(_: suite.Profile) []const usize {
@@ -1486,6 +1613,10 @@ fn crossLevelItemCounts(_: suite.Profile) []const usize {
 
 fn evictItemCounts(_: suite.Profile) []const usize {
     return &evict_item_counts;
+}
+
+fn groupFieldPacksItemCounts(_: suite.Profile) []const usize {
+    return &group_field_packs_item_counts;
 }
 
 fn elasticRampItemCounts(_: suite.Profile) []const usize {
@@ -1687,7 +1818,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    return runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr);
+    return runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr);
 }
 
 fn runCrossLevelDepthCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -1765,7 +1896,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    return runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr);
+    return runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr);
 }
 
 // One cold pathfinding step of the fixture's requests; fails unless every route solved
@@ -1779,9 +1910,9 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
 
 // Times one cold pathfinding step of the fixture's requests per iteration (runtime
 // state cleared, untimed, before each).
-fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem) !suite.RunStats {
+fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem) !suite.RunStats {
     const system = &fixture.system;
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.fallback_tuner = tuner;
+    setPathStageTuners(system, case);
     for (0..options.warmup_iterations) |_| {
         system.clearRuntimeState();
         _ = try runRouteStep(system, fixture, thread_system, case);
@@ -1799,13 +1930,17 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     var abstract_nodes: usize = 0;
+    var stage_report = StageReport{};
     for (0..options.iterations) |_| {
         system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
         last_stats = try runRouteStep(system, fixture, thread_system, case);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solveBatch());
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        accumulator.record(elapsed_ns, last_stats.solveBatch());
+        stage_report.add(elapsed_ns, last_stats);
         abstract_nodes = lastAbstractNodesUsed(system);
     }
+    stage_report.print(options, group_name, item_count, case);
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results;
     stats.candidate_pairs = abstract_nodes;
@@ -1853,8 +1988,11 @@ const EvictFixture = struct {
     empty: RangeOutputStream(PathRequest),
     system: PathfindingSystem,
     agent_count: usize,
+    // Cells whose blocking the last change flipped.
+    changed: std.ArrayList(NavCellEdit) = .empty,
 
     fn deinit(self: *EvictFixture, allocator: std.mem.Allocator) void {
+        self.changed.deinit(allocator);
         self.system.deinit();
         self.empty.deinit();
         self.stream.deinit();
@@ -1891,12 +2029,21 @@ const EvictFixture = struct {
         return cached;
     }
 
-    // Sets the dig cell to `tile` and runs the nav reaction; returns the reaction's time.
-    fn digAndReact(self: *EvictFixture, io: std.Io, tile: TileId, thread_system: ?*ThreadSystem) !u64 {
-        const changed = (try self.open.world.setDenseTile(OpenWorld.floor(0), evict_dig_cell.x, evict_dig_cell.y, tile)) orelse return error.EvictDigUnchanged;
-        if (changed.old_blocks_movement == changed.new_blocks_movement) return error.EvictDigUnchanged;
+    // Sets `cells` on level 0 to `tile` in one step (untimed) and runs the nav reaction
+    // over them, marking included; returns the reaction's time. `changed` holds
+    // `cells.len` entries.
+    fn changeAndReact(self: *EvictFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !u64 {
+        const layer = OpenWorld.floor(0);
+        self.changed.clearRetainingCapacity();
+        self.open.world.beginDenseCellWriteReserve();
+        for (cells) |cell| try self.open.world.reserveDenseCellWrite(layer, cell.x, cell.y, tile);
+        for (cells) |cell| {
+            const changed = (try self.open.world.setDenseTile(layer, cell.x, cell.y, tile)) orelse return error.EvictDigUnchanged;
+            if (changed.old_blocks_movement == changed.new_blocks_movement) return error.EvictDigUnchanged;
+            self.changed.appendAssumeCapacity(.{ .level = changed.level, .x = changed.x, .y = changed.y });
+        }
         const start_ns = suite.nowNs(io);
-        try self.system.markNavDirty(changed.level, changed.x, changed.y);
+        for (self.changed.items) |edit| try self.system.markNavDirty(edit.level, edit.x, edit.y);
         const nav_stats = try self.system.applyBufferedNavUpdates(&self.data, &self.open.world, thread_system);
         const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (nav_stats.version_bumps != 0) return error.EvictDigRebuiltNav;
@@ -1926,8 +2073,24 @@ fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usiz
     };
 }
 
+// The region config's square: chunk-aligned from chunk (2, 2), `side` chunks a side.
+fn evictRegionCells(allocator: std.mem.Allocator, region_chunks: usize, chunk_tiles: usize) ![]CellCoord {
+    const side = std.math.sqrt(region_chunks);
+    std.debug.assert(side * side == region_chunks);
+    const origin = 2 * chunk_tiles;
+    const extent = side * chunk_tiles;
+    std.debug.assert(origin + extent <= short_route_side);
+    const cells = try allocator.alloc(CellCoord, extent * extent);
+    for (cells, 0..) |*cell, index| {
+        cell.* = .{ .x = @intCast(origin + index % extent), .y = @intCast(origin + index / extent) };
+    }
+    return cells;
+}
+
 fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const region_chunks = item_count / evict_region_encoding;
+    const result_count = item_count % evict_region_encoding;
     var threads = try initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
@@ -1936,13 +2099,17 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .side = short_route_side,
         .levels = 1,
         .participant_count = participant_count,
-        .agent_budget = evictAgentBudget(item_count),
+        .agent_budget = evictAgentBudget(result_count),
         .group_fields = 1,
     };
     if (suite.navSizeSkip(evict_group.name, item_count, case, size_config)) |skip| return skip;
 
-    var fixture = try initEvictFixture(allocator, io, item_count, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initEvictFixture(allocator, io, result_count, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    const region_cells: ?[]CellCoord = if (region_chunks == 0) null else try evictRegionCells(allocator, region_chunks, fixture.open.world.chunk_size_tiles);
+    defer if (region_cells) |cells| allocator.free(cells);
+    const cells: []const CellCoord = region_cells orelse &.{evict_dig_cell};
+    try fixture.changed.ensureTotalCapacity(allocator, cells.len);
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
         fixture.system.nav_remask_tuner = tuner;
         fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
@@ -1951,27 +2118,121 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     try fixture.fillCache(case, thread_ptr);
 
     for (0..options.warmup_iterations) |_| {
-        _ = try fixture.digAndReact(io, fixture.open.blocking, thread_ptr);
-        _ = try fixture.digAndReact(io, fixture.open.walkable, thread_ptr);
+        _ = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
+        _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
     }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var evicted: usize = 0;
     for (0..options.iterations) |_| {
-        const elapsed = try fixture.digAndReact(io, fixture.open.blocking, thread_ptr);
-        evicted = item_count - fixture.cachedCount();
+        const elapsed = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
+        evicted = result_count - fixture.cachedCount();
         accumulator.record(elapsed, fixture.system.graph.last_remask_batch);
-        _ = try fixture.digAndReact(io, fixture.open.walkable, thread_ptr);
+        _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
     }
     var stats = accumulator.finish();
     stats.output_count = evicted;
     stats.cache_evictions = evicted;
-    stats.candidate_pairs = item_count;
+    stats.candidate_pairs = result_count;
     // Cached results the reaction's eviction scanned per second.
-    stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
+    stats.items_per_second = suite.itemsPerSecond(result_count, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    return stats;
+}
+
+const group_field_pack_agents: usize = 24;
+
+// Rewrites `requests` with every pack's members requesting their pack's goal for `cycle`:
+// pack `p` owns a column band of the grid, starts in a block at its top, and its goal
+// marches up from the bottom one nav cell per cycle (never revisited).
+fn writeGroupFieldPackRequests(requests: *RangeOutputStream(PathRequest), entities: []const EntityId, packs: usize, cycle: usize) !void {
+    const side = group_field_detour_grid_side;
+    const band = side / packs;
+    std.debug.assert(band >= 16 and cycle < side / 2);
+    requests.clearRetainingCapacity();
+    try requests.reserve(1, entities.len);
+    const range_base = try requests.appendRangeCounts(1);
+    requests.addCount(range_base, entities.len);
+    try requests.prefixAppendedRanges(range_base);
+    var writer = requests.rangeWriter(range_base);
+    for (entities, 0..) |entity, index| {
+        const pack = index / group_field_pack_agents;
+        const member = index % group_field_pack_agents;
+        const start: FixtureCell = .{ .x = pack * band + 2 + member % 8, .y = 4 + (member / 8) * 2 };
+        const goal: FixtureCell = .{ .x = pack * band + band / 2, .y = side - 4 - cycle };
+        writer.write(.{
+            .entity = entity,
+            .kind = .group,
+            .start = .{ .x = @as(f32, @floatFromInt(start.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(start.y)) * 32.0 + 8.0 },
+            .goal = .{ .x = @as(f32, @floatFromInt(goal.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(goal.y)) * 32.0 + 8.0 },
+        });
+    }
+    writer.finish();
+    requests.finishWrite();
+}
+
+fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side = group_field_detour_grid_side;
+    const packs = item_count;
+    const agent_count = packs * group_field_pack_agents;
+
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const entities = try allocator.alloc(EntityId, agent_count);
+    defer allocator.free(entities);
+    for (entities) |*entity| entity.* = try data.createEntity();
+
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    setPathStageTuners(&system, case);
+    try system.reserve(PathfindingCapacity{
+        .max_group_fields = packs,
+        .worker_participant_count = participant_count,
+        .max_agent_budget = agent_count,
+        .min_group_field_agents = 8,
+        .group_field_rebuild_min_steps = group_field_detour_rebuild_min_steps,
+    });
+    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
+    try system.rebuildStaticNavGrid(&data, world_extent, world_extent, 32.0);
+
+    var requests = RangeOutputStream(PathRequest).init(allocator);
+    defer requests.deinit();
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
+    var built_total: usize = 0;
+    var samples_total: usize = 0;
+    const total_cycles = group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles;
+    for (0..total_cycles) |cycle| {
+        try writeGroupFieldPackRequests(&requests, entities, packs, cycle);
+        const measured = cycle >= group_field_detour_moving_warmup_cycles;
+        for (0..group_field_detour_rekey_period_steps) |_| {
+            const start_ns = suite.nowNs(io);
+            const stats = try runColdOnce(&system, &requests, thread_ptr, case, agent_count, agent_count, agent_count);
+            const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+            if (!measured) continue;
+            accumulator.record(elapsed_ns, stats.group_field_batch);
+            stage_report.add(elapsed_ns, stats);
+            built_total += stats.group_fields_built;
+            samples_total += stats.group_field_samples;
+        }
+    }
+    stage_report.print(options, group_field_packs_group.name, item_count, case);
+    // Every pack's field engages and is sampled.
+    std.debug.assert(built_total >= packs * group_field_detour_moving_cycles);
+    std.debug.assert(samples_total > 0);
+
+    var stats = accumulator.finish();
+    stats.output_count = built_total;
+    stats.candidate_pairs = samples_total;
+    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(built_total, stats.mean_ns * stats.iterations);
     return stats;
 }
 
@@ -2012,7 +2273,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer system.deinit();
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.fallback_tuner = tuner;
+    setPathStageTuners(&system, case);
 
     for (0..options.warmup_iterations) |_| _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
     var accumulator = suite.StatsAccumulator.init(item_count);

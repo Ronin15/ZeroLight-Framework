@@ -72,11 +72,12 @@ rules.
   path (the existing stage pattern it copies, `file:line`) or why it stays
   serial (fixed count and small, by the cost model), SIMD verdict (the
   `simd.zig` pattern it copies, `file:line`, or scalar with the reason),
-  serial/threaded and scalar/SIMD parity tests, and bench group + `--items`
-  for both default cases. Threading and SIMD are standard, never optional: a
-  loop that scales with population, requests, changes, or world size and runs
-  on the main thread fails the design (`threading.md`), and the design fixes
-  it.
+  serial/threaded and scalar/SIMD parity tests, the serial/inline path's cost
+  against today's code (never more work than the code it replaces), and bench
+  group + `--items` for both default cases. Threading and SIMD are standard,
+  never optional: a loop that scales with population, requests, changes, or
+  world size and runs on the main thread fails the design (`threading.md`),
+  and the design fixes it.
 - **Main-thread and deferred boundaries**: what stays on the main thread (only
   boundaries, orchestration, ordered merge/commit proportional to what
   changed) and the deterministic merge.

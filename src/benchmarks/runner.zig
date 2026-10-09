@@ -49,6 +49,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.group_field_detour_group,
     pathfinding.group_field_detour_moving_group,
     pathfinding.group_field_detour_moving_hysteresis_group,
+    pathfinding.group_field_packs_group,
     pathfinding.query_group,
     pathfinding.level_size_group,
     pathfinding.cross_level_depth_group,

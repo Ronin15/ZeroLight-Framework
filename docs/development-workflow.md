@@ -317,6 +317,10 @@ What rows report:
   realistic `mergeDrawList` group counts, and phase timings (entity_collect,
   merge, snapshot, vertex_emit). The benchmark owns those phase timers; the
   production renderer does not run them.
+- `pathfinding-group-field-packs`: 4 (the item count) moving packs of 24 agents
+  with their own goals, so several group fields build at once. `--details` on the
+  pathfinding update groups prints each stage's busiest shape and the main-thread
+  time per phase; `pathfinding-cache-*` time the hit path only.
 - Pathfinding hard-fallback: true fallback requests, requests deferred by the
   per-step budget, pending work, results, and cache evictions.
   `pathfinding-hard-fallback` measures raw A* throughput;
@@ -378,7 +382,9 @@ Reading results:
   to level 4 on 256² worlds of 8, 32, or 128 levels joined by ramps; the
   teleport group adds one long teleport away from the routes), both item code
   `level side * 1000 + levels`, and each failing unless every route solves;
-  `pathfinding-evict` (one dig with 1,000, 10,000, or 50,000 cached results);
+  `pathfinding-evict` (one dig with 1,000, 10,000, or 50,000 cached results;
+  its region config, item `64 * 10^7 + 10,000`, fills an 8×8-chunk square in one
+  step);
   `pathfinding-elastic-ramp` (the agent count ramps to 1,000, 4,000, or
   16,000; reports solves and re-solves past one per agent);
   `nav-update-entity-obstacles` (one static body moved and committed with 10,

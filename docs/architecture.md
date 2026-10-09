@@ -743,9 +743,18 @@ cache, unavailable-path cache, per-worker budgeted A* scratch, a fixed group-fie
 registry, per-stage adaptive tuner state, and benchmark stats.
 `SimulationFrame.path_requests` carries transient requests from steering or
 future rule systems; path queues, scratch, thread state, and live path caches
-stay out of `DataSystem`. Request key preparation and static grid marking use
-`src/core/simd.zig` lane batches where the work is regular; branch-heavy A*
-frontier expansion remains scalar inside threaded request ranges. Path results
+stay out of `DataSystem`. Each update runs four stages with their own adaptive
+tuners (`group_field_expand` has one per pass) and inline paths
+(`.claude/rules/threading.md`): `path_intake` runs one direct
+classify-and-accept pass when it stays on the main thread; on workers, ranges
+classify against step-start state and the main thread merges their windows in
+range order (group tallies, expired results, in-step duplicates folded per range,
+the pending cap); `group_field_expand` runs each building field's budgeted
+expansion as one item, in an advance pass before the main-thread slot
+decisions and a begin pass after them; the solve batch keeps branch-heavy A*
+frontier expansion scalar inside threaded ranges and writes every output at the
+request's fallback ordinal; publish is a serial, fixed-count ordered commit.
+Pending is a ring, so compaction costs the solve window, not the queue. Path results
 are consumed on later fixed steps so missing or unreachable paths do not stall
 same-step movement. Cache and pending keys are goal-keyed
 (`nav_version + agent_class + goal_level + goal_cell`) so a moving agent reuses one

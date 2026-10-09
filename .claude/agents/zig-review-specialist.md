@@ -61,7 +61,8 @@ model; routes to design) or **local**.
    standard, never optional: a scalable loop left on the main thread or a hot
    float/compare loop with no SIMD verdict is a finding. When reviewing a
    design, check its hot-loop table covers every loop in the area, inherited
-   loops included.
+   loops included. A serial/inline path that does more work than the code it
+   replaces is a finding.
    Is each claimed order measured by a scaling bench at three or more sizes
    (`.claude/rules/tests-benchmarks.md`), or marked derived? A flat-cost claim
    for a local change with no such bench is a finding.

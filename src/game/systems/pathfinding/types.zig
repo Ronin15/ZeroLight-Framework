@@ -7,7 +7,7 @@
 //! key, the octile cost helpers, the binary-heap primitives, and the small array
 //! resize utilities. Leaf module within the pathfinding package (no other package
 //! module imports it back) — depends on core/app primitives plus a few lightweight
-//! game-module TYPE imports (EntityId, PathAgentClass, PathRequestKind) that
+//! game-module TYPE imports (EntityId, PathAgentClass) that
 //! PendingRequest/PathQueryKey reference, never on game module behavior.
 
 const std = @import("std");
@@ -18,9 +18,10 @@ const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const EntityId = @import("../../data_system.zig").EntityId;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
-const PathRequestKind = @import("../../simulation.zig").PathRequestKind;
 
 pub const pathfinding_range_alignment_items: usize = simd.lane_count;
+/// Cache-line size records written by concurrent ranges are padded or aligned to.
+pub const thread_shared_record_alignment: usize = 64;
 
 pub const default_cell_size: f32 = 32.0;
 pub const default_max_frame_requests: usize = 1024;
@@ -309,6 +310,9 @@ pub const NavUpdateStats = struct {
     // per-chunk edge window, forcing a loud full abstract-graph rebuild with more
     // slack (a genuine topology blow-up); else 0.
     edge_cap_fallback: usize = 0,
+    // Remask and patch dispatch time that ran on workers, summed over every level the
+    // batch touched; stages that ran inline add nothing. Diagnostic only.
+    off_main_stage_ns: u64 = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -569,6 +573,11 @@ pub const PathfindingStats = struct {
     // shapes a live perf capture can't otherwise tell apart.
     distinct_group_keys: usize = 0,
     fallback_batch: BatchStats = .{},
+    // Request classification (`path_intake`) and the group-field advance and begin
+    // passes (`group_field_expand`); inline stages report `ran_inline`.
+    intake_batch: BatchStats = .{},
+    group_field_batch: BatchStats = .{},
+    group_field_begin_batch: BatchStats = .{},
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
     accept_ns: u64 = 0,
@@ -588,13 +597,57 @@ pub const GroupRequestTally = struct {
     count: usize,
 };
 
-pub const PreparedRequest = struct {
+/// One classified request of the `path_intake` stage, written into its range's window
+/// of the item-capacity record buffer: a candidate (its range's repeats folded in) or an
+/// expired result to remove. Classified against step-start state only; the main-thread
+/// merge resolves expiry, in-step duplicates, and the pending cap in request order.
+pub const IntakeRecord = struct {
     entity: EntityId,
-    kind: PathRequestKind,
     key: PathQueryKey,
     start_level: u16,
     start: GridCell,
+    // Projected open goal cell (`no_parent` when projection found none).
+    goal_index: usize,
+    // The key's cached result was expired at step start: the merge removes it.
+    expired: bool,
+    // Not served by a group field or a cache and not pending at step start.
+    candidate: bool,
+    // The goal was blocked and projected to an open cell.
+    projected: bool,
+    // Later candidate requests for the same key in this range, folded into this record.
+    repeats: usize,
 };
+
+/// A group goal key and its request count within one intake range, in the range's
+/// first-occurrence order. A key may repeat later in the same window (the job's recent
+/// table is fixed-size); the merge sums repeats, so counts stay exact.
+pub const GroupKeyCount = struct {
+    key: PathQueryKey,
+    count: usize,
+};
+
+/// One intake range's counts, written once by its job.
+pub const IntakeTally = struct {
+    record_count: usize = 0,
+    group_key_count: usize = 0,
+    dropped_requests: usize = 0,
+    duplicate_requests: usize = 0,
+    cache_hits: usize = 0,
+    available_results: usize = 0,
+    unavailable_results: usize = 0,
+    group_field_samples: usize = 0,
+};
+
+/// Intake range alignment: a multiple of the SIMD lane count at which every range's
+/// record and group-key windows start on a cache line.
+pub const intake_range_alignment_items: usize = 2 * simd.lane_count;
+
+comptime {
+    std.debug.assert(intake_range_alignment_items % simd.lane_count == 0);
+    std.debug.assert((@sizeOf(IntakeRecord) * intake_range_alignment_items) % thread_shared_record_alignment == 0);
+    std.debug.assert((@sizeOf(GroupKeyCount) * intake_range_alignment_items) % thread_shared_record_alignment == 0);
+    std.debug.assert(@sizeOf(IntakeTally) % thread_shared_record_alignment == 0);
+}
 
 pub const PendingRequest = struct {
     entity: EntityId,
@@ -618,6 +671,72 @@ pub const PendingRequest = struct {
     // may genuinely be reachable. Reset implicitly: a solved or dropped entry leaves
     // pending entirely.
     tier: u8 = 0,
+};
+
+/// Deferred requests in FIFO order over a fixed slot buffer: logical index 0 is the
+/// oldest. Dropping a front window and appending at the tail cost what they touch,
+/// never the queue length. Main thread mutates; solve workers only read through `at`.
+pub const PendingRing = struct {
+    slots: std.ArrayList(PendingRequest) = .empty,
+    head: usize = 0,
+    len: usize = 0,
+
+    pub fn deinit(self: *PendingRing, allocator: std.mem.Allocator) void {
+        self.slots.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Resizes to `slot_count` slots and empties the ring. An OOM leaves the storage
+    /// and contents as they were.
+    pub fn reserve(self: *PendingRing, allocator: std.mem.Allocator, slot_count: usize) !void {
+        try resizeArrayList(PendingRequest, &self.slots, allocator, slot_count);
+        self.slots.items.len = slot_count;
+        self.clear();
+    }
+
+    pub fn slotCount(self: *const PendingRing) usize {
+        return self.slots.items.len;
+    }
+
+    pub fn clear(self: *PendingRing) void {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn physicalIndex(self: *const PendingRing, logical: usize) usize {
+        const slot_count = self.slots.items.len;
+        std.debug.assert(logical < slot_count);
+        const index = self.head + logical;
+        return if (index >= slot_count) index - slot_count else index;
+    }
+
+    pub fn at(self: *const PendingRing, logical: usize) PendingRequest {
+        std.debug.assert(logical < self.len);
+        return self.slots.items[self.physicalIndex(logical)];
+    }
+
+    pub fn ptr(self: *PendingRing, logical: usize) *PendingRequest {
+        std.debug.assert(logical < self.len);
+        return &self.slots.items[self.physicalIndex(logical)];
+    }
+
+    /// Appends at the tail. The caller gates on its logical pending limit, which every
+    /// reserve keeps at or below the slot count.
+    pub fn push(self: *PendingRing, request: PendingRequest) void {
+        std.debug.assert(self.len < self.slots.items.len);
+        self.slots.items[self.physicalIndex(self.len)] = request;
+        self.len += 1;
+    }
+
+    /// Removes the first `count` entries.
+    pub fn dropFront(self: *PendingRing, count: usize) void {
+        std.debug.assert(count <= self.len);
+        if (count == 0) return;
+        const slot_count = self.slots.items.len;
+        const index = self.head + count;
+        self.head = if (index >= slot_count) index - slot_count else index;
+        self.len -= count;
+    }
 };
 
 // One cell of a stitched obstacle-aware corridor path, tagged with its level. The
@@ -674,7 +793,7 @@ pub fn downsamplePathInto(dst: []u32, src: []const u32) usize {
 }
 
 pub const PathSolveResult = union(enum) {
-    // Successful solve carries the solved path through pending_index lookup.
+    // Successful solve; its solved path sits at the same fallback ordinal.
     available: PathQueryKey,
     unavailable: PathQueryKey,
     deferred: PathQueryKey,
@@ -884,8 +1003,13 @@ pub fn shouldShrinkCapacity(current_capacity: usize, target_capacity: usize) boo
 // an OOM leaves the old (larger) storage in place, never an empty list behind a logical
 // limit that still admits writes.
 pub fn resizeArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize) !void {
+    return resizeList(list, allocator, capacity);
+}
+
+/// `resizeArrayList` for any unmanaged list type (cache-line-aligned staging included).
+pub fn resizeList(list: anytype, allocator: std.mem.Allocator, capacity: usize) !void {
     if (shouldShrinkCapacity(list.capacity, capacity)) {
-        var replacement: std.ArrayList(T) = .empty;
+        var replacement: @TypeOf(list.*) = .empty;
         try replacement.ensureTotalCapacity(allocator, capacity);
         list.deinit(allocator);
         list.* = replacement;

@@ -182,10 +182,18 @@ pub const GroupField = struct {
     /// build resumes correctly across budgeted frames.
     pub fn expand(self: *GroupField, grid: *const NavGrid, budget: usize) bool {
         std.debug.assert(budget != 0); // a zero budget makes no progress and never reaches .ready
+        // The header scalars the loop advances live in locals and are written back once, so
+        // workers expanding adjacent fields never write a shared cache line per cell.
+        var distance = self.current_distance;
+        var pushed = self.pushed_count;
+        defer {
+            self.current_distance = distance;
+            self.pushed_count = pushed;
+        }
         var expansions: usize = 0;
         while (true) {
             if (expansions >= budget) return false;
-            const current_index = self.popNext() orelse {
+            const current_index = self.popNext(&distance) orelse {
                 self.state = .ready;
                 return true;
             };
@@ -211,12 +219,12 @@ pub const GroupField = struct {
                 // independent of world size. An already-costed cell's cost IMPROVEMENT is
                 // never blocked by the cap: it was already counted in pushed_count once and
                 // relaxing it again does not grow the flood's footprint.
-                if (existing == unreachable_cost and self.pushed_count >= self.max_cells) continue;
+                if (existing == unreachable_cost and pushed >= self.max_cells) continue;
                 if (candidate < existing) {
                     if (existing != unreachable_cost and self.queued_stamp.items[next_index] == self.generation) {
                         self.bucketUnlink(next_index, existing);
                     }
-                    if (existing == unreachable_cost) self.pushed_count += 1;
+                    if (existing == unreachable_cost) pushed += 1;
                     self.setCost(next_index, candidate, oppositeDirIndex(dir_index));
                     self.bucketPush(next_index, candidate);
                 } else if (candidate == existing) {
@@ -240,12 +248,12 @@ pub const GroupField = struct {
 
     // Pops the next-lowest-distance queued cell, advancing the monotone distance cursor
     // over empty buckets. Returns null when the queue is empty.
-    fn popNext(self: *GroupField) ?usize {
+    fn popNext(self: *GroupField, distance: *u32) ?usize {
         var scanned: u32 = 0;
         // The live window spans at most group_field_buckets distinct residues (max octile step =
         // diagonal_cost), so one pass over every bucket either finds work or drains the queue.
         while (scanned < group_field_buckets) : (scanned += 1) {
-            const b = self.current_distance % group_field_buckets;
+            const b = distance.* % group_field_buckets;
             const head = self.buckets.items[b];
             if (head != no_cell) {
                 const next = self.bucket_next.items[head];
@@ -256,7 +264,7 @@ pub const GroupField = struct {
             }
             // Empty bucket: advance to the next distance. A full wrap with every bucket
             // empty means the queue is drained.
-            self.current_distance += 1;
+            distance.* += 1;
         }
         return null;
     }

@@ -290,6 +290,11 @@ fn remaskChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId
     }
 }
 
+// Dispatch time of a remask or patch batch that ran on workers; zero when it ran inline.
+fn offMainNs(batch: BatchStats) u64 {
+    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
+}
+
 const NavLevelMaskJob = struct {
     graph: *NavGraph,
     world: ?*const WorldSystem,
@@ -741,6 +746,7 @@ pub const NavGraph = struct {
             for (self.levels.items, 0..) |_, level_index| {
                 if (!affected_levels.items[level_index]) continue;
                 self.remaskChangedChunks(@intCast(level_index), data, world, edits, cell_edits, levelIsFull(full_level_ids, level_index), remask_threads);
+                stats.off_main_stage_ns += offMainNs(self.last_remask_batch);
             }
             for (self.levels.items) |*level_grid| level_grid.buildComponents();
             try self.buildAbstractGraphs(world);
@@ -755,9 +761,11 @@ pub const NavGraph = struct {
                 // chunks added by buildDirtySet are NOT remasked/re-flooded — their mask is
                 // untouched — only their abstract layer is patched below.
                 self.remaskChangedChunks(level, data, world, edits, cell_edits, full_level, remask_threads);
+                stats.off_main_stage_ns += offMainNs(self.last_remask_batch);
                 self.buildDirtySet(level, world, edits, cell_edits, full_level);
                 stats.chunks_patched += self.dirty_set.items.len;
                 if (try self.patchDirtyChunks(level, world, patch_threads)) overflow = true;
+                stats.off_main_stage_ns += offMainNs(self.last_patch_batch);
             }
             if (overflow) {
                 // A chunk's edges blew past its fixed window: bump slack and rebuild the

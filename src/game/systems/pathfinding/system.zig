@@ -13,6 +13,12 @@ const math = @import("../../../core/math.zig");
 const logging = @import("../../../core/logging.zig");
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
+const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
+const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
+const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
+const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
+const JobFn = @import("../../../app/thread_system.zig").JobFn;
+const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
@@ -51,7 +57,13 @@ const PathQueryKey = types.PathQueryKey;
 const NavCellEdit = types.NavCellEdit;
 const NavUpdateStats = types.NavUpdateStats;
 const PendingRequest = types.PendingRequest;
-const PreparedRequest = types.PreparedRequest;
+const PendingRing = types.PendingRing;
+const IntakeRecord = types.IntakeRecord;
+const GroupKeyCount = types.GroupKeyCount;
+const IntakeTally = types.IntakeTally;
+const intake_range_alignment_items = types.intake_range_alignment_items;
+const thread_shared_record_alignment = types.thread_shared_record_alignment;
+const resizeList = types.resizeList;
 const PathSolveResult = types.PathSolveResult;
 const GroupRequestTally = types.GroupRequestTally;
 const StitchedCell = types.StitchedCell;
@@ -70,35 +82,46 @@ const default_max_solves_per_frame = types.default_max_solves_per_frame;
 const deriveCapacity = types.deriveCapacity;
 const default_goal_projection_radius = types.default_goal_projection_radius;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
+const GridCell = types.GridCell;
+
+const IntakeRecordList = std.ArrayListAligned(IntakeRecord, .fromByteUnits(thread_shared_record_alignment));
+const GroupKeyCountList = std.ArrayListAligned(GroupKeyCount, .fromByteUnits(thread_shared_record_alignment));
+const IntakeTallyList = std.ArrayListAligned(IntakeTally, .fromByteUnits(thread_shared_record_alignment));
 
 pub const PathfindingSystem = struct {
     allocator: std.mem.Allocator,
     capacity: PathfindingCapacity = .{},
     step_counter: u32 = 0,
     graph: NavGraph,
-    pending: std.ArrayList(PendingRequest) = .empty,
-    prepared_requests: std.ArrayList(PreparedRequest) = .empty,
+    pending: PendingRing = .{},
+    // `path_intake` staging: one record and one group-key slot per admitted request (each
+    // range writes only its own window) and one padded tally per range. Reserved at the
+    // capacity seam from max_frame_requests.
+    intake_records: IntakeRecordList = .empty,
+    intake_group_counts: GroupKeyCountList = .empty,
+    intake_tallies: IntakeTallyList = .empty,
+    // Indexed by fallback ordinal (the solve batch's item index).
     solve_results: std.ArrayList(PathSolveResult) = .empty,
     fallback_indices: std.ArrayList(usize) = .empty,
     completed: ResultCache = .{},
     unavailable: KeySet = .{},
     pending_keys: KeySet = .{},
     group_fields: std.ArrayList(GroupField) = .empty,
+    // Field slots one `group_field_expand` pass expands, one field per item.
+    group_field_slots: std.ArrayList(usize) = .empty,
     // Requested group goal keys this step (declared, never detected).
     group_requests: std.ArrayList(GroupRequestTally) = .empty,
-    // O(1) key → group_requests slot-index lookup for recordGroupRequest.
+    // O(1) key → group_requests slot-index lookup for recordGroupRequestCount.
     // Kept in sync with group_requests: insert on append, remove+updateIndex on swapRemove.
     group_key_map: GroupKeyMap = .{},
     // One per-cell A* scratch slot per configured threaded participant (workers + 1);
     // all O(cells) arrays are sized during the nav build, not lazily on first solve.
     scratch_slots: std.ArrayList(SearchScratch) = .empty,
-    // Per-worker reconstructed paths, written into completed by the main thread
+    // Reconstructed paths by fallback ordinal, written into completed by the main thread
     // after the worker batch finishes.
     solved_paths: std.ArrayList(SolvedPath) = .empty,
-    // Per-worker path pool. Each worker owns a disjoint stripe so reconstruction
-    // never shares writable storage during the batch. Stripe index = fallback_index
-    // (dense fan-out position, not pending_index), so two requests never collide
-    // even when one worker solves several in the same range.
+    // Per-request path pool: the stripe at a request's fallback ordinal, so two
+    // requests never collide even when one worker solves several in the same range.
     worker_path_pool: std.ArrayList(u32) = .empty,
     // Per-solved-request disjoint stitched-path stripe, mirroring worker_path_pool,
     // so a worker's stitched corridor never overwrites another request's during the
@@ -126,9 +149,14 @@ pub const PathfindingSystem = struct {
     // localized to a cell — e.g. a destroyed/toggled static obstacle whose nav cell is no
     // longer resolvable from the entity — so the whole level is re-derived from the world.
     nav_dirty_levels: std.ArrayList(u16) = .empty,
-    // Heap A* is the only worker-driven solver tier, so a single tuner owns its
-    // adaptive batch profile.
+    // Every admitted solve runs in the worker-driven fallback batch; this tuner owns its
+    // adaptive profile. The request-side stages own theirs.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    intake_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The group-field advance and begin passes see different item counts, so each pass
+    // owns a tuner.
+    group_field_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    group_field_begin_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // The incremental nav update has two independently-timed threaded stages — remask + component
     // re-flood, and the abstract chunk patch — so each owns its own tuner (per docs: one tuner
     // per stage, never shared across work shapes).
@@ -205,13 +233,16 @@ pub const PathfindingSystem = struct {
         self.scratch_slots.deinit(self.allocator);
         self.group_requests.deinit(self.allocator);
         self.group_key_map.deinit(self.allocator);
+        self.group_field_slots.deinit(self.allocator);
         self.group_fields.deinit(self.allocator);
         self.pending_keys.deinit(self.allocator);
         self.unavailable.deinit(self.allocator);
         self.completed.deinit(self.allocator);
         self.fallback_indices.deinit(self.allocator);
         self.solve_results.deinit(self.allocator);
-        self.prepared_requests.deinit(self.allocator);
+        self.intake_tallies.deinit(self.allocator);
+        self.intake_group_counts.deinit(self.allocator);
+        self.intake_records.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.graph.deinit();
         self.* = undefined;
@@ -262,8 +293,10 @@ pub const PathfindingSystem = struct {
             self.capacity = fallback;
             self.effective_agent_capacity = fallback.max_pending_requests;
         }
-        try resizeArrayList(PendingRequest, &self.pending, self.allocator, capacity.max_pending_requests);
-        try resizeArrayList(PreparedRequest, &self.prepared_requests, self.allocator, capacity.max_frame_requests);
+        try self.pending.reserve(self.allocator, capacity.max_pending_requests);
+        try resizeList(&self.intake_records, self.allocator, capacity.max_frame_requests);
+        try resizeList(&self.intake_group_counts, self.allocator, capacity.max_frame_requests);
+        try resizeList(&self.intake_tallies, self.allocator, maxRangeCount(capacity.max_frame_requests, intake_range_alignment_items));
         try resizeArrayList(PathSolveResult, &self.solve_results, self.allocator, capacity.max_solved_requests_per_step);
         try resizeArrayList(usize, &self.fallback_indices, self.allocator, capacity.max_solved_requests_per_step);
         try resizeArrayList(SolvedPath, &self.solved_paths, self.allocator, capacity.max_solved_requests_per_step);
@@ -280,6 +313,7 @@ pub const PathfindingSystem = struct {
         while (self.group_fields.items.len < capacity.max_group_fields) {
             self.group_fields.appendAssumeCapacity(.{});
         }
+        try self.group_field_slots.ensureTotalCapacity(self.allocator, self.group_fields.items.len);
         try resizeArrayList(GroupRequestTally, &self.group_requests, self.allocator, capacity.max_solved_requests_per_step);
         try self.group_key_map.reserve(self.allocator, capacity.max_solved_requests_per_step);
         // Pre-reserve the changed-span scratch so steady-path scoped eviction is alloc-free.
@@ -359,7 +393,7 @@ pub const PathfindingSystem = struct {
     // because capacity is already adequate by the time it runs.
     //
     // Index/pointer-stability invariant verified for every resized pool: at this
-    // point the per-step scratch pools (prepared_requests, solve_results,
+    // point the per-step scratch pools (intake staging, solve_results,
     // fallback_indices, solved_paths, worker_path_pool, worker_stitched_pool) are
     // empty/cleared from last step's prepare*, so no live offset spans the resize.
     // pending/pending_keys/group_requests/completed/unavailable hold cross-step state;
@@ -391,8 +425,8 @@ pub const PathfindingSystem = struct {
     // nav rebuild already does.
     fn resizePreservingLiveState(self: *PathfindingSystem, agent_count: usize) !void {
         self.resize_pending_snapshot.clearRetainingCapacity();
-        try self.resize_pending_snapshot.ensureTotalCapacity(self.allocator, self.pending.items.len);
-        self.resize_pending_snapshot.appendSliceAssumeCapacity(self.pending.items);
+        try self.resize_pending_snapshot.ensureTotalCapacity(self.allocator, self.pending.len);
+        for (0..self.pending.len) |index| self.resize_pending_snapshot.appendAssumeCapacity(self.pending.at(index));
         self.resize_group_snapshot.clearRetainingCapacity();
         try self.resize_group_snapshot.ensureTotalCapacity(self.allocator, self.group_requests.items.len);
         self.resize_group_snapshot.appendSliceAssumeCapacity(self.group_requests.items);
@@ -415,11 +449,13 @@ pub const PathfindingSystem = struct {
         // `pending`/`group_requests` than that would silently drop their dedup registration
         // (a live entry that reads back `.missing` instead of `.pending`, inviting a
         // duplicate accept) while resize_dropped undercounts the real loss.
-        self.pending.clearRetainingCapacity();
+        self.pending.clear();
         const keep_pending = @min(self.resize_pending_snapshot.items.len, self.capacity.max_pending_requests);
-        self.pending.appendSliceAssumeCapacity(self.resize_pending_snapshot.items[0..keep_pending]);
         self.pending_keys.clear();
-        for (self.pending.items) |pending_request| _ = self.pending_keys.insert(pending_request.key);
+        for (self.resize_pending_snapshot.items[0..keep_pending]) |pending_request| {
+            self.pending.push(pending_request);
+            _ = self.pending_keys.insert(pending_request.key);
+        }
         self.group_requests.clearRetainingCapacity();
         const keep_group = @min(self.resize_group_snapshot.items.len, self.capacity.max_solved_requests_per_step);
         self.group_requests.appendSliceAssumeCapacity(self.resize_group_snapshot.items[0..keep_group]);
@@ -491,6 +527,9 @@ pub const PathfindingSystem = struct {
         // adaptive tuners' learned profiles no longer apply — reset them to relearn against
         // the new topology rather than acting on a stale cost model.
         self.fallback_tuner = AdaptiveWorkTuner.init(.{});
+        self.intake_tuner = AdaptiveWorkTuner.init(.{});
+        self.group_field_tuner = AdaptiveWorkTuner.init(.{});
+        self.group_field_begin_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
     }
@@ -841,8 +880,7 @@ pub const PathfindingSystem = struct {
 
     // Clears short-lived request/result state but keeps the result cache for scoped eviction.
     fn clearRequestStateKeepingCompleted(self: *PathfindingSystem) void {
-        self.pending.clearRetainingCapacity();
-        self.prepared_requests.clearRetainingCapacity();
+        self.pending.clear();
         self.solve_results.clearRetainingCapacity();
         self.fallback_indices.clearRetainingCapacity();
         self.solved_paths.clearRetainingCapacity();
@@ -925,18 +963,18 @@ pub const PathfindingSystem = struct {
     // and before any accept/solve, so no live worker index or pool offset spans it.
     // A returned solve_count of 0 means no solve runs this step (caller publishes the
     // pending counts and returns).
-    fn beginUpdate(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, stats: *PathfindingStats) !usize {
+    fn beginUpdate(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: ?StageThreads, stats: *PathfindingStats) !usize {
         self.step_counter +%= 1;
         try self.adjustCapacityForAgentCount(agent_count);
         var accept_timer = PhaseTimer.begin();
-        stats.* = self.acceptRequests(requests.mergedItems());
+        stats.* = self.acceptRequests(requests.mergedItems(), threads);
         // Fold in any requests an elastic shrink dropped (it ran before acceptRequests
         // reset the step stats), then clear the accumulator.
         stats.dropped_requests += self.resize_dropped;
         self.resize_dropped = 0;
         stats.accept_ns = accept_timer.lap();
         var group_timer = PhaseTimer.begin();
-        self.serviceGroupFields(stats);
+        self.serviceGroupFields(stats, threads);
         stats.group_service_ns = group_timer.lap();
         // Diagnostic only: how many DISTINCT group keys were tallied this step, after
         // decay/compaction. Distinguishes "one goal whose build never catches up" (this
@@ -949,11 +987,11 @@ pub const PathfindingSystem = struct {
     // Shared solve prologue for update/updateSerial: runs beginUpdate and handles the
     // no-solve early-out. Returns the solve count, or null when no solve runs this step (the
     // caller publishes the pending counts via `stats` and returns it unchanged).
-    fn beginSolve(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, stats: *PathfindingStats) !?usize {
-        const solve_count = try self.beginUpdate(requests, agent_count, config, stats);
+    fn beginSolve(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: ?StageThreads, stats: *PathfindingStats) !?usize {
+        const solve_count = try self.beginUpdate(requests, agent_count, config, threads, stats);
         if (solve_count == 0) {
-            stats.pending_requests = self.pending.items.len;
-            stats.deferred_requests = self.pending.items.len;
+            stats.pending_requests = self.pending.len;
+            stats.deferred_requests = self.pending.len;
             return null;
         }
         return solve_count;
@@ -962,11 +1000,11 @@ pub const PathfindingSystem = struct {
     // Shared publish + compaction epilogue; finalizes the pending/deferred counts.
     pub fn finishUpdate(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         var publish_timer = PhaseTimer.begin();
-        self.publishSolvedResults(solve_count, stats);
+        self.publishSolvedResults(stats);
         self.compactPendingAfterSolve(solve_count, stats);
         stats.publish_ns = publish_timer.lap();
-        stats.pending_requests = self.pending.items.len;
-        stats.deferred_requests = self.pending.items.len;
+        stats.pending_requests = self.pending.len;
+        stats.deferred_requests = self.pending.len;
         // Aggregate this step's worst per-worker stitch segment usage (see
         // SearchScratch.max_stitch_segments_used), then clear each worker's counter so
         // next step's aggregation reflects only next step's solves.
@@ -980,7 +1018,8 @@ pub const PathfindingSystem = struct {
 
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, thread_system: *ThreadSystem, config: PathfindingConfig) !PathfindingStats {
         var stats: PathfindingStats = undefined;
-        const solve_count = (try self.beginSolve(requests, agent_count, config, &stats)) orelse return stats;
+        const threads = StageThreads{ .thread_system = thread_system, .config = config };
+        const solve_count = (try self.beginSolve(requests, agent_count, config, threads, &stats)) orelse return stats;
         var solve_timer = PhaseTimer.begin();
         var system_config = config;
         self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(system_config), &stats);
@@ -1034,7 +1073,7 @@ pub const PathfindingSystem = struct {
 
     pub fn updateSerial(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig) !PathfindingStats {
         var stats: PathfindingStats = undefined;
-        const solve_count = (try self.beginSolve(requests, agent_count, config, &stats)) orelse return stats;
+        const solve_count = (try self.beginSolve(requests, agent_count, config, null, &stats)) orelse return stats;
         var solve_timer = PhaseTimer.begin();
         self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(config), &stats);
         if (self.fallback_indices.items.len != 0) {
@@ -1049,19 +1088,12 @@ pub const PathfindingSystem = struct {
             if (self.scratch_slots.items.len != 0) {
                 self.resetSolvedPaths();
                 const scratch = &self.scratch_slots.items[0];
-                for (self.fallback_indices.items, 0..) |pending_index, path_slot| {
-                    self.solve_results.items[pending_index] = solveOne(self, pending_index, scratch, path_slot);
+                for (self.fallback_indices.items, 0..) |pending_index, ordinal| {
+                    self.solve_results.items[ordinal] = solveOne(self, pending_index, scratch, ordinal);
                 }
             }
         }
-        stats.fallback_batch = .{
-            .item_count = self.fallback_indices.items.len,
-            .range_count = if (self.fallback_indices.items.len == 0) 0 else 1,
-            .items_per_range = self.fallback_indices.items.len,
-            .range_alignment_items = pathfinding_range_alignment_items,
-            .main_thread_ranges = if (self.fallback_indices.items.len == 0) 0 else 1,
-            .ran_inline = true,
-        };
+        stats.fallback_batch = inlineBatch(self.fallback_indices.items.len, pathfinding_range_alignment_items);
         stats.solve_ns = solve_timer.lap();
         self.finishUpdate(solve_count, &stats);
         return stats;
@@ -1074,10 +1106,47 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    // Acceptance is the only stage that mutates the pending-key set. Cached hits
-    // never enter pending work. Group-declared requests are recorded so a field
-    // can be (re)built lazily; they still get a per-agent fallback while building.
-    fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest) PathfindingStats {
+    // Threading for the request-side stages of one update: the thread system and the
+    // caller's control config. Absent in `updateSerial`, where every stage runs inline.
+    const StageThreads = struct {
+        thread_system: *ThreadSystem,
+        config: PathfindingConfig,
+
+        // Pre-selects the batch shape so a job can assert its range against the
+        // dispatched range count. The stage's own tuner drives an adaptive config with
+        // no fixed range size.
+        fn select(self: StageThreads, owned_tuner: *AdaptiveWorkTuner, item_count: usize, range_alignment_items: usize) BatchSelection {
+            const tuner: ?*AdaptiveWorkTuner = if (self.config.adaptive and self.config.items_per_range == null) owned_tuner else null;
+            return self.thread_system.selectBatchProfile(tuner, .{
+                .item_count = item_count,
+                .items_per_range = self.config.items_per_range,
+                .max_worker_threads = self.config.max_worker_threads,
+                .range_alignment_items = range_alignment_items,
+                .adaptive = self.config.adaptive,
+            });
+        }
+
+        fn dispatch(self: StageThreads, item_count: usize, context: *anyopaque, job: JobFn, selection: BatchSelection, range_alignment_items: usize) BatchStats {
+            return self.thread_system.parallelForWithOptions(item_count, context, job, .{
+                .items_per_range = self.config.items_per_range,
+                .max_worker_threads = self.config.max_worker_threads,
+                .range_alignment_items = range_alignment_items,
+                .adaptive = self.config.adaptive,
+                .adaptive_tuner = selection.active_tuner,
+                .selected_profile = selection.profile,
+            });
+        }
+    };
+
+    // `path_intake`. On the main thread (no thread system, or the tuner keeps the pass
+    // inline) one direct pass classifies and accepts each request. Dispatched to workers,
+    // ranges classify against step-start state into their windows (a record per new or
+    // expired key, repeats folded; a group-key entry per key), then the main thread merges
+    // the windows in range order: group tallies, expired-result removal, in-step
+    // duplicates, the pending cap, and pending pushes, O(records + group keys). Both equal
+    // the serial request-order loop for any partition. Acceptance is the only stage that
+    // mutates the pending-key set; cached hits never enter pending work.
+    fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, threads: ?StageThreads) PathfindingStats {
         var stats = PathfindingStats{};
         // Cross-step decaying accumulation: halve every carried tally before this
         // step's requests fold in, so a SUSTAINED shared goal accumulates toward the
@@ -1086,94 +1155,268 @@ pub const PathfindingSystem = struct {
         // that stops requesting decays away. Zero-count tallies are compacted after
         // threshold-service in serviceGroupFields.
         for (self.group_requests.items) |*tally| tally.count /= 2;
+        stats.pending_requests = self.pending.len;
         if (requests.len == 0 or !self.graph.valid()) return stats;
-        self.prepareRequestKeys(requests, &stats);
-        for (self.prepared_requests.items) |prepared| {
-            if (prepared.kind == .group) {
-                self.recordGroupRequest(prepared.key);
-                // A ready group field is the authoritative answer ONLY for members
-                // already on the goal level AND actually covered by it: the field is
-                // built on the goal level and an off-level member cannot sample it. A
-                // ready field for an off-level member must NOT short-circuit, or that
-                // member would stall forever; it falls through to individual
-                // cross-level acceptance and gets its own corridor across the link.
-                // Same-level members must ALSO verify the field can sample their own
-                // cell (not just that the field is ready): a different chunk-local
-                // component reads as a sample miss, not "serviced" — short-circuiting
-                // it anyway would drop the request with no individual solve ever
-                // queued, matching statusForKeyAndStart's mirrored fall-through.
-                if (prepared.start_level == prepared.key.goal_level) {
-                    if (self.findGroupField(prepared.key)) |field| {
-                        if (field.state == .ready) {
-                            const sampled = if (self.graph.grid(prepared.key.goal_level)) |goal_grid|
-                                if (goal_grid.indexForCell(prepared.start)) |start_index|
-                                    field.sample(goal_grid, start_index) != null
-                                else
-                                    false
-                            else
-                                false;
-                            if (sampled) {
-                                stats.group_field_samples += 1;
-                                stats.duplicate_requests += 1;
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-            if (self.completed.findFresh(prepared.key, self.step_counter, types.default_cache_ttl_steps) != null) {
-                stats.duplicate_requests += 1;
-                stats.cache_hits += 1;
-                stats.available_results += 1;
+        // Intake gates on the LOGICAL per-step cap, never the staging's physical capacity:
+        // ensureTotalCapacity rounds up and shrink hysteresis keeps slack, so a physical
+        // gate would make the accepted set depend on allocation history.
+        const item_count = @min(requests.len, self.capacity.max_frame_requests);
+        stats.dropped_requests += requests.len - item_count;
+        if (item_count == 0) return stats;
+        const admitted = requests[0..item_count];
+        const stage = threads orelse {
+            self.acceptDirect(admitted, &stats);
+            stats.intake_batch = inlineBatch(item_count, intake_range_alignment_items);
+            stats.pending_requests = self.pending.len;
+            return stats;
+        };
+        const selection = stage.select(&self.intake_tuner, item_count, intake_range_alignment_items);
+        if (selection.worker_threads == 0) {
+            // Inline on the main thread in range order: one direct pass, no records. Still
+            // dispatched so the tuner records the batch.
+            var direct = DirectIntakeJob{ .system = self, .requests = admitted, .stats = &stats };
+            stats.intake_batch = stage.dispatch(item_count, &direct, directIntakeJob, selection, intake_range_alignment_items);
+            stats.pending_requests = self.pending.len;
+            return stats;
+        }
+        std.debug.assert(self.intake_records.capacity >= item_count);
+        std.debug.assert(self.intake_group_counts.capacity >= item_count);
+        std.debug.assert(self.intake_tallies.capacity >= selection.range_count);
+        self.intake_records.items.len = item_count;
+        self.intake_group_counts.items.len = item_count;
+        self.intake_tallies.items.len = selection.range_count;
+        @memset(self.intake_tallies.items, .{});
+        var job = IntakeJob{
+            .system = self,
+            .requests = admitted,
+            .items_per_range = selection.items_per_range,
+            .records = self.intake_records.items,
+            .group_counts = self.intake_group_counts.items,
+            .tallies = self.intake_tallies.items,
+        };
+        stats.intake_batch = stage.dispatch(item_count, &job, intakeJob, selection, intake_range_alignment_items);
+        self.mergeIntake(selection.items_per_range, &stats);
+        stats.pending_requests = self.pending.len;
+        return stats;
+    }
+
+    // Single-pass intake for a pass on the main thread: classifies and accepts each
+    // request in order, with the same results as the threaded classify-and-merge.
+    fn acceptDirect(self: *PathfindingSystem, requests: []const PathRequest, stats: *PathfindingStats) void {
+        // A valid graph has level 0, and every level shares its extent.
+        const extent_grid = self.graph.grid(0).?;
+        const level_count = self.graph.levelCount();
+        for (requests) |request| {
+            if (request.goal_level >= level_count or request.start_level >= level_count) {
+                stats.dropped_requests += 1;
                 continue;
             }
-            if (self.unavailable.contains(prepared.key)) {
+            const cells = requestCells(extent_grid, request);
+            const key = PathQueryKey{
+                .nav_version = self.graph.version,
+                .agent_class = request.agent_class,
+                .goal_level = request.goal_level,
+                .goal = cells.goal,
+            };
+            const goal_grid = self.graph.grid(request.goal_level).?;
+            if (request.kind == .group) {
+                self.recordGroupRequestCount(key, 1);
+                if (request.start_level == request.goal_level and self.groupFieldServes(key, goal_grid, cells.start)) {
+                    stats.group_field_samples += 1;
+                    stats.duplicate_requests += 1;
+                    continue;
+                }
+            }
+            if (self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps)) |found| {
+                if (found.fresh) {
+                    stats.duplicate_requests += 1;
+                    stats.cache_hits += 1;
+                    stats.available_results += 1;
+                    continue;
+                }
+                // Removes the expired result.
+                _ = self.completed.findFresh(key, self.step_counter, types.default_cache_ttl_steps);
+            }
+            if (self.unavailable.contains(key)) {
                 stats.duplicate_requests += 1;
                 stats.cache_hits += 1;
                 stats.unavailable_results += 1;
                 continue;
             }
-            if (self.pending_keys.contains(prepared.key)) {
+            if (self.pending_keys.contains(key)) {
                 stats.duplicate_requests += 1;
                 continue;
             }
-            if (self.pending.items.len >= self.capacity.max_pending_requests) {
+            if (self.pending.len >= self.capacity.max_pending_requests) {
                 stats.dropped_requests += 1;
                 continue;
             }
-            // Nearest-open goal projection happens once at acceptance, on the GOAL
-            // level, so the counter is deterministic and the worker solve reuses it.
-            const goal_grid = self.graph.grid(prepared.key.goal_level);
-            var goal_index: usize = no_parent;
-            if (goal_grid) |grid| {
-                if (grid.indexForCell(prepared.key.goal)) |index| {
-                    if (grid.isBlockedIndex(index)) {
-                        if (grid.projectToNearestOpen(prepared.key.goal, default_goal_projection_radius)) |projected| {
-                            goal_index = projected;
-                            stats.goal_projected += 1;
-                        }
-                    } else {
-                        goal_index = index;
-                    }
-                }
-            }
-            self.pending.appendAssumeCapacity(.{
-                .entity = prepared.entity,
-                .key = prepared.key,
-                .start_level = prepared.start_level,
-                .start = prepared.start,
-                .goal_index = goal_index,
+            const goal = projectGoal(goal_grid, key.goal);
+            self.pending.push(.{
+                .entity = request.entity,
+                .key = key,
+                .start_level = request.start_level,
+                .start = cells.start,
+                .goal_index = goal.index,
             });
-            _ = self.pending_keys.insert(prepared.key);
+            _ = self.pending_keys.insert(key);
             stats.accepted_requests += 1;
+            if (goal.projected) stats.goal_projected += 1;
         }
-        stats.pending_requests = self.pending.items.len;
-        return stats;
     }
 
-    fn recordGroupRequest(self: *PathfindingSystem, key: PathQueryKey) void {
+    // A ready group field answers only members on the goal level whose own cell it
+    // covers; an off-level member or a sample miss falls through to an individual
+    // request, mirroring statusForKeyAndStart.
+    fn groupFieldServes(self: *const PathfindingSystem, key: PathQueryKey, goal_grid: *const NavGrid, start: GridCell) bool {
+        const field = self.findGroupField(key) orelse return false;
+        if (field.state != .ready) return false;
+        const start_index = goal_grid.indexForCell(start) orelse return false;
+        return field.sample(goal_grid, start_index) != null;
+    }
+
+    // Classifies `requests[start..end]` into the `[start, end)` windows of `records` and
+    // `group_counts`. Reads only state the intake merge never changes, except expiry and
+    // pending keys, which the records carry for the merge to resolve in request order.
+    fn classifyIntakeRange(self: *const PathfindingSystem, requests: []const PathRequest, start: usize, end: usize, records: []IntakeRecord, group_counts: []GroupKeyCount) IntakeTally {
+        var tally = IntakeTally{};
+        // A valid graph has level 0, and every level shares its extent.
+        const extent_grid = self.graph.grid(0).?;
+        const level_count = self.graph.levelCount();
+        const record_window = records[start..end];
+        const group_window = group_counts[start..end];
+        var recent_groups: RecentKeys = .{};
+        var recent_records: RecentKeys = .{};
+        for (requests[start..end]) |request| {
+            // Reject (drop, never clamp) an out-of-range level: the query path
+            // rejects the same condition as unavailable, so a clamped solve could
+            // never be read back by its requester.
+            if (request.goal_level >= level_count or request.start_level >= level_count) {
+                tally.dropped_requests += 1;
+                continue;
+            }
+            const cells = requestCells(extent_grid, request);
+            const key = PathQueryKey{
+                .nav_version = self.graph.version,
+                .agent_class = request.agent_class,
+                .goal_level = request.goal_level,
+                .goal = cells.goal,
+            };
+            const goal_grid = self.graph.grid(request.goal_level).?;
+            if (request.kind == .group) {
+                if (recent_groups.find(key)) |entry| {
+                    group_window[entry].count += 1;
+                } else {
+                    group_window[tally.group_key_count] = .{ .key = key, .count = 1 };
+                    recent_groups.remember(key, tally.group_key_count);
+                    tally.group_key_count += 1;
+                }
+                if (request.start_level == request.goal_level and self.groupFieldServes(key, goal_grid, cells.start)) {
+                    tally.group_field_samples += 1;
+                    tally.duplicate_requests += 1;
+                    continue;
+                }
+            }
+            const cached = self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps);
+            if (cached) |found| {
+                if (found.fresh) {
+                    tally.duplicate_requests += 1;
+                    tally.cache_hits += 1;
+                    tally.available_results += 1;
+                    continue;
+                }
+            }
+            var record = IntakeRecord{
+                .entity = request.entity,
+                .key = key,
+                .start_level = request.start_level,
+                .start = cells.start,
+                .goal_index = no_parent,
+                .expired = cached != null,
+                .candidate = false,
+                .projected = false,
+                .repeats = 0,
+            };
+            if (self.unavailable.contains(key)) {
+                tally.duplicate_requests += 1;
+                tally.cache_hits += 1;
+                tally.unavailable_results += 1;
+            } else if (self.pending_keys.contains(key)) {
+                tally.duplicate_requests += 1;
+            } else {
+                const goal = projectGoal(goal_grid, key.goal);
+                record.candidate = true;
+                record.goal_index = goal.index;
+                record.projected = goal.projected;
+            }
+            if (!record.candidate and !record.expired) continue;
+            // A repeat of a key in this range classifies as its first record did, so it
+            // folds into that record; only a candidate's repeats count in the merge.
+            if (recent_records.find(key)) |entry| {
+                if (record.candidate) record_window[entry].repeats += 1;
+                continue;
+            }
+            recent_records.remember(key, tally.record_count);
+            record_window[tally.record_count] = record;
+            tally.record_count += 1;
+        }
+        return tally;
+    }
+
+    // Main-thread intake merge in range order (see acceptRequests).
+    fn mergeIntake(self: *PathfindingSystem, items_per_range: usize, stats: *PathfindingStats) void {
+        for (self.intake_tallies.items, 0..) |tally, range_index| {
+            const window_start = range_index * items_per_range;
+            for (self.intake_group_counts.items[window_start..][0..tally.group_key_count]) |entry| {
+                self.recordGroupRequestCount(entry.key, entry.count);
+            }
+            for (self.intake_records.items[window_start..][0..tally.record_count]) |record| {
+                self.mergeIntakeRecord(record, stats);
+            }
+            stats.dropped_requests += tally.dropped_requests;
+            stats.duplicate_requests += tally.duplicate_requests;
+            stats.cache_hits += tally.cache_hits;
+            stats.available_results += tally.available_results;
+            stats.unavailable_results += tally.unavailable_results;
+            stats.group_field_samples += tally.group_field_samples;
+        }
+    }
+
+    fn mergeIntakeRecord(self: *PathfindingSystem, record: IntakeRecord, stats: *PathfindingStats) void {
+        if (record.expired) {
+            // Removes the result that expired before this step; a repeat finds none.
+            const fresh = self.completed.findFresh(record.key, self.step_counter, types.default_cache_ttl_steps);
+            std.debug.assert(fresh == null);
+        }
+        if (!record.candidate) return;
+        // Repeats follow their first occurrence: pending cannot shrink during intake, so a
+        // repeat after an accept or a duplicate is a duplicate and after a drop is a drop.
+        if (self.pending_keys.contains(record.key)) {
+            stats.duplicate_requests += 1 + record.repeats;
+            return;
+        }
+        if (self.pending.len >= self.capacity.max_pending_requests) {
+            stats.dropped_requests += 1 + record.repeats;
+            return;
+        }
+        stats.duplicate_requests += record.repeats;
+        self.pending.push(.{
+            .entity = record.entity,
+            .key = record.key,
+            .start_level = record.start_level,
+            .start = record.start,
+            .goal_index = record.goal_index,
+        });
+        _ = self.pending_keys.insert(record.key);
+        stats.accepted_requests += 1;
+        if (record.projected) stats.goal_projected += 1;
+    }
+
+    // Adds `count` requests for `key` to the step's group tallies, in first-occurrence
+    // order across the merge.
+    fn recordGroupRequestCount(self: *PathfindingSystem, key: PathQueryKey, count: usize) void {
         if (self.group_key_map.find(key)) |group_index| {
-            self.group_requests.items[group_index].count += 1;
+            self.group_requests.items[group_index].count += count;
             return;
         }
         // Gate on the LOGICAL cap, not group_requests' physical .capacity:
@@ -1184,7 +1427,7 @@ pub const PathfindingSystem = struct {
         // two, splitting one goal's tally across duplicate slots.
         if (self.group_requests.items.len < self.capacity.max_solved_requests_per_step) {
             const new_index = self.group_requests.items.len;
-            self.group_requests.appendAssumeCapacity(.{ .key = key, .count = 1 });
+            self.group_requests.appendAssumeCapacity(.{ .key = key, .count = count });
             if (!self.group_key_map.insert(key, new_index)) {
                 // Registration refused (map full): roll back the tally append so
                 // group_requests and group_key_map stay in lockstep and can never
@@ -1198,19 +1441,21 @@ pub const PathfindingSystem = struct {
     // Lazy on first request, throttled on goal-cell change, budgeted per frame.
     // The threshold is checked against the cross-step accumulator (acceptRequests),
     // so it reflects SUSTAINED shared-goal demand (~2x per-step intake at
-    // equilibrium), not a single-step burst.
-    fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats) void {
+    // equilibrium), not a single-step burst. `group_field_expand` runs the budgeted
+    // expansions one field per item: the advance pass over fields building at step
+    // start, then the main-thread decisions in tally order (they see the post-advance
+    // states), then the begin pass over fields begun this step.
+    fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, threads: ?StageThreads) void {
         if (!self.graph.valid()) return;
         const threshold = self.groupFieldThreshold();
-        // Advance any field still building, on its own goal level.
-        for (self.group_fields.items) |*field| {
+        self.group_field_slots.clearRetainingCapacity();
+        for (self.group_fields.items, 0..) |*field, slot| {
             field.fresh_this_step = false;
-            if (field.state == .building) {
-                if (self.graph.grid(field.key.goal_level)) |grid| {
-                    _ = field.expand(grid, self.capacity.group_field_build_budget);
-                }
+            if (field.state == .building and self.graph.grid(field.key.goal_level) != null) {
+                self.group_field_slots.appendAssumeCapacity(slot);
             }
         }
+        stats.group_field_batch = self.expandGroupFieldSlots(threads, &self.group_field_tuner);
         for (self.group_requests.items) |tally| {
             // Only build/maintain a shared flow field once sustained demand for the
             // same goal amortizes its O(cells) build. Smaller groups already took an
@@ -1220,6 +1465,11 @@ pub const PathfindingSystem = struct {
             if (tally.count < threshold) continue;
             self.ensureGroupField(tally.key, stats);
         }
+        self.group_field_slots.clearRetainingCapacity();
+        for (self.group_fields.items, 0..) |field, slot| {
+            if (field.fresh_this_step and field.state == .building) self.group_field_slots.appendAssumeCapacity(slot);
+        }
+        stats.group_field_begin_batch = self.expandGroupFieldSlots(threads, &self.group_field_begin_tuner);
         // Compact out tallies that decayed to zero this step (they received no new
         // request to keep them alive), so a transient crowd releases its slot.
         var i: usize = 0;
@@ -1236,6 +1486,25 @@ pub const PathfindingSystem = struct {
                 i += 1;
             }
         }
+    }
+
+    // One budgeted expansion of every field in `group_field_slots`; each item writes
+    // only its own field.
+    fn expandGroupFieldSlots(self: *PathfindingSystem, threads: ?StageThreads, tuner: *AdaptiveWorkTuner) BatchStats {
+        const slots = self.group_field_slots.items;
+        if (slots.len == 0) return .{};
+        if (threads) |stage| {
+            const selection = stage.select(tuner, slots.len, 1);
+            var job = GroupFieldJob{ .system = self, .slots = slots, .range_count = selection.range_count };
+            return stage.dispatch(slots.len, &job, groupFieldExpandJob, selection, 1);
+        }
+        for (slots) |slot| self.expandGroupField(slot);
+        return inlineBatch(slots.len, 1);
+    }
+
+    fn expandGroupField(self: *PathfindingSystem, slot: usize) void {
+        const field = &self.group_fields.items[slot];
+        _ = field.expand(self.graph.grid(field.key.goal_level).?, self.capacity.group_field_build_budget);
     }
 
     fn ensureGroupField(self: *PathfindingSystem, key: PathQueryKey, stats: *PathfindingStats) void {
@@ -1286,13 +1555,12 @@ pub const PathfindingSystem = struct {
         stats.cache_evictions += 1;
     }
 
+    // Begins a build (O(1) on the main thread); the begin pass of `group_field_expand`
+    // runs its first budgeted expansion.
     fn buildGroupSlot(self: *PathfindingSystem, field: *GroupField, key: PathQueryKey, goal_index: usize, stats: *PathfindingStats) void {
         const grid = self.graph.grid(key.goal_level) orelse return;
-        if (field.beginBuild(grid, key, goal_index, self.step_counter, self.capacity.group_field_max_cells)) {
-            _ = field.expand(grid, self.capacity.group_field_build_budget);
-            field.fresh_this_step = true;
-            stats.group_fields_built += 1;
-        }
+        field.fresh_this_step = field.beginBuild(grid, key, goal_index, self.step_counter, self.capacity.group_field_max_cells);
+        if (field.fresh_this_step) stats.group_fields_built += 1;
     }
 
     // True when `key` is still a live above-threshold group request this step,
@@ -1349,71 +1617,10 @@ pub const PathfindingSystem = struct {
         return null;
     }
 
-    fn prepareRequestKeys(self: *PathfindingSystem, requests: []const PathRequest, stats: *PathfindingStats) void {
-        self.prepared_requests.clearRetainingCapacity();
-        if (!self.graph.valid()) return;
-        // Intake gates on the LOGICAL per-step cap, never prepared_requests' physical .capacity:
-        // ensureTotalCapacity rounds up and shrink hysteresis keeps slack, so a physical gate would
-        // make the accepted set depend on allocation history. applyDerivedCapacity reserves
-        // prepared_requests to at least max_frame_requests in the same call that sets it.
-        const limit = @min(requests.len, self.capacity.max_frame_requests);
-        std.debug.assert(self.prepared_requests.capacity >= limit);
-        stats.dropped_requests += requests.len - limit;
-        // Reject (drop, never clamp) an out-of-range level: the query path
-        // (statusForWorld -> NavGraph.grid) already rejects the same condition as
-        // unavailable, so clamping here would accept and solve/cache a request against
-        // level 0 that the requester's own later query can never read back (it queries
-        // its real, still out-of-range level and gets unavailable) — a wasted solve that
-        // silently burns a fallback slot every step. Matching the query path's rejection
-        // means the caller sees dropped_requests reflect the real, unusable request.
-        const level_count: u16 = @intCast(self.graph.levelCount());
-        for (requests[0..limit]) |request| {
-            if (request.goal_level >= level_count or request.start_level >= level_count) {
-                stats.dropped_requests += 1;
-                continue;
-            }
-            const goal_grid = self.graph.grid(request.goal_level).?;
-            const start_grid = self.graph.grid(request.start_level).?;
-            self.prepared_requests.appendAssumeCapacity(.{
-                .entity = request.entity,
-                .kind = request.kind,
-                .start_level = request.start_level,
-                .key = .{
-                    .nav_version = self.graph.version,
-                    .agent_class = request.agent_class,
-                    .goal_level = request.goal_level,
-                    .goal = goal_grid.worldToCellClamped(request.goal),
-                },
-                .start = start_grid.worldToCellClamped(request.start),
-            });
-        }
-    }
-
-    fn prepareSolveBuffers(self: *PathfindingSystem, solve_count: usize) void {
-        self.solve_results.clearRetainingCapacity();
-        self.fallback_indices.clearRetainingCapacity();
-        for (0..solve_count) |_| {
-            self.solve_results.appendAssumeCapacity(.{ .deferred = emptyKey(self.graph.version) });
-        }
-    }
-
-    // Shared solve-phase setup for the threaded and serial paths. The Debug check
-    // asserts the strict-increase invariant the fallback dispatch relies on; the
-    // len > 1 guard keeps the [1..] slice in-bounds when the list is empty or single.
-    fn prepareSolvePhase(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
-        self.prepareSolveBuffers(solve_count);
-        self.prepareFallbackIndices(solve_count, fallback_limit, stats);
-        if (builtin.mode == .debug and self.fallback_indices.items.len > 1) {
-            for (self.fallback_indices.items[1..], 0..) |idx, i| {
-                std.debug.assert(self.fallback_indices.items[i] < idx);
-            }
-        }
-    }
-
     fn effectiveSolveLimit(self: *const PathfindingSystem, config: PathfindingConfig) usize {
         const requested_limit = config.max_solved_requests_per_step orelse self.capacity.max_solved_requests_per_step;
         return @min(
-            self.pending.items.len,
+            self.pending.len,
             @min(
                 @min(requested_limit, self.capacity.max_solved_requests_per_step),
                 @min(self.solve_results.capacity, self.fallback_indices.capacity),
@@ -1426,20 +1633,19 @@ pub const PathfindingSystem = struct {
         return @min(requested_limit, self.capacity.max_fallback_requests_per_step);
     }
 
-    // Emits pending indices into fallback_indices for the heap A* batch. Indices come
-    // from a sequential scan of 0..solve_count, so the list is strictly increasing and
-    // every entry is distinct. Concurrent solveFallbackJob writes use these as
-    // solve_results indices; disjointness of those writes depends on this uniqueness.
+    // Admits pending indices of the solve window [0, solve_count) into fallback_indices,
+    // in increasing order, and sizes solve_results to one slot per admission: the
+    // fallback ordinal is the solve batch's item index and every solve output's index.
     // A tier-1 (escalated) request is additionally capped at max_escalated_solves_per_step
     // admissions this step, since tier-1 uses the larger derived abstract-node/stitched-cell
     // ceiling and is the expensive attempt; a tier-1-ready request past the cap is simply
-    // skipped (stays .deferred, so compactPendingAfterSolve leaves it in place to retry next
+    // skipped (stays deferred, so compactPendingAfterSolve leaves it in place to retry next
     // step) without consuming a fallback_limit slot, so tier-0 requests keep filling the rest.
-    fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
+    fn prepareSolvePhase(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
+        self.fallback_indices.clearRetainingCapacity();
         var escalated_admitted: usize = 0;
-        for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
-            if (result != .deferred) continue;
-            const is_escalated = self.pending.items[pending_index].tier != 0;
+        for (0..solve_count) |pending_index| {
+            const is_escalated = self.pending.at(pending_index).tier != 0;
             if (is_escalated and escalated_admitted >= self.capacity.max_escalated_solves_per_step) {
                 stats.escalated_deferred += 1;
                 continue;
@@ -1454,13 +1660,19 @@ pub const PathfindingSystem = struct {
                 stats.fallback_deferred_requests += 1;
             }
         }
+        self.solve_results.clearRetainingCapacity();
+        for (0..self.fallback_indices.items.len) |_| {
+            self.solve_results.appendAssumeCapacity(.{ .deferred = emptyKey(self.graph.version) });
+        }
     }
 
-    fn publishSolvedResults(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
-        for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
+    // Publishes in fallback-ordinal order, which is pending order (ordinals increase with
+    // the pending index).
+    fn publishSolvedResults(self: *PathfindingSystem, stats: *PathfindingStats) void {
+        for (self.solve_results.items, 0..) |result, ordinal| {
             switch (result) {
                 .available => |key| {
-                    const solved = self.solved_paths.items[pending_index];
+                    const solved = self.solved_paths.items[ordinal];
                     const path = self.worker_path_pool.items[solved.offset .. solved.offset + solved.len];
                     const stitched = self.worker_stitched_pool.items[solved.stitched_offset .. solved.stitched_offset + solved.stitched_len];
                     self.completed.put(key, path, stitched, solved.path_level, self.step_counter, stats);
@@ -1488,37 +1700,47 @@ pub const PathfindingSystem = struct {
         stats.fallback_requests = self.fallback_indices.items.len;
     }
 
-    // Compacts pending after a solve. Solved entries (available/unavailable) are removed.
-    // Deferred entries (not attempted this frame, including a tier-1-ready request skipped
-    // by the escalated-solve cap) keep their front order. A budget-exhausted entry follows
-    // the two-tier ladder: tier 0 (the cheap, fixed-budget attempt) promotes to tier 1 and
-    // rotates to the BACK of pending exactly once, so the untouched tail reaches the solve
-    // window before the promoted entry retries at the larger — but still fixed, never
-    // derived from world/graph size — tier-1 budget; a budget-exhausted AT tier 1 drops the
-    // entry WITHOUT negative-caching (it does not fit either fixed budget, which is not the
-    // same as a definitive "no path exists") — worst case exactly two solve attempts per
-    // request, never an unbounded retry storm and never a false `.unavailable`. Solve-window
-    // writes target indices <= their source, so the in-place rewrite never clobbers an
-    // unread entry; the rotated copies live in rotate_back_scratch. pending_keys is updated
-    // in-place: keys for solved/dropped entries are removed individually; deferred,
-    // rotating, and tail keys stay.
+    // Compacts the solve window [0, solve_count) of pending in O(solve_count). Solved
+    // entries (available/unavailable/start_invalid) are removed. Deferred entries (not
+    // admitted this frame, including a tier-1-ready request skipped by the escalated-solve
+    // cap) keep their front order. A budget-exhausted entry follows the two-tier ladder:
+    // tier 0 (the cheap, fixed-budget attempt) promotes to tier 1 and rotates to the BACK
+    // of pending exactly once, so the untouched tail reaches the solve window before the
+    // promoted entry retries at the larger — but still fixed, never derived from
+    // world/graph size — tier-1 budget; a budget-exhausted AT tier 1 drops the entry
+    // WITHOUT negative-caching (it does not fit either fixed budget, which is not the same
+    // as a definitive "no path exists") — worst case exactly two solve attempts per
+    // request, never an unbounded retry storm and never a false `.unavailable`.
+    //
+    // The window is walked back to front, each outcome recovered by merge-walking the
+    // increasing fallback_indices; kept entries are written toward the window end (a
+    // write never lands below its source), the ring head advances past everything else,
+    // and the rotated entries are pushed at the tail. Resulting order: deferred, tail,
+    // rotated. pending_keys loses the keys of solved and dropped entries only.
     fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         if (solve_count == 0) return;
         self.rotate_back_scratch.clearRetainingCapacity();
-        var write_index: usize = 0;
-        for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
+        const admitted = self.fallback_indices.items;
+        var ordinal = admitted.len;
+        var write_index = solve_count;
+        var pending_index = solve_count;
+        while (pending_index > 0) {
+            pending_index -= 1;
+            const result: PathSolveResult = if (ordinal > 0 and admitted[ordinal - 1] == pending_index) admitted_result: {
+                ordinal -= 1;
+                break :admitted_result self.solve_results.items[ordinal];
+            } else .{ .deferred = emptyKey(self.graph.version) };
             switch (result) {
                 .deferred => {
-                    self.pending.items[write_index] = self.pending.items[pending_index];
-                    write_index += 1;
+                    write_index -= 1;
+                    self.pending.ptr(write_index).* = self.pending.at(pending_index);
                 },
                 .budget_exhausted => |key| {
-                    var request = self.pending.items[pending_index];
+                    var request = self.pending.at(pending_index);
                     if (request.tier == 0) {
                         // First (tier-0) attempt exhausted its small fixed attempt cap: promote
                         // to tier 1 and rotate to the back so the untouched tail makes progress
-                        // before this entry retries at the larger (still fixed, not derived
-                        // from world/graph size) tier-1 budget.
+                        // before this entry retries at the larger (still fixed) tier-1 budget.
                         request.tier = 1;
                         self.rotate_back_scratch.appendAssumeCapacity(request);
                     } else {
@@ -1542,28 +1764,149 @@ pub const PathfindingSystem = struct {
                     // available/unavailable/start_invalid: removed from pending. A
                     // start_invalid entry was never negative-cached, so its next
                     // status query is `.missing` and the caller may re-request.
-                    self.pending_keys.remove(self.pending.items[pending_index].key);
+                    self.pending_keys.remove(self.pending.at(pending_index).key);
                 },
             }
         }
-        for (self.pending.items[solve_count..]) |pending_request| {
-            self.pending.items[write_index] = pending_request;
-            write_index += 1;
+        std.debug.assert(ordinal == 0);
+        self.pending.dropFront(write_index);
+        // Aged spillers trail the untouched tail so the tail makes progress before they
+        // retry; they were gathered back to front.
+        var rotated = self.rotate_back_scratch.items.len;
+        while (rotated > 0) {
+            rotated -= 1;
+            self.pending.push(self.rotate_back_scratch.items[rotated]);
         }
-        // Aged spillers trail the untouched tail so the tail makes progress before they retry.
-        for (self.rotate_back_scratch.items) |pending_request| {
-            self.pending.items[write_index] = pending_request;
-            write_index += 1;
-        }
-        self.pending.items.len = write_index;
     }
 };
+
+// One range of the `path_intake` stage.
+const IntakeJob = struct {
+    system: *const PathfindingSystem,
+    requests: []const PathRequest,
+    items_per_range: usize,
+    records: []IntakeRecord,
+    group_counts: []GroupKeyCount,
+    tallies: []IntakeTally,
+};
+
+fn intakeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *IntakeJob = @ptrCast(@alignCast(context));
+    // Dual worker asserts: range.index vs the dispatched tallies, and the range is the
+    // window the merge reads, inside both staging buffers.
+    std.debug.assert(range.index < job.tallies.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.requests.len);
+    std.debug.assert(range.end <= job.records.len and range.end <= job.group_counts.len);
+    job.tallies[range.index] = job.system.classifyIntakeRange(job.requests, range.start, range.end, job.records, job.group_counts);
+}
+
+// `path_intake` dispatched inline: each range, in order on the main thread, runs the
+// direct single pass.
+const DirectIntakeJob = struct {
+    system: *PathfindingSystem,
+    requests: []const PathRequest,
+    stats: *PathfindingStats,
+};
+
+fn directIntakeJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
+    const job: *DirectIntakeJob = @ptrCast(@alignCast(context));
+    std.debug.assert(worker_id.index == WorkerId.main.index);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.requests.len);
+    job.system.acceptDirect(job.requests[range.start..range.end], job.stats);
+}
+
+const ProjectedGoal = struct {
+    // `no_parent` when no open cell is near the goal: a definitive unavailable.
+    index: usize,
+    projected: bool,
+};
+
+// Nearest-open goal projection on the goal level, resolved at intake so the solve
+// reuses it.
+fn projectGoal(goal_grid: *const NavGrid, goal: GridCell) ProjectedGoal {
+    const index = goal_grid.indexForCell(goal) orelse return .{ .index = no_parent, .projected = false };
+    if (!goal_grid.isBlockedIndex(index)) return .{ .index = index, .projected = false };
+    const projected = goal_grid.projectToNearestOpen(goal, default_goal_projection_radius) orelse return .{ .index = no_parent, .projected = false };
+    return .{ .index = projected, .projected = true };
+}
+
+// One range of a `group_field_expand` pass; slot indices are distinct by construction.
+const GroupFieldJob = struct {
+    system: *PathfindingSystem,
+    slots: []const usize,
+    range_count: usize,
+};
+
+fn groupFieldExpandJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *GroupFieldJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.slots.len);
+    for (job.slots[range.start..range.end]) |slot| job.system.expandGroupField(slot);
+}
+
+// The window entry of each recently seen key in one intake range, so a repeat folds into
+// its entry. A key evicted from this fixed table opens a new entry on its next
+// occurrence; the merge handles both entries, so results stay exact.
+const RecentKeys = struct {
+    const slot_count = 8;
+
+    keys: [slot_count]PathQueryKey = undefined,
+    entries: [slot_count]usize = undefined,
+    len: usize = 0,
+    next_replace: usize = 0,
+
+    fn find(self: *const RecentKeys, key: PathQueryKey) ?usize {
+        for (self.keys[0..self.len], self.entries[0..self.len]) |recent_key, entry| {
+            if (keysEqual(recent_key, key)) return entry;
+        }
+        return null;
+    }
+
+    fn remember(self: *RecentKeys, key: PathQueryKey, entry: usize) void {
+        if (self.len < slot_count) {
+            self.keys[self.len] = key;
+            self.entries[self.len] = entry;
+            self.len += 1;
+        } else {
+            self.keys[self.next_replace] = key;
+            self.entries[self.next_replace] = entry;
+            self.next_replace = (self.next_replace + 1) % slot_count;
+        }
+    }
+};
+
+const IntakeCells = struct {
+    start: GridCell,
+    goal: GridCell,
+};
+
+// Every level shares one extent, so one grid converts for all of them. Scalar: the
+// 4-lane form measured 1.01 ms vs 631 us scalar (serial group-field-detour 4096, Debug).
+fn requestCells(grid: *const NavGrid, request: PathRequest) IntakeCells {
+    return .{ .start = grid.worldToCellClamped(request.start), .goal = grid.worldToCellClamped(request.goal) };
+}
+
+// Batch stats of a stage that ran inline on the calling thread.
+fn inlineBatch(item_count: usize, range_alignment_items: usize) BatchStats {
+    const ranges: usize = if (item_count == 0) 0 else 1;
+    return .{
+        .item_count = item_count,
+        .range_count = ranges,
+        .items_per_range = item_count,
+        .range_alignment_items = range_alignment_items,
+        .main_thread_ranges = ranges,
+        .ran_inline = true,
+    };
+}
 
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
 
-const GridCell = types.GridCell;
 const PathStatus = types.PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
 const no_component = types.no_component;
@@ -1794,7 +2137,7 @@ test "pathfinding drops an out-of-range level request instead of clamping and so
     try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests);
     try std.testing.expectEqual(@as(usize, 0), stats.available_results);
     try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
-    try std.testing.expectEqual(@as(usize, 0), system.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
 }
 
 test "pathfinding deferred_requests equals post-compaction pending in both update paths" {
@@ -1944,7 +2287,7 @@ test "pathfinding same-level group agent falls through on a field-sample miss in
 test "pathfinding warmed group-field request/sample step is allocation-free" {
     // Mirrors the first step of "pathfinding group mode builds one shared field sampled by
     // all agents": once the field reaches .ready, every subsequent step's
-    // recordGroupRequest/serviceGroupFields/ensureGroupField/sample path must not allocate —
+    // intake/serviceGroupFields/ensureGroupField/sample path must not allocate —
     // it was previously uncovered by any FailingAllocator proof.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2197,7 +2540,7 @@ test "pathfinding group tally refuses over-cap distinct keys without desyncing t
 
     // The logical per-step cap governs how many distinct group tallies may register:
     // group_requests is reserved to it, but group_key_map refuses inserts past exactly
-    // this cap. recordGroupRequest must gate the new-group append on the LOGICAL cap, not
+    // this cap. recordGroupRequestCount must gate the new-group append on the LOGICAL cap, not
     // the ArrayList's physical .capacity — otherwise appends into physical slack outrun the
     // dropped map registrations and split one goal's count across duplicate slots.
     const logical_cap = system.capacity.max_solved_requests_per_step;
@@ -2210,14 +2553,13 @@ test "pathfinding group tally refuses over-cap distinct keys without desyncing t
 
     // A repeated key must accumulate in ONE slot, never spawn duplicates.
     const repeated = PathQueryKey{ .nav_version = 1, .agent_class = .default, .goal = .{ .x = 0, .y = 0 } };
-    system.recordGroupRequest(repeated);
-    system.recordGroupRequest(repeated);
-    system.recordGroupRequest(repeated);
+    system.recordGroupRequestCount(repeated, 1);
+    system.recordGroupRequestCount(repeated, 2);
 
     // Drive more distinct goals than the logical cap in a single step.
     var made: usize = 0;
     while (made < logical_cap + 5) : (made += 1) {
-        system.recordGroupRequest(.{ .nav_version = 1, .agent_class = .default, .goal = .{ .x = @intCast(made + 1), .y = 0 } });
+        system.recordGroupRequestCount(.{ .nav_version = 1, .agent_class = .default, .goal = .{ .x = @intCast(made + 1), .y = 0 } }, 1);
     }
 
     // The tally never overflows the logical cap into the ArrayList's physical slack.
@@ -3114,7 +3456,7 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     try std.testing.expectEqual(PathStatus.pending, view.status);
     // The two-tier ladder: the FIRST (tier-0) exhaustion promotes to tier 1 immediately
     // (not retried at tier 0 repeatedly).
-    try std.testing.expectEqual(@as(u8, 1), system.pending.items[0].tier);
+    try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
 }
 
 // tier0_stitched_cell_cap and max_stitched_path_cells (the fixed tier-1 ceiling) are
@@ -3235,8 +3577,8 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     // Attempt 1 (tier 0): exhausts and promotes to tier 1.
     const first = try system.updateSerial(&stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
-    try std.testing.expectEqual(@as(usize, 1), system.pending.items.len);
-    try std.testing.expectEqual(@as(u8, 1), system.pending.items[0].tier);
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
+    try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
 
     // Force the SECOND (tier-1) attempt to also exhaust: max_abstract_nodes is the fixed
     // tier-1 ceiling, read fresh from live capacity on every tier-1 attempt, so shrinking
@@ -3250,7 +3592,7 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), second.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), second.pending_requests);
-    try std.testing.expectEqual(@as(usize, 0), system.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     // Exactly two solve attempts total across the two steps (never the old 32-retry storm).
     try std.testing.expectEqual(@as(usize, 2), first.budget_exhausted + second.budget_exhausted);
 
@@ -3288,10 +3630,10 @@ test "pathfinding max_escalated_solves_per_step caps tier-1 admission to exactly
     try appendPathRequest(&stream, .{ .entity = requester_c, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 104, .y = 8 } });
     try appendPathRequest(&stream, .{ .entity = requester_d, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 136, .y = 8 } });
     _ = try system.updateSerial(&stream, 8, .{ .max_fallback_requests_per_step = 0 });
-    try std.testing.expectEqual(@as(usize, 4), system.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 4), system.pending.len);
 
     // Promote every pending entry to tier 1 (as if each had already spilled once).
-    for (system.pending.items) |*pending_request| pending_request.tier = 1;
+    for (0..system.pending.len) |index| system.pending.ptr(index).tier = 1;
 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
@@ -3300,9 +3642,9 @@ test "pathfinding max_escalated_solves_per_step caps tier-1 admission to exactly
     try std.testing.expectEqual(@as(usize, 2), stats.escalated_deferred);
     // The two admitted tier-1 requests solved trivially (short, same-level, open goals);
     // the other two waited out this step and are still pending at tier 1.
-    try std.testing.expectEqual(@as(usize, 2), system.pending.items.len);
-    for (system.pending.items) |pending_request| {
-        try std.testing.expectEqual(@as(u8, 1), pending_request.tier);
+    try std.testing.expectEqual(@as(usize, 2), system.pending.len);
+    for (0..system.pending.len) |index| {
+        try std.testing.expectEqual(@as(u8, 1), system.pending.at(index).tier);
     }
 }
 
@@ -4482,7 +4824,7 @@ test "pathfinding capacity stays unchanged across a steady-state solve" {
     // Grow once to a steady 16-agent load.
     _ = try driveAgentCount(&system, &requesters, 16);
     const steady_cap = system.effective_agent_capacity;
-    const steady_pending = system.pending.capacity;
+    const steady_pending = system.pending.slotCount();
     const steady_cache = system.completed.slots.items.len;
     const steady_pool = system.worker_path_pool.items.len;
     // A constant agent count holds capacity (and every pool's backing) fixed across
@@ -4490,7 +4832,7 @@ test "pathfinding capacity stays unchanged across a steady-state solve" {
     for (0..30) |_| {
         _ = try driveAgentCount(&system, &requesters, 16);
         try std.testing.expectEqual(steady_cap, system.effective_agent_capacity);
-        try std.testing.expectEqual(steady_pending, system.pending.capacity);
+        try std.testing.expectEqual(steady_pending, system.pending.slotCount());
         try std.testing.expectEqual(steady_cache, system.completed.slots.items.len);
         try std.testing.expectEqual(steady_pool, system.worker_path_pool.items.len);
     }
@@ -4543,7 +4885,7 @@ test "pathfinding capacity shrink preserves surviving pending keys/tiers and cou
     // is dropped here — the snapshot taken by this grow is of the still-empty queue.
     const fill_stats = try system.updateSerial(&fill_stream, pending_count, no_fallback);
     try std.testing.expectEqual(@as(usize, pending_count), fill_stats.accepted_requests);
-    try std.testing.expectEqual(@as(usize, pending_count), system.pending.items.len);
+    try std.testing.expectEqual(@as(usize, pending_count), system.pending.len);
     try std.testing.expectEqual(@as(usize, 0), fill_stats.dropped_requests);
 
     // Sustained low load (agent_count 1, no new requests) shrinks the derived capacity to the
@@ -4559,15 +4901,15 @@ test "pathfinding capacity shrink preserves surviving pending keys/tiers and cou
     // physical (allocator-rounded) ArrayList capacity, which can run well above it — the
     // exact bug this test was written to catch: pending_keys is reserved to the logical cap,
     // so retaining more than that would silently break dedup for the excess entries.
-    const survivor_count = system.pending.items.len;
+    const survivor_count = system.pending.len;
     try std.testing.expectEqual(min_capacity_floor, survivor_count);
     try std.testing.expectEqual(pending_count - survivor_count, last_stats.dropped_requests);
 
     // The surviving entries (snapshot order, so the first survivor_count original requests)
     // keep their key and tier intact; pending_keys is rebuilt to match exactly them.
     for (0..survivor_count) |i| {
-        try std.testing.expectEqual(@as(u8, 0), system.pending.items[i].tier);
-        try std.testing.expect(system.pending_keys.contains(system.pending.items[i].key));
+        try std.testing.expectEqual(@as(u8, 0), system.pending.at(i).tier);
+        try std.testing.expect(system.pending_keys.contains(system.pending.at(i).key));
         try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goals[i], .default, null).status);
     }
     // The dropped entries' goals now read missing (retryable), never a stale "still pending".
@@ -4623,7 +4965,7 @@ test "pathfinding intake drops past the logical frame cap regardless of capacity
     var direct = try intakeTestSystem(&data, 512);
     defer direct.deinit();
     try updateEmpty(&direct, 40);
-    try direct.prepared_requests.ensureTotalCapacity(std.testing.allocator, 160);
+    try direct.intake_records.ensureTotalCapacity(std.testing.allocator, 160);
 
     // B: grown 8 -> 128, then shrunk to 40 after the 2-step low-load window.
     var history = try intakeTestSystem(&data, 512);
@@ -4636,7 +4978,7 @@ test "pathfinding intake drops past the logical frame cap regardless of capacity
     // Same logical cap, physical capacity above it on both (by different histories).
     inline for (.{ &direct, &history }) |system| {
         try std.testing.expectEqual(@as(usize, 40), system.capacity.max_frame_requests);
-        try std.testing.expect(system.prepared_requests.capacity > 45);
+        try std.testing.expect(system.intake_records.capacity > 45);
     }
 
     const direct_stats = try submitSharedGoalBurst(&direct, &requesters, requesters.len, 40);
@@ -4646,10 +4988,10 @@ test "pathfinding intake drops past the logical frame cap regardless of capacity
         try std.testing.expectEqual(@as(usize, 1), stats.accepted_requests);
         try std.testing.expectEqual(@as(usize, 39), stats.duplicate_requests);
     }
-    try std.testing.expectEqual(@as(usize, 1), direct.pending.items.len);
-    try std.testing.expectEqual(@as(usize, 1), history.pending.items.len);
-    try std.testing.expectEqual(requesters[0], direct.pending.items[0].entity);
-    try std.testing.expectEqual(direct.pending.items[0].entity, history.pending.items[0].entity);
+    try std.testing.expectEqual(@as(usize, 1), direct.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), history.pending.len);
+    try std.testing.expectEqual(requesters[0], direct.pending.at(0).entity);
+    try std.testing.expectEqual(direct.pending.at(0).entity, history.pending.at(0).entity);
 }
 
 test "pathfinding intake drop count is independent of world size" {
@@ -4681,8 +5023,10 @@ test "pathfinding intake drop count is independent of world size" {
 /// committed logical limits.
 fn expectPoolsFitLogicalCaps(system: *const PathfindingSystem) !void {
     const cap = system.capacity;
-    try std.testing.expect(system.pending.capacity >= cap.max_pending_requests);
-    try std.testing.expect(system.prepared_requests.capacity >= cap.max_frame_requests);
+    try std.testing.expect(system.pending.slotCount() >= cap.max_pending_requests);
+    try std.testing.expect(system.intake_records.capacity >= cap.max_frame_requests);
+    try std.testing.expect(system.intake_group_counts.capacity >= cap.max_frame_requests);
+    try std.testing.expect(system.intake_tallies.capacity >= maxRangeCount(cap.max_frame_requests, intake_range_alignment_items));
     try std.testing.expect(system.solve_results.capacity >= cap.max_solved_requests_per_step);
     try std.testing.expect(system.fallback_indices.capacity >= cap.max_solved_requests_per_step);
     try std.testing.expect(system.solved_paths.capacity >= cap.max_solved_requests_per_step);
@@ -4982,4 +5326,542 @@ test "pathfinding max_stitch_segments bounds stitching independent of corridor l
     const result = try runLakeDetourScenario(&system, 256, 5);
     try std.testing.expectEqual(@as(usize, 0), result.available_results);
     try std.testing.expectEqual(@as(usize, 1), result.escalated_dropped);
+}
+
+// ---- Request-side stages (path_intake, group_field_expand, pending ring) ----------
+
+const intake_test_agents: usize = 40;
+
+fn cellWorld(x: i32, y: i32) math.Vec2 {
+    return .{ .x = @as(f32, @floatFromInt(x)) * 32.0 + 16.0, .y = @as(f32, @floatFromInt(y)) * 32.0 + 16.0 };
+}
+
+fn appendIndividual(stream: *RangeOutputStream(PathRequest), entity: EntityId, goal: math.Vec2) !void {
+    try appendPathRequest(stream, .{ .entity = entity, .start = cellWorld(1, 2), .goal = goal });
+}
+
+const IntakeGoals = struct {
+    const hit = cellWorld(1, 1);
+    const expired = cellWorld(2, 1);
+    const expired_negative = cellWorld(3, 1);
+    const negative = cellWorld(4, 1);
+    const field = cellWorld(8, 8);
+    const group = cellWorld(12, 5);
+    // Inside the static body below: projected to an open cell.
+    const blocked = cellWorld(10, 4);
+
+    fn prefilled(index: usize) math.Vec2 {
+        return cellWorld(@intCast(index % 16), @intCast(15 - index / 16));
+    }
+
+    fn distinct(index: usize) math.Vec2 {
+        return cellWorld(@intCast(index % 16), @intCast(10 + index / 16));
+    }
+};
+
+const intake_prefilled_count: usize = 30;
+
+/// A 16x16-cell system at `intake_test_agents` agents holding, before the step under
+/// test: 31 pending entries, a ready group field, one fresh and three expired cached
+/// results (one of them also negative-cached, one also pending), and one negative.
+fn intakeScenarioSystem(data: *const DataSystem, requester: EntityId, participant_count: usize) !PathfindingSystem {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 64;
+    capacity.worker_participant_count = participant_count;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(data, 512, 512, 32);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (0..intake_prefilled_count) |index| try appendIndividual(&stream, requester, IntakeGoals.prefilled(index));
+    for (0..3) |index| {
+        try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = cellWorld(@intCast(index), 3), .goal = IntakeGoals.field });
+    }
+    _ = try system.updateSerial(&stream, intake_test_agents, .{ .max_fallback_requests_per_step = 0 });
+    try std.testing.expectEqual(intake_prefilled_count + 1, system.pending.len);
+
+    const step = system.step_counter;
+    var put_stats = PathfindingStats{};
+    const path = [_]u32{ 17, 18 };
+    const key = struct {
+        fn of(s: *const PathfindingSystem, goal: math.Vec2) PathQueryKey {
+            return s.graph.keyForWorld(0, goal, .default).?;
+        }
+    }.of;
+    system.completed.put(key(&system, IntakeGoals.hit), &path, &.{}, 0, step, &put_stats);
+    system.completed.put(key(&system, IntakeGoals.expired), &path, &.{}, 0, step -% 400, &put_stats);
+    system.completed.put(key(&system, IntakeGoals.expired_negative), &path, &.{}, 0, step -% 400, &put_stats);
+    system.completed.put(key(&system, IntakeGoals.prefilled(0)), &path, &.{}, 0, step -% 400, &put_stats);
+    _ = system.unavailable.insert(key(&system, IntakeGoals.negative));
+    _ = system.unavailable.insert(key(&system, IntakeGoals.expired_negative));
+    return system;
+}
+
+// Forty requests crossing every intake class, with repeats in different ranges.
+fn writeIntakeScenarioRequests(stream: *RangeOutputStream(PathRequest), entity: EntityId) !void {
+    const Kind = enum { hit, expired, negative, field, out_of_range, blocked, expired_negative, prefilled, group, distinct };
+    const Item = struct { kind: Kind, index: usize = 0 };
+    const items = [_]Item{
+        .{ .kind = .hit },                   .{ .kind = .expired },               .{ .kind = .negative },              .{ .kind = .field },
+        .{ .kind = .out_of_range },          .{ .kind = .blocked },               .{ .kind = .expired_negative },      .{ .kind = .distinct },
+        .{ .kind = .prefilled, .index = 1 }, .{ .kind = .group },                 .{ .kind = .prefilled },             .{ .kind = .distinct, .index = 1 },
+        .{ .kind = .distinct, .index = 2 },  .{ .kind = .distinct, .index = 3 },  .{ .kind = .prefilled, .index = 2 }, .{ .kind = .distinct, .index = 4 },
+        .{ .kind = .distinct, .index = 5 },  .{ .kind = .distinct, .index = 6 },  .{ .kind = .field },                 .{ .kind = .distinct, .index = 7 },
+        .{ .kind = .distinct, .index = 8 },  .{ .kind = .distinct, .index = 9 },  .{ .kind = .distinct, .index = 10 }, .{ .kind = .distinct, .index = 11 },
+        .{ .kind = .hit },                   .{ .kind = .prefilled, .index = 3 }, .{ .kind = .distinct, .index = 12 }, .{ .kind = .distinct, .index = 13 },
+        .{ .kind = .group },                 .{ .kind = .distinct, .index = 14 }, .{ .kind = .expired },               .{ .kind = .negative },
+        .{ .kind = .distinct, .index = 15 }, .{ .kind = .group },                 .{ .kind = .blocked },               .{ .kind = .distinct, .index = 16 },
+        .{ .kind = .distinct, .index = 17 }, .{ .kind = .distinct, .index = 18 }, .{ .kind = .distinct },              .{ .kind = .distinct, .index = 19 },
+    };
+    comptime std.debug.assert(items.len == intake_test_agents);
+    for (items, 0..) |item, position| {
+        var request = PathRequest{ .entity = entity, .start = cellWorld(@intCast(position % 6), 2), .goal = undefined };
+        request.goal = switch (item.kind) {
+            .hit => IntakeGoals.hit,
+            .expired => IntakeGoals.expired,
+            .negative => IntakeGoals.negative,
+            .field => IntakeGoals.field,
+            .out_of_range => IntakeGoals.hit,
+            .blocked => IntakeGoals.blocked,
+            .expired_negative => IntakeGoals.expired_negative,
+            .prefilled => IntakeGoals.prefilled(item.index),
+            .group => IntakeGoals.group,
+            .distinct => IntakeGoals.distinct(item.index),
+        };
+        if (item.kind == .out_of_range) request.goal_level = 3;
+        if (item.kind == .field or item.kind == .group) request.kind = .group;
+        try appendPathRequest(stream, request);
+    }
+}
+
+fn expectRequestStatsEqual(expected: PathfindingStats, actual: PathfindingStats) !void {
+    inline for (.{
+        "accepted_requests", "duplicate_requests",  "pending_requests",    "dropped_requests",
+        "cache_hits",        "available_results",   "unavailable_results", "group_field_samples",
+        "goal_projected",    "group_fields_built",  "group_field_reuses",  "group_field_rebuild_throttled",
+        "cache_evictions",   "distinct_group_keys", "deferred_requests",
+    }) |name| {
+        try std.testing.expectEqual(@field(expected, name), @field(actual, name));
+    }
+}
+
+fn expectRequestStateEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
+    try std.testing.expectEqual(expected.pending.len, actual.pending.len);
+    for (0..expected.pending.len) |index| {
+        try std.testing.expectEqualDeep(expected.pending.at(index), actual.pending.at(index));
+        try std.testing.expect(actual.pending_keys.contains(expected.pending.at(index).key));
+    }
+    try std.testing.expectEqual(expected.group_requests.items.len, actual.group_requests.items.len);
+    for (expected.group_requests.items, actual.group_requests.items) |expected_tally, actual_tally| {
+        try std.testing.expectEqualDeep(expected_tally, actual_tally);
+    }
+    try std.testing.expectEqual(expected.completed.slots.items.len, actual.completed.slots.items.len);
+    for (expected.completed.slots.items, actual.completed.slots.items) |expected_slot, actual_slot| {
+        try std.testing.expectEqualDeep(expected_slot, actual_slot);
+    }
+}
+
+test "threaded request intake equals serial intake across range sizes and worker counts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, IntakeGoals.blocked, .{ .x = 32, .y = 32 }, true);
+    const requester = try data.createEntity();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try writeIntakeScenarioRequests(&stream, requester);
+
+    var serial = try intakeScenarioSystem(&data, requester, 1);
+    defer serial.deinit();
+    const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_fallback_requests_per_step = 0 });
+    // The scenario reaches every class.
+    try std.testing.expectEqual(@as(usize, 2), serial_stats.group_field_samples);
+    try std.testing.expectEqual(@as(usize, 2), serial_stats.available_results);
+    try std.testing.expectEqual(@as(usize, 3), serial_stats.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 1), serial_stats.goal_projected);
+    try std.testing.expect(serial_stats.dropped_requests > 1);
+    try std.testing.expectEqual(intake_test_agents, serial.pending.len);
+    try std.testing.expect(serial.completed.slotIndex(serial.graph.keyForWorld(0, IntakeGoals.expired, .default).?) == null);
+    try std.testing.expect(serial.completed.slotIndex(serial.graph.keyForWorld(0, IntakeGoals.expired_negative, .default).?) == null);
+    try std.testing.expect(serial.completed.slotIndex(serial.graph.keyForWorld(0, IntakeGoals.prefilled(0), .default).?) == null);
+
+    for ([_]usize{ 1, 3 }) |workers| {
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 8 });
+        defer threads.deinit();
+        for ([_]usize{ 8, 16, intake_test_agents }) |items_per_range| {
+            var threaded = try intakeScenarioSystem(&data, requester, threads.participantSlotCount());
+            defer threaded.deinit();
+            const stats = try threaded.update(&stream, intake_test_agents, &threads, .{
+                .adaptive = false,
+                .items_per_range = items_per_range,
+                .max_fallback_requests_per_step = 0,
+            });
+            // Several ranges take the classify-and-merge path; one range the direct pass.
+            if (items_per_range < intake_test_agents and threads.workerThreadCount() > 0) {
+                try std.testing.expect(!stats.intake_batch.ran_inline);
+            } else {
+                try std.testing.expect(stats.intake_batch.ran_inline);
+            }
+            try expectRequestStatsEqual(serial_stats, stats);
+            try expectRequestStateEqual(&serial, &threaded);
+        }
+    }
+}
+
+fn repeatsTestSystem(data: *const DataSystem, participant_count: usize, filler: ?*const RangeOutputStream(PathRequest)) !PathfindingSystem {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 64;
+    capacity.worker_participant_count = participant_count;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(data, 512, 512, 32);
+    if (filler) |stream| {
+        _ = try system.updateSerial(stream, intake_test_agents, .{ .max_fallback_requests_per_step = 0 });
+        try std.testing.expectEqual(intake_test_agents, system.pending.len);
+    }
+    return system;
+}
+
+test "threaded intake folds a new goal's repeats per range and equals serial when accepted and when pending is full" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var repeated = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer repeated.deinit();
+    for (0..intake_test_agents) |index| {
+        try appendPathRequest(&repeated, .{ .entity = requester, .start = cellWorld(@intCast(index % 6), 2), .goal = cellWorld(9, 9) });
+    }
+    var filler = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer filler.deinit();
+    for (0..intake_test_agents) |index| try appendIndividual(&filler, requester, IntakeGoals.distinct(index));
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
+    defer threads.deinit();
+
+    for ([_]bool{ false, true }) |pending_full| {
+        const prefill: ?*const RangeOutputStream(PathRequest) = if (pending_full) &filler else null;
+        var serial = try repeatsTestSystem(&data, 1, prefill);
+        defer serial.deinit();
+        const serial_stats = try serial.updateSerial(&repeated, intake_test_agents, .{ .max_fallback_requests_per_step = 0 });
+        if (pending_full) {
+            try std.testing.expectEqual(intake_test_agents, serial_stats.dropped_requests);
+            try std.testing.expectEqual(@as(usize, 0), serial_stats.accepted_requests);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), serial_stats.accepted_requests);
+            try std.testing.expectEqual(intake_test_agents - 1, serial_stats.duplicate_requests);
+        }
+
+        var threaded = try repeatsTestSystem(&data, threads.participantSlotCount(), prefill);
+        defer threaded.deinit();
+        const stats = try threaded.update(&repeated, intake_test_agents, &threads, .{ .adaptive = false, .items_per_range = 8, .max_fallback_requests_per_step = 0 });
+        try expectRequestStatsEqual(serial_stats, stats);
+        try expectRequestStateEqual(&serial, &threaded);
+        // One record per range reaches the merge, not one per request.
+        var merged_records: usize = 0;
+        for (threaded.intake_tallies.items) |tally| merged_records += tally.record_count;
+        try std.testing.expectEqual(threaded.intake_tallies.items.len, merged_records);
+        try std.testing.expectEqual(intake_test_agents / 8, threaded.intake_tallies.items.len);
+    }
+}
+
+test "request intake after reserve allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, IntakeGoals.blocked, .{ .x = 32, .y = 32 }, true);
+    const requester = try data.createEntity();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try writeIntakeScenarioRequests(&stream, requester);
+
+    var system = try intakeScenarioSystem(&data, requester, threads.participantSlotCount());
+    defer system.deinit();
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    defer {
+        system.allocator = original;
+        system.graph.allocator = original;
+    }
+    const stats = try system.update(&stream, intake_test_agents, &threads, .{
+        .adaptive = false,
+        .items_per_range = 8,
+        .max_fallback_requests_per_step = 0,
+    });
+    try std.testing.expect(!stats.intake_batch.ran_inline);
+    try std.testing.expect(stats.intake_batch.range_count > 1);
+    try std.testing.expect(stats.accepted_requests > 0);
+}
+
+test "group tallies keep first-occurrence order and exact counts with more than eight keys per range" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    // Twelve group keys, then the first four again (evicted from the eight-entry
+    // recent table by then), then key 11 again (still recent).
+    const sequence = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 11, 0 };
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (sequence) |key_index| {
+        try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = cellWorld(1, 2), .goal = cellWorld(@intCast(key_index), 12) });
+    }
+    var expected_counts: [12]usize = @splat(0);
+    for (sequence) |key_index| expected_counts[key_index] += 1;
+
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 64;
+    // Above every count, so no field builds and the tallies stay as merged.
+    capacity.min_group_field_agents = 64;
+    var serial = PathfindingSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    try serial.reserve(capacity);
+    try serial.rebuildStaticNavGrid(&data, 512, 512, 32);
+    const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_fallback_requests_per_step = 0 });
+    try std.testing.expectEqual(@as(usize, 12), serial_stats.distinct_group_keys);
+    for (serial.group_requests.items, 0..) |tally, key_index| {
+        try std.testing.expectEqualDeep(serial.graph.keyForWorld(0, cellWorld(@intCast(key_index), 12), .default).?, tally.key);
+        try std.testing.expectEqual(expected_counts[key_index], tally.count);
+    }
+
+    if (builtin.single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+    capacity.worker_participant_count = threads.participantSlotCount();
+    var threaded = PathfindingSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    try threaded.reserve(capacity);
+    try threaded.rebuildStaticNavGrid(&data, 512, 512, 32);
+    const stats = try threaded.update(&stream, intake_test_agents, &threads, .{ .adaptive = false, .items_per_range = 8, .max_fallback_requests_per_step = 0 });
+    try expectRequestStatsEqual(serial_stats, stats);
+    try expectRequestStateEqual(&serial, &threaded);
+}
+
+fn groupFieldServiceSystem(data: *const DataSystem, participant_count: usize) !PathfindingSystem {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 64;
+    capacity.max_group_fields = 4;
+    capacity.group_field_build_budget = 64;
+    capacity.group_field_rebuild_min_steps = 1;
+    capacity.worker_participant_count = participant_count;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(data, 512, 512, 32);
+    return system;
+}
+
+// Each goal requested by three agents; the schedule's step `step` uses `goals[step]`.
+fn writeGroupGoals(stream: *RangeOutputStream(PathRequest), entity: EntityId, goals: []const math.Vec2) !void {
+    stream.clearRetainingCapacity();
+    for (goals) |goal| {
+        for (0..3) |member| {
+            try appendPathRequest(stream, .{ .entity = entity, .kind = .group, .start = cellWorld(@intCast(member), 2), .goal = goal });
+        }
+    }
+}
+
+fn expectGroupFieldsEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
+    try std.testing.expectEqual(expected.next_group_evict, actual.next_group_evict);
+    for (expected.group_fields.items, actual.group_fields.items) |*expected_field, *actual_field| {
+        try std.testing.expectEqual(expected_field.state, actual_field.state);
+        try std.testing.expectEqualDeep(expected_field.key, actual_field.key);
+        try std.testing.expectEqual(expected_field.goal_index, actual_field.goal_index);
+        try std.testing.expectEqual(expected_field.generation, actual_field.generation);
+        try std.testing.expectEqual(expected_field.current_distance, actual_field.current_distance);
+        try std.testing.expectEqual(expected_field.pushed_count, actual_field.pushed_count);
+        try std.testing.expectEqual(expected_field.fresh_this_step, actual_field.fresh_this_step);
+        try std.testing.expectEqual(expected_field.last_build_step, actual_field.last_build_step);
+        for (0..expected_field.costs.items.len) |cell| {
+            const cost = expected_field.cost(cell);
+            try std.testing.expectEqual(cost, actual_field.cost(cell));
+            if (cost != types.unreachable_cost) try std.testing.expectEqual(expected_field.flow_dir.items[cell], actual_field.flow_dir.items[cell]);
+        }
+    }
+}
+
+const group_service_schedule = [_][]const math.Vec2{
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(7, 7) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(7, 7) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(7, 7) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(7, 7) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(8, 7) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(8, 7) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(8, 7) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(8, 7), cellWorld(4, 4) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(8, 7), cellWorld(4, 4) },
+    &.{ cellWorld(2, 13), cellWorld(13, 13), cellWorld(13, 2), cellWorld(8, 7), cellWorld(4, 4) },
+};
+
+test "threaded group-field service equals serial for four fields building, finishing, rekeyed, and evicted" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    var serial = try groupFieldServiceSystem(&data, 1);
+    defer serial.deinit();
+    var threaded = try groupFieldServiceSystem(&data, threads.participantSlotCount());
+    defer threaded.deinit();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+
+    var totals = PathfindingStats{};
+    var threaded_passes: usize = 0;
+    for (group_service_schedule) |goals| {
+        try writeGroupGoals(&stream, requester, goals);
+        const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_fallback_requests_per_step = 0 });
+        const stats = try threaded.update(&stream, intake_test_agents, &threads, .{ .adaptive = false, .items_per_range = 1, .max_fallback_requests_per_step = 0 });
+        try expectRequestStatsEqual(serial_stats, stats);
+        try expectGroupFieldsEqual(&serial, &threaded);
+        try expectRequestStateEqual(&serial, &threaded);
+        for ([_]BatchStats{ stats.group_field_batch, stats.group_field_begin_batch }) |batch| {
+            if (!batch.ran_inline and batch.item_count > 1) threaded_passes += 1;
+        }
+        totals.group_fields_built += serial_stats.group_fields_built;
+        totals.cache_evictions += serial_stats.cache_evictions;
+        totals.group_field_rebuild_throttled += serial_stats.group_field_rebuild_throttled;
+    }
+    // The schedule builds four fields, finishes them, rekeys the moved goal, and evicts.
+    var ready: usize = 0;
+    for (serial.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
+    try std.testing.expect(ready > 0);
+    try std.testing.expect(totals.group_fields_built > 4);
+    try std.testing.expect(totals.cache_evictions > 0);
+    if (threads.workerThreadCount() > 0) try std.testing.expect(threaded_passes > 0);
+}
+
+test "group-field service allocates nothing on workers (FailingAllocator, multi-worker)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var system = try groupFieldServiceSystem(&data, threads.participantSlotCount());
+    defer system.deinit();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(16, 16);
+    const config = PathfindingConfig{ .adaptive = false, .items_per_range = 1, .max_fallback_requests_per_step = 0 };
+    try writeGroupGoals(&stream, requester, group_service_schedule[0][0..2]);
+    _ = try system.update(&stream, intake_test_agents, &threads, config);
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    defer {
+        system.allocator = original;
+        system.graph.allocator = original;
+    }
+    // Two fields still building advance; two new goals begin.
+    try writeGroupGoals(&stream, requester, group_service_schedule[0]);
+    const stats = try system.update(&stream, intake_test_agents, &threads, config);
+    try std.testing.expectEqual(@as(usize, 2), stats.group_field_batch.item_count);
+    try std.testing.expect(!stats.group_field_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 2), stats.group_field_begin_batch.item_count);
+    try std.testing.expect(!stats.group_field_begin_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 2), stats.group_fields_built);
+}
+
+test "solve results land at their fallback ordinal and publish in pending order" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 3), cellWorld(6, 5), cellWorld(6, 7) };
+    for (goals) |goal| try appendIndividual(&stream, requester, goal);
+    _ = try system.updateSerial(&stream, 8, .{ .max_fallback_requests_per_step = 0 });
+    try std.testing.expectEqual(goals.len, system.pending.len);
+    // Pending 0 and 1 are escalated: the one-per-step tier-1 cap admits 0 and defers 1,
+    // so ordinals 0, 1, 2 hold pending 0, 2, 3.
+    system.pending.ptr(0).tier = 1;
+    system.pending.ptr(1).tier = 1;
+    var keys: [goals.len]PathQueryKey = undefined;
+    for (&keys, 0..) |*key, index| key.* = system.pending.at(index).key;
+
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    const stats = try system.updateSerial(&empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.escalated_deferred);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, system.fallback_indices.items);
+    try std.testing.expectEqual(@as(usize, 3), system.solve_results.items.len);
+    const stride = system.capacity.max_stored_path_cells;
+    for (system.solve_results.items, system.solved_paths.items, 0..) |result, solved, ordinal| {
+        const key = keys[system.fallback_indices.items[ordinal]];
+        try std.testing.expectEqualDeep(key, result.available);
+        try std.testing.expectEqualDeep(key, solved.key);
+        try std.testing.expectEqual(ordinal * stride, solved.offset);
+    }
+    // Published results serve their own goals; the deferred one stays pending first.
+    for ([_]usize{ 0, 2, 3 }) |index| {
+        const view = system.statusForWorld(0, cellWorld(1, 2), 0, goals[index], .default, null);
+        try std.testing.expectEqual(PathStatus.available, view.status);
+        const path = system.completed.pathSlice(system.completed.slotIndex(keys[index]).?, system.completed.resultAt(system.completed.slotIndex(keys[index]).?).path_len);
+        try std.testing.expectEqual(@as(u32, @intCast(system.graph.grid(0).?.indexForCell(keys[index].goal).?)), path[path.len - 1]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
+    try std.testing.expectEqualDeep(keys[1], system.pending.at(0).key);
+}
+
+test "pending compaction keeps deferred, tail, and rotated order across a ring wrap" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+    try std.testing.expectEqual(@as(usize, 8), system.pending.slotCount());
+
+    // Seven entries starting at physical slot 6, so logical 2.. wrap to slot 0.
+    system.pending.clear();
+    system.pending.head = 6;
+    var keys: [7]PathQueryKey = undefined;
+    for (&keys, 0..) |*key, index| {
+        key.* = system.graph.keyForWorld(0, cellWorld(@intCast(index), 4), .default).?;
+        system.pending.push(.{ .entity = try data.createEntity(), .key = key.*, .start_level = 0, .start = .{ .x = 0, .y = 0 }, .goal_index = 0 });
+        _ = system.pending_keys.insert(key.*);
+    }
+    system.pending.ptr(3).tier = 1;
+    var entities: [7]EntityId = undefined;
+    for (&entities, 0..) |*entity, index| entity.* = system.pending.at(index).entity;
+
+    // Window [0, 5): 1 was not admitted (deferred); 0 solved; 2 and 4 spilled at tier 0
+    // (rotate); 3 spilled at tier 1 (dropped). 5 and 6 are the tail.
+    system.fallback_indices.clearRetainingCapacity();
+    system.fallback_indices.appendSliceAssumeCapacity(&.{ 0, 2, 3, 4 });
+    system.solve_results.clearRetainingCapacity();
+    system.solve_results.appendSliceAssumeCapacity(&.{
+        .{ .available = keys[0] },
+        .{ .budget_exhausted = keys[2] },
+        .{ .budget_exhausted = keys[3] },
+        .{ .budget_exhausted = keys[4] },
+    });
+    var stats = PathfindingStats{};
+    system.compactPendingAfterSolve(5, &stats);
+
+    const expected_order = [_]usize{ 1, 5, 6, 2, 4 };
+    try std.testing.expectEqual(expected_order.len, system.pending.len);
+    for (expected_order, 0..) |source, logical| {
+        try std.testing.expectEqual(entities[source], system.pending.at(logical).entity);
+        try std.testing.expect(system.pending_keys.contains(keys[source]));
+    }
+    try std.testing.expectEqual(@as(u8, 1), system.pending.at(3).tier);
+    try std.testing.expectEqual(@as(u8, 1), system.pending.at(4).tier);
+    try std.testing.expectEqual(@as(u8, 0), system.pending.at(0).tier);
+    try std.testing.expect(!system.pending_keys.contains(keys[0]));
+    try std.testing.expect(!system.pending_keys.contains(keys[3]));
+    try std.testing.expectEqual(@as(usize, 1), stats.escalated_dropped);
 }

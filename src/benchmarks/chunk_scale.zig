@@ -103,6 +103,7 @@ const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
+const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const default_max_group_fields = @import("../game/systems/pathfinding/types.zig").default_max_group_fields;
 const navSizeCapacity = @import("pathfinding.zig").navSizeCapacity;
@@ -1025,10 +1026,10 @@ const NavFixture = struct {
 
     // Applies the marked cells as one buffered nav update; returns 1 when it fell back
     // to relabeling or rebuilding whole levels, else 0.
-    fn react(self: *NavFixture, thread_system: ?*ThreadSystem) !usize {
+    fn react(self: *NavFixture, thread_system: ?*ThreadSystem) !NavUpdateStats {
         const stats = try self.system.applyBufferedNavUpdates(&self.data, &self.base.world, thread_system);
         if (stats.incremental_rebuilds != 1) return error.NavReactionUnchanged;
-        return @intFromBool(stats.full_relabel != 0 or stats.edge_cap_fallback != 0);
+        return stats;
     }
 
     // The recorded step's reaction: marks its blocking changes (at least `min_marked`)
@@ -1037,9 +1038,14 @@ const NavFixture = struct {
         const marked = try self.markBlockingChanges(self.changes.events.items);
         self.changes.events.clearRetainingCapacity();
         if (marked < min_marked) return error.NavWorkloadUnmarked;
-        return self.react(self.threads);
+        return navFallbacks(try self.react(self.threads));
     }
 };
+
+// 1 when a nav reaction fell back to whole-level work.
+fn navFallbacks(stats: NavUpdateStats) usize {
+    return @intFromBool(stats.full_relabel != 0 or stats.edge_cap_fallback != 0);
+}
 
 // No path requests: the agent budget stays at its floor.
 fn navSizeConfig(side: u16, levels: usize, participant_count: usize) suite.NavSizeConfig {
@@ -1196,6 +1202,8 @@ fn runNavExplosionFillCase(allocator: std.mem.Allocator, io: std.Io, options: su
 const NavBatchTiming = struct {
     terrain: BatchTiming = .{},
     nav_ns: u64 = 0,
+    // Nav reaction stage time spent on workers.
+    nav_off_main_ns: u64 = 0,
     fallbacks: usize = 0,
 };
 
@@ -1211,8 +1219,10 @@ fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, edit_thr
         timing.terrain.add(&nav.base.world);
         const start_ns = suite.nowNs(io);
         if (try nav.markBlockingChanges(edit.events.items) == 0) return error.NavWorkloadUnmarked;
-        timing.fallbacks += try nav.react(thread_system);
+        const nav_stats = try nav.react(thread_system);
         timing.nav_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+        timing.fallbacks += navFallbacks(nav_stats);
+        timing.nav_off_main_ns += nav_stats.off_main_stage_ns;
     }
     return edit.forward.items.len + edit.back.items.len;
 }
@@ -1294,9 +1304,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         write_total += timing.terrain.write_ns;
         nav_total += timing.nav_ns;
         fallbacks += timing.fallbacks;
-        // Main is everything but the terrain stages that ran on workers and the whole nav
-        // reaction (marking and apply, wall time).
-        main_total += elapsed_ns -| (timing.terrain.off_main_ns + timing.nav_ns);
+        // Main is everything but the terrain and nav reaction stages that ran on workers.
+        main_total += elapsed_ns -| (timing.terrain.off_main_ns + timing.nav_off_main_ns);
     }
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the cells written.

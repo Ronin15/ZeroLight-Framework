@@ -19,6 +19,7 @@ const SearchScratch = @import("scratch.zig").SearchScratch;
 const types = @import("types.zig");
 const PathSolveResult = types.PathSolveResult;
 const PendingRequest = types.PendingRequest;
+const PathQueryKey = types.PathQueryKey;
 const StitchedCell = types.StitchedCell;
 const OpenNode = types.OpenNode;
 const no_parent = types.no_parent;
@@ -44,26 +45,27 @@ pub const SolveJobContext = struct {
 };
 
 // Fallback workers share the system for read-only graph/pending access but use
-// worker-indexed scratch and a worker-disjoint path stripe to stay private.
+// worker-indexed scratch. Every output (result, solved path, path stripe) sits at the
+// request's fallback ordinal, so a range writes only its own `[start, end)` window.
 pub fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *SolveJobContext = @ptrCast(@alignCast(context));
     const system = job.system;
     // Dual worker asserts: range.index vs dispatched range count AND range.end vs
-    // the fallback-index buffer this job walks.
+    // the fallback-index buffer this job walks and the ordinal windows it writes.
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= system.fallback_indices.items.len);
+    std.debug.assert(range.end <= system.solve_results.items.len);
+    std.debug.assert(range.end <= system.solved_paths.items.len);
     // scratch_slots is never resized during the parallel region (only in applyDerivedCapacity,
     // which runs in beginUpdate before parallelForWithOptions), so this pointer stays valid.
     // Guards the reserve-before-dispatch invariant: applyDerivedCapacity sized scratch_slots to
     // the participant count the caller asserted against before dispatching this batch.
     std.debug.assert(worker_id.index < system.scratch_slots.items.len);
     const scratch = &system.scratch_slots.items[worker_id.index];
-    for (range.start..range.end) |fallback_index| {
-        const pending_index = system.fallback_indices.items[fallback_index];
-        // The dense fallback index is this request's disjoint path stripe; two
-        // requests never share a stripe even when one worker solves several.
-        system.solve_results.items[pending_index] = solveOne(system, pending_index, scratch, fallback_index);
+    for (range.start..range.end) |ordinal| {
+        const pending_index = system.fallback_indices.items[ordinal];
+        system.solve_results.items[ordinal] = solveOne(system, pending_index, scratch, ordinal);
     }
 }
 
@@ -78,9 +80,11 @@ const LocalSolve = enum { found, budget_exhausted, none };
 // abstract node budget, plus at most max_stitch_segments per-segment local searches
 // (see default_max_stitch_segments) — not just one, since a corridor can cross many
 // portals — each capped at the per-segment local budget, independent of total cells.
-pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *SearchScratch, path_slot: usize) PathSolveResult {
+/// Solves logical pending entry `pending_index`, writing its solved path at `ordinal`
+/// (its fallback ordinal: result slot, solved-path slot, and path stripe).
+pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *SearchScratch, ordinal: usize) PathSolveResult {
     const graph = &system.graph;
-    const request = system.pending.items[pending_index];
+    const request = system.pending.at(pending_index);
     if (!graph.valid()) return .{ .unavailable = request.key };
 
     // Start-side failures are start_invalid, never unavailable: the negative cache is
@@ -99,14 +103,14 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
     const same_level = request.start_level == request.key.goal_level;
     if (same_level) {
         if (start_index == goal_index) {
-            recordPath(system, pending_index, path_slot, &.{@intCast(goal_index)}, request.start_level);
+            recordPath(system, ordinal, request.key, &.{@intCast(goal_index)}, request.start_level);
             return .{ .available = request.key };
         }
         // Same component: a short hop the local A* can usually finish.
         if (start_grid.connected(start_index, goal_index)) {
             switch (localAStar(start_grid, scratch, start_index, goal_index)) {
                 .found => {
-                    recordPath(system, pending_index, path_slot, scratch.path_scratch.items, request.start_level);
+                    recordPath(system, ordinal, request.key, scratch.path_scratch.items, request.start_level);
                     return .{ .available = request.key };
                 },
                 // Budget spill on a short same-component hop is a transient: keep
@@ -143,7 +147,7 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
     // reserved buffer. Tier 0 is also semantically the CHEAPER attempt, so clamping
     // down to the tier-1 ceiling is never a behavior change in the intended direction.
     const stitched_cell_cap = if (request.tier == 0) @min(system.capacity.tier0_stitched_cell_cap, system.capacity.max_stitched_path_cells) else system.capacity.max_stitched_path_cells;
-    return solveAbstract(system, pending_index, scratch, path_slot, request, start_grid, goal_grid, start_index, goal_index, abstract_node_cap, stitched_cell_cap, system.capacity.max_stitch_segments);
+    return solveAbstract(system, scratch, ordinal, request, start_grid, goal_grid, start_index, goal_index, abstract_node_cap, stitched_cell_cap, system.capacity.max_stitch_segments);
 }
 
 // Abstract A* over portal nodes + link edges to choose a corridor across
@@ -156,9 +160,8 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
 // rather than mislabeling it; only a genuinely missing corridor is unavailable.
 fn solveAbstract(
     system: *PathfindingSystem,
-    pending_index: usize,
     scratch: *SearchScratch,
-    path_slot: usize,
+    ordinal: usize,
     request: PendingRequest,
     start_grid: *const NavGrid,
     goal_grid: *const NavGrid,
@@ -191,9 +194,9 @@ fn solveAbstract(
     if (stitched.len == 0) return .{ .unavailable = request.key };
     // Record the start-level prefix as the plain path (a first-cell fallback) and the
     // full stitched path the query walks.
-    recordStartLevelPrefix(system, pending_index, path_slot, stitched, request.start_level);
-    recordStitched(system, pending_index, path_slot, stitched);
-    const solved = &system.solved_paths.items[pending_index];
+    recordStartLevelPrefix(system, ordinal, request.key, stitched, request.start_level);
+    recordStitched(system, ordinal, stitched);
+    const solved = &system.solved_paths.items[ordinal];
     solved.via_abstract = true;
     solved.cross_level = corridor.crosses_level;
     return .{ .available = request.key };
@@ -622,16 +625,16 @@ fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_index:
     std.mem.reverse(u32, scratch.path_scratch.items);
 }
 
-fn recordPath(system: *PathfindingSystem, pending_index: usize, path_slot: usize, path: []const u32, path_level: u16) void {
+fn recordPath(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, path: []const u32, path_level: u16) void {
     const stride = system.capacity.max_stored_path_cells;
-    const offset = path_slot * stride;
+    const offset = ordinal * stride;
     // Downsample (not head-truncate) an over-stride plain path so the agent keeps
     // progressing to the goal instead of stalling at the stride boundary. Shares the
     // result cache's contract via downsamplePathInto.
     const dst = system.worker_path_pool.items[offset .. offset + stride];
     const stored_len = types.downsamplePathInto(dst, path);
-    system.solved_paths.items[pending_index] = .{
-        .key = system.pending.items[pending_index].key,
+    system.solved_paths.items[ordinal] = .{
+        .key = key,
         .offset = offset,
         .len = stored_len,
         .path_level = path_level,
@@ -641,9 +644,9 @@ fn recordPath(system: *PathfindingSystem, pending_index: usize, path_slot: usize
 // Records the leading start-level run of the stitched path as the plain path buffer
 // (used only as a first-cell fallback in the query). Writes the rest of the
 // SolvedPath entry, mirroring recordPath's contract for a local solve.
-fn recordStartLevelPrefix(system: *PathfindingSystem, pending_index: usize, path_slot: usize, stitched: []const StitchedCell, start_level: u16) void {
+fn recordStartLevelPrefix(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, stitched: []const StitchedCell, start_level: u16) void {
     const stride = system.capacity.max_stored_path_cells;
-    const offset = path_slot * stride;
+    const offset = ordinal * stride;
     var count: usize = 0;
     for (stitched) |sc| {
         if (sc.level != start_level) break; // first level change ends the prefix
@@ -651,8 +654,8 @@ fn recordStartLevelPrefix(system: *PathfindingSystem, pending_index: usize, path
         system.worker_path_pool.items[offset + count] = sc.cell;
         count += 1;
     }
-    system.solved_paths.items[pending_index] = .{
-        .key = system.pending.items[pending_index].key,
+    system.solved_paths.items[ordinal] = .{
+        .key = key,
         .offset = offset,
         .len = count,
         .path_level = start_level,
@@ -661,7 +664,7 @@ fn recordStartLevelPrefix(system: *PathfindingSystem, pending_index: usize, path
 
 // Copies the full stitched (level,cell) corridor path into this request's disjoint
 // stripe. Must run after recordStartLevelPrefix, which writes the rest of the entry.
-fn recordStitched(system: *PathfindingSystem, pending_index: usize, path_slot: usize, stitched: []const StitchedCell) void {
+fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell) void {
     const stride = system.capacity.max_stitched_path_cells;
     if (stride == 0) return;
     // stitchCorridor's cap (tier0_stitched_cell_cap or max_stitched_path_cells, both
@@ -670,10 +673,10 @@ fn recordStitched(system: *PathfindingSystem, pending_index: usize, path_slot: u
     // future drift between the solve-side cap and this stride fails loud instead of
     // silently dead-ending the agent at the truncation point.
     std.debug.assert(stitched.len <= stride);
-    const offset = path_slot * stride;
+    const offset = ordinal * stride;
     @memcpy(system.worker_stitched_pool.items[offset .. offset + stitched.len], stitched);
-    system.solved_paths.items[pending_index].stitched_offset = offset;
-    system.solved_paths.items[pending_index].stitched_len = stitched.len;
+    system.solved_paths.items[ordinal].stitched_offset = offset;
+    system.solved_paths.items[ordinal].stitched_len = stitched.len;
 }
 
 // ----------------------------------------------------------------------------
