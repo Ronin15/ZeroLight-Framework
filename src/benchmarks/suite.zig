@@ -695,10 +695,12 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
     if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
     if (isRenderGamePrepGroup(group_name)) return "render entities";
+    if (std.mem.startsWith(u8, group_name, "render-sparse-window-")) return "sparse tiles in the world";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
     if (isChunkScaleBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(window edge chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
     return "items";
 }

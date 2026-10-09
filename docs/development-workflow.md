@@ -357,8 +357,17 @@ Reading results:
   thread's share. `chunk-scale-dig`, `chunk-scale-ramp` (a ramp dig with its
   level link), and `chunk-scale-gpu-sync-*` measure the serial case only
   (single-cell digs, ramps, and GPU syncs run on the main thread); the
-  GPU sync groups time the GPU tile store sync for a dig and for a level
-  entering the render window, against a headless store.
+  GPU sync groups time the GPU tile store sync for a dig, for a level
+  entering the render window, and for a 2-, 6-, or 14-chunk window panning
+  one chunk across mixed chunks and back (`chunk-scale-gpu-sync-pan`, item
+  code `window edge * 10^7 + level side * 1000 + levels`), against a headless
+  store.
+- `render-sparse-window-frame`, `-pan`, and `-add` time one frame's sparse-tile
+  prep (visibility update, depth walk, submit into a headless `SpriteBatch`)
+  on a 2048² world of 8 levels holding 1,000, 16,000, or 256,000 sparse tiles
+  (the item count), exactly 256 of them inside a fixed 1280×720 window: a
+  still frame, a one-chunk pan and back, and one tile added outside the window.
+  Serial only.
 
 Optional arguments narrow or scale the run. Day-to-day runs target a group
 (`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare
@@ -379,6 +388,7 @@ zig build bench -- --group nav-update-scattered --details
 zig build bench -- --group nav-update-multichunk --details
 zig build bench -- --group scope --details
 zig build bench -- --group-prefix chunk-scale- --case serial-direct
+zig build bench -- --group-prefix render-sparse-window- --case serial-direct
 zig build bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
 zig build bench -- --details
 ```

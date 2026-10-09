@@ -22,18 +22,27 @@
 //!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
 //!     and back, each step one level entering (its directory and 64 mixed blocks)
 //!     and one leaving. Linear in chunks per level, flat across depth.
+//!   - `chunk-scale-gpu-sync-pan`: a square window of 2, 6, or 14 chunks over the
+//!     two deepest levels pans one chunk across and back, with a visibility update
+//!     and a GPU sync after each step; the window and the column it pans into are
+//!     all mixed chunks. Today the visibility update is O(window chunks), e², and
+//!     the GPU sync O(1) with no uploads. With window residency: a CPU scan of
+//!     O(layers x e²) window chunks and O(layers x e) uploads. Passes when flat
+//!     across level size and depth at every edge, and the edge axis matches those
+//!     orders.
 //! Single-cell writes go through the step's reserve seam (`reserveDenseCellWrite`)
 //! first. Changes sit on the deepest levels at the level center; each iteration ends
 //! at its start state. The item count encodes the case as `level side * 1000 +
-//! levels`, plus `region chunks * 10^7` for the two batched groups. Fixtures and the
-//! batches' write lists build once per case outside the timed loop. The batched
-//! groups run serial, fixed-thread, and adaptive, with the two deepest levels
-//! GPU resident so the GPU edit merge is timed; they report each stage's time and
-//! the main thread's share. Single-cell digs and GPU syncs are main-thread work, so
-//! their groups measure the serial case only. The GPU
-//! sync groups drive `syncDenseTileStore` against a headless renderer whose tile
-//! store has no GPU buffer: they time planning, commit, and the queued upload
-//! batch, which the bench drops after each sync as a frame copy pass would.
+//! levels`, plus `region chunks * 10^7` for the two batched groups or `window edge
+//! chunks * 10^7` for the pan group. Fixtures and the batches' write lists build
+//! once per case outside the timed loop. The batched groups run serial,
+//! fixed-thread, and adaptive, with the two deepest levels GPU resident so the GPU
+//! edit merge is timed; they report each stage's time and the main thread's share.
+//! Single-cell digs and GPU syncs are main-thread work, so their groups measure the
+//! serial case only. The GPU sync groups drive `syncDenseTileStore` against a
+//! headless renderer whose tile store has no GPU buffer: they time planning,
+//! commit, and the queued upload batch, which the bench drops after each sync as a
+//! frame copy pass would.
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -63,6 +72,9 @@ const suite = @import("suite.zig");
 const level_sides = [_]u16{ 256, 1024, 2048 };
 const level_counts = [_]u16{ 8, 32, 128 };
 const case_encoding: usize = 1000;
+// Encodes the batched groups' region chunks and the pan group's window edge above
+// the level side and count.
+const case_prefix_encoding: usize = 10_000_000;
 
 const scale_item_counts = blk: {
     var counts: [level_sides.len * level_counts.len]usize = undefined;
@@ -76,17 +88,45 @@ const scale_item_counts = blk: {
 
 // Region sizes of the batched groups, in chunks touched by one edit.
 const region_chunk_counts = [_]usize{ 4, 64, 256 };
-const region_encoding: usize = 10_000_000;
 
 const region_item_counts = blk: {
     var counts: [region_chunk_counts.len * scale_item_counts.len]usize = undefined;
     for (region_chunk_counts, 0..) |region, region_index| {
         for (scale_item_counts, 0..) |scale, scale_index| {
-            counts[region_index * scale_item_counts.len + scale_index] = region * region_encoding + scale;
+            counts[region_index * scale_item_counts.len + scale_index] = region * case_prefix_encoding + scale;
         }
     }
     break :blk counts;
 };
+
+// Pan group window edges, in chunks; each window and the column it pans into fit
+// the smallest level.
+const pan_window_edges = [_]u16{ 2, 6, 14 };
+
+// The pan region's columns: the window and the column it pans into.
+fn panRegionColumns(window_edge: u16) u16 {
+    return window_edge + 1;
+}
+
+const pan_item_counts = blk: {
+    var counts: [pan_window_edges.len * scale_item_counts.len]usize = undefined;
+    for (pan_window_edges, 0..) |edge, edge_index| {
+        std.debug.assert(panRegionColumns(edge) <= level_sides[0] / default_chunk_size_tiles);
+        for (scale_item_counts, 0..) |scale, scale_index| {
+            counts[edge_index * scale_item_counts.len + scale_index] = @as(usize, edge) * case_prefix_encoding + scale;
+        }
+    }
+    break :blk counts;
+};
+
+// Elements one pan iteration (a step across and back) uploads. Residency today
+// covers whole levels, so a pan uploads nothing. With window residency this becomes
+// 2 resident layers x 2 steps x (window_edge entering chunks' words or blocks, plus
+// the directory and window words the step rewrites).
+fn expectedPanUploads(window_edge: u16) usize {
+    _ = window_edge;
+    return 0;
+}
 
 const dig_cell_count: u16 = 64;
 const cave_in_levels: u16 = 4;
@@ -132,6 +172,12 @@ pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
     .runCase = runGpuSyncLevelEnterCase,
 };
 
+pub const gpu_sync_pan_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-gpu-sync-pan",
+    .defaultItemCounts = panItemCounts,
+    .runCase = runGpuSyncPanCase,
+};
+
 fn scaleItemCounts(_: suite.Profile) []const usize {
     return &scale_item_counts;
 }
@@ -140,7 +186,11 @@ fn regionItemCounts(_: suite.Profile) []const usize {
     return &region_item_counts;
 }
 
-const Workload = enum { dig, ramp, gpu_sync_dig, gpu_sync_level_enter };
+fn panItemCounts(_: suite.Profile) []const usize {
+    return &pan_item_counts;
+}
+
+const Workload = enum { dig, ramp, gpu_sync_dig, gpu_sync_level_enter, gpu_sync_pan };
 
 const BatchWorkload = enum { cave_in, explosion_fill };
 
@@ -168,6 +218,10 @@ fn runGpuSyncLevelEnterCase(allocator: std.mem.Allocator, io: std.Io, options: s
     return runCase(allocator, io, options, case, item_count, .gpu_sync_level_enter);
 }
 
+fn runGpuSyncPanCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, item_count, .gpu_sync_pan);
+}
+
 const Fixture = struct {
     world: WorldSystem,
     dirt: TileId,
@@ -177,6 +231,10 @@ const Fixture = struct {
     levels: u16,
     // GPU sync groups only: a headless renderer holding the world's tile store.
     renderer: ?Renderer = null,
+    // Pan group only: the window edge and its start chunk.
+    pan_window_edge: u16 = 0,
+    pan_origin_chunk_x: u16 = 0,
+    pan_origin_chunk_y: u16 = 0,
 
     fn deinit(self: *Fixture) void {
         if (self.renderer) |*renderer| {
@@ -236,6 +294,28 @@ const Fixture = struct {
         return self.levels - 1 - gpu_window_levels_below;
     }
 
+    // Sets the pan window `step_chunks` right of its start, around the GPU active
+    // level, with no overscan. The rect ends half a tile short of the window's far
+    // chunk edge: at large pixel coordinates an f32 rect ending exactly on a tile
+    // edge rounds into the next tile.
+    fn setPanWindow(self: *Fixture, step_chunks: u16) void {
+        const tile_size = self.world.tile_size;
+        const chunk_px = @as(f32, @floatFromInt(default_chunk_size_tiles)) * tile_size;
+        const edge = self.pan_window_edge;
+        const min_chunk_x = self.pan_origin_chunk_x + step_chunks;
+        const min_chunk_y = self.pan_origin_chunk_y;
+        const extent = @as(f32, @floatFromInt(edge)) * chunk_px - tile_size / 2;
+        self.world.setVisibleChunksForWorldRect(.{
+            .x = @as(f32, @floatFromInt(min_chunk_x)) * chunk_px,
+            .y = @as(f32, @floatFromInt(min_chunk_y)) * chunk_px,
+            .w = extent,
+            .h = extent,
+        }, 0, self.gpuActiveLevel());
+        const region = self.world.visibleChunkRegion().?;
+        std.debug.assert(region.min.x == min_chunk_x and region.min.y == min_chunk_y);
+        std.debug.assert(region.max_exclusive.x == min_chunk_x + edge and region.max_exclusive.y == min_chunk_y + edge);
+    }
+
     // Floor layer of `level`; level `i` owns layer `i`.
     fn floor(self: *const Fixture, level: u16) usize {
         _ = self;
@@ -274,9 +354,12 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
     if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs, ramps, and GPU syncs run on the main thread");
-    const side: u16 = @intCast(item_count / case_encoding);
-    const levels: u16 = @intCast(item_count % case_encoding);
+    const window_edge: u16 = @intCast(item_count / case_prefix_encoding);
+    const scale = item_count % case_prefix_encoding;
+    const side: u16 = @intCast(scale / case_encoding);
+    const levels: u16 = @intCast(scale % case_encoding);
     std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+    std.debug.assert((workload == .gpu_sync_pan) == (window_edge > 0));
 
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
@@ -290,6 +373,20 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             // 64 mixed chunks on each level the window crosses.
             for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
+        },
+        .gpu_sync_pan => {
+            try fixture.attachHeadlessTileStore(allocator);
+            const columns = panRegionColumns(window_edge);
+            const chunks_per_side = side / default_chunk_size_tiles;
+            std.debug.assert(columns <= chunks_per_side);
+            fixture.pan_window_edge = window_edge;
+            fixture.pan_origin_chunk_x = (chunks_per_side - columns) / 2;
+            fixture.pan_origin_chunk_y = (chunks_per_side - window_edge) / 2;
+            for (fixture.gpuActiveLevel()..fixture.levels) |level| {
+                try mixRegion(&fixture, @intCast(level), columns, window_edge);
+            }
+            fixture.setPanWindow(0);
+            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         },
         .dig, .ramp => {},
     }
@@ -330,6 +427,14 @@ fn runIteration(fixture: *Fixture, workload: Workload) !usize {
         .gpu_sync_level_enter => blk: {
             const entered = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
             break :blk entered + try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
+        },
+        .gpu_sync_pan => blk: {
+            fixture.setPanWindow(1);
+            const panned = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            fixture.setPanWindow(0);
+            const uploaded = panned + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            if (uploaded != expectedPanUploads(fixture.pan_window_edge)) return error.PanUploadCountMismatch;
+            break :blk uploaded;
         },
     };
 }
@@ -435,6 +540,26 @@ fn digCells(fixture: *Fixture, level: u16, tile: TileId) !usize {
         }
     }
     return dig_cell_count;
+}
+
+// Makes every chunk of the pan region on `level` mixed: one tunnel cell per chunk
+// in `columns` x `rows` chunks from the pan origin, in one step.
+fn mixRegion(fixture: *Fixture, level: u16, columns: u16, rows: u16) !void {
+    const world = &fixture.world;
+    const layer = fixture.floor(level);
+    const chunk = default_chunk_size_tiles;
+    world.beginDenseCellWriteReserve();
+    for (0..2) |pass| {
+        for (0..rows) |row| for (0..columns) |col| {
+            const x = (fixture.pan_origin_chunk_x + @as(u16, @intCast(col))) * chunk + 5;
+            const y = (fixture.pan_origin_chunk_y + @as(u16, @intCast(row))) * chunk + 7;
+            if (pass == 0) {
+                try world.reserveDenseCellWrite(layer, x, y, fixture.tunnel);
+            } else if (try world.setDenseTile(layer, x, y, fixture.tunnel) == null) {
+                return error.PanRegionCellUnchanged;
+            }
+        };
+    }
 }
 
 // The two batched edits of one iteration, each the other's reversal, built once in
@@ -577,8 +702,8 @@ fn tunersSettled(world: *const WorldSystem) bool {
 
 fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const region_chunks = item_count / region_encoding;
-    const scale = item_count % region_encoding;
+    const region_chunks = item_count / case_prefix_encoding;
+    const scale = item_count % case_prefix_encoding;
     const side: u16 = @intCast(scale / case_encoding);
     const levels: u16 = @intCast(scale % case_encoding);
     std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);

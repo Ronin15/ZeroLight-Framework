@@ -18,6 +18,7 @@ const perception = @import("perception.zig");
 const render_prep = @import("render_prep.zig");
 const render_game_prep = @import("render_game_prep.zig");
 const scope = @import("scope.zig");
+const sparse_window = @import("sparse_window.zig");
 const spatial_index = @import("spatial_index.zig");
 const steering = @import("steering.zig");
 const suite = @import("suite.zig");
@@ -58,10 +59,14 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     chunk_scale.explosion_fill_group,
     chunk_scale.gpu_sync_dig_group,
     chunk_scale.gpu_sync_level_enter_group,
+    chunk_scale.gpu_sync_pan_group,
     render_prep.group,
     render_game_prep.group,
     render_game_prep.dense_surface_group,
     render_game_prep.dense_deep_group,
+    sparse_window.frame_group,
+    sparse_window.pan_group,
+    sparse_window.add_group,
     scope.group,
     spatial_index.group,
     perception.group,
