@@ -31,7 +31,6 @@ const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
-const AdmittedDig = @import("dig_controller.zig").AdmittedDig;
 const facedCellForEntity = @import("dig_controller.zig").facedCellForEntity;
 const DestructibleController = @import("destructible_controller.zig").DestructibleController;
 const DestructibleProcessStats = @import("destructible_controller.zig").DestructibleProcessStats;
@@ -60,7 +59,6 @@ const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapaci
 const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
-const nav_new_links_per_step_max = @import("systems/pathfinding.zig").nav_new_links_per_step_max;
 const PerceptionStats = @import("systems/perception.zig").PerceptionStats;
 const PerceptionSystem = @import("systems/perception.zig").PerceptionSystem;
 const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPerceptionCandidate;
@@ -74,7 +72,6 @@ const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const structuralEventHeadroom = @import("simulation.zig").structuralEventHeadroom;
 const EventProducerId = @import("simulation.zig").EventProducerId;
 const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
-const eventStageOf = @import("simulation.zig").eventStageOf;
 const perception_events_per_observer_max = @import("simulation.zig").perception_events_per_observer_max;
 const affect_events_per_row_max = @import("simulation.zig").affect_events_per_row_max;
 const ActionIntent = @import("simulation.zig").ActionIntent;
@@ -494,8 +491,6 @@ pub const SimulationPipelineStats = struct {
     destructibles_destroyed: usize = 0,
     /// Destructible entities hit but not destroyed this step.
     destructibles_hit: usize = 0,
-    /// Level-link pool growths at the dig commit seam this step (0 or 1).
-    nav_link_capacity_grows: usize = 0,
     /// Plane-traversal landing-carve scratch growths this step (reservation short of the
     /// live population; zero in steady state).
     dig_plane_scratch_grown: usize = 0,
@@ -616,7 +611,6 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.action_intents_dropped, metric(self.action_intents_dropped));
         perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
         perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
-        perf.recordMetric(.nav_link_capacity_grows, metric(self.nav_link_capacity_grows));
         perf.recordMetric(.dig_plane_scratch_grown, metric(self.dig_plane_scratch_grown));
     }
 };
@@ -629,13 +623,6 @@ fn metric(value: usize) u64 {
 /// block, hot-store aligned (e.g. 12 -> 48, 37 -> 80, 7 -> 32).
 pub fn grownPopulationCapacity(rows: usize) usize {
     return hotStoreCapacity(rows + rows / 2 + movement_range_alignment_items);
-}
-
-/// The dig commit seam's level-link growth target: 1.5x plus one per-step link budget
-/// (`nav_new_links_per_step_max`), e.g. 0 -> 8, 8 -> 20, 2048 -> 3080. A pure function of
-/// the committed link count, so growth never depends on allocation history.
-pub fn grownLevelLinkLimit(links: usize) usize {
-    return links + links / 2 + nav_new_links_per_step_max;
 }
 
 /// What one `syncPopulationCapacity` call did. All-false on the O(1) fast path.
@@ -696,11 +683,6 @@ pub const SimulationPipeline = struct {
     population_capacity_grows: u64 = 0,
     /// Once-only flag for the first-growth log.
     population_growth_logged: bool = false,
-    /// Telemetry: level-link pool growths at the dig commit seam (perf metric
-    /// `nav_link_capacity_grows`).
-    level_link_capacity_grows: u64 = 0,
-    /// Once-only flag for the first level-link growth log.
-    level_link_growth_logged: bool = false,
     /// This pipeline's share of `frame.events`' `capacity_limit` for perception,
     /// passed through as `PerceptionConfig.max_events_per_step`. Derived share
     /// (`perception_events_per_observer_max` x tracked `AiPerception` rows), exact at
@@ -828,9 +810,6 @@ pub const SimulationPipeline = struct {
         } else {
             frame.events.setCapacityLimit(sum);
         }
-        // Further per-step reserves attach here; `growPopulationCapacity`
-        // re-runs this whole function on growth, so each stays sized to the grown bounds.
-        try self.pathfinding.reserveNavDirty(self.structuralStageEventBound());
     }
 
     /// Reserves `frame.contacts`, `frame.collision_triggers` and the response intents and
@@ -846,19 +825,6 @@ pub const SimulationPipeline = struct {
         // Response writes the trigger stream as one range.
         try frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_capacity));
         try self.collision_response.reserveForContacts(contact_capacity);
-    }
-
-    /// The per-step bound on `.structural_commit`-stage events: the sum of
-    /// `maxEventsPerStep` over the producers `eventStageOf` classifies into that stage.
-    /// The post-commit nav reaction marks dirty cells only from those events, so it sizes
-    /// the pathfinding dirty buffers (`reserveNavDirty`).
-    pub fn structuralStageEventBound(self: *const SimulationPipeline) usize {
-        const budgets = self.eventBudgets();
-        var sum: usize = 0;
-        inline for (comptime std.meta.tags(EventProducerId)) |producer| {
-            if (comptime eventStageOf(producer) == .structural_commit) sum += maxEventsPerStep(producer, budgets);
-        }
-        return sum;
     }
 
     /// The per-step `frame.events` bound: the exhaustive sum of `maxEventsPerStep`
@@ -1012,31 +978,6 @@ pub const SimulationPipeline = struct {
         return stats;
     }
 
-    /// Level-link growth seam. Main thread, the `dig_world_edit` stage, before the dig
-    /// mutates the world; cold. When the world's link pool is full, grows it geometrically
-    /// to `grownLevelLinkLimit(len)`; level links are runtime-growing, so growth is never
-    /// refused (`max_nav_memory_bytes` is checked only at the nav build). The pathfinding
-    /// link stores grow FIRST, then the world's limit, so an OOM leaves the world untouched
-    /// and the next press retries. Runs only for a ramp `DigController.admit` let through
-    /// (`admitDigAndGrowLinks`), so the trigger and target are pure functions of the
-    /// committed link count and an admitted ramp; no-op presses never grow the pool.
-    /// Returns whether the pool grew.
-    fn ensureLevelLinkRoom(self: *SimulationPipeline, world: *WorldSystem) !bool {
-        if (world.hasLevelLinkRoom()) return false;
-        const target = grownLevelLinkLimit(world.levelLinks().len);
-        try self.pathfinding.reserveLinkCapacity(target);
-        try world.reserveLevelLinks(target);
-        self.level_link_capacity_grows += 1;
-        if (!self.level_link_growth_logged) {
-            self.level_link_growth_logged = true;
-            if (comptime logging.enabled(.info) and !builtin.is_test) logging.game.info(
-                "dig seam grew the level-link pool to {d} links",
-                .{target},
-            );
-        }
-        return true;
-    }
-
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
@@ -1161,14 +1102,6 @@ pub const SimulationPipeline = struct {
         return PathfindingSystem.pendingEventsMayInvalidateNavigation(frame);
     }
 
-    /// Whether `world` holds LevelLinks (e.g. a ramp dug this step) the nav graph has not
-    /// folded in yet. The post-commit nav reaction processes them and appends the
-    /// invalidation event even when no event flipped blocking, so the caller's event
-    /// reservation must consult this too.
-    pub fn hasPendingNavLinks(self: *const SimulationPipeline, world: *const WorldSystem) bool {
-        return self.pathfinding.hasPendingNavLinks(world);
-    }
-
     /// Queues ambient audio (music + movement-gated jet loop) through the owned
     /// audio controller. Buffer/input/data are borrowed; the controller owns the
     /// audio-policy runtime state.
@@ -1244,7 +1177,6 @@ pub const SimulationPipeline = struct {
         stimuli_sticky_dropped: usize = 0,
         stimuli_promoted: usize = 0,
         action_intents_dropped: usize = 0,
-        nav_link_capacity_grows: usize = 0,
         dig_plane_scratch_grown: usize = 0,
         cognition_region: ?ActiveRegion = null,
         ai_halo_indices: []const u32 = &[_]u32{},
@@ -1303,7 +1235,6 @@ pub const SimulationPipeline = struct {
                 .action_intents_dropped = self.action_intents_dropped,
                 .destructibles_destroyed = self.destructible.destroyed,
                 .destructibles_hit = self.destructible.hits,
-                .nav_link_capacity_grows = self.nav_link_capacity_grows,
                 .dig_plane_scratch_grown = self.dig_plane_scratch_grown,
             };
         }
@@ -1346,33 +1277,12 @@ pub const SimulationPipeline = struct {
 
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        // Admission and the level-link growth seam run first, before the promote below
-        // consumes the deferred stimuli, so a growth OOM leaves this step's state untouched
-        // and the next press retries from the same state.
-        const admitted = try self.admitDigAndGrowLinks(context.world, context.data, context.player.*, context.frame);
-        step.nav_link_capacity_grows = @intFromBool(admitted.link_pool_grew);
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         // Player-authored world edit. Its world_tile_changed event is deferred and
         // re-masks navigation in merge_outputs regardless of order.
-        if (admitted.dig) |dig| try self.dig.commit(dig, context.world, context.frame);
+        try self.dig.process(context.world, context.data, context.player.*, context.frame);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
-    }
-
-    const AdmittedDigStep = struct {
-        dig: ?AdmittedDig,
-        link_pool_grew: bool,
-    };
-
-    /// The dig's admission plus the level-link growth seam: `DigController.admit`, then,
-    /// only for an admitted ramp, `ensureLevelLinkRoom` (main thread, before the dig
-    /// mutates the world, so the dig's link append never allocates). A no-op press never
-    /// grows the pool. Mutates nothing but the pool growth, so the stage runs it before any
-    /// other step-state change.
-    fn admitDigAndGrowLinks(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *const SimulationFrame) !AdmittedDigStep {
-        const dig = try self.dig.admit(world, data, player, frame) orelse return .{ .dig = null, .link_pool_grew = false };
-        const grew = dig.intent == .ramp and try self.ensureLevelLinkRoom(world);
-        return .{ .dig = dig, .link_pool_grew = grew };
     }
 
     /// Advance the stagger clock, derive the cognition halo from the fixed-step
@@ -5224,710 +5134,6 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     try std.testing.expectApproxEqAbs(dig_stimulus_y, data.aiPerceptionConst(observer_phase3).?.heard_stimulus_y, 1.0);
 }
 
-// Feeds one cross-level path request straight to the pipeline's pathfinding system and
-// solves it serially (the request half of what steering + the pathfinding stage do).
-fn requestCrossLevelPath(pipeline: *SimulationPipeline, requester: EntityId, start_level: u16, start: math.Vec2, goal_level: u16, goal: math.Vec2) !PathfindingStats {
-    const PathRequest = @import("simulation.zig").PathRequest;
-    var stream = @import("simulation.zig").RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer stream.deinit();
-    const range_base = try stream.appendRangeCounts(1);
-    stream.addCount(range_base, 1);
-    try stream.prefixAppendedRanges(range_base);
-    var writer = stream.rangeWriter(range_base);
-    writer.write(.{ .entity = requester, .start_level = start_level, .goal_level = goal_level, .start = start, .goal = goal });
-    writer.finish();
-    stream.finishWrite();
-    return pipeline.pathfinding.updateSerial(&stream, 8, .{});
-}
-
-test "player-dug ramp is routable by an underground NPC the same step" {
-    // End to end: a ramp dug at an INTERIOR nav cell through the real dig_ramp
-    // intent joins the abstract nav tier in that step's post-commit reaction (link cursor:
-    // interior slot + both levels dirtied), so an underground NPC's surface-bound
-    // request resolves `available` without any save/load or full rebuild.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
-    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    defer meta.deinit();
-    // Level 1 is solid dirt except the player's cell (3,3) and the NPC's cell (3,4).
-    var world = try gateTestWorld(&meta, &.{ .{ 3, 3 }, .{ 3, 4 } });
-    defer world.deinit();
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, cognition_halo_chunks);
-
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var player = try Player.spawn(&data);
-    player.current_level = 1;
-    try data.setWorldLevel(player.entity, 1);
-    placePlayerFlush(&data, player, .{ 3, 3 });
-    data.facingPtr(player.entity).?.* = .right;
-    const npc = try data.createEntity();
-
-    const dig_config = try DigConfig.fromMeta(&meta);
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
-    try frame.reservePathRequests(2, 2);
-    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
-    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
-        .contact_capacity = 4,
-        .dig = dig_config,
-        .movement_body_capacity = 4,
-        .navigation_world = &world,
-        .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
-            .max_group_fields = 1,
-            .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
-        },
-    });
-    defer pipeline.deinit();
-
-    const npc_pos: math.Vec2 = .{ .x = 3 * 32 + 16, .y = 4 * 32 + 16 };
-    const goal: math.Vec2 = .{ .x = 6 * 32 + 16, .y = 6 * 32 + 16 };
-    // No ramp yet: the underground NPC's surface-bound request is unavailable.
-    try std.testing.expectEqual(@as(usize, 1), (try requestCrossLevelPath(&pipeline, npc, 1, npc_pos, 0, goal)).unavailable_results);
-
-    const ctx = SimulationPipelineUpdateContext{
-        .data = &data,
-        .frame = &frame,
-        .world = &world,
-        .player = &player,
-        .thread_system = &threads,
-        .delta_seconds = 0.016,
-        .bounds_width = 256,
-        .bounds_height = 256,
-        .sim_view = fullWorldSimView(&world),
-    };
-    frame.beginStep();
-    frame.dig_intent = .ramp;
-    _ = try pipeline.update(ctx);
-    try std.testing.expectEqual(@as(usize, 1), world.levelLinks().len);
-    try std.testing.expectEqual(@as(u16, 4), world.levelLinks()[0].cell_a.x);
-    // The caller's event reservation sees the pending link even if no event flipped blocking.
-    try std.testing.expect(pipeline.hasPendingNavLinks(&world));
-    const nav_stats = try pipeline.reactToPostCommitNavEvents(&frame, &data, &world, null);
-    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
-    try std.testing.expect(!pipeline.hasPendingNavLinks(&world));
-
-    // Within the next 2 steps the NPC's surface-bound request resolves available.
-    var resolved = false;
-    for (0..2) |_| {
-        _ = try requestCrossLevelPath(&pipeline, npc, 1, npc_pos, 0, goal);
-        if (pipeline.pathfinding.statusForWorld(1, npc_pos, 0, goal, .default, null).status == .available) {
-            resolved = true;
-            break;
-        }
-    }
-    try std.testing.expect(resolved);
-}
-
-test "a ramp dig past the initial link reservation grows at the dig seam and is routable" {
-    // The world reserves no runtime link room at load, so the first
-    // ramp press finds the pool full. The dig seam grows it (and the nav link edges) before
-    // the dig, the ramp and its link land, and the underground NPC's surface-bound request
-    // resolves `available`, exactly as if the pool were unbounded.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
-    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    defer meta.deinit();
-    var world = try gateTestWorld(&meta, &.{ .{ 3, 3 }, .{ 3, 4 } });
-    defer world.deinit();
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, cognition_halo_chunks);
-    try world.reserveLevelLinks(world.levelLinks().len);
-
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var player = try Player.spawn(&data);
-    player.current_level = 1;
-    try data.setWorldLevel(player.entity, 1);
-    placePlayerFlush(&data, player, .{ 3, 3 });
-    data.facingPtr(player.entity).?.* = .right;
-    const npc = try data.createEntity();
-
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
-    try frame.reservePathRequests(2, 2);
-    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
-    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
-        .contact_capacity = 4,
-        .dig = try DigConfig.fromMeta(&meta),
-        .movement_body_capacity = 4,
-        .navigation_world = &world,
-        .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
-            .max_group_fields = 1,
-            .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
-        },
-    });
-    defer pipeline.deinit();
-    try std.testing.expect(!world.hasLevelLinkRoom());
-
-    const ctx = SimulationPipelineUpdateContext{
-        .data = &data,
-        .frame = &frame,
-        .world = &world,
-        .player = &player,
-        .thread_system = &threads,
-        .delta_seconds = 0.016,
-        .bounds_width = 256,
-        .bounds_height = 256,
-        .sim_view = fullWorldSimView(&world),
-    };
-    frame.beginStep();
-    frame.dig_intent = .ramp;
-    const stats = try pipeline.update(ctx);
-    const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expectEqual(pipeline.dig.ramp_tile, world.denseTile(floor1, 4, 3));
-    try std.testing.expectEqual(@as(usize, 1), world.levelLinks().len);
-    try std.testing.expectEqual(grownLevelLinkLimit(0), world.levelLinkLimit());
-    try std.testing.expect(pipeline.pathfinding.graph.link_edges.capacity >= world.levelLinkLimit());
-    try std.testing.expectEqual(@as(usize, 1), stats.nav_link_capacity_grows);
-    try std.testing.expectEqual(@as(u64, 1), pipeline.level_link_capacity_grows);
-    _ = try pipeline.reactToPostCommitNavEvents(&frame, &data, &world, null);
-
-    const npc_pos: math.Vec2 = .{ .x = 3 * 32 + 16, .y = 4 * 32 + 16 };
-    const goal: math.Vec2 = .{ .x = 6 * 32 + 16, .y = 6 * 32 + 16 };
-    var resolved = false;
-    for (0..2) |_| {
-        _ = try requestCrossLevelPath(&pipeline, npc, 1, npc_pos, 0, goal);
-        if (pipeline.pathfinding.statusForWorld(1, npc_pos, 0, goal, .default, null).status == .available) {
-            resolved = true;
-            break;
-        }
-    }
-    try std.testing.expect(resolved);
-}
-
-/// A 3-level 8x8 world with no runtime link room reserved, a level-1 player, and a pipeline
-/// over 4-tile nav chunks (2x2 chunks per level, so rows/columns 0, 3, 4, 7 are chunk-border
-/// perimeter cells needing no interior link slot). Test-only local fixture for the dig
-/// seam's level-link growth.
-const LinkGrowthFixture = struct {
-    meta: world_tileset_meta.WorldTilesetMeta,
-    world: WorldSystem,
-    data: DataSystem,
-    player: Player,
-    frame: SimulationFrame,
-    pipeline: SimulationPipeline,
-
-    fn init(self: *LinkGrowthFixture) !void {
-        const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-        self.meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-        errdefer self.meta.deinit();
-        self.world = try gateTestWorld(&self.meta, &.{});
-        errdefer self.world.deinit();
-        try self.world.reserveLevelLinks(0);
-        self.data = DataSystem.init(std.testing.allocator);
-        errdefer self.data.deinit();
-        self.player = try Player.spawn(&self.data);
-        self.player.current_level = 1;
-        try self.data.setWorldLevel(self.player.entity, 1);
-        self.data.facingPtr(self.player.entity).?.* = .right;
-        self.frame = SimulationFrame.init(std.testing.allocator);
-        errdefer self.frame.deinit();
-        try self.frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
-        self.pipeline = try SimulationPipeline.init(std.testing.allocator, &self.data, 256, 256, .{
-            .movement_body_capacity = 4,
-            .dig = try DigConfig.fromMeta(&self.meta),
-            .navigation_world = &self.world,
-            .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1, .nav_chunk_tiles = 4 },
-        });
-        errdefer self.pipeline.deinit();
-        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
-        try self.pipeline.reserve(&self.frame, 4);
-    }
-
-    fn deinit(self: *LinkGrowthFixture) void {
-        self.pipeline.deinit();
-        self.frame.deinit();
-        self.data.deinit();
-        self.world.deinit();
-        self.meta.deinit();
-    }
-
-    /// Faces the perimeter cell `cell` from its left neighbour and arms a ramp press.
-    fn aim(self: *LinkGrowthFixture, cell: [2]u16) void {
-        placePlayerFlush(&self.data, self.player, .{ cell[0] - 1, cell[1] });
-        self.frame.beginStep();
-        self.frame.dig_intent = .ramp;
-    }
-
-    /// One ramp press through the dig stage's admission + seam + commit, then the
-    /// post-commit reaction.
-    fn dig(self: *LinkGrowthFixture, cell: [2]u16) !void {
-        self.aim(cell);
-        const admitted = try self.pipeline.admitDigAndGrowLinks(&self.world, &self.data, self.player, &self.frame);
-        if (admitted.dig) |dig_plan| try self.pipeline.dig.commit(dig_plan, &self.world, &self.frame);
-        _ = try self.pipeline.reactToPostCommitNavEvents(&self.frame, &self.data, &self.world, null);
-    }
-
-    /// One full pipeline step (the real `dig_world_edit` stage) for the armed press.
-    fn step(self: *LinkGrowthFixture, threads: *ThreadSystem) !SimulationPipelineStats {
-        return self.pipeline.update(.{
-            .data = &self.data,
-            .frame = &self.frame,
-            .world = &self.world,
-            .player = &self.player,
-            .thread_system = threads,
-            .delta_seconds = 0.016,
-            .bounds_width = 256,
-            .bounds_height = 256,
-            .sim_view = fullWorldSimView(&self.world),
-        });
-    }
-
-    fn rampAt(self: *const LinkGrowthFixture, cell: [2]u16) bool {
-        const floor1 = self.world.denseFloorLayerForLevel(1).?;
-        return self.world.denseTile(floor1, cell[0], cell[1]) == self.pipeline.dig.ramp_tile;
-    }
-};
-
-/// The allocators the dig seam, the dig, and the nav reaction can reach for link storage.
-const LinkGrowthAllocators = struct {
-    world: std.mem.Allocator,
-    pathfinding: std.mem.Allocator,
-    graph: std.mem.Allocator,
-
-    fn install(fixture: *LinkGrowthFixture, allocator: std.mem.Allocator) LinkGrowthAllocators {
-        const saved: LinkGrowthAllocators = .{ .world = fixture.world.allocator, .pathfinding = fixture.pipeline.pathfinding.allocator, .graph = fixture.pipeline.pathfinding.graph.allocator };
-        fixture.world.allocator = allocator;
-        fixture.pipeline.pathfinding.allocator = allocator;
-        fixture.pipeline.pathfinding.graph.allocator = allocator;
-        return saved;
-    }
-
-    fn restore(self: LinkGrowthAllocators, fixture: *LinkGrowthFixture) void {
-        fixture.world.allocator = self.world;
-        fixture.pipeline.pathfinding.allocator = self.pathfinding;
-        fixture.pipeline.pathfinding.graph.allocator = self.graph;
-    }
-};
-
-test "link growth happens only at the dig seam" {
-    var fixture: LinkGrowthFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    // Nine distinct perimeter cells (rows 0 and 3 of the 4-tile chunks).
-    const cells = [_][2]u16{ .{ 1, 0 }, .{ 2, 0 }, .{ 3, 0 }, .{ 4, 0 }, .{ 5, 0 }, .{ 6, 0 }, .{ 7, 0 }, .{ 1, 3 }, .{ 2, 3 } };
-
-    // First press: the seam grows the empty pool to grownLevelLinkLimit(0) = 8.
-    try fixture.dig(cells[0]);
-    try std.testing.expectEqual(@as(usize, 8), fixture.world.levelLinkLimit());
-    try std.testing.expectEqual(@as(usize, 1), fixture.world.levelLinks().len);
-
-    // Seven more ramps fill the grown pool with zero allocations anywhere in link storage,
-    // the dirty buffers, or the nav patch: growth happens only at the seam.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    var saved = LinkGrowthAllocators.install(&fixture, failing.allocator());
-    for (cells[1..8]) |cell| {
-        try fixture.dig(cell);
-        try std.testing.expect(fixture.rampAt(cell));
-    }
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(usize, 8), fixture.world.levelLinks().len);
-    try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.level_link_capacity_grows);
-
-    // Ninth ramp: the pool is full, so the seam must grow and the failing allocator refuses.
-    // The pathfinding link stores grow first, so the world is untouched.
-    fixture.aim(cells[8]);
-    try std.testing.expectError(error.OutOfMemory, fixture.pipeline.ensureLevelLinkRoom(&fixture.world));
-    try std.testing.expectEqual(@as(usize, 8), fixture.world.levelLinkLimit());
-    try std.testing.expectEqual(@as(usize, 8), fixture.world.levelLinks().len);
-    try std.testing.expect(!fixture.rampAt(cells[8]));
-    saved.restore(&fixture);
-
-    // With real allocators the seam grows to grownLevelLinkLimit(8) = 20 ...
-    try std.testing.expect(try fixture.pipeline.ensureLevelLinkRoom(&fixture.world));
-    try std.testing.expectEqual(@as(usize, 20), fixture.world.levelLinkLimit());
-    // ... and the dig (through the seam, which now finds room) and reaction that follow
-    // allocate nothing.
-    var failing_after = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    saved = LinkGrowthAllocators.install(&fixture, failing_after.allocator());
-    defer saved.restore(&fixture);
-    try fixture.dig(cells[8]);
-    try std.testing.expect(fixture.rampAt(cells[8]));
-    try std.testing.expectEqual(@as(usize, 9), fixture.world.levelLinks().len);
-    try std.testing.expectEqual(@as(usize, 0), failing_after.allocations);
-}
-
-test "a ramp press the dig does not admit never grows the full link pool" {
-    var fixture: LinkGrowthFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
-    try std.testing.expect(!fixture.world.hasLevelLinkRoom());
-
-    // A surface press (ramps only climb out of a pit) and a press facing off-world are
-    // no-ops: the full pool must stay exactly as it was.
-    fixture.player.current_level = 0;
-    try fixture.data.setWorldLevel(fixture.player.entity, 0);
-    fixture.aim(.{ 1, 0 });
-    const surface = try fixture.step(&threads);
-    fixture.player.current_level = 1;
-    try fixture.data.setWorldLevel(fixture.player.entity, 1);
-    fixture.aim(.{ 8, 0 });
-    const off_world = try fixture.step(&threads);
-    for ([_]SimulationPipelineStats{ surface, off_world }) |stats| {
-        try std.testing.expectEqual(@as(usize, 0), stats.nav_link_capacity_grows);
-    }
-    try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinkLimit());
-    try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.level_link_capacity_grows);
-    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.pathfinding.graph.link_edges.capacity);
-
-    // The first admitted ramp grows the pool and lands.
-    fixture.aim(.{ 1, 0 });
-    const admitted = try fixture.step(&threads);
-    try std.testing.expectEqual(@as(usize, 1), admitted.nav_link_capacity_grows);
-    try std.testing.expect(fixture.rampAt(.{ 1, 0 }));
-    try std.testing.expectEqual(grownLevelLinkLimit(0), fixture.world.levelLinkLimit());
-}
-
-test "a link-growth OOM leaves the step's stimuli and the pool for the retry press" {
-    var fixture: LinkGrowthFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
-
-    // An impact deferred from the prior step, waiting for this step's promote.
-    fixture.pipeline.sensory.deferred_stimuli[0] = .{
-        .position = .{ .x = 48, .y = 16 },
-        .intensity = defaultStimulusIntensity(.impact),
-        .kind = .impact,
-        .level = 1,
-    };
-    fixture.pipeline.sensory.deferred_stimulus_count = 1;
-
-    // The press needs the full pool to grow; the growth's allocation fails.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const saved = LinkGrowthAllocators.install(&fixture, failing.allocator());
-    fixture.aim(.{ 1, 0 });
-    const failed = fixture.step(&threads);
-    saved.restore(&fixture);
-    try std.testing.expectError(error.OutOfMemory, failed);
-    // Nothing irreversible happened before the growth: the impact is still deferred, not
-    // promoted into a live bus the next `beginStep` clears.
-    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.sensory.deferred_stimulus_count);
-    try std.testing.expectEqual(@as(usize, 0), fixture.frame.stimulusLiveCount());
-    try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinkLimit());
-    try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.level_link_capacity_grows);
-    try std.testing.expect(!fixture.rampAt(.{ 1, 0 }));
-
-    // The retry press with memory available grows, digs, and promotes the same impact.
-    fixture.aim(.{ 1, 0 });
-    const retried = try fixture.step(&threads);
-    try std.testing.expectEqual(@as(usize, 1), retried.nav_link_capacity_grows);
-    try std.testing.expectEqual(@as(usize, 1), retried.stimuli_promoted);
-    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.sensory.deferred_stimulus_count);
-    try std.testing.expect(fixture.rampAt(.{ 1, 0 }));
-    try std.testing.expectEqual(grownLevelLinkLimit(0), fixture.world.levelLinkLimit());
-}
-
-test "link growth past the load-time nav memory limit always lands and matches a fresh build" {
-    var fixture: LinkGrowthFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const nav_memory = @import("systems/pathfinding/nav_memory.zig");
-    const pathfinding = &fixture.pipeline.pathfinding;
-    const load_capacity = pathfinding.capacity;
-    // A ceiling exactly at the load-time (empty) pool: any growth exceeds it.
-    pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pathfinding.capacity, pathfinding.graph.levelCount(), 0).requiredBytes(pathfinding.graph.width, pathfinding.graph.height);
-
-    // An OOM during growth is an ordinary error: the world is untouched and the retry lands.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const saved = LinkGrowthAllocators.install(&fixture, failing.allocator());
-    try std.testing.expectError(error.OutOfMemory, fixture.dig(.{ 1, 0 }));
-    saved.restore(&fixture);
-    try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinkLimit());
-    try std.testing.expect(!fixture.rampAt(.{ 1, 0 }));
-
-    // Nine perimeter ramps grow the pool twice (0 -> 8 -> 20), every one landing.
-    const cells = [_][2]u16{ .{ 1, 0 }, .{ 2, 0 }, .{ 3, 0 }, .{ 4, 0 }, .{ 5, 0 }, .{ 6, 0 }, .{ 7, 0 }, .{ 1, 3 }, .{ 2, 3 } };
-    for (cells) |cell| {
-        try fixture.dig(cell);
-        try std.testing.expect(fixture.rampAt(cell));
-    }
-    try std.testing.expectEqual(cells.len, fixture.world.levelLinks().len);
-    try std.testing.expectEqual(grownLevelLinkLimit(grownLevelLinkLimit(0)), fixture.world.levelLinkLimit());
-    try std.testing.expectEqual(@as(u64, 2), fixture.pipeline.level_link_capacity_grows);
-    try expectNavMatchesFreshBuild(pathfinding, &fixture.data, &fixture.world, 256, load_capacity);
-}
-
-/// A 4-level 16x16 world (8-tile nav chunks, 2x2 per level) whose underground levels are carved
-/// open over nav chunk (0,0)'s interior, a level-1 player, and a pipeline with no runtime link
-/// room reserved. Test-only local fixture for many ramps dug into one nav chunk.
-const PitFixture = struct {
-    meta: world_tileset_meta.WorldTilesetMeta,
-    world: WorldSystem,
-    data: DataSystem,
-    player: Player,
-    frame: SimulationFrame,
-    pipeline: SimulationPipeline,
-    capacity: PathfindingCapacity,
-
-    fn init(self: *PitFixture, threads: ?*ThreadSystem) !void {
-        const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-        self.meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-        errdefer self.meta.deinit();
-        self.world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &self.meta, 512, 512);
-        errdefer self.world.deinit();
-        try self.world.addUndergroundLevelStack(&self.meta, 3);
-        const cave_0 = (self.meta.tileByName("cave_0") orelse return error.TestUnexpectedResult).id;
-        for (1..4) |level| {
-            const floor = self.world.denseFloorLayerForLevel(@intCast(level)).?;
-            for (1..7) |y| for (1..7) |x| {
-                _ = try self.world.setDenseTile(floor, @intCast(x), @intCast(y), cave_0);
-            };
-        }
-        try self.world.reserveLevelLinks(0);
-        self.data = DataSystem.init(std.testing.allocator);
-        errdefer self.data.deinit();
-        self.player = try Player.spawn(&self.data);
-        self.data.facingPtr(self.player.entity).?.* = .right;
-        self.frame = SimulationFrame.init(std.testing.allocator);
-        errdefer self.frame.deinit();
-        try self.frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
-        self.capacity = .{
-            .max_group_fields = 1,
-            .worker_participant_count = if (threads) |ts| ts.participantSlotCount() else 1,
-            .nav_chunk_tiles = 8,
-        };
-        self.pipeline = try SimulationPipeline.init(std.testing.allocator, &self.data, 512, 512, .{
-            .movement_body_capacity = 4,
-            .dig = try DigConfig.fromMeta(&self.meta),
-            .navigation_world = &self.world,
-            .pathfinding = self.capacity,
-        });
-        errdefer self.pipeline.deinit();
-        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
-        try self.pipeline.reserve(&self.frame, 4);
-        self.pipeline.pathfinding.nav_thread_adaptive = false;
-        self.pipeline.pathfinding.nav_thread_items_per_range = 1;
-    }
-
-    fn deinit(self: *PitFixture) void {
-        self.pipeline.deinit();
-        self.frame.deinit();
-        self.data.deinit();
-        self.world.deinit();
-        self.meta.deinit();
-    }
-
-    /// One ramp press on `level` facing `cell` through the dig stage's admission + seam +
-    /// commit, then the post-commit reaction.
-    fn digRamp(self: *PitFixture, level: u16, cell: [2]u16, threads: ?*ThreadSystem) !NavUpdateStats {
-        self.player.current_level = level;
-        try self.data.setWorldLevel(self.player.entity, level);
-        placePlayerFlush(&self.data, self.player, .{ cell[0] - 1, cell[1] });
-        self.frame.beginStep();
-        self.frame.dig_intent = .ramp;
-        const admitted = try self.pipeline.admitDigAndGrowLinks(&self.world, &self.data, self.player, &self.frame);
-        if (admitted.dig) |dig_plan| try self.pipeline.dig.commit(dig_plan, &self.world, &self.frame);
-        return self.pipeline.reactToPostCommitNavEvents(&self.frame, &self.data, &self.world, threads);
-    }
-
-    /// Every link is routable: both endpoints are portals and the link edge is live.
-    fn expectLinksRoutable(self: *const PitFixture) !void {
-        const graph = &self.pipeline.pathfinding.graph;
-        const no_cell = @import("systems/pathfinding/types.zig").no_cell;
-        for (self.world.levelLinks()) |link| {
-            for ([2]u16{ link.level_a, link.level_b }, [2]CellCoord{ link.cell_a, link.cell_b }) |level, cell| {
-                const index = graph.grid(level).?.indexForCell(.{ .x = cell.x, .y = cell.y }).?;
-                try std.testing.expect(graph.levelGraph(level).?.cell_to_portal.items[index] != no_cell);
-            }
-        }
-        try std.testing.expectEqual(self.world.levelLinks().len, graph.link_edges.items.len);
-    }
-};
-
-/// Ramps dug around a 2x2 pit at (3..4, 2..3) in nav chunk (0,0), clear of the demo surface's
-/// (4,5) obstacle: a 12-cell ring on level 1, then 8 on level 2 (the pit floor, one under rim
-/// cell (2,1), three more), then 4 on level 3. 23 distinct interior cells: the chunk's
-/// interior link capacity grows 8 -> 16 (ring ramp 9) -> 32 (level-2 ramp 6).
-const pit_ramp_digs = [_]struct { level: u16, cell: [2]u16 }{
-    .{ .level = 1, .cell = .{ 2, 1 } }, .{ .level = 1, .cell = .{ 3, 1 } }, .{ .level = 1, .cell = .{ 4, 1 } },
-    .{ .level = 1, .cell = .{ 5, 1 } }, .{ .level = 1, .cell = .{ 2, 2 } }, .{ .level = 1, .cell = .{ 5, 2 } },
-    .{ .level = 1, .cell = .{ 2, 3 } }, .{ .level = 1, .cell = .{ 5, 3 } }, .{ .level = 1, .cell = .{ 2, 4 } },
-    .{ .level = 1, .cell = .{ 3, 4 } }, .{ .level = 1, .cell = .{ 4, 4 } }, .{ .level = 1, .cell = .{ 5, 4 } },
-    .{ .level = 2, .cell = .{ 3, 2 } }, .{ .level = 2, .cell = .{ 4, 2 } }, .{ .level = 2, .cell = .{ 3, 3 } },
-    .{ .level = 2, .cell = .{ 4, 3 } }, .{ .level = 2, .cell = .{ 2, 1 } }, .{ .level = 2, .cell = .{ 1, 1 } },
-    .{ .level = 2, .cell = .{ 6, 1 } }, .{ .level = 2, .cell = .{ 1, 6 } }, .{ .level = 3, .cell = .{ 6, 6 } },
-    .{ .level = 3, .cell = .{ 1, 3 } }, .{ .level = 3, .cell = .{ 6, 3 } }, .{ .level = 3, .cell = .{ 3, 6 } },
-};
-
-fn runPitRampDigs(fixture: *PitFixture, threads: ?*ThreadSystem) !void {
-    const ramp_tile = fixture.pipeline.dig.ramp_tile;
-    for (pit_ramp_digs, 0..) |dig, index| {
-        const stats = try fixture.digRamp(dig.level, dig.cell, threads);
-        const floor = fixture.world.denseFloorLayerForLevel(dig.level).?;
-        try std.testing.expectEqual(ramp_tile, fixture.world.denseTile(floor, dig.cell[0], dig.cell[1]));
-        try std.testing.expectEqual(index + 1, fixture.world.levelLinks().len);
-        // The digs that cross the chunk's capacity grow it in place: no dig relabels.
-        try std.testing.expectEqual(@as(usize, 0), stats.full_relabel);
-        try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
-        try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-        try fixture.expectLinksRoutable();
-        try expectNavMatchesFreshBuild(&fixture.pipeline.pathfinding, &fixture.data, &fixture.world, 512, fixture.capacity);
-    }
-}
-
-test "many ramps dug into one nav chunk, layer after layer, are routable the step they land" {
-    // Owner's case: dig a pit, then ramps around and inside it in one nav chunk, repeated a
-    // level further down twice, one ramp per step through the real dig seam and reaction. No
-    // ramp is refused; each is routable that step; the graph equals a fresh build after every
-    // dig; serial and threaded agree.
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
-    defer threads.deinit();
-
-    var serial: PitFixture = undefined;
-    try serial.init(null);
-    defer serial.deinit();
-    try runPitRampDigs(&serial, null);
-
-    var threaded: PitFixture = undefined;
-    try threaded.init(&threads);
-    defer threaded.deinit();
-    try runPitRampDigs(&threaded, &threads);
-    try std.testing.expect(!threaded.pipeline.pathfinding.graph.last_patch_batch.ran_inline);
-
-    const serial_graph = &serial.pipeline.pathfinding.graph;
-    const threaded_graph = &threaded.pipeline.pathfinding.graph;
-    for (serial_graph.level_graphs.items, threaded_graph.level_graphs.items) |*serial_level, *threaded_level| {
-        try std.testing.expectEqualSlices(u32, serial_level.chunk_portal_cap.items, threaded_level.chunk_portal_cap.items);
-        try std.testing.expectEqualSlices(u32, serial_level.chunk_link_cells.items, threaded_level.chunk_link_cells.items);
-        try std.testing.expectEqualSlices(u32, serial_level.cell_to_portal.items, threaded_level.cell_to_portal.items);
-    }
-}
-
-// Incremental-vs-fresh nav parity for pipeline tests: per-level blocked masks and portal
-// tables, the interior link-slot table, and the link edges equal a fresh full build.
-fn expectNavMatchesFreshBuild(pathfinding: *const PathfindingSystem, data: *const DataSystem, world: *const WorldSystem, extent: f32, capacity: PathfindingCapacity) !void {
-    var rebuilt = PathfindingSystem.init(std.testing.allocator);
-    defer rebuilt.deinit();
-    try rebuilt.reserve(capacity);
-    try rebuilt.rebuildStaticNavGridWithWorld(data, world, extent, extent, 32, null);
-    const inc = &pathfinding.graph;
-    const full = &rebuilt.graph;
-    try std.testing.expectEqual(full.levels.items.len, inc.levels.items.len);
-    for (full.levels.items, inc.levels.items) |*full_grid, *inc_grid| {
-        try std.testing.expectEqual(full_grid.blocked_count, inc_grid.blocked_count);
-        try std.testing.expectEqualSlices(@TypeOf(full_grid.blocked.items[0]), full_grid.blocked.items, inc_grid.blocked.items);
-    }
-    for (full.level_graphs.items, inc.level_graphs.items) |*full_level, *inc_level| {
-        try std.testing.expectEqualSlices(@TypeOf(full_level.portals.items[0]), full_level.portals.items, inc_level.portals.items);
-        try std.testing.expectEqualSlices(u32, full_level.cell_to_portal.items, inc_level.cell_to_portal.items);
-        try std.testing.expectEqualSlices(u32, full_level.chunk_link_count.items, inc_level.chunk_link_count.items);
-        try std.testing.expectEqualSlices(u32, full_level.chunk_link_cells.items, inc_level.chunk_link_cells.items);
-    }
-    try std.testing.expectEqualSlices(@TypeOf(full.link_edges.items[0]), full.link_edges.items, inc.link_edges.items);
-}
-
-// One post-commit nav reaction at the full structural-stage event bound plus a
-// full link-cursor budget, under a failing allocator on the pathfinding system and its nav
-// graph. `threads` drives the chunk patch/remask fan-out (forced off the inline path).
-fn runNavReactionAtStructuralBound(threads: ?*ThreadSystem) !void {
-    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    defer meta.deinit();
-    var world = try gateTestWorld(&meta, &.{});
-    defer world.deinit();
-    const new_links = @import("systems/pathfinding/types.zig").nav_new_links_per_step_max;
-    try world.reserveLevelLinks(new_links);
-
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    const extent: f32 = 256;
-    const capacity: PathfindingCapacity = .{
-        .max_group_fields = 1,
-        // 4-tile chunks: the 8x8 world spans 2x2 chunks per level so edits fan out.
-        .nav_chunk_tiles = 4,
-        .worker_participant_count = if (threads) |ts| ts.participantSlotCount() else 1,
-    };
-    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, extent, extent, .{
-        .movement_body_capacity = 16,
-        .structural_headroom = 8,
-        .navigation_world = &world,
-        .pathfinding = capacity,
-    });
-    defer pipeline.deinit();
-    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 16, 16, 16, 16 + 8);
-    try pipeline.reserve(&frame, 16);
-    pipeline.pathfinding.nav_thread_adaptive = false;
-    pipeline.pathfinding.nav_thread_items_per_range = 1;
-
-    // Flip four level-1 cells in four distinct chunks (solid dirt -> walkable tunnel), then
-    // publish the full structural-stage bound of blocking-flip tile events over them (marks
-    // are not deduped, so repeats each take a buffer slot) and a full link-cursor budget.
-    const cave_0 = (meta.tileByName("cave_0") orelse return error.TestUnexpectedResult).id;
-    const floor1 = world.denseFloorLayerForLevel(1).?;
-    const cells = [_][2]u16{ .{ 1, 1 }, .{ 5, 1 }, .{ 1, 5 }, .{ 5, 5 } };
-    for (cells) |cell| _ = try world.setDenseTile(floor1, cell[0], cell[1], cave_0);
-    frame.beginStep();
-    const bound = pipeline.structuralStageEventBound();
-    for (0..bound) |index| {
-        const cell = cells[index % cells.len];
-        try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = .{
-            .level = 1,
-            .x = cell[0],
-            .y = cell[1],
-            .old_tile_id = 0,
-            .new_tile_id = cave_0,
-            .old_blocks_movement = true,
-            .new_blocks_movement = false,
-        } } });
-    }
-    // Perimeter cells (x = 0 or 7) of the 8x8 world: chunk-border link endpoints.
-    for (0..new_links) |index| {
-        const y: u16 = @intCast(index);
-        try world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 0, .y = y }, .level_b = 0, .cell_b = .{ .x = 0, .y = y }, .traversal_cost = 1, .bidirectional = true });
-    }
-
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const original = pipeline.pathfinding.allocator;
-    pipeline.pathfinding.allocator = failing.allocator();
-    pipeline.pathfinding.graph.allocator = failing.allocator();
-    const stats = blk: {
-        defer {
-            pipeline.pathfinding.graph.allocator = original;
-            pipeline.pathfinding.allocator = original;
-        }
-        break :blk try pipeline.reactToPostCommitNavEvents(&frame, &data, &world, threads);
-    };
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(usize, 0), stats.dirty_buffer_grown);
-    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), stats.links_deferred);
-    if (threads != null) try std.testing.expect(!pipeline.pathfinding.graph.last_remask_batch.ran_inline);
-    try expectNavMatchesFreshBuild(&pipeline.pathfinding, &data, &world, extent, capacity);
-}
-
-test "post-commit nav reaction at the structural-stage bound allocates nothing" {
-    try runNavReactionAtStructuralBound(null);
-    if (builtin.single_threaded) return;
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
-    defer threads.deinit();
-    try runNavReactionAtStructuralBound(&threads);
-}
-
 /// The allocators of everything a pipeline step can reach: frame streams, data, world,
 /// pipeline systems, pathfinding, dig scratch, and the thread system. `install` swaps
 /// them all (to one failing allocator for a zero-allocation proof, or per-owner
@@ -6155,8 +5361,7 @@ fn markAllAlwaysActive(data: *DataSystem) !void {
 /// nav-reaction slot reserved, run the population seam, then the post-commit reactions.
 fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
     const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
-        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame) or
-        pipeline.hasPendingNavLinks(world);
+        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame);
     const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
     _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     const sync = try pipeline.syncPopulationCapacity(frame, data);
@@ -6670,7 +5875,7 @@ test "population sync raises the agent budget past the load-time nav memory limi
     // A ceiling exactly at the loaded 8-agent budget: any raise exceeds it.
     const nav_memory = @import("systems/pathfinding/nav_memory.zig");
     const graph = &pipeline.pathfinding.graph;
-    pipeline.pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pipeline.pathfinding.capacity, graph.levelCount(), world.levelLinkLimit()).requiredBytes(graph.width, graph.height);
+    pipeline.pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pipeline.pathfinding.capacity, graph.levelCount(), world.levelLinks().len).requiredBytes(graph.width, graph.height);
 
     for (0..12) |index| {
         const entity = try data.createEntity();

@@ -2,11 +2,9 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Load-time nav memory budget gate. Estimates the reserve-time nav stores from
-//! world dimensions and reserve config and fails loud (NavGridError.NavWorldTooLarge)
-//! before a rebuild reserves past the configured ceiling. Runtime-growing data (the
-//! abstract edge arena, level links, the agent budget) is estimated here but never
-//! refused during play: it grows at its commit seam.
+//! Build-time nav memory budget gate. Estimates resident nav memory from world
+//! dimensions and reserve config and fails loud (NavGridError.NavWorldTooLarge)
+//! before a rebuild can allocate past the configured ceiling.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -18,9 +16,6 @@ const AbstractEdge = types.AbstractEdge;
 const chunk_edge_floor = types.chunk_edge_floor;
 const default_edge_slack = types.default_edge_slack;
 const openHeapLimit = types.openHeapLimit;
-const nav_interior_link_slots_floor = types.nav_interior_link_slots_floor;
-const LinkEdge = @import("nav_graph.zig").LinkEdge;
-const LinkEdgeRef = @import("nav_graph.zig").LinkEdgeRef;
 const scratch = @import("scratch.zig");
 const SearchCellRow = scratch.SearchCellRow;
 const AbstractSlotRow = scratch.AbstractSlotRow;
@@ -63,12 +58,10 @@ pub const NavMemoryBudget = struct {
     // like every other reserve-config term, not silently excluded.
     max_abstract_nodes: usize,
     // Abstract chunk-portal graph sizing. Per-slot buffers are geometrically sized to the
-    // chunk-stable slot space (4*ct perimeter slots plus nav_interior_link_slots_floor
-    // interior link slots per chunk; capacity links grow past the floor is runtime-growing
-    // data, never gated); the edge arena grows to a measured, slack-padded size at the init build.
-    // The gate uses a structural estimate so large SPARSE worlds pass while a genuinely
-    // oversized world still fails loud. link_count sizes only the global link_edges /
-    // link_edge_refs arrays.
+    // chunk-stable slot space (4*ct slots per chunk plus interior link tails); the edge
+    // arena grows to a measured, slack-padded size at the init build. The gate uses a
+    // structural estimate so large SPARSE worlds pass while a genuinely oversized world
+    // still fails loud.
     chunk_tiles: usize,
     link_count: usize,
     // Realistic upper bound on the abstract degree of a portal node (intra-chunk
@@ -130,16 +123,16 @@ pub const NavMemoryBudget = struct {
             (self.max_abstract_nodes *| abstract_corridor_bytes);
         const abstract_scratch_bytes = self.worker_participant_count *| per_participant_abstract_bytes;
         // Per-participant incremental-dig BUILD scratch, reserved by rebuild AFTER this gate
-        // passes (NavGraph.computePortalGeometry), one slot per worker participant like the
-        // search scratch above. patch_scratch reserves its edge list to max_transient_edges =
+        // passes (nav_graph.zig:531-543), one slot per worker participant like the search
+        // scratch above. patch_scratch reserves its edge list to max_transient_edges =
         // max_portal_cap^2 EdgeScratch entries plus a max_portal_cap compaction cursor;
-        // remask_scratch reserves a chunk_tiles^2 BFS queue. max_portal_cap is a chunk's 4*ct
-        // perimeter slots plus nav_interior_link_slots_floor interior slots,
-        // NavLevelGraph.chunk_portal_cap's floor sizing. Counting it keeps the gate
-        // honest: a tight ceiling that passed the gate must not then let rebuild reserve past
-        // max_bytes.
+        // remask_scratch reserves a chunk_tiles^2 BFS queue. max_portal_cap is bounded by a
+        // chunk's 4*ct perimeter slots plus its interior link tails (<= 2*link_count in the
+        // worst case all endpoints land in one chunk), matching chunk_portal_cap's own
+        // 4*ct + link-count sizing. Counting it keeps the gate honest: a tight ceiling that
+        // passed the gate must not then let rebuild reserve past max_bytes.
         const ct = @max(@as(usize, 1), self.chunk_tiles);
-        const portal_cap_bound = (4 *| ct) +| nav_interior_link_slots_floor;
+        const portal_cap_bound = (4 *| ct) +| (2 *| self.link_count);
         const per_participant_build_bytes = (portal_cap_bound *| portal_cap_bound *| edge_scratch_bytes) +|
             (portal_cap_bound *| @sizeOf(u32)) +|
             (ct *| ct *| @sizeOf(usize));
@@ -163,7 +156,7 @@ pub const NavMemoryBudget = struct {
 
     // Structural bytes for the abstract-graph buffers under the geometric slot layout. The
     // cell_to_portal lookup is genuinely levels * cell_count every build (O(cells)). The
-    // per-slot buffers scale with the geometric slot count (4*ct + K per chunk,
+    // per-slot buffers scale with the geometric slot count (4*ct per chunk plus link tails,
     // ~4*cells/ct) rather than cells, and the edge arena with the slot count times a small
     // abstract degree plus a per-chunk floor, padded by the slack multiplier. This stays
     // well below the pathological per-chunk pairwise term while still failing oversized
@@ -174,36 +167,22 @@ pub const NavMemoryBudget = struct {
         const cx = (width + ct - 1) / ct;
         const cy = (height + ct - 1) / ct;
         const chunk_count = cx *| cy;
-        // Geometric node slots: 4*ct perimeter plus the floor interior link slots per chunk.
-        const slots = levels *| chunk_count *| ((4 *| ct) +| nav_interior_link_slots_floor);
+        // Geometric node slots: 4*ct per chunk plus up to two interior tails per link.
+        const slots = levels *| (4 *| ct *| chunk_count +| 2 *| self.link_count);
         // Each level owns a cell_count-sized cell_to_portal, summing to levels*cells.
         const cell_to_portal_bytes = levels *| cell_count *| @sizeOf(u32);
         // Per-slot buffers (summed across levels): portals + portal_edge_start +
         // portal_edge_count + portal_order + chunk_label_keys + chunk_label_starts.
         const slot_buffers = slots *| (portal_node_bytes +| 5 *| @sizeOf(u32));
-        // Per-level per-chunk arrays (chunk_order_len, chunk_label_len, chunk_edge_cap,
-        // chunk_edge_base, chunk_portal_cap, chunk_portal_base, chunk_link_count) and the
-        // floor-sized interior link-endpoint table, plus NavGraph's dirty-chunk arrays.
-        const chunk_aux = levels *| chunk_count *| (7 +| nav_interior_link_slots_floor) *| @sizeOf(u32) +|
-            chunk_count *| 3 *| @sizeOf(u32);
-        // Edge arena (edgeArenaSlots); plus the build's one-level edge staging buffer
-        // (NavGraph.build_edge_scratch, reused level by level).
-        const edge_buffers = self.edgeArenaSlots(width, height, levels) *| portal_edge_bytes +|
-            (slots / @max(@as(usize, 1), levels)) *| abstract_degree *| edge_scratch_bytes;
-        // Global live link edges: one LinkEdge and up to two LinkEdgeRefs per world link.
-        const link_edge_bytes = self.link_count *| (@sizeOf(LinkEdge) +| 2 *| @sizeOf(LinkEdgeRef));
-        return cell_to_portal_bytes +| slot_buffers +| chunk_aux +| edge_buffers +| link_edge_bytes;
-    }
-
-    // The gate's edge-arena estimate summed over `levels` arenas: the slot count times the
-    // abstract degree plus a per-chunk floor, padded by the slack multiplier. A build-time
-    // estimate only: the arena is runtime-growing data (NavGraph grows it on demand at the
-    // patch seam), never refused by this gate.
-    fn edgeArenaSlots(self: NavMemoryBudget, width: usize, height: usize, levels: usize) usize {
-        const ct = @max(@as(usize, 1), self.chunk_tiles);
-        const chunk_count = ((width + ct - 1) / ct) *| ((height + ct - 1) / ct);
-        const slots = levels *| chunk_count *| ((4 *| ct) +| nav_interior_link_slots_floor);
-        return (slots *| abstract_degree +| levels *| chunk_count *| @as(usize, chunk_edge_floor)) *| @as(usize, default_edge_slack);
+        // Per-chunk lens (chunk_order_len + chunk_label_len) and NavGraph geometry arrays.
+        const chunk_aux = levels *| chunk_count *| 2 *| @sizeOf(u32) +|
+            chunk_count *| 8 *| @sizeOf(u32);
+        // Edge arena: slots * abstract degree plus a per-chunk floor, padded by slack; plus
+        // the per-level edge_scratch staging buffer sized to the level's edge count.
+        const edge_slot_count = (slots *| abstract_degree +| levels *| chunk_count *| @as(usize, chunk_edge_floor)) *| @as(usize, default_edge_slack);
+        const edge_buffers = edge_slot_count *| portal_edge_bytes +|
+            slots *| abstract_degree *| edge_scratch_bytes;
+        return cell_to_portal_bytes +| slot_buffers +| chunk_aux +| edge_buffers;
     }
 
     // Pure validation helper: returns the error and stays log-free. A lifecycle
@@ -383,39 +362,10 @@ test "autoSizedMaxNavMemoryBytes covers the gate's ceiling caps and counts level
     var budget = budgetForCapacity(capacity, 2, 4);
     budget.max_bytes = autoSizedMaxNavMemoryBytes(capacity, 2, 512, 512, 4);
     try budget.check(512, 512);
-    // Links contribute to the estimate (their link_edges term) rather than being hardcoded to zero.
+    // Links contribute to the estimate rather than being hardcoded to zero.
     const without_links = budgetForCapacity(capacity, 2, 0).requiredBytes(512, 512);
     const with_links = budgetForCapacity(capacity, 2, 64).requiredBytes(512, 512);
     try std.testing.expect(with_links > without_links);
-}
-
-test "abstract slot term is levels * chunks * (4*ct + K) and links add only the link_edges term" {
-    // The gate sizes every chunk at nav_interior_link_slots_floor interior slots
-    // regardless of the link set, so the slot-scaled buffers (and the per-participant
-    // patch scratch bounded by one chunk's portal cap) never move with link_count. Links only
-    // size the global link_edges/link_edge_refs arrays.
-    var budget = testBudget(std.math.maxInt(usize));
-    budget.level_count = 2;
-    budget.chunk_tiles = 16;
-    const no_links = budget.requiredBytes(256, 256);
-    var linked = budget;
-    linked.link_count = 1000;
-    const per_link = @sizeOf(LinkEdge) + 2 * @sizeOf(LinkEdgeRef);
-    try std.testing.expectEqual(no_links + 1000 * per_link, linked.requiredBytes(256, 256));
-
-    // One level's slot-scaled share: (4*ct + K) slots per chunk, each carrying the per-slot
-    // buffers and its abstract-degree edge arena share (slack-padded); plus the level's
-    // cell_to_portal, per-chunk arrays, and per-chunk edge floor. The build's edge staging holds
-    // one level at a time, so it does not scale with levels.
-    const chunks: usize = (256 / 16) * (256 / 16);
-    const level_slots: usize = chunks * (4 * 16 + nav_interior_link_slots_floor);
-    const per_slot: usize = @sizeOf(PortalNode) + 5 * @sizeOf(u32) +
-        8 * @sizeOf(AbstractEdge) * default_edge_slack;
-    const per_level_fixed: usize = 256 * 256 * @sizeOf(u32) + chunks * (7 + nav_interior_link_slots_floor) * @sizeOf(u32) +
-        chunks * chunk_edge_floor * default_edge_slack * @sizeOf(AbstractEdge);
-    const one_level = budget.abstractGraphBytes(256, 256, 1);
-    const two_levels = budget.abstractGraphBytes(256, 256, 2);
-    try std.testing.expectEqual(level_slots * per_slot + per_level_fixed, two_levels - one_level);
 }
 
 test "requiredBytes counts per-participant chunk-patch/remask build scratch reserved after the gate" {

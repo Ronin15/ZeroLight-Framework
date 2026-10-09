@@ -268,7 +268,7 @@ the count it declared.
   read by `PerceptionSystem`. Cleared every `beginStep` and never promoted to
   an event, since a stimulus carries no stable entity identity to transition
   against. **Producer phase (before `perception_update`):** `SensoryBus`
-  promotes deferred impacts, `DigController.commit` emits a required `.dig`
+  promotes deferred impacts, `DigController.process` emits a required `.dig`
   (a full live bus returns `StimulusCapacityExceeded` and leaves the tile
   unchanged), then `SensoryBus.appendFootstep` may emit one optional
   `.footstep`. **Deferred producer:** `SensoryBus.enqueuePlayerImpacts` after

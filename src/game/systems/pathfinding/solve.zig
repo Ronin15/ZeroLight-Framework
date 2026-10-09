@@ -427,11 +427,6 @@ fn abstractCorridor(
         const local = refLocal(current_ref);
         const lg = &graph.level_graphs.items[level];
         const portal = lg.portals.items[local];
-        // Every CSR edge targets a live slot: a patch tombstones only slots its own re-patch or
-        // its orthogonal neighbors' patches re-target, and a failed step still patches the whole
-        // dirty set (NavGraph.patchDirtyChunks). A tombstone here is a graph-invariant bug, so
-        // trap (Debug/ReleaseSafe) instead of indexing `components` by no_cell below.
-        std.debug.assert(portal.cell_index != no_cell);
         // Goal reached: this portal is on the goal level and shares the goal's chunk-local
         // component, so the local refiner can finish from here.
         if (level == goal_level and goal_component != no_component and

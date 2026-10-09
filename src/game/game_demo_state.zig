@@ -41,7 +41,6 @@ const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedMaxNavMemoryBytes;
-const nav_interior_link_slots_floor = @import("systems/pathfinding.zig").nav_interior_link_slots_floor;
 const default_min_group_field_agents = @import("systems/pathfinding.zig").default_min_group_field_agents;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const DigIntent = @import("simulation.zig").DigIntent;
@@ -181,17 +180,6 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .max_dense_tile_gpu_bytes = world_system.k_max_dense_tile_gpu_bytes,
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
-
-/// Initial level-link reservation at load: a headroom estimate, not a bound. The loaded
-/// world's authored links plus one level's worth of runtime interior ramps
-/// (`nav_interior_link_slots_floor` per chunk), counting world chunks as nav chunks
-/// (assumes the nav chunk equals the world chunk; the demo's 16-tile chunks match
-/// `default_nav_chunk_tiles`). More ramps grow the pool at the dig commit seam
-/// (`SimulationPipeline.ensureLevelLinkRoom`).
-fn demoLevelLinkLimit(world: *const WorldSystem) usize {
-    const world_chunks = @as(usize, world.chunksX()) * @as(usize, world.chunksY());
-    return world.levelLinks().len + world_chunks * nav_interior_link_slots_floor;
-}
 
 /// The demo's shared-flow-field threshold (see `proceduralPathfindingCapacity`'s
 /// `min_group_field_agents` comment for the measured evidence behind 2000).
@@ -356,9 +344,7 @@ pub const GameDemoState = struct {
             // The configured threaded participant count is fixed at this point; the
             // pathfinding A* scratch is sized for it during the nav build.
             thread_system.participantSlotCount(),
-            // The nav memory gate admits the world's reserved link limit (initWithWorld
-            // reserves exactly this before the nav build).
-            proceduralPathfindingCapacity(thread_system.participantSlotCount(), demoLevelLinkLimit(&world), deriveDemoPopulationCapacity(battle_scale_demo_mover_count)),
+            proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len, deriveDemoPopulationCapacity(battle_scale_demo_mover_count)),
             thread_system,
             battle_scale_demo_mover_count,
             asset_store,
@@ -392,9 +378,6 @@ pub const GameDemoState = struct {
         // does not fire, so there is no double-deinit.
         var world = world_value;
         errdefer world.deinit();
-        // Reserve the world's initial level-link capacity up front (before the nav build sizes
-        // its link edges and memory gate from it); ramps past it grow at the dig commit seam.
-        try world.reserveLevelLinks(demoLevelLinkLimit(&world));
         const pop_cap = deriveDemoPopulationCapacity(mover_count);
         // Cold path: load the data-driven AI archetype catalog once before spawn.
         // A malformed/missing catalog surfaces as an init error rather than a
@@ -707,14 +690,11 @@ fn commitStructuralAndReact(
     // The post-commit nav reaction appends at most one nav_region_invalidated
     // event, driven by EITHER structural commands applied this frame OR
     // invalidating world events already queued in the stream (e.g. a dig's
-    // world_tile_changed that did not originate from a structural command), OR
-    // new world LevelLinks the nav graph has not folded in yet (a ramp dug on an
-    // already-walkable cell flips no blocking state, so no event announces it).
-    // Reserve the slot for every source so the append never trips a tight
+    // world_tile_changed that did not originate from a structural command).
+    // Reserve the slot for both sources so the append never trips a tight
     // capacity_limit.
     const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
-        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame) or
-        pipeline.hasPendingNavLinks(world);
+        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame);
     const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
     const structural = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     // Population growth seam: the post-commit reactions and the next step see grown
@@ -1259,25 +1239,10 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
     );
 }
 
-/// One dig press through the real pipeline step (`SimulationPipeline.update`), whose
-/// `dig_world_edit` stage runs admission, the level-link growth seam, and the dig commit.
-/// The demo's merge phase (structural commit plus post-commit reactions) does not run, so
-/// a test drives those itself where it needs them.
-fn digFacedForTest(demo: *GameDemoState, threads: *ThreadSystem, intent: DigIntent) !void {
+fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
     demo.simulation_frame.beginStep();
     demo.simulation_frame.dig_intent = intent;
-    _ = try demo.pipeline.update(.{
-        .data = &demo.data,
-        .frame = &demo.simulation_frame,
-        .world = &demo.world,
-        .player = &demo.player,
-        .thread_system = threads,
-        .delta_seconds = 0.016,
-        .bounds_width = demo.bounds_width,
-        .bounds_height = demo.bounds_height,
-        .particles = &demo.particles,
-        .sim_view = demo.simViewRect(),
-    });
+    try demo.pipeline.dig.process(&demo.world, &demo.data, demo.player, &demo.simulation_frame);
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
@@ -1626,8 +1591,6 @@ test "demo world tile event invalidates navigation after commit reaction" {
 test "demo dig hole drops the player one plane and a ramp climbs back" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
@@ -1635,7 +1598,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 
     // Dig a hole in the faced cell on the surface plane.
-    try digFacedForTest(&demo, &threads, .hole);
+    try digFacedForTest(&demo, .hole);
     const floor0 = demo.world.denseFloorLayerForLevel(0).?;
     try std.testing.expectEqual(world_system.invalid_tile_id, demo.world.denseTile(floor0, 4, 3));
 
@@ -1655,7 +1618,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // On the dirt plane, dig a ramp in the faced cell (5,3), then walk onto it.
-    try digFacedForTest(&demo, &threads, .ramp);
+    try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(u16, 1), demo.world.levelLinks().len);
     placePlayerInCell(&demo, 5, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
@@ -1670,20 +1633,18 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     // DEFERRED by tryLinkPortal, not resolved against an absent run (linkTailIndex unreachable).
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
 
     // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,3).
-    try digFacedForTest(&demo, &threads, .hole);
+    try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
-    try digFacedForTest(&demo, &threads, .ramp);
+    try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
     // The real per-step nav re-mask the live game runs each frame. Must not panic.
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
@@ -1696,81 +1657,22 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 }
 
-test "demo reserves the nav invalidation event for a pending ramp link that flipped no blocking state" {
-    // A ramp dug on an already-walkable cell (tunnel -> ramp) emits a world_tile_changed that
-    // does NOT invalidate navigation, and the batch's structural command does not either, yet
-    // the post-commit reaction folds the new link in and appends nav_region_invalidated. Only
-    // the hasPendingNavLinks term reserves that slot: with it, a tight capacity_limit fails the
-    // preflight BEFORE the structural mutation; without it, the entity would be created and
-    // only the later nav append would fail.
-    var demo = try initDemoForTest(std.testing.allocator);
-    defer demo.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
-
-    demo.data.facingPtr(demo.player.entity).?.* = .right;
-    placePlayerInCell(&demo, 3, 3);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
-    try digFacedForTest(&demo, &threads, .hole);
-    placePlayerInCell(&demo, 4, 3);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
-    try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
-    // Mine (5,3) walkable on the dirt plane, and settle the nav graph for it.
-    try digFacedForTest(&demo, &threads, .hole);
-    _ = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
-
-    // Ramp on the already-walkable (5,3): no blocking flip.
-    try digFacedForTest(&demo, &threads, .ramp);
-    try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
-    const dig_events = demo.simulation_frame.events.mergedItems();
-    try std.testing.expectEqual(@as(usize, 1), dig_events.len);
-    const changed = dig_events[0].payload.world_tile_changed;
-    try std.testing.expect(!changed.old_blocks_movement and !changed.new_blocks_movement);
-    try std.testing.expect(!SimulationPipeline.pendingEventsMayInvalidateNavigation(&demo.simulation_frame));
-    try std.testing.expect(demo.pipeline.hasPendingNavLinks(&demo.world));
-
-    // One non-navigation structural command (a dynamic entity create: entity_created plus one
-    // component event per template component = 4 events) with room for exactly its events.
-    const entity_count_before = demo.data.movementBodySliceConst().entities.len;
-    const create_event_count: usize = 4;
-    demo.simulation_frame.events.setCapacityLimit(dig_events.len + create_event_count);
-    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
-    demo.simulation_frame.structural_commands.addCount(0, 1);
-    try demo.simulation_frame.structural_commands.prefix();
-    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
-    writer.write(.{ .create_entity = .{
-        .movement_body = .{ .position = .{ .x = 360, .y = 180 }, .previous_position = .{ .x = 360, .y = 180 }, .velocity = .{}, .speed = 0 },
-        .collision_bounds = .{ .size = .{ .x = 32, .y = 32 } },
-        .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
-    } });
-    writer.finish();
-    demo.simulation_frame.structural_commands.finishWrite();
-    try std.testing.expect(!SimulationPipeline.structuralCommandsMayInvalidateNavigation(&demo.data, &demo.simulation_frame));
-
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(null));
-    // Preflighted: nothing was mutated and no event was written.
-    try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(dig_events.len, demo.simulation_frame.events.mergedItems().len);
-}
-
 test "demo dig down drops the player through the dirt plane to the void plane" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
 
     // Surface hole + fall onto the dirt plane (level 1), landing carved at (4,3).
-    try digFacedForTest(&demo, &threads, .hole);
+    try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // Dig DOWN through the faced cell (5,3): a see-through hole, not a tunnel carve.
-    try digFacedForTest(&demo, &threads, .down);
+    try digFacedForTest(&demo, .down);
     const floor1 = demo.world.denseFloorLayerForLevel(1).?;
     try std.testing.expectEqual(world_system.invalid_tile_id, demo.world.denseTile(floor1, 5, 3));
 
@@ -2481,45 +2383,4 @@ test "demo commit seam grows pipeline capacity" {
     fixture.frame.beginStep();
     const unchanged = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
     try std.testing.expect(!unchanged.population_sync.grew);
-}
-
-test "demo commit step's structural-stage events stay within the nav dirty-buffer bound" {
-    // The post-commit nav reaction marks only from `.structural_commit` events, so the
-    // pathfinding dirty buffers are reserved to `structuralStageEventBound()`. A real commit
-    // step (five full-template creates, which also grows the population) stays within it,
-    // and the seam's re-run of `pipeline.reserve` keeps the reservation at the grown bound.
-    var fixture: DemoConfigPipelineFixture = undefined;
-    try fixture.init(std.testing.allocator);
-    defer fixture.deinit();
-    var commands: [5]StructuralCommand = undefined;
-    for (&commands, 0..) |*command, index| {
-        const x: f32 = @as(f32, @floatFromInt(index)) * 64;
-        command.* = .{ .create_entity = .{
-            .movement_body = .{ .position = .{ .x = x, .y = 180 }, .previous_position = .{ .x = x, .y = 180 }, .velocity = .{}, .speed = 0 },
-            .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
-            .collision_response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
-        } };
-    }
-    fixture.frame.beginStep();
-    try fixture.frame.structural_commands.prepareRangeCounts(1);
-    fixture.frame.structural_commands.addCount(0, commands.len);
-    try fixture.frame.structural_commands.prefix();
-    var writer = fixture.frame.structural_commands.rangeWriter(0);
-    for (commands) |command| writer.write(command);
-    writer.finish();
-    fixture.frame.structural_commands.finishWrite();
-    const result = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 5), result.structural.created);
-    try std.testing.expect(result.population_sync.grew);
-
-    var structural_events: usize = 0;
-    for (fixture.frame.events.mergedItems()) |event| {
-        if (event.stage == .structural_commit) structural_events += 1;
-    }
-    const bound = fixture.pipeline.structuralStageEventBound();
-    try std.testing.expect(structural_events > 0);
-    try std.testing.expect(structural_events <= bound);
-    try std.testing.expect(fixture.pipeline.pathfinding.nav_dirty_edits_reserved >= bound);
-    try std.testing.expect(fixture.pipeline.pathfinding.nav_dirty_cell_spans_reserved >= 2 * bound);
-    try std.testing.expectEqual(@as(usize, 0), result.nav_update.dirty_buffer_grown);
 }

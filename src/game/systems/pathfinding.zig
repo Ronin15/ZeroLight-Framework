@@ -32,8 +32,6 @@ pub const default_max_solves_per_frame = @import("pathfinding/types.zig").defaul
 pub const default_nav_chunk_tiles = @import("pathfinding/types.zig").default_nav_chunk_tiles;
 pub const default_min_group_field_agents = @import("pathfinding/types.zig").default_min_group_field_agents;
 pub const autoSizedMaxNavMemoryBytes = @import("pathfinding/nav_memory.zig").autoSizedMaxNavMemoryBytes;
-pub const nav_interior_link_slots_floor = @import("pathfinding/types.zig").nav_interior_link_slots_floor;
-pub const nav_new_links_per_step_max = @import("pathfinding/types.zig").nav_new_links_per_step_max;
 
 test {
     _ = @import("pathfinding/types.zig");

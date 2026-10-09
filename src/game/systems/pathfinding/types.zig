@@ -128,7 +128,7 @@ pub const cached_results_per_agent: usize = 4;
 // (raised from the single-thread-era 256). Clamped down to the population so a tiny
 // demo (8 agents) still caps at 8.
 pub const default_max_solves_per_frame: usize = 512;
-// Generous default nav-memory ceiling. The load-time gate fails loud well before
+// Generous default nav-memory ceiling. The build-time gate fails loud well before
 // real allocation pressure; tests use a tiny ceiling to exercise the gate.
 pub const default_max_nav_memory_bytes: usize = 512 * 1024 * 1024;
 // Bounded outward radius (in cells) for projecting a blocked goal to the nearest
@@ -137,33 +137,17 @@ pub const default_goal_projection_radius: i32 = 16;
 // Side length (in nav cells) of one abstract chunk. The chunk-portal graph is the
 // structure that bounds per-query work independent of total cell count.
 pub const default_nav_chunk_tiles: u16 = 16;
-// Floor of a nav chunk's interior LevelLink-endpoint slots (beyond its 4*ct perimeter slots).
-// Each level has its own slot table. A chunk's capacity on a level is sized at every full
-// build and relabel from that level's link endpoints (NavGraph.interiorLinkCapacity: this floor,
-// else the next power of two of its distinct interior endpoint cells); a runtime endpoint past
-// it grows that level's chunk in place (NavGraph.growChunkLinkCapacity).
-// 8 is one eighth of a 16-tile chunk's 64 perimeter slots.
-pub const nav_interior_link_slots_floor: u32 = 8;
-// Fixed per-step budget of NEW LevelLinks the post-commit nav reaction folds into the graph
-// (PathfindingSystem.nav_links_processed cursor). Links past it defer, in link order, to the
-// next step's reaction. Covers every current producer (DigController makes at most one ramp
-// per step); never derived from world size or link count.
-pub const nav_new_links_per_step_max: usize = 8;
-// Slack multiplier applied to a chunk's measured edge count to size its edge window, both at
-// a full build and when an incremental patch outgrows the window and relocates it
-// (NavGraph.growChunkEdgeWindow), so window growth is geometric: a chunk relocates at most
-// O(log(max edges / floor)) times between full builds. A preference, not a requirement: past
-// the nav memory gate's ceiling the build and a relocation fall back to an unslacked window
-// (exactly the edge count) before refusing.
+// Slack multiplier applied to a chunk's measured init edge count to size its fixed edge
+// window, so an in-place dig that adds a few edges stays within the window instead of
+// triggering the loud full-rebuild fallback.
 pub const default_edge_slack: u32 = 2;
 // Smallest per-chunk edge window, so a chunk that builds with zero edges at init still has
-// headroom for a dig that opens a little connectivity before its window has to grow.
+// headroom for a dig that opens a little connectivity before any fallback.
 pub const chunk_edge_floor: u32 = 32;
 // When an incremental nav update touches more than this many distinct levels, the
 // per-affected-level relabel degenerates into a full relabel of every level. It
-// increments a loud `nav_full_relabel` counter so a runaway batch is visible. A fixed
-// per-batch level fan-out bound, not a capacity: the dirty level
-// set is reserved to the world's level count at the nav build.
+// increments a loud `nav_full_relabel` counter so a runaway batch is visible. The
+// demo's worlds have very few levels, so a real edit stays well under this.
 pub const default_nav_full_relabel_level_threshold: usize = 8;
 // Fixed abstract-cost penalty added when an abstract A* edge crosses a LevelLink.
 // Kept above any single octile step so the search prefers staying on one level.
@@ -320,20 +304,10 @@ pub const NavUpdateStats = struct {
     // border-adjacent neighbors), summed across affected levels. The dirty-bounded
     // work proxy: independent of total level size.
     chunks_patched: usize = 0,
-    // Per-level chunk edge windows outgrown (NavGraph.repackLevelEdges) since the last successful
-    // batch reported them: this batch's, plus those of a prior batch that failed after growing
-    // (carried through NavGraph.edge_windows_grown_reported). A cold, dig-triggered growth that
-    // keeps the update an incremental patch (no rebuild, no version bump). 0 on the steady path.
-    edge_windows_grown: usize = 0,
-    // Level edge arenas repacked to grow those windows (one per level per batch at most), on
-    // the same carry rule. Each is one exact allocation plus a copy of that level's live edges.
-    edge_repacks: usize = 0,
-    // New LevelLinks left for a later step's reaction because this step already folded
-    // nav_new_links_per_step_max of them (deterministic, link-order deferral).
-    links_deferred: usize = 0,
-    // 1 when this batch's marks exceeded a logical dirty-buffer reservation (the buffer grew
-    // in-step past the structural-stage bound); else 0. Loud: a producer outran its bound.
-    dirty_buffer_grown: usize = 0,
+    // 1 when an affected chunk's transition/intra edges overflowed its fixed
+    // per-chunk edge window, forcing a loud full abstract-graph rebuild with more
+    // slack (a genuine topology blow-up); else 0.
+    edge_cap_fallback: usize = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -341,10 +315,7 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_full_relabel, metric(self.full_relabel));
         perf.recordMetric(.nav_version_bumps, metric(self.version_bumps));
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
-        perf.recordMetric(.nav_edge_windows_grown, metric(self.edge_windows_grown));
-        perf.recordMetric(.nav_edge_repacks, metric(self.edge_repacks));
-        perf.recordMetric(.pathfinding_links_deferred, metric(self.links_deferred));
-        perf.recordMetric(.nav_dirty_buffer_grown, metric(self.dirty_buffer_grown));
+        perf.recordMetric(.nav_edge_cap_fallback, metric(self.edge_cap_fallback));
     }
 };
 
@@ -493,9 +464,7 @@ pub const PathfindingCapacity = struct {
     // many levels, it relabels every level (a loud, counted fallback) rather than
     // only the affected ones.
     nav_full_relabel_level_threshold: usize = default_nav_full_relabel_level_threshold,
-    // Load-time nav memory ceiling over the reserve-time stores (estimates). Exceeding it fails
-    // the nav build loudly. Runtime growth (edge arena, level links, agent budget) is never
-    // refused by it.
+    // Build-time nav memory ceiling. Exceeding it fails the rebuild loudly.
     max_nav_memory_bytes: usize = default_max_nav_memory_bytes,
     // Managed shared-goal flow fields.
     max_group_fields: usize = default_max_group_fields,
