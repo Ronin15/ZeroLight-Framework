@@ -269,35 +269,36 @@ pub const NavGrid = struct {
         }
     }
 
-    // Composes this level's blocked mask from the world's dense bands and sparse
-    // obstacles by iterating those columns directly. Dense bands cost
-    // O(bands x cells) inherently; sparse obstacles cost O(sparse tiles on this
-    // level) via `sparseTileIndicesForLevel`, not O(sparse tiles in the whole
-    // world). This avoids polling levelBlocksMovement per cell, which rescanned
-    // every sparse obstacle for every cell (O(cells x sparse)).
+    // Composes this level's blocked mask from the world's composed per-chunk
+    // movement-blocked state (dense bands OR sparse obstacles): an open chunk is
+    // skipped, a blocked chunk marks its tile rect, and only a mixed chunk is read
+    // per cell through `levelBlocksMovement` (O(1) each).
     pub fn markWorldObstacles(self: *NavGrid, world: *const WorldSystem) void {
         if (@as(usize, self.level) >= world.levelCount()) return;
-        for (0..world.denseLayerCount()) |layer_index| {
-            if (world.denseLayerLevel(layer_index) != self.level) continue;
-            if (world.denseLayerUniformFillTile(layer_index) != null) {
-                if (!world.denseTileBlocksMovement(layer_index, 0, 0)) continue;
-                @memset(self.blocked.items, true);
-                self.blocked_count = self.cellCount();
-                continue;
+        const chunk_size: usize = world.chunk_size_tiles;
+        const chunks_x: usize = world.chunksX();
+        for (0..world.chunkCountPerLevel()) |chunk_index| {
+            const min_x: u16 = @intCast((chunk_index % chunks_x) * chunk_size);
+            const min_y: u16 = @intCast((chunk_index / chunks_x) * chunk_size);
+            const max_x: u16 = @intCast(@min(@as(usize, world.width), min_x + chunk_size));
+            const max_y: u16 = @intCast(@min(@as(usize, world.height), min_y + chunk_size));
+            switch (world.levelChunkBlockedForm(self.level, @intCast(chunk_index))) {
+                .open => {},
+                .blocked => {
+                    const first = world.cellRect(min_x, min_y) orelse continue;
+                    const last = world.cellRect(max_x - 1, max_y - 1) orelse continue;
+                    self.markBlockedRectSimd(first.x, first.y, last.x + last.w, last.y + last.h);
+                },
+                .mixed => {
+                    var y = min_y;
+                    while (y < max_y) : (y += 1) {
+                        var x = min_x;
+                        while (x < max_x) : (x += 1) {
+                            if (world.levelBlocksMovement(self.level, x, y)) self.markWorldCell(world, x, y);
+                        }
+                    }
+                },
             }
-            for (0..world.height) |y_usize| {
-                const y: u16 = @intCast(y_usize);
-                for (0..world.width) |x_usize| {
-                    const x: u16 = @intCast(x_usize);
-                    if (!world.denseTileBlocksMovement(layer_index, x, y)) continue;
-                    self.markWorldCell(world, x, y);
-                }
-            }
-        }
-        for (world.sparseTileIndicesForLevel(self.level)) |sparse_index| {
-            if (!world.sparseTileBlocksMovement(sparse_index)) continue;
-            const cell = world.sparseTileCellCoord(sparse_index);
-            self.markWorldCell(world, cell.x, cell.y);
         }
     }
 

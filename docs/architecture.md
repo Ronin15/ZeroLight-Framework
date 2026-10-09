@@ -67,9 +67,9 @@ Designs start here, then read the live structure below (rules:
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
 - `src/game/game_demo_state.zig`, `src/game/loading_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via a runtime-asset-backed loading transition.
-- `src/game/world_system.zig` owns state-local world/tile data in SoA stores
-  for levels, dense layers, sparse tiles, catalog source rects, chunk
-  visibility, and durable **interest/affordance markers** (`world_interest.zig`,
+- `src/game/world_system.zig` owns state-local world/tile data for levels,
+  dense layers, sparse tiles, level links, catalog source rects, the render
+  chunk window, and durable **interest/affordance markers** (`world_interest.zig`,
   Slice 41). Markers are world-authored POIs with fixed inline slot capacity
   (allocation-free by construction) — not `DataSystem` components and not
   ephemeral `WorldStimulus` dig/footstep/impact events. Kind `investigate` is
@@ -77,6 +77,10 @@ Designs start here, then read the live structure below (rules:
   tags until a later consumer lands. Cognition discovery uses a fixed query
   radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
   not the discovery gate. Queries return nearest-k (dist², then slot index).
+- `src/game/world_terrain.zig` holds `WorldSystem`'s chunk-owned terrain
+  storage: per dense layer a chunk directory over a pool of tile blocks, per
+  level a band list, a composed movement-blocked directory over a pool of bit
+  blocks, and lazy link-endpoint list heads.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, destructible, structural, system) and owns state-local persistent
@@ -406,9 +410,20 @@ scheduler.
 
 Large world surfaces belong to state-owned world storage rather than
 `DataSystem` entities or the simulation pipeline. `GameDemoState` owns its
-`WorldSystem`, whose persistent storage is SoA: stable tile IDs, atlas
-source-rect columns, level base-z columns, dense/sparse tile columns, and
-chunk/visibility columns. `WorldSystem` prepares world draw records during
+`WorldSystem`, whose persistent storage holds stable tile IDs, atlas
+source-rect columns, level base-z columns, dense layers, and sparse tile
+columns. Dense tiles live per chunk: each layer's chunk directory holds a
+uniform tile or a block index into a pool of chunk-sized tile blocks, and a
+block returns to uniform when its last differing cell goes back to the fill.
+Each level keeps its band list and composed movement-blocked bits per chunk
+(OPEN, BLOCKED, or a bit block), so `levelBlocksMovement` is O(1) and a write
+recomposes only its own cell. Level links are append-only and indexed per
+endpoint chunk, so `rampLinkOtherLevel` walks one chunk's endpoints. A dig,
+fall carve, cave-in, or explosion reserves its growth with
+`reserveDenseCellWrite` (and `reserveLevelLink`) before any mutation, so an OOM
+leaves the step's state intact; a local change costs only the chunks it
+touches, and adding a level costs only its own directories. Visibility is the
+cached render chunk window, not per-chunk rows. `WorldSystem` prepares world draw records during
 render, using explicit world-depth bands from `src/game/render_depth.zig`.
 Runtime gameplay construction uses the Engine-owned `ThreadSystem` to build the
 procedural 512x512 tile world in deterministic chunk ranges. The gameplay state

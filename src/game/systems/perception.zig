@@ -60,9 +60,8 @@
 //! once per step by
 //! `ensureLevelBlockedCachesForObservers`/`ensureLevelBlockedCache` — a skip,
 //! a scoped patch, or a full rebuild, whichever `reactToPostCommitPerceptionEvents`'s
-//! dirty tracking says is cheapest, see `LevelBlockedSlot`'s doc comment), not
-//! `WorldSystem.levelBlocksMovement`'s own per-call linear scan over the
-//! world's sparse tiles — see `LevelBlockedSlot`'s doc comment for why this is
+//! dirty tracking says is cheapest, see `LevelBlockedSlot`'s doc comment) — see
+//! `LevelBlockedSlot`'s doc comment for why this is
 //! a bespoke cache rather than a reuse of `pathfinding/nav_grid.zig`'s
 //! `NavGrid`, and `src/benchmarks/perception.zig`'s `perception`/
 //! `perception-los-dense` groups for the before/after cost proof.
@@ -395,11 +394,8 @@ fn dirtyAreaExceedsFullRebuildThreshold(pending_dirty: []const DirtyRect, cell_c
 // skip (nothing changed), a scoped patch (a bounded set of edits since the
 // last build), or a full rebuild (first build, or an invalid/never-built
 // level, or accumulated dirty area over `full_rebuild_dirty_area_numerator`/
-// `_denominator`). This exists solely to answer `hasLineOfSight`'s per-sample
-// question in O(1) instead of `WorldSystem.levelBlocksMovement`'s per-call
-// linear scan over every sparse tile in the world (see the module doc's
-// LOS-cost note and `src/benchmarks/perception.zig`'s `perception`/
-// `perception-los-dense` split that proved the cost). Deliberately NOT a
+// `_denominator`). It answers `hasLineOfSight`'s per-sample question with one
+// bitmap read per cell. Deliberately NOT a
 // reuse of `pathfinding/nav_grid.zig`'s `NavGrid`: that grid's blocked mask is
 // world obstacles OR (level 0 only) DataSystem static collision bodies — a
 // different, broader set than `levelBlocksMovement`'s world-tiles-only
@@ -407,8 +403,8 @@ fn dirtyAreaExceedsFullRebuildThreshold(pending_dirty: []const DirtyRect, cell_c
 // `WorldSystem.tile_size` (two independently-set literals, not an enforced
 // invariant), so reusing it would risk both a silent LOS-granularity change
 // and a silent LOS-occlusion behavior change. This cache instead mirrors
-// `NavGrid.markWorldObstacles`'s shape (dense-band scan + sparse-filtered-to-
-// level pass) but stays at raw world-tile granularity with no rect
+// `NavGrid.markWorldObstacles`'s shape (per-chunk composed blocked state)
+// but stays at raw world-tile granularity with no rect
 // rasterization, so it is a direct, provable stand-in for
 // `levelBlocksMovement` — see the parity test.
 const LevelBlockedSlot = struct {
@@ -767,13 +763,12 @@ pub const PerceptionSystem = struct {
         slot.built_step = self.step_counter;
     }
 
-    // Rebuilds one level's LOS-blocked bitmap from `world`'s dense bands and
-    // sparse obstacles, mirroring `nav_grid.zig`'s `markWorldObstacles` shape
-    // (uniform-fill fast path, then a per-dense-layer cell scan, then a
-    // sparse-tile pass scoped to this level via `sparseTileIndicesForLevel` —
-    // O(sparse tiles on this level), not O(sparse tiles in the whole world))
-    // but at raw world-tile granularity — no nav-cell rect rasterization — so
-    // the result is a direct, provable stand-in for
+    // Rebuilds one level's LOS-blocked bitmap from `world`'s composed per-chunk
+    // movement-blocked state, mirroring `nav_grid.zig`'s `markWorldObstacles`
+    // shape (open chunks skipped, blocked chunks filled, mixed chunks read per
+    // cell through the O(1) `levelBlocksMovement`) but at raw world-tile
+    // granularity — no nav-cell rect rasterization — so the result is a direct,
+    // provable stand-in for
     // `WorldSystem.levelBlocksMovement` (see `LevelBlockedSlot`'s doc comment
     // and the parity test). `blocked`'s backing storage is grown once and
     // reused across steps (never deinit/re-init between steps); only its
@@ -794,25 +789,24 @@ pub const PerceptionSystem = struct {
         slot.valid = @as(usize, level) < world.levelCount();
         if (!slot.valid) return;
 
-        for (0..world.denseLayerCount()) |layer_index| {
-            if (world.denseLayerLevel(layer_index) != level) continue;
-            if (world.denseLayerUniformFillTile(layer_index) != null) {
-                if (world.denseTileBlocksMovement(layer_index, 0, 0)) @memset(slot.blocked.items, true);
-                continue;
-            }
-            for (0..world.height) |y_usize| {
-                const y: u16 = @intCast(y_usize);
-                for (0..world.width) |x_usize| {
-                    const x: u16 = @intCast(x_usize);
-                    if (!world.denseTileBlocksMovement(layer_index, x, y)) continue;
-                    slot.blocked.items[y_usize * world.width + x_usize] = true;
+        const chunk_size: usize = world.chunk_size_tiles;
+        const chunks_x: usize = world.chunksX();
+        const width: usize = world.width;
+        for (0..world.chunkCountPerLevel()) |chunk_index| {
+            const form = world.levelChunkBlockedForm(level, @intCast(chunk_index));
+            if (form == .open) continue;
+            const min_x = (chunk_index % chunks_x) * chunk_size;
+            const min_y = (chunk_index / chunks_x) * chunk_size;
+            const max_x = @min(width, min_x + chunk_size);
+            const max_y = @min(@as(usize, world.height), min_y + chunk_size);
+            for (min_y..max_y) |y| {
+                const row = slot.blocked.items[y * width ..][0..width];
+                if (form == .blocked) {
+                    @memset(row[min_x..max_x], true);
+                    continue;
                 }
+                for (min_x..max_x) |x| row[x] = world.levelBlocksMovement(level, @intCast(x), @intCast(y));
             }
-        }
-        for (world.sparseTileIndicesForLevel(level)) |sparse_index| {
-            if (!world.sparseTileBlocksMovement(sparse_index)) continue;
-            const cell = world.sparseTileCellCoord(sparse_index);
-            slot.blocked.items[@as(usize, cell.y) * @as(usize, world.width) + @as(usize, cell.x)] = true;
         }
     }
 
@@ -1119,93 +1113,28 @@ fn clampRectToLevel(rect: DirtyRect, width: u16, height: u16) DirtyRect {
     };
 }
 
-const ChunkRange = struct { min_x: u16, min_y: u16, max_x: u16, max_y: u16 };
-
-// The level-local chunk range a (clamped) rect overlaps, clamped to
-// `[0, chunks_x - 1] x [0, chunks_y - 1]` — mirrors
-// `WorldSystem.localChunkIndexForCell`'s per-cell chunk math, computed once
-// for the whole rect instead of per cell. Callers combine `min_y..max_y` and
-// `min_x..max_x` with `chunks_x` the same way `localChunkIndexForCell` does
-// (`chunk_y * chunks_x + chunk_x`) to reach `sparseTileIndicesForChunk`.
-fn chunkRangeForRect(rect: DirtyRect, chunk_size_tiles: u16, chunks_x: u16, chunks_y: u16) ChunkRange {
-    const chunk_size = @max(chunk_size_tiles, 1);
-    const max_chunk_x = if (chunks_x == 0) 0 else chunks_x - 1;
-    const max_chunk_y = if (chunks_y == 0) 0 else chunks_y - 1;
-    const max_x_inclusive_cell: u16 = if (rect.max_x_exclusive == 0) 0 else rect.max_x_exclusive - 1;
-    const max_y_inclusive_cell: u16 = if (rect.max_y_exclusive == 0) 0 else rect.max_y_exclusive - 1;
-    return .{
-        .min_x = @min(rect.min_x / chunk_size, max_chunk_x),
-        .min_y = @min(rect.min_y / chunk_size, max_chunk_y),
-        .max_x = @min(max_x_inclusive_cell / chunk_size, max_chunk_x),
-        .max_y = @min(max_y_inclusive_cell / chunk_size, max_chunk_y),
-    };
-}
-
 // Patches only the cells covered by `slot.pending_dirty`, in place, instead of
 // rescanning the whole level (see `LevelBlockedSlot`'s doc comment and
 // `ensureLevelBlockedCache`'s decision tree). A bit can flip either direction
-// (a dig can unblock a cell, not just block one), so each rect's cell range is
-// `@memset` false first, then rescanned: per relevant dense layer, bounded to
-// the rect instead of the whole level; and per sparse tile, but only within
-// the rect's overlapping level-local chunks (`WorldSystem.sparseTileIndicesForChunk`
-// via `chunkRangeForRect`) rather than every sparse tile on the level — the
-// candidate set is bounded by chunk population, not level population, which
-// is the real complexity-class win on the sparse side. Takes no allocator and
-// grows nothing: `slot.blocked`'s backing storage is already sized to
-// `slot.width * slot.height` by an earlier full build (a slot only reaches
-// this function post-first-build — see `ensureLevelBlockedCache`), and
-// `slot.width`/`height` cannot have changed since (levels never resize after
+// (a dig can unblock a cell, not just block one), so every cell in each rect is
+// re-read through `levelBlocksMovement`, which is O(1) per cell: the cost is the
+// dirty area, independent of level size, band count, and sparse population.
+// Takes no allocator and grows nothing: `slot.blocked`'s backing storage is
+// already sized to `slot.width * slot.height` by an earlier full build (a slot
+// only reaches this function post-first-build — see `ensureLevelBlockedCache`),
+// and `slot.width`/`height` cannot have changed since (levels never resize after
 // creation). An invalid slot (fail-closed, `blocked` never populated) has
 // nothing to patch and is left as-is.
 fn patchLevelBlockedCache(world: *const WorldSystem, level: u16, slot: *LevelBlockedSlot) void {
     if (!slot.valid) return;
-    const chunks_x = world.chunksX();
-    const chunks_y = world.chunksY();
-
     for (slot.pending_dirty.items) |raw_rect| {
         const rect = clampRectToLevel(raw_rect, slot.width, slot.height);
-        if (rect.min_x >= rect.max_x_exclusive or rect.min_y >= rect.max_y_exclusive) continue;
-
         var y = rect.min_y;
         while (y < rect.max_y_exclusive) : (y += 1) {
             const row_offset = @as(usize, y) * @as(usize, slot.width);
-            @memset(slot.blocked.items[row_offset + rect.min_x .. row_offset + rect.max_x_exclusive], false);
-        }
-
-        for (0..world.denseLayerCount()) |layer_index| {
-            if (world.denseLayerLevel(layer_index) != level) continue;
-            if (world.denseLayerUniformFillTile(layer_index) != null) {
-                if (!world.denseTileBlocksMovement(layer_index, 0, 0)) continue;
-                var yy = rect.min_y;
-                while (yy < rect.max_y_exclusive) : (yy += 1) {
-                    const row_offset = @as(usize, yy) * @as(usize, slot.width);
-                    @memset(slot.blocked.items[row_offset + rect.min_x .. row_offset + rect.max_x_exclusive], true);
-                }
-                continue;
-            }
-            var yy = rect.min_y;
-            while (yy < rect.max_y_exclusive) : (yy += 1) {
-                var xx = rect.min_x;
-                while (xx < rect.max_x_exclusive) : (xx += 1) {
-                    if (!world.denseTileBlocksMovement(layer_index, xx, yy)) continue;
-                    slot.blocked.items[@as(usize, yy) * @as(usize, slot.width) + @as(usize, xx)] = true;
-                }
-            }
-        }
-
-        const chunk_range = chunkRangeForRect(rect, world.chunk_size_tiles, chunks_x, chunks_y);
-        var cy = chunk_range.min_y;
-        while (cy <= chunk_range.max_y) : (cy += 1) {
-            var cx = chunk_range.min_x;
-            while (cx <= chunk_range.max_x) : (cx += 1) {
-                const local_chunk_index: u32 = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
-                for (world.sparseTileIndicesForChunk(level, local_chunk_index)) |sparse_index| {
-                    if (!world.sparseTileBlocksMovement(sparse_index)) continue;
-                    const cell = world.sparseTileCellCoord(sparse_index);
-                    if (cell.x < rect.min_x or cell.x >= rect.max_x_exclusive) continue;
-                    if (cell.y < rect.min_y or cell.y >= rect.max_y_exclusive) continue;
-                    slot.blocked.items[@as(usize, cell.y) * @as(usize, slot.width) + @as(usize, cell.x)] = true;
-                }
+            var x = rect.min_x;
+            while (x < rect.max_x_exclusive) : (x += 1) {
+                slot.blocked.items[row_offset + x] = world.levelBlocksMovement(level, x, y);
             }
         }
     }

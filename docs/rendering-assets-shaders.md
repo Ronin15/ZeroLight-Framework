@@ -147,8 +147,8 @@ instead of exiting the app.
 ## GPU-Driven Tilemap
 
 Dense world tiles are not emitted as per-tile vertices. Every dense layer's tile ids
-are concatenated into one flat array (`WorldSystem.dense_tile_ids`) and uploaded
-once, in one pass, to a single combined GPU **storage buffer**
+are gathered from the layer's chunk storage into one flat layer-major, row-major
+array and uploaded once, in one pass, to a single combined GPU **storage buffer**
 (`GRAPHICS_STORAGE_READ`, row-major — via
 `WorldSystem.uploadDenseTileDataBuffer` / `Renderer.createTileDataBuffer`).
 
@@ -227,7 +227,7 @@ alone.
 A **dig/build** (`setDenseTile`) writes the CPU tile field — the source of truth for
 collision and gameplay — and queues an edit for the packed element holding that
 cell. `flushDenseTileEdits` first coalesces the queue to one edit per element,
-valued from `dense_tile_ids` (neighboring digs share an element, and overlapping
+valued from the chunk stores (neighboring digs share an element, and overlapping
 writes in one copy pass have no defined order), then applies all of the frame's
 edits in one batched copy pass (`Renderer.uploadTileDataEdits`) at the render
 boundary: a dig is one storage-buffer element write, no full re-upload and no
@@ -434,8 +434,8 @@ metadata sidecars are required even when optional character/item textures fall
 back to primitive rendering; missing or invalid sidecars fail startup instead
 of leaving partial metadata behind.
 
-`GameDemoState` owns `WorldSystem`, which stores tile IDs, atlas source-rect
-columns, level z columns, and chunk/visibility columns in SoA form. World
+`GameDemoState` owns `WorldSystem`, which stores tile IDs (dense layers per
+chunk), atlas source-rect columns, and level z columns. World
 construction requires `.world_tileset` metadata, and world render enqueue
 requires the `.world_tileset` texture; missing world atlas data is an error, not
 a primitive rectangle fallback. The runtime loading path builds the procedural

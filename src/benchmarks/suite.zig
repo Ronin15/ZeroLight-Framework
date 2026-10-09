@@ -41,6 +41,8 @@ pub const Options = struct {
     iterations: usize = 30,
     case_filter: ?[]const u8 = null,
     group_filter: ?[]const u8 = null,
+    /// Runs every group whose name starts with this prefix (a family such as `chunk-scale-`).
+    group_prefix: ?[]const u8 = null,
     item_count_filter: ?usize = null,
     fallback_budget: ?usize = null,
     details: bool = false,
@@ -443,6 +445,12 @@ pub fn parseOptions(args: []const []const u8) !Options {
             options.group_filter = args[index];
         } else if (stripPrefix(arg, "--group=")) |value| {
             options.group_filter = value;
+        } else if (std.mem.eql(u8, arg, "--group-prefix")) {
+            index += 1;
+            if (index >= args.len) return error.MissingArgument;
+            options.group_prefix = args[index];
+        } else if (stripPrefix(arg, "--group-prefix=")) |value| {
+            options.group_prefix = value;
         } else if (std.mem.eql(u8, arg, "--items")) {
             index += 1;
             if (index >= args.len) return error.MissingArgument;
@@ -473,12 +481,11 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
     // Run order is deterministic and stdout-first. The benchmark is a regression
     // detector, so reporting favors comparable tables over machine-specific tuning.
     printHeader(options);
-    var matched_group = options.group_filter == null;
+    const filtered = options.group_filter != null or options.group_prefix != null;
+    var matched_group = !filtered;
     for (groups) |group| {
-        if (options.group_filter) |filter| {
-            if (!std.mem.eql(u8, filter, group.name)) continue;
-            matched_group = true;
-        }
+        if (!groupSelected(options, group.name)) continue;
+        matched_group = true;
         var explicit_item_count: [1]usize = undefined;
         const item_counts = itemCountsForOptions(group, options, &explicit_item_count);
         for (item_counts) |item_count| {
@@ -498,9 +505,20 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
         }
     }
     if (!matched_group) {
-        std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter.?});
+        std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter orelse options.group_prefix.?});
         return error.InvalidArgument;
     }
+}
+
+/// A group runs when it equals `--group` (if given) and starts with `--group-prefix` (if given).
+pub fn groupSelected(options: Options, group_name: []const u8) bool {
+    if (options.group_filter) |filter| {
+        if (!std.mem.eql(u8, filter, group_name)) return false;
+    }
+    if (options.group_prefix) |prefix| {
+        if (!std.mem.startsWith(u8, group_name, prefix)) return false;
+    }
+    return true;
 }
 
 fn itemCountsForOptions(group: BenchmarkGroup, options: Options, explicit_item_count: *[1]usize) []const usize {
@@ -521,6 +539,7 @@ pub fn printUsage() void {
         \\  --iterations N
         \\  --case name
         \\  --group name
+        \\  --group-prefix prefix
         \\  --items N
         \\  --fallback-budget N
         \\  --details
@@ -670,6 +689,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
+    if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
     return "items";
 }
 
@@ -1312,6 +1332,22 @@ test "benchmark options parse scaling and filtering arguments" {
     try std.testing.expectEqual(@as(usize, 65_536), options.item_count_filter.?);
     try std.testing.expectEqual(@as(usize, 64), options.fallback_budget.?);
     try std.testing.expect(options.details);
+}
+
+test "benchmark group prefix selects a family and combines with an exact group" {
+    const prefix_args = [_][]const u8{ "--group-prefix", "chunk-scale-" };
+    const prefix = try parseOptions(&prefix_args);
+    try std.testing.expectEqualStrings("chunk-scale-", prefix.group_prefix.?);
+    try std.testing.expect(groupSelected(prefix, "chunk-scale-dig"));
+    try std.testing.expect(groupSelected(prefix, "chunk-scale-cave-in"));
+    try std.testing.expect(!groupSelected(prefix, "nav-update"));
+
+    const both_args = [_][]const u8{ "--group-prefix=chunk-scale-", "--group=chunk-scale-dig" };
+    const both = try parseOptions(&both_args);
+    try std.testing.expect(groupSelected(both, "chunk-scale-dig"));
+    try std.testing.expect(!groupSelected(both, "chunk-scale-cave-in"));
+    try std.testing.expect(groupSelected(.{}, "movement"));
+    try std.testing.expectError(error.MissingArgument, parseOptions(&[_][]const u8{"--group-prefix"}));
 }
 
 test "benchmark options reject zero iterations" {

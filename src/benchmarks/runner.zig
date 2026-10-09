@@ -7,6 +7,7 @@ const logging = @import("../core/logging.zig");
 const ai = @import("ai.zig");
 const ai_memory = @import("ai_memory.zig");
 const affect = @import("affect.zig");
+const chunk_scale = @import("chunk_scale.zig");
 const collision = @import("collision.zig");
 const collision_response = @import("collision_response.zig");
 const movement = @import("movement.zig");
@@ -51,6 +52,9 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     nav_update.group,
     nav_update.multichunk_group,
     nav_update.entity_obstacle_group,
+    chunk_scale.dig_group,
+    chunk_scale.cave_in_group,
+    chunk_scale.explosion_fill_group,
     render_prep.group,
     render_game_prep.group,
     render_game_prep.dense_surface_group,

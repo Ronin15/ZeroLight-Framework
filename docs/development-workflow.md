@@ -347,8 +347,12 @@ Reading results:
   batches while the A* solve stage owns its own tuner and row.
 - `--details` adds scheduler ranges, wait time, items-per-range, tuning phase,
   and workload counters. `--items N` overrides the profile counts for the
-  selected group; `--fallback-budget N` compares hard-fallback caps against the
-  runtime default in ReleaseFast tuning.
+  selected group; `--group-prefix P` runs every group whose name starts with
+  `P` (a family such as `chunk-scale-`); `--fallback-budget N` compares
+  hard-fallback caps against the runtime default in ReleaseFast tuning.
+- `chunk-scale-*` groups time one fixed terrain change at every level size and
+  depth; their item count is a case code, `level side * 1000 + levels`, and
+  they measure the serial case only (terrain edits run on the main thread).
 
 Optional arguments narrow or scale the run. Day-to-day runs target a group
 (`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare
@@ -368,6 +372,7 @@ zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --detail
 zig build bench -- --group nav-update-scattered --details
 zig build bench -- --group nav-update-multichunk --details
 zig build bench -- --group scope --details
+zig build bench -- --group-prefix chunk-scale- --case serial-direct
 zig build bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
 zig build bench -- --details
 ```

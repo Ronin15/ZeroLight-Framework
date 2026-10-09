@@ -29,6 +29,7 @@ const WorldSystem = @import("world_system.zig").WorldSystem;
 const TileId = @import("world_system.zig").TileId;
 const invalid_tile_id = @import("world_system.zig").invalid_tile_id;
 const CellCoord = @import("world_system.zig").CellCoord;
+const LevelLink = @import("world_system.zig").LevelLink;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 const StimulusKind = @import("simulation.zig").StimulusKind;
@@ -123,7 +124,8 @@ pub const DigController = struct {
     /// Applies this step's dig intent to the cell the player faces on their current
     /// plane. No-op when there is no intent, the player lacks a body/facing, the
     /// plane has no floor layer, or the faced cell is off-world. Emits one
-    /// `world_tile_changed` event on an actual change.
+    /// `world_tile_changed` event on an actual change. Reserves the world edit
+    /// first (allocation-free after `reserveWorldEdit` this step).
     pub fn process(
         self: *const DigController,
         world: *WorldSystem,
@@ -131,9 +133,57 @@ pub const DigController = struct {
         player: Player,
         frame: *SimulationFrame,
     ) !void {
-        const intent = frame.dig_intent;
-        if (intent == .none) return;
+        const edit = (try self.planEdit(world, data, player, frame.dig_intent)) orelse return;
+        try reserveEdit(world, edit);
 
+        // Reserve event + stimulus slots before any world mutate so a capacity miss
+        // cannot leave the tile changed without matching outputs.
+        if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
+        try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
+        try frame.ensureStimulusAppendCapacity(1);
+        const changed = (try applyEdit(world, edit)) orelse return;
+
+        try frame.events.appendRequired(.{
+            .stage = .structural_commit,
+            .payload = .{ .world_tile_changed = changed },
+        });
+        var stimulus_dropped: usize = 0;
+        _ = try SensoryBus.emit(frame, .{
+            .position = cellCenterWorldPos(world, edit.cell),
+            .intensity = defaultStimulusIntensity(.dig),
+            .kind = .dig,
+            .level = player.current_level,
+        }, true, &stimulus_dropped);
+    }
+
+    /// Reserves this step's world edit (tile storage, GPU edit, and a ramp's link) so
+    /// the stage can call it before anything else mutates step state: an OOM here
+    /// leaves the world and the step untouched for the retry, and the later
+    /// `process` allocates nothing in the world. No-op when the intent does nothing.
+    pub fn reserveWorldEdit(
+        self: *const DigController,
+        world: *WorldSystem,
+        data: *const DataSystem,
+        player: Player,
+        intent: DigIntent,
+    ) !void {
+        const edit = (try self.planEdit(world, data, player, intent)) orelse return;
+        try reserveEdit(world, edit);
+    }
+
+    const DigEdit = struct {
+        floor_layer: usize,
+        cell: CellCoord,
+        /// `invalid_tile_id` punches a see-through hole.
+        tile: TileId,
+        ramp_link: ?LevelLink = null,
+    };
+
+    // Resolves the intent to one cell write, or null for an intentional no-op.
+    // Read-only; returns `UnresolvedDigTiles` before any mutate when the dig tiles
+    // were never resolved.
+    fn planEdit(self: *const DigController, world: *const WorldSystem, data: *const DataSystem, player: Player, intent: DigIntent) !?DigEdit {
+        if (intent == .none) return null;
         // Fail loudly on an unresolved config rather than silently carving the
         // invalid sentinel into the world: reaching the carve path means the
         // controller's dig tiles must have been resolved to valid ids (via
@@ -144,67 +194,38 @@ pub const DigController = struct {
         if (self.ramp_tile == invalid_tile_id or self.tunnel_tile == invalid_tile_id) {
             return error.UnresolvedDigTiles;
         }
-
-        const cell = facedCellForEntity(world, data, player.entity) orelse return;
-
-        const floor_layer = world.denseFloorLayerForLevel(player.current_level) orelse return;
-        // Intentional no-ops that never mutate return before the event preflight
-        // so a full event budget cannot fail a dig that would have done nothing.
-        if (intent == .down and @as(usize, player.current_level) + 1 >= world.levelCount()) return;
-        if (intent == .ramp and (player.current_level == 0 or world.rampLinkOtherLevel(player.current_level, cell) != null)) return;
-
-        // Reserve event + stimulus slots before any world mutate so a capacity miss
-        // cannot leave the tile changed without matching outputs. digRamp also
-        // preflights level_links capacity before its tile write.
-        if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
-        try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
-        try frame.ensureStimulusAppendCapacity(1);
-        const changed = switch (intent) {
+        const cell = facedCellForEntity(world, data, player.entity) orelse return null;
+        const level = player.current_level;
+        const floor_layer = world.denseFloorLayerForLevel(level) orelse return null;
+        return switch (intent) {
             // Surface: punch a see-through hole to fall through. Underground: mine a
             // walkable tunnel floor through the solid dirt of this plane.
-            .hole => if (player.current_level == 0)
-                try world.clearDenseTile(floor_layer, cell.x, cell.y)
-            else
-                try world.setDenseTile(floor_layer, cell.x, cell.y, self.tunnel_tile),
+            .hole => .{ .floor_layer = floor_layer, .cell = cell, .tile = if (level == 0) invalid_tile_id else self.tunnel_tile },
             // Dig down: punch a see-through hole in the faced cell on any plane to
-            // drop to the level below. Bottom-plane no-op is handled above.
-            .down => try world.clearDenseTile(floor_layer, cell.x, cell.y),
-            .ramp => try self.digRamp(world, player.current_level, floor_layer, cell),
+            // drop to the level below; a no-op on the bottom plane.
+            .down => if (@as(usize, level) + 1 >= world.levelCount())
+                null
+            else
+                .{ .floor_layer = floor_layer, .cell = cell, .tile = invalid_tile_id },
+            // Ramp: a walkable ramp tile plus a bidirectional link to the plane above;
+            // a no-op on the surface or where a ramp already links this cell.
+            .ramp => if (level == 0 or world.rampLinkOtherLevel(level, cell) != null)
+                null
+            else
+                .{ .floor_layer = floor_layer, .cell = cell, .tile = self.ramp_tile, .ramp_link = rampLink(level, cell) },
             .none => unreachable,
-        } orelse return;
-
-        try frame.events.appendRequired(.{
-            .stage = .structural_commit,
-            .payload = .{ .world_tile_changed = changed },
-        });
-        var stimulus_dropped: usize = 0;
-        _ = try SensoryBus.emit(frame, .{
-            .position = cellCenterWorldPos(world, cell),
-            .intensity = defaultStimulusIntensity(.dig),
-            .kind = .dig,
-            .level = player.current_level,
-        }, true, &stimulus_dropped);
+        };
     }
 
     /// Carves a walkable ramp tile and adds a bidirectional ramp `LevelLink` to the
     /// plane above (ramps ascend — they exist to climb out of a pit). Caller has
     /// already filtered surface / existing-link no-ops; event + stimulus capacity is
-    /// preflighted in `process` before this runs. Level-link capacity is reserved
-    /// here before the tile write so an OOM cannot leave an orphan ramp tile.
+    /// preflighted in `process` before this runs. The link and the tile write are
+    /// reserved before the tile write so an OOM cannot leave an orphan ramp tile.
     fn digRamp(self: *const DigController, world: *WorldSystem, level: u16, floor_layer: usize, cell: CellCoord) !?WorldTileChangedEvent {
-        const above = level - 1;
-        try world.ensureLevelLinkCapacity(1);
-        const changed = try world.setDenseTile(floor_layer, cell.x, cell.y, self.ramp_tile);
-        try world.addLevelLink(.{
-            .kind = .ramp,
-            .level_a = level,
-            .cell_a = cell,
-            .level_b = above,
-            .cell_b = cell,
-            .traversal_cost = 1,
-            .bidirectional = true,
-        });
-        return changed;
+        const edit = DigEdit{ .floor_layer = floor_layer, .cell = cell, .tile = self.ramp_tile, .ramp_link = rampLink(level, cell) };
+        try reserveEdit(world, edit);
+        return applyEdit(world, edit);
     }
 
     /// Result of one entity's cell-entry plane traversal. `tile_change` is set when
@@ -253,6 +274,15 @@ pub const DigController = struct {
         if (below >= world.levelCount() or !world.denseFloorIsEmpty(level, cell.x, cell.y)) return false;
         const floor_layer = world.denseFloorLayerForLevel(@intCast(below)) orelse return false;
         return world.denseTile(floor_layer, cell.x, cell.y) != self.tunnel_tile;
+    }
+
+    // Reserves the landing carve `entry` would make, if any; true when it carves.
+    fn reserveLandingCarve(self: *const DigController, world: *WorldSystem, entry: PlaneCellEntry) !bool {
+        if (!self.wouldCarveLandingCell(world, entry.level, entry.cell)) return false;
+        const below: u16 = entry.level + 1;
+        const floor_layer = world.denseFloorLayerForLevel(below) orelse return false;
+        try world.reserveDenseCellWrite(floor_layer, entry.cell.x, entry.cell.y, self.tunnel_tile);
+        return true;
     }
 
     /// Entity-generic plane traversal for one cell-entry event: follows a ramp
@@ -349,8 +379,9 @@ pub const DigController = struct {
         self.* = undefined;
     }
 
-    /// Player + NPC plane traversal for one step. Event capacity, dense GPU edit
-    /// capacity, and missing `world_level` rows are reserved before any carve.
+    /// Player + NPC plane traversal for one step. Event capacity, every landing
+    /// carve's world write (`reserveDenseCellWrite`), and missing `world_level` rows
+    /// are reserved before any carve.
     /// Landing tile changes go into `plane_tile_changes`, which is preflighted to this
     /// step's carve count (grown and counted if short) before any carve.
     pub fn applyPlaneTraversalStage(
@@ -366,22 +397,23 @@ pub const DigController = struct {
         const ai_slice = data.aiAgentSliceConst();
         const scope_columns = data.scopeColumnsSliceConst();
 
+        // One reserve scope covers every landing carve this step.
+        world.beginDenseCellWriteReserve();
         var pending_carves: usize = 0;
         var missing_world_level: usize = 0;
         const player_entry = playerCellEntry(self, world, data, player.*);
         if (player_entry) |entry| {
-            if (self.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
+            if (try self.reserveLandingCarve(world, entry)) pending_carves += 1;
             if (data.worldLevelConst(player.entity) == null) missing_world_level += 1;
         }
         for (ai_slice.entities) |entity| {
             if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-                if (self.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
+                if (try self.reserveLandingCarve(world, entry)) pending_carves += 1;
                 if (data.worldLevelConst(entity) == null) missing_world_level += 1;
             }
         }
         if (pending_carves > self.plane_scratch_reserved) try self.growPlaneScratch(pending_carves);
         try frame.events.ensureEventAppendCapacity(pending_carves);
-        try world.ensureDenseTileEditCapacity(pending_carves);
 
         if (missing_world_level > 0) {
             try data.world_levels.ensureCapacity(data.allocator, data.world_levels.len() + missing_world_level);
@@ -415,6 +447,36 @@ const PlaneCellEntry = struct {
     level: u16,
     cell: CellCoord,
 };
+
+fn rampLink(level: u16, cell: CellCoord) LevelLink {
+    return .{
+        .kind = .ramp,
+        .level_a = level,
+        .cell_a = cell,
+        .level_b = level - 1,
+        .cell_b = cell,
+        .traversal_cost = 1,
+        .bidirectional = true,
+    };
+}
+
+// Opens a reserve scope and reserves the edit's tile write and ramp link.
+fn reserveEdit(world: *WorldSystem, edit: DigController.DigEdit) !void {
+    world.beginDenseCellWriteReserve();
+    try world.reserveDenseCellWrite(edit.floor_layer, edit.cell.x, edit.cell.y, edit.tile);
+    if (edit.ramp_link) |link| try world.reserveLevelLink(link);
+}
+
+// Writes the reserved edit; allocation-free after `reserveEdit`. A ramp's link is
+// added even when the cell already held the ramp tile.
+fn applyEdit(world: *WorldSystem, edit: DigController.DigEdit) !?WorldTileChangedEvent {
+    const changed = if (edit.tile == invalid_tile_id)
+        try world.clearDenseTile(edit.floor_layer, edit.cell.x, edit.cell.y)
+    else
+        try world.setDenseTile(edit.floor_layer, edit.cell.x, edit.cell.y, edit.tile);
+    if (edit.ramp_link) |link| try world.addLevelLink(link);
+    return changed;
+}
 
 fn playerCellEntry(
     dig: *const DigController,
@@ -606,6 +668,19 @@ fn addCellEntryNpc(data: *DataSystem, from: CellCoord, to: CellCoord) !EntityId 
     return npc;
 }
 
+/// Takes and releases the tile block and composed-bits slot a landing carve into
+/// `cell` on `level` needs, so a later carve in that chunk reuses them: the terrain
+/// pools are warm, like the frame and data allocators the zero-allocation proofs warm.
+fn warmLandingTerrain(world: *WorldSystem, tunnel_tile: TileId, level: u16, cell: [2]u16) !void {
+    const floor = world.denseFloorLayerForLevel(level).?;
+    const original = world.denseTile(floor, cell[0], cell[1]);
+    world.beginDenseCellWriteReserve();
+    try world.reserveDenseCellWrite(floor, cell[0], cell[1], tunnel_tile);
+    _ = try world.setDenseTile(floor, cell[0], cell[1], tunnel_tile);
+    _ = try world.setDenseTile(floor, cell[0], cell[1], original);
+    world.beginDenseCellWriteReserve();
+}
+
 /// Opens surface holes at (4,3) and (6,3) with one NPC entering each this step.
 fn setUpTwoFalls(tw: *TestWorld) !void {
     const floor0 = tw.world.denseFloorLayerForLevel(0).?;
@@ -715,6 +790,7 @@ test "plane traversal within the scratch reserve is allocation-free (FailingAllo
     var dig = try testDigController(&tw.meta);
     defer dig.deinit();
     try dig.reservePlaneScratch(std.testing.allocator, 2);
+    try warmLandingTerrain(&tw.world, dig.tunnel_tile, 1, .{ 4, 3 });
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -1143,7 +1219,7 @@ test "digRamp OOM on level_links growth leaves ramp tile unchanged" {
     const before = tw.world.denseTile(floor, 4, 3);
     try std.testing.expect(before != dig.ramp_tile);
 
-    // Exact capacity so the next ensureLevelLinkCapacity/append must grow.
+    // Exact capacity so the link reserve must grow.
     try tw.world.level_links.ensureTotalCapacityPrecise(std.testing.allocator, tw.world.level_links.items.len);
     const original = tw.world.allocator;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -1155,6 +1231,52 @@ test "digRamp OOM on level_links growth leaves ramp tile unchanged" {
         dig.digRamp(&tw.world, 1, floor, .{ .x = 4, .y = 3 }),
     );
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
+}
+
+test "dig process after reserveWorldEdit allocates nothing in the world (FailingAllocator)" {
+    inline for (.{ DigIntent.hole, DigIntent.ramp }) |intent| {
+        var tw = try TestWorld.init(.right, 1);
+        defer tw.deinit();
+        const dig = try testDigController(&tw.meta);
+        // The faced level-1 cell sits in a uniform, fully blocked chunk, so the carve
+        // takes a fresh tile block and composed-bits slot (and a ramp its link heads).
+        const floor = tw.world.denseFloorLayerForLevel(1).?;
+        try std.testing.expect(tw.world.denseTileBlocksMovement(floor, 4, 3));
+
+        try dig.reserveWorldEdit(&tw.world, &tw.data, tw.player, intent);
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+        frame.beginStep();
+        frame.dig_intent = intent;
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        tw.world.allocator = failing.allocator();
+        defer tw.world.allocator = std.testing.allocator;
+        try dig.process(&tw.world, &tw.data, tw.player, &frame);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+        try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
+        try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
+        if (intent == .ramp) {
+            try std.testing.expectEqual(@as(?u16, 0), tw.world.rampLinkOtherLevel(1, .{ .x = 4, .y = 3 }));
+        }
+    }
+}
+
+test "dig reserveWorldEdit OOM leaves the world unchanged" {
+    var tw = try TestWorld.init(.right, 1);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+    const floor = tw.world.denseFloorLayerForLevel(1).?;
+    const before = tw.world.denseTile(floor, 4, 3);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    tw.world.allocator = failing.allocator();
+    defer tw.world.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, dig.reserveWorldEdit(&tw.world, &tw.data, tw.player, .ramp));
+    try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expect(tw.world.levelBlocksMovement(1, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
 }
 

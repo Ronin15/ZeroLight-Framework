@@ -94,6 +94,7 @@ const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSyst
 const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
+const TileId = @import("world_system.zig").TileId;
 const Rect = @import("../render/renderer.zig").Rect;
 const world_gate = @import("systems/world_gate.zig");
 
@@ -1279,6 +1280,9 @@ pub const SimulationPipeline = struct {
 
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        // The dig's world growth (tile storage, a ramp's link) is reserved before the
+        // promote, so an OOM fails the stage with the deferred impacts still queued.
+        try self.dig.reserveWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         // Player-authored world edit. Its world_tile_changed event is deferred and
@@ -2591,6 +2595,19 @@ const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 fn testMinimalMultiLevelWorld(meta: *const world_tileset_meta.WorldTilesetMeta) !WorldSystem {
     const bounds = meta.tileSize() * 8;
     return WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, meta, bounds, bounds);
+}
+
+/// Takes and releases the tile block and composed-bits slot a landing carve into
+/// `cell` on `level` needs, so a later carve in that chunk reuses them: the terrain
+/// pools are warm, like the frame and data allocators the zero-allocation proofs warm.
+fn warmLandingTerrain(world: *WorldSystem, tunnel_tile: TileId, level: u16, cell: [2]u16) !void {
+    const floor = world.denseFloorLayerForLevel(level).?;
+    const original = world.denseTile(floor, cell[0], cell[1]);
+    world.beginDenseCellWriteReserve();
+    try world.reserveDenseCellWrite(floor, cell[0], cell[1], tunnel_tile);
+    _ = try world.setDenseTile(floor, cell[0], cell[1], tunnel_tile);
+    _ = try world.setDenseTile(floor, cell[0], cell[1], original);
+    world.beginDenseCellWriteReserve();
 }
 
 // Builds a 3-level minimal world and carves the given level-1 cells walkable so a
@@ -4528,6 +4545,90 @@ test "deferred impact enqueue drops newest when deferred buffer is full" {
     try std.testing.expectEqual(stimulus_deferred_capacity, pipeline.sensory.deferred_stimulus_count);
 }
 
+test "dig stage reserves its world edit before promoting, so a failed reserve keeps the deferred impacts" {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try testMinimalMultiLevelWorld(&meta);
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 1;
+    try data.setWorldLevel(player.entity, 1);
+    // Cell (3,3), facing right: the ramp goes into level 1's solid cell (4,3).
+    placePlayerFlush(&data, player, .{ 3, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
+        .dig = try DigConfig.fromMeta(&meta),
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+    pipeline.sensory.deferred_stimuli[0] = .{
+        .position = .{ .x = 40, .y = 40 },
+        .intensity = defaultStimulusIntensity(.impact),
+        .kind = .impact,
+        .level = 1,
+    };
+    pipeline.sensory.deferred_stimulus_count = 1;
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 256,
+        .bounds_height = 256,
+        .sim_view = fullWorldSimView(&world),
+    };
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    const before = world.denseTile(floor1, 4, 3);
+
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    {
+        // The ramp needs a tile block, a bits slot, and link storage: the first fails.
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+        var step = SimulationPipeline.StepState.init(&pipeline, context);
+        try std.testing.expectError(error.OutOfMemory, pipeline.stageDigWorldEdit(&step));
+    }
+    // Nothing moved: the impact is still deferred, the bus and world untouched.
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
+    try std.testing.expectEqual(before, world.denseTile(floor1, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+
+    // The retry promotes the impact and digs the ramp.
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    var step = SimulationPipeline.StepState.init(&pipeline, context);
+    try pipeline.stageDigWorldEdit(&step);
+    try std.testing.expectEqual(@as(usize, 1), step.stimuli_promoted);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(pipeline.dig.ramp_tile, world.denseTile(floor1, 4, 3));
+    try std.testing.expectEqual(@as(?u16, 0), world.rampLinkOtherLevel(1, .{ .x = 4, .y = 3 }));
+    try std.testing.expectEqual(@as(usize, 2), frame.stimuli.mergedItems().len);
+}
+
 test "promote drops deferred impacts when live bus is already full" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -5544,6 +5645,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     }
 
     const dig_config = try DigConfig.fromMeta(&meta);
+    try warmLandingTerrain(&world, dig_config.tunnel_tile, 1, start_cells[0]);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
