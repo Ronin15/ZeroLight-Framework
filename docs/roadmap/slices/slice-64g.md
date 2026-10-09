@@ -201,11 +201,11 @@ Failure and limits:
 
 ### Acceptance checks
 
-- [ ] `chunk-scale-*` bench groups (dig, ramp, cave-in, explosion fill, and
-      level and world create and destroy, at 256², 1024², 2048², and 8 / 32 /
-      128 levels) shows per-change cost flat across sizes
-      (`.claude/rules/tests-benchmarks.md`); fixtures build once outside the
-      timed loop and the group runs quickly in Debug.
+- [ ] `chunk-scale-*` bench groups at 256², 1024², 2048², and 8 / 32 / 128
+      levels (`.claude/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
+      explosion fill flat across sizes; level and world create and destroy flat
+      across depth and world count and linear in their own chunks. Fixtures
+      build once outside the timed loop and the groups run quickly in Debug.
 - [ ] An A\* path of the same length costs the same at 2048² as at 256²
       (`pathfinding*` groups), and a cross-level path of the same length costs
       the same at 8, 32, and 128 levels.
