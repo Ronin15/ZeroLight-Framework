@@ -13,15 +13,16 @@ stays warm; both sides share the repo's `.zig-cache`, so a new base rebuilds
 only what differs). Raw outputs and the summary go to
 `benchmark_outputs/ab-<stamp>/`. Cases default to `serial-direct` and
 `thread-adaptive-tuned-range`; the forced-thread cases are scheduler controls
-(`--all-cases` runs every case). Runs use `--warmup 2 --iterations 10`
+(`--all-cases` runs every case). A run must name its config with
+`-- --items N` (or pass `--grid` for every config): one config answers a
+regression question; a full grid is rarely the right signal. Runs use `--warmup 2 --iterations 10`
 unless the forwarded bench args set them.
 
 Usage:
-    tools/bench_ab.py --group chunk-scale-dig
-    tools/bench_ab.py --group chunk-scale-cave-in --group chunk-scale-explosion-fill \\
-        --case serial-direct --case thread-adaptive-tuned-range
-    tools/bench_ab.py --group-prefix chunk-scale- --case serial-direct --base main
-    tools/bench_ab.py --base none --group nav-update-scattered    # tree only, N reps
+    tools/bench_ab.py --group chunk-scale-dig -- --items 1024032
+    tools/bench_ab.py --group chunk-scale-cave-in -- --items 2561024032
+    tools/bench_ab.py --group chunk-scale-gpu-sync-dig --case serial-direct --base 5439e36 -- --items 1024032
+    tools/bench_ab.py --base none --grid --group chunk-scale-dig   # shape: tree only, every config
     tools/bench_ab.py --group pathfinding -- --items 2000         # forward bench args
 """
 
@@ -125,6 +126,11 @@ def main() -> int:
         help="bench case (repeatable; default: serial-direct and thread-adaptive-tuned-range)",
     )
     parser.add_argument("--all-cases", action="store_true", help="run every bench case")
+    parser.add_argument(
+        "--grid",
+        action="store_true",
+        help="run every config of each group (default: refuse unless the forwarded args name --items)",
+    )
     parser.add_argument("--base", default="HEAD", help="git ref for the before side, or 'none' (default: HEAD)")
     parser.add_argument("--reps", type=int, default=3, help="interleaved reps per side (default: 3)")
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
@@ -132,6 +138,9 @@ def main() -> int:
 
     if not args.group and not args.group_prefix:
         parser.error("name at least one --group or --group-prefix; full-suite sweeps use tools/bench_run.py")
+    names_items = any(a.startswith("--items") for a in args.bench_args)
+    if not names_items and not args.grid:
+        parser.error("name the config that answers the question (-- --items N), or pass --grid for every config")
     if args.reps < 1:
         parser.error("--reps must be >= 1")
 

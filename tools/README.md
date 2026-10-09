@@ -57,14 +57,15 @@ overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
 `benchmark_outputs/ab-<stamp>/`. Always Debug. Cases default to
 `serial-direct` and `thread-adaptive-tuned-range` (`--all-cases` for every
 scheduler case) and to `--warmup 2 --iterations 10` per run (forward
-`-- --iterations N` to override). Both sides build with the repo's `.zig-cache`, so a new
+`-- --iterations N` to override). A run must name its config with `-- --items N`, or
+pass `--grid` for every config; one config answers a regression question. Both sides build with the repo's `.zig-cache`, so a new
 base rebuilds only what differs.
 
 ```sh
-tools/bench_ab.py --group chunk-scale-dig
-tools/bench_ab.py --group chunk-scale-cave-in --case serial-direct --case thread-adaptive-tuned-range
-tools/bench_ab.py --group-prefix chunk-scale- --case serial-direct --base main
-tools/bench_ab.py --base none --group nav-update-scattered     # tree only, N reps
+tools/bench_ab.py --group chunk-scale-dig -- --items 1024032
+tools/bench_ab.py --group chunk-scale-cave-in -- --items 2561024032
+tools/bench_ab.py --group chunk-scale-gpu-sync-dig --case serial-direct --base 5439e36 -- --items 1024032
+tools/bench_ab.py --base none --grid --group chunk-scale-dig  # shape: tree only, every config
 tools/bench_ab.py --group pathfinding -- --items 2000          # forward bench args
 ```
 
