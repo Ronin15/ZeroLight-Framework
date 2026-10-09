@@ -191,6 +191,7 @@ pub const RunStats = struct {
     secondary_work_tuning: ?WorkTuningSummary = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
+    terrain_edit_phases: ?TerrainEditPhaseSummary = null,
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
@@ -249,6 +250,14 @@ pub const RenderPrepPhaseSummary = struct {
     snapshot_ns: u64 = 0,
     vertex_emit_ns: u64 = 0,
     draw_group_ns: u64 = 0,
+};
+
+/// Mean per-iteration time of a batched terrain edit's plan and write stages, and
+/// the rest of the iteration (the main thread's serial share).
+pub const TerrainEditPhaseSummary = struct {
+    plan_ns: u64 = 0,
+    write_ns: u64 = 0,
+    main_ns: u64 = 0,
 };
 
 pub const RenderGamePrepPhaseSummary = struct {
@@ -689,8 +698,14 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
+    if (isChunkScaleBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
     return "items";
+}
+
+// Chunk-scale groups timing one batched terrain edit across its chunks.
+fn isChunkScaleBatchGroup(group_name: []const u8) bool {
+    return std.mem.eql(u8, group_name, "chunk-scale-cave-in") or std.mem.eql(u8, group_name, "chunk-scale-explosion-fill");
 }
 
 fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
@@ -1068,6 +1083,19 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     // Workload labels translate shared counters into subsystem language so the
     // report remains compact without hiding what was measured.
     if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
+    if (isChunkScaleBatchGroup(group_name)) {
+        var plan_buffer: [32]u8 = undefined;
+        var write_buffer: [32]u8 = undefined;
+        const plan_stage = formatStageShapeInto(&plan_buffer, stats.secondary_batch orelse .{});
+        const write_stage = formatStageShapeInto(&write_buffer, stats.batch);
+        const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
+        const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "cells={} chunks={} plan={s} write={s} plan_t={f} write_t={f} main={f} ({}%)",
+            .{ stats.output_count, stats.batch.item_count, plan_stage, write_stage, formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.main_ns), main_percent },
+        ) catch "workload";
+    }
     if (std.mem.eql(u8, group_name, "ai")) {
         if (stats.secondary_batch) |intent| {
             const tuning = stats.secondary_work_tuning;
@@ -1201,6 +1229,12 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         }
     }
     return std.fmt.bufPrint(buffer, "candidates={} outputs={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+}
+
+// A stage's batch shape as `inline` or workers/ranges.
+fn formatStageShapeInto(buffer: []u8, batch: BatchSummary) []const u8 {
+    if (batch.ran_inline or batch.active_worker_threads == 0) return "inline";
+    return std.fmt.bufPrint(buffer, "{}w/{}r", .{ batch.active_worker_threads, batch.range_count }) catch "stage";
 }
 
 fn yesNo(value: bool) []const u8 {

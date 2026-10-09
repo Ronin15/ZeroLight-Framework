@@ -351,10 +351,13 @@ Reading results:
   `P` (a family such as `chunk-scale-`); `--fallback-budget N` compares
   hard-fallback caps against the runtime default in ReleaseFast tuning.
 - `chunk-scale-*` groups time one fixed terrain change at every level size and
-  depth; their item count is a case code, `level side * 1000 + levels`, and
-  they measure the serial case only (terrain edits run on the main thread).
-  `chunk-scale-gpu-sync-*` time the GPU tile store sync for a dig and for a
-  level entering the render window, against a headless store.
+  depth. `chunk-scale-cave-in` and `chunk-scale-explosion-fill` time a dense
+  edit over 4, 64, and 256 chunks (an explosion's disk touches fewer chunks
+  than its bounding square), serial and threaded; `--details` shows the main
+  thread's share. `chunk-scale-dig` and `chunk-scale-gpu-sync-*` measure the
+  serial case only (single-cell digs and GPU syncs run on the main thread); the
+  GPU sync groups time the GPU tile store sync for a dig and for a level
+  entering the render window, against a headless store.
 
 Optional arguments narrow or scale the run. Day-to-day runs target a group
 (`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare

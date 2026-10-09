@@ -3,22 +3,29 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Chunk-owned terrain scaling: one fixed-size terrain change per timed iteration
-//! on worlds of every level size and depth. The change is the same at every point,
-//! so the cost model expects each group flat across both axes:
+//! on worlds of every level size and depth. The change is the same at every level
+//! size and depth, so the cost model expects each group flat across both axes:
 //!   - `chunk-scale-dig`: 64 single-cell digs and refills, each in its own chunk.
-//!   - `chunk-scale-cave-in`: a 32x32 tunnel region on four stacked levels collapses
-//!     to solid and is carved back, in one step each.
-//!   - `chunk-scale-explosion-fill`: a radius-12 disk is blown open and filled back.
+//!   - `chunk-scale-cave-in`: a chunk-aligned tunnel region of 4, 64, or 256 chunks,
+//!     a quarter on each of four stacked levels, collapses to solid and is carved
+//!     back, each one batched edit (`applyDenseCellWrites`). Linear in region chunks.
+//!   - `chunk-scale-explosion-fill`: a disk inscribed in a 4-, 64-, or 256-chunk
+//!     square on the deepest level (touching fewer chunks than the square) is blown
+//!     open and filled back, each one batched edit. Linear in region chunks.
 //!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the
 //!     digs and after the refills (64 blocks taken, then freed). Flat.
 //!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
 //!     and back, each step one level entering (its directory and 64 mixed blocks)
 //!     and one leaving. Linear in chunks per level, flat across depth.
-//! Every write goes through the step's reserve seam (`reserveDenseCellWrite`) first.
-//! Changes sit on the deepest levels at the level center; each iteration ends at its
-//! start state. The item count encodes the case as `level side * 1000 + levels`.
-//! Fixtures build once per case outside the timed loop. Terrain edits and GPU
-//! syncs run on the main thread, so only the serial case is measured. The GPU
+//! Single-cell writes go through the step's reserve seam (`reserveDenseCellWrite`)
+//! first. Changes sit on the deepest levels at the level center; each iteration ends
+//! at its start state. The item count encodes the case as `level side * 1000 +
+//! levels`, plus `region chunks * 10^7` for the two batched groups. Fixtures and the
+//! batches' write lists build once per case outside the timed loop. The batched
+//! groups run serial, fixed-thread, and adaptive, with the two deepest levels
+//! GPU resident so the GPU edit merge is timed; they report each stage's time and
+//! the main thread's share. Single-cell digs and GPU syncs are main-thread work, so
+//! their groups measure the serial case only. The GPU
 //! sync groups drive `syncDenseTileStore` against a headless renderer whose tile
 //! store has no GPU buffer: they time planning, commit, and the queued upload
 //! batch, which the bench drops after each sync as a frame copy pass would.
@@ -27,7 +34,13 @@ const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
+const DenseCellWrite = @import("../game/world_system.zig").DenseCellWrite;
+const DenseChunkWrites = @import("../game/world_system.zig").DenseChunkWrites;
+const TerrainEditThreads = @import("../game/world_system.zig").TerrainEditThreads;
+const WorldTileChangedEvent = @import("../game/simulation.zig").WorldTileChangedEvent;
 const TileId = @import("../game/world_system.zig").TileId;
 const invalid_tile_id = @import("../game/world_system.zig").invalid_tile_id;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
@@ -52,10 +65,25 @@ const scale_item_counts = blk: {
     break :blk counts;
 };
 
+// Region sizes of the batched groups, in chunks touched by one edit.
+const region_chunk_counts = [_]usize{ 4, 64, 256 };
+const region_encoding: usize = 10_000_000;
+
+const region_item_counts = blk: {
+    var counts: [region_chunk_counts.len * scale_item_counts.len]usize = undefined;
+    for (region_chunk_counts, 0..) |region, region_index| {
+        for (scale_item_counts, 0..) |scale, scale_index| {
+            counts[region_index * scale_item_counts.len + scale_index] = region * region_encoding + scale;
+        }
+    }
+    break :blk counts;
+};
+
 const dig_cell_count: u16 = 64;
-const cave_in_edge: u16 = 32;
 const cave_in_levels: u16 = 4;
-const explosion_radius: i32 = 12;
+// Batched edits are independent chunks; one chunk per range is the fixed controls'
+// partition.
+const edit_range_alignment_items: usize = 1;
 // The GPU sync groups render a two-level window: `active_level` and the one below.
 const gpu_window_levels_below: u16 = 1;
 
@@ -67,13 +95,13 @@ pub const dig_group = suite.BenchmarkGroup{
 
 pub const cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-cave-in",
-    .defaultItemCounts = scaleItemCounts,
+    .defaultItemCounts = regionItemCounts,
     .runCase = runCaveInCase,
 };
 
 pub const explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-explosion-fill",
-    .defaultItemCounts = scaleItemCounts,
+    .defaultItemCounts = regionItemCounts,
     .runCase = runExplosionFillCase,
 };
 
@@ -93,18 +121,24 @@ fn scaleItemCounts(_: suite.Profile) []const usize {
     return &scale_item_counts;
 }
 
-const Workload = enum { dig, cave_in, explosion_fill, gpu_sync_dig, gpu_sync_level_enter };
+fn regionItemCounts(_: suite.Profile) []const usize {
+    return &region_item_counts;
+}
+
+const Workload = enum { dig, gpu_sync_dig, gpu_sync_level_enter };
+
+const BatchWorkload = enum { cave_in, explosion_fill };
 
 fn runDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCase(allocator, io, options, case, item_count, .dig);
 }
 
 fn runCaveInCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .cave_in);
+    return runBatchCase(allocator, io, options, case, item_count, .cave_in);
 }
 
 fn runExplosionFillCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .explosion_fill);
+    return runBatchCase(allocator, io, options, case, item_count, .explosion_fill);
 }
 
 fn runGpuSyncDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -218,7 +252,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("terrain edits run on the main thread");
+    if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs and GPU syncs run on the main thread");
     const side: u16 = @intCast(item_count / case_encoding);
     const levels: u16 = @intCast(item_count % case_encoding);
     std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
@@ -226,7 +260,6 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
     switch (workload) {
-        .cave_in => _ = try applyCaveInRegion(&fixture, fixture.tunnel),
         .gpu_sync_dig => {
             try fixture.attachHeadlessTileStore(allocator);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
@@ -237,7 +270,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
         },
-        .dig, .explosion_fill => {},
+        .dig => {},
     }
 
     for (0..options.warmup_iterations) |_| _ = try runIteration(&fixture, workload);
@@ -271,14 +304,6 @@ fn runIteration(fixture: *Fixture, workload: Workload) !usize {
         .gpu_sync_level_enter => blk: {
             const entered = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
             break :blk entered + try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
-        },
-        .cave_in => blk: {
-            const collapsed = try applyCaveInRegion(fixture, fixture.dirt);
-            break :blk collapsed + try applyCaveInRegion(fixture, fixture.tunnel);
-        },
-        .explosion_fill => blk: {
-            const opened = try applyExplosionDisk(fixture, invalid_tile_id);
-            break :blk opened + try applyExplosionDisk(fixture, fixture.dirt);
         },
     };
 }
@@ -325,53 +350,240 @@ fn digCells(fixture: *Fixture, level: u16, tile: TileId) !usize {
     return dig_cell_count;
 }
 
-// Writes `tile` over the cave-in region on the four deepest levels in one step.
-fn applyCaveInRegion(fixture: *Fixture, tile: TileId) !usize {
-    const world = &fixture.world;
-    const origin = fixture.side / 2 - cave_in_edge / 2 + 3;
-    world.beginDenseCellWriteReserve();
-    for (0..cave_in_levels) |depth| {
-        const layer = fixture.floor(fixture.levels - 1 - @as(u16, @intCast(depth)));
-        for (0..cave_in_edge) |dy| for (0..cave_in_edge) |dx| {
-            try world.reserveDenseCellWrite(layer, origin + @as(u16, @intCast(dx)), origin + @as(u16, @intCast(dy)), tile);
+// The two batched edits of one iteration, each the other's reversal, built once in
+// chunk-major order: `forward_chunks[i]` and `back_chunks[i]` cover the same cells.
+const BatchEdit = struct {
+    forward: std.ArrayList(DenseCellWrite) = .empty,
+    back: std.ArrayList(DenseCellWrite) = .empty,
+    spans: std.ArrayList(ChunkSpan) = .empty,
+    forward_chunks: std.ArrayList(DenseChunkWrites) = .empty,
+    back_chunks: std.ArrayList(DenseChunkWrites) = .empty,
+    events: std.ArrayList(WorldTileChangedEvent) = .empty,
+
+    const ChunkSpan = struct {
+        level: u16,
+        chunk_x: u16,
+        chunk_y: u16,
+        start: usize,
+        end: usize,
+    };
+
+    fn deinit(self: *BatchEdit, allocator: std.mem.Allocator) void {
+        self.forward.deinit(allocator);
+        self.back.deinit(allocator);
+        self.spans.deinit(allocator);
+        self.forward_chunks.deinit(allocator);
+        self.back_chunks.deinit(allocator);
+        self.events.deinit(allocator);
+    }
+
+    // Opens the next chunk; chunks open in (level, chunk_y, chunk_x) order.
+    fn beginChunk(self: *BatchEdit, allocator: std.mem.Allocator, level: u16, chunk_x: u16, chunk_y: u16) !void {
+        const start = self.forward.items.len;
+        try self.spans.append(allocator, .{ .level = level, .chunk_x = chunk_x, .chunk_y = chunk_y, .start = start, .end = start });
+    }
+
+    fn add(self: *BatchEdit, allocator: std.mem.Allocator, layer: usize, x: u16, y: u16, forward_tile: TileId, back_tile: TileId) !void {
+        try self.forward.append(allocator, .{ .layer = @intCast(layer), .x = x, .y = y, .tile = forward_tile });
+        try self.back.append(allocator, .{ .layer = @intCast(layer), .x = x, .y = y, .tile = back_tile });
+        self.spans.items[self.spans.items.len - 1].end = self.forward.items.len;
+    }
+
+    // Builds the chunk lists once every write is in, dropping chunks no cell landed in.
+    fn finish(self: *BatchEdit, allocator: std.mem.Allocator) !void {
+        for (self.spans.items) |span| {
+            if (span.end == span.start) continue;
+            try self.forward_chunks.append(allocator, .{ .level = span.level, .chunk_x = span.chunk_x, .chunk_y = span.chunk_y, .writes = self.forward.items[span.start..span.end] });
+            try self.back_chunks.append(allocator, .{ .level = span.level, .chunk_x = span.chunk_x, .chunk_y = span.chunk_y, .writes = self.back.items[span.start..span.end] });
+        }
+        try self.events.ensureTotalCapacity(allocator, self.forward.items.len);
+    }
+};
+
+// Cave-in: `region_chunks / 4` chunks in a chunk-aligned square at the center of each
+// of the four deepest levels, tunnel to be collapsed to dirt and carved back.
+fn buildCaveInEdit(allocator: std.mem.Allocator, fixture: *const Fixture, region_chunks: usize) !BatchEdit {
+    var edit: BatchEdit = .{};
+    errdefer edit.deinit(allocator);
+    const square_chunks = std.math.sqrt(region_chunks / cave_in_levels);
+    std.debug.assert(square_chunks * square_chunks * cave_in_levels == region_chunks);
+    const chunk_edge = default_chunk_size_tiles;
+    const origin_chunk: u16 = fixture.side / 2 / chunk_edge - @as(u16, @intCast(square_chunks / 2));
+    for (fixture.levels - cave_in_levels..fixture.levels) |level_index| {
+        const level: u16 = @intCast(level_index);
+        const layer = fixture.floor(level);
+        for (0..square_chunks) |row| for (0..square_chunks) |col| {
+            const chunk_x = origin_chunk + @as(u16, @intCast(col));
+            const chunk_y = origin_chunk + @as(u16, @intCast(row));
+            try edit.beginChunk(allocator, level, chunk_x, chunk_y);
+            for (0..chunk_edge) |dy| for (0..chunk_edge) |dx| {
+                const x = chunk_x * chunk_edge + @as(u16, @intCast(dx));
+                const y = chunk_y * chunk_edge + @as(u16, @intCast(dy));
+                try edit.add(allocator, layer, x, y, fixture.dirt, fixture.tunnel);
+            };
         };
     }
-    for (0..cave_in_levels) |depth| {
-        const layer = fixture.floor(fixture.levels - 1 - @as(u16, @intCast(depth)));
-        for (0..cave_in_edge) |dy| for (0..cave_in_edge) |dx| {
-            _ = try world.setDenseTile(layer, origin + @as(u16, @intCast(dx)), origin + @as(u16, @intCast(dy)), tile);
-        };
-    }
-    return @as(usize, cave_in_levels) * cave_in_edge * cave_in_edge;
+    try edit.finish(allocator);
+    return edit;
 }
 
-// Writes `tile` (an empty hole or the refill) over the disk on the deepest level in one step.
-fn applyExplosionDisk(fixture: *Fixture, tile: TileId) !usize {
+// Explosion: the cells of the deepest level whose centers lie in the disk inscribed
+// in a chunk-aligned `sqrt(region_chunks)` square at the level center, blown open
+// to empty and filled back with dirt. The square's corner chunks the disk misses
+// are not part of the edit.
+fn buildExplosionEdit(allocator: std.mem.Allocator, fixture: *const Fixture, region_chunks: usize) !BatchEdit {
+    var edit: BatchEdit = .{};
+    errdefer edit.deinit(allocator);
+    const square_chunks = std.math.sqrt(region_chunks);
+    std.debug.assert(square_chunks * square_chunks == region_chunks);
+    const chunk_edge = default_chunk_size_tiles;
+    const radius: i32 = @intCast(square_chunks * chunk_edge / 2);
+    const center: i32 = fixture.side / 2;
+    const origin_chunk: u16 = fixture.side / 2 / chunk_edge - @as(u16, @intCast(square_chunks / 2));
+    const level = fixture.levels - 1;
+    const layer = fixture.floor(level);
+    for (0..square_chunks) |row| for (0..square_chunks) |col| {
+        const chunk_x = origin_chunk + @as(u16, @intCast(col));
+        const chunk_y = origin_chunk + @as(u16, @intCast(row));
+        try edit.beginChunk(allocator, level, chunk_x, chunk_y);
+        for (0..chunk_edge) |dy| for (0..chunk_edge) |dx| {
+            const x = chunk_x * chunk_edge + @as(u16, @intCast(dx));
+            const y = chunk_y * chunk_edge + @as(u16, @intCast(dy));
+            const offset_x = @as(i32, x) - center;
+            const offset_y = @as(i32, y) - center;
+            if ((2 * offset_x + 1) * (2 * offset_x + 1) + (2 * offset_y + 1) * (2 * offset_y + 1) > 4 * radius * radius) continue;
+            try edit.add(allocator, layer, x, y, invalid_tile_id, fixture.dirt);
+        };
+    };
+    try edit.finish(allocator);
+    return edit;
+}
+
+// Per-stage time of one iteration's two batched edits.
+const BatchTiming = struct {
+    plan_ns: u64 = 0,
+    write_ns: u64 = 0,
+
+    fn add(self: *BatchTiming, world: *const WorldSystem) void {
+        self.plan_ns += world.last_terrain_edit_plan_batch.batch_duration_ns;
+        self.write_ns += world.last_terrain_edit_write_batch.batch_duration_ns;
+    }
+};
+
+fn applyBatch(world: *WorldSystem, chunks: []const DenseChunkWrites, events: *std.ArrayList(WorldTileChangedEvent), threads: ?TerrainEditThreads) !void {
+    events.clearRetainingCapacity();
+    try world.applyDenseCellWrites(chunks, threads, events);
+}
+
+// One timed batched change and its reversal; returns the cells written.
+fn runBatchIteration(fixture: *Fixture, edit: *BatchEdit, threads: ?TerrainEditThreads, timing: *BatchTiming) !usize {
+    try applyBatch(&fixture.world, edit.forward_chunks.items, &edit.events, threads);
+    timing.add(&fixture.world);
+    try applyBatch(&fixture.world, edit.back_chunks.items, &edit.events, threads);
+    timing.add(&fixture.world);
+    return edit.forward.items.len + edit.back.items.len;
+}
+
+fn tunersSettled(world: *const WorldSystem) bool {
+    return world.terrain_edit_plan_tuner.isSettled() and world.terrain_edit_write_tuner.isSettled();
+}
+
+fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const region_chunks = item_count / region_encoding;
+    const scale = item_count % region_encoding;
+    const side: u16 = @intCast(scale / case_encoding);
+    const levels: u16 = @intCast(scale % case_encoding);
+    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+
+    var fixture = try buildFixture(allocator, io, side, levels);
+    defer fixture.deinit();
+    // The two deepest levels are GPU resident, so every edit there queues GPU edits;
+    // each iteration's sync drains them outside the timed region.
+    try fixture.attachHeadlessTileStore(allocator);
+    _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+    var edit = switch (workload) {
+        .cave_in => try buildCaveInEdit(allocator, &fixture, region_chunks),
+        .explosion_fill => try buildExplosionEdit(allocator, &fixture, region_chunks),
+    };
+    defer edit.deinit(allocator);
+    // The cave-in region starts carved, so each iteration collapses then re-carves it.
+    if (workload == .cave_in) {
+        try applyBatch(&fixture.world, edit.back_chunks.items, &edit.events, null);
+        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+    }
+
     const world = &fixture.world;
-    const layer = fixture.floor(fixture.levels - 1);
-    const center: i32 = fixture.side / 2 + 5;
-    var written: usize = 0;
-    world.beginDenseCellWriteReserve();
-    for (0..2) |pass| {
-        var dy: i32 = -explosion_radius;
-        while (dy <= explosion_radius) : (dy += 1) {
-            var dx: i32 = -explosion_radius;
-            while (dx <= explosion_radius) : (dx += 1) {
-                if (dx * dx + dy * dy > explosion_radius * explosion_radius) continue;
-                const x: u16 = @intCast(center + dx);
-                const y: u16 = @intCast(center + dy);
-                if (pass == 0) {
-                    try world.reserveDenseCellWrite(layer, x, y, tile);
-                } else {
-                    if (tile == invalid_tile_id) {
-                        _ = try world.clearDenseTile(layer, x, y);
-                    } else {
-                        _ = try world.setDenseTile(layer, x, y, tile);
-                    }
-                    written += 1;
-                }
-            }
+    world.terrain_edit_plan_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_write_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
+        .thread_system = thread_system,
+        .plan_tuner = &world.terrain_edit_plan_tuner,
+        .write_tuner = &world.terrain_edit_write_tuner,
+        .adaptive = case.adaptive,
+        .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1,
+    } else null;
+
+    var unused_timing: BatchTiming = .{};
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+        _ = try runBatchIteration(&fixture, &edit, edit_threads, &unused_timing);
+        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!tunersSettled(world) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runBatchIteration(&fixture, &edit, edit_threads, &unused_timing);
+            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         }
     }
-    return written;
+    const plan_settled = if (case.adaptive) world.terrain_edit_plan_tuner.isSettled() else false;
+    const write_settled = if (case.adaptive) world.terrain_edit_write_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var plan_total: u128 = 0;
+    var write_total: u128 = 0;
+    var main_total: u128 = 0;
+    var cells_changed: usize = 0;
+    for (0..options.iterations) |_| {
+        var timing: BatchTiming = .{};
+        const start_ns = suite.nowNs(io);
+        cells_changed = try runBatchIteration(&fixture, &edit, edit_threads, &timing);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        accumulator.record(elapsed_ns, world.last_terrain_edit_write_batch);
+        plan_total += timing.plan_ns;
+        write_total += timing.write_ns;
+        // Inline stages report no duration, so in the serial case all of it is main.
+        main_total += elapsed_ns -| (timing.plan_ns + timing.write_ns);
+        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+    }
+    var stats = accumulator.finish();
+    // The item count is a case code, so report throughput over the cells written; the
+    // batches' item count is the chunks one edit touched.
+    stats.output_count = cells_changed;
+    stats.items_per_second = if (stats.mean_ns == 0) 0 else @intCast(@as(u128, cells_changed) * std.time.ns_per_s / stats.mean_ns);
+    stats.batch = suite.batchSummaryFromBatch(world.last_terrain_edit_write_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(world.last_terrain_edit_plan_batch);
+    if (stats.iterations > 0) {
+        const iterations: u128 = stats.iterations;
+        stats.terrain_edit_phases = .{
+            .plan_ns = @intCast(plan_total / iterations),
+            .write_ns = @intCast(write_total / iterations),
+            .main_ns = @intCast(main_total / iterations),
+        };
+    }
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(world.terrain_edit_write_tuner.report(), write_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(world.terrain_edit_plan_tuner.report(), plan_settled);
+    }
+    return stats;
 }

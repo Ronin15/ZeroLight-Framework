@@ -194,9 +194,10 @@ Frame pacing policy is explicit and situational
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
 transformed through that presentation into drawable pixels, then clipped to the
-logical viewport; drawable overlays use raw swapchain pixels. All presentation
-state lives in the SDL_GPU renderer path, and debug UI state in the debug
-overlay and render-service path (`.claude/rules/render.md`).
+logical viewport; drawable overlays use raw swapchain pixels. Swapchain
+presentation state lives in the SDL_GPU renderer path, world render state in
+`WorldSystem`'s render path, and debug UI state in the debug overlay and
+render-service path (`.claude/rules/render.md`).
 
 ## Coordination Boundaries
 
@@ -427,11 +428,15 @@ block returns to uniform when its last differing cell goes back to the fill.
 Each level keeps its band list and composed movement-blocked bits per chunk
 (OPEN, BLOCKED, or a bit block), so `levelBlocksMovement` is O(1) and a write
 recomposes only its own cell. Level links are append-only and indexed per
-endpoint chunk, so `rampLinkOtherLevel` walks one chunk's endpoints. A dig,
-fall carve, cave-in, or explosion reserves its growth with
-`reserveDenseCellWrite` (and `reserveLevelLink`) before any mutation, so an OOM
-leaves the step's state intact; a local change costs only the chunks it
-touches, and adding a level costs only its own directories. A write on a layer
+endpoint chunk, so `rampLinkOtherLevel` walks one chunk's endpoints. A dig or
+fall carve reserves its growth with `reserveDenseCellWrite` (and
+`reserveLevelLink`) before any mutation, so an OOM leaves the step's state
+intact; a local change costs only the chunks it touches, and adding a level
+costs only its own directories. A dense one-step change (cave-in, explosion)
+goes through `applyDenseCellWrites`: writes arrive grouped by chunk, storage is
+reserved on the main thread first, chunks are written in parallel on the
+`ThreadSystem`, and results merge in a fixed order, so threaded equals serial
+(`.claude/rules/threading.md`). A write on a layer
 resident in the GPU tile store also queues one element edit for the next
 `syncDenseTileStore`; dense layers can be added in play. Visibility is the
 cached render chunk window, not per-chunk rows. `WorldSystem` prepares world draw records during
@@ -440,9 +445,9 @@ Runtime gameplay construction uses the Engine-owned `ThreadSystem` to build the
 procedural 512x512 tile world in deterministic chunk ranges. The gameplay state
 keeps viewport size separate from world bounds, follows the player with an
 interpolated sub-pixel camera, and asks `WorldSystem` to expose only
-camera-visible chunks to render prep. Future scoped simulation slices may
-consume its chunk/visibility view; `SimulationPipeline` owns no tile storage,
-runtime atlas metadata, or camera policy.
+camera-visible chunks to render prep. Simulation scope uses the fixed-step
+`sim_view` region, never the render window; `SimulationPipeline` owns no tile
+storage, runtime atlas metadata, or camera policy.
 
 The current gameplay fixed-step pipeline is:
 

@@ -181,6 +181,9 @@ Failure and limits:
       added in play; GPU byte gate replaced by a report (`9bbfdc0`).
 - [ ] A world's GPU tile store is released when its world is destroyed or
       replaced, never only at renderer shutdown.
+- [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
+      the thread system, serial equals threaded (S3b); the gameplay producer's
+      slice is not yet named.
 - [ ] Perception's line-of-sight state lives on chunk storage, not a
       level-area bitmap; its rebuild threshold derives from operation cost, not
       level area.

@@ -121,7 +121,7 @@ pub const GpuTileMirror = struct {
     // Released block indices; capacity always covers `block_count`.
     block_free: std.ArrayList(u32) = .empty,
     pending: std.ArrayList(PendingEdit) = .empty,
-    /// Edits reserved by `reserveEdit` and not yet queued.
+    /// Edits reserved by `reserveEdits` and not yet queued.
     pending_reserved: usize = 0,
     regions: std.ArrayList(Region) = .empty,
     /// The last commit's upload batch for `Renderer.queueTileStoreUploads`.
@@ -152,13 +152,14 @@ pub const GpuTileMirror = struct {
         return elements * @sizeOf(u32);
     }
 
-    /// Makes one later `ensureEdit` + `queueEdit` allocation-free; counted until used.
-    pub fn reserveEdit(self: *GpuTileMirror, allocator: std.mem.Allocator) error{OutOfMemory}!void {
-        try self.pending.ensureTotalCapacity(allocator, self.pending.items.len + self.pending_reserved + 1);
-        self.pending_reserved += 1;
+    /// Makes `count` later `ensureEdit` + `queueEdit` calls allocation-free; counted
+    /// until used.
+    pub fn reserveEdits(self: *GpuTileMirror, allocator: std.mem.Allocator, count: usize) error{OutOfMemory}!void {
+        try self.pending.ensureTotalCapacity(allocator, self.pending.items.len + self.pending_reserved + count);
+        self.pending_reserved += count;
     }
 
-    /// Room for one more edit; allocation-free after `reserveEdit`.
+    /// Room for one more edit; allocation-free after `reserveEdits`.
     pub fn ensureEdit(self: *GpuTileMirror, allocator: std.mem.Allocator) error{OutOfMemory}!void {
         try self.pending.ensureTotalCapacity(allocator, self.pending.items.len + 1);
     }
@@ -641,7 +642,7 @@ test "a reserved edit queues without allocating (FailingAllocator)" {
     var mirror = GpuTileMirror{};
     defer mirror.deinit(std.testing.allocator);
     _ = try layers.sync(&mirror, &.{0});
-    for (0..3) |_| try mirror.reserveEdit(std.testing.allocator);
+    for (0..3) |_| try mirror.reserveEdits(std.testing.allocator, 1);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     for (0..3) |index| {
         try mirror.ensureEdit(failing.allocator());

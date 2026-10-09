@@ -231,7 +231,43 @@ pub const DenseLayerStore = struct {
         }
     }
 
+    /// The tile at `local` in `chunk`, from its uniform entry or its block.
+    pub fn chunkTile(self: *const DenseLayerStore, block_cells: usize, chunk: u32, local: u32) TileId {
+        const entry = self.dir[chunk];
+        if (entry & uniform_bit != 0) return @truncate(entry);
+        return self.cells.items[@as(usize, entry) * block_cells + local];
+    }
+
+    /// `chunk`'s block for the one writer of that chunk, or null when uniform. The
+    /// writer never takes or releases a block, so writers of different chunks run at
+    /// once; `releaseIfAllFill` afterwards returns a block left all fill to uniform.
+    pub fn ownBlock(self: *DenseLayerStore, block_cells: usize, chunk: u32) ?OwnedBlock {
+        const entry = self.dir[chunk];
+        if (entry & uniform_bit != 0) return null;
+        const block: usize = entry;
+        const fill_row = &self.fills.items[block];
+        return .{
+            .cells = self.cells.items[block * block_cells ..][0..block_cells],
+            .fill_row = fill_row,
+            .non_fill = fill_row.non_fill,
+        };
+    }
+
+    /// Gives a uniform chunk a block whose cells stay undefined until the chunk's one
+    /// writer fills them (`OwnedBlock.fillFresh`), so the O(edge²) fill runs with the
+    /// writer, not here. Requires one available block. O(1).
+    pub fn claimChunk(self: *DenseLayerStore, block_cells: usize, chunk: u32) void {
+        const fill = self.uniformTile(chunk).?;
+        self.dir[chunk] = self.takeBlockUnfilled(block_cells, fill);
+    }
+
     fn takeBlock(self: *DenseLayerStore, block_cells: usize, fill: TileId) u32 {
+        const block = self.takeBlockUnfilled(block_cells, fill);
+        @memset(self.cells.items[@as(usize, block) * block_cells ..][0..block_cells], fill);
+        return block;
+    }
+
+    fn takeBlockUnfilled(self: *DenseLayerStore, block_cells: usize, fill: TileId) u32 {
         const block: u32 = if (self.free.pop()) |released| released else blk: {
             const index: u32 = @intCast(self.fills.items.len);
             std.debug.assert(self.cells.capacity >= self.cells.items.len + block_cells);
@@ -239,7 +275,6 @@ pub const DenseLayerStore = struct {
             _ = self.fills.addOneAssumeCapacity();
             break :blk index;
         };
-        @memset(self.cells.items[@as(usize, block) * block_cells ..][0..block_cells], fill);
         self.fills.items[block] = .{ .fill = fill, .non_fill = 0 };
         return block;
     }
@@ -431,6 +466,29 @@ pub const ChunkBitsStore = struct {
         self.releaseSlot(chunk, slot, uniform);
     }
 
+    /// `chunk`'s slot for the one setter of that chunk; requires a mixed chunk. The
+    /// setter never takes or releases a slot, so setters of different chunks run at
+    /// once; `releaseIfUniform` afterwards returns a slot left all clear or all set
+    /// to OPEN or BLOCKED.
+    pub fn ownSlot(self: *ChunkBitsStore, chunk: u32) OwnedBits {
+        const slot = self.dir[chunk];
+        std.debug.assert(slot != open_entry and slot != blocked_entry);
+        return .{
+            .slot_bits = &self.bits.items[slot],
+            .slot_count = &self.counts.items[slot],
+            .bits = self.bits.items[slot],
+            .count = self.counts.items[slot],
+        };
+    }
+
+    /// Gives an OPEN or BLOCKED chunk a slot whose bits stay undefined until the
+    /// chunk's one setter fills them from that form (`OwnedBits.fillUniform`).
+    /// Requires one available slot. O(1).
+    pub fn claimChunk(self: *ChunkBitsStore, chunk: u32) void {
+        std.debug.assert(self.form(chunk) != .mixed);
+        self.dir[chunk] = self.takeSlot();
+    }
+
     fn takeSlot(self: *ChunkBitsStore) u32 {
         if (self.free.pop()) |released| return released;
         const slot: u32 = @intCast(self.bits.items.len);
@@ -479,6 +537,70 @@ pub const ChunkBitsStore = struct {
     }
 };
 
+/// A chunk's tile block held by its one writer. Cells are written in place; the
+/// non-fill count is kept here and stored once by `finish`, so writers of
+/// neighboring chunks never share a counter's cache line per write.
+pub const OwnedBlock = struct {
+    cells: []TileId,
+    fill_row: *BlockFill,
+    non_fill: u16,
+
+    pub fn write(self: *OwnedBlock, local: u32, new_tile: TileId) void {
+        const old_tile = self.cells[local];
+        if (old_tile == new_tile) return;
+        if (old_tile == self.fill_row.fill) {
+            self.non_fill += 1;
+        } else if (new_tile == self.fill_row.fill) {
+            self.non_fill -= 1;
+        }
+        self.cells[local] = new_tile;
+    }
+
+    /// Fills a block taken by `DenseLayerStore.claimChunk` with its fill tile.
+    pub fn fillFresh(self: *OwnedBlock) void {
+        std.debug.assert(self.non_fill == 0);
+        @memset(self.cells, self.fill_row.fill);
+    }
+
+    pub fn finish(self: *const OwnedBlock) void {
+        self.fill_row.non_fill = self.non_fill;
+    }
+};
+
+/// A chunk's composed-bits slot held by its one setter, updated locally and stored
+/// once by `finish` for the same reason as `OwnedBlock`.
+pub const OwnedBits = struct {
+    slot_bits: *ChunkBits,
+    slot_count: *u16,
+    bits: ChunkBits,
+    count: u16,
+
+    pub fn set(self: *OwnedBits, local: u32, value: bool) void {
+        if (bitIsSet(&self.bits, local) == value) return;
+        const word_bit = @as(u64, 1) << @intCast(local % 64);
+        if (value) {
+            self.bits[local / 64] |= word_bit;
+            self.count += 1;
+        } else {
+            self.bits[local / 64] &= ~word_bit;
+            self.count -= 1;
+        }
+    }
+
+    /// Sets a slot taken by `ChunkBitsStore.claimChunk` to the chunk's prior OPEN
+    /// (`blocked` false) or BLOCKED form.
+    pub fn fillUniform(self: *OwnedBits, geom: ChunkGeometry, chunk: u32, blocked: bool) void {
+        const extent = geom.extent(chunk);
+        self.bits = if (blocked) inLevelMask(geom, extent) else @splat(0);
+        self.count = if (blocked) @intCast(extent.cellCount()) else 0;
+    }
+
+    pub fn finish(self: *const OwnedBits) void {
+        self.slot_bits.* = self.bits;
+        self.slot_count.* = self.count;
+    }
+};
+
 /// Bits of a chunk's in-level cells; border chunks leave out-of-level cells clear.
 pub fn inLevelMask(geom: ChunkGeometry, extent: ChunkExtent) ChunkBits {
     var words: ChunkBits = @splat(0);
@@ -524,6 +646,14 @@ pub const LevelTerrain = struct {
         const heads = try allocator.alloc(u32, chunk_count);
         @memset(heads, no_link_endpoint);
         self.link_heads = heads;
+    }
+
+    /// Position of `layer` in this level's band list.
+    pub fn bandOf(self: *const LevelTerrain, layer: u32) u8 {
+        for (self.bandLayers(), 0..) |band_layer, band| {
+            if (band_layer == layer) return @intCast(band);
+        }
+        unreachable; // every dense layer is a band of its own level
     }
 };
 
