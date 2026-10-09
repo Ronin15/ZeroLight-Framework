@@ -26,7 +26,7 @@ cross-machine caveat.
   `sinCos` via `@sin`/`@cos`, `atan2` as pure-Zig `std.math.atan2` (no libm,
   no FMA on its scalar path).
 - Callers: `divInt4` only in `deriveChunkJob` (`systems/simulation_scope.zig`)
-  with a runtime, not-necessarily-power-of-two `chunk_size_tiles` divisor;
+  with a runtime power-of-two `chunk_size_tiles` divisor (at most 16);
   `floorToI4` in the spatial index and steering; `math.sinCos` in `rng.unitVec2`
   (AI wander), perception `cos_half_fov`, sprite rotation, and the debug
   overlay; raw `@sin` in `ai_debug_overlay.zig`; runtime-bound
