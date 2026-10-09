@@ -52,8 +52,10 @@ Goal:
   parallel; no rebuild over every static
   (`.claude/rules/engine-design.md` § Cost model,
   `.claude/rules/budgets-capacities.md`).
-- Membership and order match today's steering walk, so steering output
-  stays bit-identical; the structure is a cache class in Slice 64B
+- Membership matches today's steering walk; order is entity order, so
+  steering output equals a full rebuild in that order (today's walk follows
+  `DataSystem` dense order, which swap-removes reorder, so no incremental
+  structure can match it bit for bit); the structure is a cache class in Slice 64B
   (cold vs warm parity).
 - 71B.2 is gated: a control bench must show static-heavy SAP cost growing
   with static count before the split lands; otherwise it closes as measured
@@ -87,9 +89,9 @@ Goal:
       threshold ceiling frozen at reserve, nav-memory requirement test.
 - [x] **71B.1** Obstacle rows carry the level; same-level gate in steering
       with static level-change invalidation.
-- [ ] **71B.1** Chunk-owned static-collider rows with invalidation from
-      post-commit events; a static change rebuilds only its chunks;
-      `FailingAllocator` proof; Slice 64B cache row with its proving test.
+- [ ] **71B.1** The shared static-collider structure built in
+      [Slice 64G](slice-64g.md) (nav its first consumer) serves steering's
+      and collision's queries; Slice 64B cache row with its proving test.
 - [ ] **71B.1** Steering reads the shared rows.
 - [ ] **71B.2 (gate, first)** Control benches `collision-static-heavy-sap`,
       `collision-static-heavy`, and `collision-static-index-change` at three

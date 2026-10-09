@@ -148,7 +148,17 @@ Failure and limits:
   their chunks; 75 paths far-off agents over the whole-world graph.
 - Accessor contracts used by gameplay, perception, and render stay the same.
 - Owner decision (2026-10-09): a ramp dig always digs out its exit cell on
-  the level above, so a ramp never leads into rock.
+  the level above, so a ramp never leads into rock. A blocking obstacle or
+  sparse tile at the exit is cleared with the floor; a static body there
+  leaves the ramp dug but unroutable until it moves; a hole at the exit still
+  links, and the fall rule applies on arrival.
+- Owner decision (2026-10-09): one shared static-collider structure (rows of
+  entity, level, and bounds in entity order) is built here with nav as its
+  first consumer; [Slice 71B](slice-71b.md).1 moves steering and collision
+  onto it.
+- Owner decision (2026-10-09): Slice 72 items D3, G1, G2, E2, and E3 land
+  with the nav work that rewrites the same code; level destroy moves to
+  [Slice 74](slice-74.md).
 - Owner decision (2026-10-09): cave-ins ([Slice 76](slice-76.md)) and
   explosions ([Slice 77](slice-77.md)) belong to `DestructibleController`;
   64G provides the dense terrain path they write through.
@@ -186,6 +196,10 @@ Failure and limits:
       added in play; GPU byte gate replaced by a report (`9bbfdc0`).
 - [x] A world's GPU tile store is released when its world is destroyed or
       replaced, never only at renderer shutdown (render step (a)).
+- [x] GPU tile store residency follows the camera's chunk window: toroidal
+      per-layer directories chained topmost-first; GPU memory independent of
+      level size, depth, and world count; no layer or draw cap beyond the
+      store's u32 width fit (render step (c)).
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
       the thread system, serial equals threaded (S3b). Their gameplay
       producers are [Slice 76](slice-76.md) and [Slice 77](slice-77.md).
@@ -194,20 +208,21 @@ Failure and limits:
       level area.
 - [ ] A nav-apply failure leaves that step's perception and steering
       reactions intact.
-- [ ] Steering's static-obstacle index updates the changed bodies' bins on a
-      static add, move, or destroy, not a rebuild over every static body
-      (`steering.zig:206`, `invalidateStaticObstacleSpatial`: O(static
-      bodies) per change today).
+- [ ] One shared static-collider structure, synced once per entity per step,
+      with nav as its first consumer; a static add, move, or destroy costs its
+      own rows and chunks. Steering and collision move onto it in 71B.1.
 - [ ] Runtime ramps dig out their exit cell on the level above in the same
-      dig (owner decision above).
+      dig, with the edge cases above (owner decision).
+- [ ] Slice 72 D3, G1, G2, E2, and E3 closed with the nav landings that
+      rewrite the same code; their 72 lines checked off there.
 - [ ] Level-sized load gates retired, so creating a world in play (74) and
       adding a link are never refused for capacity; index and format widths
       (cell, chunk, label, slot, edge offsets, level) fail loudly at world
       create, load, and growth. Index widths landed (`23c24ec`); gates remain.
 - [ ] World creation and dense-layer adds in play are never refused for
       capacity: today `DenseLayerWindowExceeded` refuses at
-      `k_max_dense_submit_stack_cap`, `max_dense_bands_per_level`, and
-      `world_terrain.max_level_bands`.
+      `world_terrain.max_level_bands` (the submit stack and per-level band
+      caps went with render step (c)).
 - [x] Replaced branch nav code and its tests removed; main's nav restored
       (`2c09cec`).
 - [ ] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
@@ -224,8 +239,9 @@ Failure and limits:
 
 - [ ] `chunk-scale-*` bench groups at 256², 1024², 2048², and 8 / 32 / 128
       levels (`.claude/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
-      explosion fill flat across sizes; level create and destroy flat across
-      depth and linear in their own chunks (the world-count axis is 74's).
+      explosion fill flat across sizes; level create flat across depth and
+      linear in its own chunks (level destroy and the world-count axis are
+      74's).
       Fixtures build once outside the timed loop and the groups run quickly in
       Debug.
 - [ ] An A\* path of the same length costs the same at 2048² as at 256²

@@ -101,12 +101,16 @@ One world per gameplay state; nothing models a set of worlds.
 - [ ] Every world steps each fixed step, threaded across worlds with a
       serial path and a fixed merge order.
 - [ ] The observer (camera focus, or a player when present) and presentation
-      bound to the viewed world; other worlds step without presentation at
-      75's lowest band.
+      bound to the viewed world; a mini view may show another world
+      (`.claude/rules/render.md`); worlds in no view step without
+      presentation at 75's lowest band.
 - [ ] Entities (NPCs, and a player when present) move between worlds at a
       between-step seam.
 - [ ] Per-world GPU resource release through the render boundary, replacing
       the renderer-wide release.
+- [ ] Level destroy in play (moved from 64G): a level's terrain, nav, and
+      render storage released, flat across depth and linear in its own
+      chunks.
 - [ ] Per-world state classified for 49/64B; included in 46's v1.
 - [ ] Tests: create, step, and destroy leak nothing; an entity moved
       between worlds keeps its identity as designed; one world's step is
@@ -114,7 +118,7 @@ One world per gameplay state; nothing models a set of worlds.
       advances; serial equals threaded across worlds; OOM during create leaves the set intact and the retry
       succeeds; destroy releases only that world's GPU resources.
 - [ ] Bench `world-instances`: create, destroy, and step cost at three or
-      more world counts and sizes.
+      more world counts and sizes; level destroy at three depths.
 - [ ] Docs: `docs/architecture.md` world set, ownership, step order;
       `docs/simulation-tiers-and-pipeline.md` stepping several worlds.
 
