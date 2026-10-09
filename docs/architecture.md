@@ -79,15 +79,17 @@ Designs start here, then read the live structure below (rules:
   not the discovery gate. Queries return nearest-k (dist², then slot index).
 - `src/game/world_terrain.zig` holds `WorldSystem`'s chunk-owned terrain
   storage: per dense layer a chunk directory over a pool of tile blocks, per
-  level a band list, a composed movement-blocked directory over a pool of bit
-  blocks, and per-chunk link-endpoint list heads, all sized at level create.
+  level a growable band list, a composed movement-blocked directory over a pool
+  of bit blocks, and per-chunk link-endpoint list heads, directories sized at
+  level create.
 - `src/game/world_test_support.zig` holds test-only `WorldSystem` fixtures shared
   across modules (a demo surface at any chunk edge, terrain pool warmup).
 - `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
   renderer-owned GPU tile store: the store's non-owning id, the resident
-  window, each resident layer's toroidal directory and chain link, the
-  directory and block allocator, and the queued cell edits it plans and commits
-  each frame; reset when the renderer retires the store.
+  window, each resident layer's toroidal directory and chain link, and the
+  directory and block allocator it plans and commits each frame, uploading
+  changed chunks found through layer flags and block change marks; reset when
+  the renderer retires the store.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, destructible, structural, system) and owns state-local persistent
@@ -439,7 +441,9 @@ uniform tile or a block index into a pool of chunk-sized tile blocks, and a
 block returns to uniform when a write leaves its in-level cells holding one
 tile, whichever tile (an O(1) count of unequal neighbors along a row-major cell
 chain). Pool growth is counted (`terrain_pool_grows`) and logged once.
-Each level keeps its band list and composed movement-blocked bits per chunk
+Each level keeps its band list (growable: a band add is never refused, and a
+batched edit carries per-group band bits sized to the widest touched level) and
+composed movement-blocked bits per chunk
 (OPEN, BLOCKED, or a bit block), so `levelBlocksMovement` is O(1) and a write
 recomposes only its own cell. Level links are append-only and indexed per
 endpoint chunk, so `rampLinkOtherLevel` walks one chunk's endpoints. A dig or
@@ -450,9 +454,10 @@ costs only its own directories. A dense one-step change (cave-in, explosion)
 goes through `applyDenseCellWrites`: writes arrive grouped by chunk, storage is
 reserved on the main thread first, chunks are written in parallel on the
 `ThreadSystem`, and results merge in a fixed order, so threaded equals serial
-(`.claude/rules/threading.md`). A write on a layer
-resident in the GPU tile store also queues one element edit for the next
-`syncDenseTileStore`; dense layers can be added in play. Visibility is the
+(`.claude/rules/threading.md`). A write marks its block changed and, on a layer
+resident in the GPU tile store, flags the layer for the next
+`syncDenseTileStore`, which uploads each changed window chunk once; edits hold
+no render memory. Dense layers can be added in play. Visibility is the
 cached render chunk window, not per-chunk rows. `WorldSystem` prepares world draw records during
 render, using explicit world-depth bands from `src/game/render_depth.zig`.
 Runtime gameplay construction uses the Engine-owned `ThreadSystem` to build the

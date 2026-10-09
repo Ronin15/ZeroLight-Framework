@@ -40,8 +40,9 @@
 //! levels`, plus `region chunks * 10^7` for the two batched groups or `window edge
 //! chunks * 10^7` for the pan group. Fixtures and the batches' write lists build
 //! once per case outside the timed loop. The batched groups run serial,
-//! fixed-thread, and adaptive, with the two deepest levels GPU resident so the GPU
-//! edit merge is timed; they report each stage's time and the main thread's share.
+//! fixed-thread, and adaptive, with the two deepest levels GPU resident so the
+//! merge's render flags are timed; they report each stage's time and the main
+//! thread's share.
 //! Single-cell digs and GPU syncs are main-thread work, so their groups measure the
 //! serial case only. The GPU sync groups drive `syncDenseTileStore` against a
 //! headless renderer whose tile store has no GPU buffer: they time planning,
@@ -769,7 +770,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
     // The two deepest levels are GPU resident over the fixed window, so edits there
-    // queue GPU edits; each iteration's sync drains them outside the timed region.
+    // flag their layers; each iteration's sync uploads them outside the timed region.
     fixture.setDigWindow();
     try fixture.attachHeadlessTileStore(allocator);
     _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());

@@ -22,10 +22,6 @@ pub const max_chunk_edge: u16 = 16;
 pub const max_chunk_cells: usize = @as(usize, max_chunk_edge) * max_chunk_edge;
 pub const ChunkBits = [max_chunk_cells / 64]u64;
 
-/// Inline band-list bound per level; `WorldSystem.addDenseLayer` refuses a band past it
-/// with the same error as its configured per-level cap.
-pub const max_level_bands: usize = 32;
-
 /// Head/next sentinel of a level's link-endpoint lists.
 pub const no_link_endpoint: u32 = std.math.maxInt(u32);
 
@@ -113,6 +109,9 @@ pub const BlockFill = struct {
     /// cell holds one tile, which returns the chunk to uniform. A single-cell write
     /// updates it in O(1); a chunk's one writer recounts it once (`chainUnequalPairs`).
     unequal_pairs: u16,
+    /// Render-only: set when the block is taken or a cell changes, cleared when the
+    /// GPU mirror uploads the block. Never simulation state and never saved.
+    changed: bool,
 };
 
 /// One dense layer's tiles by chunk.
@@ -165,6 +164,20 @@ pub const DenseLayerStore = struct {
         const entry = self.dir[chunk];
         if (entry & uniform_bit != 0) return null;
         return self.cells.items[@as(usize, entry) * block_cells ..][0..block_cells];
+    }
+
+    /// Whether `chunk`'s block changed since `clearBlockChanged`; false when uniform.
+    pub fn blockChanged(self: *const DenseLayerStore, chunk: u32) bool {
+        const entry = self.dir[chunk];
+        if (entry & uniform_bit != 0) return false;
+        return self.fills.items[entry].changed;
+    }
+
+    /// Clears `chunk`'s change mark after its block uploads; no-op when uniform.
+    pub fn clearBlockChanged(self: *DenseLayerStore, chunk: u32) void {
+        const entry = self.dir[chunk];
+        if (entry & uniform_bit != 0) return;
+        self.fills.items[entry].changed = false;
     }
 
     /// Blocks holding cells now (pool size less released blocks).
@@ -229,6 +242,7 @@ pub const DenseLayerStore = struct {
         const block_fill = &self.fills.items[block];
         const pairs = @as(i32, block_fill.unequal_pairs) + chainPairDelta(cells, geom.shift, geom.extent(chunk), local, old_tile, new_tile);
         block_fill.unequal_pairs = @intCast(pairs); // a chunk has at most edge² - 1 pairs
+        block_fill.changed = true;
         cells[local] = new_tile;
         if (block_fill.unequal_pairs == 0) {
             block_fill.fill = new_tile;
@@ -284,7 +298,7 @@ pub const DenseLayerStore = struct {
             _ = self.fills.addOneAssumeCapacity();
             break :blk index;
         };
-        self.fills.items[block] = .{ .fill = fill, .unequal_pairs = 0 };
+        self.fills.items[block] = .{ .fill = fill, .unequal_pairs = 0, .changed = true };
         return block;
     }
 
@@ -306,7 +320,7 @@ pub const DenseLayerStore = struct {
         _ = self.cells.addManyAsSliceAssumeCapacity(geom.chunkCount() * geom.blockCells());
         for (self.dir, 0..) |*entry, chunk| {
             std.debug.assert(entry.* & uniform_bit != 0);
-            self.fills.appendAssumeCapacity(.{ .fill = @truncate(entry.*), .unequal_pairs = 0 });
+            self.fills.appendAssumeCapacity(.{ .fill = @truncate(entry.*), .unequal_pairs = 0, .changed = true });
             entry.* = @intCast(chunk);
         }
     }
@@ -553,8 +567,9 @@ pub const ChunkBitsStore = struct {
 };
 
 /// A chunk's tile block held by its one writer. Cells are written in place and
-/// `finish` recounts the unequal pairs once, so a dense write costs no per-cell
-/// bookkeeping and writers of neighboring chunks never share a counter.
+/// `finish` recounts the unequal pairs and marks the block changed once, so a dense
+/// write costs no per-cell bookkeeping and writers of neighboring chunks never
+/// share a counter or a fill row.
 pub const OwnedBlock = struct {
     cells: []TileId,
     fill_row: *BlockFill,
@@ -573,13 +588,15 @@ pub const OwnedBlock = struct {
         @memset(self.cells, self.fill_row.fill);
     }
 
-    /// Recounts a written block's unequal pairs, O(edge²); a block left holding one
-    /// tile records it as its fill for `DenseLayerStore.releaseIfUniform`.
+    /// Recounts a written block's unequal pairs, O(edge²), and marks it changed; a
+    /// block left holding one tile records it as its fill for
+    /// `DenseLayerStore.releaseIfUniform`.
     pub fn finish(self: *const OwnedBlock) void {
         if (!self.written) return;
         const pairs = chainUnequalPairs(self.cells, self.shift, self.extent);
         if (pairs == 0) self.fill_row.fill = self.cells[0];
         self.fill_row.unequal_pairs = pairs;
+        self.fill_row.changed = true;
     }
 };
 
@@ -689,9 +706,14 @@ pub fn bitIsSet(words: *const ChunkBits, local: u32) bool {
 /// One level's chunk-owned terrain: its dense band list, composed blocked bits, and
 /// link-endpoint heads.
 pub const LevelTerrain = struct {
-    bands: [max_level_bands]u32 = undefined,
-    band_count: u8 = 0,
+    /// Dense layer indices of this level's bands in add order; a layer's position
+    /// here is its `band`. Append-only.
+    bands: std.ArrayList(u32) = .empty,
     blocked: ChunkBitsStore = .{},
+    // Advances (wrapping) whenever `blocked` changes through a path that emits no
+    // per-cell event: a blocking band add, a procedural fill. Readers compare it
+    // with != once per step.
+    content_revision: u32 = 0,
     /// Per chunk, the newest link endpoint (`2 * link + side`) on this level, or
     /// `no_link_endpoint`.
     link_heads: []u32 = &.{},
@@ -706,21 +728,14 @@ pub const LevelTerrain = struct {
     }
 
     pub fn deinit(self: *LevelTerrain, allocator: std.mem.Allocator) void {
+        self.bands.deinit(allocator);
         self.blocked.deinit(allocator);
         allocator.free(self.link_heads);
         self.* = undefined;
     }
 
     pub fn bandLayers(self: *const LevelTerrain) []const u32 {
-        return self.bands[0..self.band_count];
-    }
-
-    /// Position of `layer` in this level's band list.
-    pub fn bandOf(self: *const LevelTerrain, layer: u32) u8 {
-        for (self.bandLayers(), 0..) |band_layer, band| {
-            if (band_layer == layer) return @intCast(band);
-        }
-        unreachable; // every dense layer is a band of its own level
+        return self.bands.items;
     }
 };
 

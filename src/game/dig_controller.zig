@@ -786,7 +786,7 @@ test "plane traversal within the scratch reserve is allocation-free (FailingAllo
     frame.allocator = fail_alloc;
     frame.events.stream.allocator = fail_alloc;
     tw.data.allocator = fail_alloc;
-    // World/dense-edit allocations (tile writes, the dense edit queue) are caught too.
+    // World/dense-edit allocations (tile writes, block takes) are caught too.
     tw.world.allocator = fail_alloc;
     // Declared after the deinit defers, so it restores the real allocators first (LIFO).
     defer {

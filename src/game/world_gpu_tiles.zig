@@ -8,12 +8,13 @@
 //! plus a link word chaining it to the next deeper resident layer, and a block per
 //! mixed chunk inside the chunk window. Directories and blocks are two allocation
 //! classes over one bump high water with a free list each. The mirror keeps each
-//! resident layer's directory words as uploaded, the allocator, and the cell edits
-//! queued on resident layers since the last sync. A pan across a chunk boundary
-//! uploads the entering chunks, a dig one element, and a layer entering the window
-//! its directory and the blocks of its mixed window chunks. `plan` sizes and
-//! reserves a sync without changing anything a retry depends on; `commit` then
-//! applies it and writes the upload batch without allocating.
+//! resident layer's directory words as uploaded and the allocator; edits hold no
+//! mirror memory. A pan across a chunk boundary uploads the entering chunks, a
+//! layer entering the window its directory and the blocks of its mixed window
+//! chunks, and a changed chunk of a layer flagged changed its word or whole block
+//! once (the CPU block's change mark). `plan` sizes and reserves a sync without
+//! changing anything a retry depends on; `commit` then applies it, clears the marks
+//! it uploads, and writes the upload batch without allocating.
 
 const std = @import("std");
 const ChunkGeometry = @import("world_terrain.zig").ChunkGeometry;
@@ -21,7 +22,6 @@ const DenseLayerStore = @import("world_terrain.zig").DenseLayerStore;
 const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
 const packTileData = @import("../render/renderer.zig").packTileData;
-const packTileDataElement = @import("../render/renderer.zig").packTileDataElement;
 const tile_data_pad_cell = @import("../render/renderer.zig").tile_data_pad_cell;
 const tile_store_max_elements = @import("../render/renderer.zig").tile_store_max_elements;
 const tile_store_max_side = @import("../render/renderer.zig").tile_store_max_side;
@@ -109,14 +109,6 @@ pub fn residentLayerFit(side: u32, block_elements: u32) usize {
     return @intCast(@as(u64, tile_store_max_elements) / per_layer);
 }
 
-/// One queued cell edit on a resident layer: element `element` of `chunk`'s block in
-/// the directory of resident slot `slot`.
-pub const PendingEdit = struct {
-    slot: u32,
-    chunk: u32,
-    element: u32,
-};
-
 /// What one sync changes, sized before anything changes (`GpuTileMirror.plan`).
 pub const SyncPlan = struct {
     /// The sync moved the resident set (layers, window, or side).
@@ -128,6 +120,13 @@ pub const SyncPlan = struct {
     layers_changed: bool = false,
     side: u32 = 0,
     window: ChunkWindow = .{},
+    /// The plan scanned the window chunks of layers flagged changed; the commit
+    /// uploads them and clears every resident layer's flag.
+    edits: bool = false,
+    // Of those chunks, the ones that free a block or set a uniform word, and the
+    // ones that take or rewrite a block; the commit skips a pass with none.
+    edit_word_writes: usize = 0,
+    edit_block_writes: usize = 0,
     enter_count: usize = 0,
     evict_count: usize = 0,
     span_count: usize = 0,
@@ -136,7 +135,7 @@ pub const SyncPlan = struct {
     required_elements: u32 = 0,
 };
 
-const RegionKind = enum { directory, directory_word, link, block, block_element };
+const RegionKind = enum { directory, directory_word, link, block };
 
 // One upload span before its values are written, and where they come from.
 const Region = struct {
@@ -144,35 +143,14 @@ const Region = struct {
     count: u32,
     kind: RegionKind,
     slot: u32,
-    // Toroidal word for `directory_word`; level chunk for `block` and `block_element`.
+    // Toroidal word for `directory_word`; level chunk for `block`.
     index: u32,
-    element: u32 = 0,
 };
 
-// How one queued chunk's GPU directory word and block must change to match the CPU.
-const ChunkChange = enum { none, set_word, free_block, take_block, write_elements };
-
-const PendingGroup = struct {
-    slot: u32,
-    chunk: u32,
-    edits: []const PendingEdit,
-};
-
-// Runs of sorted pending edits sharing a slot and chunk.
-const PendingGroups = struct {
-    edits: []const PendingEdit,
-    index: usize = 0,
-
-    fn next(self: *PendingGroups) ?PendingGroup {
-        if (self.index >= self.edits.len) return null;
-        const first = self.edits[self.index];
-        var end = self.index + 1;
-        while (end < self.edits.len and self.edits[end].slot == first.slot and self.edits[end].chunk == first.chunk) end += 1;
-        const group = PendingGroup{ .slot = first.slot, .chunk = first.chunk, .edits = self.edits[self.index..end] };
-        self.index = end;
-        return group;
-    }
-};
+// How one resident chunk's GPU directory word and block must change to match the
+// CPU: a uniform tile changed, a block went uniform, a uniform chunk split, or a
+// block's cells changed (whole-block upload).
+const ChunkChange = enum { none, set_word, free_block, take_block, rewrite_block };
 
 pub const GpuTileMirror = struct {
     /// The renderer-owned store; `.invalid` until the first sync with uploads creates it.
@@ -201,9 +179,6 @@ pub const GpuTileMirror = struct {
     plan_enter: std.ArrayList(u32) = .empty,
     plan_order: std.ArrayList(u32) = .empty,
     plan_stays: std.ArrayList(bool) = .empty,
-    pending: std.ArrayList(PendingEdit) = .empty,
-    /// Edits reserved by `reserveEdits` and not yet queued.
-    pending_reserved: usize = 0,
     regions: std.ArrayList(Region) = .empty,
     /// The last commit's upload batch for `Renderer.queueTileStoreUploads`.
     spans: std.ArrayList(TileStoreSpan) = .empty,
@@ -224,7 +199,6 @@ pub const GpuTileMirror = struct {
         self.plan_enter.deinit(allocator);
         self.plan_order.deinit(allocator);
         self.plan_stays.deinit(allocator);
-        self.pending.deinit(allocator);
         self.regions.deinit(allocator);
         self.spans.deinit(allocator);
         self.values.deinit(allocator);
@@ -232,16 +206,15 @@ pub const GpuTileMirror = struct {
     }
 
     /// Forgets the store after the renderer retired it: no layer resident (each
-    /// resident layer's entry in `layer_slots` back to `no_slot`), no layout, an
-    /// empty allocator, and no queued edits; keeps every capacity for the next
-    /// store. O(resident layers).
-    pub fn reset(self: *GpuTileMirror, layer_slots: []u32) void {
-        self.dropLayout(layer_slots);
+    /// resident layer's entry in `layer_slots` back to `no_slot` and in
+    /// `layer_changed` to false), no layout, and an empty allocator; keeps every
+    /// capacity for the next store. O(resident layers).
+    pub fn reset(self: *GpuTileMirror, layer_slots: []u32, layer_changed: []bool) void {
+        self.dropLayout(layer_slots, layer_changed);
         self.store = .invalid;
         self.store_side = 0;
         self.side = 0;
         self.window = .{};
-        self.pending.clearRetainingCapacity();
         self.regions.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
         self.values.clearRetainingCapacity();
@@ -273,38 +246,21 @@ pub const GpuTileMirror = struct {
         return self.slot_words.items[@as(usize, slot) * stride ..][0..stride];
     }
 
-    /// Makes `count` later `ensureEdit` + `queueEdit` calls allocation-free; counted
-    /// until used.
-    pub fn reserveEdits(self: *GpuTileMirror, allocator: std.mem.Allocator, count: usize) error{OutOfMemory}!void {
-        try self.pending.ensureTotalCapacity(allocator, self.pending.items.len + self.pending_reserved + count);
-        self.pending_reserved += count;
-    }
-
-    /// Room for one more edit; allocation-free after `reserveEdits`.
-    pub fn ensureEdit(self: *GpuTileMirror, allocator: std.mem.Allocator) error{OutOfMemory}!void {
-        try self.pending.ensureTotalCapacity(allocator, self.pending.items.len + 1);
-    }
-
-    /// Queues a cell edit on a resident layer; requires `ensureEdit`. Duplicates
-    /// coalesce, and edits outside the window drop, at the next sync.
-    pub fn queueEdit(self: *GpuTileMirror, slot: u32, chunk: u32, element: u32) void {
-        std.debug.assert(slot < self.slot_layer.items.len and self.slot_layer.items[slot] != no_layer);
-        self.pending_reserved -|= 1;
-        self.pending.appendAssumeCapacity(.{ .slot = slot, .chunk = chunk, .element = element });
-    }
-
     /// Sizes one sync and reserves every growth it needs. `desired` is the resident
     /// set when the layers, window, or side may have changed, null otherwise.
-    /// Changes nothing a retry depends on: it only sorts and coalesces the queue and
-    /// fills plan scratch, so an OOM leaves residency, window, and edits intact.
-    /// Costs O(resident layers × window chunks) when `desired` is set, plus
-    /// O(edits log edits); never depends on chunks outside the window.
+    /// `layer_changed` is non-null when some resident layer is flagged changed; a
+    /// flagged layer that stays has its chunks in both the current and the new window
+    /// compared with the uploaded words. Changes nothing a retry depends on (it fills
+    /// only plan scratch), so an OOM leaves residency, window, flags, and marks
+    /// intact. Costs O(resident layers × window chunks) when `desired` is set, plus
+    /// O(window chunks) per flagged layer; never depends on chunks outside the window.
     pub fn plan(
         self: *GpuTileMirror,
         allocator: std.mem.Allocator,
         geom: ChunkGeometry,
         stores: []const DenseLayerStore,
         layer_slots: []const u32,
+        layer_changed: ?[]const bool,
         desired: ?Residency,
     ) error{OutOfMemory}!SyncPlan {
         const block_elements = tileStoreBlockElements(geom.edge);
@@ -390,30 +346,37 @@ pub const GpuTileMirror = struct {
             for (self.order.items) |slot| stays[slot] = true;
         }
 
-        self.coalescePending();
-        var groups = PendingGroups{ .edits = self.pending.items };
-        while (groups.next()) |group| {
-            if (!self.editLive(geom, group, result.window)) continue;
-            switch (self.chunkChange(geom, stores, group.slot, group.chunk)) {
-                .none => {},
-                .set_word => {
-                    result.span_count += 1;
-                    result.value_count += 1;
-                },
-                .free_block => {
-                    block_frees += 1;
-                    result.span_count += 1;
-                    result.value_count += 1;
-                },
-                .take_block => {
-                    block_takes += 1;
-                    result.span_count += 2;
-                    result.value_count += 1 + block_elements;
-                },
-                .write_elements => {
-                    result.span_count += group.edits.len;
-                    result.value_count += group.edits.len;
-                },
+        if (layer_changed) |changed| {
+            result.edits = true;
+            const edit_window = intersect(self.window, result.window);
+            for (self.order.items) |slot| {
+                if (!stays[slot] or !changed[self.slot_layer.items[slot]]) continue;
+                var chunks = WindowChunks.init(edit_window);
+                while (chunks.next()) |chunk| switch (self.chunkChange(geom, stores, slot, chunk.x, chunk.y)) {
+                    .none => {},
+                    .set_word => {
+                        result.edit_word_writes += 1;
+                        result.span_count += 1;
+                        result.value_count += 1;
+                    },
+                    .free_block => {
+                        result.edit_word_writes += 1;
+                        block_frees += 1;
+                        result.span_count += 1;
+                        result.value_count += 1;
+                    },
+                    .take_block => {
+                        result.edit_block_writes += 1;
+                        block_takes += 1;
+                        result.span_count += 2;
+                        result.value_count += 1 + block_elements;
+                    },
+                    .rewrite_block => {
+                        result.edit_block_writes += 1;
+                        result.span_count += 1;
+                        result.value_count += block_elements;
+                    },
+                };
             }
         }
 
@@ -451,15 +414,18 @@ pub const GpuTileMirror = struct {
 
     /// Applies `sync_plan` (from `plan` with the same inputs, nothing changed since)
     /// and writes the upload batch into `spans`/`values`, sorted and disjoint, each
-    /// span a whole directory, one word, one link, one block, or one block element.
-    /// Allocation-free. Frees come first (evictions, chunks leaving, edits), then
-    /// takes (edits, chunks entering, layers entering), then links.
+    /// span a whole directory, one word, one link, or one block. Clears the change
+    /// mark of every block it uploads and, after a plan with edits, every resident
+    /// layer's `layer_changed` flag. Allocation-free. Frees come first (evictions,
+    /// chunks leaving, edits), then takes (edits, chunks entering, layers entering),
+    /// then links.
     pub fn commit(
         self: *GpuTileMirror,
         sync_plan: *const SyncPlan,
         geom: ChunkGeometry,
-        stores: []const DenseLayerStore,
+        stores: []DenseLayerStore,
         layer_slots: []u32,
+        layer_changed: []bool,
     ) void {
         self.regions.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
@@ -470,14 +436,14 @@ pub const GpuTileMirror = struct {
         const new_window = sync_plan.window;
 
         if (sync_plan.relayout) {
-            self.dropLayout(layer_slots);
-            self.pending.clearRetainingCapacity();
+            self.dropLayout(layer_slots, layer_changed);
             self.side = sync_plan.side;
         } else if (sync_plan.residency_changed) {
             for (self.plan_evict.items) |slot| {
                 self.freeBlocks(geom, slot, old_window, .{});
                 self.freeDirectory(self.slot_dir.items[slot]);
                 layer_slots[self.slot_layer.items[slot]] = no_slot;
+                layer_changed[self.slot_layer.items[slot]] = false;
                 self.slot_layer.items[slot] = no_layer;
                 std.debug.assert(self.slot_free.items.len < self.slot_free.capacity);
                 self.slot_free.appendAssumeCapacity(slot);
@@ -487,45 +453,49 @@ pub const GpuTileMirror = struct {
             }
         }
 
-        // Only edits on chunks resident before and after stay queued; the rest
-        // upload whole when their chunk or layer enters.
-        var kept: usize = 0;
-        for (self.pending.items) |edit| {
-            if (!self.editLive(geom, .{ .slot = edit.slot, .chunk = edit.chunk, .edits = &.{} }, new_window)) continue;
-            self.pending.items[kept] = edit;
-            kept += 1;
-        }
-        self.pending.items.len = kept;
-
-        var groups = PendingGroups{ .edits = self.pending.items };
-        while (groups.next()) |group| {
-            const change = self.chunkChange(geom, stores, group.slot, group.chunk);
-            if (change != .set_word and change != .free_block) continue;
-            const word = self.toroidalIndex(geom, group.chunk);
-            const words = self.slotWordsMut(group.slot);
-            if (change == .free_block) self.freeBlock(words[word]);
-            words[word] = tileStoreUniformWord(stores[self.slot_layer.items[group.slot]].readUniformTile(group.chunk).?);
-            self.appendRegion(.directory_word, group.slot, word, 1);
-        }
-        groups = .{ .edits = self.pending.items };
-        while (groups.next()) |group| {
-            switch (self.chunkChange(geom, stores, group.slot, group.chunk)) {
-                .take_block => {
-                    const word = self.toroidalIndex(geom, group.chunk);
-                    self.slotWordsMut(group.slot)[word] = self.takeBlock(block_elements);
-                    self.appendRegion(.directory_word, group.slot, word, 1);
-                    self.appendBlockRegion(group.slot, group.chunk, word, block_elements);
-                },
-                .write_elements => {
-                    const block = self.slotWords(group.slot)[self.toroidalIndex(geom, group.chunk)];
-                    for (group.edits) |edit| {
-                        self.regions.appendAssumeCapacity(.{ .dst = block + edit.element, .count = 1, .kind = .block_element, .slot = group.slot, .index = group.chunk, .element = edit.element });
+        // Changed chunks resident before and after: frees first, then takes. Other
+        // changes upload whole when their chunk or layer enters.
+        if (sync_plan.edits) {
+            const edit_window = intersect(old_window, new_window);
+            for (self.order.items) |slot| {
+                if (sync_plan.edit_word_writes == 0) break;
+                if (!stays[slot] or !layer_changed[self.slot_layer.items[slot]]) continue;
+                var chunks = WindowChunks.init(edit_window);
+                while (chunks.next()) |chunk| {
+                    const change = self.chunkChange(geom, stores, slot, chunk.x, chunk.y);
+                    if (change != .set_word and change != .free_block) continue;
+                    const word = self.toroidalWord(chunk.x, chunk.y);
+                    const words = self.slotWordsMut(slot);
+                    if (change == .free_block) self.freeBlock(words[word]);
+                    words[word] = tileStoreUniformWord(stores[self.slot_layer.items[slot]].readUniformTile(chunk.y * geom.chunks_x + chunk.x).?);
+                    self.appendRegion(.directory_word, slot, word, 1);
+                }
+            }
+            for (self.order.items) |slot| {
+                if (sync_plan.edit_block_writes == 0) break;
+                const layer = self.slot_layer.items[slot];
+                if (!stays[slot] or !layer_changed[layer]) continue;
+                var chunks = WindowChunks.init(edit_window);
+                while (chunks.next()) |chunk| {
+                    const word = self.toroidalWord(chunk.x, chunk.y);
+                    const level_chunk = chunk.y * geom.chunks_x + chunk.x;
+                    switch (self.chunkChange(geom, stores, slot, chunk.x, chunk.y)) {
+                        .take_block => {
+                            self.slotWordsMut(slot)[word] = self.takeBlock(block_elements);
+                            self.appendRegion(.directory_word, slot, word, 1);
+                            self.appendBlockRegion(slot, level_chunk, word, block_elements);
+                        },
+                        .rewrite_block => self.appendBlockRegion(slot, level_chunk, word, block_elements),
+                        .none, .set_word, .free_block => {},
                     }
-                },
-                .none, .set_word, .free_block => {},
+                }
+            }
+            // Flags of layers resident before this sync; evicted ones cleared above
+            // and entering ones were never set.
+            for (self.order.items) |slot| {
+                if (self.slot_layer.items[slot] != no_layer) layer_changed[self.slot_layer.items[slot]] = false;
             }
         }
-        self.pending.clearRetainingCapacity();
 
         if (sync_plan.residency_changed) {
             if (!sync_plan.relayout) {
@@ -570,23 +540,22 @@ pub const GpuTileMirror = struct {
                 .directory => self.values.appendSliceAssumeCapacity(self.slotWords(region.slot)),
                 .directory_word, .link => self.values.appendAssumeCapacity(self.slotWords(region.slot)[region.index]),
                 .block => {
-                    const cells = stores[self.slot_layer.items[region.slot]].chunkCells(block_cells, region.index).?;
-                    packTileData(cells, self.values.addManyAsSliceAssumeCapacity(block_elements));
-                },
-                .block_element => {
-                    const cells = stores[self.slot_layer.items[region.slot]].chunkCells(block_cells, region.index).?;
-                    const low = region.element * 2;
-                    const high = if (low + 1 < cells.len) cells[low + 1] else tile_data_pad_cell;
-                    self.values.appendAssumeCapacity(packTileDataElement(cells[low], high));
+                    const store = &stores[self.slot_layer.items[region.slot]];
+                    packTileData(store.chunkCells(block_cells, region.index).?, self.values.addManyAsSliceAssumeCapacity(block_elements));
+                    store.clearBlockChanged(region.index);
                 },
             }
         }
         std.debug.assert(self.spans.items.len == sync_plan.span_count and self.values.items.len == sync_plan.value_count);
     }
 
-    // Drops every slot and the allocator, keeping capacity.
-    fn dropLayout(self: *GpuTileMirror, layer_slots: []u32) void {
-        for (self.order.items) |slot| layer_slots[self.slot_layer.items[slot]] = no_slot;
+    // Drops every slot and the allocator, keeping capacity; no layer stays resident
+    // or flagged changed.
+    fn dropLayout(self: *GpuTileMirror, layer_slots: []u32, layer_changed: []bool) void {
+        for (self.order.items) |slot| {
+            layer_slots[self.slot_layer.items[slot]] = no_slot;
+            layer_changed[self.slot_layer.items[slot]] = false;
+        }
         self.slot_layer.clearRetainingCapacity();
         self.slot_dir.clearRetainingCapacity();
         self.slot_words.clearRetainingCapacity();
@@ -669,36 +638,19 @@ pub const GpuTileMirror = struct {
         return link != self.slot_dir.items[next_slot];
     }
 
-    // An edit uploads only when its slot stays resident and its chunk is in both
-    // the current and the new window.
-    fn editLive(self: *const GpuTileMirror, geom: ChunkGeometry, group: PendingGroup, new_window: ChunkWindow) bool {
-        if (group.slot >= self.plan_stays.items.len or !self.plan_stays.items[group.slot]) return false;
-        const chunk_x = group.chunk % geom.chunks_x;
-        const chunk_y = group.chunk / geom.chunks_x;
-        return self.window.contains(chunk_x, chunk_y) and new_window.contains(chunk_x, chunk_y);
-    }
-
-    fn chunkChange(self: *const GpuTileMirror, geom: ChunkGeometry, stores: []const DenseLayerStore, slot: u32, chunk: u32) ChunkChange {
-        const have = self.slotWords(slot)[self.toroidalIndex(geom, chunk)];
+    // How resident `slot`'s uploaded word for chunk (chunk_x, chunk_y) must change to
+    // match the CPU store. A block uploads again only when marked changed.
+    fn chunkChange(self: *const GpuTileMirror, geom: ChunkGeometry, stores: []const DenseLayerStore, slot: u32, chunk_x: u32, chunk_y: u32) ChunkChange {
+        const have = self.slotWords(slot)[self.toroidalWord(chunk_x, chunk_y)];
         const have_block = have & tile_store_uniform_bit == 0;
-        if (stores[self.slot_layer.items[slot]].readUniformTile(chunk)) |tile| {
+        const store = &stores[self.slot_layer.items[slot]];
+        const chunk = chunk_y * geom.chunks_x + chunk_x;
+        if (store.readUniformTile(chunk)) |tile| {
             if (have_block) return .free_block;
             return if (have == tileStoreUniformWord(tile)) .none else .set_word;
         }
-        return if (have_block) .write_elements else .take_block;
-    }
-
-    // Sorts the queue by (slot, chunk, element) and drops repeats. Allocation-free.
-    fn coalescePending(self: *GpuTileMirror) void {
-        const edits = self.pending.items;
-        std.mem.sortUnstable(PendingEdit, edits, {}, pendingLessThan);
-        var kept: usize = 0;
-        for (edits) |edit| {
-            if (kept > 0 and std.meta.eql(edits[kept - 1], edit)) continue;
-            edits[kept] = edit;
-            kept += 1;
-        }
-        self.pending.items.len = kept;
+        if (!have_block) return .take_block;
+        return if (store.blockChanged(chunk)) .rewrite_block else .none;
     }
 
     fn slotWordsMut(self: *GpuTileMirror, slot: u32) []u32 {
@@ -709,10 +661,6 @@ pub const GpuTileMirror = struct {
     fn toroidalWord(self: *const GpuTileMirror, chunk_x: u32, chunk_y: u32) u32 {
         const mask = self.side - 1;
         return (chunk_y & mask) * self.side + (chunk_x & mask);
-    }
-
-    fn toroidalIndex(self: *const GpuTileMirror, geom: ChunkGeometry, chunk: u32) u32 {
-        return self.toroidalWord(chunk % geom.chunks_x, chunk / geom.chunks_x);
     }
 
     fn appendRegion(self: *GpuTileMirror, kind: RegionKind, slot: u32, index: u32, count: u32) void {
@@ -769,20 +717,40 @@ fn countMixed(geom: ChunkGeometry, store: *const DenseLayerStore, window: ChunkW
     return mixed;
 }
 
-// Chunks in both windows.
-fn overlap(a: ChunkWindow, b: ChunkWindow) usize {
+// The chunks in both windows; empty when they do not meet.
+fn intersect(a: ChunkWindow, b: ChunkWindow) ChunkWindow {
     const min_x = @max(a.min_x, b.min_x);
     const min_y = @max(a.min_y, b.min_y);
-    const max_x = @min(a.max_x, b.max_x);
-    const max_y = @min(a.max_y, b.max_y);
-    return @as(usize, max_x -| min_x) * (max_y -| min_y);
+    return .{ .min_x = min_x, .min_y = min_y, .max_x = @max(min_x, @min(a.max_x, b.max_x)), .max_y = @max(min_y, @min(a.max_y, b.max_y)) };
 }
 
-fn pendingLessThan(_: void, lhs: PendingEdit, rhs: PendingEdit) bool {
-    if (lhs.slot != rhs.slot) return lhs.slot < rhs.slot;
-    if (lhs.chunk != rhs.chunk) return lhs.chunk < rhs.chunk;
-    return lhs.element < rhs.element;
+// Chunks in both windows.
+fn overlap(a: ChunkWindow, b: ChunkWindow) usize {
+    return intersect(a, b).count();
 }
+
+// Row-major walk over a window's chunks.
+const WindowChunks = struct {
+    window: ChunkWindow,
+    x: u32,
+    y: u32,
+
+    fn init(window: ChunkWindow) WindowChunks {
+        return .{ .window = window, .x = window.min_x, .y = if (window.width() == 0) window.max_y else window.min_y };
+    }
+
+    fn next(self: *WindowChunks) ?struct { x: u32, y: u32 } {
+        if (self.y >= self.window.max_y) return null;
+        const chunk_x = self.x;
+        const chunk_y = self.y;
+        self.x += 1;
+        if (self.x >= self.window.max_x) {
+            self.x = self.window.min_x;
+            self.y += 1;
+        }
+        return .{ .x = chunk_x, .y = chunk_y };
+    }
+};
 
 fn regionLessThan(_: void, lhs: Region, rhs: Region) bool {
     return lhs.dst < rhs.dst;
@@ -796,6 +764,8 @@ const TestLayers = struct {
     geom: ChunkGeometry,
     stores: [3]DenseLayerStore,
     slots: [3]u32 = @splat(no_slot),
+    // Per layer, a cell changed while resident since the last sync.
+    changed: [3]bool = @splat(false),
     gpu: TestGpuStore = .{},
 
     const fill: u16 = 1;
@@ -826,12 +796,16 @@ const TestLayers = struct {
         store.write(self.geom, self.geom.chunkOf(x, y), self.geom.localOf(x, y), tile);
     }
 
-    // Writes a cell and, on a resident layer, queues its edit the way `WorldSystem` does.
-    fn dig(self: *TestLayers, mirror: *GpuTileMirror, layer: usize, x: u16, y: u16, tile: u16) !void {
+    // Writes a cell and, on a resident layer, flags the layer changed the way
+    // `WorldSystem` does.
+    fn dig(self: *TestLayers, layer: usize, x: u16, y: u16, tile: u16) !void {
         try self.write(layer, x, y, tile);
-        if (self.slots[layer] == no_slot) return;
-        try mirror.ensureEdit(std.testing.allocator);
-        mirror.queueEdit(self.slots[layer], self.geom.chunkOf(x, y), self.geom.localOf(x, y) / 2);
+        if (self.slots[layer] != no_slot) self.changed[layer] = true;
+    }
+
+    // The flags a sync scans, or null when no layer changed.
+    fn layerChanged(self: *const TestLayers) ?[]const bool {
+        return if (std.mem.indexOfScalar(bool, &self.changed, true) != null) &self.changed else null;
     }
 
     // Makes every chunk of `layer` mixed.
@@ -842,8 +816,8 @@ const TestLayers = struct {
     }
 
     fn sync(self: *TestLayers, mirror: *GpuTileMirror, desired: ?Residency) !SyncPlan {
-        const sync_plan = try mirror.plan(std.testing.allocator, self.geom, &self.stores, &self.slots, desired);
-        mirror.commit(&sync_plan, self.geom, &self.stores, &self.slots);
+        const sync_plan = try mirror.plan(std.testing.allocator, self.geom, &self.stores, &self.slots, self.layerChanged(), desired);
+        mirror.commit(&sync_plan, self.geom, &self.stores, &self.slots, &self.changed);
         try self.gpu.apply(mirror.spans.items, mirror.values.items);
         return sync_plan;
     }
@@ -1027,17 +1001,17 @@ test "edits read back after the next sync and a split takes a freed block" {
     const block = mirror.slotWords(layers.slots[0])[0];
 
     // Repeated and overwritten edits in one mixed chunk.
-    try layers.dig(&mirror, 0, 1, 0, TestLayers.dug);
-    try layers.dig(&mirror, 0, 0, 0, TestLayers.fill);
-    try layers.dig(&mirror, 0, 1, 0, 9);
-    try layers.dig(&mirror, 0, 1, 1, TestLayers.dug);
-    try layers.dig(&mirror, 0, 1, 1, TestLayers.dug);
+    try layers.dig(0, 1, 0, TestLayers.dug);
+    try layers.dig(0, 0, 0, TestLayers.fill);
+    try layers.dig(0, 1, 0, 9);
+    try layers.dig(0, 1, 1, TestLayers.dug);
+    try layers.dig(0, 1, 1, TestLayers.dug);
     _ = try layers.sync(&mirror, null);
     try layers.expectReadsBack(&mirror);
 
     // Back to one tile frees the block; a split elsewhere in the same sync takes it.
-    for (0..2) |y| for (0..2) |x| try layers.dig(&mirror, 0, @intCast(x), @intCast(y), TestLayers.fill);
-    try layers.dig(&mirror, 0, 6, 6, TestLayers.dug);
+    for (0..2) |y| for (0..2) |x| try layers.dig(0, @intCast(x), @intCast(y), TestLayers.fill);
+    try layers.dig(0, 6, 6, TestLayers.dug);
     const high_water = mirror.high_water;
     _ = try layers.sync(&mirror, null);
     try std.testing.expectEqual(high_water, mirror.high_water);
@@ -1053,9 +1027,10 @@ test "an out-of-memory plan leaves residency and window intact (FailingAllocator
     var mirror = GpuTileMirror{};
     defer mirror.deinit(std.testing.allocator);
     _ = try layers.sync(&mirror, .{ .layers = &.{0}, .window = testWindow(0, 0, 2, 2), .side = 2 });
-    try layers.dig(&mirror, 0, 2, 2, TestLayers.empty);
-    // Chunk (1, 0) stays in the window: its edit must survive every failed plan.
-    try layers.dig(&mirror, 0, 5, 1, TestLayers.empty);
+    try layers.dig(0, 2, 2, TestLayers.empty);
+    // Chunk (1, 0) stays in the window: its change must survive every failed plan.
+    try layers.dig(0, 5, 1, TestLayers.empty);
+    const changed_chunk = layers.geom.chunkOf(5, 1);
     const window = mirror.window;
     const high_water = mirror.high_water;
 
@@ -1064,9 +1039,9 @@ test "an out-of-memory plan leaves residency and window intact (FailingAllocator
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
-        const result = mirror.plan(failing.allocator(), layers.geom, &layers.stores, &layers.slots, residency);
+        const result = mirror.plan(failing.allocator(), layers.geom, &layers.stores, &layers.slots, layers.layerChanged(), residency);
         if (result) |sync_plan| {
-            mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots);
+            mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots, &layers.changed);
             try layers.gpu.apply(mirror.spans.items, mirror.values.items);
             break;
         } else |err| {
@@ -1075,10 +1050,14 @@ test "an out-of-memory plan leaves residency and window intact (FailingAllocator
             try std.testing.expectEqual(@as(usize, 1), mirror.residentLayerCount());
             try std.testing.expect(mirror.window.eql(window));
             try std.testing.expectEqual(high_water, mirror.high_water);
+            try std.testing.expect(layers.changed[0]);
+            try std.testing.expect(layers.stores[0].blockChanged(changed_chunk));
         }
     }
     try std.testing.expect(fail_index > 0);
     try std.testing.expect(layers.slots[1] != no_slot);
+    try std.testing.expect(!layers.changed[0]);
+    try std.testing.expect(!layers.stores[0].blockChanged(changed_chunk));
     try std.testing.expectEqual(@as(?u16, TestLayers.empty), layers.gpu.tileAt(layers.geom, 2, mirror.window, mirror.slotDirectory(layers.slots[0]), 5, 1));
     try layers.expectReadsBack(&mirror);
 }
@@ -1098,28 +1077,87 @@ test "a warmed pan sync allocates nothing (FailingAllocator)" {
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     for ([_]Residency{ right, left, right }) |residency| {
-        const sync_plan = try mirror.plan(failing.allocator(), layers.geom, &layers.stores, &layers.slots, residency);
-        mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots);
+        const sync_plan = try mirror.plan(failing.allocator(), layers.geom, &layers.stores, &layers.slots, null, residency);
+        mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots, &layers.changed);
         try layers.gpu.apply(mirror.spans.items, mirror.values.items);
     }
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try layers.expectReadsBack(&mirror);
 }
 
-test "a reserved edit queues without allocating (FailingAllocator)" {
+test "a changed mixed chunk uploads its whole block once and clears its mark; unchanged chunks upload nothing" {
+    // 8x8 cells: a 2x2 chunk grid, every chunk mixed on layer 0.
     var layers = try TestLayers.init(8, 8);
     defer layers.deinit();
+    try layers.mixEveryChunk(0);
     var mirror = GpuTileMirror{};
     defer mirror.deinit(std.testing.allocator);
     _ = try layers.sync(&mirror, .{ .layers = &.{0}, .window = testWindow(0, 0, 2, 2), .side = 2 });
-    for (0..3) |_| try mirror.reserveEdits(std.testing.allocator, 1);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    for (0..3) |index| {
-        try mirror.ensureEdit(failing.allocator());
-        mirror.queueEdit(layers.slots[0], @intCast(index), 0);
-    }
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(usize, 0), mirror.pending_reserved);
+    // Entering uploaded every block and cleared every mark.
+    for (0..4) |chunk| try std.testing.expect(!layers.stores[0].blockChanged(@intCast(chunk)));
+
+    // Several changes in chunk (0, 0), one cell twice: one whole-block upload.
+    try layers.dig(0, 0, 0, TestLayers.dug);
+    try layers.dig(0, 3, 3, 9);
+    try layers.dig(0, 3, 3, TestLayers.empty);
+    const block = mirror.slotWords(layers.slots[0])[mirror.toroidalWord(0, 0)];
+    const high_water = mirror.high_water;
+    const edited = try layers.sync(&mirror, null);
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{.{ .dst_element = block, .count = TestLayers.block_elements }}, mirror.spans.items);
+    try std.testing.expectEqual(@as(usize, TestLayers.block_elements), edited.value_count);
+    try std.testing.expectEqual(high_water, mirror.high_water);
+    try std.testing.expect(!layers.changed[0]);
+    try std.testing.expect(!layers.stores[0].blockChanged(0));
+    try layers.expectReadsBack(&mirror);
+
+    // Nothing changed since: the same sync, flag set or not, uploads nothing.
+    try std.testing.expectEqual(@as(usize, 0), (try layers.sync(&mirror, null)).span_count);
+    layers.changed[0] = true;
+    try std.testing.expectEqual(@as(usize, 0), (try layers.sync(&mirror, null)).span_count);
+    try std.testing.expect(!layers.changed[0]);
+}
+
+test "a chunk that re-uniforms at a different tile uploads one word and frees its block" {
+    var layers = try TestLayers.init(8, 8);
+    defer layers.deinit();
+    try layers.write(0, 1, 1, TestLayers.dug);
+    var mirror = GpuTileMirror{};
+    defer mirror.deinit(std.testing.allocator);
+    _ = try layers.sync(&mirror, .{ .layers = &.{0}, .window = testWindow(0, 0, 2, 2), .side = 2 });
+    const directory = mirror.slotDirectory(layers.slots[0]);
+    try std.testing.expectEqual(@as(usize, 0), mirror.block_free.items.len);
+
+    // Every cell of chunk (0, 0) to tile 9, neither its fill nor the dug tile.
+    for (0..4) |y| for (0..4) |x| try layers.dig(0, @intCast(x), @intCast(y), 9);
+    try std.testing.expectEqual(@as(?u16, 9), layers.stores[0].uniformTile(0));
+    _ = try layers.sync(&mirror, null);
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{.{ .dst_element = directory, .count = 1 }}, mirror.spans.items);
+    try std.testing.expectEqualSlices(u32, &.{tileStoreUniformWord(9)}, mirror.values.items);
+    try std.testing.expectEqual(@as(usize, 1), mirror.block_free.items.len);
+    try layers.expectReadsBack(&mirror);
+}
+
+test "changes outside the window upload nothing until the chunk enters, then upload whole" {
+    // 16x4 cells: a 4x1 chunk grid; the window holds the left two chunks.
+    var layers = try TestLayers.init(16, 4);
+    defer layers.deinit();
+    var mirror = GpuTileMirror{};
+    defer mirror.deinit(std.testing.allocator);
+    _ = try layers.sync(&mirror, .{ .layers = &.{0}, .window = testWindow(0, 0, 2, 1), .side = 2 });
+
+    // Chunks 2 and 3 split outside the window: the flagged layer's sync scans the
+    // window only and uploads nothing; the chunks keep their marks.
+    try layers.dig(0, 9, 1, TestLayers.dug);
+    try layers.dig(0, 13, 2, TestLayers.dug);
+    try std.testing.expectEqual(@as(usize, 0), (try layers.sync(&mirror, null)).span_count);
+    try std.testing.expect(layers.stores[0].blockChanged(2) and layers.stores[0].blockChanged(3));
+
+    // The window moves onto them: each uploads its word and whole block once.
+    const entered = try layers.sync(&mirror, .{ .layers = &.{0}, .window = testWindow(2, 0, 4, 1), .side = 2 });
+    try std.testing.expectEqual(@as(usize, 4), entered.span_count);
+    try std.testing.expectEqual(@as(usize, 2 * (1 + TestLayers.block_elements)), entered.value_count);
+    try std.testing.expect(!layers.stores[0].blockChanged(2) and !layers.stores[0].blockChanged(3));
+    try layers.expectReadsBack(&mirror);
 }
 
 test "residentLayerFit is the most layers whose directories and window blocks fit the u32 width" {

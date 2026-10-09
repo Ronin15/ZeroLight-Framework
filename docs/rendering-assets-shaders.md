@@ -243,7 +243,7 @@ and swapchain acquisition. It plans first (`GpuTileMirror.plan` sizes every span
 and reserves every growth, the frame's dense render scratch included, changing
 nothing a retry depends on), then commits and queues one upload batch
 (`Renderer.queueTileStoreUploads`) recorded in the frame's one copy pass. Spans
-are whole units (a directory, a word, a link, a block, an element), so a batch
+are whole units (a directory, a word, a link, a block), so a batch
 carried from a skipped frame folds into the next (`mergeTileStoreSpans`), newer
 values winning.
 
@@ -256,22 +256,28 @@ values winning.
   viewport crossing a power of two) lays the window out anew in a new store;
   the old one is swept. A layer added in play on an in-window level enters at
   the next sync.
-- **Edits.** A dig/build (`setDenseTile`) writes the CPU chunk store, the source
-  of truth, and on a resident layer queues one `(slot, chunk, element)` entry.
-  The sync sorts and coalesces the queue, then per chunk compares the CPU form
-  with the uploaded directory word: a chunk that split takes a block and uploads
-  its word and whole block, one that returned to a single tile frees its block
-  and uploads its word, and a mixed chunk uploads one element per edited
-  element, valued from the chunk store. An edit on a chunk outside the window
-  uploads nothing; the chunk uploads whole when it enters.
+- **Edits.** A dig/build (`setDenseTile`, or a batched `applyDenseCellWrites`)
+  writes the CPU chunk store, the source of truth, which marks each block it
+  takes or changes (`BlockFill.changed`, render-only, never saved). A change on a
+  resident layer also flags the layer (`render_changed`) and the world
+  (`gpu_edits_pending`); edits hold no GPU-side memory, so a world nobody renders
+  pays nothing for them. The next sync scans each flagged layer's chunks in the
+  window and compares the CPU form with the uploaded directory word: a chunk
+  that split takes a block and uploads its word and whole block, one that
+  returned to a single tile frees its block and uploads its word, a uniform
+  chunk at a new tile uploads its word, and a mixed chunk whose block is marked
+  uploads the whole block once. Every uploaded block's mark and every resident
+  flag clear at commit. A change on a chunk outside the window, or on a layer
+  not resident, uploads nothing; the chunk uploads whole when it enters.
 - **Cost.** Steady frame O(resident layers): the plan's per-slot scan and the
   interleave collect. Pan across a chunk boundary O(L × Wc) CPU (`Wc`
   window chunks) and O(L × e) uploads (`e` window edge in chunks), GPU memory
   flat (`chunk-scale-gpu-sync-pan`, which also varies L at 2, 8, and 32).
   Active level change O(L × Wc + the entering layer's mixed window blocks)
   (`chunk-scale-gpu-sync-level-enter`, flat across level size and depth, L at
-  2, 8, and 32). One dig O(1) upload
-  (`chunk-scale-gpu-sync-dig`, flat). Never dependent on chunks or levels
+  2, 8, and 32). One dig: an O(Wc) scan of its layer and one word or block
+  upload (`chunk-scale-gpu-sync-dig`: flat across level size and depth,
+  measured; linear in window chunks, derived). Never dependent on chunks or levels
   outside the window. Serial render-boundary work, O(window).
 
 The world holds only a non-owning, generational `TileDataId` (slot index plus
@@ -382,8 +388,8 @@ not.** The fixed loop does not fence between frames, so any buffer touched on
 frame N+1 while frame N's copy is still in flight must cycle to rotate to fresh
 backing, or the new write lands on memory the in-flight copy is still reading.
 
-- A world's GPU tile store is retained and written partially (one element per
-  dig edit, one directory or block per change), so its span uploads and growth
+- A world's GPU tile store is retained and written partially (one directory
+  word or one whole block per changed chunk), so its span uploads and growth
   copies pass `cycle=false`. Cycling it would ping-pong GPU storage and flip
   visible tiles while CPU state stays correct.
 - The renderer's pooled tile-upload transfer buffer is reused across frames and

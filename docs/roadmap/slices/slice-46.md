@@ -49,7 +49,8 @@ continuing session and to replay.
 - Terrain saves per chunk, every chunk of every world (64G): save and load
   cost follow the chunks and content that exist, never level area or world
   extent (`.claude/rules/budgets-capacities.md`). Saving only edited chunks
-  is 69F's later optimization.
+  is 69F's later optimization. The render-only `BlockFill.changed` mark is
+  excluded from chunk saves.
 - Exact restore of dense-row order, entity slots, and free lists, because the
   checksum hashes them.
 - Header layout and version policy: Table T3. The checksum is compared only

@@ -199,10 +199,9 @@ Failure and limits:
 - [x] GPU tile memory follows the camera's window, independent of level
       size, depth, and world count; no layer or draw cap beyond the store's
       u32 width fit (render step (c)).
-- [ ] The GPU sync after one dig is back within spread of `5439e36`
-      (`chunk-scale-gpu-sync-dig` is 4–12% slower after render step (c):
-      per-edit chunk math on the edit queue, `world_gpu_tiles.zig` plan and
-      commit edit loops); closed when change marks replace the queue.
+- [x] The GPU sync after one dig is back within spread of `5439e36`
+      (`chunk-scale-gpu-sync-dig` was 4–12% slower after render step (c);
+      +0.5%, within spread, once change marks replaced the edit queue).
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
       the thread system, serial equals threaded (S3b). Their gameplay
       producers are [Slice 76](slice-76.md) and [Slice 77](slice-77.md).
@@ -222,10 +221,9 @@ Failure and limits:
       adding a link are never refused for capacity; index and format widths
       (cell, chunk, label, slot, edge offsets, level) fail loudly at world
       create, load, and growth. Index widths landed (`23c24ec`); gates remain.
-- [ ] World creation and dense-layer adds in play are never refused for
-      capacity: today `DenseLayerWindowExceeded` refuses at
-      `world_terrain.max_level_bands` (the submit stack and per-level band
-      caps went with render step (c)).
+- [x] World creation and dense-layer adds in play are never refused for
+      capacity: band lists grow, and edits hold no GPU memory for unrendered
+      worlds (render R3).
 - [x] Replaced branch nav code and its tests removed; main's nav restored
       (`2c09cec`).
 - [ ] Tests: incremental equals a full rebuild, serial equals threaded; OOM at

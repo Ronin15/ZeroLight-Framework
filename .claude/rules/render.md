@@ -55,8 +55,9 @@ How the renderer works: `docs/rendering-assets-shaders.md`.
   submit. Never hold the swapchain texture across CPU prep.
 - A buffer fully re-staged every frame and reused cycles; a retained, partially
   written buffer never does (the tile-data buffer upload is `cycle=false`).
-- The CPU tile field is the source of truth; GPU tile edits coalesce to one per
-  element and flush in one batched copy pass per frame.
+- The CPU tile field is the source of truth; a changed chunk uploads once per
+  sync (directory word or whole block), and all uploads flush in one batched copy
+  pass per frame.
 - Visible rendering is swapchain-paced; non-renderable frames use the fallback
   delay and pause policy. A failed swapchain acquire skips the frame
   deterministically.

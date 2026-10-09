@@ -23,11 +23,9 @@ const Rect = @import("../render/renderer.zig").Rect;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
-const tileDataElementIndex = @import("../render/renderer.zig").tileDataElementIndex;
 const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
 const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
-const packTileDataElement = @import("../render/renderer.zig").packTileDataElement;
 const tile_store_uniform_bit = @import("../render/renderer.zig").tile_store_uniform_bit;
 const tile_store_max_side = @import("../render/renderer.zig").tile_store_max_side;
 const Sprite = @import("../render/renderer.zig").Sprite;
@@ -226,12 +224,17 @@ const SparseDepthRange = struct {
 
 const DenseLayerRow = struct {
     level_index: u16,
+    // Position in its level's band list (`LevelTerrain.bands`); fixed at add.
+    band: u32,
     base_z: i32,
     depth_band: WorldDepth,
     store: DenseLayerStore,
     // Resident slot in the GPU tile store mirror, or `world_gpu_tiles.no_slot` when
     // the layer is outside the render window.
     gpu_slot: u32,
+    // Render-only: a cell changed on this layer while resident since the last GPU
+    // sync, which scans its window chunks' change marks. False while not resident.
+    render_changed: bool,
 };
 
 const ReservedChunk = struct {
@@ -287,30 +290,45 @@ const TerrainEditStageThreads = struct {
 
 const DenseEditStatus = enum { ok, invalid_layer, invalid_cell, invalid_tile };
 
-// One bit per band of a level.
-const BandMask = u32;
-comptime {
-    std.debug.assert(@bitSizeOf(BandMask) == world_terrain.max_level_bands);
-}
+// One bit per band of a level over a caller-owned window of words: a group's
+// written or claimed bands in `DenseEditScratch.masks`.
+const BandBits = struct {
+    words: []u64,
 
-// What the plan stage derives from one group's writes, before any mutation.
+    fn set(self: BandBits, band: u32) void {
+        self.words[band / 64] |= @as(u64, 1) << @intCast(band % 64);
+    }
+
+    fn isSet(self: BandBits, band: u32) bool {
+        return self.words[band / 64] & (@as(u64, 1) << @intCast(band % 64)) != 0;
+    }
+
+    // The first set band at or after `cursor`, or null. O(words from `cursor`).
+    fn next(self: BandBits, cursor: u32) ?u32 {
+        var word_index: usize = cursor / 64;
+        if (word_index >= self.words.len) return null;
+        var word = self.words[word_index] & (~@as(u64, 0) << @intCast(cursor % 64));
+        while (true) {
+            if (word != 0) return @intCast(word_index * 64 + @ctz(word));
+            word_index += 1;
+            if (word_index >= self.words.len) return null;
+            word = self.words[word_index];
+        }
+    }
+};
+
+// What the plan stage derives from one group's writes, before any mutation. The
+// group's band bits live in `DenseEditScratch.masks` (`groupBandBits`).
 const DenseEditPlan = struct {
     status: DenseEditStatus = .ok,
-    // Bands of the level with a write in this chunk.
-    band_mask: BandMask = 0,
-    // Bands whose chunk is uniform and a write differs from its tile; the main
-    // thread claims its block and the write stage fills it.
-    block_mask: BandMask = 0,
     // The chunk's composed form; when not mixed the main thread claims a slot and
     // the write stage fills it from this form.
     slot_form: ChunkForm = .mixed,
-    // Writes on GPU-resident layers, the group's bound on queued GPU edits.
-    resident_writes: usize = 0,
 };
 
 // One (level, chunk) of a batched dense edit. The plan stage writes `plan` and the
 // write stage `change_count`, each once, by the one participant running the group;
-// `start` is its window in the batch's event and change buffers.
+// `start` is its window in the batch's event buffer.
 const DenseEditGroup = struct {
     level: u16,
     chunk: u32,
@@ -320,60 +338,79 @@ const DenseEditGroup = struct {
     change_count: usize = 0,
 };
 
-// The layer and local cell of one changed cell, for the main thread's GPU edit.
-const DenseCellChange = struct {
-    layer: u32,
-    local: u32,
-};
-
 // Per-participant scratch strides are whole cache lines: no shared writable line.
 const edit_scratch_alignment: usize = 64;
 const EditFinalsList = std.ArrayListAligned(TileId, .fromByteUnits(edit_scratch_alignment));
 const EditTouchedList = std.ArrayListAligned(ChunkBits, .fromByteUnits(edit_scratch_alignment));
+const EditOwnedList = std.ArrayListAligned(?OwnedBlock, .fromByteUnits(edit_scratch_alignment));
+const EditBandList = std.ArrayListAligned(u32, .fromByteUnits(edit_scratch_alignment));
 
 // Scratch of `applyDenseCellWrites`, kept at its high water.
 const DenseEditScratch = struct {
     groups: std.ArrayList(DenseEditGroup) = .empty,
-    changes: std.ArrayList(DenseCellChange) = .empty,
+    // Per group, `mask_words` words of written bands then `mask_words` of bands
+    // whose uniform chunk a write splits (claimed by the main thread).
+    masks: std.ArrayList(u64) = .empty,
     finals: EditFinalsList = .empty,
     touched: EditTouchedList = .empty,
+    owned: EditOwnedList = .empty,
+    // Per participant, the running group's written bands in band order.
+    written_bands: EditBandList = .empty,
+    // Per band of the level being reserved: blocks its claims take.
+    band_counts: std.ArrayList(usize) = .empty,
 
     fn deinit(self: *DenseEditScratch, allocator: std.mem.Allocator) void {
         self.groups.deinit(allocator);
-        self.changes.deinit(allocator);
+        self.masks.deinit(allocator);
         self.finals.deinit(allocator);
         self.touched.deinit(allocator);
+        self.owned.deinit(allocator);
+        self.written_bands.deinit(allocator);
+        self.band_counts.deinit(allocator);
     }
 };
 
+// Group `group_index`'s written bands (`claims` false) or claimed bands in `masks`.
+fn groupBandBits(masks: []u64, mask_words: usize, group_index: usize, claims: bool) BandBits {
+    return .{ .words = masks[(2 * group_index + @intFromBool(claims)) * mask_words ..][0..mask_words] };
+}
+
 // Job context of the plan stage: read-only over the world; group `g` writes only
-// its own `plan`.
+// its own `plan` and its window of `masks`.
 const DenseEditPlanJob = struct {
     geom: ChunkGeometry,
     groups: []DenseEditGroup,
+    masks: []u64,
+    mask_words: usize,
     stores: []const DenseLayerStore,
     layer_levels: []const u16,
-    gpu_slots: []const u32,
+    layer_bands: []const u32,
     levels: []const LevelTerrain,
     catalog_valid: []const bool,
     range_count: usize,
 };
 
-// Job context of the write stage. Group `g` writes only its chunk's blocks on its
-// level's bands, that chunk's composed-bits slot, its windows of `events` and
-// `changes`, and its own `change_count`; a participant uses only its scratch slot.
+// Job context of the write stage. Group `g` writes only its chunk's blocks and their
+// fill rows on its level's bands, that chunk's composed-bits slot, its window of
+// `events`, and its own `change_count`; a participant uses only its scratch slots.
 const DenseEditWriteJob = struct {
     geom: ChunkGeometry,
     width: u16,
     groups: []DenseEditGroup,
+    masks: []u64,
+    mask_words: usize,
     events: []WorldTileChangedEvent,
-    changes: []DenseCellChange,
     finals: []TileId,
     finals_stride: usize,
     touched: []ChunkBits,
     touched_stride: usize,
+    owned: []?OwnedBlock,
+    owned_stride: usize,
+    written_bands: []u32,
+    written_bands_stride: usize,
     participant_count: usize,
     stores: []DenseLayerStore,
+    layer_bands: []const u32,
     levels: []LevelTerrain,
     catalog_flags: []const TileFlags,
     sparse_cells: []const u32,
@@ -479,10 +516,12 @@ pub const WorldSystem = struct {
     terrain_pool_grows: u64 = 0,
     terrain_pool_growth_logged: bool = false,
     // Mirror of the renderer-owned GPU tile store holding the render window's dense
-    // layers by chunk; `syncDenseTileStore` uploads what changed. Edits queued on
-    // resident layers are drained every frame gameplay advances (the pause policy
-    // blocks gameplay updates whenever render is skipped).
+    // layers by chunk; `syncDenseTileStore` uploads what changed. Edits hold no GPU
+    // memory: a change on a resident layer sets the layer's `render_changed` and
+    // this flag, and the next sync scans that layer's window chunks for blocks
+    // marked changed (`BlockFill.changed`). Render-only; never read by simulation.
     gpu_tiles: GpuTileMirror = .{},
+    gpu_edits_pending: bool = false,
     // The GPU directory side for the last visibility rect: a power of two covering
     // any chunk window a rect of that size can touch, so a pan keeps the layout.
     render_side: u32 = 0,
@@ -1205,14 +1244,15 @@ pub const WorldSystem = struct {
     /// render chunk window in a toroidal directory chained topmost-first. Layers
     /// entering upload their directory and their mixed window chunks' blocks; layers
     /// leaving free theirs; a pan across a chunk boundary uploads only the chunks
-    /// entering; cell edits on resident chunks upload one element each, coalesced;
+    /// entering; a changed resident chunk uploads once, its word or its whole block;
     /// all in the next frame copy pass. Creates the store, content-sized, on first
     /// need and whenever the directory side changes; layers past the store's `u32`
     /// width are dropped deepest first and reported once. Call once per frame on
     /// the main thread before `submitStaticDenseGeometry` and swapchain acquisition.
-    /// O(1) when nothing changed; O(resident layers × window chunks) when the window,
-    /// level, or layer set moves; never depends on chunks or levels outside the
-    /// window. An error leaves residency and queued edits for a retry. Claims the
+    /// O(1) when nothing changed; O(window chunks) per resident layer changed since the
+    /// last sync; O(resident layers × window chunks) when the window, level, or layer
+    /// set moves; never depends on chunks or levels outside the window. An error
+    /// leaves residency and change marks for a retry. Claims the
     /// store for this frame; the renderer retires it the first frame this is not
     /// called, and the next call re-uploads the window into a new store.
     pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16) !void {
@@ -1257,7 +1297,8 @@ pub const WorldSystem = struct {
     // The renderer retired the store: nothing is resident any more, so the next
     // sync lays the window out anew and the draws re-submit. O(resident layers).
     fn resetGpuResidency(self: *WorldSystem) void {
-        self.gpu_tiles.reset(self.dense_layers.items(.gpu_slot));
+        self.gpu_tiles.reset(self.dense_layers.items(.gpu_slot), self.dense_layers.items(.render_changed));
+        self.gpu_edits_pending = false;
         self.dense_render.layers.clearRetainingCapacity();
         self.dense_render.layer_depths.clearRetainingCapacity();
         self.gpu_residency_dirty = true;
@@ -1285,13 +1326,15 @@ pub const WorldSystem = struct {
             !window.eql(self.gpu_tiles.window) or
             fitted.side != self.gpu_tiles.side or
             !self.gpu_tiles.layoutMatchesStore();
+        const rows = self.dense_layers.slice();
+        const layer_changed: ?[]const bool = if (self.gpu_edits_pending) rows.items(.render_changed) else null;
         if (!rederive) {
-            return self.gpu_tiles.plan(self.allocator, geom, self.dense_layers.items(.store), self.dense_layers.items(.gpu_slot), null);
+            return self.gpu_tiles.plan(self.allocator, geom, rows.items(.store), rows.items(.gpu_slot), layer_changed, null);
         }
         const desired = try self.collectDenseSubmitLayers(active_level);
         try self.dense_render.reserve(self.allocator, desired.len);
         const fit = world_gpu_tiles.residentLayerFit(fitted.side, tileStoreBlockElements(geom.edge));
-        return self.gpu_tiles.plan(self.allocator, geom, self.dense_layers.items(.store), self.dense_layers.items(.gpu_slot), .{
+        return self.gpu_tiles.plan(self.allocator, geom, rows.items(.store), rows.items(.gpu_slot), layer_changed, .{
             .layers = fitResidentLayers(desired, fit, &self.gpu_tiles.width_drop_reported),
             .window = window,
             .side = fitted.side,
@@ -1313,7 +1356,10 @@ pub const WorldSystem = struct {
     // Applies the sync and, when the resident set moved, rebuilds the resident
     // layers (deepest first) and their depths from the chain. O(resident layers).
     fn commitDenseGpuSync(self: *WorldSystem, sync_plan: *const world_gpu_tiles.SyncPlan, active_level: u16) void {
-        self.gpu_tiles.commit(sync_plan, self.chunkGeometry(), self.dense_layers.items(.store), self.dense_layers.items(.gpu_slot));
+        const rows = self.dense_layers.slice();
+        self.gpu_tiles.commit(sync_plan, self.chunkGeometry(), rows.items(.store), rows.items(.gpu_slot), rows.items(.render_changed));
+        // The commit cleared every resident layer's flag; non-resident ones are never set.
+        if (sync_plan.edits) self.gpu_edits_pending = false;
         self.gpu_resident_level = active_level;
         self.gpu_resident_window = self.render_window;
         self.gpu_residency_dirty = false;
@@ -1454,16 +1500,14 @@ pub const WorldSystem = struct {
             .blocked_slot => self.level_terrain.items[reserved.owner].blocked.releaseIfUniform(self.chunkGeometry(), reserved.chunk),
         };
         self.dense_reserved_chunks.clearRetainingCapacity();
-        self.gpu_tiles.pending_reserved = 0;
     }
 
     /// The dense growth seam: makes writing `tile_id` into one cell allocation-free.
     /// A uniform chunk the write would split gets its tile block (and a composed chunk
     /// the write would split its bits slot) now, once per chunk, so N reserves in one
-    /// scope (`beginDenseCellWriteReserve`) cover N writes however they share chunks;
-    /// each reserve on a GPU-resident layer also counts one GPU edit. Reads are
-    /// unchanged. O(bands + sparse
-    /// tiles in the chunk), plus a one-time O(edge²) block and pool growth.
+    /// scope (`beginDenseCellWriteReserve`) cover N writes however they share chunks.
+    /// Reads are unchanged. O(bands + sparse tiles in the chunk), plus a one-time
+    /// O(edge²) block and pool growth.
     pub fn reserveDenseCellWrite(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !void {
         if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
@@ -1481,9 +1525,6 @@ pub const WorldSystem = struct {
         try self.dense_reserved_chunks.ensureUnusedCapacity(self.allocator, @as(usize, @intFromBool(needs_block)) + @intFromBool(needs_slot));
         if (needs_block) try self.ensureDenseBlocks(store, geom.blockCells(), 1);
         if (needs_slot) try self.ensureBlockedSlots(blocked, 1);
-        if (self.dense_layers.items(.gpu_slot)[layer_index] != world_gpu_tiles.no_slot) {
-            try self.gpu_tiles.reserveEdits(self.allocator, 1);
-        }
         if (needs_block) {
             store.materializeChunk(geom.blockCells(), chunk);
             self.dense_reserved_chunks.appendAssumeCapacity(.{ .kind = .dense_block, .owner = @intCast(layer_index), .chunk = chunk });
@@ -1495,12 +1536,12 @@ pub const WorldSystem = struct {
     }
 
     /// Shared dense-cell write: bounds-checks, updates the chunk store (the source of
-    /// truth) and the level's composed blocked bit, queues one GPU element edit when
-    /// the layer is resident in the GPU tile store, and returns the compact change
-    /// event. Tile-id
-    /// validity is the caller's concern, so an empty (`invalid_tile_id`) write is
-    /// allowed here. Every growth (tile block, bits slot, edit queue) is ensured
-    /// before the first mutation, so an OOM leaves the world unchanged and retryable.
+    /// truth, which marks its block changed) and the level's composed blocked bit,
+    /// flags the layer for the next GPU sync when it is resident, and returns the
+    /// compact change event. Tile-id validity is the caller's concern, so an empty
+    /// (`invalid_tile_id`) write is allowed here. Every growth (tile block, bits
+    /// slot) is ensured before the first mutation, so an OOM leaves the world
+    /// unchanged and retryable; the GPU side allocates nothing.
     fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
         if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
@@ -1513,18 +1554,14 @@ pub const WorldSystem = struct {
         const level = self.denseLayerLevel(layer_index);
         const blocked = &self.level_terrain.items[level].blocked;
         const new_composed = self.composedBlockedWith(level, x, y, layer_index, tile_id);
-        // A layer outside the render window queues nothing: it uploads whole when it
-        // enters. The sync reads the value from the chunk store and coalesces repeats.
-        const gpu_slot = self.dense_layers.items(.gpu_slot)[layer_index];
-        if (gpu_slot != world_gpu_tiles.no_slot) try self.gpu_tiles.ensureEdit(self.allocator);
         if (store.writeNeedsBlock(chunk, tile_id)) try self.ensureDenseBlocks(store, geom.blockCells(), 1);
         if (blocked.setNeedsSlot(chunk, local, new_composed)) try self.ensureBlockedSlots(blocked, 1);
 
         store.write(geom, chunk, local, tile_id);
         blocked.set(geom, chunk, local, new_composed);
-        if (gpu_slot != world_gpu_tiles.no_slot) {
-            self.gpu_tiles.queueEdit(gpu_slot, chunk, @intCast(tileDataElementIndex(local)));
-        }
+        // A layer outside the render window flags nothing: it uploads whole when it
+        // enters.
+        self.markRenderChanged(self.dense_layers.items(.gpu_slot), self.dense_layers.items(.render_changed), layer_index);
         return .{
             .level = level,
             .x = x,
@@ -1538,19 +1575,21 @@ pub const WorldSystem = struct {
 
     /// Applies a dense one-step change (cave-in, explosion) all-or-nothing: every
     /// write is validated and every growth reserved before the first mutation, so
-    /// an error leaves the world and its queues untouched for a retry.
+    /// an error leaves the world untouched for a retry.
     ///
     /// `chunks` holds one entry per (level, chunk), strictly increasing in (level,
     /// chunk_y, chunk_x), else `error.UnorderedDenseChunkWrites`; an entry's writes
     /// lie in its chunk on its level's layers and apply in order. Chunks are planned
     /// and written one participant each over `threads` (inline for one chunk or no
     /// threads). Appends one event per changed cell to `events`, which must have
-    /// spare capacity for every write, and queues GPU edits, both in (level, chunk, local cell, layer) order, identical
-    /// for any partition.
+    /// spare capacity for every write, in (level, chunk, local cell, layer) order,
+    /// identical for any partition; flags each resident written layer for the next
+    /// GPU sync.
     ///
-    /// c writes over k chunks with d changed cells: O(c·bands + k·edge² +
-    /// d·(bands + sparse tiles in the chunk)) stage work; the main thread does O(k)
-    /// reserves and claims and an O(k + d) merge.
+    /// c writes over k chunks with d changed cells, B bands on the widest touched
+    /// level and b bands written per chunk: O(c + k·(edge² + ⌈B/64⌉) + d·(bands +
+    /// sparse tiles in the chunk)) stage work; the main thread does O(k·b) reserves,
+    /// claims, flags, and releases and an O(k + d) event merge.
     pub fn applyDenseCellWrites(
         self: *WorldSystem,
         chunks: []const DenseChunkWrites,
@@ -1564,8 +1603,8 @@ pub const WorldSystem = struct {
         if (self.level_terrain.items.len == 0) return error.InvalidWorldLevel;
         const geom = self.chunkGeometry();
         const block_cells = geom.blockCells();
-        const stores = self.dense_layers.items(.store);
-        const gpu_slots = self.dense_layers.items(.gpu_slot);
+        const rows = self.dense_layers.slice();
+        const stores = rows.items(.store);
         const levels = self.level_terrain.items;
         const scratch = &self.dense_edit;
 
@@ -1573,6 +1612,7 @@ pub const WorldSystem = struct {
         try scratch.groups.ensureTotalCapacity(self.allocator, chunks.len);
         scratch.groups.clearRetainingCapacity();
         var write_count: usize = 0;
+        var band_stride: usize = 0;
         for (chunks, 0..) |entry, index| {
             if (entry.level >= levels.len) return error.InvalidWorldLevel;
             if (entry.chunk_x >= geom.chunks_x or entry.chunk_y >= geom.chunks_y) return error.InvalidWorldCell;
@@ -1585,19 +1625,40 @@ pub const WorldSystem = struct {
             }
             scratch.groups.appendAssumeCapacity(.{ .level = entry.level, .chunk = chunk, .writes = entry.writes });
             write_count += entry.writes.len;
+            band_stride = @max(band_stride, levels[entry.level].bandLayers().len);
         }
         std.debug.assert(events.capacity - events.items.len >= write_count);
         const groups = scratch.groups.items;
         // One chunk runs inline: there is nothing to fan out.
         const stage_threads: ?TerrainEditThreads = if (groups.len > 1) threads else null;
 
-        // Plan stage: validation and growth per group, read-only over the world.
+        // Reserve every growth both stages and the merge use, sized from the groups'
+        // widest level, before either dispatch; nothing changes yet.
+        const participant_count = if (stage_threads) |stage| stage.thread_system.participantSlotCount() else 1;
+        const mask_words = @max(1, (band_stride + 63) / 64);
+        const finals_stride = band_stride * max_chunk_cells;
+        const touched_stride = std.mem.alignForward(usize, band_stride * @sizeOf(ChunkBits), edit_scratch_alignment) / @sizeOf(ChunkBits);
+        const owned_stride = std.mem.alignForward(usize, band_stride, edit_scratch_alignment / std.math.gcd(@sizeOf(?OwnedBlock), edit_scratch_alignment));
+        const written_bands_stride = std.mem.alignForward(usize, band_stride, edit_scratch_alignment / @sizeOf(u32));
+        comptime std.debug.assert(max_chunk_cells * @sizeOf(TileId) % edit_scratch_alignment == 0);
+        try scratch.masks.ensureTotalCapacity(self.allocator, groups.len * 2 * mask_words);
+        try scratch.finals.ensureTotalCapacity(self.allocator, participant_count * finals_stride);
+        try scratch.touched.ensureTotalCapacity(self.allocator, participant_count * touched_stride);
+        try scratch.owned.ensureTotalCapacity(self.allocator, participant_count * owned_stride);
+        try scratch.written_bands.ensureTotalCapacity(self.allocator, participant_count * written_bands_stride);
+        try scratch.band_counts.ensureTotalCapacity(self.allocator, band_stride);
+        scratch.masks.items.len = groups.len * 2 * mask_words;
+        const masks = scratch.masks.items;
+
+        // Plan stage: validation and band bits per group, read-only over the world.
         var plan_job = DenseEditPlanJob{
             .geom = geom,
             .groups = groups,
+            .masks = masks,
+            .mask_words = mask_words,
             .stores = stores,
-            .layer_levels = self.dense_layers.items(.level_index),
-            .gpu_slots = gpu_slots,
+            .layer_levels = rows.items(.level_index),
+            .layer_bands = rows.items(.band),
             .levels = levels,
             .catalog_valid = self.catalog_valid.items,
             .range_count = 1,
@@ -1606,83 +1667,89 @@ pub const WorldSystem = struct {
             self.last_terrain_edit_plan_batch = dispatchTerrainEditStage(stage.plan(), groups.len, &plan_job, denseEditPlanJob);
         } else {
             self.last_terrain_edit_plan_batch = .{ .item_count = groups.len, .ran_inline = true };
-            for (groups) |*group| planDenseEditGroup(&plan_job, group);
+            for (0..groups.len) |group_index| planDenseEditGroup(&plan_job, group_index);
         }
 
         // The first invalid write in group order fails the batch before any growth.
-        var resident_writes: usize = 0;
-        var band_stride: usize = 0;
-        for (groups) |group| {
-            switch (group.plan.status) {
-                .ok => {},
-                .invalid_layer => return error.InvalidWorldLayer,
-                .invalid_cell => return error.InvalidWorldCell,
-                .invalid_tile => return error.InvalidWorldTile,
-            }
-            resident_writes += group.plan.resident_writes;
-            band_stride = @max(band_stride, levels[group.level].band_count);
-        }
+        for (groups) |group| switch (group.plan.status) {
+            .ok => {},
+            .invalid_layer => return error.InvalidWorldLayer,
+            .invalid_cell => return error.InvalidWorldCell,
+            .invalid_tile => return error.InvalidWorldTile,
+        };
 
-        // Reserve every growth the write stage and merge use; nothing changes yet.
-        const participant_count = if (stage_threads) |stage| stage.thread_system.participantSlotCount() else 1;
-        const finals_stride = band_stride * max_chunk_cells;
-        const touched_stride = std.mem.alignForward(usize, band_stride * @sizeOf(ChunkBits), edit_scratch_alignment) / @sizeOf(ChunkBits);
-        comptime std.debug.assert(max_chunk_cells * @sizeOf(TileId) % edit_scratch_alignment == 0);
-        try scratch.changes.ensureTotalCapacity(self.allocator, write_count);
-        try scratch.finals.ensureTotalCapacity(self.allocator, participant_count * finals_stride);
-        try scratch.touched.ensureTotalCapacity(self.allocator, participant_count * touched_stride);
         // Groups are in level order, so each level's pools reserve once: one block per
-        // (band, chunk) a write splits and one slot per chunk not already mixed.
+        // (band, chunk) a write splits and one slot per chunk not already mixed. The
+        // counts are zeroed, summed, and read through the claimed bits alone.
+        scratch.band_counts.items.len = band_stride;
+        const band_counts = scratch.band_counts.items;
         var run_start: usize = 0;
         while (run_start < groups.len) {
             const level = groups[run_start].level;
             const terrain = &levels[level];
-            var block_counts: [world_terrain.max_level_bands]usize = @splat(0);
             var slot_count: usize = 0;
             var run_end = run_start;
             while (run_end < groups.len and groups[run_end].level == level) : (run_end += 1) {
-                const plan = groups[run_end].plan;
-                var split_bands = plan.block_mask;
-                while (split_bands != 0) : (split_bands &= split_bands - 1) block_counts[@ctz(split_bands)] += 1;
-                slot_count += @intFromBool(plan.slot_form != .mixed);
+                const claims = groupBandBits(masks, mask_words, run_end, true);
+                var cursor: u32 = 0;
+                while (claims.next(cursor)) |band| : (cursor = band + 1) band_counts[band] = 0;
             }
-            for (terrain.bandLayers(), block_counts[0..terrain.band_count]) |layer, count| {
-                if (count > 0) try self.ensureDenseBlocks(&stores[layer], block_cells, count);
+            for (run_start..run_end) |group_index| {
+                const claims = groupBandBits(masks, mask_words, group_index, true);
+                var cursor: u32 = 0;
+                while (claims.next(cursor)) |band| : (cursor = band + 1) band_counts[band] += 1;
+                slot_count += @intFromBool(groups[group_index].plan.slot_form != .mixed);
+            }
+            for (run_start..run_end) |group_index| {
+                const claims = groupBandBits(masks, mask_words, group_index, true);
+                var cursor: u32 = 0;
+                while (claims.next(cursor)) |band| : (cursor = band + 1) {
+                    if (band_counts[band] == 0) continue;
+                    try self.ensureDenseBlocks(&stores[terrain.bands.items[band]], block_cells, band_counts[band]);
+                    band_counts[band] = 0;
+                }
             }
             try self.ensureBlockedSlots(&terrain.blocked, slot_count);
             run_start = run_end;
         }
-        if (resident_writes > 0) try self.gpu_tiles.reserveEdits(self.allocator, resident_writes);
 
         // Commit. Every chunk a write may split takes its block and slot here, so the
-        // write stage never takes or releases pool entries; each group's windows start
-        // at its writes' prefix offset.
+        // write stage never takes or releases pool entries; each group's event window
+        // starts at its writes' prefix offset.
         var offset: usize = 0;
-        for (groups) |*group| {
+        for (groups, 0..) |*group, group_index| {
             const terrain = &levels[group.level];
-            var split_bands = group.plan.block_mask;
-            while (split_bands != 0) : (split_bands &= split_bands - 1) stores[terrain.bands[@ctz(split_bands)]].claimChunk(block_cells, group.chunk);
+            const claims = groupBandBits(masks, mask_words, group_index, true);
+            var cursor: u32 = 0;
+            while (claims.next(cursor)) |band| : (cursor = band + 1) stores[terrain.bands.items[band]].claimChunk(block_cells, group.chunk);
             if (group.plan.slot_form != .mixed) terrain.blocked.claimChunk(group.chunk);
             group.start = offset;
             group.change_count = 0;
             offset += group.writes.len;
         }
-        scratch.changes.items.len = write_count;
         scratch.finals.items.len = participant_count * finals_stride;
         scratch.touched.items.len = participant_count * touched_stride;
+        scratch.owned.items.len = participant_count * owned_stride;
+        scratch.written_bands.items.len = participant_count * written_bands_stride;
         const event_windows = events.unusedCapacitySlice()[0..write_count];
         var write_job = DenseEditWriteJob{
             .geom = geom,
             .width = self.width,
             .groups = groups,
+            .masks = masks,
+            .mask_words = mask_words,
             .events = event_windows,
-            .changes = scratch.changes.items,
             .finals = scratch.finals.items,
             .finals_stride = finals_stride,
             .touched = scratch.touched.items,
             .touched_stride = touched_stride,
+            .owned = scratch.owned.items,
+            .owned_stride = owned_stride,
+            .written_bands = scratch.written_bands.items,
+            .written_bands_stride = written_bands_stride,
             .participant_count = participant_count,
             .stores = stores,
+            .layer_bands = rows.items(.band),
             .levels = levels,
             .catalog_flags = self.catalog_flags.items,
             .sparse_cells = self.sparse_tiles.items(.cell_index),
@@ -1694,34 +1761,41 @@ pub const WorldSystem = struct {
             self.last_terrain_edit_write_batch = dispatchTerrainEditStage(stage.write(), groups.len, &write_job, denseEditWriteJob);
         } else {
             self.last_terrain_edit_write_batch = .{ .item_count = groups.len, .ran_inline = true };
-            for (groups) |*group| writeDenseEditGroup(&write_job, group, 0);
+            for (0..groups.len) |group_index| writeDenseEditGroup(&write_job, group_index, 0);
         }
 
         // Ordered merge: compact the event windows in group order (each window starts
-        // at or after the merged length) and queue GPU edits in the same order; then
-        // return chunks left uniform to the pools.
+        // at or after the merged length), flag the resident written layers of each
+        // group that changed a cell, then return chunks left uniform to the pools.
+        const gpu_slots = rows.items(.gpu_slot);
+        const render_changed = rows.items(.render_changed);
         var merged: usize = 0;
-        var gpu_queued: usize = 0;
-        for (groups) |group| {
+        for (groups, 0..) |group, group_index| {
             const window = event_windows[group.start..][0..group.change_count];
             if (merged != group.start) std.mem.copyForwards(WorldTileChangedEvent, event_windows[merged..][0..window.len], window);
             merged += window.len;
-            if (resident_writes == 0) continue;
-            for (scratch.changes.items[group.start..][0..group.change_count]) |change| {
-                const slot = gpu_slots[change.layer];
-                if (slot == world_gpu_tiles.no_slot) continue;
-                self.gpu_tiles.queueEdit(slot, group.chunk, @intCast(tileDataElementIndex(change.local)));
-                gpu_queued += 1;
-            }
+            if (group.change_count == 0) continue;
+            const written = groupBandBits(masks, mask_words, group_index, false);
+            var cursor: u32 = 0;
+            while (written.next(cursor)) |band| : (cursor = band + 1) self.markRenderChanged(gpu_slots, render_changed, levels[group.level].bands.items[band]);
         }
         events.items.len += merged;
-        for (groups) |group| {
+        for (groups, 0..) |group, group_index| {
             const terrain = &levels[group.level];
-            var written_bands = group.plan.band_mask;
-            while (written_bands != 0) : (written_bands &= written_bands - 1) stores[terrain.bands[@ctz(written_bands)]].releaseIfUniform(group.chunk);
+            const written = groupBandBits(masks, mask_words, group_index, false);
+            var cursor: u32 = 0;
+            while (written.next(cursor)) |band| : (cursor = band + 1) stores[terrain.bands.items[band]].releaseIfUniform(group.chunk);
             terrain.blocked.releaseIfUniform(geom, group.chunk);
         }
-        self.gpu_tiles.pending_reserved -= resident_writes - gpu_queued;
+    }
+
+    // Flags resident `layer_index` (columns `gpu_slots`, `render_changed`) for the
+    // next GPU sync after one of its cells changed; a layer outside the render window
+    // uploads whole when it enters. O(1).
+    fn markRenderChanged(self: *WorldSystem, gpu_slots: []const u32, render_changed: []bool, layer_index: usize) void {
+        if (gpu_slots[layer_index] == world_gpu_tiles.no_slot) return;
+        render_changed[layer_index] = true;
+        self.gpu_edits_pending = true;
     }
 
     // The terrain pools' reserve seams: each counts a reserve that grew its pool.
@@ -2090,39 +2164,40 @@ pub const WorldSystem = struct {
     }
 
     /// Adds a dense band on `level_index`, every chunk uniform at `fill_tile`, at load
-    /// or in play. O(chunks per level): the layer's directory, plus marking the
-    /// level's composed chunks BLOCKED when `fill_tile` blocks movement. A layer on a
-    /// level in the render window enters the GPU tile store at the next sync.
+    /// or in play; never refused for capacity. O(chunks per level): the layer's
+    /// directory, plus marking the level's composed chunks BLOCKED when `fill_tile`
+    /// blocks movement; the level's band list grows geometrically. A layer on a level
+    /// in the render window enters the GPU tile store at the next sync.
     ///
-    /// Band headroom is validated and every growth reserved before the band list,
-    /// layer row, and composed bits are written, so an OOM leaves them retryable.
+    /// Every growth is reserved before the band list, layer row, and composed bits
+    /// are written, so an OOM leaves them retryable.
     pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) !usize {
         try self.validateLevelIndex(level_index);
         try self.validateTileId(fill_tile);
 
         const terrain = &self.level_terrain.items[level_index];
-        if (@as(usize, terrain.band_count) + 1 > world_terrain.max_level_bands) {
-            return error.DenseLayerWindowExceeded;
-        }
-
         const layer_index = self.dense_layers.len;
         if (layer_index > std.math.maxInt(u32)) return error.WorldLayerOverflow;
         try self.dense_layers.ensureUnusedCapacity(self.allocator, 1);
+        try terrain.bands.ensureUnusedCapacity(self.allocator, 1);
         var store = try DenseLayerStore.init(self.allocator, self.chunkCountPerLevel(), fill_tile);
         errdefer store.deinit(self.allocator);
 
         // Commit: band list, layer row, and composed bits are all infallible from here.
         self.dense_layers.appendAssumeCapacity(.{
             .level_index = level_index,
+            // At most one band per dense layer, and layer indices fit u32 (checked above).
+            .band = @intCast(terrain.bands.items.len),
             .base_z = base_z,
             .depth_band = depth,
             .store = store,
             .gpu_slot = world_gpu_tiles.no_slot,
+            .render_changed = false,
         });
-        terrain.bands[terrain.band_count] = @intCast(layer_index);
-        terrain.band_count += 1;
+        terrain.bands.appendAssumeCapacity(@intCast(layer_index));
         if (self.flagsFor(fill_tile).blocks_movement) {
             for (0..terrain.blocked.dir.len) |chunk| terrain.blocked.setChunk(@intCast(chunk), true);
+            terrain.content_revision +%= 1;
         }
         self.render_index_dirty = true;
         // The window's draws and GPU residency include the new layer from the next frame.
@@ -2519,7 +2594,7 @@ pub const WorldSystem = struct {
     fn buildProceduralGround(self: *WorldSystem, level: u16, layer_index: usize, ids: ProceduralTiles, seed: u64, thread_system: *ThreadSystem) !void {
         const geom = self.chunkGeometry();
         const terrain = &self.level_terrain.items[level];
-        std.debug.assert(terrain.band_count == 1 and terrain.bands[0] == layer_index);
+        std.debug.assert(terrain.bandLayers().len == 1 and terrain.bandLayers()[0] == layer_index);
         std.debug.assert(self.sparseTileIndicesForLevel(level).len == 0);
         const store = &self.dense_layers.items(.store)[layer_index];
         try store.reserveEveryChunk(self.allocator, geom);
@@ -2544,11 +2619,13 @@ pub const WorldSystem = struct {
         });
         store.finishChunkFill();
         terrain.blocked.finishChunkFill(geom);
+        terrain.content_revision +%= 1;
     }
 
     fn addProceduralSparseTiles(self: *WorldSystem, level: u16, ids: ProceduralTiles, seed: u64) !void {
         const chunks_x = self.chunksX();
         const chunks_y = self.chunksY();
+        var added_blocking = false;
         for (0..chunks_y) |cy| {
             for (0..chunks_x) |cx| {
                 const h = hash2(seed ^ 0x9e37_79b9, cx, cy);
@@ -2564,11 +2641,14 @@ pub const WorldSystem = struct {
                 const center_y = @abs(@as(i32, @intCast(y)) - @as(i32, self.height / 2));
                 if ((h & 15) == 0 and center_x > 4 and center_y > 4) {
                     _ = try self.addSparseTile(level, x, y, ids.tree, 0, .obstacle);
+                    added_blocking = added_blocking or self.flagsFor(ids.tree).blocks_movement;
                 } else if ((h & 63) == 1) {
                     _ = try self.addSparseTile(level, x, y, ids.deco, 0, .obstacle);
+                    added_blocking = added_blocking or self.flagsFor(ids.deco).blocks_movement;
                 }
             }
         }
+        if (added_blocking) self.level_terrain.items[level].content_revision +%= 1;
     }
 };
 
@@ -2609,7 +2689,7 @@ fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) 
         }
         // A chunk left holding one tile records it so `finishChunkFill` re-uniforms it.
         const unequal_pairs = world_terrain.chainUnequalPairs(cells, geom.shift, extent);
-        build.block_fills[chunk_index] = .{ .fill = if (unequal_pairs == 0) cells[0] else fill, .unequal_pairs = unequal_pairs };
+        build.block_fills[chunk_index] = .{ .fill = if (unequal_pairs == 0) cells[0] else fill, .unequal_pairs = unequal_pairs, .changed = true };
         build.blocked_bits[chunk_index] = bits;
         build.blocked_counts[chunk_index] = blocked_count;
     }
@@ -2638,17 +2718,25 @@ fn denseEditPlanJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.groups.len);
-    for (job.groups[range.start..range.end]) |*group| planDenseEditGroup(job, group);
+    std.debug.assert(job.masks.len == job.groups.len * 2 * job.mask_words);
+    for (range.start..range.end) |group_index| planDenseEditGroup(job, group_index);
 }
 
-// Validates one group's writes and derives its plan; read-only over the world.
-fn planDenseEditGroup(job: *const DenseEditPlanJob, group: *DenseEditGroup) void {
+// Validates one group's writes and derives its plan and band bits; read-only over
+// the world. O(writes + mask words).
+fn planDenseEditGroup(job: *const DenseEditPlanJob, group_index: usize) void {
     const geom = job.geom;
+    const group = &job.groups[group_index];
     const terrain = &job.levels[group.level];
-    const bands = terrain.bandLayers();
-    var uniform: [world_terrain.max_level_bands]?TileId = undefined;
-    for (bands, uniform[0..bands.len]) |layer, *tile| tile.* = job.stores[layer].uniformTile(group.chunk);
+    const written = groupBandBits(job.masks, job.mask_words, group_index, false);
+    const claims = groupBandBits(job.masks, job.mask_words, group_index, true);
+    @memset(written.words, 0);
+    @memset(claims.words, 0);
     var plan = DenseEditPlan{ .slot_form = terrain.blocked.form(group.chunk) };
+    var run_layer: u32 = std.math.maxInt(u32);
+    var run_band: u32 = 0;
+    var run_uniform: ?TileId = null;
+    var run_claimed = false;
     for (group.writes) |write| {
         if (write.layer >= job.layer_levels.len or job.layer_levels[write.layer] != group.level) {
             plan.status = .invalid_layer;
@@ -2662,12 +2750,22 @@ fn planDenseEditGroup(job: *const DenseEditPlanJob, group: *DenseEditGroup) void
             plan.status = .invalid_tile;
             break;
         }
-        const band = terrain.bandOf(write.layer);
-        plan.band_mask |= @as(BandMask, 1) << @intCast(band);
-        if (uniform[band]) |tile| {
-            if (tile != write.tile) plan.block_mask |= @as(BandMask, 1) << @intCast(band);
+        // Runs of writes on one layer look its band and uniform tile up once.
+        if (write.layer != run_layer) {
+            run_layer = write.layer;
+            run_band = job.layer_bands[write.layer];
+            // The plan stage mutates nothing, so this is the chunk's form before the batch.
+            run_uniform = job.stores[write.layer].uniformTile(group.chunk);
+            run_claimed = false;
+            written.set(run_band);
         }
-        plan.resident_writes += @intFromBool(job.gpu_slots[write.layer] != world_gpu_tiles.no_slot);
+        if (run_claimed) continue;
+        if (run_uniform) |tile| {
+            if (tile != write.tile) {
+                claims.set(run_band);
+                run_claimed = true;
+            }
+        }
     }
     group.plan = plan;
 }
@@ -2679,54 +2777,65 @@ fn denseEditWriteJob(context: *anyopaque, range: ParallelRange, worker_id: Worke
     std.debug.assert(range.end <= job.groups.len);
     // Scratch was reserved for every participant before dispatch.
     std.debug.assert(worker_id.index < job.participant_count);
-    for (job.groups[range.start..range.end]) |*group| writeDenseEditGroup(job, group, worker_id.index);
+    for (range.start..range.end) |group_index| writeDenseEditGroup(job, group_index, worker_id.index);
 }
 
-// Applies one group's writes: fills its claimed block and slot, then writes each
+// Applies one group's writes: fills its claimed blocks and slot, then writes each
 // touched cell's last write per band, recomposing its blocked bit and recording
-// changes at the head of the group's windows in local-cell then band order.
-fn writeDenseEditGroup(job: *const DenseEditWriteJob, group: *DenseEditGroup, participant: usize) void {
+// events at the head of the group's window in local-cell then band order.
+fn writeDenseEditGroup(job: *const DenseEditWriteJob, group_index: usize, participant: usize) void {
     const geom = job.geom;
     const block_cells = geom.blockCells();
+    const group = &job.groups[group_index];
     const terrain = &job.levels[group.level];
     const bands = terrain.bandLayers();
     const chunk = group.chunk;
     const plan = group.plan;
     const extent = geom.extent(chunk);
     const chunk_sparse_tiles = chunkSparseTiles(job.sparse_level_chunk_tiles, group.level, chunk);
+    const written = groupBandBits(job.masks, job.mask_words, group_index, false);
+    const claims = groupBandBits(job.masks, job.mask_words, group_index, true);
     std.debug.assert(bands.len * max_chunk_cells <= job.finals_stride);
     std.debug.assert(bands.len <= job.touched_stride);
-    std.debug.assert(group.start + group.writes.len <= job.changes.len);
+    std.debug.assert(bands.len <= job.owned_stride);
     std.debug.assert(group.start + group.writes.len <= job.events.len);
+    std.debug.assert(bands.len <= job.written_bands_stride);
+    std.debug.assert((participant + 1) * job.owned_stride <= job.owned.len);
+    std.debug.assert((participant + 1) * job.written_bands_stride <= job.written_bands.len);
     const finals = job.finals[participant * job.finals_stride ..][0..job.finals_stride];
     const touched = job.touched[participant * job.touched_stride ..][0..job.touched_stride];
-
     // Every written band's block, or null for a uniform band no write changes.
-    var blocks: [world_terrain.max_level_bands]?OwnedBlock = undefined;
-    var written_bands = plan.band_mask;
-    while (written_bands != 0) : (written_bands &= written_bands - 1) {
-        const band = @ctz(written_bands);
+    const blocks = job.owned[participant * job.owned_stride ..][0..job.owned_stride];
+    // The written bands, listed once so the per-cell loop walks only them.
+    const band_slots = job.written_bands[participant * job.written_bands_stride ..][0..job.written_bands_stride];
+    var written_count: usize = 0;
+    var cursor: u32 = 0;
+    while (written.next(cursor)) |band| : (cursor = band + 1) {
+        band_slots[written_count] = band;
+        written_count += 1;
+    }
+    const written_list = band_slots[0..written_count];
+
+    for (written_list) |band| {
         touched[band] = @splat(0);
         blocks[band] = job.stores[bands[band]].ownBlock(geom, chunk);
-        if (plan.block_mask & (@as(BandMask, 1) << @intCast(band)) != 0) blocks[band].?.fillFresh();
+        if (claims.isSet(band)) blocks[band].?.fillFresh();
     }
     var blocked = terrain.blocked.ownSlot(chunk);
     if (plan.slot_form != .mixed) blocked.fillUniform(geom, chunk, plan.slot_form == .blocked);
 
     for (group.writes) |write| {
-        const band = terrain.bandOf(write.layer);
+        const band = job.layer_bands[write.layer];
         const local = geom.localOf(write.x, write.y);
         finals[@as(usize, band) * max_chunk_cells + local] = write.tile;
         touched[band][local / 64] |= @as(u64, 1) << @intCast(local % 64);
     }
     var any_touched: ChunkBits = @splat(0);
-    written_bands = plan.band_mask;
-    while (written_bands != 0) : (written_bands &= written_bands - 1) {
-        for (&any_touched, touched[@ctz(written_bands)]) |*word, band_word| word.* |= band_word;
+    for (written_list) |band| {
+        for (&any_touched, touched[band]) |*word, band_word| word.* |= band_word;
     }
 
     const events = job.events[group.start..][0..group.writes.len];
-    const changes = job.changes[group.start..][0..group.writes.len];
     var change_count: usize = 0;
     const edge_mask: u32 = geom.edge - 1;
     for (any_touched, 0..) |touched_word, word_index| {
@@ -2736,9 +2845,7 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group: *DenseEditGroup, pa
             const x: u16 = extent.min_x + @as(u16, @intCast(local & edge_mask));
             const y: u16 = extent.min_y + @as(u16, @intCast(local >> geom.shift));
             var cell_changed = false;
-            var cell_bands = plan.band_mask;
-            while (cell_bands != 0) : (cell_bands &= cell_bands - 1) {
-                const band = @ctz(cell_bands);
+            for (written_list) |band| {
                 if (!world_terrain.bitIsSet(&touched[band], local)) continue;
                 const layer = bands[band];
                 const old_tile = job.stores[layer].chunkTile(block_cells, chunk, local);
@@ -2746,7 +2853,6 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group: *DenseEditGroup, pa
                 if (old_tile == new_tile) continue;
                 // A write that changes a cell of a uniform chunk had its block claimed.
                 blocks[band].?.write(local, new_tile);
-                changes[change_count] = .{ .layer = layer, .local = local };
                 events[change_count] = .{
                     .level = group.level,
                     .x = x,
@@ -2765,9 +2871,8 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group: *DenseEditGroup, pa
             }
         }
     }
-    written_bands = plan.band_mask;
-    while (written_bands != 0) : (written_bands &= written_bands - 1) {
-        if (blocks[@ctz(written_bands)]) |owned| owned.finish();
+    for (written_list) |band| {
+        if (blocks[band]) |owned| owned.finish();
     }
     blocked.finish();
     group.change_count = change_count;
@@ -3549,7 +3654,7 @@ test "setDenseTile on a resident layer uploads at the next sync; one outside the
     try expectGpuStoreMatches(&world, &gpu);
 }
 
-test "reserveDenseCellWrite covers N writes across uniform chunks and the edit queue (FailingAllocator)" {
+test "reserveDenseCellWrite covers N writes across uniform chunks on a resident layer (FailingAllocator)" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     // 8x8 tiles, 4x4 chunks: three writes land in three different uniform chunks and
@@ -3612,7 +3717,7 @@ test "reserveDenseCellWrite covers N writes across uniform chunks and the edit q
     try std.testing.expectEqual(@as(usize, 0), world.dense_reserved_chunks.items.len);
 }
 
-test "GPU tile sync uploads one element per edited element, valued from the chunk store" {
+test "a split chunk uploads its word and whole block; later edits re-upload the block once" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -3628,7 +3733,10 @@ test "GPU tile sync uploads one element per edited element, valued from the chun
     const grass = try world.requireTileByName(&meta, "grass");
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(level, 0, .floor, grass);
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
     _ = try testSyncGpuTiles(&world, level);
+    try testApplySync(&world, &gpu);
     // One chunk: a directory of side 1 (one word and the link) at 0, blocks after it.
     const block = world_gpu_tiles.directoryWords(1);
 
@@ -3639,17 +3747,21 @@ test "GPU tile sync uploads one element per edited element, valued from the chun
         .{ .dst_element = 0, .count = 1 },
         .{ .dst_element = block, .count = 8 },
     }, world.gpu_tiles.spans.items);
+    try testApplySync(&world, &gpu);
 
-    // (0,0) and (1,0) share element 0, written three times with a rewrite of (0,0);
-    // (2,0) is untouched. Out-of-order edits exercise the sort.
+    // Three edits, one cell twice, then the same frame again: the block uploads
+    // whole once, valued from the chunk store, and nothing after.
     _ = try world.setDenseTile(layer, 1, 0, water);
     _ = try world.setDenseTile(layer, 0, 0, water);
     _ = try world.clearDenseTile(layer, 0, 0);
     _ = try testSyncGpuTiles(&world, level);
     try std.testing.expectEqualSlices(TileStoreSpan, &.{
-        .{ .dst_element = block, .count = 1 },
+        .{ .dst_element = block, .count = 8 },
     }, world.gpu_tiles.spans.items);
-    try std.testing.expectEqualSlices(u32, &.{packTileDataElement(invalid_tile_id, water)}, world.gpu_tiles.values.items);
+    try testApplySync(&world, &gpu);
+    try expectGpuStoreMatches(&world, &gpu);
+    _ = try testSyncGpuTiles(&world, level);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.spans.items.len);
 }
 
 test "two resident layers on one level upload to their own directories and blocks" {
@@ -3682,7 +3794,7 @@ test "two resident layers on one level upload to their own directories and block
     try expectGpuStoreMatches(&world, &gpu);
 }
 
-test "writeDenseTileCell reserves edit queue before mutating CPU tiles (FailingAllocator)" {
+test "writeDenseTileCell reserves its growth before mutating CPU tiles (FailingAllocator)" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -3699,59 +3811,31 @@ test "writeDenseTileCell reserves edit queue before mutating CPU tiles (FailingA
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(level, 0, .floor, grass);
 
-    // Resident in the GPU tile store, so the edit-queue path is armed.
+    // Resident in the GPU tile store, so a change also flags the layer.
     _ = try testSyncGpuTiles(&world, level);
 
     const old_tile = world.denseTile(layer, 1, 1);
-    const old_edit_len = world.gpu_tiles.pending.items.len;
     try std.testing.expectEqual(grass, old_tile);
     try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(0));
     try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
-    try std.testing.expectEqual(@as(usize, 0), old_edit_len);
 
-    {
+    // The block pool fails first; then, warmed, the composed-bits slot. Each OOM
+    // leaves the chunk's tiles and form, the composed bits, and the layer's render
+    // flag exactly as they were.
+    for (0..2) |warmed| {
+        if (warmed == 1) _ = try world.dense_layers.items(.store)[layer].ensureAvailable(std.testing.allocator, world.chunkGeometry().blockCells(), 1);
         // Block remap (resize_fail_index) as well as fresh alloc: ArrayList growth
         // may succeed via remap without bumping fail_index's allocation count.
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         world.allocator = failing.allocator();
         defer world.allocator = std.testing.allocator;
-
         try std.testing.expectError(error.OutOfMemory, world.setDenseTile(layer, 1, 1, water));
-        // OOM must leave the chunk's tiles and form, the composed bits, and the edit
-        // queue exactly as they were — a partial mutate would desync GPU edits from truth.
         try std.testing.expectEqual(old_tile, world.denseTile(layer, 1, 1));
         try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(0));
-        try std.testing.expectEqual(@as(usize, 0), world.dense_layers.items(.store)[layer].liveBlockCount());
         try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
         try std.testing.expect(!world.levelBlocksMovement(level, 1, 1));
-        try std.testing.expectEqual(old_edit_len, world.gpu_tiles.pending.items.len);
-    }
-
-    // Each growth alone also fails cleanly: warm the edit queue so the block pool is
-    // the first allocation.
-    try world.gpu_tiles.pending.ensureTotalCapacity(std.testing.allocator, 4);
-    {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-        world.allocator = failing.allocator();
-        defer world.allocator = std.testing.allocator;
-        try std.testing.expectError(error.OutOfMemory, world.setDenseTile(layer, 1, 1, water));
-        try std.testing.expectEqual(old_tile, world.denseTile(layer, 1, 1));
-        try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(0));
-        try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
-        try std.testing.expectEqual(old_edit_len, world.gpu_tiles.pending.items.len);
-    }
-
-    // Warm the block pool too, so the composed-bits slot is the first allocation.
-    _ = try world.dense_layers.items(.store)[layer].ensureAvailable(std.testing.allocator, world.chunkGeometry().blockCells(), 1);
-    {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-        world.allocator = failing.allocator();
-        defer world.allocator = std.testing.allocator;
-        try std.testing.expectError(error.OutOfMemory, world.setDenseTile(layer, 1, 1, water));
-        try std.testing.expectEqual(old_tile, world.denseTile(layer, 1, 1));
-        try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(0));
-        try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
-        try std.testing.expectEqual(old_edit_len, world.gpu_tiles.pending.items.len);
+        try std.testing.expect(!world.dense_layers.items(.render_changed)[layer]);
+        try std.testing.expect(!world.gpu_edits_pending);
     }
 
     // Retry with a working allocator succeeds and is consistent.
@@ -3760,7 +3844,7 @@ test "writeDenseTileCell reserves edit queue before mutating CPU tiles (FailingA
     try std.testing.expectEqual(water, world.denseTile(layer, 1, 1));
     try std.testing.expectEqual(@as(?TileId, null), world.dense_layers.items(.store)[layer].uniformTile(0));
     try std.testing.expect(world.levelBlocksMovement(level, 1, 1));
-    try std.testing.expectEqual(@as(usize, 1), world.gpu_tiles.pending.items.len);
+    try std.testing.expect(world.dense_layers.items(.render_changed)[layer] and world.gpu_edits_pending);
 }
 
 test "world rejects invalid tile ids before render" {
@@ -4943,25 +5027,7 @@ test "submitStaticDenseGeometry marks only the bucket holding the shallowest sub
     try std.testing.expect(renderer.tilemap_window_layers.items[1].is_shallowest_bucket);
 }
 
-test "addDenseLayer rejects bands beyond the level's band width" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 2,
-    };
-    defer world.deinit();
-    try world.buildCatalog(&meta);
-    const grass = try world.requireTileByName(&meta, "grass");
-    const level = try world.addLevel(0);
-    for (0..world_terrain.max_level_bands) |_| _ = try world.addDenseLayer(level, 0, .floor, grass);
-    try std.testing.expectError(error.DenseLayerWindowExceeded, world.addDenseLayer(level, 0, .effect, grass));
-}
-
-test "addDenseLayer reserves capacities before committing band or layer (FailingAllocator)" {
+test "addDenseLayer grows a level's band list and fails without a partial band (FailingAllocator)" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -4977,42 +5043,29 @@ test "addDenseLayer reserves capacities before committing band or layer (Failing
     const grass = try world.requireTileByName(&meta, "grass");
     const dirt = try world.requireTileByName(&meta, "dirt");
 
-    // Case 1: first layer ever — every allocation (row storage, then the layer's
-    // chunk directory) fails in turn, and none commits a band, row, or bit.
-    for (0..2) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
-        world.allocator = failing.allocator();
-        defer world.allocator = std.testing.allocator;
-
-        try std.testing.expectError(error.OutOfMemory, world.addDenseLayer(level, 0, .floor, dirt));
-        try std.testing.expectEqual(@as(usize, 0), world.dense_layers.len);
-        try std.testing.expectEqual(@as(u8, 0), world.level_terrain.items[level].band_count);
-        try std.testing.expect(!world.levelBlocksMovement(level, 3, 3));
+    // Every allocation of each add (the row storage, the band list, the layer's
+    // chunk directory) fails in turn and commits no band, row, or bit; the first
+    // index past them adds. The blocking adds past the band list's first growth
+    // cover a growth of a list that already holds bands.
+    for (0..70) |band| {
+        const fill = if (band % 2 == 0) grass else dirt;
+        var fail_index: usize = 0;
+        const added = while (true) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
+            world.allocator = failing.allocator();
+            defer world.allocator = std.testing.allocator;
+            if (world.addDenseLayer(level, 0, .floor, fill)) |layer| break layer else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(band, world.dense_layers.len);
+            try std.testing.expectEqual(band, world.level_terrain.items[level].bandLayers().len);
+            // Only an added blocking band blocks the level.
+            try std.testing.expectEqual(band > 1, world.levelBlocksMovement(level, 3, 3));
+        };
+        try std.testing.expect(fail_index >= 1);
+        try std.testing.expectEqual(band, added);
+        try std.testing.expectEqual(@as(u32, @intCast(band)), world.dense_layers.items(.band)[added]);
+        try std.testing.expectEqual(@as(u32, @intCast(added)), world.level_terrain.items[level].bandLayers()[band]);
     }
-
-    // Warm one real (walkable) layer so the next case isolates the second band.
-    _ = try world.addDenseLayer(level, 0, .floor, grass);
-    try std.testing.expectEqual(@as(usize, 1), world.dense_layers.len);
-    try std.testing.expectEqual(@as(u8, 1), world.level_terrain.items[level].band_count);
-
-    // Case 2: second (blocking) band on the same level — the directory OOM must not
-    // bump the band count, append a half-built layer, or block the level's chunks.
-    {
-        try world.dense_layers.ensureTotalCapacity(std.testing.allocator, 2);
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-        world.allocator = failing.allocator();
-        defer world.allocator = std.testing.allocator;
-
-        try std.testing.expectError(error.OutOfMemory, world.addDenseLayer(level, 0, .obstacle, dirt));
-        try std.testing.expectEqual(@as(usize, 1), world.dense_layers.len);
-        try std.testing.expectEqual(@as(u8, 1), world.level_terrain.items[level].band_count);
-        try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
-    }
-
-    // Retry is consistent and blocks every chunk of the level.
-    _ = try world.addDenseLayer(level, 0, .obstacle, dirt);
-    try std.testing.expectEqual(@as(usize, 2), world.dense_layers.len);
-    try std.testing.expectEqual(@as(u8, 2), world.level_terrain.items[level].band_count);
+    try std.testing.expectEqual(@as(usize, 70), world.level_terrain.items[level].bandLayers().len);
     for (0..world.chunkCountPerLevel()) |chunk| {
         try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(level, @intCast(chunk)));
     }
@@ -5833,7 +5886,7 @@ test "addLevel touches only its own directory and fails without a partial level 
     try std.testing.expectEqual(@as(u16, 5), added);
     const terrain = world.level_terrain.items[added];
     try std.testing.expectEqual(chunk_count, terrain.blocked.dir.len);
-    try std.testing.expectEqual(@as(u8, 0), terrain.band_count);
+    try std.testing.expectEqual(@as(usize, 0), terrain.bandLayers().len);
     for (0..chunk_count) |chunk| try std.testing.expectEqual(ChunkForm.open, terrain.blocked.form(@intCast(chunk)));
     // Its link heads exist from create, every chunk without an endpoint.
     try std.testing.expectEqual(chunk_count, terrain.link_heads.len);
@@ -6011,6 +6064,64 @@ test "procedural world build is identical serial and threaded" {
     try expectUniformExactlyWhenOneTile(&threaded, 0);
 }
 
+test "a blocking dense layer add and procedural fills advance the level's content revision; a non-blocking layer add, a dig, and a batched dense edit do not" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+
+    // Procedural: the ground fill once, the sparse pass once when it placed a
+    // blocking tile; the walkable ground band add itself nothing. Seeds cover both
+    // a sparse pass with and one without a blocking tile.
+    var seen_blocking_sparse = [2]bool{ false, false };
+    for (0..32) |seed| {
+        var config = procedural_test_config;
+        config.seed = seed;
+        var world = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
+        defer world.deinit();
+        var blocking_sparse = false;
+        for (world.sparseTileIndicesForLevel(0)) |index| blocking_sparse = blocking_sparse or world.sparseTileBlocksMovement(index);
+        seen_blocking_sparse[@intFromBool(blocking_sparse)] = true;
+        try std.testing.expectEqual(@as(u32, 1) + @intFromBool(blocking_sparse), world.level_terrain.items[0].content_revision);
+    }
+    try std.testing.expect(seen_blocking_sparse[0] and seen_blocking_sparse[1]);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const level = try world.addLevel(0);
+    try std.testing.expectEqual(@as(u32, 0), world.level_terrain.items[level].content_revision);
+    const floor = try world.addDenseLayer(level, 0, .floor, tiles.grass);
+    try std.testing.expectEqual(@as(u32, 0), world.level_terrain.items[level].content_revision);
+    _ = try world.addDenseLayer(level, 0, .obstacle, tiles.dirt);
+    try std.testing.expectEqual(@as(u32, 1), world.level_terrain.items[level].content_revision);
+    // Underground levels are solid bands added the same way.
+    try world.addUndergroundLevelStack(&meta, 2);
+    for (world.level_terrain.items[1..]) |terrain| try std.testing.expectEqual(@as(u32, 1), terrain.content_revision);
+
+    // Evented changes leave it: a dig, a batched edit, and a blocking sparse tile.
+    const below = world.denseFloorLayerForLevel(1).?;
+    _ = (try world.setDenseTile(below, 1, 1, tiles.cave)).?;
+    const writes = [_]DenseCellWrite{ .{ .layer = @intCast(below), .x = 2, .y = 2, .tile = tiles.cave }, .{ .layer = @intCast(below), .x = 6, .y = 6, .tile = tiles.cave } };
+    const chunks = [_]DenseChunkWrites{ .{ .level = 1, .chunk_x = 0, .chunk_y = 0, .writes = writes[0..1] }, .{ .level = 1, .chunk_x = 1, .chunk_y = 1, .writes = writes[1..2] } };
+    var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.ensureTotalCapacity(std.testing.allocator, writes.len);
+    try world.applyDenseCellWrites(&chunks, null, &events);
+    try std.testing.expectEqual(writes.len, events.items.len);
+    _ = try world.setDenseTile(floor, 3, 3, tiles.water);
+    _ = try world.addSparseTile(level, 5, 5, tiles.tree, 0, .obstacle);
+    try std.testing.expectEqual(@as(u32, 1), world.level_terrain.items[level].content_revision);
+    try std.testing.expectEqual(@as(u32, 1), world.level_terrain.items[1].content_revision);
+}
+
 // Every chunk of `layer` is uniform exactly when its in-level cells hold one tile, by
 // brute force over the cells.
 fn expectUniformExactlyWhenOneTile(world: *const WorldSystem, layer: usize) !void {
@@ -6117,13 +6228,19 @@ fn testBatchEditWorld(meta: *const WorldTilesetMeta) !WorldSystem {
     return world;
 }
 
-// Every byte of a world's chunk terrain and queued GPU edits, for exact comparison.
+// Every byte of a world's chunk terrain, block change marks, and layer render
+// flags, for exact comparison.
 fn appendTerrainBytes(out: *std.ArrayList(u8), world: *const WorldSystem) !void {
     const allocator = std.testing.allocator;
     for (world.dense_layers.items(.store)) |store| {
         try out.appendSlice(allocator, std.mem.sliceAsBytes(store.dir));
         try out.appendSlice(allocator, std.mem.sliceAsBytes(store.cells.items));
-        try out.appendSlice(allocator, std.mem.sliceAsBytes(store.fills.items));
+        // Field by field: `BlockFill` has padding bytes.
+        for (store.fills.items) |fill| {
+            try out.appendSlice(allocator, std.mem.asBytes(&fill.fill));
+            try out.appendSlice(allocator, std.mem.asBytes(&fill.unequal_pairs));
+            try out.append(allocator, @intFromBool(fill.changed));
+        }
         try out.appendSlice(allocator, std.mem.sliceAsBytes(store.free.items));
     }
     for (world.level_terrain.items) |terrain| {
@@ -6132,13 +6249,8 @@ fn appendTerrainBytes(out: *std.ArrayList(u8), world: *const WorldSystem) !void 
         try out.appendSlice(allocator, std.mem.sliceAsBytes(terrain.blocked.counts.items));
         try out.appendSlice(allocator, std.mem.sliceAsBytes(terrain.blocked.free.items));
     }
-    // Field by field: `PendingEdit` has padding bytes.
-    for (world.gpu_tiles.pending.items) |edit| {
-        try out.appendSlice(allocator, std.mem.asBytes(&edit.slot));
-        try out.appendSlice(allocator, std.mem.asBytes(&edit.chunk));
-        try out.appendSlice(allocator, std.mem.asBytes(&edit.element));
-    }
-    try out.appendSlice(allocator, std.mem.asBytes(&world.gpu_tiles.pending_reserved));
+    for (world.dense_layers.items(.render_changed)) |changed| try out.append(allocator, @intFromBool(changed));
+    try out.append(allocator, @intFromBool(world.gpu_edits_pending));
 }
 
 fn expectTerrainBytesEqual(expected: *const WorldSystem, actual: *const WorldSystem) !void {
@@ -6333,7 +6445,7 @@ test "a batched dense edit is identical inline and threaded and matches its cano
         try expectTerrainBytesEqual(&serial, &threaded);
         const layers = reference.layers();
         try expectTerrainMatchesReference(&threaded, &layers);
-        // Drain both GPU queues as a frame's sync would.
+        // Upload both worlds' changes as a frame's sync would.
         _ = try testSyncGpuTiles(&threaded, 0);
         _ = try testSyncGpuTiles(&serial, 0);
     }
@@ -6380,36 +6492,103 @@ test "a batched dense edit composes the same tiles and blocked cells as single-c
                 try std.testing.expectEqual(single.levelBlocksMovement(level_index, @intCast(x), @intCast(y)), batched.levelBlocksMovement(level_index, @intCast(x), @intCast(y)));
             };
         }
-        // Drain both GPU queues as a frame's sync would.
+        // Upload both worlds' changes as a frame's sync would.
         _ = try testSyncGpuTiles(&batched, 0);
         _ = try testSyncGpuTiles(&single, 0);
     }
 }
 
-test "a batched dense edit's GPU edits upload every changed resident tile" {
+test "a batched dense edit marks resident layers identically inline and threaded and the next sync matches the CPU" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try testBatchEditWorld(&meta);
-    defer world.deinit();
-    const tiles = try TerrainTestTiles.resolve(&world, &meta);
-    // The fixture's sync batch uploads the resident layers whole.
-    var gpu_store: TestGpuStore = .{};
-    defer gpu_store.deinit();
-    try testApplySync(&world, &gpu_store);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var serial = try testBatchEditWorld(&meta);
+    defer serial.deinit();
+    var threaded = try testBatchEditWorld(&meta);
+    defer threaded.deinit();
+    const tiles = try TerrainTestTiles.resolve(&serial, &meta);
+    // The fixtures' sync batches upload the resident layers whole.
+    var serial_gpu: TestGpuStore = .{};
+    defer serial_gpu.deinit();
+    var threaded_gpu: TestGpuStore = .{};
+    defer threaded_gpu.deinit();
+    try testApplySync(&serial, &serial_gpu);
+    try testApplySync(&threaded, &threaded_gpu);
     var events: std.ArrayList(WorldTileChangedEvent) = .empty;
     defer events.deinit(std.testing.allocator);
     var write_buffer: [160]DenseCellWrite = undefined;
     var prng = std.Random.DefaultPrng.init(0x64_9b);
-    for (0..10) |_| {
+    var threaded_batches: usize = 0;
+    for (0..20) |_| {
         const writes = randomBatchWrites(prng.random(), tiles, &write_buffer);
-        var batch = try ChunkMajorWrites.init(&world, writes);
+        var batch = try ChunkMajorWrites.init(&serial, writes);
         defer batch.deinit();
         events.clearRetainingCapacity();
         try events.ensureTotalCapacity(std.testing.allocator, writes.len);
-        try world.applyDenseCellWrites(batch.chunks.items, null, &events);
-        _ = try testSyncGpuTiles(&world, 0);
-        try testApplySync(&world, &gpu_store);
-        try expectGpuStoreMatches(&world, &gpu_store);
+        try serial.applyDenseCellWrites(batch.chunks.items, null, &events);
+        events.clearRetainingCapacity();
+        try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &events);
+        if (editRanThreaded(&threaded)) threaded_batches += 1;
+        // Marks and flags are part of the compared bytes.
+        try expectTerrainBytesEqual(&serial, &threaded);
+
+        _ = try testSyncGpuTiles(&serial, 0);
+        _ = try testSyncGpuTiles(&threaded, 0);
+        try std.testing.expectEqualSlices(TileStoreSpan, serial.gpu_tiles.spans.items, threaded.gpu_tiles.spans.items);
+        try std.testing.expectEqualSlices(u32, serial.gpu_tiles.values.items, threaded.gpu_tiles.values.items);
+        try testApplySync(&serial, &serial_gpu);
+        try testApplySync(&threaded, &threaded_gpu);
+        try expectGpuStoreMatches(&serial, &serial_gpu);
+        try expectGpuStoreMatches(&threaded, &threaded_gpu);
+        try std.testing.expect(!serial.gpu_edits_pending and !threaded.gpu_edits_pending);
+    }
+    try std.testing.expect(threaded_batches > 0);
+}
+
+test "edits between syncs allocate nothing for the GPU, rendered or not (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // A world with no store (its residency reset, nothing resident) and one whose
+    // surface layer is resident: 1000 warmed dig/fill cycles each, single-cell and
+    // batched.
+    for ([_]bool{ false, true }) |rendered| {
+        var world = try testBatchEditWorld(&meta);
+        defer world.deinit();
+        if (!rendered) world.resetGpuResidency();
+        try std.testing.expectEqual(rendered, world.dense_layers.items(.gpu_slot)[0] != world_gpu_tiles.no_slot);
+        var gpu: TestGpuStore = .{};
+        defer gpu.deinit();
+        try testApplySync(&world, &gpu);
+        const tiles = try TerrainTestTiles.resolve(&world, &meta);
+        const dig = [_]DenseCellWrite{ .{ .layer = 0, .x = 1, .y = 1, .tile = tiles.water }, .{ .layer = 0, .x = 5, .y = 1, .tile = tiles.water } };
+        const fill = [_]DenseCellWrite{ .{ .layer = 0, .x = 1, .y = 1, .tile = tiles.grass }, .{ .layer = 0, .x = 5, .y = 1, .tile = tiles.grass } };
+        const dig_chunks = [_]DenseChunkWrites{ .{ .level = 0, .chunk_x = 0, .chunk_y = 0, .writes = dig[0..1] }, .{ .level = 0, .chunk_x = 1, .chunk_y = 0, .writes = dig[1..2] } };
+        const fill_chunks = [_]DenseChunkWrites{ .{ .level = 0, .chunk_x = 0, .chunk_y = 0, .writes = fill[0..1] }, .{ .level = 0, .chunk_x = 1, .chunk_y = 0, .writes = fill[1..2] } };
+        var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+        defer events.deinit(std.testing.allocator);
+        try events.ensureTotalCapacity(std.testing.allocator, dig.len);
+
+        for (0..1001) |cycle| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+            // The first cycle warms the terrain pools and batch scratch.
+            if (cycle > 0) world.allocator = failing.allocator();
+            defer world.allocator = std.testing.allocator;
+            _ = try world.setDenseTile(0, 2, 2, tiles.water);
+            _ = try world.setDenseTile(0, 2, 2, tiles.grass);
+            events.clearRetainingCapacity();
+            try world.applyDenseCellWrites(&dig_chunks, null, &events);
+            events.clearRetainingCapacity();
+            try world.applyDenseCellWrites(&fill_chunks, null, &events);
+            try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+        }
+        try std.testing.expectEqual(rendered, world.gpu_edits_pending);
+        if (rendered) {
+            _ = try testSyncGpuTiles(&world, 0);
+            try testApplySync(&world, &gpu);
+            try expectGpuStoreMatches(&world, &gpu);
+        }
     }
 }
 
@@ -6432,12 +6611,63 @@ fn caveInBatchWrites(tiles: TerrainTestTiles, out: *[160]DenseCellWrite) []Dense
     return out[0..count];
 }
 
-fn batchEditAllocationTest(meta: *const WorldTilesetMeta, threads: *ThreadSystem, fail_index: usize) !bool {
-    var world = try testBatchEditWorld(meta);
+// The batched-edit allocation proofs run on the three-level fixture and on the
+// wide-band level.
+const EditFixture = enum { batch, wide_bands };
+
+fn editFixtureWorld(meta: *const WorldTilesetMeta, fixture: EditFixture) !WorldSystem {
+    return switch (fixture) {
+        .batch => testBatchEditWorld(meta),
+        .wide_bands => testWideBandWorld(meta),
+    };
+}
+
+// The fixture's multi-chunk cave-in, in flat order.
+fn editFixtureCaveIn(tiles: TerrainTestTiles, fixture: EditFixture, out: *[wide_cave_in_writes]DenseCellWrite) []DenseCellWrite {
+    return switch (fixture) {
+        .batch => caveInBatchWrites(tiles, out[0..160]),
+        .wide_bands => wideCaveInWrites(tiles, out),
+    };
+}
+
+// A flat row-major copy of every dense layer of a world, for
+// `expectTerrainMatchesReference`.
+const FlatReference = struct {
+    cells: []TileId,
+    layers: [][]const TileId,
+    width: usize,
+
+    fn init(world: *const WorldSystem) !FlatReference {
+        const allocator = std.testing.allocator;
+        const layer_cells = @as(usize, world.width) * world.height;
+        const cells = try allocator.alloc(TileId, world.dense_layers.len * layer_cells);
+        errdefer allocator.free(cells);
+        const layers = try allocator.alloc([]const TileId, world.dense_layers.len);
+        for (layers, 0..) |*layer, index| {
+            const layer_slice = cells[index * layer_cells ..][0..layer_cells];
+            for (layer_slice, 0..) |*cell, cell_index| cell.* = world.denseTile(index, @intCast(cell_index % world.width), @intCast(cell_index / world.width));
+            layer.* = layer_slice;
+        }
+        return .{ .cells = cells, .layers = layers, .width = world.width };
+    }
+
+    fn deinit(self: *FlatReference) void {
+        std.testing.allocator.free(self.cells);
+        std.testing.allocator.free(self.layers);
+    }
+
+    fn apply(self: *FlatReference, writes: []const DenseCellWrite) void {
+        const layer_cells = self.cells.len / self.layers.len;
+        for (writes) |write| self.cells[write.layer * layer_cells + @as(usize, write.y) * self.width + write.x] = write.tile;
+    }
+};
+
+fn batchEditAllocationTest(meta: *const WorldTilesetMeta, threads: *ThreadSystem, fixture: EditFixture, fail_index: usize) !bool {
+    var world = try editFixtureWorld(meta, fixture);
     defer world.deinit();
     const tiles = try TerrainTestTiles.resolve(&world, meta);
-    var write_buffer: [160]DenseCellWrite = undefined;
-    const writes = caveInBatchWrites(tiles, &write_buffer);
+    var write_buffer: [wide_cave_in_writes]DenseCellWrite = undefined;
+    const writes = editFixtureCaveIn(tiles, fixture, &write_buffer);
     var batch = try ChunkMajorWrites.init(&world, writes);
     defer batch.deinit();
     var events: std.ArrayList(WorldTileChangedEvent) = .empty;
@@ -6446,23 +6676,23 @@ fn batchEditAllocationTest(meta: *const WorldTilesetMeta, threads: *ThreadSystem
     var before: std.ArrayList(u8) = .empty;
     defer before.deinit(std.testing.allocator);
     try appendTerrainBytes(&before, &world);
+    var reference = try FlatReference.init(&world);
+    defer reference.deinit();
+    reference.apply(writes);
 
     const edit_threads = testEditThreads(&world, threads);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
     world.allocator = failing.allocator();
     const result = world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
     world.allocator = std.testing.allocator;
-    var reference = BatchReference.init(tiles);
-    reference.apply(writes);
-    const layers = reference.layers();
     if (result) |_| {
         try std.testing.expect(!failing.has_induced_failure);
         try std.testing.expect(editRanThreaded(&world));
-        try expectTerrainMatchesReference(&world, &layers);
+        try expectTerrainMatchesReference(&world, reference.layers);
         return true;
     } else |err| {
         try std.testing.expectEqual(error.OutOfMemory, err);
-        // Nothing changed: terrain, composed bits, GPU queue, and events.
+        // Nothing changed: terrain, composed bits, change marks, render flags, and events.
         var after: std.ArrayList(u8) = .empty;
         defer after.deinit(std.testing.allocator);
         try appendTerrainBytes(&after, &world);
@@ -6471,7 +6701,7 @@ fn batchEditAllocationTest(meta: *const WorldTilesetMeta, threads: *ThreadSystem
         // The retry succeeds and lands the whole batch.
         try world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
         try std.testing.expect(editRanThreaded(&world));
-        try expectTerrainMatchesReference(&world, &layers);
+        try expectTerrainMatchesReference(&world, reference.layers);
         return false;
     }
 }
@@ -6482,10 +6712,12 @@ test "a batched dense edit fails cleanly at every allocation on the multi-worker
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
-    var fail_index: usize = 0;
-    while (!try batchEditAllocationTest(&meta, &threads, fail_index)) fail_index += 1;
-    // Scratch, both pools on three levels, and the GPU queue grew.
-    try std.testing.expect(fail_index >= 10);
+    for ([_]EditFixture{ .batch, .wide_bands }) |fixture| {
+        var fail_index: usize = 0;
+        while (!try batchEditAllocationTest(&meta, &threads, fixture, fail_index)) fail_index += 1;
+        // Scratch and the touched levels' pools grew.
+        try std.testing.expect(fail_index >= 10);
+    }
 }
 
 test "a warmed batched dense edit allocates nothing (FailingAllocator)" {
@@ -6494,39 +6726,155 @@ test "a warmed batched dense edit allocates nothing (FailingAllocator)" {
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
-    var world = try testBatchEditWorld(&meta);
-    defer world.deinit();
-    const tiles = try TerrainTestTiles.resolve(&world, &meta);
-    var write_buffer: [160]DenseCellWrite = undefined;
-    const writes = caveInBatchWrites(tiles, &write_buffer);
-    var restore_buffer: [160]DenseCellWrite = undefined;
-    const restores = restore_buffer[0..writes.len];
-    for (writes, restores) |write, *restore| {
-        restore.* = write;
-        restore.tile = world.denseTile(write.layer, write.x, write.y);
-    }
-    var batch = try ChunkMajorWrites.init(&world, writes);
-    defer batch.deinit();
-    var restore_batch = try ChunkMajorWrites.init(&world, restores);
-    defer restore_batch.deinit();
-    var events: std.ArrayList(WorldTileChangedEvent) = .empty;
-    defer events.deinit(std.testing.allocator);
-    try events.ensureTotalCapacity(std.testing.allocator, writes.len);
-    const edit_threads = testEditThreads(&world, &threads);
-    try world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
-    events.clearRetainingCapacity();
-    try world.applyDenseCellWrites(restore_batch.chunks.items, edit_threads, &events);
-    // The GPU queue drains as a frame's sync would.
-    _ = try testSyncGpuTiles(&world, 0);
+    for ([_]EditFixture{ .batch, .wide_bands }) |fixture| {
+        var world = try editFixtureWorld(&meta, fixture);
+        defer world.deinit();
+        const tiles = try TerrainTestTiles.resolve(&world, &meta);
+        var write_buffer: [wide_cave_in_writes]DenseCellWrite = undefined;
+        const writes = editFixtureCaveIn(tiles, fixture, &write_buffer);
+        var restore_buffer: [wide_cave_in_writes]DenseCellWrite = undefined;
+        const restores = restore_buffer[0..writes.len];
+        for (writes, restores) |write, *restore| {
+            restore.* = write;
+            restore.tile = world.denseTile(write.layer, write.x, write.y);
+        }
+        var batch = try ChunkMajorWrites.init(&world, writes);
+        defer batch.deinit();
+        var restore_batch = try ChunkMajorWrites.init(&world, restores);
+        defer restore_batch.deinit();
+        var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+        defer events.deinit(std.testing.allocator);
+        try events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        const edit_threads = testEditThreads(&world, &threads);
+        try world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
+        events.clearRetainingCapacity();
+        try world.applyDenseCellWrites(restore_batch.chunks.items, edit_threads, &events);
+        // A frame's sync uploads the changes, as between steps in play.
+        _ = try testSyncGpuTiles(&world, 0);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    world.allocator = failing.allocator();
-    defer world.allocator = std.testing.allocator;
-    events.clearRetainingCapacity();
-    try world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(editRanThreaded(&world));
-    try std.testing.expectEqual(writes.len, events.items.len);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+        events.clearRetainingCapacity();
+        try world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+        try std.testing.expect(editRanThreaded(&world));
+        try std.testing.expectEqual(writes.len, events.items.len);
+    }
+}
+
+// The wide-band fixture: one 4x4-tile level in 2x2-tile chunks holding more bands
+// than one 64-bit band word, walkable grass but for one blocking dirt band, every
+// band GPU resident.
+const wide_band_count: usize = 70;
+const wide_blocking_band: usize = 66;
+// Every band's cells (0..3, 0..3): a cave-in across all four chunks.
+const wide_cave_in_writes: usize = wide_band_count * 9;
+
+fn wideBandFill(tiles: TerrainTestTiles, band: usize) TileId {
+    return if (band == wide_blocking_band) tiles.dirt else tiles.grass;
+}
+
+fn testWideBandWorld(meta: *const WorldTilesetMeta) !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    errdefer world.deinit();
+    try world.buildCatalog(meta);
+    const tiles = try TerrainTestTiles.resolve(&world, meta);
+    const level = try world.addLevel(0);
+    for (0..wide_band_count) |band| _ = try world.addDenseLayer(level, 0, .floor, wideBandFill(tiles, band));
+    _ = try testSyncGpuTiles(&world, 0);
+    std.debug.assert(world.gpu_tiles.residentLayerCount() == wide_band_count);
+    return world;
+}
+
+fn wideCaveInWrites(tiles: TerrainTestTiles, out: *[wide_cave_in_writes]DenseCellWrite) []DenseCellWrite {
+    var count: usize = 0;
+    for (0..wide_band_count) |band| for (0..3) |y| for (0..3) |x| {
+        const tile = switch (band % 3) {
+            0 => invalid_tile_id,
+            1 => tiles.cave,
+            else => tiles.dirt,
+        };
+        out[count] = .{ .layer = @intCast(band), .x = @intCast(x), .y = @intCast(y), .tile = tile };
+        count += 1;
+    };
+    return out[0..count];
+}
+
+// Random writes over every band and cell of the wide-band fixture, at least one on
+// a band past the first band word.
+fn randomWideBandWrites(random: std.Random, tiles: TerrainTestTiles, out: []DenseCellWrite) []DenseCellWrite {
+    const write_tiles = [_]TileId{ tiles.grass, tiles.dirt, tiles.water, tiles.cave, tiles.tree, invalid_tile_id };
+    const count = random.intRangeAtMost(usize, 2, out.len);
+    for (out[0..count], 0..) |*write, index| {
+        const band: u32 = if (index == 0) @intCast(wide_band_count - 1) else random.uintLessThan(u32, wide_band_count);
+        write.* = .{
+            .layer = band,
+            .x = random.uintLessThan(u16, 4),
+            .y = random.uintLessThan(u16, 4),
+            .tile = if (random.boolean()) wideBandFill(tiles, band) else write_tiles[random.uintLessThan(usize, write_tiles.len)],
+        };
+    }
+    return out[0..count];
+}
+
+test "a level grows past 64 bands and a batched edit across all of them is identical inline and threaded and matches single-cell writes" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var serial = try testWideBandWorld(&meta);
+    defer serial.deinit();
+    var threaded = try testWideBandWorld(&meta);
+    defer threaded.deinit();
+    var single = try testWideBandWorld(&meta);
+    defer single.deinit();
+    const tiles = try TerrainTestTiles.resolve(&serial, &meta);
+    var reference = try FlatReference.init(&serial);
+    defer reference.deinit();
+    var gpu: TestGpuStore = .{};
+    defer gpu.deinit();
+    try testApplySync(&threaded, &gpu);
+
+    var serial_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer serial_events.deinit(std.testing.allocator);
+    var threaded_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer threaded_events.deinit(std.testing.allocator);
+    var write_buffer: [200]DenseCellWrite = undefined;
+    var prng = std.Random.DefaultPrng.init(0x70_ba5d);
+    var threaded_batches: usize = 0;
+    for (0..30) |_| {
+        const writes = randomWideBandWrites(prng.random(), tiles, &write_buffer);
+        var batch = try ChunkMajorWrites.init(&serial, writes);
+        defer batch.deinit();
+        serial_events.clearRetainingCapacity();
+        threaded_events.clearRetainingCapacity();
+        try serial_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try threaded_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try serial.applyDenseCellWrites(batch.chunks.items, null, &serial_events);
+        try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &threaded_events);
+        for (writes) |write| _ = try single.writeDenseTileCell(write.layer, write.x, write.y, write.tile);
+        if (editRanThreaded(&threaded)) threaded_batches += 1;
+        reference.apply(writes);
+
+        try std.testing.expectEqualSlices(WorldTileChangedEvent, serial_events.items, threaded_events.items);
+        try expectTerrainBytesEqual(&serial, &threaded);
+        try expectTerrainMatchesReference(&threaded, reference.layers);
+        try expectTerrainMatchesReference(&single, reference.layers);
+        _ = try testSyncGpuTiles(&threaded, 0);
+        try testApplySync(&threaded, &gpu);
+        try expectGpuStoreMatches(&threaded, &gpu);
+        _ = try testSyncGpuTiles(&serial, 0);
+        _ = try testSyncGpuTiles(&single, 0);
+    }
+    try std.testing.expect(threaded_batches > 0);
 }
 
 test "a multi-level cave-in lands in one batched step and refills to uniform chunks" {
@@ -6732,7 +7080,6 @@ test "a batched carve and restore of one cell leaves its uniform chunk unchanged
     };
     const chunks = [_]DenseChunkWrites{.{ .level = 1, .chunk_x = 1, .chunk_y = 1, .writes = &writes }};
     const slots_before = world.level_terrain.items[1].blocked.liveSlotCount();
-    const reserved_before = world.gpu_tiles.pending_reserved;
     var events: std.ArrayList(WorldTileChangedEvent) = .empty;
     defer events.deinit(std.testing.allocator);
     try events.ensureTotalCapacity(std.testing.allocator, writes.len);
@@ -6741,13 +7088,14 @@ test "a batched carve and restore of one cell leaves its uniform chunk unchanged
     for (world.dense_layers.items(.store)) |store| try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
     try std.testing.expectEqual(slots_before, world.level_terrain.items[1].blocked.liveSlotCount());
     try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(1, 1 * 4 + 1));
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.pending.items.len);
-    try std.testing.expectEqual(reserved_before, world.gpu_tiles.pending_reserved);
+    // No cell changed, so no layer is flagged for the GPU sync.
+    try std.testing.expect(!world.gpu_edits_pending);
+    try std.testing.expect(!world.dense_layers.items(.render_changed)[2]);
 }
 
 // Applies `chunks` threaded into `events` with exactly `event_capacity` spare
-// slots, expects `expected`, and checks the world, its GPU queue, and `events` are
-// untouched.
+// slots, expects `expected`, and checks the world, its render flags, and `events`
+// are untouched.
 fn expectRejectedBatch(world: *WorldSystem, threads: *ThreadSystem, chunks: []const DenseChunkWrites, event_capacity: usize, expected: anyerror) !void {
     var before: std.ArrayList(u8) = .empty;
     defer before.deinit(std.testing.allocator);

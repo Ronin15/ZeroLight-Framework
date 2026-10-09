@@ -45,11 +45,8 @@ One world per gameplay state; nothing models a set of worlds.
   destroyed or replaced world's store is released at the first frame its world
   does not render, with no game-side release call.
 - Load-time checks that refuse: `NavMemoryBudget.check` (`NavWorldTooLarge`
-  at `max_nav_memory_bytes`). `DenseLayerWindowExceeded` still refuses
-  world creation past `k_max_dense_submit_stack_cap` or
-  `max_dense_bands_per_level`, and `addDenseLayer` past
-  `max_dense_bands_per_level` or `world_terrain.max_level_bands` (64G owns the
-  fix).
+  at `max_nav_memory_bytes`). World terrain and render refuse nothing: band
+  lists grow, and the GPU store keeps only the render window.
 
 ### Architecture notes
 
