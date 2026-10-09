@@ -35,9 +35,9 @@ rules.
   streams, events, and structural commands). For a slice: the roadmap index,
   the slice file, and the track files it links. Never design from memory.
 - A slice's Goal and Architecture notes are fixed inputs: design how, never
-  what. Current foundation is fact about the code; where it is stale, the live
-  code wins. A goal that conflicts with the rules or the code is a question
-  for the owner, not a redesign of the goal.
+  what. The rules and `docs/architecture.md` win over code; code that
+  disagrees with them is wrong. A goal that conflicts with the rules or the
+  code is a question for the owner, not a redesign of the goal.
 - Anything unconfirmed is a question for the owner, not part of the plan
   (`.claude/rules/engine-design.md`).
 
@@ -46,7 +46,8 @@ rules.
 - **Cost model first** (`.claude/rules/engine-design.md`): a table of each
   operation's work and memory growth order for a local change, a dense one-step
   change, and world/level/dungeon create and destroy, each marked measured or
-  derived. If the existing structure fails, the design replaces it.
+  derived. If the existing structure fails, the design replaces the parts
+  that fail (`.claude/rules/engine-design.md`).
 - **One chosen design**, justified against the target in a few lines; one line
   per rejected alternative.
 - **Goal, success criteria, scope**, and the owning module of every new piece.

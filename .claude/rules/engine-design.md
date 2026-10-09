@@ -1,9 +1,11 @@
 # Engine Design
 
 Rules live only in `.claude/rules/`; docs describe and cite them. No two rules
-conflict. When a rule blocks a sound design, propose the edit with its reason;
-it changes in its rule file in the same change, never by loosening a rule to
-ease work. Owner decisions are not reopened.
+conflict. The rules and `docs/architecture.md` win over code: code that
+disagrees with them is wrong and is fixed. When a rule blocks a sound design,
+propose the edit with its reason; it changes in its rule file in the same
+change, never by loosening a rule to ease work. Owner decisions are not
+reopened.
 
 ## Target scale
 
@@ -51,6 +53,9 @@ Every design, and every fix touching storage or per-change work, states:
 - If the existing structure cannot pass, redesign that structure; never patch
   around it. Code, tests, and benches built on a failing structure go with it
   and are never references or baselines.
+- Default is keep: replace only the parts that fail the cost model; replacing
+  a part that passes needs a concrete performance or efficiency benefit
+  against its cost and risk.
 
 ## Ownership boundaries
 

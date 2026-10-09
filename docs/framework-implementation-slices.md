@@ -50,9 +50,10 @@ files it links. Do not load the whole roadmap.
   behavior; say what is scaffolded and where future behavior hooks in, and
   never document deferred behavior as complete. No half-wired states: finish
   end to end or keep every open item visible in the slice file.
-- Read [architecture.md](architecture.md) and the live owning modules first;
-  code wins over stale slice prose. Module placement follows architecture.md
-  § Source Layout.
+- Read [architecture.md](architecture.md) and the live owning modules first.
+  The rules and architecture.md win over code; code that disagrees with them
+  is wrong. Code wins over stale slice prose. Module placement follows
+  architecture.md § Source Layout.
 - Every slice follows the rules in `.claude/rules/`; a slice cites a rule file
   and never restates or adds a rule. A slice that needs a new rule has a
   checklist item to add it to the owning rule file when it lands. The planned
@@ -80,11 +81,8 @@ files it links. Do not load the whole roadmap.
    architecture.md, the header's track file, and any doc the slice links; no
    other slice files unless linked.
 3. **Design pass, right before implementation.** `zig-design-specialist`
-   designs the slice against the live code and current rules; the slice's Goal
-   and Architecture notes are fixed inputs, so it designs how, not what, and
-   live code wins over stale Current foundation facts. The main session writes
-   the plan's steps into the Checklist, one outcome per line, and checks those
-   off; the design itself stays out of the slice file.
+   works out how to build the slice. The design goes to the implementer, not
+   into the slice.
 4. **Implement only that slice's scope** in the owning `src/` modules.
 5. **Check off Checklist items** as each lands with its tests. Items marked
    "(added by Slice N)" are part of this slice's scope.
@@ -102,7 +100,7 @@ files it links. Do not load the whole roadmap.
 | **Goal** | What "done" means for this chunk |
 | **Current foundation** | What already exists; build on it unless it fails the cost model (`.claude/rules/engine-design.md`), then replace it |
 | **Architecture notes** / **Problem** | Constraints and ownership boundaries, citing rule files; never an internal design |
-| **Checklist** | `[ ]` / `[x]` intent-level steps, refined by the design pass — check off as you land each |
+| **Checklist** | `[ ]` / `[x]` intent-level steps — check off as you land each |
 | **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
 | **Status** | One line near the top: open/partial note, or a completion record before the archive move |
 
