@@ -175,7 +175,10 @@ Failure and limits:
 - [ ] A level or world added in play builds only its own chunks, threaded, and
       is never refused; other levels' nav, caches, and runtime state are
       untouched.
-- [ ] Render terrain upload per chunk; dense layers added in play.
+- [x] Render terrain uploaded per chunk for the render window; dense layers
+      added in play; GPU byte gate replaced by a report (`9bbfdc0`).
+- [ ] A world's GPU tile store is released when its world is destroyed or
+      replaced, never only at renderer shutdown.
 - [ ] Perception's line-of-sight state lives on chunk storage, not a
       level-area bitmap; its rebuild threshold derives from operation cost, not
       level area.
