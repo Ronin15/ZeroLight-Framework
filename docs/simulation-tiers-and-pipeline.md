@@ -267,8 +267,7 @@ the count it declared.
 - `stimuli`: transient per-step positional sensory bus AI hearing can sense,
   read by `PerceptionSystem`. Cleared every `beginStep` and never promoted to
   an event, since a stimulus carries no stable entity identity to transition
-  against. **Producer phase (before `perception_update`):** `DigController.admit`
-  and the level-link growth seam run first (they touch no stimulus), then `SensoryBus`
+  against. **Producer phase (before `perception_update`):** `SensoryBus`
   promotes deferred impacts, `DigController.commit` emits a required `.dig`
   (a full live bus returns `StimulusCapacityExceeded` and leaves the tile
   unchanged), then `SensoryBus.appendFootstep` may emit one optional

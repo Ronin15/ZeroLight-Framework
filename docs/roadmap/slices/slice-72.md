@@ -2,8 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none (F and G re-scoped against [Slice 64G](slice-64g.md) first) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** A1–A4, B1, C1–C7, I1, I2, K3, K6 landed; M1, D,
-E, F, G, H, J, K1, K2, K4, K5, X1 open.
+**Status: in progress.** A1–A4, B1, C1–C7, I1, I2, K6 landed; E4 and K3
+moved into 64G; M1, D, E, F, G, H, J, K1, K2, K4, K5, X1 open.
 
 Goal: no live behavior (iteration order, deferral, refusal, drops,
 truncation, cache flushes, query reach) depends on physical `.capacity`,
@@ -43,7 +43,7 @@ content across world sizes.
   waits for idle; `StateTransitions.reserve` sets the refusal bound.
 - Per-level nav arrays, dense world arrays, the nav memory gate, and
   `SearchScratch` O(cells) are replaced by 64G's chunk storage.
-- Owned elsewhere: nav dirty buffers and level-link growth (64E, landed);
+- Owned elsewhere: nav dirty buffers and level links (64G);
   `max_agent_budget` (71B.1, landed); deferred-nav buffers (65B); the
   `markStaticBodies` per-call map (64G's nav storage); stacked-UI headroom
   (53B, 60); spatial-index coverage of the whole population (75);
@@ -106,7 +106,7 @@ content across world sizes.
 - [ ] E6 · Initial elastic capacity from the loaded population.
 - [ ] E7 · Solve result slots isolated per worker (65A's helper).
 - [ ] E8 · Worker path and stitched pool stripes start on a line.
-- [x] E4 · Superseded by 64E's edge-window growth.
+- [x] E4 · Moved into 64G (nav storage).
 - [ ] F1 · Exact reserves for exact-size nav arrays (re-scoped by 64G).
 - [ ] F2 · Nav memory gate charges what load reserves (re-scoped by 64G).
 - [ ] F3 · Dense world arrays sized exactly (re-scoped by 64G).
@@ -132,7 +132,7 @@ content across world sizes.
 - [ ] K1 · `SimulationEvents.capacity_limit` justified at its site.
 - [ ] K2 · Pending-queue intake: its drop is unreachable by construction or
       becomes deterministic deferral, never a capacity refusal.
-- [x] K3 · Interior link slots: a per-chunk floor that grows in place.
+- [x] K3 · Moved into 64G (ramps never refused).
 - [ ] K4 · Particle pool justified as presentation-only.
 - [ ] K5 · Collision-SFX cooldown table justified as audio policy.
 - [x] K6 · Owned-elsewhere sites carry an owner pointer.

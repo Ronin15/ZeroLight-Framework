@@ -18,9 +18,7 @@ engine scale correctly:
   instance is right-sized at load, and runtime-growing stores grow only at the
   structural-commit seam.
 - **Determinism:** simulation scope no longer depends on the render camera.
-- **Pathfinding:** runtime ramps become routable in the same step.
-- **Nav edge storage:** rebuilt so dense, destructive terrain can never be
-  refused.
+- **Pathfinding:** Slice 64G rebuilds nav chunk-owned from main's model.
 
 The roadmap was split into one file per slice. It gained the VoidLight feature
 port plan (Slices 49–72) and an explicit three-way rule for budgets, capacities
@@ -48,20 +46,6 @@ These contracts are unchanged:
 - **Simulation scope decoupled from rendering (Slice 49 part).** Scope follows
   a fixed-step `sim_view` taken from the previous step's camera. It is a
   required field and never reads the interpolated render window.
-- **Runtime ramps are routable the same step (Slice 64E).**
-  - Runtime level links fold into the nav abstract tier, with per-chunk interior
-    link capacity (floor 8, doubled in place when a ramp needs more),
-    both-level dirtying, and a per-step link budget with deterministic deferral.
-    No ramp is refused.
-  - Incremental patches match a full rebuild.
-  - Nav dirty buffers and level links grow at the dig commit seam.
-- **Nav edge storage simplified (Slice 64F).**
-  - Edge windows are per level, and a level is repacked when a window
-    overflows. The edge arena is runtime-growing data that is never refused;
-    the only fixed cap is the u32 edge index, checked at load.
-  - Holes, compaction, relocation and the refusal ceiling are deleted.
-  - Effect: about 450 fewer lines in `nav_graph.zig`, and demo nav-edge memory
-    down 34%.
 - **Live capacity sizing pass (Slice 72, Batches A, B, C1–C7, I1, I2).**
   - One population growth seam (`syncPopulationCapacity`) and one exhaustive
     per-step event bound.
@@ -74,8 +58,7 @@ These contracts are unchanged:
   agent ceiling is sized from content.
 - **Branch review remediation.** Factionless agents no longer pass
   faction-restricted markers. The pipeline owns its structural event share.
-  The dig admission seam is private again. Sprite drift accounting is compiled
-  out of shipping builds.
+  Sprite drift accounting is compiled out of shipping builds.
 
 ## Simulation Pipeline And Capacity
 
@@ -106,24 +89,9 @@ These contracts are unchanged:
 
 ## Pathfinding
 
-- **Slice 64E:**
-  - runtime level links patch both levels incrementally, using interior link
-    slots and a link cursor;
-  - a chunk's interior link capacity grows in place (floor 8, then doubling)
-    on the step a ramp needs it: slot windows shift and slot indices are
-    remapped, with no relabel; the ramp refusal is gone;
-  - incremental patches match a full rebuild, serial and threaded;
-  - a failed growth still patches the whole dirty set;
-  - link-cursor and growth stats survive a failed step;
-  - the completed path cache is cleared after a degraded apply.
-- **Slice 64F:** per-level windows, `repackLevelEdges` on overflow (allocate
-  before mutate, so an OOM leaves the old layout valid), and a level-by-level
-  relabel.
-- Gameplay-reachable nav-memory refusals are removed.
-- **Slice 64G** (open) replaces the per-level terrain and nav storage with
-  chunk-owned storage, so a local change costs only the chunks it touches.
-- **New benches:** `nav-update-links`, `nav-update-links-dense`,
-  `nav-update-cave-in` and `nav-update-cave-in-warm`.
+- Nav work on this branch from 2026-10-05..07 is superseded. Slice 64G
+  replaces it with chunk-owned terrain and nav built from main's model, before
+  merge.
 
 ## Rendering And Build
 
@@ -161,8 +129,7 @@ These contracts are unchanged:
 - **New slices:** 73 (data-driven cognition), 74 (world instances), 75 (far
   simulation). Slice 62 keeps villagers and NPCs and recycles only ambient
   spawns; 69F's region paging became chunk storage forms that never leave
-  the simulation; 57's world items persist and decay outdoors. 64E is
-  archived (owner's manual check, Debug, 2026-10-08).
+  the simulation; 57's world items persist and decay outdoors.
 - **Rules added or clarified:** the cost model and target scale come first;
   the chunk owns terrain and nav storage and work; budgets, capacities, and
   thresholds are separate; no backlog dumping; terse comments; plain code over
@@ -193,8 +160,8 @@ These contracts are unchanged:
 
 ## Known Open Items
 
-- **64G:** chunk-owned terrain and nav lands on this branch before merge; it
-  supersedes 64F's open items.
+- **64G:** chunk-owned terrain and nav, built from main's model, lands on
+  this branch before merge.
 - **73, 74, 75:** the fully simulated direction's planning slices (cognition,
   world instances, far simulation); not started.
 - **65B:** re-scoped against 64G's chunk storage at its design pass.
@@ -229,12 +196,11 @@ These contracts are unchanged:
 - `fa4c064` Decouple simulation scope from the render visibility window
 - `3ca132a` Merge branch 'worktree-agent-a9f3ca2bf2cd45e36' into ai_update3
 - `9859496` Document that production callers must set SimulationContext.sim_view
-- `172d1af` Fold runtime LevelLinks into the nav abstract tier (Slice 64E)
+- 37 nav commits (2026-10-05..07), superseded by Slice 64G (`git log main..ai_update3`)
 - `21a918f` Fix the group-field threshold to a constant (Slice 71B.1)
 - `47e331f` Merge branch 'worktree-agent-a9bf9adb34b42d270' into ai_update3
 - `ef21356` Split the fixed-budget rule into budgets, capacities, and thresholds
 - `4edca97` Record capacity audit as the next roadmap task
-- `fe721f9` Address Slice 64E review: link capacity, ordering, admission
 - `2c345f0` Merge branch 'worktree-agent-a9bf9adb34b42d270' into ai_update3
 - `6a10f3e` Capacity audit: right-size per world instance with engine best practice
 - `c648f61` Add Slice 72: live capacity sizing pass from best-practice src/ sweep
@@ -259,21 +225,14 @@ These contracts are unchanged:
 - `466e94b` Slice 72: own the per-range slot warming gap as checklist item C5
 - `1e951ba` Roadmap bookkeeping: index and status reflect landed 52A, 71B, 72 work
 - `91138df` Slice 71B.1 capacity-audit follow-up: content-sized agent ceiling, threshold frozen at reserve
-- `daac4ae` Slice 64E: nav dirty buffers sized by the structural-stage event bound
-- `5c4fa8c` Slice 64E: level links grow at the dig commit seam
 - `c9496b8` Slice 72 C5: per-range outputs never warm in-stage
 - `78ed7e5` Slice 72 C5 follow-up: collision staging reserved to the per-item pair bound
 - `b070a85` Slice 71B.1 follow-up: nav-memory benefit test compares unrounded bytes
-- `92da19d` Slice 64E follow-up: link growth only for an admitted dig, before promote
 - `3dc8fb2` Slice 72: C5 review follow-up record; C6 contact streams to the pair bound
 - `c4c5677` Slice 72 C6: contact streams and response reserves to the pair bound
 - `161624b` Slice 72 C6 follow-up: broadphase slots reserved per item, slot growth counted
 - `33f855c` Slice 72: own the in-demo contact density check as manual item C7
-- `c28b4d0` Record owner's manual checks: 72 C7 contact density, 64E ramp pathing
 - `33e0b98` Correct manual-check records: the run was a Debug build
-- `b39e016` Slice 64E: grow an overflowing nav chunk edge window in place
-- `58f24a5` Slice 64E review: prove and bound in-place nav edge-window growth
-- `e513298` Slice 64E: assert the nav edge-hole bound instead of a dead compaction trigger
 - `12016da` Branch review: keep factionless agents out of faction-restricted markers
 - `1ba327e` Branch review: count the pipeline's own destructible share in the structural budget
 - `10d8581` Branch review: make the pipeline update context's sim_view required
@@ -285,38 +244,12 @@ These contracts are unchanged:
 - `3ddb983` Slice 72 I2: affect crossings from per-row bits, no sort
 - `82ea89c` Slice 72 I1/I2 follow-up: pipeline growth proof covers perception and affect
 - `3f54b79` Branch review: pin the cognition phase in single-step AI pipeline tests
-- `dbaddd0` Slice 64E M4: patch the whole dirty set before surfacing a growth failure
-- `f5b1cb7` Slice 64E M6: gate edge-arena re-admission on live slots, not physical capacity
-- `c67b294` Slice 64E M5: fail a build whose measured edge arena exceeds the nav memory gate
-- `cf1107f` Slice 64E M7: carry link-cursor stats across a failed nav apply
-- `b1fab5c` Slice 64E: record M4-M7 benches and reopen a post-fix manual check
-- `2c66e5e` Branch review: make the dig admission seam private again
 - `b8ae306` Branch review: count pipeline-stage structural commands in the pipeline share
 - `cd38a09` Branch review: describe commandOverflowGrows as a lifetime diagnostic
 - `95c8441` Branch review: cite padding constants and helpers by symbol, not line
 - `aad4acb` Branch review: count projectile, world-item, and harvest structural commands in the pipeline share
-- `393f1de` Slice 64E M10: report edge-window growths and compactions of a failed step on the next success
-- `ad017a2` Slice 64E M8: size edge windows by a slacked -> unslacked -> refuse ladder in the build and relocation
-- `5ac317b` Slice 64E M11: log a refused nav update once per step
-- `44c0f70` Slice 64E M9: keep every edge arena's capacity within the nav memory gate's ceiling
-- `0c32383` Slice 64E M12: drop the completed path cache after a degraded nav apply
-- `3c31040` Slice 64E M13: check the tombstone oracle in the OOM sweeps
-- `c29b19b` Slice 64E: record M8-M13 benches
 - `403cef7` Trim comment, plan, and report verbosity; verify once per batch
-- `987351b` Slice 64E/65B: own the M8-M13 review follow-ups
-- `20b5d68` Slice 64F: decide nav edge storage before 65B builds on it
-- `7ae44ef` Slice 64F: take the nav edge arena out of the memory gate
-- `1529862` Slice 64F: per-level edge windows, repack a level on overflow
-- `e0aef77` Slice 64F: readable names in the repack and its tests
-- `08e64bc` Slice 64F: cheaper repack measure and rebase
-- `3e29b2d` Slice 64F: record the edge storage decision, benches, and memory
 - `84cafcc` Coding standards: prefer the plain, obvious form over clever code
-- `6d5ee8c` Slice 64F: keep edge windows packed and relabel level by level
-- `8328a30` Slice 64F: test the u32 edge-index cap at its boundary
-- `c6138db` Slice 64F: cave-in repack bench and open review follow-ups
-- `4604730` Slice 64F: fix a stale repack comment, note why step 1 is not reused
-- `60a8aab` Slice 64F: gate the threaded level repack on a demo-scale trigger
-- `2e9b07b` Slice 64F: status matches its open follow-ups
 - `b471443` README: current pipeline, scoped simulation, dig-aware pathfinding, docs index
 - `10e5d8c` README: keep feature bullets at overview level
 - `7ae6be1` README: one-line AI and interactables bullets; list Python 3 requirement
@@ -326,12 +259,10 @@ These contracts are unchanged:
 - `0b00252` Rename file-namespace imports to snake_case per coding standards
 - `d56e634` Give every guidance rule one owner and point everywhere else at it
 - `d6a7305` Concise, context-aware guidance: one owner per rule, directory CLAUDE.md files
-- `6aa0c72` Remove gameplay-reachable nav-memory refusals
 - `334e8d0` Drop slice and review references from code comments
 - `edba22b` Directory guidance fixes
 - `b6a5b5c` Coding standards: terse rule lists per section
 - `40064d5` Single root CLAUDE.md: fold directory guidance back into its owner docs
-- `61d2f6a` Grow nav interior link capacity per chunk; remove the ramp refusal
 - `ecbac6c` Guidance: design for target scale and multiple worlds; local changes cost local work
 - `1580fe0` tooling updates
 - `ec362ea` Rules in .claude/rules; CLAUDE.md, agents, workflows, and docs point to them

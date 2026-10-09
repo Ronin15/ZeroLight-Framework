@@ -81,8 +81,8 @@ cover the new features.
 - [ ] Structures: site selection in the plan step, footprint terrain check,
       jobs suppress features under footprints, stamping and sockets at
       finish; every surviving site placed.
-- [x] Entrance skip for full interior link slots dropped: interior link
-      capacity grows per chunk, so every ranked entrance commits.
+- [ ] Every ranked entrance commits as a ramp link; none is skipped for
+      capacity (64G never refuses a link).
 - [ ] AI goal level: AI intents carry their goal's level, not a default 0.
 - [ ] Gameplay state adopts the authored records through 58, 61, and 62's
       existing adoption paths.

@@ -29,8 +29,9 @@ The nav storage below is per level today; 64G replaces it.
 - After an apply, cached paths are evicted by changed spans, cleared for a
   whole-level change, or invalidated by a version bump.
 - A batch touching more than `nav_full_relabel_level_threshold` (8) levels
-  relabels every level; 64G retires relabel, repack, and per-level storage
-  and makes the per-step apply all-or-nothing and threaded over dirty chunks.
+  relabels every level; 64G retires relabel, fallback rebuilds, and
+  per-level storage and makes the per-step apply all-or-nothing and threaded
+  over dirty chunks.
 - `expectGraphsEquivalent` (`nav_graph.zig`) is today's equivalence oracle;
   64G keeps incremental == full rebuild.
 - The production allocator (`std.process.Init.gpa`) is thread-safe.
@@ -45,7 +46,7 @@ The nav storage below is per level today; 64G replaces it.
 - The classification threshold and latency `k` are fixed constants, never
   derived from map size (`.claude/rules/budgets-capacities.md`).
 - From submit to publish the affected chunks are frozen: readers see the
-  pre-batch graph; marks and link growth arriving in the window are held
+  pre-batch graph; marks and new links arriving in the window are held
   (grown, never dropped) and applied at the publish step's seam; at most one
   deferred batch per world is in flight.
 - Publish step and result are identical with no lane, a thread-less lane,
@@ -77,7 +78,7 @@ The nav storage below is per level today; 64G replaces it.
       threshold.
 - [ ] Deferred plan prepared at the commit seam (threaded per chunk), a job
       rebuilding copies of the dirty chunks, publish at `s + k`, a fence
-      holding marks and link growth, abandon on rebuild, normalize, and
+      holding marks and new links, abandon on rebuild, normalize, and
       teardown.
 - [ ] Pipeline and state wiring: publish serviced in the main-thread input
       phase after replay capture; the nav event at the publish step's seam
