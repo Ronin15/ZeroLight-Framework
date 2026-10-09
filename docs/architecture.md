@@ -256,8 +256,10 @@ frame with no teardown call and no device drain (sweep O(store-slot high
 water), derived). A world whose claim fails re-uploads its window into a new
 store, O(resident layers × window chunks), derived.
 Multi-level compositing requires back-to-front dense-layer depth order at
-submit and in `mergeDrawList`. Sparse tiles cull to the window's levels and
-the camera chunk window separately.
+submit and in `mergeDrawList`. Sparse tiles draw from a per-window list the
+window update builds from the window's levels and chunks, ordered by (depth,
+cell, tile id): memory O(V), rebuild O(window levels × window chunks + V log V)
+for the V tiles in the window, independent of the world's sparse count.
 Dynamic entities collect from movement-body dense rows (Slice 24B): scope
 columns and `renderCollectIndicesForMovement` align on `movement_index`; render
 visibility is camera chunk + AABB only (simulation tier does not gate draw).

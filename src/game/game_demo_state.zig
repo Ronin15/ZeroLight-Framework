@@ -400,7 +400,7 @@ pub const GameDemoState = struct {
         errdefer particles.deinit();
         var scene_prep = render_prep.DynamicScenePrep.init(allocator);
         errdefer scene_prep.deinit();
-        world.setVisibleChunksForWorldRect(.{
+        try world.setVisibleChunksForWorldRect(.{
             .x = 0,
             .y = 0,
             .w = viewport_width,
@@ -556,7 +556,7 @@ pub const GameDemoState = struct {
         };
         // Draw culling only: the simulation never reads this window (its scope
         // comes from `simViewRect()` in `update`).
-        self.world.setVisibleChunksForWorldRect(camera_rect, world_render_overscan_chunks, self.player.current_level);
+        try self.world.setVisibleChunksForWorldRect(camera_rect, world_render_overscan_chunks, self.player.current_level);
         const scene = self.gameplayScene();
         // Always reserve the fixed AI-overlay headroom alongside the gameplay
         // scene budget (grow-only) so the first F2 toggle draws allocation-free.
@@ -1530,7 +1530,7 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
     try std.testing.expect(sim_view.x != camera.position.x);
     for ([_]f32{ 0, 0.25, 0.5, 1 }) |alpha| {
         const render_camera = demo.interpolatedCamera(alpha);
-        demo.world.setVisibleChunksForWorldRect(.{
+        try demo.world.setVisibleChunksForWorldRect(.{
             .x = render_camera.position.x,
             .y = render_camera.position.y,
             .w = demo.viewport_width / render_camera.zoom,

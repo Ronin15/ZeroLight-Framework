@@ -2941,7 +2941,7 @@ fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
     var trace: ScopeRenderTrace = undefined;
     for (&trace.steps, render_rects) |*out, rects| {
         if (render_cadence) {
-            for (rects) |rect| world.setVisibleChunksForWorldRect(rect, sim_view_overscan_chunks, 0);
+            for (rects) |rect| try world.setVisibleChunksForWorldRect(rect, sim_view_overscan_chunks, 0);
         }
         frame.beginStep();
         const stats = try pipeline.update(.{

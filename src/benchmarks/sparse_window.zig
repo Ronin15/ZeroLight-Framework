@@ -7,10 +7,10 @@
 //! a fixed 1280x720 camera window on the active level, over four depths; every other
 //! tile sits outside the window's chunks on all levels. The window's work is the
 //! same at every size, so each group is expected flat in the world's sparse count:
-//!   - `render-sparse-window-frame`: one frame's visibility update, depth walk, and
-//!     sparse submit into a headless `SpriteBatch`.
+//!   - `render-sparse-window-frame`: one frame's window update (unchanged, so
+//!     O(1)), depth range walk, and sparse submit into a headless `SpriteBatch`.
 //!   - `render-sparse-window-pan`: the window pans one chunk across, a frame, back,
-//!     a frame.
+//!     a frame; each pan rebuilds the window's sparse list.
 //!   - `render-sparse-window-add`: one sparse tile added outside the window, then a
 //!     frame. Tiles are append-only in play, so each iteration's reset (untimed)
 //!     drops the added tile.
@@ -127,16 +127,15 @@ const Fixture = struct {
     }
 
     // One frame's sparse prep for the camera `step_chunks` right of its start:
-    // visibility update, depth walk, and submit. Returns the sprites submitted.
+    // window update, depth range walk, and submit. Returns the sprites submitted.
     fn frame(self: *Fixture, step_chunks: i32) !usize {
         const world = &self.world;
         self.batch.beginFrame();
-        world.setVisibleChunksForWorldRect(self.cameraRect(step_chunks), overscan_chunks, active_level);
+        try world.setVisibleChunksForWorldRect(self.cameraRect(step_chunks), overscan_chunks, active_level);
         if (world.reserveRenderRecords() != window_tile_count) return error.WindowSparseCountMismatch;
-        try world.ensureRenderDepthIndex();
         var submitted: usize = 0;
         for (0..world.sparseDepthRangeCount()) |range_index| {
-            submitted += try world.submitVisibleSparseSprites(&self.batch, self.texture, world.sparseDepthRangeAt(range_index));
+            submitted += try world.submitVisibleSparseSprites(&self.batch, self.texture, range_index);
         }
         if (submitted != window_tile_count) return error.WindowSparseSubmitMismatch;
         return submitted;
@@ -149,8 +148,8 @@ const Fixture = struct {
     }
 
     // Drops the tile `addOutsideTile` appended, returning the world to `sparse_count`
-    // tiles. Tiles are append-only in play, so this truncates `sparse_tiles` and the
-    // tile's level and chunk index lists, and marks the render index for a rebuild.
+    // tiles: truncates `sparse_tiles` and the tile's level and chunk index lists. It
+    // invalidates nothing, as the add outside the window invalidated nothing.
     fn dropAddedTile(self: *Fixture) !void {
         const world = &self.world;
         if (world.sparseTileCount() != self.sparse_count + 1) return error.AddedTileCountMismatch;
@@ -160,8 +159,7 @@ const Fixture = struct {
         if (world.sparse_level_tiles.items[added_tile_level].pop() != added_index) return error.AddedTileIndexMismatch;
         if (world.sparse_level_chunk_tiles.items[added_tile_level].items[chunk_index].pop() != added_index) return error.AddedTileIndexMismatch;
         world.sparse_tiles.shrinkRetainingCapacity(self.sparse_count);
-        world.render_index_dirty = true;
-        world.visibility_window_valid = false;
+        if (world.sparse_window.dirty) return error.OutsideAddDirtiedWindow;
     }
 };
 
@@ -230,7 +228,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var fixture: Fixture = undefined;
     try initFixture(&fixture, allocator, io, item_count);
     defer fixture.deinit();
-    // The first frame builds the render index and the window's sparse count.
+    // The first frame builds the window's sparse list.
     _ = try fixture.frame(0);
 
     for (0..options.warmup_iterations) |_| {

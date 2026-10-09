@@ -331,23 +331,23 @@ const Fixture = struct {
 
     // Sets the pan window `step_chunks` right of its start, around the GPU active
     // level, with no overscan.
-    fn setPanWindow(self: *Fixture, step_chunks: u16) void {
-        self.setChunkWindow(self.pan_origin_chunk_x + step_chunks, self.pan_origin_chunk_y, self.pan_window_edge);
+    fn setPanWindow(self: *Fixture, step_chunks: u16) !void {
+        try self.setChunkWindow(self.pan_origin_chunk_x + step_chunks, self.pan_origin_chunk_y, self.pan_window_edge);
     }
 
     // Sets the fixed render window over the dig cells' chunk square, with the two
     // deepest levels in the level window.
-    fn setDigWindow(self: *Fixture) void {
+    fn setDigWindow(self: *Fixture) !void {
         self.world.render_window = .{ .levels_below = self.gpu_levels_below };
         const origin_chunk = self.side / default_chunk_size_tiles / 2 - dig_window_chunks / 2;
-        self.setChunkWindow(origin_chunk, origin_chunk, dig_window_chunks);
+        try self.setChunkWindow(origin_chunk, origin_chunk, dig_window_chunks);
     }
 
     // A rect exactly covering `edge` x `edge` chunks from (min_chunk_x, min_chunk_y).
-    fn setChunkWindow(self: *Fixture, min_chunk_x: u16, min_chunk_y: u16, edge: u16) void {
+    fn setChunkWindow(self: *Fixture, min_chunk_x: u16, min_chunk_y: u16, edge: u16) !void {
         const chunk_px = @as(f32, @floatFromInt(default_chunk_size_tiles)) * self.world.tile_size;
         const extent = @as(f32, @floatFromInt(edge)) * chunk_px;
-        self.world.setVisibleChunksForWorldRect(.{
+        try self.world.setVisibleChunksForWorldRect(.{
             .x = @as(f32, @floatFromInt(min_chunk_x)) * chunk_px,
             .y = @as(f32, @floatFromInt(min_chunk_y)) * chunk_px,
             .w = extent,
@@ -412,12 +412,12 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     fixture.gpu_levels_below = resident_layers - 1;
     switch (workload) {
         .gpu_sync_dig => {
-            fixture.setDigWindow();
+            try fixture.setDigWindow();
             try fixture.attachHeadlessTileStore(allocator);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         },
         .gpu_sync_level_enter => {
-            fixture.setDigWindow();
+            try fixture.setDigWindow();
             try fixture.attachHeadlessTileStore(allocator);
             // 64 mixed chunks on each level the window crosses.
             for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel);
@@ -434,7 +434,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             for (fixture.gpuActiveLevel()..fixture.levels) |level| {
                 try mixRegion(&fixture, @intCast(level), columns, window_edge);
             }
-            fixture.setPanWindow(0);
+            try fixture.setPanWindow(0);
             try fixture.attachHeadlessTileStore(allocator);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         },
@@ -479,9 +479,9 @@ fn runIteration(fixture: *Fixture, workload: Workload) !usize {
             break :blk entered + try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
         },
         .gpu_sync_pan => blk: {
-            fixture.setPanWindow(1);
+            try fixture.setPanWindow(1);
             const panned = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-            fixture.setPanWindow(0);
+            try fixture.setPanWindow(0);
             const uploaded = panned + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
             if (uploaded != expectedPanUploads(fixture.pan_window_edge, fixture.gpu_levels_below + 1)) return error.PanUploadCountMismatch;
             break :blk uploaded;
@@ -771,7 +771,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer fixture.deinit();
     // The two deepest levels are GPU resident over the fixed window, so edits there
     // flag their layers; each iteration's sync uploads them outside the timed region.
-    fixture.setDigWindow();
+    try fixture.setDigWindow();
     try fixture.attachHeadlessTileStore(allocator);
     _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
     var edit = switch (workload) {

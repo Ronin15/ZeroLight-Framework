@@ -206,20 +206,27 @@ const ProceduralBuildContext = struct {
     ids: ProceduralTiles,
 };
 
-const VisibleTileBounds = struct {
-    min_x: u16,
-    min_y: u16,
-    max_x_exclusive: u16,
-    max_y_exclusive: u16,
-};
-
-// One contiguous run of sparse tiles that share a render depth, expressed as a
-// window into `sparse_render_order`. Lets sparse submission touch only the
-// tiles at a given depth instead of rescanning every sparse tile per depth.
+// One contiguous run of window sparse tiles that share a render depth, as a slice
+// of `SparseWindow.tiles`.
 const SparseDepthRange = struct {
     depth: i32,
     start: u32,
     count: u32,
+};
+
+// The sparse tiles the render window draws: those on the window's levels inside
+// its tile bounds, ordered by (depth, cell, tile id), with one range per distinct
+// depth. Rebuilt by the window update when the window moves or `dirty` is set
+// (a tile added inside the current window); render-only.
+const SparseWindow = struct {
+    tiles: std.ArrayList(u32) = .empty,
+    ranges: std.ArrayList(SparseDepthRange) = .empty,
+    dirty: bool = true,
+
+    fn deinit(self: *SparseWindow, allocator: std.mem.Allocator) void {
+        self.ranges.deinit(allocator);
+        self.tiles.deinit(allocator);
+    }
 };
 
 const DenseLayerRow = struct {
@@ -540,15 +547,11 @@ pub const WorldSystem = struct {
     // dirty flag or deferred rebuild. That matters because gameplay consumers
     // (nav rebuild after a dig, the perception LOS-blocked cache) read it
     // within the same fixed-step tick a tile is placed, well before the next
-    // `ensureRenderDepthIndex` render pass would run; a lazily-rebuilt index
-    // keyed off the render dirty flag would be stale for them. A future bulk
-    // sparse-tile insert path must maintain this the same way. Lets per-level
-    // consumers walk only one level's tiles instead of scanning every sparse
-    // tile in the world and filtering by level. Deliberately not
-    // shaped like `sparse_render_order` (one flat sorted array + range table):
-    // that shape requires a contiguous per-group run, which can only be kept
-    // contiguous by a full resort after every insert — exactly the O(n) full
-    // rescan this index exists to avoid. Grown lazily up to `level_index + 1`
+    // render window update would run; a lazily-rebuilt index keyed off a
+    // render dirty flag would be stale for them. A future bulk sparse-tile
+    // insert path must maintain this the same way. Lets per-level consumers
+    // walk only one level's tiles instead of scanning every sparse tile in the
+    // world and filtering by level. Grown lazily up to `level_index + 1`
     // entries the first time a level gets a sparse tile; a level with no
     // sparse tiles yet simply has no entry (the accessor treats that the same
     // as an out-of-range level: an empty slice).
@@ -561,35 +564,22 @@ pub const WorldSystem = struct {
     // maintained by `addSparseTile` only, never removed from or resorted.
     sparse_level_chunk_tiles: std.ArrayList(std.ArrayList(std.ArrayList(u32))) = .empty,
 
-    // Derived render-walk index, rebuilt only when the dense-layer or sparse-tile
-    // set changes (tracked by render_index_dirty), never per frame. render_depths
-    // is the sorted distinct set of dense+sparse depths; sparse_render_order holds
-    // sparse indices grouped by depth (ascending depth, then original index), with
-    // sparse_depth_ranges giving the per-depth window into it.
-    render_depths: std.ArrayList(i32) = .empty,
-    sparse_render_order: std.ArrayList(u32) = .empty,
-    sparse_depth_ranges: std.ArrayList(SparseDepthRange) = .empty,
-    render_index_dirty: bool = true,
+    sparse_window: SparseWindow = .{},
 
     visible_min_tile_x: u16 = 0,
     visible_min_tile_y: u16 = 0,
     visible_max_tile_x_exclusive: u16 = 0,
     visible_max_tile_y_exclusive: u16 = 0,
-    // Visible sparse-tile count cached at each visibility update so the per-frame
-    // sprite-command reservation reads it directly instead of rescanning all
-    // sparse tiles. Refreshed whenever visibility changes (the only producer that
-    // runs before the reservation each render frame).
-    visible_sparse_count: usize = 0,
-    // Cached visible-window bounds (tile + chunk) from the last visibility update.
-    // The window only changes when the camera crosses a tile boundary, so a still
-    // camera or a sub-tile pan early-outs instead of recounting visible sparse
-    // tiles each render frame. Cleared to force that recount.
-    visibility_window_valid: bool = false,
-    // Whether the last_* chunk window has been set; until then every chunk is visible.
+    // Whether the visible_*/last_* window has been set. Until then nothing renders:
+    // the GPU store holds no layer and the sparse window holds no tile. The window
+    // changes only when the camera crosses a tile edge, so a still camera or a
+    // sub-tile pan leaves it and the sparse window as they are.
     visible_window_set: bool = false,
     // Active level of the last visibility update; sparse tiles draw only on the
     // render window's levels around it.
     visible_active_level: u16 = 0,
+    // `render_window` as of the last window update: the levels the sparse list holds.
+    visible_render_window: DenseLayerRenderWindow = .{},
     last_min_chunk_x: u16 = 0,
     last_min_chunk_y: u16 = 0,
     last_max_chunk_x: u16 = 0,
@@ -767,9 +757,7 @@ pub const WorldSystem = struct {
     }
 
     pub fn deinit(self: *WorldSystem) void {
-        self.sparse_depth_ranges.deinit(self.allocator);
-        self.sparse_render_order.deinit(self.allocator);
-        self.render_depths.deinit(self.allocator);
+        self.sparse_window.deinit(self.allocator);
 
         self.sparse_tiles.deinit(self.allocator);
         for (self.sparse_level_tiles.items) |*bucket| bucket.deinit(self.allocator);
@@ -812,9 +800,10 @@ pub const WorldSystem = struct {
 
     /// Dynamic sprite-command budget the world contributes per frame. Dense tiles
     /// render from the retained static buffer and no longer stream through the
-    /// dynamic sprite batch, so only visible sparse tiles count here.
+    /// dynamic sprite batch, so only the window's sparse tiles count here. Read
+    /// after `setVisibleChunksForWorldRect`.
     pub fn reserveRenderRecords(self: *const WorldSystem) usize {
-        return self.visible_sparse_count;
+        return self.sparse_window.tiles.items.len;
     }
 
     /// Upper bound on dense tilemap composite draws submitted this frame: one per
@@ -822,42 +811,6 @@ pub const WorldSystem = struct {
     /// `syncDenseTileStore`, which sets the resident layers.
     pub fn maxDenseSubmitDrawCount(self: *const WorldSystem) usize {
         return self.dense_render.layers.items.len;
-    }
-
-    /// Sparse tiles the next frame draws: those on the render window's levels around
-    /// the visible active level, in visible chunks, inside the visible tile bounds.
-    /// Walks only those levels' visible chunks through the per-chunk sparse index:
-    /// O(window levels × window chunks + their sparse tiles), whatever the depth.
-    pub fn visibleSparseTileCount(self: *const WorldSystem) usize {
-        const region = self.visibleChunkRegion() orelse return 0;
-        const levels = self.renderWindowLevels(self.visible_active_level) orelse return 0;
-        const bounds = self.visibleTileBounds();
-        const chunks_x = self.chunksX();
-        const chunks_y = self.chunksY();
-        const min_cx: u16 = @intCast(@max(0, region.min.x));
-        const min_cy: u16 = @intCast(@max(0, region.min.y));
-        const max_cx_exclusive: u16 = @intCast(@min(@as(i32, chunks_x), region.max_exclusive.x));
-        const max_cy_exclusive: u16 = @intCast(@min(@as(i32, chunks_y), region.max_exclusive.y));
-        const sparse_cells = self.sparse_tiles.items(.cell_index);
-        var visible_sparse_tiles: usize = 0;
-        var level_index = levels.first;
-        while (level_index <= levels.last) : (level_index += 1) {
-            const level: u16 = @intCast(level_index);
-            if (!self.render_window.levelInWindow(self.visible_active_level, level, levels.max_level)) continue;
-            var cy = min_cy;
-            while (cy < max_cy_exclusive) : (cy += 1) {
-                var cx = min_cx;
-                while (cx < max_cx_exclusive) : (cx += 1) {
-                    const local_chunk_index = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
-                    for (self.sparseTileIndicesForChunk(level, local_chunk_index)) |sparse_index| {
-                        if (self.cellInVisibleBounds(sparse_cells[sparse_index], bounds)) {
-                            visible_sparse_tiles += 1;
-                        }
-                    }
-                }
-            }
-        }
-        return visible_sparse_tiles;
     }
 
     /// Inclusive tile and chunk bounds of a world rect; see `chunkWindowForWorldRect`.
@@ -930,52 +883,134 @@ pub const WorldSystem = struct {
     }
 
     /// Sets the render chunk window, the GPU directory side for the rect's size, and
-    /// the active level it renders around, and refreshes the visible sparse count.
-    /// O(1) when the window and level are unchanged; otherwise
-    /// `visibleSparseTileCount`, never depending on the level's chunk count or the
-    /// world's depth.
-    pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16, active_level: u16) void {
-        if (self.levelCount() == 0) {
-            self.visible_sparse_count = 0;
-            return;
-        }
-        self.render_side = self.renderSideForRect(rect, overscan_chunks);
+    /// the active level it renders around, and rebuilds the window's sparse list.
+    /// O(1) when the window, level, and `render_window` are unchanged and no tile was
+    /// added inside the window; otherwise O(window levels × window chunks + V log V)
+    /// for the V sparse
+    /// tiles in the window, never depending on the world's sparse count, level size,
+    /// or depth. Out of memory leaves the window and its sparse list as they were and
+    /// the next call retries.
+    pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16, active_level: u16) error{OutOfMemory}!void {
+        if (self.levelCount() == 0) return;
+        const render_side = self.renderSideForRect(rect, overscan_chunks);
         const window = self.chunkWindowForWorldRect(rect, overscan_chunks);
-        const min_tile_x = window.min_tile_x;
-        const min_tile_y = window.min_tile_y;
-        const max_tile_x = window.max_tile_x;
-        const max_tile_y = window.max_tile_y;
-        const min_chunk_x = window.min_chunk_x;
-        const min_chunk_y = window.min_chunk_y;
-        const max_chunk_x = window.max_chunk_x;
-        const max_chunk_y = window.max_chunk_y;
-
-        // Early-out when the visible window is unchanged: chunk visibility and the
-        // sparse count are fully determined by these bounds, so a still camera or a
-        // sub-tile pan needs no rescan.
-        if (self.visibility_window_valid and active_level == self.visible_active_level and
-            min_tile_x == self.visible_min_tile_x and min_tile_y == self.visible_min_tile_y and
-            max_tile_x + 1 == self.visible_max_tile_x_exclusive and max_tile_y + 1 == self.visible_max_tile_y_exclusive and
-            min_chunk_x == self.last_min_chunk_x and min_chunk_y == self.last_min_chunk_y and
-            max_chunk_x == self.last_max_chunk_x and max_chunk_y == self.last_max_chunk_y)
+        if (self.visible_window_set and !self.sparse_window.dirty and active_level == self.visible_active_level and
+            windowsEqual(self.render_window, self.visible_render_window) and
+            window.min_tile_x == self.visible_min_tile_x and window.min_tile_y == self.visible_min_tile_y and
+            window.max_tile_x + 1 == self.visible_max_tile_x_exclusive and window.max_tile_y + 1 == self.visible_max_tile_y_exclusive and
+            window.min_chunk_x == self.last_min_chunk_x and window.min_chunk_y == self.last_min_chunk_y and
+            window.max_chunk_x == self.last_max_chunk_x and window.max_chunk_y == self.last_max_chunk_y)
         {
+            self.render_side = render_side;
             return;
         }
-        self.visible_min_tile_x = min_tile_x;
-        self.visible_min_tile_y = min_tile_y;
-        self.visible_max_tile_x_exclusive = max_tile_x + 1;
-        self.visible_max_tile_y_exclusive = max_tile_y + 1;
-        self.last_min_chunk_x = min_chunk_x;
-        self.last_min_chunk_y = min_chunk_y;
-        self.last_max_chunk_x = max_chunk_x;
-        self.last_max_chunk_y = max_chunk_y;
-        self.visibility_window_valid = true;
+
+        // Count, reserve, then commit: an allocation failure changes nothing.
+        const tile_count = self.walkWindowSparseTiles(window, active_level, null);
+        try self.sparse_window.tiles.ensureTotalCapacity(self.allocator, tile_count);
+        try self.sparse_window.ranges.ensureTotalCapacity(self.allocator, tile_count);
+
+        self.render_side = render_side;
+        self.visible_min_tile_x = window.min_tile_x;
+        self.visible_min_tile_y = window.min_tile_y;
+        self.visible_max_tile_x_exclusive = window.max_tile_x + 1;
+        self.visible_max_tile_y_exclusive = window.max_tile_y + 1;
+        self.last_min_chunk_x = window.min_chunk_x;
+        self.last_min_chunk_y = window.min_chunk_y;
+        self.last_max_chunk_x = window.max_chunk_x;
+        self.last_max_chunk_y = window.max_chunk_y;
         self.visible_window_set = true;
         self.visible_active_level = active_level;
+        self.visible_render_window = self.render_window;
+        self.fillWindowSparseTiles(window, active_level, tile_count);
+        self.sparse_window.dirty = false;
+    }
 
-        // Chunk visibility crops sparse tiles here; the GPU sync moves the dense
-        // window's residency to the new chunks.
-        self.visible_sparse_count = self.visibleSparseTileCount();
+    // Counts the sparse tiles on the render window's levels around `active_level`
+    // inside the window's tile bounds, appending each to `out` (reserved for them)
+    // when given. Walks only the chunks under the tile bounds, never the overscan
+    // ring: O(window levels × those chunks + their sparse tiles).
+    fn walkWindowSparseTiles(self: *const WorldSystem, window: ChunkWindow, active_level: u16, out: ?*std.ArrayList(u32)) usize {
+        const levels = self.renderWindowLevels(active_level) orelse return 0;
+        const sparse_cells = self.sparse_tiles.items(.cell_index);
+        const chunks_x = self.chunksX();
+        const min_cx = window.min_tile_x / self.chunk_size_tiles;
+        const max_cx = window.max_tile_x / self.chunk_size_tiles;
+        const min_cy = window.min_tile_y / self.chunk_size_tiles;
+        const max_cy = window.max_tile_y / self.chunk_size_tiles;
+        var count: usize = 0;
+        var level = levels.first;
+        while (level <= levels.last) : (level += 1) {
+            if (!self.render_window.levelInWindow(active_level, @intCast(level), levels.max_level)) continue;
+            var cy = min_cy;
+            while (cy <= max_cy) : (cy += 1) {
+                var cx = min_cx;
+                while (cx <= max_cx) : (cx += 1) {
+                    const chunk = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
+                    for (self.sparseTileIndicesForChunk(@intCast(level), chunk)) |sparse_index| {
+                        if (!self.cellInWindowTiles(sparse_cells[sparse_index], window)) continue;
+                        if (out) |tiles| tiles.appendAssumeCapacity(sparse_index);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    // Fills the reserved sparse window with the `tile_count` tiles
+    // `walkWindowSparseTiles` counted, sorts them by (depth, cell, tile id), and
+    // builds one range per distinct depth. Allocation-free; an empty window skips
+    // the walk and sort.
+    fn fillWindowSparseTiles(self: *WorldSystem, window: ChunkWindow, active_level: u16, tile_count: usize) void {
+        const tiles = &self.sparse_window.tiles;
+        const ranges = &self.sparse_window.ranges;
+        std.debug.assert(tiles.capacity >= tile_count and ranges.capacity >= tile_count);
+        tiles.clearRetainingCapacity();
+        ranges.clearRetainingCapacity();
+        if (tile_count == 0) return;
+        const sparse = self.sparse_tiles.slice();
+        const order = SparseWindowOrder{
+            .depths = sparse.items(.depth_value),
+            .cells = sparse.items(.cell_index),
+            .tile_ids = sparse.items(.tile_id),
+        };
+        _ = self.walkWindowSparseTiles(window, active_level, tiles);
+        std.debug.assert(tiles.items.len == tile_count);
+        std.mem.sort(u32, tiles.items, order, SparseWindowOrder.lessThan);
+
+        var start: usize = 0;
+        while (start < tiles.items.len) {
+            const depth = order.depths[tiles.items[start]];
+            var end = start + 1;
+            while (end < tiles.items.len and order.depths[tiles.items[end]] == depth) : (end += 1) {}
+            // Window tiles index `sparse_tiles`, whose indices fit u32.
+            ranges.appendAssumeCapacity(.{ .depth = depth, .start = @intCast(start), .count = @intCast(end - start) });
+            start = end;
+        }
+    }
+
+    // Draw order of window sparse tiles: depth, then cell, then tile id. Never the
+    // tile's index, so removing and moving rows cannot change what draws on top.
+    const SparseWindowOrder = struct {
+        depths: []const i32,
+        cells: []const u32,
+        tile_ids: []const TileId,
+
+        fn lessThan(self: SparseWindowOrder, lhs: u32, rhs: u32) bool {
+            if (self.depths[lhs] != self.depths[rhs]) return self.depths[lhs] < self.depths[rhs];
+            if (self.cells[lhs] != self.cells[rhs]) return self.cells[lhs] < self.cells[rhs];
+            return self.tile_ids[lhs] < self.tile_ids[rhs];
+        }
+    };
+
+    // Whether `cell` is inside the window's tile bounds (the rect's tiles, without
+    // the chunk overscan).
+    fn cellInWindowTiles(self: *const WorldSystem, cell: u32, window: ChunkWindow) bool {
+        const x = cell % self.width;
+        const y = cell / self.width;
+        return x >= window.min_tile_x and x <= window.max_tile_x and
+            y >= window.min_tile_y and y <= window.max_tile_y;
     }
 
     // A power-of-two side covering every chunk window a rect of this size touches:
@@ -1379,46 +1414,49 @@ pub const WorldSystem = struct {
         }
     }
 
-    /// Submits the visible sparse tiles at `depth` through the dynamic ordered
-    /// stream. Sparse tiles stay dynamic (they are sparse and change independently
-    /// of the dense static field); the renderer merges them with dynamic entities
-    /// and the static dense spans by render order.
-    pub fn submitVisibleSparseAtDepth(
+    /// Submits the window's sparse tiles in depth range `range_index` (below
+    /// `sparseDepthRangeCount`) through the dynamic ordered stream, in (cell, tile
+    /// id) order. Sparse tiles stay dynamic (they are sparse and change
+    /// independently of the dense static field); the renderer merges them with
+    /// dynamic entities and the static dense spans by render order. O(tiles in the
+    /// range).
+    pub fn submitVisibleSparseRange(
         self: *const WorldSystem,
         renderer: *Renderer,
         runtime_assets: *const RuntimeAssets,
-        depth: i32,
+        range_index: usize,
     ) !void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
-        const bounds = self.visibleTileBounds();
-        try self.submitVisibleSparseRange(renderer, prepared, bounds, depth);
+        const range = self.sparse_window.ranges.items[range_index];
+        const sparse = self.sparse_tiles.slice();
+        const sparse_cells = sparse.items(.cell_index);
+        const sparse_tile_ids = sparse.items(.tile_id);
+        for (self.sparse_window.tiles.items[range.start..][0..range.count]) |index| {
+            const cell = sparse_cells[index];
+            const x: u16 = @intCast(cell % self.width);
+            const y: u16 = @intCast(cell / self.width);
+            try self.submitTile(renderer, prepared, sparse_tile_ids[index], x, y, RenderOrder.world(range.depth));
+        }
     }
 
     /// CPU-only sparse submission for benchmarks and headless parity checks. Mirrors
     /// `submitVisibleSparseRange` but writes ordered sprites into `batch` instead of
-    /// a live `Renderer`.
+    /// a live `Renderer`. Returns the sprites written.
     pub fn submitVisibleSparseSprites(
         self: *const WorldSystem,
         batch: *sprite_batch.SpriteBatch,
         texture: TextureId,
-        depth: i32,
+        range_index: usize,
     ) !usize {
-        const bounds = self.visibleTileBounds();
-        const range = self.sparseDepthRange(depth) orelse return 0;
+        const range = self.sparse_window.ranges.items[range_index];
         const sparse = self.sparse_tiles.slice();
-        const sparse_levels = sparse.items(.level_index);
         const sparse_cells = sparse.items(.cell_index);
         const sparse_tile_ids = sparse.items(.tile_id);
-        var submitted: usize = 0;
-        for (self.sparse_render_order.items[range.start..][0..range.count]) |index| {
+        for (self.sparse_window.tiles.items[range.start..][0..range.count]) |index| {
             const cell = sparse_cells[index];
-            if (!self.isSparseLevelVisible(sparse_levels[index])) continue;
-            if (!self.isSparseCellChunkVisible(cell)) continue;
-            if (!self.cellInVisibleBounds(cell, bounds)) continue;
-            const tile_id = sparse_tile_ids[index];
             const x: u16 = @intCast(cell % self.width);
             const y: u16 = @intCast(cell / self.width);
-            const source = self.sourceRect(tile_id) orelse return error.MissingTileSourceRect;
+            const source = self.sourceRect(sparse_tile_ids[index]) orelse return error.MissingTileSourceRect;
             try batch.drawSprite(.{
                 .texture = texture,
                 .source = source,
@@ -1428,44 +1466,22 @@ pub const WorldSystem = struct {
                     .w = self.tile_size,
                     .h = self.tile_size,
                 },
-                .order = RenderOrder.world(depth),
+                .order = RenderOrder.world(range.depth),
             });
-            submitted += 1;
         }
-        return submitted;
+        return range.count;
     }
 
-    pub fn firstVisibleSparseDepth(self: *const WorldSystem) ?i32 {
-        return self.nextVisibleSparseDepthAfter(null);
-    }
-
-    /// Returns the next sparse render depth strictly greater than `previous_depth`
-    /// (or the first sparse depth for null). Walks the precomputed, ascending
-    /// `sparse_depth_ranges`, so discovery is independent of tile count. Callers
-    /// must keep the index current via `ensureRenderDepthIndex` before walking.
-    pub fn nextVisibleSparseDepthAfter(self: *const WorldSystem, previous_depth: ?i32) ?i32 {
-        const ranges = self.sparse_depth_ranges.items;
-        if (previous_depth) |previous| {
-            for (ranges) |range| {
-                if (range.depth > previous) return range.depth;
-            }
-            return null;
-        }
-        return if (ranges.len == 0) null else ranges[0].depth;
-    }
-
-    /// Distinct sparse render depths registered this frame (`sparse_depth_ranges`
-    /// length). Paired with `sparseDepthRangeAt` so a caller that needs the
-    /// ascending depth sequence more than once per frame can walk it by index
-    /// instead of paying `nextVisibleSparseDepthAfter`'s rescan-from-start cursor
-    /// twice. Callers must keep the index current via `ensureRenderDepthIndex`.
+    /// Distinct render depths of the window's sparse tiles, as of the last
+    /// `setVisibleChunksForWorldRect`. Ranges are ascending by depth, so walking
+    /// them by index is the window's sparse draw order.
     pub fn sparseDepthRangeCount(self: *const WorldSystem) usize {
-        return self.sparse_depth_ranges.items.len;
+        return self.sparse_window.ranges.items.len;
     }
 
-    /// The `index`th distinct sparse render depth, ascending order.
+    /// The render depth of window sparse range `index`.
     pub fn sparseDepthRangeAt(self: *const WorldSystem, index: usize) i32 {
-        return self.sparse_depth_ranges.items[index].depth;
+        return self.sparse_window.ranges.items[index].depth;
     }
 
     pub fn denseTile(self: *const WorldSystem, layer_index: usize, x: u16, y: u16) TileId {
@@ -2123,7 +2139,7 @@ pub const WorldSystem = struct {
     /// simulation path may read it — fixed-step scope uses
     /// `chunkRegionForWorldRect` / `cognitionRegionForWorldRect` instead.
     pub fn visibleChunkRegion(self: *const WorldSystem) ?ActiveRegion {
-        if (!self.visibility_window_valid or self.levelCount() == 0) return null;
+        if (!self.visible_window_set or self.levelCount() == 0) return null;
         std.debug.assert(self.last_max_chunk_x >= self.last_min_chunk_x);
         std.debug.assert(self.last_max_chunk_y >= self.last_min_chunk_y);
         return .{
@@ -2199,7 +2215,6 @@ pub const WorldSystem = struct {
             for (0..terrain.blocked.dir.len) |chunk| terrain.blocked.setChunk(@intCast(chunk), true);
             terrain.content_revision +%= 1;
         }
-        self.render_index_dirty = true;
         // The window's draws and GPU residency include the new layer from the next frame.
         self.dense_quads_dirty = true;
         self.gpu_residency_dirty = true;
@@ -2278,9 +2293,8 @@ pub const WorldSystem = struct {
         self.commitSparseLevelIndexEntry(level_index, new_index);
         self.commitSparseChunkIndexEntry(level_index, local_chunk_index, new_index);
         if (flags.blocks_movement) blocked.set(geom, local_chunk_index, local_cell, true);
-        self.render_index_dirty = true;
-        // The sparse set changed, so the cached visible-sparse count must refresh.
-        self.visibility_window_valid = false;
+        // Only a tile the current window draws rebuilds its sparse list.
+        if (self.sparseTileInWindow(level_index, x, y)) self.sparse_window.dirty = true;
         if (!flags.blocks_movement) return null;
         return .{
             .level = level_index,
@@ -2289,30 +2303,6 @@ pub const WorldSystem = struct {
             .max_x_exclusive = @min(self.width, x +| 1),
             .max_y_exclusive = @min(self.height, y +| 1),
         };
-    }
-
-    fn submitVisibleSparseRange(
-        self: *const WorldSystem,
-        renderer: *Renderer,
-        prepared: PreparedSprite,
-        bounds: VisibleTileBounds,
-        depth: i32,
-    ) !void {
-        const range = self.sparseDepthRange(depth) orelse return;
-        const sparse = self.sparse_tiles.slice();
-        const sparse_levels = sparse.items(.level_index);
-        const sparse_cells = sparse.items(.cell_index);
-        const sparse_tile_ids = sparse.items(.tile_id);
-        for (self.sparse_render_order.items[range.start..][0..range.count]) |index| {
-            const cell = sparse_cells[index];
-            if (!self.isSparseLevelVisible(sparse_levels[index])) continue;
-            if (!self.isSparseCellChunkVisible(cell)) continue;
-            if (!self.cellInVisibleBounds(cell, bounds)) continue;
-            const tile_id = sparse_tile_ids[index];
-            const x: u16 = @intCast(cell % self.width);
-            const y: u16 = @intCast(cell / self.width);
-            try self.submitTile(renderer, prepared, tile_id, x, y, RenderOrder.world(depth));
-        }
     }
 
     fn submitTile(
@@ -2375,72 +2365,6 @@ pub const WorldSystem = struct {
         }
     }
 
-    /// Rebuilds the derived render-walk index if a structural change marked it
-    /// dirty. Cheap no-op on a clean world, so it is safe to call every frame at
-    /// the render entry point; the const render readers assume it is current.
-    pub fn ensureRenderDepthIndex(self: *WorldSystem) !void {
-        if (!self.render_index_dirty) return;
-        try self.rebuildRenderDepthIndex();
-    }
-
-    fn rebuildRenderDepthIndex(self: *WorldSystem) !void {
-        const sparse_count = self.sparse_tiles.len;
-        const depth_values = self.sparse_tiles.items(.depth_value);
-
-        // Sparse indices grouped by (depth, original index) — a total order, so
-        // the per-depth windows below preserve the original submission order.
-        self.sparse_render_order.clearRetainingCapacity();
-        try self.sparse_render_order.ensureTotalCapacity(self.allocator, sparse_count);
-        for (0..sparse_count) |i| self.sparse_render_order.appendAssumeCapacity(@intCast(i));
-        std.mem.sort(u32, self.sparse_render_order.items, depth_values, sparseRenderOrderLessThan);
-
-        self.sparse_depth_ranges.clearRetainingCapacity();
-        var i: usize = 0;
-        while (i < sparse_count) {
-            const depth = depth_values[self.sparse_render_order.items[i]];
-            const start = i;
-            while (i < sparse_count and depth_values[self.sparse_render_order.items[i]] == depth) : (i += 1) {}
-            try self.sparse_depth_ranges.append(self.allocator, .{
-                .depth = depth,
-                .start = @intCast(start),
-                .count = @intCast(i - start),
-            });
-        }
-
-        // Distinct, ascending union of dense-layer and sparse depths.
-        self.render_depths.clearRetainingCapacity();
-        for (0..self.dense_layers.len) |layer_index| {
-            try self.appendRenderDepth(self.denseLayerOrder(layer_index).depth);
-        }
-        for (self.sparse_depth_ranges.items) |range| {
-            try self.appendRenderDepth(range.depth);
-        }
-        std.mem.sort(i32, self.render_depths.items, {}, std.sort.asc(i32));
-
-        self.render_index_dirty = false;
-    }
-
-    fn appendRenderDepth(self: *WorldSystem, depth: i32) !void {
-        for (self.render_depths.items) |existing| {
-            if (existing == depth) return;
-        }
-        try self.render_depths.append(self.allocator, depth);
-    }
-
-    fn sparseRenderOrderLessThan(depth_values: []const i32, lhs: u32, rhs: u32) bool {
-        const lhs_depth = depth_values[lhs];
-        const rhs_depth = depth_values[rhs];
-        if (lhs_depth != rhs_depth) return lhs_depth < rhs_depth;
-        return lhs < rhs;
-    }
-
-    fn sparseDepthRange(self: *const WorldSystem, depth: i32) ?SparseDepthRange {
-        for (self.sparse_depth_ranges.items) |range| {
-            if (range.depth == depth) return range;
-        }
-        return null;
-    }
-
     fn sourceRect(self: *const WorldSystem, tile_id: TileId) ?Rect {
         const index: usize = tile_id;
         if (index >= self.catalog_valid.items.len or !self.catalog_valid.items[index]) return null;
@@ -2477,30 +2401,14 @@ pub const WorldSystem = struct {
         return @intCast(@as(usize, y) * @as(usize, self.width) + @as(usize, x));
     }
 
-    fn visibleTileBounds(self: *const WorldSystem) VisibleTileBounds {
-        if (self.visible_max_tile_x_exclusive <= self.visible_min_tile_x or
-            self.visible_max_tile_y_exclusive <= self.visible_min_tile_y)
-        {
-            return .{
-                .min_x = 0,
-                .min_y = 0,
-                .max_x_exclusive = self.width,
-                .max_y_exclusive = self.height,
-            };
-        }
-        return .{
-            .min_x = self.visible_min_tile_x,
-            .min_y = self.visible_min_tile_y,
-            .max_x_exclusive = @min(self.visible_max_tile_x_exclusive, self.width),
-            .max_y_exclusive = @min(self.visible_max_tile_y_exclusive, self.height),
-        };
-    }
-
-    fn cellInVisibleBounds(self: *const WorldSystem, cell: u32, bounds: VisibleTileBounds) bool {
-        const x: u16 = @intCast(cell % self.width);
-        const y: u16 = @intCast(cell / self.width);
-        return x >= bounds.min_x and x < bounds.max_x_exclusive and
-            y >= bounds.min_y and y < bounds.max_y_exclusive;
+    // Whether the current render window draws a sparse tile at (x, y) on `level`:
+    // the level is in the window around its active level and the cell is inside
+    // its tile bounds. False before a window is set.
+    fn sparseTileInWindow(self: *const WorldSystem, level: u16, x: u16, y: u16) bool {
+        if (!self.visible_window_set) return false;
+        if (!self.visible_render_window.levelInWindow(self.visible_active_level, level, self.maxLevelIndex())) return false;
+        return x >= self.visible_min_tile_x and x < self.visible_max_tile_x_exclusive and
+            y >= self.visible_min_tile_y and y < self.visible_max_tile_y_exclusive;
     }
 
     fn validateLevelIndex(self: *const WorldSystem, level_index: u16) !void {
@@ -2538,23 +2446,6 @@ pub const WorldSystem = struct {
         const depth_b = self.denseLayerOrder(b).depth;
         if (depth_a != depth_b) return depth_a < depth_b;
         return a < b;
-    }
-
-    // Whether a sparse tile's level is in the render window around the visible active
-    // level (every level is, before the first window is set).
-    fn isSparseLevelVisible(self: *const WorldSystem, level: u16) bool {
-        if (!self.visible_window_set) return true;
-        return self.render_window.levelInWindow(self.visible_active_level, level, self.maxLevelIndex());
-    }
-
-    // Whether a sparse tile's chunk is in the visible chunk window (every chunk is,
-    // before the first window is set).
-    fn isSparseCellChunkVisible(self: *const WorldSystem, cell: u32) bool {
-        if (!self.visible_window_set) return true;
-        const chunk_x = (cell % self.width) / self.chunk_size_tiles;
-        const chunk_y = (cell / self.width) / self.chunk_size_tiles;
-        return chunk_x >= self.last_min_chunk_x and chunk_x <= self.last_max_chunk_x and
-            chunk_y >= self.last_min_chunk_y and chunk_y <= self.last_max_chunk_y;
     }
 
     // Flat level-local chunk offset for a cell (chunkY*chunksX+chunkX),
@@ -3052,7 +2943,7 @@ const TestGpuStore = @import("world_test_support.zig").TestGpuStore;
 // `world.gpu_tiles.spans`/`values`. A world with no render window set renders its
 // whole extent.
 fn testSyncGpuTiles(world: *WorldSystem, active_level: u16) !world_gpu_tiles.SyncPlan {
-    if (!world.visible_window_set) testShowWholeWorld(world, active_level);
+    if (!world.visible_window_set) try testShowWholeWorld(world, active_level);
     const sync_plan = try world.planDenseGpuSync(active_level);
     world.commitDenseGpuSync(&sync_plan, active_level);
     return sync_plan;
@@ -3066,14 +2957,14 @@ fn testSubmitLayers(world: *WorldSystem, active_level: u16, out: []u32) ![]u32 {
     return layers;
 }
 
-fn testShowWholeWorld(world: *WorldSystem, active_level: u16) void {
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = world.worldWidthPixels(), .h = world.worldHeightPixels() }, 0, active_level);
+fn testShowWholeWorld(world: *WorldSystem, active_level: u16) !void {
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = world.worldWidthPixels(), .h = world.worldHeightPixels() }, 0, active_level);
 }
 
 // Sets the render window to exactly the chunks [min, min + size) on both axes.
-fn testShowChunks(world: *WorldSystem, min_x: u16, min_y: u16, size_x: u16, size_y: u16, active_level: u16) void {
+fn testShowChunks(world: *WorldSystem, min_x: u16, min_y: u16, size_x: u16, size_y: u16, active_level: u16) !void {
     const chunk_px = @as(f32, @floatFromInt(world.chunk_size_tiles)) * world.tile_size;
-    world.setVisibleChunksForWorldRect(.{
+    try world.setVisibleChunksForWorldRect(.{
         .x = @as(f32, @floatFromInt(min_x)) * chunk_px,
         .y = @as(f32, @floatFromInt(min_y)) * chunk_px,
         .w = @as(f32, @floatFromInt(size_x)) * chunk_px,
@@ -3129,101 +3020,306 @@ fn expectGpuStoreMatches(world: *const WorldSystem, gpu: *const TestGpuStore) !v
     };
 }
 
-fn containsDepth(depths: []const i32, value: i32) bool {
-    for (depths) |depth| {
-        if (depth == value) return true;
-    }
-    return false;
-}
-
-fn sparseDepthIndexLessForTest(values: []const i32, a: u32, b: u32) bool {
-    if (values[a] != values[b]) return values[a] < values[b];
-    return a < b;
-}
-
-test "world render depth index orders sparse tiles by depth then insertion" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
+// A 16x16 world in 4-tile chunks with `level_count` empty levels; the render
+// window holds the active level and one below.
+fn testSparseWindowWorld(meta: *const WorldTilesetMeta, allocator: std.mem.Allocator, level_count: u16) !WorldSystem {
     var world = WorldSystem{
-        .allocator = std.testing.allocator,
+        .allocator = allocator,
         .width = 16,
         .height = 16,
         .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 8,
+        .chunk_size_tiles = 4,
+        .render_window = .{ .levels_below = 1 },
     };
-    defer world.deinit();
-    try world.buildCatalog(&meta);
-
-    const level = try world.addLevel(0);
-    const grass = try world.requireTileByName(&meta, "grass");
-    const tree = try world.requireTileByName(&meta, "tree_0");
-    const deco = try world.requireTileByName(&meta, "deco_0");
-    _ = try world.addDenseLayer(level, 0, .floor, grass);
-
-    // Insertion order is deliberately not depth order, with repeated depths.
-    const bands = [_]WorldDepth{ .obstacle, .floor, .effect, .floor, .obstacle, .effect };
-    for (bands, 0..) |band, i| {
-        const x: u16 = @intCast(i + 1);
-        _ = try world.addSparseTile(level, x, 1, if (i % 2 == 0) tree else deco, 0, band);
+    errdefer world.deinit();
+    try world.buildCatalog(meta);
+    for (0..level_count) |level_index| {
+        _ = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
-    try world.ensureRenderDepthIndex();
-
-    // render_depths is strictly ascending and covers every dense and sparse depth.
-    const depths = world.render_depths.items;
-    try std.testing.expect(depths.len > 0);
-    for (depths[1..], 1..) |depth, idx| {
-        try std.testing.expect(depths[idx - 1] < depth);
-    }
-    for (0..world.dense_layers.len) |layer| {
-        try std.testing.expect(containsDepth(depths, world.denseLayerOrder(layer).depth));
-    }
-    const sparse_depth_values = world.sparse_tiles.items(.depth_value);
-    for (sparse_depth_values) |depth| {
-        try std.testing.expect(containsDepth(depths, depth));
-    }
-
-    // Reference order: original indices sorted by (depth, insertion index) — the
-    // exact order the old scan-per-depth path visited matching sparse tiles in.
-    var reference: [bands.len]u32 = undefined;
-    for (0..bands.len) |i| reference[i] = @intCast(i);
-    std.mem.sort(u32, &reference, sparse_depth_values, sparseDepthIndexLessForTest);
-
-    // Actual order produced by walking render_depths through the range index.
-    var actual: [bands.len]u32 = undefined;
-    var count: usize = 0;
-    for (depths) |depth| {
-        const range = world.sparseDepthRange(depth) orelse continue;
-        for (world.sparse_render_order.items[range.start..][0..range.count]) |index| {
-            try std.testing.expectEqual(depth, sparse_depth_values[index]);
-            actual[count] = index;
-            count += 1;
-        }
-    }
-    try std.testing.expectEqual(bands.len, count);
-    try std.testing.expectEqualSlices(u32, &reference, actual[0..count]);
+    return world;
 }
 
-test "world render depth index refreshes after runtime sparse insert" {
+// Sets the render window to the tiles [x, x + edge) x [0, edge) plus `overscan` chunks.
+fn testShowTiles(world: *WorldSystem, x: u16, edge: u16, overscan: u16, active_level: u16) !void {
+    const tile_px = world.tile_size;
+    try world.setVisibleChunksForWorldRect(.{
+        .x = @as(f32, @floatFromInt(x)) * tile_px,
+        .y = 0,
+        .w = @as(f32, @floatFromInt(edge)) * tile_px,
+        .h = @as(f32, @floatFromInt(edge)) * tile_px,
+    }, overscan, active_level);
+}
+
+const TestSparseKey = struct { depth: i32, cell: u32, tile_id: TileId };
+
+fn testSparseKeyLessThan(_: void, lhs: TestSparseKey, rhs: TestSparseKey) bool {
+    if (lhs.depth != rhs.depth) return lhs.depth < rhs.depth;
+    if (lhs.cell != rhs.cell) return lhs.cell < rhs.cell;
+    return lhs.tile_id < rhs.tile_id;
+}
+
+// The window's sparse tiles as (depth, cell, tile id), in list order, into `out`.
+fn testWindowSparseKeys(world: *const WorldSystem, out: []TestSparseKey) []TestSparseKey {
+    const sparse = world.sparse_tiles.slice();
+    const tiles = world.sparse_window.tiles.items;
+    for (tiles, out[0..tiles.len]) |index, *key| {
+        key.* = .{
+            .depth = sparse.items(.depth_value)[index],
+            .cell = sparse.items(.cell_index)[index],
+            .tile_id = sparse.items(.tile_id)[index],
+        };
+    }
+    return out[0..tiles.len];
+}
+
+// Every range is one depth, ranges ascend by depth, and together they cover the
+// window's tiles exactly once in list order.
+fn expectSparseRangesCoverWindow(world: *const WorldSystem) !void {
+    const depths = world.sparse_tiles.items(.depth_value);
+    const tiles = world.sparse_window.tiles.items;
+    var next_start: u32 = 0;
+    for (0..world.sparseDepthRangeCount()) |range_index| {
+        const range = world.sparse_window.ranges.items[range_index];
+        try std.testing.expectEqual(next_start, range.start);
+        try std.testing.expect(range.count > 0);
+        if (range_index > 0) try std.testing.expect(world.sparseDepthRangeAt(range_index - 1) < range.depth);
+        try std.testing.expectEqual(range.depth, world.sparseDepthRangeAt(range_index));
+        for (tiles[range.start..][0..range.count]) |index| try std.testing.expectEqual(range.depth, depths[index]);
+        next_start += range.count;
+    }
+    try std.testing.expectEqual(tiles.len, next_start);
+}
+
+test "the window sparse list holds exactly the window's tiles ordered by depth, then cell, then tile id" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 3);
     defer world.deinit();
-    // Surface construction dirties the index; rebuild so the test starts clean.
-    try world.ensureRenderDepthIndex();
-    try std.testing.expect(!world.render_index_dirty);
-
     const tree = try world.requireTileByName(&meta, "tree_0");
-    const new_depth = world.worldZForLevel(0, 0, .effect);
-    try std.testing.expect(!containsDepth(world.render_depths.items, new_depth));
+    const deco = try world.requireTileByName(&meta, "deco_0");
 
-    _ = try world.addSparseTile(0, 2, 1, tree, 0, .effect);
-    try std.testing.expect(world.render_index_dirty);
+    // Insertion order is neither depth nor cell order, with repeated depths and two
+    // tile ids sharing a cell and depth.
+    const Placement = struct { level: u16, x: u16, y: u16, tile: TileId, depth: WorldDepth };
+    const placements = [_]Placement{
+        .{ .level = 0, .x = 5, .y = 2, .tile = tree, .depth = .obstacle },
+        .{ .level = 1, .x = 1, .y = 1, .tile = deco, .depth = .floor },
+        .{ .level = 0, .x = 2, .y = 2, .tile = deco, .depth = .obstacle },
+        .{ .level = 0, .x = 3, .y = 0, .tile = deco, .depth = .effect },
+        .{ .level = 0, .x = 3, .y = 0, .tile = tree, .depth = .effect },
+        .{ .level = 0, .x = 0, .y = 5, .tile = tree, .depth = .floor },
+        .{ .level = 1, .x = 4, .y = 4, .tile = tree, .depth = .floor },
+        // Outside: in an overscan chunk but past the tile bounds, outside the
+        // chunk window, and on a level below the render window.
+        .{ .level = 0, .x = 7, .y = 1, .tile = tree, .depth = .obstacle },
+        .{ .level = 0, .x = 13, .y = 13, .tile = tree, .depth = .obstacle },
+        .{ .level = 2, .x = 1, .y = 1, .tile = tree, .depth = .obstacle },
+    };
+    const inside_count = 7;
+    var expected: [placements.len]TestSparseKey = undefined;
+    for (placements, 0..) |placement, index| {
+        _ = try world.addSparseTile(placement.level, placement.x, placement.y, placement.tile, 0, placement.depth);
+        expected[index] = .{
+            .depth = world.worldZForLevel(placement.level, 0, placement.depth),
+            .cell = world.cellIndex(placement.x, placement.y),
+            .tile_id = placement.tile,
+        };
+    }
+    std.mem.sort(TestSparseKey, expected[0..inside_count], {}, testSparseKeyLessThan);
 
-    try world.ensureRenderDepthIndex();
-    try std.testing.expect(!world.render_index_dirty);
-    try std.testing.expect(containsDepth(world.render_depths.items, new_depth));
-    // Every sparse tile is represented exactly once in the render order.
-    try std.testing.expectEqual(world.sparse_tiles.len, world.sparse_render_order.items.len);
+    // Tiles [0, 6) with one chunk of overscan: chunks [0, 3) on both axes.
+    try testShowTiles(&world, 0, 6, 1, 0);
+    try std.testing.expectEqual(@as(usize, inside_count), world.reserveRenderRecords());
+    var actual: [placements.len]TestSparseKey = undefined;
+    try std.testing.expectEqualSlices(TestSparseKey, expected[0..inside_count], testWindowSparseKeys(&world, &actual));
+    try expectSparseRangesCoverWindow(&world);
+
+    // The batch path submits the same tiles, range by range.
+    var batch = sprite_batch.SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    batch.beginFrame();
+    var submitted: usize = 0;
+    for (0..world.sparseDepthRangeCount()) |range_index| {
+        submitted += try world.submitVisibleSparseSprites(&batch, try TextureId.init(1, 1), range_index);
+    }
+    try std.testing.expectEqual(@as(usize, inside_count), submitted);
+}
+
+test "two same-depth sparse tiles in one window draw in the same order whichever was added first" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    const Placement = struct { x: u16, tile: []const u8 };
+    // Same depth: two cells, and two tile ids on one of them.
+    const placements = [_]Placement{ .{ .x = 3, .tile = "tree_0" }, .{ .x = 1, .tile = "deco_0" }, .{ .x = 1, .tile = "tree_0" } };
+    var orders: [2][placements.len]TestSparseKey = undefined;
+    for (&orders, 0..) |*order, pass| {
+        var world = try testSparseWindowWorld(&meta, std.testing.allocator, 1);
+        defer world.deinit();
+        for (0..placements.len) |step| {
+            const placement = placements[if (pass == 0) step else placements.len - 1 - step];
+            _ = try world.addSparseTile(0, placement.x, 1, try world.requireTileByName(&meta, placement.tile), 0, .obstacle);
+        }
+        try testShowTiles(&world, 0, 4, 0, 0);
+        try std.testing.expectEqual(@as(usize, 1), world.sparseDepthRangeCount());
+        _ = testWindowSparseKeys(&world, order);
+    }
+    try std.testing.expectEqualSlices(TestSparseKey, &orders[0], &orders[1]);
+    for (orders[0][1..], 1..) |key, index| try std.testing.expect(testSparseKeyLessThan({}, orders[0][index - 1], key));
+}
+
+test "a sparse tile added outside the window leaves the list untouched; one inside appears after the next window update" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 3);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
+    try testShowTiles(&world, 0, 6, 1, 0);
+    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+
+    // Outside: past the tile bounds in an overscan chunk, and below the level window.
+    _ = try world.addSparseTile(0, 7, 1, deco, 0, .effect);
+    _ = try world.addSparseTile(2, 1, 1, deco, 0, .effect);
+    try std.testing.expect(!world.sparse_window.dirty);
+    try testShowTiles(&world, 0, 6, 1, 0);
+    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    try std.testing.expectEqual(@as(usize, 1), world.sparseDepthRangeCount());
+
+    // Inside, on the level below: listed from the next window update.
+    _ = try world.addSparseTile(1, 2, 2, deco, 0, .effect);
+    try std.testing.expect(world.sparse_window.dirty);
+    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    try testShowTiles(&world, 0, 6, 1, 0);
+    try std.testing.expect(!world.sparse_window.dirty);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 0 }, world.sparse_window.tiles.items);
+    try expectSparseRangesCoverWindow(&world);
+}
+
+test "a render window change under a still camera relists the window's sparse levels" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 3);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    for (0..3) |level| _ = try world.addSparseTile(@intCast(level), 1, 1, deco, 0, .floor);
+    try testShowTiles(&world, 0, 4, 0, 0);
+    // Levels 0 and 1, deepest first.
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, world.sparse_window.tiles.items);
+
+    world.render_window = .{ .levels_below = 2 };
+    try testShowTiles(&world, 0, 4, 0, 0);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1, 0 }, world.sparse_window.tiles.items);
+    try expectSparseRangesCoverWindow(&world);
+}
+
+test "an active level change under a still camera relists the window's sparse levels" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 3);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    _ = try world.addSparseTile(0, 1, 1, deco, 0, .floor);
+    _ = try world.addSparseTile(2, 1, 1, deco, 0, .floor);
+    try testShowTiles(&world, 0, 4, 0, 0);
+    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    // Level 1 renders levels 1 and 2.
+    try testShowTiles(&world, 0, 4, 0, 1);
+    try std.testing.expectEqualSlices(u32, &.{1}, world.sparse_window.tiles.items);
+}
+
+test "an out-of-memory window update leaves the previous window and its sparse list intact (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 1);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
+    // More tiles than the first list's capacity, in the chunks right of the window.
+    for (0..64) |index| {
+        _ = try world.addSparseTile(0, 8 + @as(u16, @intCast(index % 8)), @intCast(index / 8), deco, 0, .effect);
+    }
+    try testShowTiles(&world, 0, 4, 0, 0);
+    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    const region = world.visibleChunkRegion().?;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    world.allocator = failing.allocator();
+    // A pan onto the dense chunks fails: the window and list stay as they were.
+    try std.testing.expectError(error.OutOfMemory, testShowTiles(&world, 8, 8, 0, 0));
+    try std.testing.expectEqual(region, world.visibleChunkRegion().?);
+    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    try std.testing.expectEqual(@as(usize, 1), world.sparseDepthRangeCount());
+
+    // An in-window add that cannot be listed keeps the list dirty for the retry.
+    world.allocator = std.testing.allocator;
+    for (0..64) |_| _ = try world.addSparseTile(0, 2, 2, deco, 0, .effect);
+    world.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, testShowTiles(&world, 0, 4, 0, 0));
+    try std.testing.expect(world.sparse_window.dirty);
+    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+
+    world.allocator = std.testing.allocator;
+    try testShowTiles(&world, 0, 4, 0, 0);
+    try std.testing.expect(!world.sparse_window.dirty);
+    try std.testing.expectEqual(@as(usize, 65), world.reserveRenderRecords());
+    try testShowTiles(&world, 8, 8, 0, 0);
+    try std.testing.expectEqual(@as(usize, 64), world.reserveRenderRecords());
+    try expectSparseRangesCoverWindow(&world);
+}
+
+test "a warmed window update allocates nothing across pans and an in-window add (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 2);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    for (0..16) |index| {
+        const x: u16 = @intCast(index % 16);
+        _ = try world.addSparseTile(@intCast(index % 2), x, 1, deco, 0, if (index % 3 == 0) .floor else .effect);
+    }
+    // Warm the list to the widest window, then add one tile inside the left window.
+    try testShowTiles(&world, 0, 16, 0, 0);
+    try testShowTiles(&world, 0, 8, 0, 0);
+    _ = try world.addSparseTile(1, 3, 3, deco, 0, .marker);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    world.allocator = failing.allocator();
+    defer world.allocator = std.testing.allocator;
+    try testShowTiles(&world, 0, 8, 0, 0);
+    try std.testing.expectEqual(@as(usize, 9), world.reserveRenderRecords());
+    try testShowTiles(&world, 8, 8, 0, 0);
+    try testShowTiles(&world, 0, 16, 0, 1);
+    try testShowTiles(&world, 0, 8, 0, 0);
+    try std.testing.expectEqual(@as(usize, 9), world.reserveRenderRecords());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "the window sparse list is the same at 1k and 64k tiles outside the window" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    const window_depths = [_]WorldDepth{ .floor, .obstacle, .effect, .marker };
+    var lists: [2][8]TestSparseKey = undefined;
+    for ([_]usize{ 1_000, 64_000 }, &lists) |outside_count, *list| {
+        var world = try testSparseWindowWorld(&meta, std.testing.allocator, 3);
+        defer world.deinit();
+        const deco = try world.requireTileByName(&meta, "deco_0");
+        for (0..8) |index| {
+            _ = try world.addSparseTile(0, @intCast(index), 2, deco, 0, window_depths[index % window_depths.len]);
+        }
+        // Outside: the right half on the window's levels, anywhere on the level
+        // below the render window.
+        for (0..outside_count) |index| {
+            const level: u16 = @intCast(index % 3);
+            const x: u16 = @intCast(if (level == 2) index % 16 else 8 + index % 8);
+            _ = try world.addSparseTile(level, x, @intCast(index / 3 % 16), deco, 0, window_depths[index % window_depths.len]);
+        }
+        try testShowTiles(&world, 0, 8, 0, 0);
+        try std.testing.expectEqual(@as(usize, 8), world.reserveRenderRecords());
+        try std.testing.expectEqual(window_depths.len, world.sparseDepthRangeCount());
+        _ = testWindowSparseKeys(&world, list);
+    }
+    try std.testing.expectEqualSlices(TestSparseKey, &lists[0], &lists[1]);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
@@ -3307,7 +3403,7 @@ test "a synced store reads back every resident window tile through splits, edits
     // back, including edits made while a chunk was outside the window.
     const steps = [_][2]u16{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 }, .{ 0, 0 } };
     for (steps, 0..) |step, index| {
-        testShowChunks(&world, step[0], step[1], 1, 1, level);
+        try testShowChunks(&world, step[0], step[1], 1, 1, level);
         _ = try world.setDenseTile(layer, @intCast(4 + index % 4), 5, if (index % 2 == 0) water else grass);
         _ = try testSyncGpuTiles(&world, level);
         try testApplySync(&world, &gpu);
@@ -3333,7 +3429,7 @@ test "an edit outside the window uploads nothing; its chunk reads back edited wh
     const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
     var gpu = TestGpuStore{};
     defer gpu.deinit();
-    testShowChunks(&world, 0, 0, 1, 1, 0);
+    try testShowChunks(&world, 0, 0, 1, 1, 0);
     _ = try testSyncGpuTiles(&world, 0);
     try testApplySync(&world, &gpu);
 
@@ -3343,7 +3439,7 @@ test "an edit outside the window uploads nothing; its chunk reads back edited wh
     try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.spans.items.len);
 
     // The window reaches it: the chunk uploads whole and reads back edited.
-    testShowChunks(&world, 2, 0, 1, 1, 0);
+    try testShowChunks(&world, 2, 0, 1, 1, 0);
     _ = try testSyncGpuTiles(&world, 0);
     try testApplySync(&world, &gpu);
     try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, layer, 9, 1));
@@ -3538,7 +3634,7 @@ test "syncDenseTileStore claims its live store every frame and drops a retired o
     const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
     // Level 1 holds no layer, so syncing there needs no store and never creates one.
     _ = try world.addLevel(-level_z_step);
-    testShowWholeWorld(&world, 0);
+    try testShowWholeWorld(&world, 0);
 
     var renderer = Renderer{
         .allocator = allocator,
@@ -3592,7 +3688,7 @@ test "a new directory side with nothing resident lets the old store go and re-su
     const grass = try world.requireTileByName(&meta, "grass");
     const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
     _ = try world.addLevel(-level_z_step);
-    testShowChunks(&world, 0, 0, 1, 1, 0);
+    try testShowChunks(&world, 0, 0, 1, 1, 0);
     var renderer = Renderer{
         .allocator = allocator,
         .device = undefined,
@@ -3612,7 +3708,7 @@ test "a new directory side with nothing resident lets the old store go and re-su
 
     // A wider rect needs a larger side; on a level with no layer nothing uploads,
     // so the world stops naming (and claiming) the old store's layout.
-    testShowChunks(&world, 0, 0, 3, 3, 1);
+    try testShowChunks(&world, 0, 0, 3, 3, 1);
     world.dense_quads_dirty = false;
     try world.syncDenseTileStore(&renderer, 1);
     try std.testing.expect(!world.gpu_tiles.store.isValid());
@@ -4004,7 +4100,7 @@ test "world add level preserves the existing visible chunk window" {
 
     const level0 = try world.addLevel(0);
     // Window over chunk (1,0) only: chunk (0,0) is hidden.
-    world.setVisibleChunksForWorldRect(.{ .x = meta.tileSize(), .y = 0, .w = meta.tileSize(), .h = meta.tileSize() }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = meta.tileSize(), .y = 0, .w = meta.tileSize(), .h = meta.tileSize() }, 0, 0);
     const level1 = try world.addLevel(10);
     const grass = try world.requireTileByName(&meta, "grass");
     _ = try world.addDenseLayer(level0, 0, .floor, grass);
@@ -4063,12 +4159,12 @@ test "the visible chunk region covers exactly the chunks a world rect touches" {
     _ = try world.addDenseLayer(level, 0, .floor, grass);
 
     const chunk_pixels = @as(f32, @floatFromInt(2)) * tile_size;
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
     var region = world.visibleChunkRegion() orelse return error.ExpectedRegion;
     try std.testing.expectEqual(ChunkCoord{ .x = 0, .y = 0 }, region.min);
     try std.testing.expectEqual(ChunkCoord{ .x = 1, .y = 1 }, region.max_exclusive);
 
-    world.setVisibleChunksForWorldRect(.{ .x = chunk_pixels, .y = chunk_pixels, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = chunk_pixels, .y = chunk_pixels, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
     region = world.visibleChunkRegion() orelse return error.ExpectedRegion;
     try std.testing.expectEqual(ChunkCoord{ .x = 1, .y = 1 }, region.min);
     try std.testing.expectEqual(ChunkCoord{ .x = 2, .y = 2 }, region.max_exclusive);
@@ -4495,7 +4591,7 @@ test "dense layers order by z level and quads re-submit only on structural chang
 
     // A pan changes chunk visibility (crops sparse tiles) but not the full-world
     // dense quads, so it does not re-arm a re-submit either.
-    world.setVisibleChunksForWorldRect(.{ .x = 1024, .y = 1024, .w = 128, .h = 128 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 1024, .y = 1024, .w = 128, .h = 128 }, 0, 0);
     try std.testing.expect(!world.dense_quads_dirty);
 }
 
@@ -4539,7 +4635,7 @@ test "visibleChunkRegion returns correct half-open bounds after setVisibleChunks
 
     // Show chunk (0,0) only — rect covering just the first chunk (tiles 0–1).
     const chunk_pixels = @as(f32, @floatFromInt(2)) * tile_size;
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
 
     const region = world.visibleChunkRegion() orelse return error.ExpectedRegion;
     try std.testing.expectEqual(@as(i32, 0), region.min.x);
@@ -4614,7 +4710,7 @@ test "chunkRegionForWorldRect matches the render visibility window for the same 
     };
     for (rects) |rect| {
         for ([_]u16{ 0, 1, 3 }) |overscan| {
-            world.setVisibleChunksForWorldRect(rect, overscan, 0);
+            try world.setVisibleChunksForWorldRect(rect, overscan, 0);
             const visible = world.visibleChunkRegion() orelse return error.ExpectedRegion;
             const region = world.chunkRegionForWorldRect(rect, overscan) orelse return error.ExpectedRegion;
             try std.testing.expectEqual(visible, region);
@@ -5112,7 +5208,7 @@ test "a level whose full-level GPU store would overflow u32 is created and rende
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
     _ = try world.setDenseTile(layer, 8000, 8000, water);
-    testShowChunks(&world, 499, 499, 2, 2, 0);
+    try testShowChunks(&world, 499, 499, 2, 2, 0);
     var gpu = TestGpuStore{};
     defer gpu.deinit();
     const sync_plan = try testSyncGpuTiles(&world, 0);
@@ -5146,7 +5242,7 @@ test "GPU store bytes are the same for the same window at 64 and 512 tiles a sid
                 _ = try world.setDenseTile(layer, @intCast(chunk_x * 16 + 3), @intCast(chunk_y * 16 + 3), water);
             };
         }
-        testShowChunks(&world, 1, 1, 2, 2, 0);
+        try testShowChunks(&world, 1, 1, 2, 2, 0);
         _ = try testSyncGpuTiles(&world, 0);
         out.* = world.gpu_tiles.residentBytes();
     }
@@ -5187,7 +5283,7 @@ test "GPU residency follows the window and a pan uploads only entering chunks" {
 
     // A 2x2 chunk window over levels 0 and 1: two directories and four blocks each;
     // chunks outside the window upload nothing.
-    testShowChunks(&world, 0, 0, 2, 2, 0);
+    try testShowChunks(&world, 0, 0, 2, 2, 0);
     var sync_plan = try testSyncGpuTiles(&world, 0);
     try testApplySync(&world, &gpu);
     try std.testing.expectEqual(@as(usize, 2), sync_plan.enter_count);
@@ -5196,7 +5292,7 @@ test "GPU residency follows the window and a pan uploads only entering chunks" {
     try expectGpuStoreMatches(&world, &gpu);
 
     // A pan inside the same chunks uploads nothing.
-    world.setVisibleChunksForWorldRect(.{ .x = 3, .y = 3, .w = 2 * 4 * world.tile_size - 6, .h = 2 * 4 * world.tile_size - 6 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 3, .y = 3, .w = 2 * 4 * world.tile_size - 6, .h = 2 * 4 * world.tile_size - 6 }, 0, 0);
     sync_plan = try testSyncGpuTiles(&world, 0);
     try std.testing.expectEqual(@as(usize, 0), sync_plan.span_count);
 
@@ -5205,7 +5301,7 @@ test "GPU residency follows the window and a pan uploads only entering chunks" {
     // and the store's high water stays flat.
     const high_water = world.gpu_tiles.high_water;
     for (1..7) |step| {
-        testShowChunks(&world, @intCast(step), 0, 2, 2, 0);
+        try testShowChunks(&world, @intCast(step), 0, 2, 2, 0);
         sync_plan = try testSyncGpuTiles(&world, 0);
         try testApplySync(&world, &gpu);
         try std.testing.expectEqual(@as(usize, 2 * 2 * 2), world.gpu_tiles.spans.items.len);
@@ -5295,7 +5391,7 @@ test "a chunk window wider than the largest directory side is clipped to it and 
     };
     defer world.deinit();
     _ = try world.addLevel(0);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 1.0e9, .h = 1.0e9 }, 2, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 1.0e9, .h = 1.0e9 }, 2, 0);
     try std.testing.expectEqual(tile_store_max_side, world.render_side);
     const sync_plan = try testSyncGpuTiles(&world, 0);
     try std.testing.expectEqual(tile_store_max_side, sync_plan.side);
@@ -5334,7 +5430,7 @@ test "a store created for a sync that never committed gets the whole window at t
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
     _ = try world.setDenseTile(layer, 1, 1, water);
-    testShowChunks(&world, 0, 0, 1, 1, 0);
+    try testShowChunks(&world, 0, 0, 1, 1, 0);
     world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
     world.gpu_tiles.store_side = world.render_side;
     _ = try testSyncGpuTiles(&world, 0);
@@ -5372,7 +5468,7 @@ test "a rect ending exactly on a tile edge at large pixel coordinates excludes t
     const scope = world.chunkRegionForWorldRect(rect, 0) orelse return error.ExpectedRegion;
     try std.testing.expectEqual(ChunkCoord{ .x = 64, .y = 64 }, scope.min);
     try std.testing.expectEqual(ChunkCoord{ .x = 65, .y = 65 }, scope.max_exclusive);
-    world.setVisibleChunksForWorldRect(rect, 0, 0);
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
     try std.testing.expectEqual(scope, world.visibleChunkRegion().?);
     try std.testing.expectEqual(@as(u16, 1040), world.visible_max_tile_x_exclusive);
     // A rect ending just past the edge takes the next tile; a tiny rect keeps its tile.
@@ -5394,24 +5490,24 @@ test "the render directory side covers the rect's chunk span plus alignment and 
     defer world.deinit();
     _ = try world.addLevel(0);
     // 1280x720 px over 512 px chunks: 3 chunks wide + 1 for alignment.
-    world.setVisibleChunksForWorldRect(.{ .x = 100, .y = 100, .w = 1280, .h = 720 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 100, .y = 100, .w = 1280, .h = 720 }, 0, 0);
     try std.testing.expectEqual(@as(u32, 4), world.render_side);
     // One chunk of overscan on each side: 3 + 1 + 2.
-    world.setVisibleChunksForWorldRect(.{ .x = 100, .y = 100, .w = 1280, .h = 720 }, 1, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 100, .y = 100, .w = 1280, .h = 720 }, 1, 0);
     try std.testing.expectEqual(@as(u32, 8), world.render_side);
     // A rect wider than the level clamps to the grid's power of two (128 chunks).
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 1.0e9, .h = 1.0e9 }, 3, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 1.0e9, .h = 1.0e9 }, 3, 0);
     try std.testing.expectEqual(@as(u32, 128), world.render_side);
     // Every window the side covers fits it.
     const region = world.visibleChunkRegion().?;
     try std.testing.expect(region.max_exclusive.x - region.min.x <= 128);
 }
 
-test "the visible sparse count is the same at 8 and 128 levels for the same window" {
+test "the window sparse list is the same at 8 and 128 levels for the same window" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var counts: [2]usize = undefined;
-    for ([_]u16{ 8, 128 }, &counts) |level_count, *count| {
+    var lists: [2][3]TestSparseKey = undefined;
+    for ([_]u16{ 8, 128 }, &lists) |level_count, *list| {
         var world = WorldSystem{
             .allocator = std.testing.allocator,
             .width = 16,
@@ -5429,13 +5525,12 @@ test "the visible sparse count is the same at 8 and 128 levels for the same wind
             _ = try world.addSparseTile(level, 1, 1, deco, 0, .obstacle);
             _ = try world.addSparseTile(level, 14, 14, deco, 0, .obstacle);
         }
-        world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 4 * meta.tileSize(), .h = 4 * meta.tileSize() }, 0, 3);
-        count.* = world.visible_sparse_count;
-        try std.testing.expectEqual(world.visibleSparseTileCount(), count.*);
+        try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 4 * meta.tileSize(), .h = 4 * meta.tileSize() }, 0, 3);
+        // Levels 3, 4, 5 are in the window: one tile each.
+        try std.testing.expectEqual(@as(usize, 3), world.reserveRenderRecords());
+        _ = testWindowSparseKeys(&world, list);
     }
-    // Levels 3, 4, 5 are in the window: one visible tile each.
-    try std.testing.expectEqual(@as(usize, 3), counts[0]);
-    try std.testing.expectEqual(counts[0], counts[1]);
+    try std.testing.expectEqualSlices(TestSparseKey, &lists[0], &lists[1]);
 }
 
 fn moveWorldByValue(world: WorldSystem) WorldSystem {

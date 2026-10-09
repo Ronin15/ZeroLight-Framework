@@ -245,7 +245,6 @@ fn runCaseWithConfig(
     var last_merged_groups: usize = 0;
     var last_merged_tilemap_groups: usize = 0;
     for (0..options.iterations) |_| {
-        const start_ns = suite.nowNs(io);
         const measured = try runMeasuredOnce(
             io,
             fixture,
@@ -256,8 +255,7 @@ fn runCaseWithConfig(
             case,
             allocator,
         );
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), measured.stats.batch);
+        accumulator.record(measured.timed_ns, measured.stats.batch);
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
         last_sparse_submitted = measured.sparse_submitted;
@@ -288,6 +286,8 @@ fn runCaseWithConfig(
 }
 
 const MeasuredGamePrep = struct {
+    // The frame's timed phases summed; excludes the untimed render window sets.
+    timed_ns: u64,
     stats: sprite_batch.SpritePrepStats,
     phases: suite.RenderGamePrepPhaseSummary,
     sparse_submitted: usize,
@@ -332,11 +332,18 @@ fn runMeasuredOnce(
 ) !MeasuredGamePrep {
     batch.beginFrame();
 
+    // The fixture moves the render window twice a frame (whole world for collect,
+    // camera for the sparse emit), which production never does, so the window sets
+    // stay out of every timed span; production's one window update per frame is
+    // measured by the `render-sparse-window-*` groups.
+    try setBenchCollectChunkVisibility(fixture);
     const collect_start_ns = suite.nowNs(io);
     try collectProductionDynamicRecords(fixture);
-    setBenchSparseEmitChunkVisibility(fixture);
-    const sparse_submitted = try emitLayeredCommands(fixture, batch);
     const collect_end_ns = suite.nowNs(io);
+    try setBenchSparseEmitChunkVisibility(fixture);
+    const emit_start_ns = suite.nowNs(io);
+    const sparse_submitted = try emitLayeredCommands(fixture, batch);
+    const emit_end_ns = suite.nowNs(io);
 
     const snapshot_start_ns = suite.nowNs(io);
     _ = batch.snapshotCommandsAssumeCapacity(resolver);
@@ -357,17 +364,19 @@ fn runMeasuredOnce(
     }
     const merge_end_ns = suite.nowNs(io);
 
+    const phases = suite.RenderGamePrepPhaseSummary{
+        .entity_collect_ns = suite.elapsedNs(collect_start_ns, collect_end_ns) + suite.elapsedNs(emit_start_ns, emit_end_ns),
+        .merge_ns = suite.elapsedNs(merge_start_ns, merge_end_ns),
+        .snapshot_ns = suite.elapsedNs(snapshot_start_ns, snapshot_end_ns),
+        .vertex_emit_ns = suite.elapsedNs(vertex_start_ns, vertex_end_ns),
+    };
     return .{
+        .timed_ns = phases.entity_collect_ns + phases.merge_ns + phases.snapshot_ns + phases.vertex_emit_ns,
         .stats = stats,
         .sparse_submitted = sparse_submitted,
         .merged_group_count = merged_group_count,
         .merged_tilemap_group_count = merged_tilemap_group_count,
-        .phases = .{
-            .entity_collect_ns = suite.elapsedNs(collect_start_ns, collect_end_ns),
-            .merge_ns = suite.elapsedNs(merge_start_ns, merge_end_ns),
-            .snapshot_ns = suite.elapsedNs(snapshot_start_ns, snapshot_end_ns),
-            .vertex_emit_ns = suite.elapsedNs(vertex_start_ns, vertex_end_ns),
-        },
+        .phases = phases,
     };
 }
 
@@ -393,10 +402,10 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
         suite.alignItemCount(suite.default_items_per_range, render_game_prep_range_alignment_items);
 }
 
+// Requires `setBenchCollectChunkVisibility` first: full-world visibility is an
+// upper-bound ceiling for entity_collect_ns, not the production camera/chunk/AABB
+// cull path.
 fn collectProductionDynamicRecords(fixture: *Fixture) !void {
-    // Full-world visibility is an upper-bound ceiling for entity_collect_ns, not
-    // the production camera/chunk/AABB cull path.
-    setBenchCollectChunkVisibility(fixture);
     const visible = benchCollectVisibleRect(fixture.world_width_px, fixture.world_height_px);
     try render_prep.collectDynamicRecords(
         &fixture.scene_prep,
@@ -409,8 +418,8 @@ fn collectProductionDynamicRecords(fixture: *Fixture) !void {
     std.debug.assert(fixture.last_collected_records == expectedBenchCollectedRecords(fixture.item_count));
 }
 
-fn setBenchCollectChunkVisibility(fixture: *Fixture) void {
-    fixture.world.setVisibleChunksForWorldRect(.{
+fn setBenchCollectChunkVisibility(fixture: *Fixture) !void {
+    try fixture.world.setVisibleChunksForWorldRect(.{
         .x = 0,
         .y = 0,
         .w = fixture.world_width_px,
@@ -418,9 +427,9 @@ fn setBenchCollectChunkVisibility(fixture: *Fixture) void {
     }, 0, fixture.player_level);
 }
 
-fn setBenchSparseEmitChunkVisibility(fixture: *Fixture) void {
+fn setBenchSparseEmitChunkVisibility(fixture: *Fixture) !void {
     const camera_rect = cameraWorldRect(fixture.world_width_px, fixture.world_height_px);
-    fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks, fixture.player_level);
+    try fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks, fixture.player_level);
 }
 
 /// Full-world pixel bounds for entity collect. Perf benches target the requested
@@ -435,16 +444,16 @@ fn benchCollectVisibleRect(world_width_px: f32, world_height_px: f32) render_pre
 }
 
 fn emitLayeredCommands(fixture: *Fixture, batch: *sprite_batch.SpriteBatch) !usize {
-    try fixture.world.ensureRenderDepthIndex();
+    const world = &fixture.world;
     var sparse_submitted: usize = 0;
-    var sparse_depth = fixture.world.firstVisibleSparseDepth();
+    var sparse_range: usize = 0;
     var dynamic_span_index: usize = 0;
     var dynamic_depth = nextDynamicDepthSpan(&fixture.scene_prep, &dynamic_span_index);
-    while (sparse_depth != null or dynamic_depth != null) {
-        if (sparse_depth) |depth| {
-            if (dynamic_depth == null or depth <= dynamic_depth.?) {
-                sparse_submitted += try fixture.world.submitVisibleSparseSprites(batch, fixture.tile_texture, depth);
-                sparse_depth = fixture.world.nextVisibleSparseDepthAfter(depth);
+    while (sparse_range < world.sparseDepthRangeCount() or dynamic_depth != null) {
+        if (sparse_range < world.sparseDepthRangeCount()) {
+            if (dynamic_depth == null or world.sparseDepthRangeAt(sparse_range) <= dynamic_depth.?) {
+                sparse_submitted += try world.submitVisibleSparseSprites(batch, fixture.tile_texture, sparse_range);
+                sparse_range += 1;
                 continue;
             }
         }

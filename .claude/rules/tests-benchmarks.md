@@ -42,8 +42,9 @@ paths:
   count fit, and never report "fast enough at N".
 - A perf question with no covering case gets a new case under
   `src/benchmarks/`.
-- Run targeted groups (`zig build bench -- --group <name>`), never the full
-  suite filtered; full sweeps only when the owner or a slice asks.
+- Run only the groups and configs (`--group <name> --items N`) the change's
+  question needs, never the full suite; full sweeps only when the owner or a
+  slice asks.
 - Bench only changes that can move a hot path. Compare before/after on adjacent
   commits in Debug with 3 interleaved reps and medians (`tools/bench_ab.py`);
   a regression is a change beyond the run-to-run spread.

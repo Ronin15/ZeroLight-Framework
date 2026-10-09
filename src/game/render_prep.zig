@@ -513,23 +513,21 @@ fn submitLayeredWorld(
     renderer: *Renderer,
     runtime_assets: *const RuntimeAssets,
 ) !void {
-    try scene.world.ensureRenderDepthIndex();
-
     try scene.world.syncDenseTileStore(renderer, scene.player_level);
     try ensureStaticGeometryCapacity(scene, renderer);
     const interleave_depths = collectDenseInterleaveDepths(scene, prep);
     try scene.world.submitStaticDenseGeometry(renderer, runtime_assets, scene.player_level, interleave_depths);
 
-    var sparse_index: usize = 0;
-    var sparse_depth = nextSparseDepth(scene, &sparse_index);
+    var sparse_range: usize = 0;
+    var sparse_depth = sparseRangeDepth(scene, sparse_range);
     var dynamic_span_index: usize = 0;
     var dynamic_depth = nextDynamicDepth(prep, &dynamic_span_index);
     while (mergeNextSource(sparse_depth, dynamic_depth)) |source| {
         switch (source) {
             .sparse => {
-                const depth = sparse_depth.?;
-                try scene.world.submitVisibleSparseAtDepth(renderer, runtime_assets, depth);
-                sparse_depth = nextSparseDepth(scene, &sparse_index);
+                try scene.world.submitVisibleSparseRange(renderer, runtime_assets, sparse_range);
+                sparse_range += 1;
+                sparse_depth = sparseRangeDepth(scene, sparse_range);
             },
             .dynamic => {
                 const dynamic_range = prep.depth_spans.items[dynamic_span_index - 1];
@@ -547,10 +545,10 @@ fn submitLayeredWorld(
 /// Gathers this frame's dense-composite-draw cut points: `active_level`'s own
 /// actor depth (always included, so the common case with no sandwiched content
 /// still splits exactly where an actor stands), every distinct dynamic depth this
-/// frame (`prep.depthSpans()`), and every registered sparse-tile depth anywhere in
-/// the world (`sparseDepthRangeCount`/`sparseDepthRangeAt`, the same indexed
-/// sequence `submitLayeredWorld` walks again for the merge), since a sparse tile
-/// at any in-window level needs its own sandwich point.
+/// frame (`prep.depthSpans()`), and every depth of the render window's sparse
+/// tiles (`sparseDepthRangeCount`/`sparseDepthRangeAt`, the same ranges
+/// `submitLayeredWorld` walks for the merge), since a sparse tile at any
+/// in-window level needs its own sandwich point.
 ///
 /// `WorldSystem.partitionDenseCompositeBuckets` needs at most one candidate per
 /// gap between two adjacent resident dense layers to cut there, so candidates
@@ -593,15 +591,11 @@ fn interleaveGapIndex(layer_depths: []const i32, depth: i32) ?usize {
     return null;
 }
 
-/// Advances the sparse-tile merge cursor by index into `sparse_depth_ranges`
-/// (ascending, already deduplicated by `ensureRenderDepthIndex`), shared with
-/// `collectDenseInterleaveDepths`'s own indexed walk over the same list so
-/// neither pass needs `nextVisibleSparseDepthAfter`'s rescan-from-start cursor.
-fn nextSparseDepth(scene: GameplayScene, index: *usize) ?i32 {
-    if (index.* >= scene.world.sparseDepthRangeCount()) return null;
-    const depth = scene.world.sparseDepthRangeAt(index.*);
-    index.* += 1;
-    return depth;
+/// The depth of the window's sparse range `range_index` (ascending, one range
+/// per distinct depth), or null past the last range.
+fn sparseRangeDepth(scene: GameplayScene, range_index: usize) ?i32 {
+    if (range_index >= scene.world.sparseDepthRangeCount()) return null;
+    return scene.world.sparseDepthRangeAt(range_index);
 }
 
 /// Appends `depth` to `depths[0..count]` once per gap it could cut between two
@@ -900,7 +894,7 @@ test "dynamic record capacity counts visuals player marker and particles" {
     );
 }
 
-test "sprite command capacity sums sparse reserve visuals player and ui headroom" {
+test "sprite command capacity sums the window's sparse tiles, visuals, player, and ui headroom" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const entity = try data.createEntity();
@@ -915,15 +909,16 @@ test "sprite command capacity sums sparse reserve visuals player and ui headroom
     defer particles.deinit();
     try std.testing.expect(particles.emit(.{ .start_size = 4 }));
 
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 1,
-        .height = 1,
-        .tile_size = 32,
-        .chunk_size_tiles = 8,
-        .visible_sparse_count = 3,
-    };
+    var meta = try testWorldTilesetMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
     defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    // Three tiles in the window's top row of three tiles and one outside it.
+    for ([_]u16{ 0, 1, 2 }) |x| _ = try world.addSparseTile(0, x, 0, deco, 0, .effect);
+    _ = try world.addSparseTile(0, 7, 7, deco, 0, .effect);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 3 * meta.tileSize(), .h = meta.tileSize() }, 0, 0);
+    try std.testing.expectEqual(@as(usize, 3), world.reserveRenderRecords());
     const player_entity = try EntityId.init(0, 1);
 
     try std.testing.expectEqual(
@@ -950,7 +945,7 @@ test "static geometry capacity covers one span per resident layer" {
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
     world.render_window = .{ .levels_below = 3 };
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0, 0);
     const scene = GameplayScene{
         .data = undefined,
         .world = &world,
@@ -1021,7 +1016,7 @@ test "collect dynamic records after structural growth stays within reserve and a
     };
     defer world.deinit();
     _ = try world.addLevel(0);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 2048, .h = 2048 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 2048, .h = 2048 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const scene = GameplayScene{
@@ -1108,7 +1103,7 @@ test "collect dynamic records includes an entity that fell to a level within the
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addLevel(-level_z_step);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const scene = GameplayScene{
@@ -1175,7 +1170,7 @@ test "collect dynamic records excludes an entity beyond the render window depth"
     };
     defer world.deinit();
     for (0..8) |_| _ = try world.addLevel(0);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const scene = GameplayScene{
@@ -1421,7 +1416,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     // Neither `active_level` special-casing nor the old per-layer-draw design
     // needed this; the general interleave-point rule is what must catch it.
     _ = try world.addSparseTile(level1, 0, 0, tree, 0, .effect);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -1462,6 +1457,53 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     try std.testing.expectEqual(@as(usize, 2), merged.items.len);
 }
 
+test "window sparse depths cut dense composites at any in-window level; a sparse tile outside the window cuts none" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldTilesetMeta();
+    defer meta.deinit();
+    // 64x64 tiles in 16-cell chunks; a deeper level under the surface.
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64 * 32, 64 * 32);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const level1 = try world.addLevel(-level_z_step);
+    _ = try world.addDenseLayer(level1, 0, .floor, grass);
+    // On the deeper level, in the far corner chunk.
+    _ = try world.addSparseTile(level1, 60, 60, tree, 0, .effect);
+    const near = Rect{ .x = 0, .y = 0, .w = 128, .h = 128 };
+    const far = Rect{ .x = 58 * 32, .y = 58 * 32, .w = 128, .h = 128 };
+    try world.setVisibleChunksForWorldRect(near, 0, 0);
+
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+    var renderer = headlessRendererForTest(allocator);
+    defer deinitHeadlessRendererForTest(&renderer);
+    try fakeTileStoreForTest(&renderer, &world);
+    var prep = DynamicScenePrep.init(allocator);
+    defer prep.deinit();
+    const scene = GameplayScene{
+        .data = undefined,
+        .world = &world,
+        .player_entity = try EntityId.init(0, 1),
+        .player_level = 0,
+        .particles = undefined,
+        .overscan_chunks = 0,
+    };
+
+    // Outside the window: one composite draw for both levels.
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+    try std.testing.expectEqual(@as(usize, 2), world.maxDenseSubmitDrawCount());
+    try std.testing.expectEqual(@as(usize, 1), renderer.static_groups.items.len);
+
+    // In the window: its depth cuts the two levels apart.
+    renderer.batch.beginFrame();
+    renderer.tile_stores.items[0].pending_spans.clearRetainingCapacity();
+    renderer.tile_stores.items[0].pending_values.clearRetainingCapacity();
+    try world.setVisibleChunksForWorldRect(far, 0, 0);
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+    try std.testing.expectEqual(@as(usize, 2), renderer.static_groups.items.len);
+}
+
 test "dense composite bucketing keeps every needed cut regardless of how many redundant interleave candidates exist" {
     const allocator = std.testing.allocator;
     var meta = try testWorldTilesetMeta();
@@ -1495,7 +1537,7 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
         prep.depth_spans.appendAssumeCapacity(.{ .start = 0, .end = 0, .depth = gap_start_depth + 10 });
         _ = try world.addSparseTile(0, 0, 0, grass, gap_start_depth + 13, .effect);
     }
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0, 0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -1534,13 +1576,14 @@ test "a warmed layered-world frame allocates nothing across a pan and a level ch
             _ = try world.clearDenseTile(layer, @intCast(chunk_x * 16 + 3), @intCast(chunk_y * 16 + 5));
         };
     }
-    // A sparse tile between levels 2 and 3 cuts the stack into two draws.
-    _ = try world.addSparseTile(3, 1, 1, tree, level_z_step - 1, .effect);
+    // A sparse tile between levels 2 and 3, in the chunk both windows share, cuts
+    // the stack into two draws.
+    _ = try world.addSparseTile(3, 17, 1, tree, level_z_step - 1, .effect);
     world.render_window = .{ .levels_below = 3 };
     const chunk_px: f32 = 16 * 32;
     const left = Rect{ .x = 0, .y = 0, .w = 2 * chunk_px, .h = 2 * chunk_px };
     const right = Rect{ .x = chunk_px, .y = 0, .w = 2 * chunk_px, .h = 2 * chunk_px };
-    world.setVisibleChunksForWorldRect(left, 0, 0);
+    try world.setVisibleChunksForWorldRect(left, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -1570,7 +1613,7 @@ test "a warmed layered-world frame allocates nothing across a pan and a level ch
             renderer.allocator = allocator;
         }
         renderer.batch.beginFrame();
-        world.setVisibleChunksForWorldRect(frame.rect, 0, frame.level);
+        try world.setVisibleChunksForWorldRect(frame.rect, 0, frame.level);
         const scene = GameplayScene{
             .data = undefined,
             .world = &world,

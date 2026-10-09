@@ -201,9 +201,10 @@ layers (deepest first, `dense_render.layers`) into buckets at every
 two dense layers this frame (`partitionDenseCompositeBuckets`). Interleave
 depths come from `render_prep.collectDenseInterleaveDepths`: `active_level`'s
 own actor depth (always), every distinct dynamic entity/particle depth this
-frame, and every depth a sparse tile is registered at anywhere in the world,
-since a whole-layer composite draw has no per-cell cull and a sparse tile at any
-in-window level needs its own sandwich point. Candidates dedupe by the gap they
+frame, and every depth of the render window's sparse tiles, since a
+whole-layer composite draw has no per-cell cull and a sparse tile at any
+in-window level needs its own sandwich point; a sparse tile outside the window
+cuts nothing. Candidates dedupe by the gap they
 would cut and drop outside the resident layers' depth span
 (`denseWindowDepthSpan`), so they fit one slot per gap in the world's scratch.
 
@@ -331,16 +332,23 @@ Nothing caps the window's layers except the store width fit above.
 (`WorldSystem.maxDenseSubmitDrawCount`), the most composite draws a frame can
 cut.
 
-**Sparse/dense boundary:** chunk visibility (`setVisibleChunksForWorldRect`,
-which also takes the active level and sets `render_side`) culls sparse tiles to
-the render window's levels and visible chunks and sizes dynamic sparse prep
-(`reserveRenderRecords`) from `visibleSparseTileCount`, which walks only those
-levels' visible chunks (cost independent of depth). A sparse tile becomes an
-interleave point purely by being *registered* at some depth
-(`WorldSystem.sparseDepthRangeCount`/`sparseDepthRangeAt` walk every registered
-depth). Sparse overlays and dense composite draws interleave in the merged draw
-list by `RenderOrder`; per-entity depth cull (Slice 25E) is separate from this
-floor window.
+**Sparse/dense boundary:** the window update (`setVisibleChunksForWorldRect`,
+which also takes the active level and sets `render_side`) builds the window's
+sparse list: the sparse tiles on the render window's levels, in its chunks
+(through the per-chunk sparse index) and inside its tile bounds, sorted by
+(depth, cell, tile id) with one range per distinct depth. It counts, reserves,
+then fills, so work and memory follow the tiles in the window (O(window levels
+× window chunks + V log V)), never the world's sparse count, level size, or
+depth; an allocation failure leaves the previous window and list in place and
+the next call retries. A still camera or sub-tile pan returns early.
+`addSparseTile` is O(1) and marks the list for rebuild only when the tile lands
+inside the current window; nothing is listed before a window is set. Dynamic
+sparse prep reserves `reserveRenderRecords` (the list's length);
+`sparseDepthRangeCount`/`sparseDepthRangeAt` give the window's sparse depths
+for interleave points, and `submitVisibleSparseRange` submits one range. Draw
+order never depends on a tile's storage index. Sparse overlays and dense
+composite draws interleave in the merged draw list by `RenderOrder`;
+per-entity depth cull (Slice 25E) is separate from this floor window.
 
 ### Dynamic entity collect (Slice 24B)
 
