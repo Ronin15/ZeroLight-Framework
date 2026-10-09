@@ -703,6 +703,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
+    if (std.mem.eql(u8, group_name, "chunk-scale-explosion-fill")) return "(sparse props * 10^10 + region chunks * 10^7 + level side * 1000 + levels)";
     if (isChunkScaleBatchGroup(group_name) or isChunkScaleNavBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(window edge chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(revision case * 10^7 + level side * 1000 + levels)";

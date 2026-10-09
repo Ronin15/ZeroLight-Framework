@@ -1602,8 +1602,8 @@ pub const WorldSystem = struct {
     /// GPU sync.
     ///
     /// c writes over k chunks with d changed cells, B bands on the widest touched
-    /// level and b bands written per chunk: O(c + k·(edge² + ⌈B/64⌉) + d·(bands +
-    /// sparse tiles in the chunk)) stage work; the main thread does O(k·b) reserves,
+    /// level, b bands written per chunk, and s sparse tiles in each chunk: O(c +
+    /// k·(edge² + ⌈B/64⌉ + s) + d·bands) stage work; the main thread does O(k·b) reserves,
     /// claims, flags, and releases and an O(k + d) event merge.
     pub fn applyDenseCellWrites(
         self: *WorldSystem,
@@ -2698,7 +2698,7 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group_index: usize, partic
     const chunk = group.chunk;
     const plan = group.plan;
     const extent = geom.extent(chunk);
-    const chunk_sparse_tiles = chunkSparseTiles(job.sparse_level_chunk_tiles, group.level, chunk);
+    const sparse_blocked = sparseBlockedBits(job, geom, group.level, chunk);
     const written = groupBandBits(job.masks, job.mask_words, group_index, false);
     const claims = groupBandBits(job.masks, job.mask_words, group_index, true);
     std.debug.assert(bands.len * max_chunk_cells <= job.finals_stride);
@@ -2771,10 +2771,7 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group_index: usize, partic
                 change_count += 1;
                 cell_changed = true;
             }
-            if (cell_changed) {
-                const cell = @as(u32, y) * job.width + x;
-                blocked.set(local, composedBlockedCell(job, bands, chunk, local, chunk_sparse_tiles, cell));
-            }
+            if (cell_changed) blocked.set(local, composedBlockedCell(job, bands, chunk, local, &sparse_blocked));
         }
     }
     for (written_list) |band| {
@@ -2785,18 +2782,33 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group_index: usize, partic
 }
 
 // A cell's composed movement-blocked bit after the write stage's writes: OR over
-// the level's `bands`, then the chunk's sparse tiles (`chunk_sparse_tiles`) at
-// `cell`; the same rule as `WorldSystem.composedBlockedWith`, kept separate for the
-// per-changed-cell cost. O(bands + sparse tiles in the chunk).
-fn composedBlockedCell(job: *const DenseEditWriteJob, bands: []const u32, chunk: u32, local: u32, chunk_sparse_tiles: []const u32, cell: u32) bool {
+// the level's `bands`, then the cell's bit in the chunk's `sparse_blocked`; the same
+// rule as `WorldSystem.composedBlockedWith`, kept separate for the per-changed-cell
+// cost. O(bands).
+fn composedBlockedCell(job: *const DenseEditWriteJob, bands: []const u32, chunk: u32, local: u32, sparse_blocked: *const ChunkBits) bool {
     const block_cells = job.geom.blockCells();
     for (bands) |layer| {
         if (catalogFlags(job.catalog_flags, job.stores[layer].chunkTile(block_cells, chunk, local)).blocks_movement) return true;
     }
-    for (chunk_sparse_tiles) |sparse_index| {
-        if (job.sparse_cells[sparse_index] == cell and job.sparse_flags[sparse_index].blocks_movement) return true;
+    return world_terrain.bitIsSet(sparse_blocked, local);
+}
+
+// The chunk-local cells of `level`'s `chunk` that hold a movement-blocking sparse
+// tile, built once per group so each changed cell tests one bit. O(sparse tiles in
+// the chunk).
+fn sparseBlockedBits(job: *const DenseEditWriteJob, geom: ChunkGeometry, level: u16, chunk: u32) ChunkBits {
+    var bits: ChunkBits = @splat(0);
+    for (chunkSparseTiles(job.sparse_level_chunk_tiles, level, chunk)) |sparse_index| {
+        if (!job.sparse_flags[sparse_index].blocks_movement) continue;
+        const cell = job.sparse_cells[sparse_index];
+        // A cell index is below width * height, so both coordinates fit u16.
+        const x: u16 = @intCast(cell % job.width);
+        const y: u16 = @intCast(cell / job.width);
+        std.debug.assert(geom.chunkOf(x, y) == chunk);
+        const local = geom.localOf(x, y);
+        bits[local / 64] |= @as(u64, 1) << @intCast(local % 64);
     }
-    return false;
+    return bits;
 }
 
 // Indices into the sparse tile rows of `level`'s tiles in `chunk`.
@@ -6316,10 +6328,16 @@ fn batchLayerFill(tiles: TerrainTestTiles, layer: usize) TileId {
 // 16x16 tiles in 4x4 chunks (16 per level) on three levels with a few sparse
 // obstacles; levels 0 and 1 are resident in the GPU tile store, level 2 is not.
 fn testBatchEditWorld(meta: *const WorldTilesetMeta) !WorldSystem {
+    return testBatchEditWorldSized(meta, 16, 16);
+}
+
+// `testBatchEditWorld` at `width` x `height` (at least 14 each), so a side short of
+// whole chunks gives short border chunks.
+fn testBatchEditWorldSized(meta: *const WorldTilesetMeta, width: u16, height: u16) !WorldSystem {
     var world = WorldSystem{
         .allocator = std.testing.allocator,
-        .width = 16,
-        .height = 16,
+        .width = width,
+        .height = height,
         .tile_size = meta.tileSize(),
         .chunk_size_tiles = 4,
     };
@@ -6606,6 +6624,154 @@ test "a batched dense edit composes the same tiles and blocked cells as single-c
         _ = try testSyncGpuTiles(&batched, 0);
         _ = try testSyncGpuTiles(&single, 0);
     }
+}
+
+// Adds `count` sparse tiles at random cells on every level of the batched-edit
+// fixture, two in three blocking; the same seed places the same tiles.
+fn addRandomSparseTiles(world: *WorldSystem, tiles: TerrainTestTiles, seed: u64, count: usize) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (0..world.level_terrain.items.len) |level| {
+        for (0..count) |_| {
+            const tile = if (random.uintLessThan(u8, 3) == 0) tiles.grass else tiles.deco;
+            _ = try world.addSparseTile(@intCast(level), random.uintLessThan(u16, world.width), random.uintLessThan(u16, world.height), tile, 0, .obstacle);
+        }
+    }
+}
+
+test "a batched dense edit over many sparse tiles is identical inline, threaded, and as single-cell writes" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var serial = try testBatchEditWorld(&meta);
+    defer serial.deinit();
+    var threaded = try testBatchEditWorld(&meta);
+    defer threaded.deinit();
+    var single = try testBatchEditWorld(&meta);
+    defer single.deinit();
+    const tiles = try TerrainTestTiles.resolve(&serial, &meta);
+    // About a third of each level's cells hold a sparse tile, some cells several.
+    for ([_]*WorldSystem{ &serial, &threaded, &single }) |world| try addRandomSparseTiles(world, tiles, 0x5ba7_5e00, 96);
+
+    var serial_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer serial_events.deinit(std.testing.allocator);
+    var threaded_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer threaded_events.deinit(std.testing.allocator);
+    var write_buffer: [160]DenseCellWrite = undefined;
+    var prng = std.Random.DefaultPrng.init(0x5ba7_5e01);
+    var threaded_batches: usize = 0;
+    for (0..40) |_| {
+        const writes = randomBatchWrites(prng.random(), tiles, &write_buffer);
+        var batch = try ChunkMajorWrites.init(&serial, writes);
+        defer batch.deinit();
+        serial_events.clearRetainingCapacity();
+        threaded_events.clearRetainingCapacity();
+        try serial_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try threaded_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try serial.applyDenseCellWrites(batch.chunks.items, null, &serial_events);
+        try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &threaded_events);
+        for (writes) |write| _ = try single.writeDenseTileCell(write.layer, write.x, write.y, write.tile);
+        if (editRanThreaded(&threaded)) threaded_batches += 1;
+
+        try std.testing.expectEqualSlices(WorldTileChangedEvent, serial_events.items, threaded_events.items);
+        try expectTerrainBytesEqual(&serial, &threaded);
+        for (0..serial.level_terrain.items.len) |level| {
+            for (0..serial.height) |y| for (0..serial.width) |x| {
+                const level_index: u16 = @intCast(level);
+                try std.testing.expectEqual(single.levelBlocksMovement(level_index, @intCast(x), @intCast(y)), serial.levelBlocksMovement(level_index, @intCast(x), @intCast(y)));
+            };
+        }
+        _ = try testSyncGpuTiles(&threaded, 0);
+        _ = try testSyncGpuTiles(&serial, 0);
+        _ = try testSyncGpuTiles(&single, 0);
+    }
+    try std.testing.expect(threaded_batches > 0);
+}
+
+test "a batched dense edit over sparse tiles in short border chunks is identical inline, threaded, and as single-cell writes" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    // 15x15 tiles in 4x4 chunks: the right column and bottom row of chunks are 3
+    // cells short of a full chunk on one or both axes.
+    var serial = try testBatchEditWorldSized(&meta, 15, 15);
+    defer serial.deinit();
+    var threaded = try testBatchEditWorldSized(&meta, 15, 15);
+    defer threaded.deinit();
+    var single = try testBatchEditWorldSized(&meta, 15, 15);
+    defer single.deinit();
+    const tiles = try TerrainTestTiles.resolve(&serial, &meta);
+    const write_tiles = [_]TileId{ tiles.grass, tiles.dirt, tiles.water, tiles.cave, tiles.tree, invalid_tile_id };
+
+    // Sparse tiles only in the border chunks (x or y at least 12), two in three blocking.
+    var prng = std.Random.DefaultPrng.init(0xb0_7de2);
+    const random = prng.random();
+    for ([_]*WorldSystem{ &serial, &threaded, &single }) |world| {
+        var place = std.Random.DefaultPrng.init(0xb0_7de3);
+        for (0..world.level_terrain.items.len) |level| {
+            for (0..40) |_| {
+                const along = place.random().uintLessThan(u16, 15);
+                const across = 12 + place.random().uintLessThan(u16, 3);
+                const x, const y = if (place.random().boolean()) .{ across, along } else .{ along, across };
+                const tile = if (place.random().uintLessThan(u8, 3) == 0) tiles.grass else tiles.deco;
+                _ = try world.addSparseTile(@intCast(level), x, y, tile, 0, .obstacle);
+            }
+        }
+    }
+
+    var serial_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer serial_events.deinit(std.testing.allocator);
+    var threaded_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer threaded_events.deinit(std.testing.allocator);
+    var write_buffer: [160]DenseCellWrite = undefined;
+    var threaded_batches: usize = 0;
+    for (0..40) |_| {
+        // Random writes over the whole level, biased toward each layer's fill so
+        // chunks split and re-uniform.
+        const count = random.intRangeAtMost(usize, 1, write_buffer.len);
+        for (write_buffer[0..count]) |*write| {
+            const layer = random.uintLessThan(u32, batch_layer_levels.len);
+            write.* = .{
+                .layer = layer,
+                .x = random.uintLessThan(u16, 15),
+                .y = random.uintLessThan(u16, 15),
+                .tile = if (random.boolean()) batchLayerFill(tiles, layer) else write_tiles[random.uintLessThan(usize, write_tiles.len)],
+            };
+        }
+        const writes = write_buffer[0..count];
+        var batch = try ChunkMajorWrites.init(&serial, writes);
+        defer batch.deinit();
+        serial_events.clearRetainingCapacity();
+        threaded_events.clearRetainingCapacity();
+        try serial_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try threaded_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try serial.applyDenseCellWrites(batch.chunks.items, null, &serial_events);
+        try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &threaded_events);
+        for (writes) |write| _ = try single.writeDenseTileCell(write.layer, write.x, write.y, write.tile);
+        if (editRanThreaded(&threaded)) threaded_batches += 1;
+
+        try std.testing.expectEqualSlices(WorldTileChangedEvent, serial_events.items, threaded_events.items);
+        try expectTerrainBytesEqual(&serial, &threaded);
+        for (0..serial.dense_layers.len) |layer| {
+            for (0..serial.chunkCountPerLevel()) |chunk| {
+                try std.testing.expectEqual(single.dense_layers.items(.store)[layer].uniformTile(@intCast(chunk)), serial.dense_layers.items(.store)[layer].uniformTile(@intCast(chunk)));
+            }
+        }
+        for (0..serial.level_terrain.items.len) |level| {
+            for (0..serial.height) |y| for (0..serial.width) |x| {
+                const level_index: u16 = @intCast(level);
+                try std.testing.expectEqual(single.levelBlocksMovement(level_index, @intCast(x), @intCast(y)), serial.levelBlocksMovement(level_index, @intCast(x), @intCast(y)));
+            };
+        }
+        _ = try testSyncGpuTiles(&threaded, 0);
+        _ = try testSyncGpuTiles(&serial, 0);
+        _ = try testSyncGpuTiles(&single, 0);
+    }
+    try std.testing.expect(threaded_batches > 0);
 }
 
 test "a batched dense edit marks resident layers identically inline and threaded and the next sync matches the CPU" {

@@ -13,7 +13,9 @@ paths:
   PascalCase types and type-returning functions.
 - Write the plain form first: names that say what a value is (`corridor`, not
   `i`), arithmetic over bit tricks, named helpers over inline tuple arrays. A
-  clever form needs a bench-shown hot-path win and a one-line comment.
+  clever form needs a bench-shown hot-path win and a one-line comment. SIMD
+  through `simd.zig` is the default form for hot loops, not a clever one
+  (`memory-performance.md` § SIMD).
 - Import declarations directly
   (`const Engine = @import("app/engine.zig").Engine;`), or a snake_case file
   namespace where the call reads better.

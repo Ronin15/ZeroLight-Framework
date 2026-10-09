@@ -5,7 +5,13 @@
 const std = @import("std");
 const math = @import("math.zig");
 
-pub const lane_count: usize = 4;
+// Bytes in one vector register (SSE2, NEON); every lane count derives from it.
+const vector_bytes: usize = 16;
+/// Lanes of a 32-bit element type.
+pub const lane_count: usize = vector_bytes / @sizeOf(u32);
+// Lanes of a 16-bit element type.
+const u16_lane_count: usize = vector_bytes / @sizeOf(u16);
+const Uint16x8 = @Vector(u16_lane_count, u16);
 pub const Float4 = @Vector(lane_count, f32);
 pub const Int4 = @Vector(lane_count, i32);
 pub const Uint4 = @Vector(lane_count, u32);
@@ -233,6 +239,29 @@ pub fn tailLen(item_count: usize) usize {
 
 pub fn hasTail(item_count: usize) bool {
     return tailLen(item_count) != 0;
+}
+
+/// Counts positions `index` where `lhs[index] != rhs[index]`; the slices have equal
+/// length. Whole registers, then a scalar tail.
+pub fn countUnequalU16(lhs: []const u16, rhs: []const u16) u32 {
+    std.debug.assert(lhs.len == rhs.len);
+    const vector_end = lhs.len - lhs.len % u16_lane_count;
+    var count: u32 = 0;
+    var index: usize = 0;
+    while (index < vector_end) : (index += u16_lane_count) {
+        const lhs_lanes: Uint16x8 = lhs[index..][0..u16_lane_count].*;
+        const rhs_lanes: Uint16x8 = rhs[index..][0..u16_lane_count].*;
+        count += @reduce(.Add, @as(@Vector(u16_lane_count, u8), @intFromBool(lhs_lanes != rhs_lanes)));
+    }
+    return count + countUnequalU16Scalar(lhs[vector_end..], rhs[vector_end..]);
+}
+
+/// Scalar form of `countUnequalU16`.
+pub fn countUnequalU16Scalar(lhs: []const u16, rhs: []const u16) u32 {
+    std.debug.assert(lhs.len == rhs.len);
+    var count: u32 = 0;
+    for (lhs, rhs) |lhs_value, rhs_value| count += @intFromBool(lhs_value != rhs_value);
+    return count;
 }
 
 /// Per-lane pair of 2D components (one `Float4` per axis).
@@ -492,6 +521,31 @@ test "tail helpers cover empty partial exact and multi lane counts" {
     try std.testing.expectEqual(@as(usize, 8), vectorizedEnd(11));
     try std.testing.expectEqual(@as(usize, 3), tailLen(11));
     try std.testing.expect(hasTail(11));
+}
+
+test "countUnequalU16 matches its scalar form over every tail length and random, equal, and different data" {
+    var prng = std.Random.DefaultPrng.init(0x00c0_0e16);
+    const random = prng.random();
+    var lhs: [33]u16 = undefined;
+    var rhs: [33]u16 = undefined;
+    for (0..lhs.len + 1) |len| {
+        for (0..8) |_| {
+            // A small value range so equal and unequal lanes both occur.
+            for (lhs[0..len], rhs[0..len]) |*left, *right| {
+                left.* = random.uintLessThan(u16, 3);
+                right.* = random.uintLessThan(u16, 3);
+            }
+            try std.testing.expectEqual(countUnequalU16Scalar(lhs[0..len], rhs[0..len]), countUnequalU16(lhs[0..len], rhs[0..len]));
+        }
+        @memset(lhs[0..len], 0xBEEF);
+        try std.testing.expectEqual(@as(u32, 0), countUnequalU16(lhs[0..len], lhs[0..len]));
+        for (rhs[0..len], 0..) |*right, index| right.* = @intCast(index);
+        @memset(lhs[0..len], std.math.maxInt(u16));
+        try std.testing.expectEqual(@as(u32, @intCast(len)), countUnequalU16(lhs[0..len], rhs[0..len]));
+    }
+    // Overlapping views, as a chain of adjacent cells is compared.
+    for (&lhs) |*value| value.* = random.uintLessThan(u16, 2);
+    try std.testing.expectEqual(countUnequalU16Scalar(lhs[0..32], lhs[1..33]), countUnequalU16(lhs[0..32], lhs[1..33]));
 }
 
 test "gather and scatter move lanes through sparse indices" {

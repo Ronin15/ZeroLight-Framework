@@ -931,10 +931,9 @@ fn resolveCandidate(ctx: SurvivorSortContext, slot: usize) ResolvedCandidate {
     return .{ .entity = ctx.candidates.entities[candidate_index], .level = ctx.candidates.level[candidate_index] };
 }
 
-// Small (<= max_perception_scratch), branchy comparator resolving an entity
-// per compare: irreducibly small and does not scale with population, so this
-// sort stays scalar (per-agent candidate counts are bounded by
-// max_perception_candidates regardless of world size).
+// Branchy comparator resolving an entity per compare. Scalar: each observer
+// sorts at most max_perception_scratch survivors, a tiny batch; total work
+// grows with observers, which the threaded perception ranges spread.
 fn survivorLessThan(ctx: SurvivorSortContext, lhs: usize, rhs: usize) bool {
     const lhs_dist2 = ctx.scratch.dist2[lhs];
     const rhs_dist2 = ctx.scratch.dist2[rhs];
@@ -1118,9 +1117,9 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     var last_seen_x: f32 = 0;
     var last_seen_y: f32 = 0;
 
-    // Small (<= max_perception_scratch), branchy walk with a per-candidate
-    // bounded LOS raycast: irreducible, does not scale with population, so
-    // this stays scalar.
+    // Scalar: a branchy walk with a data-dependent LOS raycast per candidate,
+    // over at most max_perception_scratch survivors per observer; total work
+    // grows with observers, which the threaded perception ranges spread.
     for (survivors[0..survivor_count]) |slot| {
         const resolved = resolveCandidate(sort_ctx, slot);
         if (resolved.level != observer_level) continue;

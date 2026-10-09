@@ -88,8 +88,13 @@ pub fn packTileDataElement(low_cell: u16, high_cell: u16) u32 {
 pub fn packTileData(cells: []const u16, out: []u32) void {
     std.debug.assert(out.len == tileDataElementCount(cells.len));
     const pair_count = cells.len / tile_data_cells_per_element;
-    for (out[0..pair_count], 0..) |*element, pair| {
-        element.* = packTileDataElement(cells[pair * 2], cells[pair * 2 + 1]);
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        // Low cell first in each u32 is the cells' own byte image on little-endian.
+        @memcpy(std.mem.sliceAsBytes(out[0..pair_count]), std.mem.sliceAsBytes(cells[0 .. pair_count * tile_data_cells_per_element]));
+    } else {
+        for (out[0..pair_count], 0..) |*element, pair| {
+            element.* = packTileDataElement(cells[pair * 2], cells[pair * 2 + 1]);
+        }
     }
     if (pair_count < out.len) {
         out[pair_count] = packTileDataElement(cells[cells.len - 1], tile_data_pad_cell);
@@ -2318,6 +2323,23 @@ test "packTileData packs two cells per element low half first and pads an odd ta
         const element = elements[tileDataElementIndex(flat)];
         const shift: u5 = @intCast((flat & 1) * 16);
         try std.testing.expectEqual(cell, @as(u16, @truncate(element >> shift)));
+    }
+}
+
+test "packTileData matches per-element packing at every length up to 33, odd tails padded" {
+    var prng = std.Random.DefaultPrng.init(0x7a1e_da7a);
+    const random = prng.random();
+    var cells: [33]u16 = undefined;
+    for (&cells) |*cell| cell.* = random.int(u16);
+    var packed_elements: [tileDataElementCount(cells.len)]u32 = undefined;
+    for (0..cells.len + 1) |len| {
+        const element_count = tileDataElementCount(len);
+        packTileData(cells[0..len], packed_elements[0..element_count]);
+        for (packed_elements[0..element_count], 0..) |element, index| {
+            const low = cells[index * 2];
+            const high = if (index * 2 + 1 < len) cells[index * 2 + 1] else tile_data_pad_cell;
+            try std.testing.expectEqual(packTileDataElement(low, high), element);
+        }
     }
 }
 

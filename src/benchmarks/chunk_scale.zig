@@ -16,7 +16,10 @@
 //!     back, each one batched edit (`applyDenseCellWrites`). Linear in region chunks.
 //!   - `chunk-scale-explosion-fill`: a disk inscribed in a 4-, 64-, or 256-chunk
 //!     square on the deepest level (touching fewer chunks than the square) is blown
-//!     open and filled back, each one batched edit. Linear in region chunks.
+//!     open and filled back, each one batched edit. Linear in region chunks. One
+//!     extra case (item prefix `1 * 10^10`, 64 chunks at 256² and 8 levels) first
+//!     places 32 blocking sparse props in every chunk of the square, so each changed
+//!     cell's composed blocked bit also reads its chunk's sparse tiles.
 //!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the
 //!     digs and after the refills (64 blocks taken, then freed). Flat.
 //!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
@@ -78,6 +81,7 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const CellCoord = @import("../game/world_system.zig").CellCoord;
@@ -131,6 +135,21 @@ const region_item_counts = blk: {
             counts[region_index * scale_item_counts.len + scale_index] = region * case_prefix_encoding + scale;
         }
     }
+    break :blk counts;
+};
+
+// Encodes the explosion group's sparse-props case above the region chunks.
+const sparse_props_encoding: usize = 10_000_000_000;
+// Blocking sparse props per chunk of the sparse-props case: every cell whose
+// (3 * x + 5 * y) % 8 is zero, 32 of a 16x16 chunk's cells.
+const sparse_props_stride: u16 = 8;
+// The sparse-props case's one config: 64 region chunks at 256² and 8 levels.
+const sparse_props_item_count: usize = sparse_props_encoding + 64 * case_prefix_encoding + 256 * case_encoding + 8;
+
+const explosion_item_counts = blk: {
+    var counts: [region_item_counts.len + 1]usize = undefined;
+    @memcpy(counts[0..region_item_counts.len], &region_item_counts);
+    counts[region_item_counts.len] = sparse_props_item_count;
     break :blk counts;
 };
 
@@ -214,7 +233,7 @@ pub const cave_in_group = suite.BenchmarkGroup{
 
 pub const explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-explosion-fill",
-    .defaultItemCounts = regionItemCounts,
+    .defaultItemCounts = explosionItemCounts,
     .runCase = runExplosionFillCase,
 };
 
@@ -290,6 +309,10 @@ fn regionItemCounts(_: suite.Profile) []const usize {
     return &region_item_counts;
 }
 
+fn explosionItemCounts(_: suite.Profile) []const usize {
+    return &explosion_item_counts;
+}
+
 fn panItemCounts(_: suite.Profile) []const usize {
     return &pan_item_counts;
 }
@@ -335,6 +358,8 @@ const Fixture = struct {
     dirt: TileId,
     tunnel: TileId,
     ramp: TileId,
+    // A blocking sparse prop.
+    prop: TileId,
     side: u16,
     levels: u16,
     // GPU sync groups only: a headless renderer holding the world's tile store.
@@ -459,6 +484,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
     const dirt = try world.requireTileByName(&meta, "dirt");
     const tunnel = try world.requireTileByName(&meta, "cave_0");
     const ramp = (try DigConfig.fromMeta(&meta)).ramp_tile;
+    const prop = try world.requireTileByName(&meta, "deco_0");
     for (0..levels) |level_index| {
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
         const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) grass else dirt);
@@ -466,7 +492,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
     }
     world.adoptTilesetMeta(meta);
     meta_owned = false;
-    return .{ .world = world, .dirt = dirt, .tunnel = tunnel, .ramp = ramp, .side = side, .levels = levels };
+    return .{ .world = world, .dirt = dirt, .tunnel = tunnel, .ramp = ramp, .prop = prop, .side = side, .levels = levels };
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
@@ -812,12 +838,34 @@ fn buildExplosionEdit(allocator: std.mem.Allocator, fixture: *const Fixture, reg
     return edit;
 }
 
+// Places blocking sparse props on the explosion level over its whole region square,
+// `sparse_props_stride` cells apart in a skewed pattern.
+fn addExplosionProps(fixture: *Fixture, region_chunks: usize) !void {
+    const world = &fixture.world;
+    const square_chunks = std.math.sqrt(region_chunks);
+    std.debug.assert(square_chunks * square_chunks == region_chunks);
+    const chunk_edge = default_chunk_size_tiles;
+    const origin: u16 = (fixture.side / 2 / chunk_edge - @as(u16, @intCast(square_chunks / 2))) * chunk_edge;
+    const square_cells: u16 = @intCast(square_chunks * chunk_edge);
+    for (origin..origin + square_cells) |y| for (origin..origin + square_cells) |x| {
+        if ((3 * x + 5 * y) % sparse_props_stride != 0) continue;
+        // Only a blocking tile reports an obstacle change.
+        if (try world.addSparseTile(fixture.levels - 1, @intCast(x), @intCast(y), fixture.prop, 0, .obstacle) == null) return error.SparsePropNotBlocking;
+    };
+}
+
 // Per-stage time of one iteration's two batched edits.
 const BatchTiming = struct {
     plan_ns: u64 = 0,
     write_ns: u64 = 0,
+    // Stage time spent on workers: a stage that ran inline reports its duration but
+    // ran on the main thread.
+    off_main_ns: u64 = 0,
 
     fn add(self: *BatchTiming, world: *const WorldSystem) void {
+        for ([_]BatchStats{ world.last_terrain_edit_plan_batch, world.last_terrain_edit_write_batch }) |batch| {
+            if (!batch.ran_inline) self.off_main_ns += batch.batch_duration_ns;
+        }
         self.plan_ns += world.last_terrain_edit_plan_batch.batch_duration_ns;
         self.write_ns += world.last_terrain_edit_write_batch.batch_duration_ns;
     }
@@ -843,7 +891,9 @@ fn tunersSettled(world: *const WorldSystem) bool {
 
 fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const region_chunks = item_count / case_prefix_encoding;
+    const sparse_props = item_count / sparse_props_encoding != 0;
+    std.debug.assert(!sparse_props or workload == .explosion_fill);
+    const region_chunks = item_count % sparse_props_encoding / case_prefix_encoding;
     const scale = item_count % case_prefix_encoding;
     const side: u16 = @intCast(scale / case_encoding);
     const levels: u16 = @intCast(scale % case_encoding);
@@ -860,6 +910,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
+    if (sparse_props) try addExplosionProps(&fixture, region_chunks);
     // The two deepest levels are GPU resident over the fixed window, so edits there
     // flag their layers; each iteration's sync uploads them outside the timed region.
     try fixture.setDigWindow();
@@ -916,8 +967,8 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         accumulator.record(elapsed_ns, world.last_terrain_edit_write_batch);
         plan_total += timing.plan_ns;
         write_total += timing.write_ns;
-        // Inline stages report no duration, so in the serial case all of it is main.
-        main_total += elapsed_ns -| (timing.plan_ns + timing.write_ns);
+        // Main is everything but the stages that ran on workers.
+        main_total += elapsed_ns -| timing.off_main_ns;
         _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
     }
     var stats = accumulator.finish();
@@ -1243,8 +1294,9 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         write_total += timing.terrain.write_ns;
         nav_total += timing.nav_ns;
         fallbacks += timing.fallbacks;
-        // Inline terrain stages report no duration, so in the serial case they count as main.
-        main_total += elapsed_ns -| (timing.terrain.plan_ns + timing.terrain.write_ns + timing.nav_ns);
+        // Main is everything but the terrain stages that ran on workers and the whole nav
+        // reaction (marking and apply, wall time).
+        main_total += elapsed_ns -| (timing.terrain.off_main_ns + timing.nav_ns);
     }
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the cells written.

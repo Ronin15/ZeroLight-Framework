@@ -14,6 +14,7 @@
 //! allocate nothing.
 
 const std = @import("std");
+const simd = @import("../core/simd.zig");
 
 pub const TileId = u16;
 
@@ -604,21 +605,20 @@ pub const OwnedBlock = struct {
 /// different tiles. One pass over the in-level cells, O(edge²).
 pub fn chainUnequalPairs(cells: []const TileId, shift: u4, extent: ChunkExtent) u16 {
     const edge = @as(usize, 1) << shift;
-    var pairs: u16 = 0;
+    // At most edge² - 1 pairs, which fits a u16 for every chunk edge.
     if (extent.cols == edge) {
         // Full-width rows: the chain is the block's first `rows` rows in order.
         const chain = cells[0 .. @as(usize, extent.rows) * edge];
-        for (chain[0 .. chain.len - 1], chain[1..]) |cell, next| pairs += @intFromBool(cell != next);
-        return pairs;
+        return @intCast(simd.countUnequalU16(chain[0 .. chain.len - 1], chain[1..]));
     }
-    var previous = cells[0];
+    // Short rows: each row's own pairs, plus the pair joining it to the row above.
+    var pairs: u32 = 0;
     for (0..extent.rows) |row| {
-        for (cells[row << shift ..][0..extent.cols]) |cell| {
-            pairs += @intFromBool(cell != previous);
-            previous = cell;
-        }
+        const row_cells = cells[row << shift ..][0..extent.cols];
+        if (row > 0) pairs += @intFromBool(row_cells[0] != cells[((row - 1) << shift) + extent.cols - 1]);
+        pairs += simd.countUnequalU16(row_cells[0 .. row_cells.len - 1], row_cells[1..]);
     }
-    return pairs;
+    return @intCast(pairs);
 }
 
 /// A chunk's in-level cells chain row-major: (row, col) follows (row, col - 1), and
@@ -689,12 +689,21 @@ pub const OwnedBits = struct {
 
 /// Bits of a chunk's in-level cells; border chunks leave out-of-level cells clear.
 pub fn inLevelMask(geom: ChunkGeometry, extent: ChunkExtent) ChunkBits {
+    return rectMask(geom, 0, 0, extent.cols, extent.rows);
+}
+
+/// Bits of the chunk-local cells in columns [x0, x1) and rows [y0, y1), within one
+/// `geom.edge` square. O(rows): each row is one run of at most `edge` bits inside
+/// one word (64 is a multiple of every edge).
+pub fn rectMask(geom: ChunkGeometry, x0: u32, y0: u32, x1: u32, y1: u32) ChunkBits {
+    std.debug.assert(x0 <= x1 and x1 <= geom.edge and y0 <= y1 and y1 <= geom.edge);
     var words: ChunkBits = @splat(0);
-    for (0..extent.rows) |row| {
-        for (0..extent.cols) |col| {
-            const local = (row << geom.shift) | col;
-            words[local / 64] |= @as(u64, 1) << @intCast(local % 64);
-        }
+    if (x0 == x1 or y0 == y1) return words;
+    // x1 - x0 <= edge <= 16, so the run fits below bit 64.
+    const row_run = ((@as(u64, 1) << @intCast(x1 - x0)) - 1) << @intCast(x0);
+    for (y0..y1) |row| {
+        const row_start = row << geom.shift;
+        words[row_start / 64] |= row_run << @intCast(row_start % 64);
     }
     return words;
 }
@@ -751,6 +760,75 @@ test "chunk geometry maps cells to chunk and local indices with short border chu
     try std.testing.expectEqual(@as(u16, 4), border.min_y);
     try std.testing.expectEqual(@as(u16, 2), border.cols);
     try std.testing.expectEqual(@as(u16, 2), border.rows);
+}
+
+// The per-cell form of `rectMask`.
+fn rectMaskReference(geom: ChunkGeometry, x0: u32, y0: u32, x1: u32, y1: u32) ChunkBits {
+    var words: ChunkBits = @splat(0);
+    for (y0..y1) |row| for (x0..x1) |col| {
+        const local = (row << geom.shift) | col;
+        words[local / 64] |= @as(u64, 1) << @intCast(local % 64);
+    };
+    return words;
+}
+
+test "rectMask matches a per-cell mask at every edge, border extent, and random rect" {
+    var prng = std.Random.DefaultPrng.init(0x4ec7_3a5c);
+    const random = prng.random();
+    for ([_]u16{ 1, 2, 4, 8, 16 }) |edge| {
+        // A level one cell short of whole chunks on both axes, so its border chunks
+        // are short; an edge-1 level has none.
+        const side: u16 = 3 * edge - @intFromBool(edge > 1);
+        const geom = ChunkGeometry.init(side, side, edge);
+        for (0..geom.chunkCount()) |chunk| {
+            const extent = geom.extent(@intCast(chunk));
+            try std.testing.expectEqual(rectMaskReference(geom, 0, 0, extent.cols, extent.rows), inLevelMask(geom, extent));
+        }
+        try std.testing.expectEqual(rectMaskReference(geom, 0, 0, edge, edge), rectMask(geom, 0, 0, edge, edge));
+        try std.testing.expectEqual(rectMaskReference(geom, 0, 0, 0, 0), rectMask(geom, edge, 0, edge, edge));
+        for (0..200) |_| {
+            const xa = random.uintAtMost(u32, edge);
+            const xb = random.uintAtMost(u32, edge);
+            const ya = random.uintAtMost(u32, edge);
+            const yb = random.uintAtMost(u32, edge);
+            const x0 = @min(xa, xb);
+            const x1 = @max(xa, xb);
+            const y0 = @min(ya, yb);
+            const y1 = @max(ya, yb);
+            try std.testing.expectEqual(rectMaskReference(geom, x0, y0, x1, y1), rectMask(geom, x0, y0, x1, y1));
+        }
+    }
+}
+
+// The cell-by-cell walk of the chain `chainUnequalPairs` counts.
+fn chainUnequalPairsReference(cells: []const TileId, shift: u4, extent: ChunkExtent) u16 {
+    var pairs: u16 = 0;
+    var previous = cells[0];
+    for (0..extent.rows) |row| {
+        for (cells[row << shift ..][0..extent.cols]) |cell| {
+            pairs += @intFromBool(cell != previous);
+            previous = cell;
+        }
+    }
+    return pairs;
+}
+
+test "chainUnequalPairs matches a cell-by-cell chain walk on full and short-row blocks" {
+    var prng = std.Random.DefaultPrng.init(0xc4a1_9a1e);
+    const random = prng.random();
+    var cells: [max_chunk_cells]TileId = undefined;
+    for ([_]u16{ 1, 2, 4, 8, 16 }) |edge| {
+        const geom = ChunkGeometry.init(2 * edge - 1, 2 * edge - 1, edge);
+        for (0..geom.chunkCount()) |chunk| {
+            const extent = geom.extent(@intCast(chunk));
+            for (0..20) |_| {
+                for (cells[0..geom.blockCells()]) |*cell| cell.* = random.uintLessThan(TileId, 3);
+                try std.testing.expectEqual(chainUnequalPairsReference(&cells, geom.shift, extent), chainUnequalPairs(&cells, geom.shift, extent));
+            }
+            @memset(cells[0..geom.blockCells()], 5);
+            try std.testing.expectEqual(@as(u16, 0), chainUnequalPairs(&cells, geom.shift, extent));
+        }
+    }
 }
 
 test "chunk bits store returns to OPEN and BLOCKED at the in-level cell count of a border chunk" {
