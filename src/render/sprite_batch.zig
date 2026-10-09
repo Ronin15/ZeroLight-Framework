@@ -187,17 +187,17 @@ pub const TilemapParams = extern struct {
     grid: [4]f32,
     // x=atlas_columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     atlas: [4]f32,
-    // x=this draw's composited layer count (topmost-first), y/z/w unused. Filled
-    // per draw group at push time (Renderer.applyWindowLayers), not stored in
-    // createTileDataBuffer's per-buffer params, since several draws can
-    // composite different layer subsets from one combined buffer.
+    // x=this draw's composited layer count (topmost-first), y=shallowest-bucket
+    // flag, z=chunk shift (log2 of the chunk edge), w=chunks per row. x/y are
+    // filled per draw group at push time (Renderer.applyWindowLayers); z/w are
+    // the store's chunk geometry, stored with its params at `createTileStore`.
     layer_meta: [4]i32 = .{ 0, 0, 0, 0 },
-    // Topmost-first cell offsets (not packed element offsets) into the
-    // tile-data buffer named by DrawGroup.tile_data, one per composited layer
+    // Topmost-first directory start words (slot * chunks per level) in the tile
+    // store named by DrawGroup.tile_data, one per composited layer
     // (layer_meta[0] of them valid; the rest are stale). A flat u32 array to
     // byte-match the GLSL uvec4 array under std140 (uvec4 array elements have
     // no interior padding, so this is contiguous with no guessed compiler
-    // padding).
+    // padding). Its length is also the store's directory slot count.
     layer_offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
 };
 
@@ -225,7 +225,7 @@ pub const DrawGroup = struct {
     order: RenderOrder = .{},
     first_vertex: u32,
     vertex_count: u32,
-    // Tilemap-material groups only: the buffer's storage-buffer handle. The grid/atlas
+    // Tilemap-material groups only: the world's tile store handle. The grid/atlas
     // uniform lives in the renderer keyed by this id.
     tile_data: resources.TileDataId = .invalid,
     // Tilemap-material groups only: indexes the renderer's per-frame

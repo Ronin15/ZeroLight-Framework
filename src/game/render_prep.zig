@@ -523,8 +523,8 @@ fn submitLayeredWorld(
     var interleave_scratch: [k_max_dense_submit_stack_cap]i32 = undefined;
     const interleave_depths = try collectDenseInterleaveDepths(scene, prep, &interleave_scratch);
 
+    try scene.world.syncDenseTileStore(renderer, scene.player_level);
     try scene.world.submitStaticDenseGeometry(renderer, runtime_assets, scene.player_level, interleave_depths);
-    try scene.world.flushDenseTileEdits(renderer);
 
     var sparse_index: usize = 0;
     var sparse_depth = nextSparseDepth(scene, &sparse_index);
@@ -1075,7 +1075,7 @@ test "collect dynamic records after structural growth stays within reserve and a
     };
     defer world.deinit();
     _ = try world.addLevel(0);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 2048, .h = 2048 }, 0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 2048, .h = 2048 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const scene = GameplayScene{
@@ -1162,7 +1162,7 @@ test "collect dynamic records includes an entity that fell to a level within the
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addLevel(-level_z_step);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const scene = GameplayScene{
@@ -1229,7 +1229,7 @@ test "collect dynamic records excludes an entity beyond the render window depth"
     };
     defer world.deinit();
     for (0..8) |_| _ = try world.addLevel(0);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const scene = GameplayScene{
@@ -1400,6 +1400,30 @@ test "visible world rect uses half-open point containment" {
     try std.testing.expect(!rect.containsPoint(.{ .x = 10, .y = 120 }));
 }
 
+// Registers a fake tile store in a headless renderer and hands it to `world`, so
+// `syncDenseTileStore` validates and queues uploads without touching SDL. The
+// capacity covers any test world, so no sync grows it.
+fn fakeTileStoreForTest(renderer: *Renderer, world: *WorldSystem) !void {
+    try renderer.tile_stores.append(renderer.allocator, .{
+        .buffer = @ptrFromInt(0x1000),
+        .element_capacity = 1 << 20,
+        .directory_elements = 0,
+        .block_elements = 1,
+        .params = std.mem.zeroes(renderer_mod.TilemapParams),
+    });
+    world.gpu_tiles.store = @fromBackingInt(@intCast(renderer.tile_stores.items.len - 1));
+}
+
+fn deinitFakeTileStoresForTest(renderer: *Renderer) void {
+    for (renderer.tile_stores.items) |*store| {
+        store.pending_spans.deinit(renderer.allocator);
+        store.pending_values.deinit(renderer.allocator);
+    }
+    renderer.tile_stores.deinit(renderer.allocator);
+    renderer.tile_merge_spans.deinit(renderer.allocator);
+    renderer.tile_merge_values.deinit(renderer.allocator);
+}
+
 fn testWorldTilesetMeta() !WorldTilesetMeta {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     return try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -1425,11 +1449,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     // Neither `active_level` special-casing nor the old per-layer-draw design
     // needed this; the general interleave-point rule is what must catch it.
     _ = try world.addSparseTile(level1, 0, 0, tree, 0, .effect);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0);
-    // Fake the combined GPU tile-data buffer so submitStaticDenseGeometry skips
-    // the real GPU upload (unavailable headless), mirroring world_system.zig's
-    // "setDenseTile queues a GPU cell edit only once the combined buffer exists".
-    world.dense_tile_data_buffer = @fromBackingInt(0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -1461,6 +1481,8 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     defer renderer.static_colors.deinit(allocator);
     defer renderer.static_groups.deinit(allocator);
     defer renderer.draw_list.deinit(allocator);
+    try fakeTileStoreForTest(&renderer, &world);
+    defer deinitFakeTileStoresForTest(&renderer);
 
     var prep = DynamicScenePrep.init(allocator);
     defer prep.deinit();
@@ -1525,8 +1547,7 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
         prep.depth_spans.appendAssumeCapacity(.{ .start = 0, .end = 0, .depth = gap_start_depth + 10 });
         _ = try world.addSparseTile(0, 0, 0, grass, gap_start_depth + 13, .effect);
     }
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0);
-    world.dense_tile_data_buffer = @fromBackingInt(0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0, 0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -1551,6 +1572,8 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
     defer renderer.static_colors.deinit(allocator);
     defer renderer.static_groups.deinit(allocator);
     defer renderer.draw_list.deinit(allocator);
+    try fakeTileStoreForTest(&renderer, &world);
+    defer deinitFakeTileStoresForTest(&renderer);
 
     const scene = GameplayScene{
         .data = undefined,

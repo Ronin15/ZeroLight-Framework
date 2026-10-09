@@ -55,6 +55,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     chunk_scale.dig_group,
     chunk_scale.cave_in_group,
     chunk_scale.explosion_fill_group,
+    chunk_scale.gpu_sync_dig_group,
+    chunk_scale.gpu_sync_level_enter_group,
     render_prep.group,
     render_game_prep.group,
     render_game_prep.dense_surface_group,

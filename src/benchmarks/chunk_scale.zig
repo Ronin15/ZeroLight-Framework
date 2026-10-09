@@ -9,11 +9,19 @@
 //!   - `chunk-scale-cave-in`: a 32x32 tunnel region on four stacked levels collapses
 //!     to solid and is carved back, in one step each.
 //!   - `chunk-scale-explosion-fill`: a radius-12 disk is blown open and filled back.
+//!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the
+//!     digs and after the refills (64 blocks taken, then freed). Flat.
+//!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
+//!     and back, each step one level entering (its directory and 64 mixed blocks)
+//!     and one leaving. Linear in chunks per level, flat across depth.
 //! Every write goes through the step's reserve seam (`reserveDenseCellWrite`) first.
 //! Changes sit on the deepest levels at the level center; each iteration ends at its
 //! start state. The item count encodes the case as `level side * 1000 + levels`.
-//! Fixtures build once per case outside the timed loop. Terrain edits run on the
-//! main thread, so only the serial case is measured.
+//! Fixtures build once per case outside the timed loop. Terrain edits and GPU
+//! syncs run on the main thread, so only the serial case is measured. The GPU
+//! sync groups drive `syncDenseTileStore` against a headless renderer whose tile
+//! store has no GPU buffer: they time planning, commit, and the queued upload
+//! batch, which the bench drops after each sync as a frame copy pass would.
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -24,6 +32,10 @@ const TileId = @import("../game/world_system.zig").TileId;
 const invalid_tile_id = @import("../game/world_system.zig").invalid_tile_id;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
+const Renderer = @import("../render/renderer.zig").Renderer;
+const TilemapParams = @import("../render/renderer.zig").TilemapParams;
+const tile_store_max_elements = @import("../render/renderer.zig").tile_store_max_elements;
+const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
 const suite = @import("suite.zig");
 
 const level_sides = [_]u16{ 256, 1024, 2048 };
@@ -44,6 +56,8 @@ const dig_cell_count: u16 = 64;
 const cave_in_edge: u16 = 32;
 const cave_in_levels: u16 = 4;
 const explosion_radius: i32 = 12;
+// The GPU sync groups render a two-level window: `active_level` and the one below.
+const gpu_window_levels_below: u16 = 1;
 
 pub const dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-dig",
@@ -63,11 +77,23 @@ pub const explosion_fill_group = suite.BenchmarkGroup{
     .runCase = runExplosionFillCase,
 };
 
+pub const gpu_sync_dig_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-gpu-sync-dig",
+    .defaultItemCounts = scaleItemCounts,
+    .runCase = runGpuSyncDigCase,
+};
+
+pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-gpu-sync-level-enter",
+    .defaultItemCounts = scaleItemCounts,
+    .runCase = runGpuSyncLevelEnterCase,
+};
+
 fn scaleItemCounts(_: suite.Profile) []const usize {
     return &scale_item_counts;
 }
 
-const Workload = enum { dig, cave_in, explosion_fill };
+const Workload = enum { dig, cave_in, explosion_fill, gpu_sync_dig, gpu_sync_level_enter };
 
 fn runDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCase(allocator, io, options, case, item_count, .dig);
@@ -81,16 +107,79 @@ fn runExplosionFillCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     return runCase(allocator, io, options, case, item_count, .explosion_fill);
 }
 
+fn runGpuSyncDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, item_count, .gpu_sync_dig);
+}
+
+fn runGpuSyncLevelEnterCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, item_count, .gpu_sync_level_enter);
+}
+
 const Fixture = struct {
     world: WorldSystem,
     dirt: TileId,
     tunnel: TileId,
     side: u16,
     levels: u16,
+    // GPU sync groups only: a headless renderer holding the world's tile store.
+    renderer: ?Renderer = null,
 
     fn deinit(self: *Fixture) void {
+        if (self.renderer) |*renderer| {
+            for (renderer.tile_stores.items) |*store| {
+                store.pending_spans.deinit(renderer.allocator);
+                store.pending_values.deinit(renderer.allocator);
+            }
+            renderer.tile_stores.deinit(renderer.allocator);
+            renderer.tile_merge_spans.deinit(renderer.allocator);
+            renderer.tile_merge_values.deinit(renderer.allocator);
+            renderer.batch.deinit();
+        }
         self.world.deinit();
         self.* = undefined;
+    }
+
+    // Gives the world a tile store with no GPU buffer, large enough that no sync
+    // grows it (growth would create a GPU buffer).
+    fn attachHeadlessTileStore(self: *Fixture, allocator: std.mem.Allocator) !void {
+        self.renderer = Renderer{
+            .allocator = allocator,
+            .device = undefined,
+            .window = undefined,
+            .pipeline = undefined,
+            .tilemap_pipeline = undefined,
+            .sampler = undefined,
+            .vertex_streams = undefined,
+            .batch_capacity_vertices = 0,
+            .batch = SpriteBatch.init(allocator),
+        };
+        const renderer = &self.renderer.?;
+        try renderer.tile_stores.append(allocator, .{
+            // Never dereferenced: syncs only validate and queue.
+            .buffer = @ptrFromInt(0x1000),
+            .element_capacity = tile_store_max_elements,
+            .directory_elements = 0,
+            .block_elements = 1,
+            .params = std.mem.zeroes(TilemapParams),
+        });
+        self.world.gpu_tiles.store = @fromBackingInt(0);
+        self.world.render_window = .{ .levels_below = gpu_window_levels_below };
+    }
+
+    // One GPU tile sync; returns the elements it uploads and drops the batch.
+    fn syncGpuTiles(self: *Fixture, active_level: u16) !usize {
+        const renderer = &self.renderer.?;
+        try self.world.syncDenseTileStore(renderer, active_level);
+        const store = &renderer.tile_stores.items[0];
+        const uploaded = store.pending_values.items.len;
+        store.pending_spans.clearRetainingCapacity();
+        store.pending_values.clearRetainingCapacity();
+        return uploaded;
+    }
+
+    // The window's top level for the GPU sync groups: the deepest level is resident.
+    fn gpuActiveLevel(self: *const Fixture) u16 {
+        return self.levels - 1 - gpu_window_levels_below;
     }
 
     // Floor layer of `level`; level `i` owns layer `i`.
@@ -136,7 +225,20 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
-    if (workload == .cave_in) _ = try applyCaveInRegion(&fixture, fixture.tunnel);
+    switch (workload) {
+        .cave_in => _ = try applyCaveInRegion(&fixture, fixture.tunnel),
+        .gpu_sync_dig => {
+            try fixture.attachHeadlessTileStore(allocator);
+            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+        },
+        .gpu_sync_level_enter => {
+            try fixture.attachHeadlessTileStore(allocator);
+            // 64 mixed chunks on each level the window crosses.
+            for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel);
+            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
+        },
+        .dig, .explosion_fill => {},
+    }
 
     for (0..options.warmup_iterations) |_| _ = try runIteration(&fixture, workload);
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -147,16 +249,29 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), suite.serialBatch(cells_changed, 1));
     }
     var stats = accumulator.finish();
-    // The item count is a case code, so report throughput over the cells written.
+    // The item count is a case code, so report throughput over the cells written
+    // (elements uploaded for the GPU sync groups).
     stats.output_count = cells_changed;
     stats.items_per_second = if (stats.mean_ns == 0) 0 else @intCast(@as(u128, cells_changed) * std.time.ns_per_s / stats.mean_ns);
     return stats;
 }
 
-// One timed change and its reversal; returns the cells written.
+// One timed change and its reversal; returns the cells written, or the elements
+// uploaded for the GPU sync groups.
 fn runIteration(fixture: *Fixture, workload: Workload) !usize {
     return switch (workload) {
         .dig => digAndRefill(fixture),
+        .gpu_sync_dig => blk: {
+            const level = fixture.levels - 1;
+            _ = try digCells(fixture, level, fixture.tunnel);
+            const split = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            _ = try digCells(fixture, level, fixture.dirt);
+            break :blk split + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+        },
+        .gpu_sync_level_enter => blk: {
+            const entered = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            break :blk entered + try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
+        },
         .cave_in => blk: {
             const collapsed = try applyCaveInRegion(fixture, fixture.dirt);
             break :blk collapsed + try applyCaveInRegion(fixture, fixture.tunnel);
@@ -186,6 +301,28 @@ fn digAndRefill(fixture: *Fixture) !usize {
         _ = try world.setDenseTile(layer, x, y, fixture.dirt);
     }
     return @as(usize, dig_cell_count) * 2;
+}
+
+// Writes `tile` into the dig workload's 64 cells on `level`, one per chunk, in one step.
+fn digCells(fixture: *Fixture, level: u16, tile: TileId) !usize {
+    const world = &fixture.world;
+    const layer = fixture.floor(level);
+    const chunk = default_chunk_size_tiles;
+    const origin = fixture.side / 2 - 4 * chunk;
+    world.beginDenseCellWriteReserve();
+    for (0..2) |pass| {
+        var cell_index: u16 = 0;
+        while (cell_index < dig_cell_count) : (cell_index += 1) {
+            const x = origin + (cell_index % 8) * chunk + 5;
+            const y = origin + (cell_index / 8) * chunk + 7;
+            if (pass == 0) {
+                try world.reserveDenseCellWrite(layer, x, y, tile);
+            } else {
+                _ = try world.setDenseTile(layer, x, y, tile);
+            }
+        }
+    }
+    return dig_cell_count;
 }
 
 // Writes `tile` over the cave-in region on the four deepest levels in one step.

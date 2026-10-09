@@ -10,8 +10,11 @@ const log = @import("../core/logging.zig").platform;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
+const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
 const packTileData = @import("../render/renderer.zig").packTileData;
-const tileDataElementCount = @import("../render/renderer.zig").tileDataElementCount;
+const tile_store_directory_slots = @import("../render/renderer.zig").tile_store_directory_slots;
+const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
+const tileStoreUniformWord = @import("../render/renderer.zig").tileStoreUniformWord;
 const TilemapWindowLayers = Renderer.TilemapWindowLayers;
 const Position = @import("../render/renderer.zig").Position;
 const Uv = @import("../render/renderer.zig").Uv;
@@ -49,26 +52,42 @@ pub fn main(init: std.process.Init) !void {
     var renderer = try Renderer.init(init.gpa, window.handle, assets, app_config);
     defer renderer.deinit();
 
-    // Two 3x1 layers concatenated in one combined buffer: a topmost layer with
-    // one dug hole (invalid_tile_id) and a fully solid layer beneath it. This
-    // exercises the fragment shader's multi-layer compositing loop (a real
-    // GPU read at layer_offsets[1] beyond the first uvec4 lane, not just the
-    // single-layer pass-through) end to end, not just the trivial 1-layer case.
-    // The odd per-layer cell count starts the bottom layer mid-element, so the
-    // hole's fall-through reads flat cell 0 (element 0 low half) and then flat
-    // cell 3 (element 1 high half), crossing an element boundary.
+    // A 3x1 grid in one 4x4-cell chunk, two layers in directory slots 0 and 1 of a
+    // tile store: the topmost layer is a mixed chunk (a block with one dug hole,
+    // invalid_tile_id) and the layer beneath it a uniform chunk. This exercises the
+    // fragment shader's directory lookup on both word kinds and its multi-layer
+    // compositing loop end to end: the hole falls through from a block read in
+    // slot 0 to a uniform word in slot 1. The store starts with no block room, so
+    // queueing the block grows it: the frame copy pass copies the old buffer's
+    // unwritten directory words forward around the two uploaded ones.
     const invalid_tile_id: u16 = 65535;
-    const tiles = [_]u16{
-        invalid_tile_id, 1, 1, // topmost layer, offset 0: one hole
-        1, 1, 1, // bottom layer, offset 3: solid, revealed through the hole
+    const chunk_edge: u16 = 4;
+    const block_elements = comptime tileStoreBlockElements(chunk_edge);
+    const directory_elements: u32 = tile_store_directory_slots;
+    var block_cells: [chunk_edge * chunk_edge]u16 = @splat(1);
+    block_cells[0] = invalid_tile_id;
+    var values: [2 + block_elements]u32 = undefined;
+    values[0] = 0; // slot 0: block 0
+    values[1] = tileStoreUniformWord(1); // slot 1: uniform
+    packTileData(&block_cells, values[2..]);
+    const spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 2 },
+        .{ .dst_element = directory_elements, .count = block_elements },
     };
-    var packed_tiles: [tileDataElementCount(tiles.len)]u32 = undefined;
-    packTileData(&tiles, &packed_tiles);
-    const tile_params = TilemapParams{
+    var tile_params = TilemapParams{
         .grid = .{ 16.0, 3.0, 1.0, @floatFromInt(invalid_tile_id) },
         .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
     };
-    const tile_data = try renderer.createTileDataBuffer(&packed_tiles, tile_params);
+    tile_params.layer_meta[2] = @ctz(chunk_edge);
+    tile_params.layer_meta[3] = 1;
+    const tile_store = try renderer.createTileStore(.{
+        .directory_elements = directory_elements,
+        .block_elements = block_elements,
+        .element_capacity = directory_elements,
+        .params = tile_params,
+    });
+    try renderer.reserveTileStoreUploads(tile_store, directory_elements + block_elements, spans.len, values.len);
+    try renderer.queueTileStoreUploads(tile_store, &spans, &values);
 
     // Sprite submit is reserve-first for allocation-free frames (see
     // Renderer.reserveSpriteCommands). The capacity is grow-only and survives
@@ -91,16 +110,17 @@ pub fn main(init: std.process.Init) !void {
         .uvs = &tile_uvs,
         .colors = &tile_colors,
     });
-    // Topmost-first: the holed layer at offset 0, the solid layer at offset 3.
+    // Topmost-first directory offsets (slot * chunks per level): the holed layer in
+    // slot 0, the solid layer in slot 1.
     var window_layers = TilemapWindowLayers{};
     window_layers.count = 2;
     window_layers.offsets[0] = 0;
-    window_layers.offsets[1] = 3;
+    window_layers.offsets[1] = 1;
     try renderer.appendStaticTilemapSpan(
         renderer.white_texture,
         RenderOrder.world(@backingInt(SmokeDepth.test_tilemap)),
         .{ .positions = &tile_positions, .uvs = &tile_uvs, .colors = &tile_colors },
-        tile_data,
+        tile_store,
         window_layers,
     );
 

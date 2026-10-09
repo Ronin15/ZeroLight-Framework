@@ -416,12 +416,12 @@ fn setBenchCollectChunkVisibility(fixture: *Fixture) void {
         .y = 0,
         .w = fixture.world_width_px,
         .h = fixture.world_height_px,
-    }, 0);
+    }, 0, fixture.player_level);
 }
 
 fn setBenchSparseEmitChunkVisibility(fixture: *Fixture) void {
     const camera_rect = cameraWorldRect(fixture.world_width_px, fixture.world_height_px);
-    fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks);
+    fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks, fixture.player_level);
 }
 
 /// Full-world pixel bounds for entity collect. Perf benches target the requested
@@ -574,7 +574,9 @@ fn initFixture(
     }
 
     const deco = try requireTile(&fixture.tileset_meta, "deco_0");
-    const level: u16 = 0;
+    // Sparse tiles sit on the player's level so both variants draw them: sparse
+    // tiles draw only on the render window's levels.
+    const level: u16 = fixture_config.player_level;
 
     for (0..sparse_tile_count) |index| {
         const x: u16 = @intCast((index % sparse_grid_side) * 2 + 4);

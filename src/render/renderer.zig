@@ -63,11 +63,11 @@ pub const FrameResult = enum {
 };
 
 pub const TileDataId = resources.TileDataId;
+pub const TileStoreSpan = gpu_buffer.StorageSpan;
 
-/// Tile-data storage packs two 16-bit tile ids per `u32` element: flat cell `i`
-/// lives in element `i >> 1`, in the low half when `i` is even. `u32` elements
-/// avoid a 16-bit storage extension; `tilemap.frag.glsl`'s `tileAt` is the
-/// matching unpack. Layer offsets (`TilemapWindowLayers.offsets`) stay in cells.
+/// Tile blocks pack two 16-bit tile ids per `u32` element: local cell `i` lives in
+/// element `i >> 1`, in the low half when `i` is even. `u32` elements avoid a 16-bit
+/// storage extension; `tilemap.frag.glsl`'s `tileAt` is the matching unpack.
 pub const tile_data_cells_per_element: usize = 2;
 /// Fills the unread high half of a trailing element when the cell count is odd.
 pub const tile_data_pad_cell: u16 = std.math.maxInt(u16);
@@ -96,39 +96,178 @@ pub fn packTileData(cells: []const u16, out: []u32) void {
     }
 }
 
-/// Overwrites the value of a `pending` region targeting the same buffer element
-/// as `region`; returns false when none does.
-fn replacePendingStorageRegion(pending: []gpu_buffer.StorageRegion, region: gpu_buffer.StorageRegion) bool {
-    for (pending) |*slot| {
-        if (slot.buffer == region.buffer and slot.element_index == region.element_index) {
-            slot.value = region.value;
-            return true;
+/// Tile store layout, shared with `tilemap.frag.glsl`: `tile_store_directory_slots`
+/// directories of one word per chunk (`chunks_x * chunks_y` words each), then a
+/// block region of `tileStoreBlockElements(chunk_edge)` elements per block. A
+/// directory word with `tile_store_uniform_bit` set is a uniform chunk whose tile is
+/// the low 16 bits; any other word is the chunk's block index. A block holds the
+/// chunk's tiles in local row-major order (`(y % edge) * edge + x % edge`), packed
+/// by `packTileData`.
+pub const tile_store_directory_slots: usize = sprite_batch.k_max_tilemap_window_layers;
+pub const tile_store_uniform_bit: u32 = 1 << 31;
+/// Largest element count whose byte size fits SDL's `u32` buffer size and offsets.
+pub const tile_store_max_elements: u32 = std.math.maxInt(u32) / @sizeOf(gpu_buffer.StorageElement);
+
+pub fn tileStoreUniformWord(tile: u16) u32 {
+    return tile_store_uniform_bit | tile;
+}
+
+pub fn tileStoreBlockElements(chunk_edge: u16) u32 {
+    return @intCast(tileDataElementCount(@as(usize, chunk_edge) * chunk_edge));
+}
+
+/// One world's tile store. `params.layer_meta[2]` is the chunk shift (`log2` of the
+/// chunk edge) and `params.layer_meta[3]` the chunks per row; `directory_elements`
+/// and `block_elements` must match them and the grid size (`validateTileStoreDesc`).
+pub const TileStoreDesc = struct {
+    directory_elements: u32,
+    block_elements: u32,
+    element_capacity: u32,
+    params: TilemapParams,
+};
+
+pub fn validateTileStoreDesc(desc: TileStoreDesc) error{InvalidTileStoreLayout}!void {
+    const shift = desc.params.layer_meta[2];
+    const chunks_x = desc.params.layer_meta[3];
+    if (shift < 0 or shift > 4 or chunks_x <= 0) return error.InvalidTileStoreLayout;
+    const grid_w = desc.params.grid[1];
+    const grid_h = desc.params.grid[2];
+    if (!(grid_w >= 1 and grid_w <= std.math.maxInt(u16) and grid_h >= 1 and grid_h <= std.math.maxInt(u16))) {
+        return error.InvalidTileStoreLayout;
+    }
+    const edge: u64 = @as(u64, 1) << @intCast(shift);
+    const width: u64 = @intFromFloat(grid_w);
+    const height: u64 = @intFromFloat(grid_h);
+    if ((width + edge - 1) / edge != @as(u64, @intCast(chunks_x))) return error.InvalidTileStoreLayout;
+    const chunk_count = @as(u64, @intCast(chunks_x)) * ((height + edge - 1) / edge);
+    if (desc.directory_elements != tile_store_directory_slots * chunk_count) return error.InvalidTileStoreLayout;
+    if (desc.block_elements != tileStoreBlockElements(@intCast(edge))) return error.InvalidTileStoreLayout;
+    if (desc.element_capacity < desc.directory_elements or desc.element_capacity > tile_store_max_elements) {
+        return error.InvalidTileStoreLayout;
+    }
+}
+
+/// Element capacity after growing a store to hold `required` elements: the block
+/// region doubles until it fits, clamped to `tile_store_max_elements`.
+fn tileStoreGrownCapacity(directory_elements: u32, block_elements: u32, current: u32, required: u32) error{GpuBufferTooLarge}!u32 {
+    std.debug.assert(current >= directory_elements and block_elements > 0);
+    if (required <= current) return current;
+    if (required > tile_store_max_elements) return error.GpuBufferTooLarge;
+    var blocks: u64 = @max(1, (current - directory_elements) / block_elements);
+    while (directory_elements + blocks * block_elements < required) blocks *= 2;
+    return @intCast(@min(@as(u64, directory_elements) + blocks * block_elements, tile_store_max_elements));
+}
+
+/// The ranges of a grown store's previous contents to copy forward: elements
+/// `[0, source_elements)` less the pending spans (sorted), which overwrite theirs in
+/// the same copy pass, so no element is written twice.
+const GrowthCopySegments = struct {
+    spans: []const TileStoreSpan,
+    source_elements: u32,
+    cursor: u32 = 0,
+    span_index: usize = 0,
+
+    fn next(self: *GrowthCopySegments) ?TileStoreSpan {
+        while (self.cursor < self.source_elements) {
+            if (self.span_index == self.spans.len) {
+                const tail = TileStoreSpan{ .dst_element = self.cursor, .count = self.source_elements - self.cursor };
+                self.cursor = self.source_elements;
+                return tail;
+            }
+            const span = self.spans[self.span_index];
+            if (span.dst_element <= self.cursor) {
+                self.cursor = @max(self.cursor, @as(u32, @intCast(@min(span.end(), self.source_elements))));
+                self.span_index += 1;
+                continue;
+            }
+            const segment_end = @min(span.dst_element, self.source_elements);
+            const segment = TileStoreSpan{ .dst_element = self.cursor, .count = segment_end - self.cursor };
+            self.cursor = segment_end;
+            return segment;
+        }
+        return null;
+    }
+};
+
+/// Folds a new batch into a store's batch still pending from a skipped frame. Both
+/// are sorted and disjoint, and any old and new span are disjoint or nested: a new
+/// span covering an old one replaces it, and a new span inside an old one patches
+/// the old span's values in place. `out_*` must hold both batches.
+fn mergeTileStoreSpans(
+    old_spans: []const TileStoreSpan,
+    old_values: []u32,
+    new_spans: []const TileStoreSpan,
+    new_values: []const u32,
+    out_spans: *std.ArrayList(TileStoreSpan),
+    out_values: *std.ArrayList(u32),
+) void {
+    std.debug.assert(out_spans.capacity - out_spans.items.len >= old_spans.len + new_spans.len);
+    std.debug.assert(out_values.capacity - out_values.items.len >= old_values.len + new_values.len);
+    var old_index: usize = 0;
+    var old_value: usize = 0;
+    var new_index: usize = 0;
+    var new_value: usize = 0;
+    while (old_index < old_spans.len or new_index < new_spans.len) {
+        const take_old = if (new_index == new_spans.len)
+            true
+        else if (old_index == old_spans.len)
+            false
+        else blk: {
+            const old = old_spans[old_index];
+            const new = new_spans[new_index];
+            if (old.end() <= new.dst_element) break :blk true;
+            if (new.end() <= old.dst_element) break :blk false;
+            if (new.dst_element <= old.dst_element and old.end() <= new.end()) {
+                old_value += old.count;
+                old_index += 1;
+                continue;
+            }
+            std.debug.assert(old.dst_element <= new.dst_element and new.end() <= old.end());
+            const patch_start = old_value + (new.dst_element - old.dst_element);
+            @memcpy(old_values[patch_start..][0..new.count], new_values[new_value..][0..new.count]);
+            new_value += new.count;
+            new_index += 1;
+            continue;
+        };
+        if (take_old) {
+            const old = old_spans[old_index];
+            out_spans.appendAssumeCapacity(old);
+            out_values.appendSliceAssumeCapacity(old_values[old_value..][0..old.count]);
+            old_value += old.count;
+            old_index += 1;
+        } else {
+            const new = new_spans[new_index];
+            out_spans.appendAssumeCapacity(new);
+            out_values.appendSliceAssumeCapacity(new_values[new_value..][0..new.count]);
+            new_value += new.count;
+            new_index += 1;
         }
     }
-    return false;
 }
 
-/// Debug-checks the one-write-per-element batch contract: edits are strictly
-/// increasing by (`buffer`, `element_index`), so no element repeats.
-fn assertTileDataEditsSortedUnique(edits: []const TileDataEdit) void {
-    if (edits.len < 2) return;
-    for (edits[0 .. edits.len - 1], edits[1..]) |prev, next| {
-        const prev_buffer = @backingInt(prev.buffer);
-        const next_buffer = @backingInt(next.buffer);
-        std.debug.assert(prev_buffer < next_buffer or
-            (prev_buffer == next_buffer and prev.element_index < next.element_index));
-    }
-}
+// One world's GPU tile store. A released slot has a null buffer.
+const TileStore = struct {
+    buffer: ?*c.SDL_GPUBuffer,
+    element_capacity: u32,
+    directory_elements: u32,
+    block_elements: u32,
+    params: TilemapParams,
+    // Uploads not yet recorded, sorted and disjoint; values concatenated in span order.
+    pending_spans: std.ArrayList(TileStoreSpan) = .empty,
+    pending_values: std.ArrayList(u32) = .empty,
+    // After a growth not yet recorded: the buffer holding the last recorded contents.
+    growth_source: ?*c.SDL_GPUBuffer = null,
+    growth_source_elements: u32 = 0,
+    // First transfer element of this store's values staged this frame.
+    staged_first_element: u32 = 0,
 
-/// One queued tile-data element edit: write the packed `value` at
-/// `element_index` of `buffer`. Game code accumulates these on tile changes and
-/// flushes them to the GPU once per frame at the render boundary. One batch must
-/// be sorted with at most one edit per element (`uploadTileDataEdits`):
-/// overlapping writes in one copy pass have no defined order.
-pub const TileDataEdit = struct {
-    buffer: TileDataId,
-    element_index: usize,
-    value: u32,
+    const released = TileStore{
+        .buffer = null,
+        .element_capacity = 0,
+        .directory_elements = 0,
+        .block_elements = 0,
+        .params = std.mem.zeroes(TilemapParams),
+    };
 };
 
 // One GPU vertex buffer + its upload transfer buffer per SoA column. The three
@@ -233,8 +372,8 @@ pub const Renderer = struct {
     pub const k_max_dense_composite_draws: usize = 32;
 
     /// One tilemap draw's composited layer window: up to
-    /// `k_max_tilemap_window_layers` cell offsets into a combined tile-data
-    /// buffer, topmost layer first. The fragment shader walks these in order and
+    /// `k_max_tilemap_window_layers` directory start words in the world's tile
+    /// store, topmost layer first. The fragment shader walks these in order and
     /// stops at the first opaque cell. `is_shallowest_bucket` is true only for
     /// the composite draw holding the frame's overall shallowest submitted dense
     /// layer (`world_system.zig`'s `submitStaticDenseGeometry`) — the fragment
@@ -268,24 +407,17 @@ pub const Renderer = struct {
     vertex_streams: VertexStreams,
     batch_capacity_vertices: usize,
     texture_slots: std.ArrayList(TextureSlot) = .empty,
-    // GPU-driven tilemap tile-data: graphics-storage-read buffers of packed
-    // tile-id elements (see `packTileData`). Renderer-owned so world keeps only
-    // opaque handles and never crosses the render/gpu boundary.
-    tile_data_buffers: std.ArrayList(*c.SDL_GPUBuffer) = .empty,
-    // World-constant grid/atlas uniform per tile-data buffer (parallel to
-    // tile_data_buffers). Kept here rather than on each DrawGroup so the per-frame
-    // draw-group sort/coalesce/merge stays small.
-    tile_data_params: std.ArrayList(TilemapParams) = .empty,
-    // Element count per tile-data buffer (parallel to tile_data_buffers) so the
-    // dig-edit upload boundary can reject an out-of-range element_index before it
-    // becomes an out-of-bounds GPU buffer write.
-    tile_data_counts: std.ArrayList(u32) = .empty,
-    // Grow-only scratch resolving queued tile-data edits (handles) to GPU buffers
-    // for one batched dig upload per frame.
-    tile_edit_scratch: std.ArrayList(gpu_buffer.StorageRegion) = .empty,
-    tile_edit_transfer: ?*c.SDL_GPUTransferBuffer = null,
-    tile_edit_transfer_byte_size: u32 = 0,
-    tile_edits_pending: bool = false,
+    // Per-world GPU tile stores (`createTileStore`), indexed by `TileDataId`.
+    // Renderer-owned so a world keeps only its opaque handle. Released slots are
+    // reused from `tile_store_free`, whose capacity always covers every slot.
+    tile_stores: std.ArrayList(TileStore) = .empty,
+    tile_store_free: std.ArrayList(u32) = .empty,
+    // Grow-only scratch for folding a new batch into one carried from a skipped frame.
+    tile_merge_spans: std.ArrayList(TileStoreSpan) = .empty,
+    tile_merge_values: std.ArrayList(u32) = .empty,
+    // Pooled transfer buffer holding every store's pending values for one copy pass.
+    tile_upload_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    tile_upload_transfer_byte_size: u32 = 0,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
     first_free_texture_slot: ?u32 = null,
@@ -391,16 +523,16 @@ pub const Renderer = struct {
             }
         }
         self.texture_slots.deinit(self.allocator);
-        for (self.tile_data_buffers.items) |buffer| {
-            c.SDL_ReleaseGPUBuffer(self.device, buffer);
+        for (self.tile_stores.items, 0..) |store, index| {
+            if (store.buffer != null) self.releaseTileStore(@fromBackingInt(@intCast(index)));
         }
-        self.tile_data_buffers.deinit(self.allocator);
-        self.tile_data_params.deinit(self.allocator);
-        self.tile_data_counts.deinit(self.allocator);
-        self.tile_edit_scratch.deinit(self.allocator);
-        if (self.tile_edit_transfer) |transfer| {
+        self.tile_stores.deinit(self.allocator);
+        self.tile_store_free.deinit(self.allocator);
+        self.tile_merge_spans.deinit(self.allocator);
+        self.tile_merge_values.deinit(self.allocator);
+        if (self.tile_upload_transfer) |transfer| {
             c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
-            self.tile_edit_transfer = null;
+            self.tile_upload_transfer = null;
         }
         self.deinitBatchStorage();
         self.static_positions.deinit(self.allocator);
@@ -516,7 +648,7 @@ pub const Renderer = struct {
     }
 
     /// Appends one retained world-space quad that composites `window_layers`
-    /// (topmost-first offsets into a combined tile-data buffer) via the tilemap
+    /// (topmost-first directories of the `tile_data` store) via the tilemap
     /// pipeline: the fragment shader walks them per pixel, stopping at the first
     /// opaque cell, and samples `atlas_texture`. `vertices` are the quad's
     /// world-space corners (6). Must be called between `beginStaticGeometry` and
@@ -695,7 +827,7 @@ pub const Renderer = struct {
         // gpu/buffer.zig): the map rotates to fresh backing storage rather than
         // overwriting bytes a prior frame's copy pass may still reference. The
         // static buffer uses the same cycle=true upload, only when dirty.
-        // Tile-edit transfer grow (create → WaitForGPUIdle → release-old) and
+        // Tile-store transfer grow (create → WaitForGPUIdle → release-old) and
         // staging also live here so a capacity stall never holds an acquired
         // swapchain and post-acquire work is record-only (matches dynamic verts).
         if (self.batch.positions.items.len > 0) {
@@ -704,9 +836,9 @@ pub const Renderer = struct {
         if (upload_static) {
             try self.stageStaticVertices();
         }
-        const upload_tile_edits = self.tile_edits_pending and self.tile_edit_scratch.items.len > 0;
-        if (upload_tile_edits) {
-            try self.stageTileEdits();
+        const upload_tile_stores = self.tileStoreUploadsPending();
+        if (upload_tile_stores) {
+            try self.stageTileStoreUploads();
         }
 
         const frame = try self.acquireSwapchainFrame(false) orelse return .skipped_no_swapchain;
@@ -718,11 +850,11 @@ pub const Renderer = struct {
         });
 
         const upload_dynamic = self.batch.positions.items.len > 0;
-        if (upload_dynamic or upload_static or upload_tile_edits) {
+        if (upload_dynamic or upload_static or upload_tile_stores) {
             self.recordFrameCopyPass(command_buffer, .{
                 .dynamic = upload_dynamic,
                 .static_vertices = upload_static,
-                .tile_edits = upload_tile_edits,
+                .tile_stores = upload_tile_stores,
             }) catch |err| {
                 log.err("recording frame copy pass failed: {s}", .{@errorName(err)});
                 return finishAcquiredCommandBufferAfterError(command_buffer, "copy pass");
@@ -766,7 +898,7 @@ pub const Renderer = struct {
                 };
                 const tile_buffer: ?*c.SDL_GPUBuffer = switch (group.material) {
                     .sprite => null,
-                    .tilemap => self.tileDataBuffer(group.tile_data) orelse continue,
+                    .tilemap => (self.tileStore(group.tile_data) orelse continue).buffer.?,
                 };
 
                 if (active_material == null or active_material.? != group.material) {
@@ -816,10 +948,10 @@ pub const Renderer = struct {
                     // differs, and an unconditional rebind is correct on every backend.
                     var storage = tile_buffer.?;
                     c.SDL_BindGPUFragmentStorageBuffers(render_pass, 0, &storage, 1);
-                    var params = self.tileDataParams(group.tile_data);
-                    // The per-buffer params carry only the world-constant grid/atlas
-                    // geometry; the per-draw composited layer window (which offsets
-                    // into a possibly-shared buffer this group reads) is set here.
+                    var params = self.tileStore(group.tile_data).?.params;
+                    // The per-store params carry only the world-constant grid, atlas,
+                    // and chunk geometry; the per-draw composited layer window (which
+                    // directories of the shared store this group reads) is set here.
                     applyWindowLayers(&params, self.tilemap_window_layers[group.window_slot]);
                     c.SDL_PushGPUFragmentUniformData(command_buffer, 0, &params, @sizeOf(TilemapParams));
                 }
@@ -994,130 +1126,173 @@ pub const Renderer = struct {
         return ids;
     }
 
-    /// Creates a renderer-owned tile-data storage buffer from row-major cells
-    /// already packed by `packTileData` and returns its handle. `params` is the
-    /// world-constant grid/atlas uniform, stored alongside so draw groups carry only
-    /// the handle. A generic multi-buffer registry: `WorldSystem` registers one
-    /// entry holding every dense layer's cells concatenated, built once at world
-    /// load; draw groups distinguish layers via a per-draw cell offset instead of
-    /// a distinct buffer per layer.
-    pub fn createTileDataBuffer(self: *Renderer, packed_cells: []const u32, params: TilemapParams) !TileDataId {
-        const element_count = std.math.cast(u32, packed_cells.len) orelse return error.TileDataBufferTooLarge;
-        const buffer = try gpu_buffer.uploadStorageData(self.device, packed_cells);
-        errdefer c.SDL_ReleaseGPUBuffer(self.device, buffer);
-        const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
-        if (index == @backingInt(TileDataId.invalid)) return error.TooManyTileDataBuffers;
-        try self.tile_data_buffers.append(self.allocator, buffer);
-        errdefer _ = self.tile_data_buffers.pop();
-        try self.tile_data_params.append(self.allocator, params);
-        errdefer _ = self.tile_data_params.pop();
-        try self.tile_data_counts.append(self.allocator, element_count);
-        log.debug("created tilemap tile-data buffer {d}: {d} packed elements", .{ index, packed_cells.len });
-        return @fromBackingInt(@intCast(index));
+    /// Creates a world's GPU tile store (layout: `tile_store_directory_slots`) with
+    /// `desc.element_capacity` elements and returns its handle. Contents are
+    /// undefined until uploads are queued; draws must read only directories and
+    /// blocks the owner has written. Release with `releaseTileStore`.
+    pub fn createTileStore(self: *Renderer, desc: TileStoreDesc) !TileDataId {
+        try validateTileStoreDesc(desc);
+        const reused = self.tile_store_free.pop();
+        errdefer if (reused) |index| self.tile_store_free.appendAssumeCapacity(index);
+        const index: u32 = reused orelse blk: {
+            const appended = std.math.cast(u32, self.tile_stores.items.len) orelse return error.TooManyTileStores;
+            if (appended == @backingInt(TileDataId.invalid)) return error.TooManyTileStores;
+            try self.tile_stores.ensureUnusedCapacity(self.allocator, 1);
+            // Release pushes the slot back infallibly.
+            try self.tile_store_free.ensureTotalCapacity(self.allocator, self.tile_stores.items.len + 1);
+            break :blk appended;
+        };
+        const buffer = try gpu_buffer.createStorageBuffer(self.device, desc.element_capacity);
+        const store = TileStore{
+            .buffer = buffer,
+            .element_capacity = desc.element_capacity,
+            .directory_elements = desc.directory_elements,
+            .block_elements = desc.block_elements,
+            .params = desc.params,
+        };
+        if (reused == null) self.tile_stores.appendAssumeCapacity(store) else self.tile_stores.items[index] = store;
+        log.debug("created tile store {d}: {d} elements", .{ index, desc.element_capacity });
+        return @fromBackingInt(index);
     }
 
-    /// Queues a batch of packed-element tile edits (the dig path) for upload during
-    /// the next `endFrame` copy pass. The batch must be sorted by strictly
-    /// increasing (`buffer`, `element_index`): one edit per element. Edits whose
-    /// handle no longer resolves are skipped. The scratch list resolves handles to
-    /// buffers and is grow-only.
-    pub fn uploadTileDataEdits(self: *Renderer, edits: []const TileDataEdit) !void {
-        if (edits.len == 0) return;
-        assertTileDataEditsSortedUnique(edits);
-        // Grow-only append: pending edits are held until the post-acquire copy pass
-        // runs so a skipped swapchain frame does not drop dig updates.
-        try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, self.tile_edit_scratch.items.len + edits.len);
-        // Edits still pending from a skipped frame may share an element with this
-        // batch; those are overwritten so the copy pass holds one write per element.
-        const carried = self.tile_edit_scratch.items.len;
-        for (edits) |edit| {
-            const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
-            const element_count = self.tileDataCount(edit.buffer);
-            if (edit.element_index >= element_count) {
-                // Silent under test so the drop path is testable without stderr noise.
-                if (comptime logging.enabled(.warn) and !builtin.is_test) log.warn("dropped tile-data edit: element {d} out of range for buffer {d}", .{
-                    edit.element_index,
-                    @backingInt(edit.buffer),
-                });
-                continue;
-            }
-            const region = gpu_buffer.StorageRegion{
-                .buffer = buffer,
-                .element_index = edit.element_index,
-                .element_count = element_count,
-                .value = edit.value,
-            };
-            if (replacePendingStorageRegion(self.tile_edit_scratch.items[0..carried], region)) continue;
-            self.tile_edit_scratch.appendAssumeCapacity(region);
-        }
-        self.tile_edits_pending = self.tile_edit_scratch.items.len > 0;
-    }
-
-    /// Releases every renderer-owned tile-data storage buffer and resets the
-    /// parallel handle/params/count lists. Required before rebuilding the dense
-    /// tilemap when the renderer outlives the world that created the buffers; app
-    /// shutdown goes through `deinit`, which performs the same release. Waits for
-    /// GPU idle first so in-flight frames (up to `frames_in_flight`) finish
-    /// sampling the buffers/transfer before they are freed.
-    pub fn releaseTileDataBuffers(self: *Renderer) void {
-        const has_buffers = self.tile_data_buffers.items.len > 0 or self.tile_edit_transfer != null;
-        if (has_buffers) self.waitForIdle();
-
-        for (self.tile_data_buffers.items) |buffer| {
-            c.SDL_ReleaseGPUBuffer(self.device, buffer);
-        }
-        self.tile_data_buffers.clearRetainingCapacity();
-        self.tile_data_params.clearRetainingCapacity();
-        self.tile_data_counts.clearRetainingCapacity();
-        self.tile_edit_scratch.clearRetainingCapacity();
-        self.tile_edits_pending = false;
-        if (self.tile_edit_transfer) |transfer| {
-            c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
-            self.tile_edit_transfer = null;
-            self.tile_edit_transfer_byte_size = 0;
+    /// Grows the store to `required_elements` when it is smaller (a new buffer; the
+    /// previous contents copy forward in the next frame copy pass, then the old
+    /// buffer is released) and reserves room for `span_count` spans of
+    /// `value_count` values, so the matching `queueTileStoreUploads` allocates
+    /// nothing. Call before swapchain acquisition.
+    pub fn reserveTileStoreUploads(self: *Renderer, id: TileDataId, required_elements: u32, span_count: usize, value_count: usize) !void {
+        const store = self.tileStore(id) orelse return error.InvalidTileStore;
+        if (required_elements > store.element_capacity) try self.growTileStore(store, required_elements);
+        try store.pending_spans.ensureUnusedCapacity(self.allocator, span_count);
+        try store.pending_values.ensureUnusedCapacity(self.allocator, value_count);
+        if (store.pending_spans.items.len > 0) {
+            try self.tile_merge_spans.ensureTotalCapacity(self.allocator, store.pending_spans.items.len + span_count);
+            try self.tile_merge_values.ensureTotalCapacity(self.allocator, store.pending_values.items.len + value_count);
         }
     }
 
-    /// Ensures the reusable tile-edit transfer buffer is large enough. Mirrors
-    /// `ensureBatchCapacity`: create the new transfer first, idle the GPU, then
-    /// release the old one so a creation failure leaves the live transfer
-    /// untouched and no in-flight copy still reads a freed buffer.
-    fn ensureTileEditTransfer(self: *Renderer, required_bytes: u32) !void {
-        if (self.tile_edit_transfer) |existing| {
-            if (self.tile_edit_transfer_byte_size >= required_bytes) return;
+    /// Queues one upload batch for the store, flushed in the next frame copy pass
+    /// and carried across skipped frames. `spans` must be sorted, disjoint, and
+    /// inside the store, with `values` holding their elements in span order; every
+    /// span of a carried batch must be disjoint from or nested with every new span,
+    /// and the newer values win. Allocation-free after `reserveTileStoreUploads`.
+    pub fn queueTileStoreUploads(self: *Renderer, id: TileDataId, spans: []const TileStoreSpan, values: []const u32) !void {
+        const store = self.tileStore(id) orelse return error.InvalidTileStore;
+        try gpu_buffer.validateStorageSpans(spans, values.len, store.element_capacity);
+        if (spans.len == 0) return;
+        if (store.pending_spans.items.len == 0) {
+            try store.pending_spans.appendSlice(self.allocator, spans);
+            try store.pending_values.appendSlice(self.allocator, values);
+            return;
+        }
+        self.tile_merge_spans.clearRetainingCapacity();
+        self.tile_merge_values.clearRetainingCapacity();
+        try self.tile_merge_spans.ensureTotalCapacity(self.allocator, store.pending_spans.items.len + spans.len);
+        try self.tile_merge_values.ensureTotalCapacity(self.allocator, store.pending_values.items.len + values.len);
+        mergeTileStoreSpans(
+            store.pending_spans.items,
+            store.pending_values.items,
+            spans,
+            values,
+            &self.tile_merge_spans,
+            &self.tile_merge_values,
+        );
+        std.mem.swap(std.ArrayList(TileStoreSpan), &store.pending_spans, &self.tile_merge_spans);
+        std.mem.swap(std.ArrayList(u32), &store.pending_values, &self.tile_merge_values);
+    }
+
+    /// Releases a world's tile store. SDL frees its GPU buffers once in-flight
+    /// frames finish; retained static draws that reference it stop drawing. A no-op
+    /// for a released or invalid handle.
+    pub fn releaseTileStore(self: *Renderer, id: TileDataId) void {
+        const store = self.tileStore(id) orelse return;
+        c.SDL_ReleaseGPUBuffer(self.device, store.buffer.?);
+        if (store.growth_source) |source| c.SDL_ReleaseGPUBuffer(self.device, source);
+        store.pending_spans.deinit(self.allocator);
+        store.pending_values.deinit(self.allocator);
+        store.* = TileStore.released;
+        for (self.static_groups.items) |*group| {
+            if (group.tile_data == id) group.tile_data = .invalid;
+        }
+        std.debug.assert(self.tile_store_free.items.len < self.tile_store_free.capacity);
+        self.tile_store_free.appendAssumeCapacity(@backingInt(id));
+    }
+
+    fn growTileStore(self: *Renderer, store: *TileStore, required_elements: u32) !void {
+        const capacity = try tileStoreGrownCapacity(store.directory_elements, store.block_elements, store.element_capacity, required_elements);
+        const grown = try gpu_buffer.createStorageBuffer(self.device, capacity);
+        if (store.growth_source == null) {
+            store.growth_source = store.buffer;
+            store.growth_source_elements = store.element_capacity;
+        } else {
+            // No frame recorded the replaced buffer; `growth_source` still holds the contents.
+            c.SDL_ReleaseGPUBuffer(self.device, store.buffer.?);
+        }
+        store.buffer = grown;
+        store.element_capacity = capacity;
+        log.debug("grew tile store to {d} elements", .{capacity});
+    }
+
+    fn tileStoreUploadsPending(self: *const Renderer) bool {
+        for (self.tile_stores.items) |store| {
+            if (store.buffer == null) continue;
+            if (store.pending_spans.items.len > 0 or store.growth_source != null) return true;
+        }
+        return false;
+    }
+
+    // Stages every store's pending values into the pooled transfer buffer
+    // (cycle=true, so a reused transfer never overwrites an in-flight copy) and
+    // records where each store's values start. Pre-acquire; the copy pass only records.
+    fn stageTileStoreUploads(self: *Renderer) !void {
+        var total: usize = 0;
+        for (self.tile_stores.items) |*store| {
+            if (store.buffer == null) continue;
+            store.staged_first_element = std.math.cast(u32, total) orelse return error.GpuBufferTooLarge;
+            total += store.pending_values.items.len;
+        }
+        if (total == 0) return;
+        try self.ensureTileUploadTransfer(try gpu_buffer.storageByteSize(total));
+        const transfer = self.tile_upload_transfer.?;
+        const mapped = c.SDL_MapGPUTransferBuffer(self.device, transfer, true) orelse {
+            return sdlError("SDL_MapGPUTransferBuffer");
+        };
+        const staged = @as([*]u32, @ptrCast(@alignCast(mapped)))[0..total];
+        for (self.tile_stores.items) |store| {
+            if (store.buffer == null) continue;
+            @memcpy(staged[store.staged_first_element..][0..store.pending_values.items.len], store.pending_values.items);
+        }
+        c.SDL_UnmapGPUTransferBuffer(self.device, transfer);
+    }
+
+    // Mirrors `ensureBatchCapacity`: create the new transfer first, idle the GPU,
+    // then release the old one, so a creation failure leaves the live transfer
+    // untouched and no in-flight copy still reads a freed buffer.
+    fn ensureTileUploadTransfer(self: *Renderer, required_bytes: u32) !void {
+        if (self.tile_upload_transfer) |existing| {
+            if (self.tile_upload_transfer_byte_size >= required_bytes) return;
 
             const new_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
             errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_transfer);
 
             _ = c.SDL_WaitForGPUIdle(self.device);
             c.SDL_ReleaseGPUTransferBuffer(self.device, existing);
-            self.tile_edit_transfer = new_transfer;
-            self.tile_edit_transfer_byte_size = required_bytes;
+            self.tile_upload_transfer = new_transfer;
+            self.tile_upload_transfer_byte_size = required_bytes;
             return;
         }
 
-        self.tile_edit_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
-        self.tile_edit_transfer_byte_size = required_bytes;
+        self.tile_upload_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
+        self.tile_upload_transfer_byte_size = required_bytes;
     }
 
-    fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
+    fn tileStore(self: *const Renderer, id: TileDataId) ?*TileStore {
         if (id == .invalid) return null;
         const index = @backingInt(id);
-        if (index >= self.tile_data_buffers.items.len) return null;
-        return self.tile_data_buffers.items[index];
-    }
-
-    fn tileDataCount(self: *const Renderer, id: TileDataId) u32 {
-        if (id == .invalid) return 0;
-        const index = @backingInt(id);
-        if (index >= self.tile_data_counts.items.len) return 0;
-        return self.tile_data_counts.items[index];
-    }
-
-    // Direct load: only called for a tilemap group whose `tile_data` already
-    // resolved to a buffer this frame, so the parallel params entry is present.
-    fn tileDataParams(self: *const Renderer, id: TileDataId) TilemapParams {
-        return self.tile_data_params.items[@backingInt(id)];
+        if (index >= self.tile_stores.items.len) return null;
+        const store = &self.tile_stores.items[index];
+        if (store.buffer == null) return null;
+        return store;
     }
 
     fn createInternalTextureFromPixels(
@@ -1291,7 +1466,7 @@ pub const Renderer = struct {
     const FrameCopyPassWork = struct {
         dynamic: bool = false,
         static_vertices: bool = false,
-        tile_edits: bool = false,
+        tile_stores: bool = false,
     };
 
     fn recordFrameCopyPass(
@@ -1304,8 +1479,7 @@ pub const Renderer = struct {
 
         // Every vertex-stream upload below is a full-buffer rewrite, so each
         // passes `cycle=true` independently of what else shares this pass.
-        // Tile-data storage edits are excluded — they target retained
-        // per-layer buffers with partial writes.
+        // Tile-store uploads are excluded: they write retained stores in part.
         if (work.dynamic) {
             const streams = self.vertex_streams;
             try gpu_buffer.recordVertexUploadInPass(
@@ -1368,39 +1542,40 @@ pub const Renderer = struct {
             );
         }
 
-        if (work.tile_edits) {
-            // Staging (map + write values) already happened pre-acquire; only
-            // record the storage-region uploads into the open copy pass here.
-            const transfer = self.tile_edit_transfer.?;
-            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-            std.debug.assert(self.tile_edit_transfer_byte_size >= required_bytes);
-            try gpu_buffer.recordStorageRegionsInPass(
-                copy_pass_scope.pass,
-                transfer,
-                self.tile_edit_transfer_byte_size,
-                self.tile_edit_scratch.items,
-            );
-            self.tile_edits_pending = false;
-            self.tile_edit_scratch.clearRetainingCapacity();
+        if (work.tile_stores) {
+            // Values were staged pre-acquire; this only records. A grown store first
+            // copies its previous contents forward, skipping the elements its
+            // pending spans overwrite, so no element is written twice in the pass.
+            for (self.tile_stores.items) |*store| {
+                const buffer = store.buffer orelse continue;
+                if (store.growth_source) |source| {
+                    var segments = GrowthCopySegments{
+                        .spans = store.pending_spans.items,
+                        .source_elements = store.growth_source_elements,
+                    };
+                    while (segments.next()) |segment| {
+                        try gpu_buffer.recordStorageCopyInPass(copy_pass_scope.pass, source, buffer, segment.dst_element, segment.count);
+                    }
+                }
+                if (store.pending_spans.items.len > 0) {
+                    try gpu_buffer.recordStorageSpansInPass(
+                        copy_pass_scope.pass,
+                        self.tile_upload_transfer.?,
+                        self.tile_upload_transfer_byte_size,
+                        store.staged_first_element,
+                        buffer,
+                        store.element_capacity,
+                        store.pending_spans.items,
+                    );
+                }
+                if (store.growth_source) |source| {
+                    c.SDL_ReleaseGPUBuffer(self.device, source);
+                    store.growth_source = null;
+                }
+                store.pending_spans.clearRetainingCapacity();
+                store.pending_values.clearRetainingCapacity();
+            }
         }
-    }
-
-    /// Ensures tile-edit transfer capacity and stages edit values into the
-    /// pooled transfer buffer (cycle=true). Call pre-acquire so the post-acquire
-    /// copy pass only records `recordStorageRegionsInPass`.
-    fn stageTileEdits(self: *Renderer) !void {
-        const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-        try self.ensureTileEditTransfer(required_bytes);
-        const transfer = self.tile_edit_transfer.?;
-        // cycle=true: transfer is renderer-owned and reused across frames, so
-        // map must rotate to fresh backing rather than overwrite in-flight data.
-        try gpu_buffer.stageStorageRegions(
-            self.device,
-            transfer,
-            self.tile_edit_transfer_byte_size,
-            self.tile_edit_scratch.items,
-            true,
-        );
     }
 
     // Grows the retained static buffer to hold `needed_vertices` (the dense-layer
@@ -2055,85 +2230,153 @@ test "packTileData packs two cells per element low half first and pads an odd ta
     }
 }
 
-test "replacePendingStorageRegion overwrites a carried edit to the same element only" {
-    const buffer_a: *c.SDL_GPUBuffer = @ptrFromInt(0x1000);
-    const buffer_b: *c.SDL_GPUBuffer = @ptrFromInt(0x2000);
-    var pending = [_]gpu_buffer.StorageRegion{
-        .{ .buffer = buffer_a, .element_index = 3, .element_count = 8, .value = 1 },
-        .{ .buffer = buffer_b, .element_index = 3, .element_count = 8, .value = 2 },
+test "mergeTileStoreSpans replaces covered carried spans and patches nested ones" {
+    const allocator = std.testing.allocator;
+    // Carried: a directory word (0), a block (8..12), a single element (20).
+    const old_spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 1 },
+        .{ .dst_element = 8, .count = 4 },
+        .{ .dst_element = 20, .count = 1 },
     };
+    var old_values = [_]u32{ 1, 10, 11, 12, 13, 2 };
+    // New: a whole directory covering element 0, an element inside the carried block,
+    // the same single element again, and a disjoint element.
+    const new_spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 4 },
+        .{ .dst_element = 10, .count = 1 },
+        .{ .dst_element = 16, .count = 1 },
+        .{ .dst_element = 20, .count = 1 },
+    };
+    const new_values = [_]u32{ 100, 101, 102, 103, 99, 50, 3 };
+    var out_spans: std.ArrayList(TileStoreSpan) = .empty;
+    defer out_spans.deinit(allocator);
+    var out_values: std.ArrayList(u32) = .empty;
+    defer out_values.deinit(allocator);
+    try out_spans.ensureTotalCapacity(allocator, old_spans.len + new_spans.len);
+    try out_values.ensureTotalCapacity(allocator, old_values.len + new_values.len);
 
-    try std.testing.expect(replacePendingStorageRegion(&pending, .{ .buffer = buffer_a, .element_index = 3, .element_count = 8, .value = 9 }));
-    try std.testing.expectEqual(@as(u32, 9), pending[0].value);
-    try std.testing.expectEqual(@as(u32, 2), pending[1].value);
+    mergeTileStoreSpans(&old_spans, &old_values, &new_spans, &new_values, &out_spans, &out_values);
 
-    try std.testing.expect(!replacePendingStorageRegion(&pending, .{ .buffer = buffer_a, .element_index = 4, .element_count = 8, .value = 7 }));
-    try std.testing.expect(!replacePendingStorageRegion(pending[0..0], .{ .buffer = buffer_a, .element_index = 3, .element_count = 8, .value = 7 }));
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{
+        .{ .dst_element = 0, .count = 4 },
+        .{ .dst_element = 8, .count = 4 },
+        .{ .dst_element = 16, .count = 1 },
+        .{ .dst_element = 20, .count = 1 },
+    }, out_spans.items);
+    try std.testing.expectEqualSlices(u32, &.{ 100, 101, 102, 103, 10, 11, 99, 13, 50, 3 }, out_values.items);
+    try gpu_buffer.validateStorageSpans(out_spans.items, out_values.items.len, 24);
 }
 
-test "uploadTileDataEdits rewrites a carried element in place and drops stale or out-of-range edits allocation-free" {
+test "growth copy segments skip the elements pending spans overwrite" {
+    const spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 2 },
+        .{ .dst_element = 5, .count = 1 },
+        .{ .dst_element = 9, .count = 4 },
+        .{ .dst_element = 20, .count = 1 },
+    };
+    var segments = GrowthCopySegments{ .spans = &spans, .source_elements = 12 };
+    var copied: [3]TileStoreSpan = undefined;
+    var count: usize = 0;
+    while (segments.next()) |segment| {
+        copied[count] = segment;
+        count += 1;
+    }
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{
+        .{ .dst_element = 2, .count = 3 },
+        .{ .dst_element = 6, .count = 3 },
+    }, copied[0..count]);
+
+    var whole = GrowthCopySegments{ .spans = &.{}, .source_elements = 7 };
+    try std.testing.expectEqual(TileStoreSpan{ .dst_element = 0, .count = 7 }, whole.next().?);
+    try std.testing.expectEqual(@as(?TileStoreSpan, null), whole.next());
+}
+
+test "tile store growth doubles the block region until it fits and clamps to the SDL width" {
+    // 64 directory words, 8-element blocks, room for 2 blocks.
+    try std.testing.expectEqual(@as(u32, 80), try tileStoreGrownCapacity(64, 8, 80, 80));
+    try std.testing.expectEqual(@as(u32, 64 + 4 * 8), try tileStoreGrownCapacity(64, 8, 80, 81));
+    try std.testing.expectEqual(@as(u32, 64 + 16 * 8), try tileStoreGrownCapacity(64, 8, 80, 64 + 9 * 8));
+    // A store with no block room yet starts from one block.
+    try std.testing.expectEqual(@as(u32, 64 + 4 * 8), try tileStoreGrownCapacity(64, 8, 64, 64 + 3 * 8));
+    const near_max = tile_store_max_elements - 8;
+    try std.testing.expectEqual(tile_store_max_elements, try tileStoreGrownCapacity(64, 8, near_max - 1000, near_max));
+    try std.testing.expectError(error.GpuBufferTooLarge, tileStoreGrownCapacity(64, 8, 80, tile_store_max_elements + 1));
+}
+
+test "tile store layout must match the grid and chunk geometry" {
+    // 10x6 cells in 4-cell chunks: 3x2 chunks, 32 directories of 6 words, 8-element blocks.
+    var params = TilemapParams{ .grid = .{ 16, 10, 6, 65535 }, .atlas = .{ 1, 1, 1, 16 } };
+    params.layer_meta[2] = 2;
+    params.layer_meta[3] = 3;
+    const desc = TileStoreDesc{ .directory_elements = 32 * 6, .block_elements = 8, .element_capacity = 32 * 6 + 8, .params = params };
+    try validateTileStoreDesc(desc);
+    var wrong = desc;
+    wrong.directory_elements = 32 * 4;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong = desc;
+    wrong.block_elements = 16;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong = desc;
+    wrong.params.layer_meta[3] = 2;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong = desc;
+    wrong.element_capacity = 32 * 6 - 1;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    try std.testing.expectEqual(@as(u32, 1), tileStoreBlockElements(1));
+    try std.testing.expectEqual(@as(u32, 128), tileStoreBlockElements(16));
+}
+
+test "queueTileStoreUploads folds a carried batch allocation-free after reserve" {
     const allocator = std.testing.allocator;
     var renderer = testRenderer(allocator);
     defer renderer.batch.deinit();
-    defer renderer.tile_edit_scratch.deinit(allocator);
-    defer renderer.tile_data_counts.deinit(allocator);
-    defer renderer.tile_data_buffers.deinit(allocator);
-    // Fake GPU handles: the upload only resolves and compares them, never touches SDL.
-    const buffer_a: *c.SDL_GPUBuffer = @ptrFromInt(0x1000);
-    const buffer_b: *c.SDL_GPUBuffer = @ptrFromInt(0x2000);
-    try renderer.tile_data_buffers.appendSlice(allocator, &.{ buffer_a, buffer_b });
-    try renderer.tile_data_counts.appendSlice(allocator, &.{ 8, 4 });
-    const id_a: TileDataId = @fromBackingInt(0);
-    const id_b: TileDataId = @fromBackingInt(1);
-    // Never created: the handle no longer resolves.
-    const stale: TileDataId = @fromBackingInt(5);
-
-    // First batch stays pending (no `endFrame` copy pass ran), so it is carried.
-    try renderer.uploadTileDataEdits(&.{
-        .{ .buffer = id_a, .element_index = 1, .value = 10 },
-        .{ .buffer = id_a, .element_index = 3, .value = 30 },
-        .{ .buffer = id_b, .element_index = 2, .value = 50 },
+    defer renderer.tile_stores.deinit(allocator);
+    defer renderer.tile_merge_spans.deinit(allocator);
+    defer renderer.tile_merge_values.deinit(allocator);
+    // Fake GPU handle: queueing only validates and records, never touches SDL.
+    try renderer.tile_stores.append(allocator, .{
+        .buffer = @ptrFromInt(0x1000),
+        .element_capacity = 64,
+        .directory_elements = 32,
+        .block_elements = 8,
+        .params = std.mem.zeroes(TilemapParams),
     });
-    try std.testing.expectEqual(@as(usize, 3), renderer.tile_edit_scratch.items.len);
+    const store = &renderer.tile_stores.items[0];
+    defer store.pending_spans.deinit(allocator);
+    defer store.pending_values.deinit(allocator);
+    const id: TileDataId = @fromBackingInt(0);
 
-    const second = [_]TileDataEdit{
-        // Rewrites the carried (a, 3) edit.
-        .{ .buffer = id_a, .element_index = 3, .value = 33 },
-        // Out of range for buffer a's 8 elements: dropped.
-        .{ .buffer = id_a, .element_index = 8, .value = 99 },
-        .{ .buffer = id_b, .element_index = 0, .value = 60 },
-        // Stale handle: dropped.
-        .{ .buffer = stale, .element_index = 0, .value = 77 },
-    };
-    // Warm the scratch the way a reserved frame would, then prove the second call
-    // allocates nothing.
-    try renderer.tile_edit_scratch.ensureTotalCapacity(allocator, renderer.tile_edit_scratch.items.len + second.len);
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    renderer.allocator = failing.allocator();
-    try renderer.uploadTileDataEdits(&second);
-    renderer.allocator = allocator;
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-
-    const regions = renderer.tile_edit_scratch.items;
-    try std.testing.expectEqual(@as(usize, 4), regions.len);
-    var a3_count: usize = 0;
-    for (regions) |region| {
-        if (region.buffer == buffer_a and region.element_index == 3) {
-            a3_count += 1;
-            try std.testing.expectEqual(@as(u32, 33), region.value);
-        }
-        try std.testing.expect(region.element_index < region.element_count);
-        try std.testing.expect(region.value != 99 and region.value != 77);
+    const first_spans = [_]TileStoreSpan{ .{ .dst_element = 3, .count = 1 }, .{ .dst_element = 32, .count = 8 } };
+    const first_values = [_]u32{ 7, 0, 1, 2, 3, 4, 5, 6, 7 };
+    try renderer.reserveTileStoreUploads(id, 40, first_spans.len, first_values.len);
+    // A batch no frame recorded stays pending and the next one folds into it.
+    const second_spans = [_]TileStoreSpan{ .{ .dst_element = 3, .count = 1 }, .{ .dst_element = 34, .count = 1 }, .{ .dst_element = 40, .count = 8 } };
+    const second_values = [_]u32{ 8, 22, 9, 9, 9, 9, 9, 9, 9, 9 };
+    {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        renderer.allocator = failing.allocator();
+        defer renderer.allocator = allocator;
+        try renderer.queueTileStoreUploads(id, &first_spans, &first_values);
+        try std.testing.expectError(error.OutOfMemory, renderer.reserveTileStoreUploads(id, 48, second_spans.len, second_values.len));
     }
-    try std.testing.expectEqual(@as(usize, 1), a3_count);
-    // Carried edits keep their slots; the one new in-range edit appends after them.
-    try std.testing.expectEqual(@as(u32, 10), regions[0].value);
-    try std.testing.expectEqual(@as(u32, 33), regions[1].value);
-    try std.testing.expectEqual(@as(u32, 50), regions[2].value);
-    try std.testing.expect(regions[3].buffer == buffer_b);
-    try std.testing.expectEqual(@as(usize, 0), regions[3].element_index);
-    try std.testing.expectEqual(@as(u32, 60), regions[3].value);
-    try std.testing.expect(renderer.tile_edits_pending);
+    try renderer.reserveTileStoreUploads(id, 48, second_spans.len, second_values.len);
+    {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        renderer.allocator = failing.allocator();
+        defer renderer.allocator = allocator;
+        try renderer.queueTileStoreUploads(id, &second_spans, &second_values);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{
+        .{ .dst_element = 3, .count = 1 },
+        .{ .dst_element = 32, .count = 8 },
+        .{ .dst_element = 40, .count = 8 },
+    }, store.pending_spans.items);
+    try std.testing.expectEqualSlices(u32, &.{ 8, 0, 1, 22, 3, 4, 5, 6, 7, 9, 9, 9, 9, 9, 9, 9, 9 }, store.pending_values.items);
+    // Out of bounds, unsorted, or a stale handle never reaches the queue.
+    try std.testing.expectError(error.GpuUploadOutOfBounds, renderer.queueTileStoreUploads(id, &.{.{ .dst_element = 63, .count = 2 }}, &.{ 1, 2 }));
+    try std.testing.expectError(error.InvalidTileStore, renderer.queueTileStoreUploads(@fromBackingInt(1), &.{}, &.{}));
+    try std.testing.expectEqual(@as(usize, 3), store.pending_spans.items.len);
 }
 
 test "tileDataElementCount halves cell counts rounding up" {

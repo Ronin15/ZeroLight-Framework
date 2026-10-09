@@ -9,12 +9,15 @@ layout(location = 0) in vec2 in_world_pos;
 
 layout(location = 0) out vec4 out_color;
 
-// Fragment resource set: sampler at binding 0, tile-data storage buffer at
-// binding 1 (the world's row-major dense_tile_ids, two 16-bit ids per uint;
-// see renderer.zig packTileData).
+// Fragment resource set: sampler at binding 0, the world's tile store at binding 1
+// (renderer.zig tile store layout). The store is one directory per window layer
+// slot, one word per chunk, then a block region. A directory word with bit 31 set
+// is a uniform chunk whose tile is its low 16 bits; any other word indexes the
+// chunk's block, which holds its tiles in local row-major order, two 16-bit ids per
+// word, low half first.
 layout(set = 2, binding = 0) uniform sampler2D atlas_texture;
 layout(set = 2, binding = 1) readonly buffer TileData {
-    uint packed_tile_ids[];
+    uint words[];
 } tiles;
 
 layout(set = 3, binding = 0) uniform TilemapUniform {
@@ -22,23 +25,41 @@ layout(set = 3, binding = 0) uniform TilemapUniform {
     vec4 grid;
     // atlas: x=columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     vec4 atlas;
-    // layer_meta: x=this draw's composited layer count (topmost-first), y/z/w unused
+    // layer_meta: x=this draw's composited layer count (topmost-first),
+    // y=shallowest-bucket flag, z=chunk shift (log2 of the chunk edge),
+    // w=chunks per row
     ivec4 layer_meta;
-    // layer_offsets: cell offsets (not packed element offsets) into the combined
-    // tile-data buffer, one per composited layer (layer_meta.x of them valid),
-    // topmost layer first. Packed 4-per-uvec4 so this matches the flat Zig
+    // layer_offsets: directory start words in the tile store (slot * chunks per
+    // level), one per composited layer (layer_meta.x of them valid), topmost layer
+    // first. Packed 4-per-uvec4 so this matches the flat Zig
     // [k_max_tilemap_window_layers]u32 (sprite_batch.zig) byte-for-byte under
-    // std140 (uvec4 array elements have no interior padding). The array size
-    // must equal k_max_tilemap_window_layers / 4; the Zig test
+    // std140 (uvec4 array elements have no interior padding). Its length is also
+    // the store's directory slot count. The array size must equal
+    // k_max_tilemap_window_layers / 4; the Zig test
     // "tilemap.frag.glsl layer_offsets matches k_max_tilemap_window_layers"
     // parses this declaration, so keep it a single-line decimal literal.
     uvec4 layer_offsets[8];
 } tm;
 
-// Flat cell i lives in element i >> 1, low 16 bits when i is even.
-uint tileAt(uint flat_cell) {
-    uint element = tiles.packed_tile_ids[flat_cell >> 1];
-    return (element >> ((flat_cell & 1u) * 16u)) & 0xFFFFu;
+const uint uniform_bit = 0x80000000u;
+
+struct StoreLayout {
+    uint shift;
+    uint chunks_x;
+    uint block_base;
+    uint block_words;
+};
+
+uint tileAt(StoreLayout store, uint directory_start, uint cx, uint cy) {
+    uint edge_mask = (1u << store.shift) - 1u;
+    uint chunk = (cy >> store.shift) * store.chunks_x + (cx >> store.shift);
+    uint word = tiles.words[directory_start + chunk];
+    if ((word & uniform_bit) != 0u) {
+        return word & 0xFFFFu;
+    }
+    uint local_cell = ((cy & edge_mask) << store.shift) | (cx & edge_mask);
+    uint element = tiles.words[store.block_base + word * store.block_words + (local_cell >> 1u)];
+    return (element >> ((local_cell & 1u) * 16u)) & 0xFFFFu;
 }
 
 void main() {
@@ -54,7 +75,16 @@ void main() {
         discard;
     }
 
-    uint cell_index = uint(cy * grid_w + cx);
+    StoreLayout store_layout;
+    store_layout.shift = uint(tm.layer_meta.z);
+    store_layout.chunks_x = uint(tm.layer_meta.w);
+    uint chunks_y = (uint(grid_h) + (1u << store_layout.shift) - 1u) >> store_layout.shift;
+    uint directory_slots = uint(tm.layer_offsets.length()) * 4u;
+    store_layout.block_base = directory_slots * store_layout.chunks_x * chunks_y;
+    store_layout.block_words = max(1u, (1u << (2u * store_layout.shift)) >> 1u);
+    uint ucx = uint(cx);
+    uint ucy = uint(cy);
+
     int layer_count = tm.layer_meta.x;
     uint tile_id = invalid_id;
     int resolved_depth = 0;
@@ -63,8 +93,8 @@ void main() {
     // opaque hit walking topmost-first, so a hole in a shallower layer falls
     // through to whichever composited layer beneath it is actually opaque.
     for (int i = 0; i < layer_count; i++) {
-        uint layer_offset = tm.layer_offsets[i / 4][i % 4];
-        uint candidate = tileAt(layer_offset + cell_index);
+        uint directory_start = tm.layer_offsets[i / 4][i % 4];
+        uint candidate = tileAt(store_layout, directory_start, ucx, ucy);
         if (candidate != invalid_id) {
             tile_id = candidate;
             resolved_depth = i;
@@ -114,7 +144,7 @@ void main() {
     // the neighbor cells' actual tile data directly is deterministic regardless
     // of camera position.
     if (resolved_depth == 0 && layer_count > 0 && tm.layer_meta.y != 0) {
-        uint top_layer_offset = tm.layer_offsets[0][0];
+        uint top_directory = tm.layer_offsets[0][0];
         const float rim_margin = 0.28;
         // Subtractive, not multiplicative: this tileset's floor/cave tiles sit at
         // ~0.09-0.19 luminance (measured from world_tileset.png), so scaling by a
@@ -126,26 +156,22 @@ void main() {
         float rim = 0.0;
 
         if (in_tile.x < rim_margin && cx > 0) {
-            uint left_index = uint(cy * grid_w + (cx - 1));
-            if (tileAt(top_layer_offset + left_index) == invalid_id) {
+            if (tileAt(store_layout, top_directory, ucx - 1u, ucy) == invalid_id) {
                 rim = max(rim, 1.0 - in_tile.x / rim_margin);
             }
         }
         if (in_tile.x > 1.0 - rim_margin && cx + 1 < grid_w) {
-            uint right_index = uint(cy * grid_w + (cx + 1));
-            if (tileAt(top_layer_offset + right_index) == invalid_id) {
+            if (tileAt(store_layout, top_directory, ucx + 1u, ucy) == invalid_id) {
                 rim = max(rim, 1.0 - (1.0 - in_tile.x) / rim_margin);
             }
         }
         if (in_tile.y < rim_margin && cy > 0) {
-            uint up_index = uint((cy - 1) * grid_w + cx);
-            if (tileAt(top_layer_offset + up_index) == invalid_id) {
+            if (tileAt(store_layout, top_directory, ucx, ucy - 1u) == invalid_id) {
                 rim = max(rim, 1.0 - in_tile.y / rim_margin);
             }
         }
         if (in_tile.y > 1.0 - rim_margin && cy + 1 < grid_h) {
-            uint down_index = uint((cy + 1) * grid_w + cx);
-            if (tileAt(top_layer_offset + down_index) == invalid_id) {
+            if (tileAt(store_layout, top_directory, ucx, ucy + 1u) == invalid_id) {
                 rim = max(rim, 1.0 - (1.0 - in_tile.y) / rim_margin);
             }
         }

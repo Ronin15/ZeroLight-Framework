@@ -177,7 +177,6 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .chunk_size_tiles = 16,
     .underground_level_count = procedural_underground_count,
     .max_dense_bands_per_level = procedural_max_dense_bands_per_level,
-    .max_dense_tile_gpu_bytes = world_system.k_max_dense_tile_gpu_bytes,
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 
@@ -414,7 +413,7 @@ pub const GameDemoState = struct {
             .y = 0,
             .w = viewport_width,
             .h = viewport_height,
-        }, world_render_overscan_chunks);
+        }, world_render_overscan_chunks, player.current_level);
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
         try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
@@ -565,7 +564,7 @@ pub const GameDemoState = struct {
         };
         // Draw culling only: the simulation never reads this window (its scope
         // comes from `simViewRect()` in `update`).
-        self.world.setVisibleChunksForWorldRect(camera_rect, world_render_overscan_chunks);
+        self.world.setVisibleChunksForWorldRect(camera_rect, world_render_overscan_chunks, self.player.current_level);
         const scene = self.gameplayScene();
         // Always reserve the fixed AI-overlay headroom alongside the gameplay
         // scene budget (grow-only) so the first F2 toggle draws allocation-free.
@@ -1542,7 +1541,7 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
             .y = render_camera.position.y,
             .w = demo.viewport_width / render_camera.zoom,
             .h = demo.viewport_height / render_camera.zoom,
-        }, world_render_overscan_chunks);
+        }, world_render_overscan_chunks, demo.player.current_level);
         try std.testing.expectEqual(sim_view, demo.simViewRect());
     }
 }

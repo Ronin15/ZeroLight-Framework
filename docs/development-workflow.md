@@ -353,6 +353,8 @@ Reading results:
 - `chunk-scale-*` groups time one fixed terrain change at every level size and
   depth; their item count is a case code, `level side * 1000 + levels`, and
   they measure the serial case only (terrain edits run on the main thread).
+  `chunk-scale-gpu-sync-*` time the GPU tile store sync for a dig and for a
+  level entering the render window, against a headless store.
 
 Optional arguments narrow or scale the run. Day-to-day runs target a group
 (`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare

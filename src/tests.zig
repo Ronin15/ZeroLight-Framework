@@ -59,6 +59,7 @@ comptime {
     _ = @import("game/world_system.zig");
     _ = @import("game/world_interest.zig");
     _ = @import("game/world_terrain.zig");
+    _ = @import("game/world_gpu_tiles.zig");
     _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");

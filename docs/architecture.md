@@ -81,6 +81,9 @@ Designs start here, then read the live structure below (rules:
   storage: per dense layer a chunk directory over a pool of tile blocks, per
   level a band list, a composed movement-blocked directory over a pool of bit
   blocks, and lazy link-endpoint list heads.
+- `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
+  renderer-owned GPU tile store: resident layers' directory slots, the block
+  allocator, and the queued cell edits it plans and commits each frame.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, destructible, structural, system) and owns state-local persistent
@@ -223,17 +226,23 @@ Sprite prep emits presentation-independent world/logical or drawable positions;
 the acquired swapchain interval stays focused on acquired-size presentation
 uniforms, copy-pass upload, render-pass encoding, and submit.
 
-Dense world floors use one combined per-world tile-data storage buffer
-(layer-offset indexed, Slice 36), not one buffer per layer: partial dig
-uploads always use `cycle=false`; vertex ring buffers alone use `cycle=true`
-on the final upload in a batched copy pass. Multi-level compositing requires
-back-to-front dense-layer depth order at submit and in `mergeDrawList`. Dense
-floor submit uses a vertical render window (`DenseLayerRenderWindow`,
-`levels_below` default 6, widened to the full authored underground stack in
-the procedural demo world since Slice 36 removed draw count's dependency on
-window depth) so the in-window layer set stays bounded; all authored layers
-still retain data in the combined GPU buffer. Sparse tiles cull by camera
-chunk visibility separately.
+Dense world floors use one renderer-owned GPU tile store per world
+(`Renderer.createTileStore`), stored by chunk like the CPU terrain: 32 fixed
+directory slots of one word per chunk (a uniform tile or a block index) and a
+block region holding one block per resident mixed chunk-layer, doubled at the
+upload seam. It holds only the layers on levels in the vertical render window
+(`DenseLayerRenderWindow`, `levels_below` default 6, widened to the full
+authored underground stack in the procedural demo world since Slice 36 removed
+draw count's dependency on window depth), so GPU memory follows the window,
+never world depth. `WorldSystem.syncDenseTileStore` (mirror:
+`world_gpu_tiles.zig`) runs once per frame in render prep before swapchain
+acquisition: a level entering the window uploads its directories and mixed
+blocks, a dig uploads one element, a pan uploads nothing, and everything goes
+in the frame's one batched copy pass. Store uploads always use
+`cycle=false`; vertex ring buffers alone use `cycle=true` on the final upload.
+Multi-level compositing requires back-to-front dense-layer depth order at
+submit and in `mergeDrawList`. Sparse tiles cull to the window's levels and
+the camera chunk window separately.
 Dynamic entities collect from movement-body dense rows (Slice 24B): scope
 columns and `renderCollectIndicesForMovement` align on `movement_index`; render
 visibility is camera chunk + AABB only (simulation tier does not gate draw).
@@ -422,7 +431,9 @@ endpoint chunk, so `rampLinkOtherLevel` walks one chunk's endpoints. A dig,
 fall carve, cave-in, or explosion reserves its growth with
 `reserveDenseCellWrite` (and `reserveLevelLink`) before any mutation, so an OOM
 leaves the step's state intact; a local change costs only the chunks it
-touches, and adding a level costs only its own directories. Visibility is the
+touches, and adding a level costs only its own directories. A write on a layer
+resident in the GPU tile store also queues one element edit for the next
+`syncDenseTileStore`; dense layers can be added in play. Visibility is the
 cached render chunk window, not per-chunk rows. `WorldSystem` prepares world draw records during
 render, using explicit world-depth bands from `src/game/render_depth.zig`.
 Runtime gameplay construction uses the Engine-owned `ThreadSystem` to build the

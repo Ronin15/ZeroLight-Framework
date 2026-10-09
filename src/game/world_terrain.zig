@@ -145,6 +145,22 @@ pub const DenseLayerStore = struct {
         return self.cells.items[@as(usize, entry) * geom.blockCells() + geom.localOf(x, y)];
     }
 
+    /// The tile every cell of `chunk` reads: its uniform tile, or the fill of a block
+    /// no write has changed yet (an early block); null when the chunk's cells differ.
+    pub fn readUniformTile(self: *const DenseLayerStore, chunk: u32) ?TileId {
+        const entry = self.dir[chunk];
+        if (entry & uniform_bit != 0) return @truncate(entry);
+        const block_fill = self.fills.items[entry];
+        return if (block_fill.non_fill == 0) block_fill.fill else null;
+    }
+
+    /// The cells of `chunk`'s block, row-major by local cell, or null when uniform.
+    pub fn chunkCells(self: *const DenseLayerStore, block_cells: usize, chunk: u32) ?[]const TileId {
+        const entry = self.dir[chunk];
+        if (entry & uniform_bit != 0) return null;
+        return self.cells.items[@as(usize, entry) * block_cells ..][0..block_cells];
+    }
+
     /// Blocks holding cells now (pool size less released blocks).
     pub fn liveBlockCount(self: *const DenseLayerStore) usize {
         return self.fills.items.len - self.free.items.len;
