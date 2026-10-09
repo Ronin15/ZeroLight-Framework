@@ -36,11 +36,10 @@ const world_overscan_chunks: u16 = 1;
 const bench_viewport_w: f32 = 800;
 const bench_viewport_h: f32 = 450;
 const static_sprite_group_count: usize = 1;
-/// `submitStaticDenseGeometry` emits at
-/// most `Renderer.k_max_dense_composite_draws` interleave-partitioned
-/// composite draws; this fixture has no sparse/entity content at non-active
-/// levels, so it always hits the common single-bucket case, i.e. exactly one
-/// retained `.tilemap` group regardless of dense window depth.
+/// `submitStaticDenseGeometry` emits at most one interleave-partitioned
+/// composite draw per resident layer; this fixture has no sparse/entity content
+/// at non-active levels, so it always hits the common single-bucket case, i.e.
+/// exactly one retained `.tilemap` group regardless of dense window depth.
 const tilemap_group_count: usize = 1;
 const max_static_group_count: usize = tilemap_group_count + static_sprite_group_count;
 /// Mid-depth play level for dense render-window bench variants.

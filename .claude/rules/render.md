@@ -45,8 +45,8 @@ How the renderer works: `docs/rendering-assets-shaders.md`.
   size.
 - Render visibility is camera chunk window plus AABB only; never gate drawing
   on `SimulationTier`.
-- Apply the camera in the vertex shader for `.world`; a pan alone never
-  re-uploads.
+- Apply the camera in the vertex shader for `.world`; a pan re-uploads only
+  chunks entering the resident window, never vertices or resident chunks.
 
 ## Frame and uploads
 
@@ -65,8 +65,8 @@ How the renderer works: `docs/rendering-assets-shaders.md`.
 ## Shaders
 
 - Storage-buffer layouts never need 16-bit storage extensions.
-- Change `k_max_tilemap_window_layers` and the GLSL `layer_offsets` literal
-  together.
+- Keep `TilemapParams` and `tilemap.frag.glsl`'s `TilemapUniform` in one
+  field order and std140 layout.
 - Bindings follow the SDL_GPU sets: 0 vertex resources, 1 vertex UBO, 2
   fragment resources, 3 fragment UBO. For MSL, the first storage-buffer binding
   equals that stage's UBO count and vertex buffer bindings stay below 14;

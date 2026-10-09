@@ -165,56 +165,39 @@ pub const Material = enum {
     tilemap,
 };
 
-/// Upper bound on composited layers in one tilemap draw's window, and the
-/// length of `TilemapParams.layer_offsets`. `tilemap.frag.glsl` declares the
-/// matching `uvec4 layer_offsets[k_max_tilemap_window_layers / 4]`; GLSL cannot
-/// read this constant, so the test "tilemap.frag.glsl layer_offsets matches
-/// k_max_tilemap_window_layers" enforces the pair.
-pub const k_max_tilemap_window_layers: usize = 32;
-
-comptime {
-    // Offsets pack 4 per GLSL uvec4.
-    std.debug.assert(k_max_tilemap_window_layers % 4 == 0);
-}
-
-/// Fragment uniform (set 3) for a tilemap draw — world-constant grid + atlas
-/// geometry plus this draw's composited layer window. extern for a stable GPU
-/// layout matching `tilemap.frag.glsl`. Kept off `DrawGroup` (looked up in the
-/// renderer by `tile_data`) so the per-frame draw-group sort/coalesce/merge does
-/// not drag this payload through every sprite group.
+/// Fragment uniform (set 3) for a tilemap draw: world-constant grid and atlas
+/// geometry, the store's chunk geometry and resident window, and this draw's layer
+/// chain. extern, in `tilemap.frag.glsl`'s `TilemapUniform` field order and std140
+/// layout. Kept off `DrawGroup` (looked up in the renderer by `tile_data`) so the
+/// per-frame draw-group sort/coalesce/merge does not drag this payload through every
+/// sprite group.
 pub const TilemapParams = extern struct {
     // x=tile_size, y=grid_width, z=grid_height, w=invalid_tile_id
     grid: [4]f32,
     // x=atlas_columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     atlas: [4]f32,
-    // x=this draw's composited layer count (topmost-first), y=shallowest-bucket
-    // flag, z=chunk shift (log2 of the chunk edge), w=chunks per row. x/y are
-    // filled per draw group at push time (Renderer.applyWindowLayers); z/w are
-    // the store's chunk geometry, stored with its params at `createTileStore`.
+    // x=this draw's chained layer count, y=shallowest-bucket flag (both per draw,
+    // `Renderer.applyWindowLayers`); z=chunk shift (log2 of the chunk edge),
+    // w=directory side in chunks (a power of two), both per store.
     layer_meta: [4]i32 = .{ 0, 0, 0, 0 },
-    // Topmost-first directory start words (slot * chunks per level) in the tile
-    // store named by DrawGroup.tile_data, one per composited layer
-    // (layer_meta[0] of them valid; the rest are stale). A flat u32 array to
-    // byte-match the GLSL uvec4 array under std140 (uvec4 array elements have
-    // no interior padding, so this is contiguous with no guessed compiler
-    // padding). Its length is also the store's directory slot count.
-    layer_offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
+    // The resident chunk window the draw reads: min chunk x, min chunk y,
+    // max-exclusive chunk x, max-exclusive chunk y. Chunks outside it draw nothing.
+    window: [4]u32 = .{ 0, 0, 0, 0 },
+    // x=this draw's topmost directory start (absolute element offset); deeper
+    // layers follow each directory's link word. y/z/w unused.
+    chain: [4]u32 = .{ 0, 0, 0, 0 },
 };
 
-// std140 (the default GLSL uniform-block layout, and what `tilemap.frag.glsl`'s
-// `TilemapUniform` uses since it names neither std140 nor std430) requires every
-// `vec4`/`ivec4`/`uvec4` field, and every element of an array of them, to sit at
-// a 16-byte-aligned offset with no interior padding — exactly this struct's
-// four 16-byte fields back to back. Confirmed (not just asserted) against the
-// SPIRV-Cross-generated MSL for this shader: `struct TilemapUniform { float4
-// grid; float4 atlas; int4 layer_meta; uint4 layer_offsets[8]; };`, byte-for-byte
-// matching this extern struct with zero padding either side.
+// std140 places every vec4/ivec4/uvec4 member at a 16-byte-aligned offset with no
+// padding between them, which is exactly this struct's five 16-byte fields back to
+// back.
 comptime {
-    std.debug.assert(@sizeOf(TilemapParams) == 4 * 4 + 4 * 4 + 4 * 4 + k_max_tilemap_window_layers * 4);
+    std.debug.assert(@sizeOf(TilemapParams) == 80);
     std.debug.assert(@offsetOf(TilemapParams, "grid") == 0);
     std.debug.assert(@offsetOf(TilemapParams, "atlas") == 16);
     std.debug.assert(@offsetOf(TilemapParams, "layer_meta") == 32);
-    std.debug.assert(@offsetOf(TilemapParams, "layer_offsets") == 48);
+    std.debug.assert(@offsetOf(TilemapParams, "window") == 48);
+    std.debug.assert(@offsetOf(TilemapParams, "chain") == 64);
 }
 
 pub const DrawGroup = struct {
@@ -231,9 +214,9 @@ pub const DrawGroup = struct {
     tile_data: resources.TileDataId = .invalid,
     // Tilemap-material groups only: indexes the renderer's per-frame
     // TilemapWindowLayers side table (populated by appendStaticTilemapSpan),
-    // giving this draw's topmost-first composited layer offsets. Zero (and
+    // giving this draw's topmost directory and chained layer count. Zero (and
     // unused) for non-tilemap groups.
-    window_slot: u8 = 0,
+    window_slot: u32 = 0,
 };
 
 pub const TextureResolver = struct {
@@ -1274,23 +1257,6 @@ test "reserveStorage mid-list grow failure preserves prior data and capacity" {
         .dest = .{ .x = 1, .y = 0, .w = 1, .h = 1 },
     });
     try std.testing.expectEqual(@as(usize, 2), batch.commands.items.len);
-}
-
-// Expects exactly one `uvec4 layer_offsets[N];` declaration with a decimal
-// literal N in `tilemap.frag.glsl` (embedded via build.zig's
-// `tilemap_frag_glsl` test import).
-test "tilemap.frag.glsl layer_offsets matches k_max_tilemap_window_layers" {
-    const source = @embedFile("tilemap_frag_glsl");
-    const declaration = "uvec4 layer_offsets[";
-
-    const start = std.mem.indexOf(u8, source, declaration) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfPos(u8, source, start + declaration.len, declaration));
-
-    const count_start = start + declaration.len;
-    const count_end = std.mem.indexOfScalarPos(u8, source, count_start, ']') orelse return error.TestUnexpectedResult;
-    const shader_uvec4_count = try std.fmt.parseInt(usize, source[count_start..count_end], 10);
-
-    try std.testing.expectEqual(k_max_tilemap_window_layers / 4, shader_uvec4_count);
 }
 
 test "render order compares domain before depth" {

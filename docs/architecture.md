@@ -84,9 +84,10 @@ Designs start here, then read the live structure below (rules:
 - `src/game/world_test_support.zig` holds test-only `WorldSystem` fixtures shared
   across modules (a demo surface at any chunk edge, terrain pool warmup).
 - `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
-  renderer-owned GPU tile store: the store's non-owning id, resident layers'
-  directory slots, the block allocator, and the queued cell edits it plans and
-  commits each frame; reset when the renderer retires the store.
+  renderer-owned GPU tile store: the store's non-owning id, the resident
+  window, each resident layer's toroidal directory and chain link, the
+  directory and block allocator, and the queued cell edits it plans and commits
+  each frame; reset when the renderer retires the store.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, destructible, structural, system) and owns state-local persistent
@@ -230,42 +231,42 @@ Sprite prep emits presentation-independent world/logical or drawable positions;
 the acquired swapchain interval stays focused on acquired-size presentation
 uniforms, copy-pass upload, render-pass encoding, and submit.
 
-Dense world floors use one renderer-owned GPU tile store per world
-(`Renderer.createTileStore`), stored by chunk like the CPU terrain: 32 fixed
-directory slots of one word per chunk (a uniform tile or a block index) and a
-block region holding one block per resident mixed chunk-layer, doubled at the
-upload seam. It holds only the layers on levels in the vertical render window
-(`DenseLayerRenderWindow`, `levels_below` default 6, widened to the full
-authored underground stack in the procedural demo world since Slice 36 removed
-draw count's dependency on window depth), so GPU memory follows the window,
-never world depth. `WorldSystem.syncDenseTileStore` (mirror:
+Dense world floors use one renderer-owned GPU tile store per rendered world
+(`Renderer.createTileStore`), stored by chunk like the CPU terrain but only for
+the render window: per resident layer a toroidal directory of `side²` chunk
+words (a uniform tile or a block offset) plus a link word chaining it to the
+next deeper resident layer, and a block per mixed chunk inside the camera's
+chunk window. The resident layers are those of the levels in the vertical
+render window (`DenseLayerRenderWindow`, `levels_below` default 6, widened to
+the full authored underground stack in the procedural demo world), so GPU
+memory follows the window's layers times its chunks, never level area, world
+depth, or world count. `WorldSystem.syncDenseTileStore` (mirror:
 `world_gpu_tiles.zig`) runs once per frame in render prep before swapchain
-acquisition: a level entering the window uploads its directories and mixed
-blocks, a dig uploads one element, a pan uploads nothing, and everything goes
-in the frame's one batched copy pass. Store uploads always use
-`cycle=false`; vertex ring buffers alone use `cycle=true` on the final upload.
-The world holds only a generational `TileDataId` and claims the store each sync
-(`Renderer.claimTileStore`); `Renderer.endFrame` first retires every store no
-world claimed since the last frame, so a destroyed or replaced world's store
-goes at the next frame with no teardown call and no device drain (sweep
-O(store-slot high water), derived). A world whose claim fails re-uploads its
-resident layers into a new store: currently whole-level directories plus mixed
-blocks per resident layer, O(resident layers × chunks per level), derived;
-O(window) once residency is windowed.
+acquisition: a level entering the window uploads its window directory and
+mixed blocks, a pan across a chunk boundary uploads the entering chunks, a dig
+uploads one element, and everything goes in the frame's one batched copy pass.
+Store uploads always use `cycle=false`; vertex ring buffers alone use
+`cycle=true` on the final upload. The world holds only a generational
+`TileDataId` and claims the store each sync (`Renderer.claimTileStore`);
+`Renderer.endFrame` first retires every store no world claimed since the last
+frame, so a destroyed, replaced, or unviewed world's store goes at the next
+frame with no teardown call and no device drain (sweep O(store-slot high
+water), derived). A world whose claim fails re-uploads its window into a new
+store, O(resident layers × window chunks), derived.
 Multi-level compositing requires back-to-front dense-layer depth order at
 submit and in `mergeDrawList`. Sparse tiles cull to the window's levels and
 the camera chunk window separately.
 Dynamic entities collect from movement-body dense rows (Slice 24B): scope
 columns and `renderCollectIndicesForMovement` align on `movement_index`; render
 visibility is camera chunk + AABB only (simulation tier does not gate draw).
-Dense floor submit buckets the in-window layer set into a small bounded
-number of composite draws (`partitionDenseCompositeBuckets`, cut only at true
+Dense floor submit buckets the resident layer set into a small number of
+composite draws (`partitionDenseCompositeBuckets`, cut only at true
 depth-interleave points where a dynamic entity, particle, or sparse tile
-needs to render between two dense layers this frame; capped by
-`Renderer.k_max_dense_composite_draws`), not one draw per layer; the
-fragment shader loops a bounded topmost-first window of layers per pixel and
-stops at the first opaque cell (GPU clips full-world quads; not
-camera-chunk culled). NPC per-level cull (Slice 25E) uses the `world_level` component in `DataSystem`
+needs to render between two dense layers this frame; at most one per resident
+layer), not one draw per layer; the fragment shader walks a bucket's chain of
+layer directories topmost-first per pixel and stops at the first opaque cell
+(GPU clips full-world quads; pixels outside the resident chunk window
+discard). NPC per-level cull (Slice 25E) uses the `world_level` component in `DataSystem`
 as the gameplay/nav/render authority; `setWorldLevel` syncs `scope.level` for
 cube LOD. Player floor policy stays on `Player.current_level` for digging.
 See `docs/rendering-assets-shaders.md`'s GPU-Driven Tilemap section (source

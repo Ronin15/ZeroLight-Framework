@@ -196,10 +196,13 @@ Failure and limits:
       added in play; GPU byte gate replaced by a report (`9bbfdc0`).
 - [x] A world's GPU tile store is released when its world is destroyed or
       replaced, never only at renderer shutdown (render step (a)).
-- [x] GPU tile store residency follows the camera's chunk window: toroidal
-      per-layer directories chained topmost-first; GPU memory independent of
-      level size, depth, and world count; no layer or draw cap beyond the
-      store's u32 width fit (render step (c)).
+- [x] GPU tile memory follows the camera's window, independent of level
+      size, depth, and world count; no layer or draw cap beyond the store's
+      u32 width fit (render step (c)).
+- [ ] The GPU sync after one dig is back within spread of `5439e36`
+      (`chunk-scale-gpu-sync-dig` is 4–12% slower after render step (c):
+      per-edit chunk math on the edit queue, `world_gpu_tiles.zig` plan and
+      commit edit loops); closed when change marks replace the queue.
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
       the thread system, serial equals threaded (S3b). Their gameplay
       producers are [Slice 76](slice-76.md) and [Slice 77](slice-77.md).

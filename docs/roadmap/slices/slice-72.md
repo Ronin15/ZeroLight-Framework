@@ -52,9 +52,8 @@ content across world sizes.
 - Kept, justified at each site: work budgets (audio commands per step, SFX
   voices, `TimeLoop.max_updates_per_frame`, full SDL event drain); format
   widths (`TileId` u16, component `enum(u5)`, entity u32, GPU u32 guards,
-  `k_max_tilemap_window_layers`, `k_max_dense_submit_stack_cap`, AI memory
-  ring, probe tables at 2×); seam growth already proven (structural preflight,
-  slot map, state stack, sprite batches, static geometry, texture and text
+  AI memory ring, probe tables at 2×); seam growth already proven
+  (structural preflight, slot map, state stack, sprite batches, static geometry, texture and text
   slots, range-stream prefix, request and solve pools); presentation pools
   (overlay top-up, particles); per-machine thresholds (pool size, range
   sizes, tuners).
@@ -127,7 +126,9 @@ content across world sizes.
 - [ ] J1 · `StateTransitions` budget set at init, `reserve` follows it.
 - [ ] J2 · `FpsCounter` command bound comptime-checked against overlay
       headroom; 67B text updated.
-- [ ] J3 · `window_slot` width assert for the composite-draw cap.
+- [x] J3 · `window_slot` width assert for the composite-draw cap. Superseded:
+      the cap is gone and `window_slot` is a `u32` behind a checked cast in
+      `appendStaticTilemapSpan`.
 - [ ] J4 · MAL alignment wording in `docs/architecture.md` and the
       `hotStoreCapacity` doc comment.
 - [ ] K1 · `SimulationEvents.capacity_limit` justified at its site.

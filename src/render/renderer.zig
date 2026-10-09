@@ -96,17 +96,33 @@ pub fn packTileData(cells: []const u16, out: []u32) void {
     }
 }
 
-/// Tile store layout, shared with `tilemap.frag.glsl`: `tile_store_directory_slots`
-/// directories of one word per chunk (`chunks_x * chunks_y` words each), then a
-/// block region of `tileStoreBlockElements(chunk_edge)` elements per block. A
-/// directory word with `tile_store_uniform_bit` set is a uniform chunk whose tile is
-/// the low 16 bits; any other word is the chunk's block index. A block holds the
-/// chunk's tiles in local row-major order (`(y % edge) * edge + x % edge`), packed
-/// by `packTileData`.
-pub const tile_store_directory_slots: usize = sprite_batch.k_max_tilemap_window_layers;
+/// Tile store layout, shared with `tilemap.frag.glsl`. One `u32` buffer holds two
+/// allocation classes at absolute element offsets:
+/// - a directory per resident layer: `side * side` toroidal words, chunk (cx, cy) at
+///   `(cy & (side - 1)) * side + (cx & (side - 1))`, then one link word holding the
+///   next deeper resident layer's directory start, or `tile_store_no_link`. A word
+///   with `tile_store_uniform_bit` set is a uniform chunk whose tile is the low 16
+///   bits; any other word is the absolute element offset of the chunk's block.
+/// - a block per resident mixed chunk-layer: `tileStoreBlockElements(chunk_edge)`
+///   elements holding the chunk's tiles in local row-major order
+///   (`(y % edge) * edge + x % edge`), packed by `packTileData`.
+/// A draw reads only chunks inside the window its uniform names; words of chunks
+/// outside it are never read.
 pub const tile_store_uniform_bit: u32 = 1 << 31;
+pub const tile_store_no_link: u32 = std.math.maxInt(u32);
 /// Largest element count whose byte size fits SDL's `u32` buffer size and offsets.
+/// Below `tile_store_uniform_bit`, so a block offset never reads as uniform.
 pub const tile_store_max_elements: u32 = std.math.maxInt(u32) / @sizeOf(gpu_buffer.StorageElement);
+/// Largest directory side: the largest power of two whose one directory
+/// (`side * side + 1` words) fits `tile_store_max_elements`, so every directory
+/// index and the shader's `side * side` fit `u32`.
+pub const tile_store_max_side: u32 = 1 << 14;
+
+comptime {
+    std.debug.assert(tile_store_max_elements < tile_store_uniform_bit);
+    std.debug.assert(@as(u64, tile_store_max_side) * tile_store_max_side + 1 <= tile_store_max_elements);
+    std.debug.assert(@as(u64, tile_store_max_side) * 2 * tile_store_max_side * 2 + 1 > tile_store_max_elements);
+}
 
 pub fn tileStoreUniformWord(tile: u16) u32 {
     return tile_store_uniform_bit | tile;
@@ -117,45 +133,37 @@ pub fn tileStoreBlockElements(chunk_edge: u16) u32 {
 }
 
 /// One world's tile store. `params.layer_meta[2]` is the chunk shift (`log2` of the
-/// chunk edge) and `params.layer_meta[3]` the chunks per row; `directory_elements`
-/// and `block_elements` must match them and the grid size (`validateTileStoreDesc`).
+/// chunk edge), `params.layer_meta[3]` the directory side, and `params.window` the
+/// resident chunk window (`setTileStoreWindow` moves it).
 pub const TileStoreDesc = struct {
-    directory_elements: u32,
-    block_elements: u32,
     element_capacity: u32,
     params: TilemapParams,
 };
 
 pub fn validateTileStoreDesc(desc: TileStoreDesc) error{InvalidTileStoreLayout}!void {
     const shift = desc.params.layer_meta[2];
-    const chunks_x = desc.params.layer_meta[3];
-    if (shift < 0 or shift > 4 or chunks_x <= 0) return error.InvalidTileStoreLayout;
+    if (shift < 0 or shift > 4) return error.InvalidTileStoreLayout;
+    const side = desc.params.layer_meta[3];
+    if (side < 1 or side > tile_store_max_side or !std.math.isPowerOfTwo(@as(u32, @intCast(side)))) {
+        return error.InvalidTileStoreLayout;
+    }
     const grid_w = desc.params.grid[1];
     const grid_h = desc.params.grid[2];
     if (!(grid_w >= 1 and grid_w <= std.math.maxInt(u16) and grid_h >= 1 and grid_h <= std.math.maxInt(u16))) {
         return error.InvalidTileStoreLayout;
     }
-    const edge: u64 = @as(u64, 1) << @intCast(shift);
-    const width: u64 = @intFromFloat(grid_w);
-    const height: u64 = @intFromFloat(grid_h);
-    if ((width + edge - 1) / edge != @as(u64, @intCast(chunks_x))) return error.InvalidTileStoreLayout;
-    const chunk_count = @as(u64, @intCast(chunks_x)) * ((height + edge - 1) / edge);
-    if (desc.directory_elements != tile_store_directory_slots * chunk_count) return error.InvalidTileStoreLayout;
-    if (desc.block_elements != tileStoreBlockElements(@intCast(edge))) return error.InvalidTileStoreLayout;
-    if (desc.element_capacity < desc.directory_elements or desc.element_capacity > tile_store_max_elements) {
+    if (desc.element_capacity < 1 or desc.element_capacity > tile_store_max_elements) {
         return error.InvalidTileStoreLayout;
     }
 }
 
-/// Element capacity after growing a store to hold `required` elements: the block
-/// region doubles until it fits, clamped to `tile_store_max_elements`.
-fn tileStoreGrownCapacity(directory_elements: u32, block_elements: u32, current: u32, required: u32) error{GpuBufferTooLarge}!u32 {
-    std.debug.assert(current >= directory_elements and block_elements > 0);
+/// Element capacity after growing a store to hold `required` elements: at least
+/// double the current capacity, clamped to `tile_store_max_elements`.
+fn tileStoreGrownCapacity(current: u32, required: u32) error{GpuBufferTooLarge}!u32 {
     if (required <= current) return current;
     if (required > tile_store_max_elements) return error.GpuBufferTooLarge;
-    var blocks: u64 = @max(1, (current - directory_elements) / block_elements);
-    while (directory_elements + blocks * block_elements < required) blocks *= 2;
-    return @intCast(@min(@as(u64, directory_elements) + blocks * block_elements, tile_store_max_elements));
+    const doubled = @as(u64, current) * 2;
+    return @intCast(@min(@max(@as(u64, required), doubled), tile_store_max_elements));
 }
 
 /// The ranges of a grown store's previous contents to copy forward: elements
@@ -255,8 +263,7 @@ const TileStore = struct {
     // sweep, which retires a live store still unclaimed.
     claimed: bool = false,
     element_capacity: u32,
-    directory_elements: u32,
-    block_elements: u32,
+    // Grid, atlas, chunk geometry, and resident window; each draw adds its chain.
     params: TilemapParams,
     // Uploads not yet recorded, sorted and disjoint; values concatenated in span order.
     pending_spans: std.ArrayList(TileStoreSpan) = .empty,
@@ -270,8 +277,6 @@ const TileStore = struct {
     const released = TileStore{
         .buffer = null,
         .element_capacity = 0,
-        .directory_elements = 0,
-        .block_elements = 0,
         .params = std.mem.zeroes(TilemapParams),
     };
 };
@@ -363,51 +368,27 @@ pub const Renderer = struct {
         std.debug.assert(k_stacked_state_ui_headroom >= 2 * k_overlay_command_headroom);
     }
 
-    /// Upper bound on composited layers in one tilemap draw's window; owned by
-    /// `sprite_batch.zig` beside the `TilemapParams.layer_offsets` array it sizes.
-    /// Tied to `world_system.zig`'s `k_max_dense_submit_stack_cap` by a comptime
-    /// assert in that file (which already imports this module, so the assert
-    /// lives there to avoid an import cycle).
-    pub const k_max_tilemap_window_layers = sprite_batch.k_max_tilemap_window_layers;
-
-    /// Cap on separate tilemap composite draw calls in one frame. In the
-    /// shipped default config this always resolves to 1 (only the active
-    /// level's own actor depth is ever an interleave point); more buckets only
-    /// appear when something (a sparse tile, a dynamic depth) needs to render
-    /// sandwiched between two dense layers this frame. Sized to the
-    /// mathematically-proven worst case rather than a defensive guess:
-    /// `partitionDenseCompositeBuckets` can never produce more buckets than
-    /// submitted dense layers, which `world_system.zig` already hard-caps at
-    /// `k_max_dense_submit_stack_cap` — tied to that constant by a comptime
-    /// assert in that file (which already imports this module, avoiding an
-    /// import cycle).
-    pub const k_max_dense_composite_draws: usize = 32;
-
-    /// One tilemap draw's composited layer window: up to
-    /// `k_max_tilemap_window_layers` directory start words in the world's tile
-    /// store, topmost layer first. The fragment shader walks these in order and
-    /// stops at the first opaque cell. `is_shallowest_bucket` is true only for
-    /// the composite draw holding the frame's overall shallowest submitted dense
-    /// layer (`world_system.zig`'s `submitStaticDenseGeometry`) — the fragment
-    /// shader's rim-shadow effect must gate on this rather than its own
-    /// draw-local resolved depth, since bucket splitting for an unrelated
-    /// interleave point can otherwise put a merely hole-revealed tile at
-    /// resolved depth 0 within a non-shallowest draw.
+    /// One tilemap draw's layers: the directory start of its topmost layer in the
+    /// world's tile store and how many layers its chain walks (each directory's link
+    /// word names the next deeper one). The fragment shader stops at the first
+    /// opaque cell. `is_shallowest_bucket` is true only for the composite draw
+    /// holding the frame's overall shallowest submitted dense layer
+    /// (`world_system.zig`'s `submitStaticDenseGeometry`): the shader's rim shadow
+    /// gates on it rather than on its own draw-local resolved depth, since bucket
+    /// splitting for an unrelated interleave point can put a hole-revealed tile at
+    /// resolved depth 0 within a deeper draw.
     pub const TilemapWindowLayers = struct {
-        count: u8 = 0,
+        first_directory: u32 = 0,
+        count: u32 = 0,
         is_shallowest_bucket: bool = false,
-        offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
     };
 
-    /// Fills `params.layer_meta`/`layer_offsets` from `window` right before the
-    /// fragment uniform push. Pure and GPU-free so it is unit-testable headlessly.
+    /// Fills the per-draw fields of `params` (`layer_meta[0..2]`, `chain[0]`) from
+    /// `window` right before the fragment uniform push. Pure and GPU-free.
     pub fn applyWindowLayers(params: *TilemapParams, window: TilemapWindowLayers) void {
-        std.debug.assert(window.count <= k_max_tilemap_window_layers);
         params.layer_meta[0] = @intCast(window.count);
         params.layer_meta[1] = @intFromBool(window.is_shallowest_bucket);
-        for (0..window.count) |i| {
-            params.layer_offsets[i] = window.offsets[i];
-        }
+        params.chain[0] = window.first_directory;
     }
 
     allocator: std.mem.Allocator,
@@ -451,11 +432,10 @@ pub const Renderer = struct {
     static_colors: std.ArrayList(VertexColor) = .empty,
     static_groups: std.ArrayList(DrawGroup) = .empty,
     static_dirty: bool = false,
-    // Per-frame side table for tilemap DrawGroup.window_slot: which composited
-    // layer offsets each static tilemap span reads this frame. Reset by
-    // beginStaticGeometry; populated by appendStaticTilemapSpan.
-    tilemap_window_layers: [k_max_dense_composite_draws]TilemapWindowLayers = undefined,
-    tilemap_window_layer_count: usize = 0,
+    // Side table for tilemap DrawGroup.window_slot: the layer chain each static
+    // tilemap span reads. Reset by beginStaticGeometry; populated by
+    // appendStaticTilemapSpan; reserved with the static spans.
+    tilemap_window_layers: std.ArrayList(TilemapWindowLayers) = .empty,
     draw_list: std.ArrayList(DrawGroup) = .empty,
     // Reserved upper bounds feeding the merged draw list. `draw_list` is sized to
     // their sum so the per-frame merge stays allocation-free.
@@ -552,6 +532,7 @@ pub const Renderer = struct {
         self.static_uvs.deinit(self.allocator);
         self.static_colors.deinit(self.allocator);
         self.static_groups.deinit(self.allocator);
+        self.tilemap_window_layers.deinit(self.allocator);
         self.draw_list.deinit(self.allocator);
         if (self.static_streams) |streams| releaseVertexStreams(self.device, streams);
 
@@ -636,7 +617,7 @@ pub const Renderer = struct {
         self.static_uvs.clearRetainingCapacity();
         self.static_colors.clearRetainingCapacity();
         self.static_groups.clearRetainingCapacity();
-        self.tilemap_window_layer_count = 0;
+        self.tilemap_window_layers.clearRetainingCapacity();
         self.static_dirty = true;
     }
 
@@ -647,6 +628,7 @@ pub const Renderer = struct {
         try self.static_uvs.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.static_colors.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.static_groups.ensureTotalCapacity(self.allocator, span_capacity);
+        try self.tilemap_window_layers.ensureTotalCapacity(self.allocator, span_capacity);
         self.reserved_static_spans = span_capacity;
         try self.ensureDrawListReservation();
     }
@@ -660,13 +642,12 @@ pub const Renderer = struct {
         self.draw_list_high_water = total;
     }
 
-    /// Appends one retained world-space quad that composites `window_layers`
-    /// (topmost-first directories of the `tile_data` store) via the tilemap
-    /// pipeline: the fragment shader walks them per pixel, stopping at the first
-    /// opaque cell, and samples `atlas_texture`. `vertices` are the quad's
+    /// Appends one retained world-space quad that composites `window_layers` (a
+    /// chain of directories in the `tile_data` store, topmost first) via the
+    /// tilemap pipeline: the fragment shader walks it per pixel, stopping at the
+    /// first opaque cell, and samples `atlas_texture`. `vertices` are the quad's
     /// world-space corners (6). Must be called between `beginStaticGeometry` and
-    /// the next `endFrame`. At most `k_max_dense_composite_draws` calls are
-    /// allowed between two `beginStaticGeometry` calls.
+    /// the next `endFrame`. Allocation-free within `reserveStaticGeometry`.
     pub fn appendStaticTilemapSpan(
         self: *Renderer,
         atlas_texture: TextureId,
@@ -678,7 +659,6 @@ pub const Renderer = struct {
         const vertex_count = vertices.positions.len;
         std.debug.assert(vertices.uvs.len == vertex_count and vertices.colors.len == vertex_count);
         if (vertex_count == 0) return;
-        if (self.tilemap_window_layer_count >= k_max_dense_composite_draws) return error.TooManyTilemapWindowDraws;
         const end = try std.math.add(usize, self.static_positions.items.len, vertex_count);
         const first_vertex = std.math.cast(u32, self.static_positions.items.len) orelse return error.StaticGeometryTooLarge;
         _ = std.math.cast(u32, end) orelse return error.StaticGeometryTooLarge;
@@ -689,12 +669,12 @@ pub const Renderer = struct {
         try self.static_uvs.ensureTotalCapacity(self.allocator, end);
         try self.static_colors.ensureTotalCapacity(self.allocator, end);
         try self.static_groups.ensureTotalCapacity(self.allocator, self.static_groups.items.len + 1);
+        try self.tilemap_window_layers.ensureTotalCapacity(self.allocator, self.tilemap_window_layers.items.len + 1);
+        const window_slot = std.math.cast(u32, self.tilemap_window_layers.items.len) orelse return error.StaticGeometryTooLarge;
         self.static_positions.appendSliceAssumeCapacity(vertices.positions);
         self.static_uvs.appendSliceAssumeCapacity(vertices.uvs);
         self.static_colors.appendSliceAssumeCapacity(vertices.colors);
-        const window_slot: u8 = @intCast(self.tilemap_window_layer_count);
-        self.tilemap_window_layers[window_slot] = window_layers;
-        self.tilemap_window_layer_count += 1;
+        self.tilemap_window_layers.appendAssumeCapacity(window_layers);
         self.static_groups.appendAssumeCapacity(.{
             .source = .static,
             .material = .tilemap,
@@ -965,10 +945,9 @@ pub const Renderer = struct {
                     var storage = tile_buffer.?;
                     c.SDL_BindGPUFragmentStorageBuffers(render_pass, 0, &storage, 1);
                     var params = self.tileStore(group.tile_data).?.params;
-                    // The per-store params carry only the world-constant grid, atlas,
-                    // and chunk geometry; the per-draw composited layer window (which
-                    // directories of the shared store this group reads) is set here.
-                    applyWindowLayers(&params, self.tilemap_window_layers[group.window_slot]);
+                    // The per-store params carry the grid, atlas, chunk geometry, and
+                    // resident window; the per-draw layer chain is set here.
+                    applyWindowLayers(&params, self.tilemap_window_layers.items[group.window_slot]);
                     c.SDL_PushGPUFragmentUniformData(command_buffer, 0, &params, @sizeOf(TilemapParams));
                 }
 
@@ -1142,7 +1121,7 @@ pub const Renderer = struct {
         return ids;
     }
 
-    /// Creates a world's GPU tile store (layout: `tile_store_directory_slots`) with
+    /// Creates a world's GPU tile store (layout documented at `tile_store_uniform_bit`) with
     /// `desc.element_capacity` elements and returns its non-owning id, claimed for
     /// the current frame. Contents are undefined until uploads are queued; draws
     /// must read only directories and blocks the owner has written. The owner
@@ -1155,8 +1134,6 @@ pub const Renderer = struct {
         const id = self.installTileStore(.{
             .buffer = buffer,
             .element_capacity = desc.element_capacity,
-            .directory_elements = desc.directory_elements,
-            .block_elements = desc.block_elements,
             .params = desc.params,
         });
         log.debug("created tile store {d}: {d} elements", .{ id.index, desc.element_capacity });
@@ -1170,6 +1147,14 @@ pub const Renderer = struct {
         const store = self.tileStore(id) orelse return false;
         store.claimed = true;
         return true;
+    }
+
+    /// Moves the store's resident chunk window (min x, min y, max-exclusive x,
+    /// max-exclusive y), read by every later draw of the store. No-op when `id` is
+    /// stale. O(1).
+    pub fn setTileStoreWindow(self: *Renderer, id: TileDataId, window: [4]u32) void {
+        const store = self.tileStore(id) orelse return;
+        store.params.window = window;
     }
 
     /// Grows the store to `required_elements` when it is smaller (a new buffer; the
@@ -1307,7 +1292,7 @@ pub const Renderer = struct {
     }
 
     fn growTileStore(self: *Renderer, store: *TileStore, required_elements: u32) !void {
-        const capacity = try tileStoreGrownCapacity(store.directory_elements, store.block_elements, store.element_capacity, required_elements);
+        const capacity = try tileStoreGrownCapacity(store.element_capacity, required_elements);
         const grown = try gpu_buffer.createStorageBuffer(self.device, capacity);
         if (store.growth_source == null) {
             store.growth_source = store.buffer;
@@ -2378,39 +2363,60 @@ test "growth copy segments skip the elements pending spans overwrite" {
     try std.testing.expectEqual(@as(?TileStoreSpan, null), whole.next());
 }
 
-test "tile store growth doubles the block region until it fits and clamps to the SDL width" {
-    // 64 directory words, 8-element blocks, room for 2 blocks.
-    try std.testing.expectEqual(@as(u32, 80), try tileStoreGrownCapacity(64, 8, 80, 80));
-    try std.testing.expectEqual(@as(u32, 64 + 4 * 8), try tileStoreGrownCapacity(64, 8, 80, 81));
-    try std.testing.expectEqual(@as(u32, 64 + 16 * 8), try tileStoreGrownCapacity(64, 8, 80, 64 + 9 * 8));
-    // A store with no block room yet starts from one block.
-    try std.testing.expectEqual(@as(u32, 64 + 4 * 8), try tileStoreGrownCapacity(64, 8, 64, 64 + 3 * 8));
+test "tile store growth at least doubles, covers the request, and clamps to the SDL width" {
+    try std.testing.expectEqual(@as(u32, 80), try tileStoreGrownCapacity(80, 80));
+    try std.testing.expectEqual(@as(u32, 160), try tileStoreGrownCapacity(80, 81));
+    try std.testing.expectEqual(@as(u32, 500), try tileStoreGrownCapacity(80, 500));
+    try std.testing.expectEqual(@as(u32, 2), try tileStoreGrownCapacity(1, 2));
     const near_max = tile_store_max_elements - 8;
-    try std.testing.expectEqual(tile_store_max_elements, try tileStoreGrownCapacity(64, 8, near_max - 1000, near_max));
-    try std.testing.expectError(error.GpuBufferTooLarge, tileStoreGrownCapacity(64, 8, 80, tile_store_max_elements + 1));
+    try std.testing.expectEqual(tile_store_max_elements, try tileStoreGrownCapacity(near_max - 1000, near_max));
+    try std.testing.expectError(error.GpuBufferTooLarge, tileStoreGrownCapacity(80, tile_store_max_elements + 1));
 }
 
-test "tile store layout must match the grid and chunk geometry" {
-    // 10x6 cells in 4-cell chunks: 3x2 chunks, 32 directories of 6 words, 8-element blocks.
+test "tile store layout bounds the chunk shift, directory side, grid, and capacity" {
     var params = TilemapParams{ .grid = .{ 16, 10, 6, 65535 }, .atlas = .{ 1, 1, 1, 16 } };
     params.layer_meta[2] = 2;
-    params.layer_meta[3] = 3;
-    const desc = TileStoreDesc{ .directory_elements = 32 * 6, .block_elements = 8, .element_capacity = 32 * 6 + 8, .params = params };
+    params.layer_meta[3] = 4;
+    const desc = TileStoreDesc{ .element_capacity = 17, .params = params };
     try validateTileStoreDesc(desc);
+    var edge = desc;
+    edge.params.layer_meta[3] = @intCast(tile_store_max_side);
+    edge.element_capacity = tile_store_max_elements;
+    try validateTileStoreDesc(edge);
+    edge.params.layer_meta[3] = 1;
+    edge.element_capacity = 1;
+    try validateTileStoreDesc(edge);
+
     var wrong = desc;
-    wrong.directory_elements = 32 * 4;
+    wrong.params.layer_meta[3] = 3;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong.params.layer_meta[3] = 0;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong.params.layer_meta[3] = @intCast(tile_store_max_side * 2);
     try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
     wrong = desc;
-    wrong.block_elements = 16;
+    wrong.params.layer_meta[2] = 5;
     try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
     wrong = desc;
-    wrong.params.layer_meta[3] = 2;
+    wrong.params.grid[1] = 0;
     try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
     wrong = desc;
-    wrong.element_capacity = 32 * 6 - 1;
+    wrong.element_capacity = 0;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong.element_capacity = tile_store_max_elements + 1;
     try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
     try std.testing.expectEqual(@as(u32, 1), tileStoreBlockElements(1));
     try std.testing.expectEqual(@as(u32, 128), tileStoreBlockElements(16));
+}
+
+test "setTileStoreWindow moves a live store's window and ignores a stale id" {
+    var renderer = testRenderer(std.testing.allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const id = try testInstallTileStore(&renderer, 0x1000);
+    renderer.setTileStoreWindow(id, .{ 3, 4, 7, 8 });
+    try std.testing.expectEqual([4]u32{ 3, 4, 7, 8 }, renderer.tileStore(id).?.params.window);
+    renderer.setTileStoreWindow(.{ .index = id.index, .generation = id.generation + 1 }, .{ 0, 0, 1, 1 });
+    try std.testing.expectEqual([4]u32{ 3, 4, 7, 8 }, renderer.tileStore(id).?.params.window);
 }
 
 test "queueTileStoreUploads folds a carried batch allocation-free after reserve" {
@@ -2424,8 +2430,6 @@ test "queueTileStoreUploads folds a carried batch allocation-free after reserve"
     try renderer.tile_stores.append(allocator, .{
         .buffer = @ptrFromInt(0x1000),
         .element_capacity = 64,
-        .directory_elements = 32,
-        .block_elements = 8,
         .params = std.mem.zeroes(TilemapParams),
     });
     const store = &renderer.tile_stores.items[0];
@@ -2474,8 +2478,6 @@ fn testInstallTileStore(renderer: *Renderer, buffer_address: usize) !TileDataId 
     return renderer.installTileStore(.{
         .buffer = @ptrFromInt(buffer_address),
         .element_capacity = 64,
-        .directory_elements = 32,
-        .block_elements = 8,
         .params = std.mem.zeroes(TilemapParams),
     });
 }
@@ -2575,8 +2577,6 @@ test "a retired tile store slot is reused under a new generation and the old id 
     const fresh = renderer.installTileStore(.{
         .buffer = @ptrFromInt(0x4000),
         .element_capacity = 64,
-        .directory_elements = 32,
-        .block_elements = 8,
         .params = std.mem.zeroes(TilemapParams),
     });
     _ = renderer.retireTileStoreSlot(fresh.index);
@@ -2594,23 +2594,19 @@ test "tileDataElementCount halves cell counts rounding up" {
     try std.testing.expectEqual(@as(usize, 2), tileDataElementCount(3));
 }
 
-test "applyWindowLayers fills layer count and topmost-first offsets" {
+test "applyWindowLayers fills the draw's layer count, shallowest flag, and topmost directory" {
     var params = TilemapParams{
         .grid = .{ 1, 1, 1, 1 },
         .atlas = .{ 1, 1, 1, 1 },
+        .layer_meta = .{ 0, 0, 2, 8 },
+        .window = .{ 1, 2, 3, 4 },
     };
-    var window = Renderer.TilemapWindowLayers{};
-    window.count = 3;
-    window.offsets[0] = 100;
-    window.offsets[1] = 200;
-    window.offsets[2] = 300;
+    Renderer.applyWindowLayers(&params, .{ .first_directory = 130, .count = 80, .is_shallowest_bucket = true });
 
-    Renderer.applyWindowLayers(&params, window);
-
-    try std.testing.expectEqual(@as(i32, 3), params.layer_meta[0]);
-    try std.testing.expectEqual(@as(u32, 100), params.layer_offsets[0]);
-    try std.testing.expectEqual(@as(u32, 200), params.layer_offsets[1]);
-    try std.testing.expectEqual(@as(u32, 300), params.layer_offsets[2]);
+    try std.testing.expectEqual([4]i32{ 80, 1, 2, 8 }, params.layer_meta);
+    try std.testing.expectEqual(@as(u32, 130), params.chain[0]);
+    // The store's window is untouched.
+    try std.testing.expectEqual([4]u32{ 1, 2, 3, 4 }, params.window);
 }
 
 // A minimal 6-vertex quad; `appendStaticTilemapSpan` only counts and stores
@@ -2638,6 +2634,7 @@ fn deinitStaticGeometryTestRenderer(renderer: *Renderer, allocator: std.mem.Allo
     renderer.static_uvs.deinit(allocator);
     renderer.static_colors.deinit(allocator);
     renderer.static_groups.deinit(allocator);
+    renderer.tilemap_window_layers.deinit(allocator);
     renderer.batch.deinit();
 }
 
@@ -2654,32 +2651,26 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
 
     renderer.beginStaticGeometry();
     for (0..3) |i| {
-        var window = Renderer.TilemapWindowLayers{};
-        window.count = 1;
-        window.offsets[0] = @intCast(i);
+        const window = Renderer.TilemapWindowLayers{ .first_directory = @intCast(i), .count = 1 };
         try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
     }
 
-    try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layer_count);
+    try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layers.items.len);
     for (0..3) |i| {
-        try std.testing.expectEqual(@as(u8, @intCast(i)), renderer.static_groups.items[i].window_slot);
-        try std.testing.expectEqual(@as(u32, @intCast(i)), renderer.tilemap_window_layers[i].offsets[0]);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), renderer.static_groups.items[i].window_slot);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), renderer.tilemap_window_layers.items[i].first_directory);
     }
 
-    // A rebuild's beginStaticGeometry resets the slot count -- no leaked slots
+    // A rebuild's beginStaticGeometry resets the side table -- no leaked slots
     // carry over from the prior cycle.
     renderer.beginStaticGeometry();
-    try std.testing.expectEqual(@as(usize, 0), renderer.tilemap_window_layer_count);
-
-    var window = Renderer.TilemapWindowLayers{};
-    window.count = 1;
-    window.offsets[0] = 99;
-    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
-    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
-    try std.testing.expectEqual(@as(u8, 0), renderer.static_groups.items[0].window_slot);
+    try std.testing.expectEqual(@as(usize, 0), renderer.tilemap_window_layers.items.len);
+    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, TileDataId{ .index = 0, .generation = 1 }, .{ .first_directory = 99, .count = 1 });
+    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layers.items.len);
+    try std.testing.expectEqual(@as(u32, 0), renderer.static_groups.items[0].window_slot);
 }
 
-test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composite-draw cap" {
+test "appendStaticTilemapSpan assigns window slots past 255" {
     const allocator = std.testing.allocator;
     var renderer = testRenderer(allocator);
     defer deinitStaticGeometryTestRenderer(&renderer, allocator);
@@ -2689,21 +2680,18 @@ test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composi
     const colors: [6]VertexColor = @splat(.{ 1, 1, 1, 1 });
     const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
     const texture = testTextureId(0, 1);
-    const window = Renderer.TilemapWindowLayers{ .count = 1 };
+    const span_count: usize = 300;
 
     renderer.beginStaticGeometry();
-    for (0..Renderer.k_max_dense_composite_draws) |i| {
+    for (0..span_count) |i| {
+        const window = Renderer.TilemapWindowLayers{ .first_directory = @intCast(i * 3), .count = 1 };
         try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
     }
-    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
-
-    try std.testing.expectError(
-        error.TooManyTilemapWindowDraws,
-        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, TileDataId{ .index = 0, .generation = 1 }, window),
-    );
-    // The fixed-size table stayed exactly at the cap; the failed call past it
-    // neither corrupted it nor grew past bounds.
-    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
+    try std.testing.expectEqual(span_count, renderer.tilemap_window_layers.items.len);
+    for (renderer.static_groups.items, 0..) |group, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), group.window_slot);
+        try std.testing.expectEqual(@as(u32, @intCast(i * 3)), renderer.tilemap_window_layers.items[group.window_slot].first_directory);
+    }
 }
 
 test "reserved static geometry append and mergeDrawList stay allocation-free" {
@@ -2723,7 +2711,8 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
     const texture = testTextureId(0, 1);
     const window = Renderer.TilemapWindowLayers{ .count = 1 };
 
-    // Reserved-then-append/merge SUCCESS branch under a hard-failing allocator.
+    // Reserved-then-append/merge SUCCESS branch under a hard-failing allocator,
+    // the window side table included.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const real_allocator = renderer.allocator;
     renderer.allocator = failing.allocator();
@@ -2744,6 +2733,7 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(span_count, renderer.static_groups.items.len);
+    try std.testing.expectEqual(span_count, renderer.tilemap_window_layers.items.len);
     try std.testing.expectEqual(vertex_capacity, renderer.static_positions.items.len);
     try std.testing.expectEqual(span_count, renderer.draw_list.items.len);
 }

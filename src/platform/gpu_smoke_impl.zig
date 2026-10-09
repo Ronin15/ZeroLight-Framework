@@ -12,10 +12,9 @@ const Renderer = @import("../render/renderer.zig").Renderer;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
 const packTileData = @import("../render/renderer.zig").packTileData;
-const tile_store_directory_slots = @import("../render/renderer.zig").tile_store_directory_slots;
+const tile_store_no_link = @import("../render/renderer.zig").tile_store_no_link;
 const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
 const tileStoreUniformWord = @import("../render/renderer.zig").tileStoreUniformWord;
-const TilemapWindowLayers = Renderer.TilemapWindowLayers;
 const Position = @import("../render/renderer.zig").Position;
 const Uv = @import("../render/renderer.zig").Uv;
 const VertexColor = @import("../render/renderer.zig").VertexColor;
@@ -107,62 +106,127 @@ pub fn main(init: std.process.Init) !void {
         log.err("SDL_GPU smoke replacement tile store did not survive its first frame", .{});
         return error.TileStoreNotLive;
     }
+
+    // Frame D: a side-2 directory over three chunks with the window on chunks 1
+    // and 2. Chunk 2 wraps onto word 0 and chunk 0, outside the window, discards.
+    const wrap_store = try createSmokeWrapTileStore(&renderer);
+    var wrap_positions: [6]Position = undefined;
+    var wrap_uvs: [6]Uv = undefined;
+    var wrap_colors: [6]VertexColor = undefined;
+    writeWorldSpriteQuad(.{
+        .texture = renderer.white_texture,
+        .source = .{ .x = 0, .y = 0, .w = 16, .h = 16 },
+        .dest = .{ .x = 0, .y = 0, .w = 192, .h = 64 },
+    }, TextureDesc{ .width = 1, .height = 1 }, .{
+        .positions = &wrap_positions,
+        .uvs = &wrap_uvs,
+        .colors = &wrap_colors,
+    });
+    renderer.beginStaticGeometry();
+    try renderer.appendStaticTilemapSpan(
+        renderer.white_texture,
+        RenderOrder.world(@backingInt(SmokeDepth.test_tilemap)),
+        .{ .positions = &wrap_positions, .uvs = &wrap_uvs, .colors = &wrap_colors },
+        wrap_store,
+        .{ .first_directory = 0, .count = 1 },
+    );
+    try submitSmokeFrame(&renderer, app_config, "tilemap with a wrapped toroidal word and a discarded chunk");
+    if (!renderer.claimTileStore(wrap_store)) {
+        log.err("SDL_GPU smoke wrap tile store did not survive its first frame", .{});
+        return error.TileStoreNotLive;
+    }
 }
 
-// A 3x1 grid in one 4x4-cell chunk, two layers in directory slots 0 and 1 of a
-// tile store: the topmost layer is a mixed chunk (a block with one dug hole,
-// invalid_tile_id) and the layer beneath it a uniform chunk. This exercises the
-// fragment shader's directory lookup on both word kinds and its multi-layer
-// compositing loop end to end: the hole falls through from a block read in slot 0
-// to a uniform word in slot 1. The store starts with no block room, so queueing
-// the block grows it: the frame copy pass copies the old buffer's unwritten
-// directory words forward around the two uploaded ones.
+// A 3x1 grid in one 4x4-cell chunk, two chained layers in a tile store of
+// directory side 1 with the window over chunk (0, 0): directory A at 0 holds the
+// chunk's block (at 4, one dug hole, invalid_tile_id) and links to directory B at
+// 2, a uniform chunk with no link. This exercises the fragment shader's toroidal
+// lookup on both word kinds, the window check, and the chain walk end to end: the
+// hole falls through from A's block to B's uniform word. The store starts at 4
+// elements, so queueing the block grows it: the frame copy pass copies the old
+// buffer's contents forward around the uploaded spans.
 fn createSmokeTileStore(renderer: *Renderer) !TileDataId {
     const invalid_tile_id: u16 = 65535;
     const chunk_edge: u16 = 4;
     const block_elements = comptime tileStoreBlockElements(chunk_edge);
-    const directory_elements: u32 = tile_store_directory_slots;
+    const directory_a: u32 = 0;
+    const directory_b: u32 = 2;
+    const block: u32 = 4;
     var block_cells: [chunk_edge * chunk_edge]u16 = @splat(1);
     block_cells[0] = invalid_tile_id;
-    var values: [2 + block_elements]u32 = undefined;
-    values[0] = 0; // slot 0: block 0
-    values[1] = tileStoreUniformWord(1); // slot 1: uniform
-    packTileData(&block_cells, values[2..]);
+    var values: [4 + block_elements]u32 = undefined;
+    values[0] = block; // A: chunk (0, 0) is mixed
+    values[1] = directory_b; // A's link
+    values[2] = tileStoreUniformWord(1); // B: chunk (0, 0) is uniform
+    values[3] = tile_store_no_link; // B is the deepest
+    packTileData(&block_cells, values[4..]);
     const spans = [_]TileStoreSpan{
-        .{ .dst_element = 0, .count = 2 },
-        .{ .dst_element = directory_elements, .count = block_elements },
+        .{ .dst_element = directory_a, .count = 4 },
+        .{ .dst_element = block, .count = block_elements },
     };
     var tile_params = TilemapParams{
         .grid = .{ 16.0, 3.0, 1.0, @floatFromInt(invalid_tile_id) },
         .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
+        .window = .{ 0, 0, 1, 1 },
     };
     tile_params.layer_meta[2] = @ctz(chunk_edge);
     tile_params.layer_meta[3] = 1;
     const tile_store = try renderer.createTileStore(.{
-        .directory_elements = directory_elements,
-        .block_elements = block_elements,
-        .element_capacity = directory_elements,
+        .element_capacity = 4,
         .params = tile_params,
     });
-    try renderer.reserveTileStoreUploads(tile_store, directory_elements + block_elements, spans.len, values.len);
+    try renderer.reserveTileStoreUploads(tile_store, block + block_elements, spans.len, values.len);
     try renderer.queueTileStoreUploads(tile_store, &spans, &values);
     return tile_store;
 }
 
-// Appends one retained tilemap draw over `quad` reading `tile_store`: the holed
-// layer in slot 0 over the solid layer in slot 1 (topmost-first directory offsets,
-// slot * chunks per level).
+// A 12x4 grid in three 4x4-cell chunks, one layer in a directory of side 2 at 0
+// with the window over chunks 1 and 2: chunk 1 at word 1 is uniform, chunk 2 wraps
+// to word 0 and holds a block at 5 with one hole; chunk 0 also maps to word 0 but
+// lies outside the window, so its pixels discard instead of reading chunk 2's block.
+fn createSmokeWrapTileStore(renderer: *Renderer) !TileDataId {
+    const invalid_tile_id: u16 = 65535;
+    const chunk_edge: u16 = 4;
+    const block_elements = comptime tileStoreBlockElements(chunk_edge);
+    const block: u32 = 5;
+    var block_cells: [chunk_edge * chunk_edge]u16 = @splat(1);
+    block_cells[5] = invalid_tile_id;
+    var values: [5 + block_elements]u32 = undefined;
+    values[0] = block; // chunks 0 and 2: chunk 2's block
+    values[1] = tileStoreUniformWord(1); // chunk 1
+    values[2] = tileStoreUniformWord(invalid_tile_id); // unused row
+    values[3] = tileStoreUniformWord(invalid_tile_id);
+    values[4] = tile_store_no_link;
+    packTileData(&block_cells, values[5..]);
+    const spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 5 },
+        .{ .dst_element = block, .count = block_elements },
+    };
+    var tile_params = TilemapParams{
+        .grid = .{ 16.0, 12.0, 4.0, @floatFromInt(invalid_tile_id) },
+        .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
+        .window = .{ 1, 0, 3, 1 },
+    };
+    tile_params.layer_meta[2] = @ctz(chunk_edge);
+    tile_params.layer_meta[3] = 2;
+    const tile_store = try renderer.createTileStore(.{
+        .element_capacity = block + block_elements,
+        .params = tile_params,
+    });
+    try renderer.reserveTileStoreUploads(tile_store, block + block_elements, spans.len, values.len);
+    try renderer.queueTileStoreUploads(tile_store, &spans, &values);
+    return tile_store;
+}
+
+// Appends one retained tilemap draw over `quad` reading `tile_store`: the chain
+// from directory A (the holed layer) through B (the solid layer).
 fn appendSmokeTilemap(renderer: *Renderer, quad: VertexColumnsConst, tile_store: TileDataId) !void {
-    var window_layers = TilemapWindowLayers{};
-    window_layers.count = 2;
-    window_layers.offsets[0] = 0;
-    window_layers.offsets[1] = 1;
     try renderer.appendStaticTilemapSpan(
         renderer.white_texture,
         RenderOrder.world(@backingInt(SmokeDepth.test_tilemap)),
         quad,
         tile_store,
-        window_layers,
+        .{ .first_directory = 0, .count = 2 },
     );
 }
 

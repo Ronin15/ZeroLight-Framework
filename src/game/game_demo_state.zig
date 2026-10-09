@@ -159,25 +159,16 @@ const procedural_world_height_tiles: u16 = 256;
 /// Unit tests use `initDemoForTest` / `initDemoFromMetaWithUnderground` (3 levels), not this config.
 const procedural_underground_count: u16 = 31; //31
 const procedural_dense_layer_count: usize = 1 + procedural_underground_count;
-/// Procedural worlds author one `.floor` dense band per level (no obstacle stack per plane).
-const procedural_max_dense_bands_per_level: u8 = 1;
-/// Dense floors below `active_level` kept in the render window. Draw/fragment
-/// cost is proportional to actual interleave points this frame (normally 1),
-/// not window depth, so the full authored underground stack fits:
-/// `1 + procedural_render_window_levels_below == procedural_dense_layer_count`,
-/// exactly filling `k_max_dense_submit_stack_cap`.
+/// Dense floors below `active_level` kept in the render window: the full authored
+/// underground stack. Draw count follows interleave points this frame (normally
+/// 1), not window depth, and GPU memory follows the window's layers times its
+/// chunk window, never the level's area.
 const procedural_render_window_levels_below: u16 = procedural_underground_count;
-comptime {
-    std.debug.assert(procedural_dense_layer_count <= world_system.k_max_dense_submit_stack_cap);
-    const submit_layers = @as(usize, 1 + procedural_render_window_levels_below) * procedural_max_dense_bands_per_level;
-    std.debug.assert(submit_layers <= world_system.k_max_dense_submit_stack_cap);
-}
 pub const default_world_build_config = world_system.WorldBuildConfig{
     .width_tiles = procedural_world_width_tiles,
     .height_tiles = procedural_world_height_tiles,
     .chunk_size_tiles = 16,
     .underground_level_count = procedural_underground_count,
-    .max_dense_bands_per_level = procedural_max_dense_bands_per_level,
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 

@@ -20,16 +20,20 @@
 //!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the
 //!     digs and after the refills (64 blocks taken, then freed). Flat.
 //!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
-//!     and back, each step one level entering (its directory and 64 mixed blocks)
-//!     and one leaving. Linear in chunks per level, flat across depth.
+//!     and back, each step one level entering (its window directory and 64 mixed
+//!     blocks) and one leaving. Flat across level size and depth.
 //!   - `chunk-scale-gpu-sync-pan`: a square window of 2, 6, or 14 chunks over the
 //!     two deepest levels pans one chunk across and back, with a visibility update
 //!     and a GPU sync after each step; the window and the column it pans into are
-//!     all mixed chunks. Today the visibility update is O(window chunks), e², and
-//!     the GPU sync O(1) with no uploads. With window residency: a CPU scan of
-//!     O(layers x e²) window chunks and O(layers x e) uploads. Passes when flat
-//!     across level size and depth at every edge, and the edge axis matches those
+//!     all mixed chunks. Each step scans O(layers x e²) window chunks and uploads
+//!     the entering column, O(layers x e). Passes when flat across level size and
+//!     depth at every edge, and the edge and resident-layer axes match those
 //!     orders.
+//! The pan and level-enter groups also run 8 and 32 resident layers at 256² and
+//! 128 levels (item prefix `layers * 10^9`); every other case renders 2.
+//! The GPU sync and batched groups render a fixed 8x8-chunk window over the dig
+//! cells (the pan group its own window), so their GPU work follows the window,
+//! never the level.
 //! Single-cell writes go through the step's reserve seam (`reserveDenseCellWrite`)
 //! first. Changes sit on the deepest levels at the level center; each iteration ends
 //! at its start state. The item count encodes the case as `level side * 1000 +
@@ -66,6 +70,7 @@ const default_chunk_size_tiles = @import("../game/world_system.zig").default_chu
 const Renderer = @import("../render/renderer.zig").Renderer;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const tile_store_max_elements = @import("../render/renderer.zig").tile_store_max_elements;
+const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
 const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
 const suite = @import("suite.zig");
 
@@ -108,24 +113,46 @@ fn panRegionColumns(window_edge: u16) u16 {
     return window_edge + 1;
 }
 
+// The GPU sync groups' resident layers by default: `active_level` and the one below.
+const default_resident_layers: u16 = 2;
+// The pan and level-enter groups' resident-layer axis, measured at one level size
+// and depth deep enough to hold it; the size and depth axes run at the default.
+const resident_layer_axis = [_]u16{ 8, 32 };
+const resident_layer_axis_scale: usize = @as(usize, level_sides[0]) * case_encoding + level_counts[level_counts.len - 1];
+// Encodes a non-default resident-layer count above every other case field.
+const resident_layer_encoding: usize = 1_000_000_000;
+
 const pan_item_counts = blk: {
-    var counts: [pan_window_edges.len * scale_item_counts.len]usize = undefined;
+    const scale_cases = pan_window_edges.len * scale_item_counts.len;
+    var counts: [scale_cases + pan_window_edges.len * resident_layer_axis.len]usize = undefined;
     for (pan_window_edges, 0..) |edge, edge_index| {
         std.debug.assert(panRegionColumns(edge) <= level_sides[0] / default_chunk_size_tiles);
         for (scale_item_counts, 0..) |scale, scale_index| {
             counts[edge_index * scale_item_counts.len + scale_index] = @as(usize, edge) * case_prefix_encoding + scale;
         }
+        for (resident_layer_axis, 0..) |layers, layer_index| {
+            counts[scale_cases + edge_index * resident_layer_axis.len + layer_index] =
+                @as(usize, layers) * resident_layer_encoding + @as(usize, edge) * case_prefix_encoding + resident_layer_axis_scale;
+        }
     }
     break :blk counts;
 };
 
-// Elements one pan iteration (a step across and back) uploads. Residency today
-// covers whole levels, so a pan uploads nothing. With window residency this becomes
-// 2 resident layers x 2 steps x (window_edge entering chunks' words or blocks, plus
-// the directory and window words the step rewrites).
-fn expectedPanUploads(window_edge: u16) usize {
-    _ = window_edge;
-    return 0;
+const level_enter_item_counts = blk: {
+    var counts: [scale_item_counts.len + resident_layer_axis.len]usize = undefined;
+    @memcpy(counts[0..scale_item_counts.len], &scale_item_counts);
+    for (resident_layer_axis, scale_item_counts.len..) |layers, index| {
+        counts[index] = @as(usize, layers) * resident_layer_encoding + resident_layer_axis_scale;
+    }
+    break :blk counts;
+};
+
+// Elements one pan iteration (a step across and back) uploads: per resident layer
+// and step, the entering column's `window_edge` mixed chunks, each a directory word
+// and a whole block.
+fn expectedPanUploads(window_edge: u16, resident_layers: u16) usize {
+    const steps = 2;
+    return @as(usize, resident_layers) * steps * window_edge * (1 + tileStoreBlockElements(default_chunk_size_tiles));
 }
 
 const dig_cell_count: u16 = 64;
@@ -133,8 +160,9 @@ const cave_in_levels: u16 = 4;
 // Batched edits are independent chunks; one chunk per range is the fixed controls'
 // partition.
 const edit_range_alignment_items: usize = 1;
-// The GPU sync groups render a two-level window: `active_level` and the one below.
-const gpu_window_levels_below: u16 = 1;
+// The fixed render window of the dig, level-enter, and batched groups, in chunks: the
+// dig workload's 8x8 chunk square at the level center.
+const dig_window_chunks: u16 = 8;
 
 pub const dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-dig",
@@ -168,7 +196,7 @@ pub const gpu_sync_dig_group = suite.BenchmarkGroup{
 
 pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-level-enter",
-    .defaultItemCounts = scaleItemCounts,
+    .defaultItemCounts = levelEnterItemCounts,
     .runCase = runGpuSyncLevelEnterCase,
 };
 
@@ -188,6 +216,10 @@ fn regionItemCounts(_: suite.Profile) []const usize {
 
 fn panItemCounts(_: suite.Profile) []const usize {
     return &pan_item_counts;
+}
+
+fn levelEnterItemCounts(_: suite.Profile) []const usize {
+    return &level_enter_item_counts;
 }
 
 const Workload = enum { dig, ramp, gpu_sync_dig, gpu_sync_level_enter, gpu_sync_pan };
@@ -233,6 +265,8 @@ const Fixture = struct {
     renderer: ?Renderer = null,
     // Pan group only: the window edge and its start chunk.
     pan_window_edge: u16 = 0,
+    // GPU sync groups: levels below the active level in the render window.
+    gpu_levels_below: u16 = default_resident_layers - 1,
     pan_origin_chunk_x: u16 = 0,
     pan_origin_chunk_y: u16 = 0,
 
@@ -252,8 +286,10 @@ const Fixture = struct {
     }
 
     // Gives the world a tile store with no GPU buffer, large enough that no sync
-    // grows it (growth would create a GPU buffer).
+    // grows it (growth would create a GPU buffer), laid out for the render window
+    // already set, so no sync creates a store either.
     fn attachHeadlessTileStore(self: *Fixture, allocator: std.mem.Allocator) !void {
+        std.debug.assert(self.world.visible_window_set);
         self.renderer = Renderer{
             .allocator = allocator,
             .device = undefined,
@@ -270,12 +306,10 @@ const Fixture = struct {
             // Never dereferenced: syncs only validate and queue.
             .buffer = @ptrFromInt(0x1000),
             .element_capacity = tile_store_max_elements,
-            .directory_elements = 0,
-            .block_elements = 1,
             .params = std.mem.zeroes(TilemapParams),
         });
         self.world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
-        self.world.render_window = .{ .levels_below = gpu_window_levels_below };
+        self.world.gpu_tiles.store_side = self.world.render_side;
     }
 
     // One GPU tile sync; returns the elements it uploads and drops the batch.
@@ -291,20 +325,27 @@ const Fixture = struct {
 
     // The window's top level for the GPU sync groups: the deepest level is resident.
     fn gpuActiveLevel(self: *const Fixture) u16 {
-        return self.levels - 1 - gpu_window_levels_below;
+        return self.levels - 1 - self.gpu_levels_below;
     }
 
     // Sets the pan window `step_chunks` right of its start, around the GPU active
-    // level, with no overscan. The rect ends half a tile short of the window's far
-    // chunk edge: at large pixel coordinates an f32 rect ending exactly on a tile
-    // edge rounds into the next tile.
+    // level, with no overscan.
     fn setPanWindow(self: *Fixture, step_chunks: u16) void {
-        const tile_size = self.world.tile_size;
-        const chunk_px = @as(f32, @floatFromInt(default_chunk_size_tiles)) * tile_size;
-        const edge = self.pan_window_edge;
-        const min_chunk_x = self.pan_origin_chunk_x + step_chunks;
-        const min_chunk_y = self.pan_origin_chunk_y;
-        const extent = @as(f32, @floatFromInt(edge)) * chunk_px - tile_size / 2;
+        self.setChunkWindow(self.pan_origin_chunk_x + step_chunks, self.pan_origin_chunk_y, self.pan_window_edge);
+    }
+
+    // Sets the fixed render window over the dig cells' chunk square, with the two
+    // deepest levels in the level window.
+    fn setDigWindow(self: *Fixture) void {
+        self.world.render_window = .{ .levels_below = self.gpu_levels_below };
+        const origin_chunk = self.side / default_chunk_size_tiles / 2 - dig_window_chunks / 2;
+        self.setChunkWindow(origin_chunk, origin_chunk, dig_window_chunks);
+    }
+
+    // A rect exactly covering `edge` x `edge` chunks from (min_chunk_x, min_chunk_y).
+    fn setChunkWindow(self: *Fixture, min_chunk_x: u16, min_chunk_y: u16, edge: u16) void {
+        const chunk_px = @as(f32, @floatFromInt(default_chunk_size_tiles)) * self.world.tile_size;
+        const extent = @as(f32, @floatFromInt(edge)) * chunk_px;
         self.world.setVisibleChunksForWorldRect(.{
             .x = @as(f32, @floatFromInt(min_chunk_x)) * chunk_px,
             .y = @as(f32, @floatFromInt(min_chunk_y)) * chunk_px,
@@ -354,28 +395,35 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
     if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs, ramps, and GPU syncs run on the main thread");
-    const window_edge: u16 = @intCast(item_count / case_prefix_encoding);
+    const encoded_layers = item_count / resident_layer_encoding;
+    const resident_layers: u16 = if (encoded_layers == 0) default_resident_layers else @intCast(encoded_layers);
+    const window_edge: u16 = @intCast(item_count % resident_layer_encoding / case_prefix_encoding);
     const scale = item_count % case_prefix_encoding;
     const side: u16 = @intCast(scale / case_encoding);
     const levels: u16 = @intCast(scale % case_encoding);
     std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
     std.debug.assert((workload == .gpu_sync_pan) == (window_edge > 0));
 
+    std.debug.assert(resident_layers == default_resident_layers or workload == .gpu_sync_pan or workload == .gpu_sync_level_enter);
+    std.debug.assert(resident_layers + 1 <= levels);
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
+    fixture.gpu_levels_below = resident_layers - 1;
     switch (workload) {
         .gpu_sync_dig => {
+            fixture.setDigWindow();
             try fixture.attachHeadlessTileStore(allocator);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         },
         .gpu_sync_level_enter => {
+            fixture.setDigWindow();
             try fixture.attachHeadlessTileStore(allocator);
             // 64 mixed chunks on each level the window crosses.
             for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
         },
         .gpu_sync_pan => {
-            try fixture.attachHeadlessTileStore(allocator);
+            fixture.world.render_window = .{ .levels_below = fixture.gpu_levels_below };
             const columns = panRegionColumns(window_edge);
             const chunks_per_side = side / default_chunk_size_tiles;
             std.debug.assert(columns <= chunks_per_side);
@@ -386,6 +434,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
                 try mixRegion(&fixture, @intCast(level), columns, window_edge);
             }
             fixture.setPanWindow(0);
+            try fixture.attachHeadlessTileStore(allocator);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         },
         .dig, .ramp => {},
@@ -433,7 +482,7 @@ fn runIteration(fixture: *Fixture, workload: Workload) !usize {
             const panned = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
             fixture.setPanWindow(0);
             const uploaded = panned + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-            if (uploaded != expectedPanUploads(fixture.pan_window_edge)) return error.PanUploadCountMismatch;
+            if (uploaded != expectedPanUploads(fixture.pan_window_edge, fixture.gpu_levels_below + 1)) return error.PanUploadCountMismatch;
             break :blk uploaded;
         },
     };
@@ -719,8 +768,9 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
-    // The two deepest levels are GPU resident, so every edit there queues GPU edits;
-    // each iteration's sync drains them outside the timed region.
+    // The two deepest levels are GPU resident over the fixed window, so edits there
+    // queue GPU edits; each iteration's sync drains them outside the timed region.
+    fixture.setDigWindow();
     try fixture.attachHeadlessTileStore(allocator);
     _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
     var edit = switch (workload) {

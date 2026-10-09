@@ -29,6 +29,7 @@ const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
 const packTileDataElement = @import("../render/renderer.zig").packTileDataElement;
 const tile_store_uniform_bit = @import("../render/renderer.zig").tile_store_uniform_bit;
+const tile_store_max_side = @import("../render/renderer.zig").tile_store_max_side;
 const Sprite = @import("../render/renderer.zig").Sprite;
 const sprite_batch = @import("../render/sprite_batch.zig");
 const Position = @import("../render/renderer.zig").Position;
@@ -99,31 +100,9 @@ pub fn validateChunkGrid(width: usize, height: usize, chunk_size: u16) ChunkGrid
 // lower plane's bands never sort above a higher plane's. Levels descend by this
 // step: level 0 (surface) is highest, deeper levels lower.
 pub const level_z_step: i32 = 16;
-/// Stack cap for dense submit collection. Sized above the default window
-/// (8 level indices × 2 bands). Build-time validation keeps real worlds inside
-/// `maxDenseSubmitLayerCount`; overflow here is a defensive submit-time guard.
-pub const k_max_dense_submit_stack_cap: usize = 32;
-
-// The renderer's per-draw composited layer window must be able to hold every
-// layer this stack can ever submit in one frame; tied here (this file already
-// imports renderer.zig) rather than in renderer.zig, to avoid an import cycle.
-comptime {
-    std.debug.assert(Renderer.k_max_tilemap_window_layers == k_max_dense_submit_stack_cap);
-}
-
-// `partitionDenseCompositeBuckets` can never produce more buckets than
-// submitted dense layers (one cut point consumes at least one layer), so the
-// renderer's composite-draw budget must cover the full submit-stack cap or
-// the bucket-count invariant it relies on breaks.
-comptime {
-    std.debug.assert(Renderer.k_max_dense_composite_draws >= k_max_dense_submit_stack_cap);
-}
-
-// GPU tile blocks pack two tile ids per u32 element (`renderer.zig` `packTileData`),
-// and every layer the window can submit holds one directory slot.
+// GPU tile blocks pack two tile ids per u32 element (`renderer.zig` `packTileData`).
 comptime {
     std.debug.assert(@bitSizeOf(TileId) == 16);
-    std.debug.assert(world_gpu_tiles.slot_count == k_max_dense_submit_stack_cap);
 }
 
 pub const TileFlags = packed struct(u8) {
@@ -146,16 +125,6 @@ pub const DenseLayerRenderWindow = struct {
     /// render slice following the player down. Hole see-through from the surface
     /// uses `levels_below` while `active_level == 0`.
     ceiling_when_underground: bool = false,
-
-    pub fn maxLevelSpan(self: DenseLayerRenderWindow) u16 {
-        var span: u16 = 1 + self.levels_below;
-        if (self.ceiling_when_underground) span += 1;
-        return span;
-    }
-
-    pub fn maxSubmitLayers(self: DenseLayerRenderWindow, max_dense_bands_per_level: u8) usize {
-        return @as(usize, self.maxLevelSpan()) * @as(usize, max_dense_bands_per_level);
-    }
 
     pub fn levelInWindow(
         self: DenseLayerRenderWindow,
@@ -180,7 +149,6 @@ pub const WorldBuildConfig = struct {
     height_tiles: u16 = 512,
     chunk_size_tiles: u16 = 16,
     seed: u64 = 0x51d1_ea5e_2026_0624,
-    max_dense_bands_per_level: u8 = 2,
     /// Underground dense floors below the surface (level 0). Default 31 → 32 total levels.
     underground_level_count: u16 = 31,
     render_window: DenseLayerRenderWindow = .{},
@@ -261,9 +229,9 @@ const DenseLayerRow = struct {
     base_z: i32,
     depth_band: WorldDepth,
     store: DenseLayerStore,
-    // Directory slot in the GPU tile store, or `world_gpu_tiles.no_slot` when the
-    // layer is outside the render window.
-    gpu_slot: u8,
+    // Resident slot in the GPU tile store mirror, or `world_gpu_tiles.no_slot` when
+    // the layer is outside the render window.
+    gpu_slot: u32,
 };
 
 const ReservedChunk = struct {
@@ -385,7 +353,7 @@ const DenseEditPlanJob = struct {
     groups: []DenseEditGroup,
     stores: []const DenseLayerStore,
     layer_levels: []const u16,
-    gpu_slots: []const u8,
+    gpu_slots: []const u32,
     levels: []const LevelTerrain,
     catalog_valid: []const bool,
     range_count: usize,
@@ -412,6 +380,42 @@ const DenseEditWriteJob = struct {
     sparse_flags: []const TileFlags,
     sparse_level_chunk_tiles: []const std.ArrayList(std.ArrayList(u32)),
     range_count: usize,
+};
+
+// Render-path state of the dense window, sized at the GPU sync's plan to the
+// window's layer count so the frame's submit allocates nothing. Render-only.
+const DenseRenderScratch = struct {
+    // The window's layers, topmost first (`collectDenseSubmitLayers`).
+    desired: std.ArrayList(u32) = .empty,
+    // Resident layers, deepest first, and their render depths (ascending).
+    layers: std.ArrayList(u32) = .empty,
+    layer_depths: std.ArrayList(i32) = .empty,
+    // render_prep's interleave candidates and per-gap flags.
+    interleave: std.ArrayList(i32) = .empty,
+    gap_filled: std.ArrayList(bool) = .empty,
+    buckets: std.ArrayList(WorldSystem.DenseCompositeBucket) = .empty,
+    // The interleave depths the last submit cut against.
+    submitted_interleave: std.ArrayList(i32) = .empty,
+
+    fn deinit(self: *DenseRenderScratch, allocator: std.mem.Allocator) void {
+        self.desired.deinit(allocator);
+        self.layers.deinit(allocator);
+        self.layer_depths.deinit(allocator);
+        self.interleave.deinit(allocator);
+        self.gap_filled.deinit(allocator);
+        self.buckets.deinit(allocator);
+        self.submitted_interleave.deinit(allocator);
+    }
+
+    // Room for a resident set of `count` layers in every per-frame list.
+    fn reserve(self: *DenseRenderScratch, allocator: std.mem.Allocator, count: usize) error{OutOfMemory}!void {
+        try self.layers.ensureTotalCapacity(allocator, count);
+        try self.layer_depths.ensureTotalCapacity(allocator, count);
+        try self.interleave.ensureTotalCapacity(allocator, count);
+        try self.gap_filled.ensureTotalCapacity(allocator, count);
+        try self.buckets.ensureTotalCapacity(allocator, count);
+        try self.submitted_interleave.ensureTotalCapacity(allocator, count);
+    }
 };
 
 const SparseTileRow = struct {
@@ -479,6 +483,10 @@ pub const WorldSystem = struct {
     // resident layers are drained every frame gameplay advances (the pause policy
     // blocks gameplay updates whenever render is skipped).
     gpu_tiles: GpuTileMirror = .{},
+    // The GPU directory side for the last visibility rect: a power of two covering
+    // any chunk window a rect of that size can touch, so a pan keeps the layout.
+    render_side: u32 = 0,
+    dense_render: DenseRenderScratch = .{},
     // Residency inputs of the last GPU sync; a change re-derives the resident layers.
     gpu_resident_level: u16 = std.math.maxInt(u16),
     gpu_resident_window: DenseLayerRenderWindow = .{},
@@ -552,39 +560,19 @@ pub const WorldSystem = struct {
     // atlas params and the safe-build runtime-texture-match assert.
     atlas_texture: TextureDesc = .{ .width = 0, .height = 0 },
     // World-constant grid + atlas geometry for the tilemap fragment shader. Built
-    // once at init; the GPU tile store adds the chunk geometry, and each composite
-    // draw adds its layers' directory offsets.
+    // once at init; the GPU tile store adds the chunk geometry and resident window,
+    // and each composite draw adds its layer chain.
     tilemap_params: TilemapParams = .{ .grid = .{ 0, 0, 0, 0 }, .atlas = .{ 0, 0, 0, 0 } },
     // The dense-layer tilemap quads need (re)submitting into the renderer's static
-    // buffer: true at init and on a structural change (new dense layer). Unlike the
-    // old vertex cache this never flips on a pan — the quads are full-world and the
-    // camera lives in the shader, so panning uploads nothing.
+    // buffer: true at init and when the resident layers or the store change. Never
+    // set by a pan: the quads are full-world, the camera lives in the shader, and
+    // the chunk window is a store uniform.
     dense_quads_dirty: bool = true,
     // Last dense static submit anchor and window fingerprint. A change forces a
     // re-submit even without a structural edit. Sentinel forces the first submit.
     submitted_active_level: u16 = std.math.maxInt(u16),
     submitted_window: DenseLayerRenderWindow = .{},
-    // Last submitted interleave-depth set (sorted ascending, deduplicated by the
-    // caller): the depths this frame's composite-draw buckets were cut against.
-    // A change forces a re-submit even without a structural/level/window change,
-    // since a newly-registered interleave point (e.g. a sparse tile at a new
-    // depth becoming relevant) can change where the dense stack must split.
-    submitted_interleave_depths: [k_max_dense_submit_stack_cap]i32 = undefined,
-    submitted_interleave_count: usize = 0,
-    // Cached result from the last time `denseWindowDepthSpan` actually recomputed
-    // (rather than reusing this cache): valid exactly when `dense_quads_dirty`,
-    // `submitted_active_level`, and `submitted_window` still match the request,
-    // since those are the only things that can change the window's real content.
-    dense_window_depth_span: ?DenseWindowDepthSpan = null,
-    // The submitted layers' own depths (ascending), cached alongside
-    // `dense_window_depth_span` on the same recompute condition. Lets
-    // `render_prep.collectDenseInterleaveDepths` bucket candidate depths by
-    // which gap between adjacent submitted layers they would cut, without
-    // recomputing `collectDenseSubmitLayers` a second time.
-    dense_window_layer_depths: [k_max_dense_submit_stack_cap]i32 = undefined,
-    dense_window_layer_depth_count: usize = 0,
     render_window: DenseLayerRenderWindow = .{},
-    max_dense_bands_per_level: u8 = 2,
 
     interest_markers: world_interest.InterestMarkerStore = .{},
 
@@ -598,7 +586,6 @@ pub const WorldSystem = struct {
         var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
         errdefer world.deinit();
         try world.addUndergroundLevels(meta);
-        try world.validateDenseRenderBudget();
         return world;
     }
 
@@ -612,7 +599,6 @@ pub const WorldSystem = struct {
         var world = try initProceduralFromMeta(allocator, meta, config, thread_system);
         errdefer world.deinit();
         try world.addUndergroundLevelStack(meta, config.underground_level_count);
-        try world.validateDenseRenderBudget();
         return world;
     }
 
@@ -630,7 +616,6 @@ pub const WorldSystem = struct {
             .chunk_size_tiles = config.chunk_size_tiles,
             .atlas_texture = atlasTextureDesc(meta),
             .render_window = config.render_window,
-            .max_dense_bands_per_level = config.max_dense_bands_per_level,
         };
         try validateChunkGrid(world.width, world.height, world.chunk_size_tiles);
         errdefer world.deinit();
@@ -739,7 +724,6 @@ pub const WorldSystem = struct {
         var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
         errdefer world.deinit();
         try world.addUndergroundLevels(meta);
-        try world.validateDenseRenderBudget();
         return world;
     }
 
@@ -758,6 +742,7 @@ pub const WorldSystem = struct {
         self.sparse_level_chunk_tiles.deinit(self.allocator);
 
         self.gpu_tiles.deinit(self.allocator);
+        self.dense_render.deinit(self.allocator);
         self.dense_reserved_chunks.deinit(self.allocator);
         self.dense_edit.deinit(self.allocator);
         for (self.dense_layers.items(.store)) |*store| store.deinit(self.allocator);
@@ -793,32 +778,11 @@ pub const WorldSystem = struct {
         return self.visible_sparse_count;
     }
 
-    /// Upper bound on dense tilemap static groups submitted in one frame for the
-    /// configured render window and per-level band cap.
-    pub fn maxDenseSubmitLayerCount(self: *const WorldSystem) usize {
-        return self.render_window.maxSubmitLayers(self.max_dense_bands_per_level);
-    }
-
-    /// Upper bound on dense tilemap composite draw calls submitted in one frame.
-    /// Actual bucket count is data-dependent (which depths need a sandwich point
-    /// this frame); this is the worst case the render-prep boundary reserves
-    /// static-geometry draw-list capacity for.
+    /// Upper bound on dense tilemap composite draws submitted this frame: one per
+    /// resident layer, the most `partitionDenseCompositeBuckets` can cut. Read after
+    /// `syncDenseTileStore`, which sets the resident layers.
     pub fn maxDenseSubmitDrawCount(self: *const WorldSystem) usize {
-        _ = self;
-        return Renderer.k_max_dense_composite_draws;
-    }
-
-    /// The render window and every level's band count fit one composited window of
-    /// GPU directory slots. Presentation-only; never a terrain or memory refusal.
-    pub fn validateDenseRenderBudget(self: *const WorldSystem) error{DenseLayerWindowExceeded}!void {
-        if (self.maxDenseSubmitLayerCount() > k_max_dense_submit_stack_cap) {
-            return error.DenseLayerWindowExceeded;
-        }
-        for (self.level_terrain.items) |terrain| {
-            if (terrain.band_count > self.max_dense_bands_per_level) {
-                return error.DenseLayerWindowExceeded;
-            }
-        }
+        return self.dense_render.layers.items.len;
     }
 
     /// Sparse tiles the next frame draws: those on the render window's levels around
@@ -881,8 +845,8 @@ pub const WorldSystem = struct {
         const tile_size = self.tile_size;
         const min_tile_x = floorTileClamped(rect.x, tile_size, self.width);
         const min_tile_y = floorTileClamped(rect.y, tile_size, self.height);
-        const max_tile_x = floorTileClamped(visibleMaxCoord(rect.x, rect.w), tile_size, self.width);
-        const max_tile_y = floorTileClamped(visibleMaxCoord(rect.y, rect.h), tile_size, self.height);
+        const max_tile_x = lastTileClamped(rect.x, rect.w, tile_size, self.width);
+        const max_tile_y = lastTileClamped(rect.y, rect.h, tile_size, self.height);
         return .{
             .min_tile_x = min_tile_x,
             .min_tile_y = min_tile_y,
@@ -926,8 +890,9 @@ pub const WorldSystem = struct {
         };
     }
 
-    /// Sets the render chunk window and the active level it renders around, and
-    /// refreshes the visible sparse count. O(1) when neither changed; otherwise
+    /// Sets the render chunk window, the GPU directory side for the rect's size, and
+    /// the active level it renders around, and refreshes the visible sparse count.
+    /// O(1) when the window and level are unchanged; otherwise
     /// `visibleSparseTileCount`, never depending on the level's chunk count or the
     /// world's depth.
     pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16, active_level: u16) void {
@@ -935,6 +900,7 @@ pub const WorldSystem = struct {
             self.visible_sparse_count = 0;
             return;
         }
+        self.render_side = self.renderSideForRect(rect, overscan_chunks);
         const window = self.chunkWindowForWorldRect(rect, overscan_chunks);
         const min_tile_x = window.min_tile_x;
         const min_tile_y = window.min_tile_y;
@@ -968,9 +934,33 @@ pub const WorldSystem = struct {
         self.visible_window_set = true;
         self.visible_active_level = active_level;
 
-        // Chunk visibility crops sparse tiles only; each dense composite draw is one
-        // full-world tilemap quad, so a pan uploads nothing.
+        // Chunk visibility crops sparse tiles here; the GPU sync moves the dense
+        // window's residency to the new chunks.
         self.visible_sparse_count = self.visibleSparseTileCount();
+    }
+
+    // A power-of-two side covering every chunk window a rect of this size touches:
+    // its chunk span plus one for alignment and the overscan on both sides, clamped
+    // to the level's chunk grid. Depends only on the rect size, so a pan keeps it.
+    fn renderSideForRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16) u32 {
+        const geom = self.chunkGeometry();
+        const chunk_px = @as(f32, @floatFromInt(geom.edge)) * self.tile_size;
+        const overscan = 1 + 2 * @as(u32, overscan_chunks);
+        const span_x = rectChunkSpan(rect.w, chunk_px, geom.chunks_x) + overscan;
+        const span_y = rectChunkSpan(rect.h, chunk_px, geom.chunks_y) + overscan;
+        const grid_side = std.math.ceilPowerOfTwoAssert(u32, @max(geom.chunks_x, geom.chunks_y));
+        const max_side = @min(grid_side, tile_store_max_side);
+        return @min(std.math.ceilPowerOfTwo(u32, @max(span_x, span_y)) catch max_side, max_side);
+    }
+
+    // The render chunk window as the GPU mirror's half-open window. Requires a set window.
+    fn renderChunkWindow(self: *const WorldSystem) world_gpu_tiles.ChunkWindow {
+        return .{
+            .min_x = self.last_min_chunk_x,
+            .min_y = self.last_min_chunk_y,
+            .max_x = @as(u32, self.last_max_chunk_x) + 1,
+            .max_y = @as(u32, self.last_max_chunk_y) + 1,
+        };
     }
 
     pub fn worldWidthPixels(self: *const WorldSystem) f32 {
@@ -990,45 +980,32 @@ pub const WorldSystem = struct {
 
     pub const DenseWindowDepthSpan = struct { min: i32, max: i32 };
 
-    /// Returns the depth span (shallowest/deepest render depth) of whatever
-    /// `collectDenseSubmitLayers` would submit for `active_level` this frame, or
-    /// null when nothing is in window. Lets callers filter candidate interleave
-    /// depths to only the ones that could possibly matter before computing them,
-    /// without duplicating the window-selection rule. Reuses the cached span from
-    /// the last recompute while `dense_quads_dirty`, `active_level`, and
-    /// `render_window` all still match `submitted_active_level`/`submitted_window`
-    /// (the same triggers `submitStaticDenseGeometry` gates a re-submit on, so the
-    /// window's real dense-layer content is guaranteed unchanged too), sparing a
-    /// full dense-layer scan and sort on every still frame. Propagates
-    /// `error.TooManyDenseLayers` instead of swallowing it as an empty window.
-    pub fn denseWindowDepthSpan(self: *WorldSystem, active_level: u16) error{TooManyDenseLayers}!?DenseWindowDepthSpan {
-        if (!self.dense_quads_dirty and
-            active_level == self.submitted_active_level and
-            windowsEqual(self.render_window, self.submitted_window))
-            return self.dense_window_depth_span;
-
-        var submit_layers: [k_max_dense_submit_stack_cap]usize = undefined;
-        const submit_count = try self.collectDenseSubmitLayers(active_level, &submit_layers);
-        for (submit_layers[0..submit_count], 0..) |layer_index, i| {
-            self.dense_window_layer_depths[i] = self.denseLayerOrder(layer_index).depth;
-        }
-        self.dense_window_layer_depth_count = submit_count;
-        const span: ?DenseWindowDepthSpan = if (submit_count == 0) null else .{
-            .min = self.dense_window_layer_depths[0],
-            .max = self.dense_window_layer_depths[submit_count - 1],
-        };
-        self.dense_window_depth_span = span;
-        return span;
+    /// The depth span (deepest/shallowest render depth) of the resident dense
+    /// layers the next submit draws, or null when none is resident. Read after
+    /// `syncDenseTileStore`. O(1).
+    pub fn denseWindowDepthSpan(self: *const WorldSystem) ?DenseWindowDepthSpan {
+        const depths = self.dense_render.layer_depths.items;
+        if (depths.len == 0) return null;
+        return .{ .min = depths[0], .max = depths[depths.len - 1] };
     }
 
-    /// This frame's submitted dense layer depths (ascending, deepest first),
-    /// cached by the last `denseWindowDepthSpan` recompute. Callers must call
-    /// `denseWindowDepthSpan` for the same `active_level` first in the same
-    /// frame (`render_prep.collectDenseInterleaveDepths` does, by construction)
-    /// so this reads a fresh cache rather than a stale one from a prior level
-    /// or window.
+    /// The resident dense layers' render depths, ascending (deepest first), as of
+    /// the last `syncDenseTileStore`.
     pub fn denseWindowLayerDepths(self: *const WorldSystem) []const i32 {
-        return self.dense_window_layer_depths[0..self.dense_window_layer_depth_count];
+        return self.dense_render.layer_depths.items;
+    }
+
+    /// Scratch for render_prep's interleave candidates: room for one depth per gap
+    /// between resident layers, and those gaps' flags cleared. Allocation-free:
+    /// sized when the resident set was planned.
+    pub fn denseInterleaveScratch(self: *WorldSystem) struct { depths: []i32, gap_filled: []bool } {
+        const scratch = &self.dense_render;
+        const gaps = scratch.layers.items.len -| 1;
+        std.debug.assert(scratch.interleave.capacity >= gaps and scratch.gap_filled.capacity >= gaps);
+        scratch.interleave.items.len = gaps;
+        scratch.gap_filled.items.len = gaps;
+        @memset(scratch.gap_filled.items, false);
+        return .{ .depths = scratch.interleave.items, .gap_filled = scratch.gap_filled.items };
     }
 
     /// The render depth an actor standing on `active_level` draws at. Always
@@ -1039,19 +1016,20 @@ pub const WorldSystem = struct {
         return self.worldZForLevel(active_level, 0, .actor);
     }
 
-    /// Submits this frame's dense window as one retained world-space tilemap
-    /// quad per composite draw: each draw's fragment shader walks a topmost-first
-    /// window of dense layers' directories in the world's GPU tile store, stopping at
-    /// the first opaque cell, so a whole run of layers with nothing sandwiched
-    /// between them is one draw independent of world size. `interleave_depths`
-    /// (sorted ascending, deduplicated) are this frame's cut points — depths
-    /// something else (a sparse tile, a dynamic entity) needs to render strictly
-    /// between two dense layers; each one splits the stack into another
-    /// composite draw at that boundary. Requires `syncDenseTileStore` for the same
-    /// `active_level` first. Re-submits on a structural change (`dense_quads_dirty`), an
-    /// `active_level`/window change, or an interleave-depth-set change — never
-    /// on a pan alone, since the quads are full-world and the camera lives in
-    /// the vertex shader.
+    /// Submits this frame's resident dense layers as one retained world-space
+    /// tilemap quad per composite draw: each draw's fragment shader walks a chain of
+    /// layer directories in the world's GPU tile store from its topmost layer,
+    /// stopping at the first opaque cell, so a run of layers with nothing sandwiched
+    /// between them is one draw independent of world size and window depth.
+    /// `interleave_depths` (sorted ascending, deduplicated) are this frame's cut
+    /// points: depths something else (a sparse tile, a dynamic entity) needs to
+    /// render strictly between two dense layers; each splits the stack into another
+    /// draw. Requires `syncDenseTileStore` for the same `active_level` first.
+    /// Re-submits on a layer or store change (`dense_quads_dirty`), an
+    /// `active_level`/window change, or an interleave-depth-set change, never on a
+    /// pan alone: the quads are full-world, the camera lives in the vertex shader,
+    /// and the resident chunk window is a store uniform. Allocation-free within the
+    /// sync's reserve.
     pub fn submitStaticDenseGeometry(
         self: *WorldSystem,
         renderer: *Renderer,
@@ -1063,30 +1041,26 @@ pub const WorldSystem = struct {
         if (!self.dense_quads_dirty and
             active_level == self.submitted_active_level and
             windowsEqual(self.render_window, self.submitted_window) and
-            std.mem.eql(i32, self.submitted_interleave_depths[0..self.submitted_interleave_count], interleave_depths))
+            std.mem.eql(i32, self.dense_render.submitted_interleave.items, interleave_depths))
             return;
 
         // The tilemap atlas params are baked from the world atlas dimensions at init;
         // the bound runtime texture must match. Safe-build only, and only on a
-        // re-submit (structural change), not still frames.
+        // re-submit, not still frames.
         if (std.debug.runtime_safety) {
             if (renderer.textureDesc(prepared.texture)) |desc| {
                 std.debug.assert(desc.width == self.atlas_texture.width and desc.height == self.atlas_texture.height);
             }
         }
 
-        var submit_layers: [k_max_dense_submit_stack_cap]usize = undefined;
-        const submit_count = try self.collectDenseSubmitLayers(active_level, &submit_layers);
-        std.debug.assert(submit_count <= self.maxDenseSubmitLayerCount());
+        const layers = self.dense_render.layers.items;
+        try self.dense_render.buckets.resize(self.allocator, layers.len);
+        try self.dense_render.submitted_interleave.ensureTotalCapacity(self.allocator, interleave_depths.len);
         renderer.beginStaticGeometry();
 
-        if (submit_count > 0) {
-            var buckets: [Renderer.k_max_dense_composite_draws]DenseCompositeBucket = undefined;
-            const bucket_count = self.partitionDenseCompositeBuckets(
-                submit_layers[0..submit_count],
-                interleave_depths,
-                &buckets,
-            );
+        if (layers.len > 0) {
+            const buckets = self.dense_render.buckets.items;
+            const bucket_count = self.partitionDenseCompositeBuckets(layers, interleave_depths, buckets);
 
             // Only the world-space corners (position) are consumed by the tilemap
             // shader; the source/uv are ignored, so the source rect is a
@@ -1103,18 +1077,16 @@ pub const WorldSystem = struct {
             }, self.atlas_texture, .{ .positions = &pos, .uvs = &uv, .colors = &col });
 
             for (buckets[0..bucket_count]) |bucket| {
-                var window_layers = try self.buildWindowLayers(submit_layers[0..submit_count], bucket.start, bucket.end);
-                // True only for the bucket holding the overall shallowest submitted
-                // layer (the last bucket, since submit_layers is depth-ascending):
-                // the fragment shader's rim-shadow effect must gate on this, not on
-                // its own draw-local `resolved_depth == 0`, since a bucket split for
-                // an unrelated interleave point elsewhere can put a merely
-                // hole-revealed (not truly topmost) tile at `resolved_depth == 0`
-                // within its own draw.
-                window_layers.is_shallowest_bucket = bucket.end == submit_count;
-                // Order = the bucket's own shallowest submitted layer (depth-ascending
-                // input means that is the last index in the bucket's range).
-                const order = self.denseLayerOrder(submit_layers[bucket.end - 1]);
+                var window_layers = self.buildWindowLayers(bucket.start, bucket.end);
+                // True only for the bucket holding the overall shallowest resident
+                // layer (the last bucket, since `layers` is depth-ascending): the
+                // fragment shader's rim shadow gates on this, not on its own
+                // draw-local `resolved_depth == 0`, since a bucket split for an
+                // unrelated interleave point can put a merely hole-revealed tile at
+                // `resolved_depth == 0` within its own draw.
+                window_layers.is_shallowest_bucket = bucket.end == layers.len;
+                // Order = the bucket's own shallowest layer (the last in its range).
+                const order = self.denseLayerOrder(layers[bucket.end - 1]);
                 try renderer.appendStaticTilemapSpan(
                     prepared.texture,
                     order,
@@ -1128,35 +1100,26 @@ pub const WorldSystem = struct {
         self.dense_quads_dirty = false;
         self.submitted_active_level = active_level;
         self.submitted_window = self.render_window;
-        self.storeSubmittedInterleaveDepths(interleave_depths);
+        self.dense_render.submitted_interleave.clearRetainingCapacity();
+        self.dense_render.submitted_interleave.appendSliceAssumeCapacity(interleave_depths);
     }
 
-    fn storeSubmittedInterleaveDepths(self: *WorldSystem, interleave_depths: []const i32) void {
-        std.debug.assert(interleave_depths.len <= self.submitted_interleave_depths.len);
-        @memcpy(self.submitted_interleave_depths[0..interleave_depths.len], interleave_depths);
-        self.submitted_interleave_count = interleave_depths.len;
-    }
-
-    /// Cuts `submit_layers` (depth-ascending, deepest-first, per
-    /// `collectDenseSubmitLayers`'s contract) into composite-draw buckets: a new
-    /// bucket boundary is placed at every point where an `interleave_depths`
-    /// value falls strictly between two consecutive submitted layers' depths
-    /// (or exactly at the shallower one, since nothing may draw between that
-    /// pair once composited together). `interleave_depths` must be sorted
-    /// ascending and deduplicated (asserted). Writes bucket ranges into `out`
-    /// and returns the count. Every cut point consumes at least one submitted
-    /// layer, so `out`'s count can never exceed `submit_layers.len`, which is
-    /// itself hard-capped at `k_max_dense_submit_stack_cap` — the comptime
-    /// assert tying `Renderer.k_max_dense_composite_draws` to that same cap
-    /// makes `out.len` always sufficient, so overflow here is unreachable in
-    /// a correct build, not a runtime condition to degrade gracefully around.
+    /// Cuts `layers` (depth-ascending, deepest first) into composite-draw buckets:
+    /// a new bucket boundary is placed at every point where an `interleave_depths`
+    /// value falls strictly between two consecutive layers' depths (or exactly at
+    /// the shallower one, since nothing may draw between that pair once composited
+    /// together). `interleave_depths` must be sorted ascending and deduplicated
+    /// (asserted). Writes bucket ranges into `out` (at least `layers.len` long) and
+    /// returns the count; every cut consumes at least one layer, so the count never
+    /// exceeds `layers.len`.
     fn partitionDenseCompositeBuckets(
         self: *const WorldSystem,
-        submit_layers: []const usize,
+        layers: []const u32,
         interleave_depths: []const i32,
         out: []DenseCompositeBucket,
     ) usize {
-        if (submit_layers.len == 0) return 0;
+        if (layers.len == 0) return 0;
+        std.debug.assert(out.len >= layers.len);
         if (std.debug.runtime_safety and interleave_depths.len > 1) {
             for (1..interleave_depths.len) |i| {
                 std.debug.assert(interleave_depths[i] > interleave_depths[i - 1]);
@@ -1165,11 +1128,11 @@ pub const WorldSystem = struct {
         var bucket_count: usize = 0;
         var bucket_start: usize = 0;
         var interleave_index: usize = 0;
-        for (1..submit_layers.len + 1) |index| {
-            var cut = index == submit_layers.len;
+        for (1..layers.len + 1) |index| {
+            var cut = index == layers.len;
             if (!cut) {
-                const prev_depth = self.denseLayerOrder(submit_layers[index - 1]).depth;
-                const next_depth = self.denseLayerOrder(submit_layers[index]).depth;
+                const prev_depth = self.denseLayerOrder(layers[index - 1]).depth;
+                const next_depth = self.denseLayerOrder(layers[index]).depth;
                 while (interleave_index < interleave_depths.len and interleave_depths[interleave_index] <= prev_depth) {
                     interleave_index += 1;
                 }
@@ -1178,7 +1141,6 @@ pub const WorldSystem = struct {
                 }
             }
             if (cut) {
-                std.debug.assert(bucket_count < out.len);
                 out[bucket_count] = .{ .start = bucket_start, .end = index };
                 bucket_count += 1;
                 bucket_start = index;
@@ -1187,28 +1149,17 @@ pub const WorldSystem = struct {
         return bucket_count;
     }
 
-    /// Reverses one bucket's depth-ascending (deepest-first) layer slice into a
-    /// topmost-first `TilemapWindowLayers` of directory offsets, since the shader
-    /// composites from the top down.
-    fn buildWindowLayers(
-        self: *const WorldSystem,
-        submit_layers: []const usize,
-        bucket_start: usize,
-        bucket_end: usize,
-    ) !Renderer.TilemapWindowLayers {
-        const gpu_slots = self.dense_layers.items(.gpu_slot);
-        const chunk_count = self.chunkCountPerLevel();
-        var window = Renderer.TilemapWindowLayers{};
-        var index = bucket_end;
-        while (index > bucket_start) {
-            index -= 1;
-            const slot = gpu_slots[submit_layers[index]];
-            if (slot == world_gpu_tiles.no_slot) return error.DenseLayerNotResident;
-            // Below the store's u32 element width, checked by `validateStoreWidth`.
-            window.offsets[window.count] = @intCast(@as(usize, slot) * chunk_count);
-            window.count += 1;
-        }
-        return window;
+    /// The chain of one bucket of resident layers (`dense_render.layers[start..end]`,
+    /// deepest first): its topmost layer's directory and the layer count. The
+    /// resident layers chain topmost-first, so the walk visits exactly the bucket.
+    fn buildWindowLayers(self: *const WorldSystem, bucket_start: usize, bucket_end: usize) Renderer.TilemapWindowLayers {
+        std.debug.assert(bucket_start < bucket_end);
+        const topmost = self.dense_render.layers.items[bucket_end - 1];
+        const slot = self.dense_layers.items(.gpu_slot)[topmost];
+        return .{
+            .first_directory = self.gpu_tiles.slotDirectory(slot),
+            .count = @intCast(bucket_end - bucket_start),
+        };
     }
 
     const RenderWindowLevels = struct { first: u32, last: u32, max_level: u16 };
@@ -1225,108 +1176,161 @@ pub const WorldSystem = struct {
         };
     }
 
-    fn collectDenseSubmitLayers(
-        self: *const WorldSystem,
-        active_level: u16,
-        out: []usize,
-    ) error{TooManyDenseLayers}!usize {
-        // Only the window's own levels are visited, through their band lists.
-        const levels = self.renderWindowLevels(active_level) orelse return 0;
-        var submit_count: usize = 0;
+    /// The dense layers of the render window's levels around `active_level`, topmost
+    /// first (back-to-front reversed), in `dense_render.desired`. Visits only the
+    /// window's levels through their band lists: O(window layers log window layers).
+    fn collectDenseSubmitLayers(self: *WorldSystem, active_level: u16) error{OutOfMemory}![]const u32 {
+        const desired = &self.dense_render.desired;
+        desired.clearRetainingCapacity();
+        const levels = self.renderWindowLevels(active_level) orelse return desired.items;
+        var count: usize = 0;
         var level = levels.first;
         while (level <= levels.last) : (level += 1) {
-            const world_level: u16 = @intCast(level);
-            if (!self.render_window.levelInWindow(active_level, world_level, levels.max_level)) continue;
-            for (self.level_terrain.items[level].bandLayers()) |layer_index| {
-                if (submit_count >= out.len) return error.TooManyDenseLayers;
-                out[submit_count] = layer_index;
-                submit_count += 1;
-            }
+            if (!self.render_window.levelInWindow(active_level, @intCast(level), levels.max_level)) continue;
+            count += self.level_terrain.items[level].bandLayers().len;
         }
-        // Back-to-front: deepest plane first so each higher floor composites on top.
-        std.mem.sort(usize, out[0..submit_count], self, denseLayerIndexLessThan);
-        return submit_count;
+        try desired.ensureTotalCapacity(self.allocator, count);
+        level = levels.first;
+        while (level <= levels.last) : (level += 1) {
+            if (!self.render_window.levelInWindow(active_level, @intCast(level), levels.max_level)) continue;
+            desired.appendSliceAssumeCapacity(self.level_terrain.items[level].bandLayers());
+        }
+        std.mem.sort(u32, desired.items, self, denseLayerIndexLessThan);
+        std.mem.reverse(u32, desired.items);
+        return desired.items;
     }
 
     /// Brings the world's GPU tile store in line with the render window around
-    /// `active_level`: layers entering the window upload their directory and their
-    /// mixed chunks' blocks, layers leaving it free their slots, and cell edits on
-    /// resident layers upload one element each, coalesced per element, all in the
-    /// next frame copy pass. Creates the store on first need, content-sized. Call
-    /// once per frame on the main thread before `submitStaticDenseGeometry` and
-    /// swapchain acquisition. O(1) when nothing changed; never depends on levels
-    /// outside the window. An error leaves residency and queued edits for a retry.
-    /// Claims the store for this frame; the renderer retires it the first frame
-    /// this is not called, and the next call re-uploads every resident layer into
-    /// a new store.
+    /// `active_level`: the dense layers of the window's levels, each over the
+    /// render chunk window in a toroidal directory chained topmost-first. Layers
+    /// entering upload their directory and their mixed window chunks' blocks; layers
+    /// leaving free theirs; a pan across a chunk boundary uploads only the chunks
+    /// entering; cell edits on resident chunks upload one element each, coalesced;
+    /// all in the next frame copy pass. Creates the store, content-sized, on first
+    /// need and whenever the directory side changes; layers past the store's `u32`
+    /// width are dropped deepest first and reported once. Call once per frame on
+    /// the main thread before `submitStaticDenseGeometry` and swapchain acquisition.
+    /// O(1) when nothing changed; O(resident layers × window chunks) when the window,
+    /// level, or layer set moves; never depends on chunks or levels outside the
+    /// window. An error leaves residency and queued edits for a retry. Claims the
+    /// store for this frame; the renderer retires it the first frame this is not
+    /// called, and the next call re-uploads the window into a new store.
     pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16) !void {
-        if (self.gpu_tiles.store.isValid() and !renderer.claimTileStore(self.gpu_tiles.store)) self.resetGpuResidency();
-        if (self.levelCount() == 0) return;
+        const mirror = &self.gpu_tiles;
+        if (mirror.store.isValid() and !renderer.claimTileStore(mirror.store)) self.resetGpuResidency();
+        if (self.levelCount() == 0 or !self.visible_window_set) return;
         const sync_plan = try self.planDenseGpuSync(active_level);
-        if (sync_plan.isEmpty()) {
-            self.commitDenseGpuSync(&sync_plan, active_level);
-            return;
-        }
-        const geom = self.chunkGeometry();
-        if (!self.gpu_tiles.store.isValid()) {
+        const old_store = mirror.store;
+        if (sync_plan.span_count > 0 and (!old_store.isValid() or mirror.store_side != sync_plan.side)) {
             var params = self.tilemap_params;
-            params.layer_meta[2] = geom.shift;
-            params.layer_meta[3] = @intCast(geom.chunks_x);
-            self.gpu_tiles.store = try renderer.createTileStore(.{
-                .directory_elements = world_gpu_tiles.directoryElements(geom.chunkCount()),
-                .block_elements = tileStoreBlockElements(geom.edge),
-                .element_capacity = sync_plan.required_elements,
-                .params = params,
-            });
+            params.layer_meta[2] = self.chunkGeometry().shift;
+            params.layer_meta[3] = @intCast(sync_plan.side);
+            params.window = sync_plan.window.uniform();
+            // Held from creation: a retry after a failed reserve reuses this empty
+            // store instead of creating another. It holds no resident layer yet, and
+            // the retry's plan still enters every window layer.
+            mirror.store = try renderer.createTileStore(.{ .element_capacity = @max(1, sync_plan.required_elements), .params = params });
+            mirror.store_side = sync_plan.side;
         }
-        try renderer.reserveTileStoreUploads(self.gpu_tiles.store, sync_plan.required_elements, sync_plan.span_count, sync_plan.value_count);
+        if (sync_plan.span_count > 0) {
+            try renderer.reserveTileStoreUploads(mirror.store, sync_plan.required_elements, sync_plan.span_count, sync_plan.value_count);
+        }
         self.commitDenseGpuSync(&sync_plan, active_level);
-        try renderer.queueTileStoreUploads(self.gpu_tiles.store, self.gpu_tiles.spans.items, self.gpu_tiles.values.items);
-        if (!self.gpu_tiles.resident_bytes_reported) {
-            self.gpu_tiles.resident_bytes_reported = true;
-            if (comptime logging.enabled(.info)) log.info("GPU tile store: {d} resident layers, {d} resident bytes ({d} chunks per level)", .{
-                self.gpu_tiles.residentLayerCount(),
-                self.gpu_tiles.residentBytes(geom),
-                geom.chunkCount(),
+        if (sync_plan.relayout and sync_plan.span_count == 0) {
+            // A new layout with nothing resident leaves the old store unclaimed.
+            mirror.store = .invalid;
+            mirror.store_side = 0;
+        }
+        if (sync_plan.layers_changed or !std.meta.eql(old_store, mirror.store)) self.dense_quads_dirty = true;
+        if (sync_plan.span_count > 0) try renderer.queueTileStoreUploads(mirror.store, mirror.spans.items, mirror.values.items);
+        if (sync_plan.residency_changed and mirror.store.isValid()) renderer.setTileStoreWindow(mirror.store, mirror.window.uniform());
+        if (!mirror.resident_bytes_reported and mirror.store.isValid()) {
+            mirror.resident_bytes_reported = true;
+            if (comptime logging.enabled(.info)) log.info("GPU tile store: {d} resident layers over {d} window chunks, {d} resident bytes", .{
+                mirror.residentLayerCount(),
+                mirror.window.count(),
+                mirror.residentBytes(),
             });
         }
     }
 
     // The renderer retired the store: nothing is resident any more, so the next
-    // sync re-enters every window layer and the draws re-submit. O(resident layers).
+    // sync lays the window out anew and the draws re-submit. O(resident layers).
     fn resetGpuResidency(self: *WorldSystem) void {
         self.gpu_tiles.reset(self.dense_layers.items(.gpu_slot));
+        self.dense_render.layers.clearRetainingCapacity();
+        self.dense_render.layer_depths.clearRetainingCapacity();
         self.gpu_residency_dirty = true;
         self.dense_quads_dirty = true;
     }
 
-    // Sizes this frame's GPU tile sync and reserves its growth; re-derives the
-    // resident layers only when the window, active level, or layer set changed.
+    // Sizes this frame's GPU tile sync and reserves its growth, the frame's dense
+    // render scratch included; re-derives the resident set only when the layer set,
+    // active level, level window, chunk window, or directory side changed. Requires
+    // a set render window.
     fn planDenseGpuSync(self: *WorldSystem, active_level: u16) !world_gpu_tiles.SyncPlan {
+        std.debug.assert(self.visible_window_set);
+        const geom = self.chunkGeometry();
+        const visible = self.renderChunkWindow();
+        const fitted = world_gpu_tiles.fitWindow(self.render_side, visible);
+        const window = fitted.window;
+        if (!window.eql(visible) and !self.gpu_tiles.window_clip_reported) {
+            @branchHint(.cold);
+            self.gpu_tiles.window_clip_reported = true;
+            log.warn("render chunk window clipped to {d}x{d} chunks; store width", .{ window.width(), window.height() });
+        }
         const rederive = self.gpu_residency_dirty or
             active_level != self.gpu_resident_level or
-            !windowsEqual(self.render_window, self.gpu_resident_window);
-        var desired: [world_gpu_tiles.slot_count]u32 = undefined;
-        var desired_count: usize = 0;
-        if (rederive) {
-            var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-            desired_count = try self.collectDenseSubmitLayers(active_level, &layers);
-            for (layers[0..desired_count], desired[0..desired_count]) |layer, *out| out.* = @intCast(layer);
+            !windowsEqual(self.render_window, self.gpu_resident_window) or
+            !window.eql(self.gpu_tiles.window) or
+            fitted.side != self.gpu_tiles.side or
+            !self.gpu_tiles.layoutMatchesStore();
+        if (!rederive) {
+            return self.gpu_tiles.plan(self.allocator, geom, self.dense_layers.items(.store), self.dense_layers.items(.gpu_slot), null);
         }
-        return self.gpu_tiles.plan(
-            self.allocator,
-            self.chunkGeometry(),
-            self.dense_layers.items(.store),
-            self.dense_layers.items(.gpu_slot),
-            if (rederive) desired[0..desired_count] else null,
-        );
+        const desired = try self.collectDenseSubmitLayers(active_level);
+        try self.dense_render.reserve(self.allocator, desired.len);
+        const fit = world_gpu_tiles.residentLayerFit(fitted.side, tileStoreBlockElements(geom.edge));
+        return self.gpu_tiles.plan(self.allocator, geom, self.dense_layers.items(.store), self.dense_layers.items(.gpu_slot), .{
+            .layers = fitResidentLayers(desired, fit, &self.gpu_tiles.width_drop_reported),
+            .window = window,
+            .side = fitted.side,
+        });
     }
 
+    // The window layers (topmost first) the store width holds: the first `fit`, so
+    // the deepest drop. Reports a drop once per world through `reported`.
+    fn fitResidentLayers(desired: []const u32, fit: usize, reported: *bool) []const u32 {
+        const resident = desired[0..@min(desired.len, fit)];
+        if (resident.len < desired.len and !reported.*) {
+            @branchHint(.cold);
+            reported.* = true;
+            log.warn("{d} deepest window layers not drawn; store width", .{desired.len - resident.len});
+        }
+        return resident;
+    }
+
+    // Applies the sync and, when the resident set moved, rebuilds the resident
+    // layers (deepest first) and their depths from the chain. O(resident layers).
     fn commitDenseGpuSync(self: *WorldSystem, sync_plan: *const world_gpu_tiles.SyncPlan, active_level: u16) void {
         self.gpu_tiles.commit(sync_plan, self.chunkGeometry(), self.dense_layers.items(.store), self.dense_layers.items(.gpu_slot));
         self.gpu_resident_level = active_level;
         self.gpu_resident_window = self.render_window;
         self.gpu_residency_dirty = false;
+        if (!sync_plan.residency_changed) return;
+        const order = self.gpu_tiles.order.items;
+        const layers = &self.dense_render.layers;
+        const depths = &self.dense_render.layer_depths;
+        std.debug.assert(layers.capacity >= order.len and depths.capacity >= order.len);
+        layers.clearRetainingCapacity();
+        depths.clearRetainingCapacity();
+        var index = order.len;
+        while (index > 0) {
+            index -= 1;
+            const layer = self.gpu_tiles.slot_layer.items[order[index]];
+            layers.appendAssumeCapacity(layer);
+            depths.appendAssumeCapacity(self.denseLayerOrder(layer).depth);
+        }
     }
 
     /// Submits the visible sparse tiles at `depth` through the dynamic ordered
@@ -2068,7 +2072,6 @@ pub const WorldSystem = struct {
     // from them. All growth precedes the commit, so an OOM adds no level.
     fn appendLevelBaseZ(self: *WorldSystem, base_z: i32) !u16 {
         try validateChunkGrid(self.width, self.height, self.chunk_size_tiles);
-        try world_gpu_tiles.validateStoreWidth(self.chunkCountPerLevel(), self.chunk_size_tiles);
         const index = self.level_base_z.items.len;
         if (index > std.math.maxInt(u16)) return error.WorldLevelOverflow;
         const geom = ChunkGeometry.init(self.width, self.height, self.chunk_size_tiles);
@@ -2098,8 +2101,7 @@ pub const WorldSystem = struct {
         try self.validateTileId(fill_tile);
 
         const terrain = &self.level_terrain.items[level_index];
-        const next_band = @as(usize, terrain.band_count) + 1;
-        if (next_band > self.max_dense_bands_per_level or next_band > world_terrain.max_level_bands) {
+        if (@as(usize, terrain.band_count) + 1 > world_terrain.max_level_bands) {
             return error.DenseLayerWindowExceeded;
         }
 
@@ -2456,7 +2458,7 @@ pub const WorldSystem = struct {
     }
 
     // Depth, then layer index, so equal depths keep layer order whatever the input order.
-    fn denseLayerIndexLessThan(self: *const WorldSystem, a: usize, b: usize) bool {
+    fn denseLayerIndexLessThan(self: *const WorldSystem, a: u32, b: u32) bool {
         const depth_a = self.denseLayerOrder(a).depth;
         const depth_b = self.denseLayerOrder(b).depth;
         if (depth_a != depth_b) return depth_a < depth_b;
@@ -2880,9 +2882,22 @@ fn floorTileClamped(value: f32, tile_size: f32, max_tiles: u16) u16 {
     return @intCast(math.worldPosToCell(value, tile_size, max_tiles));
 }
 
-fn visibleMaxCoord(origin: f32, extent: f32) f32 {
-    if (extent <= 0) return origin;
-    return @max(origin, origin + extent - 0.001);
+// The last tile a span from `origin` of `extent` pixels covers, clamped to the
+// grid: an end exactly on a tile edge excludes the tile starting there, at any f32
+// magnitude. Never before the span's first tile.
+fn lastTileClamped(origin: f32, extent: f32, tile_size: f32, max_tiles: u16) u16 {
+    const first = floorTileClamped(origin, tile_size, max_tiles);
+    if (!(extent > 0)) return first;
+    const end_tiles = @ceil((origin + extent) / tile_size);
+    return @max(first, floorTileClamped(end_tiles - 1, 1, max_tiles));
+}
+
+// Chunks a pixel extent spans at most, capped at `chunks`.
+fn rectChunkSpan(extent: f32, chunk_px: f32, chunks: u32) u32 {
+    if (!(extent > 0)) return 0;
+    const span = @ceil(extent / chunk_px);
+    if (!(span < @as(f32, @floatFromInt(chunks)))) return chunks;
+    return @intFromFloat(span);
 }
 
 fn saturatingSubU16(value: u16, amount: u16) u16 {
@@ -2926,55 +2941,87 @@ fn testMinimalSurfaceWorld(meta: *const WorldTilesetMeta, width: u16, height: u1
     return world;
 }
 
+const TestGpuStore = @import("world_test_support.zig").TestGpuStore;
+
 // Runs one GPU tile sync without a renderer; the upload batch stays in
-// `world.gpu_tiles.spans`/`values`.
+// `world.gpu_tiles.spans`/`values`. A world with no render window set renders its
+// whole extent.
 fn testSyncGpuTiles(world: *WorldSystem, active_level: u16) !world_gpu_tiles.SyncPlan {
+    if (!world.visible_window_set) testShowWholeWorld(world, active_level);
     const sync_plan = try world.planDenseGpuSync(active_level);
     world.commitDenseGpuSync(&sync_plan, active_level);
     return sync_plan;
 }
 
-// CPU copy of a world's GPU tile store: applies each sync's upload batch and reads
-// tiles back the way `tilemap.frag.glsl` does.
-const TestGpuStore = struct {
-    words: std.ArrayList(u32) = .empty,
+// The window layers around `active_level`, deepest first, copied into `out`.
+fn testSubmitLayers(world: *WorldSystem, active_level: u16, out: []u32) ![]u32 {
+    const desired = try world.collectDenseSubmitLayers(active_level);
+    const layers = out[0..desired.len];
+    for (desired, 0..) |layer, index| layers[desired.len - 1 - index] = layer;
+    return layers;
+}
 
-    fn deinit(self: *TestGpuStore) void {
-        self.words.deinit(std.testing.allocator);
-    }
+fn testShowWholeWorld(world: *WorldSystem, active_level: u16) void {
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = world.worldWidthPixels(), .h = world.worldHeightPixels() }, 0, active_level);
+}
 
-    fn apply(self: *TestGpuStore, world: *const WorldSystem) !void {
-        var value_index: usize = 0;
-        for (world.gpu_tiles.spans.items) |span| {
-            const end: usize = @intCast(span.end());
-            if (self.words.items.len < end) try self.words.appendNTimes(std.testing.allocator, 0xDEAD_BEEF, end - self.words.items.len);
-            @memcpy(self.words.items[span.dst_element..end], world.gpu_tiles.values.items[value_index..][0..span.count]);
-            value_index += span.count;
-        }
-        try std.testing.expectEqual(world.gpu_tiles.values.items.len, value_index);
-    }
+// Sets the render window to exactly the chunks [min, min + size) on both axes.
+fn testShowChunks(world: *WorldSystem, min_x: u16, min_y: u16, size_x: u16, size_y: u16, active_level: u16) void {
+    const chunk_px = @as(f32, @floatFromInt(world.chunk_size_tiles)) * world.tile_size;
+    world.setVisibleChunksForWorldRect(.{
+        .x = @as(f32, @floatFromInt(min_x)) * chunk_px,
+        .y = @as(f32, @floatFromInt(min_y)) * chunk_px,
+        .w = @as(f32, @floatFromInt(size_x)) * chunk_px,
+        .h = @as(f32, @floatFromInt(size_y)) * chunk_px,
+    }, 0, active_level);
+}
 
-    fn tile(self: *const TestGpuStore, world: *const WorldSystem, slot: u8, x: u16, y: u16) TileId {
-        const geom = world.chunkGeometry();
-        const chunk_count: u32 = @intCast(geom.chunkCount());
-        const word = self.words.items[@as(usize, slot) * chunk_count + geom.chunkOf(x, y)];
-        if (word & tile_store_uniform_bit != 0) return @truncate(word);
-        const local = geom.localOf(x, y);
-        const block_base = world_gpu_tiles.directoryElements(chunk_count);
-        const element = self.words.items[block_base + word * tileStoreBlockElements(geom.edge) + local / 2];
-        return @truncate(element >> @intCast((local & 1) * 16));
-    }
-};
+// Applies the last sync's upload batch to `gpu`.
+fn testApplySync(world: *const WorldSystem, gpu: *TestGpuStore) !void {
+    try gpu.apply(world.gpu_tiles.spans.items, world.gpu_tiles.values.items);
+}
 
+// The tile `gpu` shows for resident `layer` at (x, y), or null outside the window.
+fn testGpuTile(world: *const WorldSystem, gpu: *const TestGpuStore, layer: usize, x: u16, y: u16) ?TileId {
+    const mirror = &world.gpu_tiles;
+    const slot = world.dense_layers.items(.gpu_slot)[layer];
+    std.debug.assert(slot != world_gpu_tiles.no_slot);
+    return gpu.tileAt(world.chunkGeometry(), mirror.side, mirror.window, mirror.slotDirectory(slot), x, y);
+}
+
+// Every resident layer reads back its CPU tiles over the window and nothing
+// outside it, and the chain from the topmost resident layer composites them in
+// depth order.
 fn expectGpuStoreMatches(world: *const WorldSystem, gpu: *const TestGpuStore) !void {
+    const mirror = &world.gpu_tiles;
+    const layers = world.dense_render.layers.items;
+    try std.testing.expectEqual(mirror.residentLayerCount(), layers.len);
     for (world.dense_layers.items(.gpu_slot), 0..) |slot, layer| {
         if (slot == world_gpu_tiles.no_slot) continue;
-        for (0..world.height) |y| {
-            for (0..world.width) |x| {
-                try std.testing.expectEqual(world.denseTile(layer, @intCast(x), @intCast(y)), gpu.tile(world, slot, @intCast(x), @intCast(y)));
+        for (0..world.height) |y| for (0..world.width) |x| {
+            const gpu_tile = testGpuTile(world, gpu, layer, @intCast(x), @intCast(y));
+            const chunk_x = @as(u32, @intCast(x)) >> world.chunkGeometry().shift;
+            const chunk_y = @as(u32, @intCast(y)) >> world.chunkGeometry().shift;
+            if (mirror.window.contains(chunk_x, chunk_y)) {
+                try std.testing.expectEqual(@as(?TileId, world.denseTile(layer, @intCast(x), @intCast(y))), gpu_tile);
+            } else {
+                try std.testing.expectEqual(@as(?TileId, null), gpu_tile);
             }
-        }
+        };
     }
+    if (layers.len == 0) return;
+    const top_slot = world.dense_layers.items(.gpu_slot)[layers[layers.len - 1]];
+    for (0..world.height) |y| for (0..world.width) |x| {
+        const shown = gpu.composite(world.chunkGeometry(), mirror.side, mirror.window, mirror.slotDirectory(top_slot), layers.len, invalid_tile_id, @intCast(x), @intCast(y)) orelse continue;
+        var expected: TileId = invalid_tile_id;
+        var index = layers.len;
+        while (index > 0) {
+            index -= 1;
+            expected = world.denseTile(layers[index], @intCast(x), @intCast(y));
+            if (expected != invalid_tile_id) break;
+        }
+        try std.testing.expectEqual(expected, shown);
+    };
 }
 
 fn containsDepth(depths: []const i32, value: i32) bool {
@@ -3098,7 +3145,7 @@ test "world dense layer uses row-major indexing" {
     try std.testing.expectEqual(grass, world.denseTile(0, 2, 1));
 }
 
-test "a synced GPU tile store reads back every resident tile through splits, edits, and re-uniforms" {
+test "a synced store reads back every resident window tile through splits, edits, re-uniforms, and pans" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     // 8x8 tiles in 4x4 chunks: a 2x2 chunk grid, every chunk starting uniform.
@@ -3120,8 +3167,8 @@ test "a synced GPU tile store reads back every resident tile through splits, edi
 
     // Entering: one directory, no blocks while every chunk is uniform.
     _ = try testSyncGpuTiles(&world, level);
-    try gpu.apply(&world);
-    try std.testing.expectEqual(@as(u32, 0), world.gpu_tiles.block_count);
+    try testApplySync(&world, &gpu);
+    try std.testing.expectEqual(@as(usize, 1), world.gpu_tiles.spans.items.len);
     try expectGpuStoreMatches(&world, &gpu);
 
     // One step splits all four chunks (a multi-chunk change), then edits one of
@@ -3131,27 +3178,112 @@ test "a synced GPU tile store reads back every resident tile through splits, edi
     }
     _ = try world.clearDenseTile(layer, 2, 1);
     _ = try testSyncGpuTiles(&world, level);
-    try gpu.apply(&world);
-    try std.testing.expectEqual(@as(u32, 4), world.gpu_tiles.block_count);
+    try testApplySync(&world, &gpu);
     try expectGpuStoreMatches(&world, &gpu);
 
-    // Repeated dig and fill: returning a chunk to one tile frees its block slot,
-    // and the next split reuses it without growing the block region.
+    // Repeated dig and fill: a chunk returning to one tile frees its block, and the
+    // next split reuses it, so the store never grows.
+    const high_water = world.gpu_tiles.high_water;
     for (0..3) |_| {
         _ = try world.setDenseTile(layer, 1, 1, grass);
         _ = try world.setDenseTile(layer, 2, 1, grass);
         _ = try testSyncGpuTiles(&world, level);
-        try gpu.apply(&world);
-        try std.testing.expectEqual(@as(usize, 1), world.gpu_tiles.block_free.items.len);
+        try testApplySync(&world, &gpu);
         try expectGpuStoreMatches(&world, &gpu);
         _ = try world.setDenseTile(layer, 3, 3, water);
         _ = try testSyncGpuTiles(&world, level);
-        try gpu.apply(&world);
-        try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.block_free.items.len);
-        try std.testing.expectEqual(@as(u32, 4), world.gpu_tiles.block_count);
+        try testApplySync(&world, &gpu);
         try expectGpuStoreMatches(&world, &gpu);
         _ = try world.setDenseTile(layer, 3, 3, grass);
+        try std.testing.expectEqual(high_water, world.gpu_tiles.high_water);
     }
+
+    // Pans one chunk at a time around the grid with a 1x1 window: every step reads
+    // back, including edits made while a chunk was outside the window.
+    const steps = [_][2]u16{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 }, .{ 0, 0 } };
+    for (steps, 0..) |step, index| {
+        testShowChunks(&world, step[0], step[1], 1, 1, level);
+        _ = try world.setDenseTile(layer, @intCast(4 + index % 4), 5, if (index % 2 == 0) water else grass);
+        _ = try testSyncGpuTiles(&world, level);
+        try testApplySync(&world, &gpu);
+        try expectGpuStoreMatches(&world, &gpu);
+    }
+}
+
+test "an edit outside the window uploads nothing; its chunk reads back edited when it enters" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 16x4 tiles in 4x4 chunks: a 4x1 chunk grid, the window one chunk wide.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 16,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
+    testShowChunks(&world, 0, 0, 1, 1, 0);
+    _ = try testSyncGpuTiles(&world, 0);
+    try testApplySync(&world, &gpu);
+
+    // Chunk 2 is outside the window: its dig uploads nothing.
+    _ = try world.setDenseTile(layer, 9, 1, water);
+    _ = try testSyncGpuTiles(&world, 0);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.spans.items.len);
+
+    // The window reaches it: the chunk uploads whole and reads back edited.
+    testShowChunks(&world, 2, 0, 1, 1, 0);
+    _ = try testSyncGpuTiles(&world, 0);
+    try testApplySync(&world, &gpu);
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, layer, 9, 1));
+    try expectGpuStoreMatches(&world, &gpu);
+}
+
+test "an evicted layer's edits upload nothing; it reads back edited when it returns" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+        .render_window = .{ .levels_below = 0 },
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const surface = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    _ = try world.addDenseLayer(try world.addLevel(-level_z_step), 0, .floor, grass);
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
+    _ = try testSyncGpuTiles(&world, 0);
+    try testApplySync(&world, &gpu);
+
+    // An edit made while resident, then the layer leaves before the next sync: the
+    // sync that evicts it uploads only the entering layer's directory.
+    _ = try world.setDenseTile(surface, 1, 1, water);
+    _ = try testSyncGpuTiles(&world, 1);
+    try testApplySync(&world, &gpu);
+    try std.testing.expectEqual(@as(usize, 1), world.gpu_tiles.spans.items.len);
+    try std.testing.expectEqual(world_gpu_tiles.no_slot, world.dense_layers.items(.gpu_slot)[surface]);
+    // Edits while not resident upload nothing either.
+    _ = try world.setDenseTile(surface, 6, 6, water);
+    _ = try testSyncGpuTiles(&world, 1);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.spans.items.len);
+
+    _ = try testSyncGpuTiles(&world, 0);
+    try testApplySync(&world, &gpu);
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, surface, 1, 1));
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, surface, 6, 6));
+    try expectGpuStoreMatches(&world, &gpu);
 }
 
 test "a reset GPU mirror re-enters every resident layer at the next sync" {
@@ -3174,37 +3306,32 @@ test "a reset GPU mirror re-enters every resident layer at the next sync" {
     var before = TestGpuStore{};
     defer before.deinit();
     _ = try testSyncGpuTiles(&world, 0);
-    try before.apply(&world);
-    // Split one chunk on each layer, sync, then queue one more edit.
+    try testApplySync(&world, &before);
+    // Split one chunk on each layer and sync, then edit once more without a sync.
     _ = try world.setDenseTile(surface, 1, 1, water);
     _ = try world.setDenseTile(below, 6, 6, water);
     _ = try testSyncGpuTiles(&world, 0);
-    try before.apply(&world);
-    try std.testing.expectEqual(@as(u32, 2), world.gpu_tiles.block_count);
+    try testApplySync(&world, &before);
     _ = try world.setDenseTile(surface, 5, 1, water);
-    try std.testing.expect(world.gpu_tiles.pending.items.len > 0);
     world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
     world.dense_quads_dirty = false;
 
-    // The renderer retired the store: nothing stays resident or queued.
+    // The renderer retired the store: nothing stays resident or drawn.
     world.resetGpuResidency();
     try std.testing.expect(!world.gpu_tiles.store.isValid());
     for (world.dense_layers.items(.gpu_slot)) |slot| try std.testing.expectEqual(world_gpu_tiles.no_slot, slot);
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.residentLayerCount());
-    try std.testing.expectEqual(@as(u32, 0), world.gpu_tiles.block_count);
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.block_free.items.len);
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.pending.items.len);
-    try std.testing.expect(world.gpu_residency_dirty and world.dense_quads_dirty);
+    try std.testing.expectEqual(@as(usize, 0), world.maxDenseSubmitDrawCount());
+    try std.testing.expect(world.dense_quads_dirty);
 
-    // A new store starts empty: the next sync uploads every window layer whole,
-    // edits since the last sync included, into a block region of the same size.
+    // A new store starts empty: the next sync uploads the window whole, the edit
+    // made since the last sync included.
     var after = TestGpuStore{};
     defer after.deinit();
     const sync_plan = try testSyncGpuTiles(&world, 0);
-    try std.testing.expectEqual(@as(usize, 2), sync_plan.enter_count);
-    try after.apply(&world);
-    try std.testing.expectEqual(@as(usize, 2), world.gpu_tiles.residentLayerCount());
-    try std.testing.expectEqual(@as(u32, 3), world.gpu_tiles.block_count);
+    try std.testing.expect(sync_plan.relayout);
+    try testApplySync(&world, &after);
+    try std.testing.expectEqual(@as(usize, 2), world.maxDenseSubmitDrawCount());
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &after, surface, 5, 1));
     try expectGpuStoreMatches(&world, &after);
 }
 
@@ -3228,11 +3355,7 @@ test "after a GPU residency reset the re-submitted static tilemap draws name the
         .batch_capacity_vertices = 0,
         .batch = sprite_batch.SpriteBatch.init(allocator),
     };
-    defer renderer.batch.deinit();
-    defer renderer.static_positions.deinit(allocator);
-    defer renderer.static_uvs.deinit(allocator);
-    defer renderer.static_colors.deinit(allocator);
-    defer renderer.static_groups.deinit(allocator);
+    defer deinitStaticTestRenderer(&renderer);
 
     const retired = TileDataId{ .index = 0, .generation = 1 };
     world.gpu_tiles.store = retired;
@@ -3250,6 +3373,24 @@ test "after a GPU residency reset the re-submitted static tilemap draws name the
     try expectStaticTilemapStore(&renderer, replacement);
 }
 
+fn deinitStaticTestRenderer(renderer: *Renderer) void {
+    const allocator = renderer.allocator;
+    renderer.batch.deinit();
+    renderer.static_positions.deinit(allocator);
+    renderer.static_uvs.deinit(allocator);
+    renderer.static_colors.deinit(allocator);
+    renderer.static_groups.deinit(allocator);
+    renderer.tilemap_window_layers.deinit(allocator);
+    renderer.draw_list.deinit(allocator);
+    for (renderer.tile_stores.items) |*store| {
+        store.pending_spans.deinit(allocator);
+        store.pending_values.deinit(allocator);
+    }
+    renderer.tile_stores.deinit(allocator);
+    renderer.tile_merge_spans.deinit(allocator);
+    renderer.tile_merge_values.deinit(allocator);
+}
+
 fn expectStaticTilemapStore(renderer: *const Renderer, store: TileDataId) !void {
     var tilemap_draws: usize = 0;
     for (renderer.static_groups.items) |group| {
@@ -3258,6 +3399,20 @@ fn expectStaticTilemapStore(renderer: *const Renderer, store: TileDataId) !void 
         try std.testing.expectEqual(store, group.tile_data);
     }
     try std.testing.expect(tilemap_draws > 0);
+}
+
+// Registers a store with no GPU buffer in a headless renderer and hands it to
+// `world`, laid out for its render window, so syncs validate and queue uploads
+// without touching SDL. The capacity covers any test world, so no sync grows it.
+fn attachFakeTileStore(renderer: *Renderer, world: *WorldSystem) !*@TypeOf(renderer.tile_stores.items[0]) {
+    try renderer.tile_stores.append(renderer.allocator, .{
+        .buffer = @ptrFromInt(0x1000),
+        .element_capacity = 1 << 20,
+        .params = std.mem.zeroes(TilemapParams),
+    });
+    world.gpu_tiles.store = .{ .index = @intCast(renderer.tile_stores.items.len - 1), .generation = 1 };
+    world.gpu_tiles.store_side = world.render_side;
+    return &renderer.tile_stores.items[renderer.tile_stores.items.len - 1];
 }
 
 test "syncDenseTileStore claims its live store every frame and drops a retired one with its residency" {
@@ -3278,8 +3433,8 @@ test "syncDenseTileStore claims its live store every frame and drops a retired o
     const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
     // Level 1 holds no layer, so syncing there needs no store and never creates one.
     _ = try world.addLevel(-level_z_step);
+    testShowWholeWorld(&world, 0);
 
-    // Headless renderer with one fake store: syncs only validate and queue.
     var renderer = Renderer{
         .allocator = allocator,
         .device = undefined,
@@ -3291,25 +3446,14 @@ test "syncDenseTileStore claims its live store every frame and drops a retired o
         .batch_capacity_vertices = 0,
         .batch = sprite_batch.SpriteBatch.init(allocator),
     };
-    defer renderer.batch.deinit();
-    defer renderer.tile_stores.deinit(allocator);
-    defer renderer.tile_merge_spans.deinit(allocator);
-    defer renderer.tile_merge_values.deinit(allocator);
-    try renderer.tile_stores.append(allocator, .{
-        .buffer = @ptrFromInt(0x1000),
-        .element_capacity = 1 << 10,
-        .directory_elements = 0,
-        .block_elements = 1,
-        .params = std.mem.zeroes(TilemapParams),
-    });
-    const store = &renderer.tile_stores.items[0];
-    defer store.pending_spans.deinit(allocator);
-    defer store.pending_values.deinit(allocator);
-    world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
+    defer deinitStaticTestRenderer(&renderer);
+    const store = try attachFakeTileStore(&renderer, &world);
 
-    // Every sync claims the live store, even one with nothing to upload.
+    // Every sync claims the live store, even one with nothing to upload, and moves
+    // its window uniform to the render window.
     try world.syncDenseTileStore(&renderer, 0);
     try std.testing.expect(store.claimed);
+    try std.testing.expectEqual([4]u32{ 0, 0, 2, 2 }, store.params.window);
     try std.testing.expect(world.dense_layers.items(.gpu_slot)[layer] != world_gpu_tiles.no_slot);
     store.claimed = false;
     try world.syncDenseTileStore(&renderer, 0);
@@ -3325,33 +3469,84 @@ test "syncDenseTileStore claims its live store every frame and drops a retired o
     try std.testing.expect(world.dense_quads_dirty);
 }
 
-test "setDenseTile queues a GPU edit only on a layer resident in the GPU tile store" {
+test "a new directory side with nothing resident lets the old store go and re-submits the draws" {
+    const allocator = std.testing.allocator;
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
+    // 16x16 tiles in 4x4 chunks; level 1 holds no layer.
+    var world = WorldSystem{
+        .allocator = allocator,
+        .width = 16,
+        .height = 16,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+        .render_window = .{ .levels_below = 0 },
+    };
     defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    _ = try world.addLevel(-level_z_step);
+    testShowChunks(&world, 0, 0, 1, 1, 0);
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer deinitStaticTestRenderer(&renderer);
+    const store = try attachFakeTileStore(&renderer, &world);
+    try world.syncDenseTileStore(&renderer, 0);
+    try std.testing.expect(world.gpu_tiles.store.isValid());
+    try std.testing.expectEqual([4]u32{ 0, 0, 1, 1 }, store.params.window);
 
+    // A wider rect needs a larger side; on a level with no layer nothing uploads,
+    // so the world stops naming (and claiming) the old store's layout.
+    testShowChunks(&world, 0, 0, 3, 3, 1);
+    world.dense_quads_dirty = false;
+    try world.syncDenseTileStore(&renderer, 1);
+    try std.testing.expect(!world.gpu_tiles.store.isValid());
+    try std.testing.expectEqual(world_gpu_tiles.no_slot, world.dense_layers.items(.gpu_slot)[layer]);
+    try std.testing.expect(world.dense_quads_dirty);
+    try std.testing.expectEqual(@as(usize, 0), world.maxDenseSubmitDrawCount());
+}
+
+test "setDenseTile on a resident layer uploads at the next sync; one outside the level window uploads when it enters" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, 96, 64);
+    defer world.deinit();
+    world.render_window = .{ .levels_below = 0 };
     const water = try world.requireTileByName(&meta, "water_1");
     const grass = try world.requireTileByName(&meta, "grass");
-
-    // Not resident yet: the layer uploads whole when it enters, so no edit queues.
-    _ = try world.setDenseTile(0, 2, 1, water);
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.pending.items.len);
+    const below = world.denseFloorLayerForLevel(1).?;
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
 
     _ = try testSyncGpuTiles(&world, 0);
-    _ = try world.setDenseTile(0, 1, 0, grass);
-    try std.testing.expectEqual(@as(usize, 1), world.gpu_tiles.pending.items.len);
-    const edit = world.gpu_tiles.pending.items[0];
-    const geom = world.chunkGeometry();
-    try std.testing.expectEqual(world.dense_layers.items(.gpu_slot)[0], edit.slot);
-    try std.testing.expectEqual(geom.chunkOf(1, 0), edit.chunk);
-    // Local cell 1 is the high half of element 0.
-    try std.testing.expectEqual(@as(u32, 0), edit.element);
-
-    // A synced queue is empty; an unchanged tile queues nothing.
+    try testApplySync(&world, &gpu);
+    // Not resident: nothing uploads.
+    _ = try world.setDenseTile(below, 2, 1, grass);
     _ = try testSyncGpuTiles(&world, 0);
-    try std.testing.expect((try world.setDenseTile(0, 1, 0, grass)) == null);
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.spans.items.len);
+    // Resident: the next sync uploads it; an unchanged tile uploads nothing.
+    _ = try world.setDenseTile(0, 1, 0, water);
+    _ = try testSyncGpuTiles(&world, 0);
+    try testApplySync(&world, &gpu);
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, 0, 1, 0));
+    try std.testing.expect((try world.setDenseTile(0, 1, 0, water)) == null);
+    _ = try testSyncGpuTiles(&world, 0);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.spans.items.len);
+
+    _ = try testSyncGpuTiles(&world, 1);
+    try testApplySync(&world, &gpu);
+    try std.testing.expectEqual(@as(?TileId, grass), testGpuTile(&world, &gpu, below, 2, 1));
+    try expectGpuStoreMatches(&world, &gpu);
 }
 
 test "reserveDenseCellWrite covers N writes across uniform chunks and the edit queue (FailingAllocator)" {
@@ -3372,8 +3567,11 @@ test "reserveDenseCellWrite covers N writes across uniform chunks and the edit q
     const grass = try world.requireTileByName(&meta, "grass");
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(level, 0, .floor, grass);
-    // Resident in the GPU tile store, so every write also queues one GPU edit.
+    // Resident in the GPU tile store, so every write also reaches the GPU.
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
     _ = try testSyncGpuTiles(&world, level);
+    try testApplySync(&world, &gpu);
 
     const writes = [_][2]u16{ .{ 0, 0 }, .{ 5, 1 }, .{ 2, 6 }, .{ 1, 0 }, .{ 3, 3 } };
     world.beginDenseCellWriteReserve();
@@ -3391,10 +3589,12 @@ test "reserveDenseCellWrite covers N writes across uniform chunks and the edit q
         world.allocator = failing.allocator();
         defer world.allocator = std.testing.allocator;
         for (writes) |cell| _ = try world.setDenseTile(layer, cell[0], cell[1], water);
-        try std.testing.expectEqual(writes.len, world.gpu_tiles.pending.items.len);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
     for (writes) |cell| try std.testing.expect(world.levelBlocksMovement(level, cell[0], cell[1]));
+    _ = try testSyncGpuTiles(&world, level);
+    try testApplySync(&world, &gpu);
+    try expectGpuStoreMatches(&world, &gpu);
 
     // A reserve whose write never comes leaves only an early block, which the next
     // scope returns to uniform.
@@ -3429,31 +3629,30 @@ test "GPU tile sync uploads one element per edited element, valued from the chun
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(level, 0, .floor, grass);
     _ = try testSyncGpuTiles(&world, level);
-    const directory_elements = world_gpu_tiles.directoryElements(1);
+    // One chunk: a directory of side 1 (one word and the link) at 0, blocks after it.
+    const block = world_gpu_tiles.directoryWords(1);
 
     // Splitting the chunk uploads its directory word and its whole block.
     _ = try world.setDenseTile(layer, 2, 0, water);
     _ = try testSyncGpuTiles(&world, level);
     try std.testing.expectEqualSlices(TileStoreSpan, &.{
         .{ .dst_element = 0, .count = 1 },
-        .{ .dst_element = directory_elements, .count = 8 },
+        .{ .dst_element = block, .count = 8 },
     }, world.gpu_tiles.spans.items);
 
     // (0,0) and (1,0) share element 0, written three times with a rewrite of (0,0);
-    // (2,0) is untouched. Out-of-order queueing exercises the sort.
+    // (2,0) is untouched. Out-of-order edits exercise the sort.
     _ = try world.setDenseTile(layer, 1, 0, water);
     _ = try world.setDenseTile(layer, 0, 0, water);
     _ = try world.clearDenseTile(layer, 0, 0);
-    try std.testing.expectEqual(@as(usize, 3), world.gpu_tiles.pending.items.len);
     _ = try testSyncGpuTiles(&world, level);
     try std.testing.expectEqualSlices(TileStoreSpan, &.{
-        .{ .dst_element = directory_elements, .count = 1 },
+        .{ .dst_element = block, .count = 1 },
     }, world.gpu_tiles.spans.items);
     try std.testing.expectEqualSlices(u32, &.{packTileDataElement(invalid_tile_id, water)}, world.gpu_tiles.values.items);
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.pending.items.len);
 }
 
-test "two resident layers on one level upload to their own directory slots and blocks" {
+test "two resident layers on one level upload to their own directories and blocks" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = try testMinimalSurfaceWorld(&meta, 3, 1);
@@ -3464,22 +3663,21 @@ test "two resident layers on one level upload to their own directory slots and b
     var gpu = TestGpuStore{};
     defer gpu.deinit();
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu.apply(&world);
+    try testApplySync(&world, &gpu);
     const slots = world.dense_layers.items(.gpu_slot);
-    try std.testing.expect(slots[0] != slots[layer1]);
+    try std.testing.expect(world.gpu_tiles.slotDirectory(slots[0]) != world.gpu_tiles.slotDirectory(slots[layer1]));
 
     // Edits in both layers in one frame write separate blocks; neither layer reads
     // the other's cells.
     _ = try world.setDenseTile(0, 2, 0, water);
     _ = try world.setDenseTile(layer1, 0, 0, grass);
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu.apply(&world);
-    try std.testing.expectEqual(@as(u32, 2), world.gpu_tiles.block_count);
+    try testApplySync(&world, &gpu);
     try expectGpuStoreMatches(&world, &gpu);
     _ = try world.clearDenseTile(0, 2, 0);
     _ = try world.setDenseTile(layer1, 1, 0, grass);
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu.apply(&world);
+    try testApplySync(&world, &gpu);
     try std.testing.expectEqual(@as(usize, 2), world.gpu_tiles.spans.items.len);
     try expectGpuStoreMatches(&world, &gpu);
 }
@@ -4093,8 +4291,8 @@ test "dense layer submit order sorts back to front by render depth" {
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
-    var indices: [3]usize = .{ 0, 1, 2 };
-    std.mem.sort(usize, &indices, &world, WorldSystem.denseLayerIndexLessThan);
+    var indices: [3]u32 = .{ 0, 1, 2 };
+    std.mem.sort(u32, &indices, &world, WorldSystem.denseLayerIndexLessThan);
     try std.testing.expectEqual(@as(i32, -34), world.denseLayerOrder(indices[0]).depth);
     try std.testing.expectEqual(@as(i32, -18), world.denseLayerOrder(indices[1]).depth);
     try std.testing.expectEqual(@as(i32, -2), world.denseLayerOrder(indices[2]).depth);
@@ -4405,8 +4603,9 @@ test "collectDenseSubmitLayers caps surface play to render window" {
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(0, &layers);
+    var layer_buffer: [64]u32 = undefined;
+    const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const count = layers.len;
     try std.testing.expectEqual(@as(usize, 7), count);
     for (layers[0..count]) |layer_index| {
         const level = world.denseLayerLevel(layer_index);
@@ -4438,8 +4637,9 @@ test "collectDenseSubmitLayers deep play follows player level not surface" {
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(20, &layers);
+    var layer_buffer: [64]u32 = undefined;
+    const layers = try testSubmitLayers(&world, 20, &layer_buffer);
+    const count = layers.len;
     try std.testing.expectEqual(@as(usize, 7), count);
     for (layers[0..count]) |layer_index| {
         const level = world.denseLayerLevel(layer_index);
@@ -4454,8 +4654,9 @@ test "collectDenseSubmitLayers shifts with player level transitions" {
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const surface_count = try world.collectDenseSubmitLayers(0, &layers);
+    var layer_buffer: [64]u32 = undefined;
+    var layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const surface_count = layers.len;
     try std.testing.expectEqual(@as(usize, 3), surface_count);
     var saw_surface = false;
     for (layers[0..surface_count]) |layer_index| {
@@ -4463,13 +4664,15 @@ test "collectDenseSubmitLayers shifts with player level transitions" {
     }
     try std.testing.expect(saw_surface);
 
-    const dirt_count = try world.collectDenseSubmitLayers(1, &layers);
+    layers = try testSubmitLayers(&world, 1, &layer_buffer);
+    const dirt_count = layers.len;
     try std.testing.expectEqual(@as(usize, 2), dirt_count);
     for (layers[0..dirt_count]) |layer_index| {
         try std.testing.expect(world.denseLayerLevel(layer_index) >= 1);
     }
 
-    const void_count = try world.collectDenseSubmitLayers(2, &layers);
+    layers = try testSubmitLayers(&world, 2, &layer_buffer);
+    const void_count = layers.len;
     try std.testing.expectEqual(@as(usize, 1), void_count);
     try std.testing.expectEqual(@as(u16, 2), world.denseLayerLevel(layers[0]));
 }
@@ -4491,21 +4694,32 @@ test "collectDenseSubmitLayers includes every band on an in-window level" {
     _ = try world.addDenseLayer(level, 0, .floor, grass);
     _ = try world.addDenseLayer(level, 0, .obstacle, grass);
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(0, &layers);
+    var layer_buffer: [64]u32 = undefined;
+    const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const count = layers.len;
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
-test "denseWindowDepthSpan returns the submitted window's shallowest and deepest depth" {
+test "denseWindowDepthSpan returns the resident layers' deepest and shallowest depth" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
-    const span = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
+    // Nothing is resident before the first sync.
+    try std.testing.expect(world.denseWindowDepthSpan() == null);
+    _ = try testSyncGpuTiles(&world, 0);
+    const span = world.denseWindowDepthSpan() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(world.denseLayerOrder(2).depth, span.min);
     try std.testing.expectEqual(world.denseLayerOrder(0).depth, span.max);
+    try std.testing.expectEqual(@as(usize, 3), world.denseWindowLayerDepths().len);
+
+    // The span follows the resident set to the next level at the next sync.
+    _ = try testSyncGpuTiles(&world, 1);
+    const deeper = world.denseWindowDepthSpan() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(world.denseLayerOrder(2).depth, deeper.min);
+    try std.testing.expectEqual(world.denseLayerOrder(1).depth, deeper.max);
 }
 
 test "denseWindowDepthSpan returns null when nothing is in window" {
@@ -4518,62 +4732,7 @@ test "denseWindowDepthSpan returns null when nothing is in window" {
     };
     defer world.deinit();
 
-    try std.testing.expect((try world.denseWindowDepthSpan(0)) == null);
-}
-
-test "denseWindowDepthSpan caches the span until dirty, level, or window changes" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
-    defer world.deinit();
-    try world.addUndergroundLevels(&meta);
-
-    const first = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
-
-    // denseWindowDepthSpan itself never clears dense_quads_dirty or updates the
-    // submitted_* fields (only an actual submitStaticDenseGeometry call does);
-    // set them here to simulate "already submitted for this level/window" so the
-    // cache-hit path below is reachable without a live Renderer.
-    world.dense_quads_dirty = false;
-    world.submitted_active_level = 0;
-    world.submitted_window = world.render_window;
-
-    // Mutate the underlying layer order directly (bypassing addDenseLayer, which
-    // would mark dense_quads_dirty) to prove a clean-cache call really skips
-    // recomputation instead of coincidentally landing on the same answer.
-    const swapped = world.denseLayerOrder(0).depth + 1000;
-    world.dense_layers.items(.base_z)[0] += 1000;
-    const cached = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(first.min, cached.min);
-    try std.testing.expectEqual(first.max, cached.max);
-    try std.testing.expect(cached.max != swapped);
-
-    world.dense_quads_dirty = true;
-    const recomputed = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(swapped, recomputed.max);
-}
-
-test "denseWindowDepthSpan propagates TooManyDenseLayers instead of swallowing it" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 2,
-        .render_window = .{ .levels_below = 40 },
-        .max_dense_bands_per_level = 1,
-    };
-    defer world.deinit();
-    try world.buildCatalog(&meta);
-    const grass = try world.requireTileByName(&meta, "grass");
-    for (0..k_max_dense_submit_stack_cap + 1) |_| {
-        const level = try world.addLevel(0);
-        _ = try world.addDenseLayer(level, 0, .floor, grass);
-    }
-
-    try std.testing.expectError(error.TooManyDenseLayers, world.denseWindowDepthSpan(0));
+    try std.testing.expect(world.denseWindowDepthSpan() == null);
 }
 
 test "partitionDenseCompositeBuckets returns a single bucket with no interleave depths in window" {
@@ -4583,10 +4742,11 @@ test "partitionDenseCompositeBuckets returns a single bucket with no interleave 
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(0, &layers);
+    var layer_buffer: [64]u32 = undefined;
+    const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const count = layers.len;
 
-    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
+    var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
     const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &.{}, &buckets);
 
     try std.testing.expectEqual(@as(usize, 1), bucket_count);
@@ -4613,14 +4773,15 @@ test "partitionDenseCompositeBuckets splits off the ceiling layer at the active 
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(2, &layers);
+    var layer_buffer: [64]u32 = undefined;
+    const layers = try testSubmitLayers(&world, 2, &layer_buffer);
+    const count = layers.len;
     try std.testing.expectEqual(@as(usize, 4), count);
 
     // The active level's own actor depth is the only interleave point — mirrors
     // today's ceiling-vs-window split, now expressed as the general rule.
     const interleave = [_]i32{world.activeLevelActorDepth(2)};
-    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
+    var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
     const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
 
     try std.testing.expectEqual(@as(usize, 2), bucket_count);
@@ -4647,15 +4808,16 @@ test "partitionDenseCompositeBuckets splits at a synthetic interleave point on a
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(0, &layers);
+    var layer_buffer: [64]u32 = undefined;
+    const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const count = layers.len;
     try std.testing.expectEqual(@as(usize, 7), count);
 
     // A synthetic sandwich point (e.g. a sparse tile) between level 5 and level
     // 4's own floor depths — neither is the active level (0) nor the window's
     // shallowest layer. This is the case an active-level-only design would miss.
     const interleave = [_]i32{world.worldZForLevel(5, 0, .effect)};
-    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
+    var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
     const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
 
     try std.testing.expectEqual(@as(usize, 2), bucket_count);
@@ -4665,7 +4827,7 @@ test "partitionDenseCompositeBuckets splits at a synthetic interleave point on a
     try std.testing.expectEqual(@as(u16, 4), world.denseLayerLevel(layers[buckets[1].start]));
 }
 
-test "partitionDenseCompositeBuckets produces one bucket per cut point at the proven worst case, no fold or error" {
+test "partitionDenseCompositeBuckets produces one bucket per cut point when every gap is cut" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -4675,64 +4837,57 @@ test "partitionDenseCompositeBuckets produces one bucket per cut point at the pr
         .tile_size = meta.tileSize(),
         .chunk_size_tiles = 2,
         .render_window = .{ .levels_below = 40 },
-        .max_dense_bands_per_level = 1,
     };
     defer world.deinit();
     try world.buildCatalog(&meta);
     const grass = try world.requireTileByName(&meta, "grass");
-    for (0..k_max_dense_submit_stack_cap) |level_index| {
+    const level_count = 40;
+    for (0..level_count) |level_index| {
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
 
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(0, &layers);
-    try std.testing.expectEqual(k_max_dense_submit_stack_cap, count);
+    var layer_buffer: [64]u32 = undefined;
+    const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    try std.testing.expectEqual(@as(usize, level_count), layers.len);
 
-    // One interleave point strictly between every consecutive submitted-layer
-    // pair: `submit_layers.len - 1` cut points, the mathematically-proven
-    // worst case bucket count `Renderer.k_max_dense_composite_draws` is now
-    // sized to cover exactly, so this never folds or errors even here.
-    var interleave: [k_max_dense_submit_stack_cap - 1]i32 = undefined;
-    for (0..k_max_dense_submit_stack_cap - 1) |i| {
+    // One interleave point strictly between every consecutive pair: one bucket per
+    // layer, the most a partition can produce.
+    var interleave: [level_count - 1]i32 = undefined;
+    for (&interleave, 0..) |*depth, i| {
         const deeper = world.denseLayerOrder(layers[i]).depth;
         const shallower = world.denseLayerOrder(layers[i + 1]).depth;
-        interleave[i] = deeper + @divTrunc(shallower - deeper, 2);
+        depth.* = deeper + @divTrunc(shallower - deeper, 2);
     }
 
-    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
+    var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
+    const bucket_count = world.partitionDenseCompositeBuckets(layers, &interleave, &buckets);
 
-    try std.testing.expectEqual(k_max_dense_submit_stack_cap, bucket_count);
-    for (0..bucket_count) |i| {
-        try std.testing.expectEqual(@as(usize, 1), buckets[i].end - buckets[i].start);
+    try std.testing.expectEqual(@as(usize, level_count), bucket_count);
+    for (buckets[0..bucket_count]) |bucket| {
+        try std.testing.expectEqual(@as(usize, 1), bucket.end - bucket.start);
     }
 }
 
-test "buildWindowLayers reverses a bucket's deepest-first layers to topmost-first offsets" {
+test "buildWindowLayers names each bucket's topmost resident directory and its layer count" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
-
-    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
-    const count = try world.collectDenseSubmitLayers(0, &layers);
-    try std.testing.expectEqual(@as(usize, 3), count);
-    try std.testing.expectError(error.DenseLayerNotResident, world.buildWindowLayers(layers[0..count], 0, count));
     _ = try testSyncGpuTiles(&world, 0);
 
-    const window = try world.buildWindowLayers(layers[0..count], 0, count);
-
-    try std.testing.expectEqual(@as(u8, 3), window.count);
-    // submit_layers is deepest-first (dirt_dark, dirt, grass); the window must be
-    // topmost-first (grass, dirt, dirt_dark) since the shader composites downward.
-    // Each offset is the layer's directory: slot * chunks per level.
+    // Resident layers are deepest first (dirt_dark, dirt, grass); the shader walks
+    // a chain topmost first, so a bucket starts at its shallowest layer.
+    const layers = world.dense_render.layers.items;
+    try std.testing.expectEqual(@as(usize, 3), layers.len);
     const slots = world.dense_layers.items(.gpu_slot);
-    const chunk_count: u32 = @intCast(world.chunkCountPerLevel());
-    try std.testing.expectEqual(@as(u32, slots[layers[2]]) * chunk_count, window.offsets[0]);
-    try std.testing.expectEqual(@as(u32, slots[layers[1]]) * chunk_count, window.offsets[1]);
-    try std.testing.expectEqual(@as(u32, slots[layers[0]]) * chunk_count, window.offsets[2]);
+    const whole = world.buildWindowLayers(0, 3);
+    try std.testing.expectEqual(world.gpu_tiles.slotDirectory(slots[layers[2]]), whole.first_directory);
+    try std.testing.expectEqual(@as(u32, 3), whole.count);
+    const deeper = world.buildWindowLayers(0, 2);
+    try std.testing.expectEqual(world.gpu_tiles.slotDirectory(slots[layers[1]]), deeper.first_directory);
+    try std.testing.expectEqual(@as(u32, 2), deeper.count);
 }
 
 test "submitStaticDenseGeometry marks only the bucket holding the shallowest submitted layer, regardless of where an unrelated interleave point splits the stack" {
@@ -4761,19 +4916,14 @@ test "submitStaticDenseGeometry marks only the bucket holding the shallowest sub
         .batch_capacity_vertices = 0,
         .batch = sprite_batch.SpriteBatch.init(allocator),
     };
-    defer renderer.batch.deinit();
-    defer renderer.static_positions.deinit(allocator);
-    defer renderer.static_uvs.deinit(allocator);
-    defer renderer.static_colors.deinit(allocator);
-    defer renderer.static_groups.deinit(allocator);
-    defer renderer.draw_list.deinit(allocator);
+    defer deinitStaticTestRenderer(&renderer);
 
     // No interleave points this frame: both layers merge into one bucket,
     // which must be marked shallowest (the common case the rim-shadow effect
     // was originally written for).
     try world.submitStaticDenseGeometry(&renderer, &runtime_assets, 0, &.{});
-    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
-    try std.testing.expect(renderer.tilemap_window_layers[0].is_shallowest_bucket);
+    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layers.items.len);
+    try std.testing.expect(renderer.tilemap_window_layers.items[0].is_shallowest_bucket);
 
     // An unrelated interleave point (e.g. a dynamic entity or sparse tile
     // elsewhere on the map, nothing to do with this cell's own geometry)
@@ -4788,12 +4938,12 @@ test "submitStaticDenseGeometry marks only the bucket holding the shallowest sub
     const cut = deeper_depth + @divTrunc(surface_depth - deeper_depth, 2);
     try world.submitStaticDenseGeometry(&renderer, &runtime_assets, 0, &.{cut});
 
-    try std.testing.expectEqual(@as(usize, 2), renderer.tilemap_window_layer_count);
-    try std.testing.expect(!renderer.tilemap_window_layers[0].is_shallowest_bucket);
-    try std.testing.expect(renderer.tilemap_window_layers[1].is_shallowest_bucket);
+    try std.testing.expectEqual(@as(usize, 2), renderer.tilemap_window_layers.items.len);
+    try std.testing.expect(!renderer.tilemap_window_layers.items[0].is_shallowest_bucket);
+    try std.testing.expect(renderer.tilemap_window_layers.items[1].is_shallowest_bucket);
 }
 
-test "addDenseLayer rejects bands beyond configured per-level cap" {
+test "addDenseLayer rejects bands beyond the level's band width" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -4802,14 +4952,12 @@ test "addDenseLayer rejects bands beyond configured per-level cap" {
         .height = 4,
         .tile_size = meta.tileSize(),
         .chunk_size_tiles = 2,
-        .max_dense_bands_per_level = 2,
     };
     defer world.deinit();
     try world.buildCatalog(&meta);
     const grass = try world.requireTileByName(&meta, "grass");
     const level = try world.addLevel(0);
-    _ = try world.addDenseLayer(level, 0, .floor, grass);
-    _ = try world.addDenseLayer(level, 0, .obstacle, grass);
+    for (0..world_terrain.max_level_bands) |_| _ = try world.addDenseLayer(level, 0, .floor, grass);
     try std.testing.expectError(error.DenseLayerWindowExceeded, world.addDenseLayer(level, 0, .effect, grass));
 }
 
@@ -4822,7 +4970,6 @@ test "addDenseLayer reserves capacities before committing band or layer (Failing
         .height = 8,
         .tile_size = meta.tileSize(),
         .chunk_size_tiles = 4,
-        .max_dense_bands_per_level = 2,
     };
     defer world.deinit();
     try world.buildCatalog(&meta);
@@ -4862,14 +5009,13 @@ test "addDenseLayer reserves capacities before committing band or layer (Failing
         try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
     }
 
-    // Retry is consistent, blocks every chunk of the level, and reaches the per-level cap cleanly.
+    // Retry is consistent and blocks every chunk of the level.
     _ = try world.addDenseLayer(level, 0, .obstacle, dirt);
     try std.testing.expectEqual(@as(usize, 2), world.dense_layers.len);
     try std.testing.expectEqual(@as(u8, 2), world.level_terrain.items[level].band_count);
     for (0..world.chunkCountPerLevel()) |chunk| {
         try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(level, @intCast(chunk)));
     }
-    try std.testing.expectError(error.DenseLayerWindowExceeded, world.addDenseLayer(level, 0, .effect, grass));
 }
 
 test "a dense layer added on a resident level enters the GPU tile store at the next sync" {
@@ -4881,7 +5027,7 @@ test "a dense layer added on a resident level enters the GPU tile store at the n
     var gpu = TestGpuStore{};
     defer gpu.deinit();
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu.apply(&world);
+    try testApplySync(&world, &gpu);
     try std.testing.expectEqual(@as(usize, 1), world.gpu_tiles.residentLayerCount());
 
     const added = try world.addDenseLayer(0, 0, .obstacle, water);
@@ -4889,75 +5035,80 @@ test "a dense layer added on a resident level enters the GPU tile store at the n
     _ = try world.clearDenseTile(added, 1, 1);
     const sync_plan = try testSyncGpuTiles(&world, 0);
     try std.testing.expectEqual(@as(usize, 1), sync_plan.enter_count);
-    try gpu.apply(&world);
+    try testApplySync(&world, &gpu);
     try std.testing.expect(world.dense_layers.items(.gpu_slot)[added] != world_gpu_tiles.no_slot);
     try std.testing.expectEqual(@as(usize, 2), world.gpu_tiles.residentLayerCount());
     try expectGpuStoreMatches(&world, &gpu);
 }
 
-test "validateDenseRenderBudget rejects oversized render window stack cap" {
+test "a level whose full-level GPU store would overflow u32 is created and renders a window" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 8192x8192 cells in 16-cell chunks: a whole-level directory set and block per
+    // chunk would pass the u32 byte width, a window-sized store does not come near.
     var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = 32,
-        .chunk_size_tiles = 2,
-        .render_window = .{ .levels_below = 20, .ceiling_when_underground = true },
-        .max_dense_bands_per_level = 2,
-    };
-    defer world.deinit();
-    try std.testing.expectError(error.DenseLayerWindowExceeded, world.validateDenseRenderBudget());
-}
-
-test "validateDenseRenderBudget accepts a window at the submit stack cap and refuses one past it" {
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 1,
-        .height = 1,
-        .tile_size = 32,
-        .chunk_size_tiles = 1,
-        .render_window = .{ .levels_below = @intCast(k_max_dense_submit_stack_cap - 1) },
-        .max_dense_bands_per_level = 1,
-    };
-    defer world.deinit();
-    try std.testing.expectEqual(k_max_dense_submit_stack_cap, world.maxDenseSubmitLayerCount());
-    try world.validateDenseRenderBudget();
-
-    world.render_window.levels_below += 1;
-    try std.testing.expectError(error.DenseLayerWindowExceeded, world.validateDenseRenderBudget());
-}
-
-test "a level whose GPU tile store would overflow its index width fails loudly at create" {
-    // 4 B x 32 slots x (1 + 128) words per 16-cell chunk: 8192x8192 cells (512x512
-    // chunks) is past the u32 byte width, 2048x2048 inside it.
-    var too_wide = WorldSystem{
         .allocator = std.testing.allocator,
         .width = 8192,
         .height = 8192,
-        .tile_size = 32,
+        .tile_size = meta.tileSize(),
         .chunk_size_tiles = 16,
     };
-    defer too_wide.deinit();
-    try std.testing.expectError(error.GpuTileStoreWidthOverflow, too_wide.addLevel(0));
-    try std.testing.expectEqual(@as(usize, 0), too_wide.levelCount());
-
-    var floor_scale = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 2048,
-        .height = 2048,
-        .tile_size = 32,
-        .chunk_size_tiles = 16,
-    };
-    defer floor_scale.deinit();
-    _ = try floor_scale.addLevel(0);
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    _ = try world.setDenseTile(layer, 8000, 8000, water);
+    testShowChunks(&world, 499, 499, 2, 2, 0);
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
+    const sync_plan = try testSyncGpuTiles(&world, 0);
+    try testApplySync(&world, &gpu);
+    // One directory of side 4 and the one mixed chunk's block.
+    try std.testing.expectEqual(world_gpu_tiles.directoryWords(4) + tileStoreBlockElements(16), sync_plan.required_elements);
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, layer, 8000, 8000));
 }
 
-test "GPU residency follows the render window and a pan uploads nothing" {
+test "GPU store bytes are the same for the same window at 64 and 512 tiles a side" {
     var meta = try testWorldMeta();
     defer meta.deinit();
+    var bytes: [2]u64 = undefined;
+    for ([_]u16{ 64, 512 }, &bytes) |side, *out| {
+        var world = WorldSystem{
+            .allocator = std.testing.allocator,
+            .width = side,
+            .height = side,
+            .tile_size = meta.tileSize(),
+            .chunk_size_tiles = 16,
+            .render_window = .{ .levels_below = 1 },
+        };
+        defer world.deinit();
+        try world.buildCatalog(&meta);
+        const grass = try world.requireTileByName(&meta, "grass");
+        const water = try world.requireTileByName(&meta, "water_1");
+        for (0..3) |level_index| {
+            const layer = try world.addDenseLayer(try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step), 0, .floor, grass);
+            // Every chunk of the level is mixed.
+            for (0..side / 16) |chunk_y| for (0..side / 16) |chunk_x| {
+                _ = try world.setDenseTile(layer, @intCast(chunk_x * 16 + 3), @intCast(chunk_y * 16 + 3), water);
+            };
+        }
+        testShowChunks(&world, 1, 1, 2, 2, 0);
+        _ = try testSyncGpuTiles(&world, 0);
+        out.* = world.gpu_tiles.residentBytes();
+    }
+    try std.testing.expectEqual(bytes[0], bytes[1]);
+    // Two resident layers: a side-4 directory and four blocks each.
+    try std.testing.expectEqual(@as(u64, 2 * (world_gpu_tiles.directoryWords(4) + 4 * tileStoreBlockElements(16)) * 4), bytes[0]);
+}
+
+test "GPU residency follows the window and a pan uploads only entering chunks" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 32x8 tiles in 4x4 chunks: an 8x2 chunk grid on four levels, two in the window.
     var world = WorldSystem{
         .allocator = std.testing.allocator,
-        .width = 8,
+        .width = 32,
         .height = 8,
         .tile_size = meta.tileSize(),
         .chunk_size_tiles = 4,
@@ -4971,52 +5122,236 @@ test "GPU residency follows the render window and a pan uploads nothing" {
     for (&layers, 0..) |*layer, level_index| {
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
         layer.* = try world.addDenseLayer(level, 0, .floor, grass);
-        // One mixed chunk per level.
-        _ = try world.setDenseTile(layer.*, 0, 0, water);
+        // Every chunk of every level is mixed.
+        for (0..8) |chunk_x| for (0..2) |chunk_y| {
+            _ = try world.setDenseTile(layer.*, @intCast(chunk_x * 4 + 1), @intCast(chunk_y * 4 + 2), water);
+        };
     }
     var gpu = TestGpuStore{};
     defer gpu.deinit();
     const slots = world.dense_layers.items(.gpu_slot);
+    const block_elements = tileStoreBlockElements(4);
 
-    // Levels 0 and 1 enter: two directories and their one block each.
+    // A 2x2 chunk window over levels 0 and 1: two directories and four blocks each;
+    // chunks outside the window upload nothing.
+    testShowChunks(&world, 0, 0, 2, 2, 0);
     var sync_plan = try testSyncGpuTiles(&world, 0);
-    try gpu.apply(&world);
+    try testApplySync(&world, &gpu);
     try std.testing.expectEqual(@as(usize, 2), sync_plan.enter_count);
-    try std.testing.expectEqual(@as(usize, 4), world.gpu_tiles.spans.items.len);
-    try std.testing.expect(slots[layers[0]] != world_gpu_tiles.no_slot and slots[layers[1]] != world_gpu_tiles.no_slot);
+    try std.testing.expectEqual(@as(usize, 2 * (1 + 4)), world.gpu_tiles.spans.items.len);
     try std.testing.expectEqual(world_gpu_tiles.no_slot, slots[layers[2]]);
     try expectGpuStoreMatches(&world, &gpu);
 
-    // A pan changes the visible chunks only: the next sync has nothing to upload.
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0, 0);
-    world.setVisibleChunksForWorldRect(.{ .x = 64, .y = 64, .w = 32, .h = 32 }, 0, 0);
+    // A pan inside the same chunks uploads nothing.
+    world.setVisibleChunksForWorldRect(.{ .x = 3, .y = 3, .w = 2 * 4 * world.tile_size - 6, .h = 2 * 4 * world.tile_size - 6 }, 0, 0);
     sync_plan = try testSyncGpuTiles(&world, 0);
-    try std.testing.expect(sync_plan.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), sync_plan.span_count);
 
-    // Moving down one level: level 0 leaves (its block slot freed and reused), level
-    // 2 enters, and level 1 keeps its slot without re-uploading.
-    const kept_slot = slots[layers[1]];
+    // A long pan right, one chunk per step: each step uploads the entering column
+    // (a word and a block per chunk and layer), frees the leaving column's blocks,
+    // and the store's high water stays flat.
+    const high_water = world.gpu_tiles.high_water;
+    for (1..7) |step| {
+        testShowChunks(&world, @intCast(step), 0, 2, 2, 0);
+        sync_plan = try testSyncGpuTiles(&world, 0);
+        try testApplySync(&world, &gpu);
+        try std.testing.expectEqual(@as(usize, 2 * 2 * 2), world.gpu_tiles.spans.items.len);
+        try std.testing.expectEqual(@as(usize, 2 * 2 * (1 + block_elements)), world.gpu_tiles.values.items.len);
+        try std.testing.expectEqual(high_water, world.gpu_tiles.high_water);
+        try expectGpuStoreMatches(&world, &gpu);
+    }
+
+    // Moving down one level: level 0 leaves, level 2 enters, level 1 keeps its
+    // directory and rewrites only its link.
+    const kept_directory = world.gpu_tiles.slotDirectory(slots[layers[1]]);
     sync_plan = try testSyncGpuTiles(&world, 1);
-    try gpu.apply(&world);
+    try testApplySync(&world, &gpu);
     try std.testing.expectEqual(@as(usize, 1), sync_plan.enter_count);
-    try std.testing.expectEqual(@as(usize, 1), sync_plan.evict.count());
+    try std.testing.expectEqual(@as(usize, 1), sync_plan.evict_count);
     try std.testing.expectEqual(world_gpu_tiles.no_slot, slots[layers[0]]);
-    try std.testing.expectEqual(kept_slot, slots[layers[1]]);
-    try std.testing.expectEqual(@as(usize, 2), world.gpu_tiles.spans.items.len);
-    try std.testing.expectEqual(@as(u32, 2), world.gpu_tiles.block_count);
+    try std.testing.expectEqual(kept_directory, world.gpu_tiles.slotDirectory(slots[layers[1]]));
+    try std.testing.expectEqual(high_water, world.gpu_tiles.high_water);
+    try expectGpuStoreMatches(&world, &gpu);
+}
+
+test "a window of 80 resident layers composites in one chained draw" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+        .render_window = .{ .levels_below = 39 },
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    var deepest_floor: usize = 0;
+    for (0..40) |level_index| {
+        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+        deepest_floor = try world.addDenseLayer(level, 0, .floor, grass);
+        const obstacle = try world.addDenseLayer(level, 0, .obstacle, water);
+        // Holes everywhere but the deepest floor, so (1, 1) composites through all 80.
+        _ = try world.clearDenseTile(obstacle, 1, 1);
+        if (level_index + 1 < 40) _ = try world.clearDenseTile(deepest_floor, 1, 1);
+    }
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
+    _ = try testSyncGpuTiles(&world, 0);
+    try testApplySync(&world, &gpu);
+    try std.testing.expectEqual(@as(usize, 80), world.maxDenseSubmitDrawCount());
     try expectGpuStoreMatches(&world, &gpu);
 
-    // Edits queued on a layer that leaves the window are dropped with it; it
-    // uploads whole if it returns.
-    _ = try world.setDenseTile(layers[1], 5, 5, water);
-    sync_plan = try testSyncGpuTiles(&world, 3);
-    try gpu.apply(&world);
-    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.pending.items.len);
-    try std.testing.expectEqual(world_gpu_tiles.no_slot, slots[layers[1]]);
-    try expectGpuStoreMatches(&world, &gpu);
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer deinitStaticTestRenderer(&renderer);
+    try world.submitStaticDenseGeometry(&renderer, &runtime_assets, 0, &.{});
+    try std.testing.expectEqual(@as(usize, 1), renderer.static_groups.items.len);
+    const chain = renderer.tilemap_window_layers.items[0];
+    try std.testing.expectEqual(@as(u32, 80), chain.count);
+    // The draw's chain reaches the deepest floor's tile through 79 holes.
+    const mirror = &world.gpu_tiles;
+    try std.testing.expectEqual(@as(?TileId, grass), gpu.composite(world.chunkGeometry(), mirror.side, mirror.window, chain.first_directory, chain.count, invalid_tile_id, 1, 1));
+    try std.testing.expectEqual(world.dense_layers.items(.gpu_slot)[deepest_floor], mirror.order.items[mirror.order.items.len - 1]);
+}
+
+test "a chunk window wider than the largest directory side is clipped to it and syncs" {
+    // 40000x1 tiles in 1-tile chunks: a rect over the whole level spans more chunks
+    // than any directory side can map. No layer, so no directory is allocated.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 40000,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 1.0e9, .h = 1.0e9 }, 2, 0);
+    try std.testing.expectEqual(tile_store_max_side, world.render_side);
+    const sync_plan = try testSyncGpuTiles(&world, 0);
+    try std.testing.expectEqual(tile_store_max_side, sync_plan.side);
+    try std.testing.expectEqual(tile_store_max_side, world.gpu_tiles.window.width());
+    try std.testing.expectEqual(@as(u32, 1), world.gpu_tiles.window.height());
+    try std.testing.expect(world.gpu_tiles.window_clip_reported);
+    try std.testing.expectEqual(@as(usize, 0), sync_plan.span_count);
+}
+
+test "the store width keeps the topmost window layers and reports the drop once" {
+    const desired = [_]u32{ 7, 3, 5, 1 };
+    var reported = false;
+    try std.testing.expectEqualSlices(u32, &desired, WorldSystem.fitResidentLayers(&desired, 9, &reported));
+    try std.testing.expect(!reported);
+    // Past the fit, the deepest layers drop and the report latches.
+    try std.testing.expectEqualSlices(u32, &.{ 7, 3 }, WorldSystem.fitResidentLayers(&desired, 2, &reported));
+    try std.testing.expect(reported);
+    try std.testing.expectEqualSlices(u32, &.{7}, WorldSystem.fitResidentLayers(&desired, 1, &reported));
+    try std.testing.expect(reported);
+    try std.testing.expectEqual(@as(usize, 0), WorldSystem.fitResidentLayers(&desired, 0, &reported).len);
+}
+
+test "a store created for a sync that never committed gets the whole window at the next sync" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    _ = try world.setDenseTile(layer, 1, 1, water);
+    testShowChunks(&world, 0, 0, 1, 1, 0);
+    world.gpu_tiles.store = .{ .index = 0, .generation = 1 };
+    world.gpu_tiles.store_side = world.render_side;
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu.apply(&world);
-    try expectGpuStoreMatches(&world, &gpu);
+    try std.testing.expect(world.gpu_tiles.layoutMatchesStore());
+
+    // A sync at another side created its store and failed before committing,
+    // and the window is back at the old side. The mirror's layout describes the
+    // old store, so the next sync lays the window out anew rather than uploading
+    // only what changed into an empty store.
+    world.gpu_tiles.store = .{ .index = 1, .generation = 1 };
+    world.gpu_tiles.store_side = world.render_side * 2;
+    try std.testing.expect(!world.gpu_tiles.layoutMatchesStore());
+    var fresh = TestGpuStore{};
+    defer fresh.deinit();
+    const sync_plan = try testSyncGpuTiles(&world, 0);
+    try std.testing.expect(sync_plan.relayout);
+    try testApplySync(&world, &fresh);
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &fresh, layer, 1, 1));
+    try expectGpuStoreMatches(&world, &fresh);
+}
+
+test "a rect ending exactly on a tile edge at large pixel coordinates excludes the next tile and chunk" {
+    // 2048x2048 cells in 16-cell chunks of 32 px: x = 33,280 px is the edge between
+    // tile 1039 and 1040, chunks 64 and 65, where f32 spacing is about 0.004 px.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 2048,
+        .height = 2048,
+        .tile_size = 32,
+        .chunk_size_tiles = 16,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    const rect = Rect{ .x = 32_768, .y = 32_768, .w = 512, .h = 512 };
+    const scope = world.chunkRegionForWorldRect(rect, 0) orelse return error.ExpectedRegion;
+    try std.testing.expectEqual(ChunkCoord{ .x = 64, .y = 64 }, scope.min);
+    try std.testing.expectEqual(ChunkCoord{ .x = 65, .y = 65 }, scope.max_exclusive);
+    world.setVisibleChunksForWorldRect(rect, 0, 0);
+    try std.testing.expectEqual(scope, world.visibleChunkRegion().?);
+    try std.testing.expectEqual(@as(u16, 1040), world.visible_max_tile_x_exclusive);
+    // A rect ending just past the edge takes the next tile; a tiny rect keeps its tile.
+    const past = world.chunkRegionForWorldRect(.{ .x = 32_768, .y = 32_768, .w = 512.01, .h = 1 }, 0).?;
+    try std.testing.expectEqual(@as(i32, 66), past.max_exclusive.x);
+    const tiny = world.chunkRegionForWorldRect(.{ .x = 33_280, .y = 0, .w = 0.001, .h = 0.001 }, 0).?;
+    try std.testing.expectEqual(ChunkCoord{ .x = 65, .y = 0 }, tiny.min);
+    try std.testing.expectEqual(ChunkCoord{ .x = 66, .y = 1 }, tiny.max_exclusive);
+}
+
+test "the render directory side covers the rect's chunk span plus alignment and overscan, clamped to the grid" {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 2048,
+        .height = 512,
+        .tile_size = 32,
+        .chunk_size_tiles = 16,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    // 1280x720 px over 512 px chunks: 3 chunks wide + 1 for alignment.
+    world.setVisibleChunksForWorldRect(.{ .x = 100, .y = 100, .w = 1280, .h = 720 }, 0, 0);
+    try std.testing.expectEqual(@as(u32, 4), world.render_side);
+    // One chunk of overscan on each side: 3 + 1 + 2.
+    world.setVisibleChunksForWorldRect(.{ .x = 100, .y = 100, .w = 1280, .h = 720 }, 1, 0);
+    try std.testing.expectEqual(@as(u32, 8), world.render_side);
+    // A rect wider than the level clamps to the grid's power of two (128 chunks).
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 1.0e9, .h = 1.0e9 }, 3, 0);
+    try std.testing.expectEqual(@as(u32, 128), world.render_side);
+    // Every window the side covers fits it.
+    const region = world.visibleChunkRegion().?;
+    try std.testing.expect(region.max_exclusive.x - region.min.x <= 128);
 }
 
 test "the visible sparse count is the same at 8 and 128 levels for the same window" {
@@ -5799,7 +6134,7 @@ fn appendTerrainBytes(out: *std.ArrayList(u8), world: *const WorldSystem) !void 
     }
     // Field by field: `PendingEdit` has padding bytes.
     for (world.gpu_tiles.pending.items) |edit| {
-        try out.append(allocator, edit.slot);
+        try out.appendSlice(allocator, std.mem.asBytes(&edit.slot));
         try out.appendSlice(allocator, std.mem.asBytes(&edit.chunk));
         try out.appendSlice(allocator, std.mem.asBytes(&edit.element));
     }
@@ -6060,7 +6395,7 @@ test "a batched dense edit's GPU edits upload every changed resident tile" {
     // The fixture's sync batch uploads the resident layers whole.
     var gpu_store: TestGpuStore = .{};
     defer gpu_store.deinit();
-    try gpu_store.apply(&world);
+    try testApplySync(&world, &gpu_store);
     var events: std.ArrayList(WorldTileChangedEvent) = .empty;
     defer events.deinit(std.testing.allocator);
     var write_buffer: [160]DenseCellWrite = undefined;
@@ -6072,11 +6407,8 @@ test "a batched dense edit's GPU edits upload every changed resident tile" {
         events.clearRetainingCapacity();
         try events.ensureTotalCapacity(std.testing.allocator, writes.len);
         try world.applyDenseCellWrites(batch.chunks.items, null, &events);
-        var resident_changes: usize = 0;
-        for (events.items) |event| resident_changes += @intFromBool(event.level <= 1);
-        try std.testing.expectEqual(resident_changes, world.gpu_tiles.pending.items.len);
         _ = try testSyncGpuTiles(&world, 0);
-        try gpu_store.apply(&world);
+        try testApplySync(&world, &gpu_store);
         try expectGpuStoreMatches(&world, &gpu_store);
     }
 }
@@ -6206,7 +6538,7 @@ test "a multi-level cave-in lands in one batched step and refills to uniform chu
     // The fixture's sync batch uploads the resident layers whole.
     var gpu_store: TestGpuStore = .{};
     defer gpu_store.deinit();
-    try gpu_store.apply(&world);
+    try testApplySync(&world, &gpu_store);
     var reference = BatchReference.init(tiles);
     var write_buffer: [160]DenseCellWrite = undefined;
     const writes = caveInBatchWrites(tiles, &write_buffer);
@@ -6233,7 +6565,7 @@ test "a multi-level cave-in lands in one batched step and refills to uniform chu
     try std.testing.expectEqual(@as(?TileId, invalid_tile_id), stores[0].uniformTile(1 * 4 + 1));
     // The GPU store reads those chunks back at their new uniform tiles.
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu_store.apply(&world);
+    try testApplySync(&world, &gpu_store);
     try expectGpuStoreMatches(&world, &gpu_store);
 
     // The refill in one step returns every block and slot to uniform.
@@ -6249,7 +6581,7 @@ test "a multi-level cave-in lands in one batched step and refills to uniform chu
     layers = reference.layers();
     try expectTerrainMatchesReference(&world, &layers);
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu_store.apply(&world);
+    try testApplySync(&world, &gpu_store);
     try expectGpuStoreMatches(&world, &gpu_store);
     for (world.dense_layers.items(.store)) |store| try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
     try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[1].blocked.liveSlotCount());
@@ -6275,14 +6607,14 @@ test "a 1x1 border chunk turning uniform at another tile reads back from the GPU
     _ = try testSyncGpuTiles(&world, 0);
     var gpu_store: TestGpuStore = .{};
     defer gpu_store.deinit();
-    try gpu_store.apply(&world);
+    try testApplySync(&world, &gpu_store);
     const store = &world.dense_layers.items(.store)[layer];
 
     // Single-cell path, grass -> water in one frame: uniform to uniform, no block.
     _ = try world.setDenseTile(layer, 4, 4, tiles.water);
     try std.testing.expectEqual(@as(?TileId, tiles.water), store.uniformTile(3));
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu_store.apply(&world);
+    try testApplySync(&world, &gpu_store);
     try expectGpuStoreMatches(&world, &gpu_store);
 
     // Batched path, water -> cave in one frame.
@@ -6295,9 +6627,9 @@ test "a 1x1 border chunk turning uniform at another tile reads back from the GPU
     try std.testing.expectEqual(@as(?TileId, tiles.cave), store.uniformTile(3));
     try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
     _ = try testSyncGpuTiles(&world, 0);
-    try gpu_store.apply(&world);
+    try testApplySync(&world, &gpu_store);
     try expectGpuStoreMatches(&world, &gpu_store);
-    try std.testing.expectEqual(tiles.cave, gpu_store.tile(&world, world.dense_layers.items(.gpu_slot)[layer], 4, 4));
+    try std.testing.expectEqual(@as(?TileId, tiles.cave), testGpuTile(&world, &gpu_store, layer, 4, 4));
 }
 
 test "a one-chunk batched dense edit runs inline" {

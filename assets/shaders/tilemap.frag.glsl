@@ -10,56 +10,63 @@ layout(location = 0) in vec2 in_world_pos;
 layout(location = 0) out vec4 out_color;
 
 // Fragment resource set: sampler at binding 0, the world's tile store at binding 1
-// (renderer.zig tile store layout). The store is one directory per window layer
-// slot, one word per chunk, then a block region. A directory word with bit 31 set
-// is a uniform chunk whose tile is its low 16 bits; any other word indexes the
-// chunk's block, which holds its tiles in local row-major order, two 16-bit ids per
-// word, low half first.
+// (renderer.zig tile store layout). A layer's directory is side * side toroidal
+// words, chunk (cx, cy) at ((cy & (side - 1)) * side + (cx & (side - 1))), then a
+// link word holding the next deeper layer's directory start. A directory word with
+// bit 31 set is a uniform chunk whose tile is its low 16 bits; any other word is the
+// absolute element offset of the chunk's block, which holds its tiles in local
+// row-major order, two 16-bit ids per word, low half first.
 layout(set = 2, binding = 0) uniform sampler2D atlas_texture;
 layout(set = 2, binding = 1) readonly buffer TileData {
     uint words[];
 } tiles;
 
+// Field order and std140 layout match sprite_batch.zig's TilemapParams.
 layout(set = 3, binding = 0) uniform TilemapUniform {
     // grid:  x=tile_size, y=grid_width, z=grid_height, w=invalid_tile_id
     vec4 grid;
     // atlas: x=columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     vec4 atlas;
-    // layer_meta: x=this draw's composited layer count (topmost-first),
-    // y=shallowest-bucket flag, z=chunk shift (log2 of the chunk edge),
-    // w=chunks per row
+    // layer_meta: x=this draw's chained layer count, y=shallowest-bucket flag,
+    // z=chunk shift (log2 of the chunk edge), w=directory side in chunks
     ivec4 layer_meta;
-    // layer_offsets: directory start words in the tile store (slot * chunks per
-    // level), one per composited layer (layer_meta.x of them valid), topmost layer
-    // first. Packed 4-per-uvec4 so this matches the flat Zig
-    // [k_max_tilemap_window_layers]u32 (sprite_batch.zig) byte-for-byte under
-    // std140 (uvec4 array elements have no interior padding). Its length is also
-    // the store's directory slot count. The array size must equal
-    // k_max_tilemap_window_layers / 4; the Zig test
-    // "tilemap.frag.glsl layer_offsets matches k_max_tilemap_window_layers"
-    // parses this declaration, so keep it a single-line decimal literal.
-    uvec4 layer_offsets[8];
+    // window: resident chunks, min x, min y, max-exclusive x, max-exclusive y
+    uvec4 window;
+    // chain: x=this draw's topmost directory start
+    uvec4 chain;
 } tm;
 
 const uint uniform_bit = 0x80000000u;
 
-struct StoreLayout {
-    uint shift;
-    uint chunks_x;
-    uint block_base;
-    uint block_words;
-};
+bool chunkResident(uint chunk_x, uint chunk_y) {
+    return chunk_x >= tm.window.x && chunk_y >= tm.window.y && chunk_x < tm.window.z && chunk_y < tm.window.w;
+}
 
-uint tileAt(StoreLayout store, uint directory_start, uint cx, uint cy) {
-    uint edge_mask = (1u << store.shift) - 1u;
-    uint chunk = (cy >> store.shift) * store.chunks_x + (cx >> store.shift);
-    uint word = tiles.words[directory_start + chunk];
+// The tile at cell (cx, cy) of the layer whose directory starts at `directory`;
+// the cell's chunk must be resident.
+uint tileAt(uint directory, uint cx, uint cy) {
+    uint shift = uint(tm.layer_meta.z);
+    uint side = uint(tm.layer_meta.w);
+    uint side_mask = side - 1u;
+    uint edge_mask = (1u << shift) - 1u;
+    uint chunk_x = cx >> shift;
+    uint chunk_y = cy >> shift;
+    uint word = tiles.words[directory + (chunk_y & side_mask) * side + (chunk_x & side_mask)];
     if ((word & uniform_bit) != 0u) {
         return word & 0xFFFFu;
     }
-    uint local_cell = ((cy & edge_mask) << store.shift) | (cx & edge_mask);
-    uint element = tiles.words[store.block_base + word * store.block_words + (local_cell >> 1u)];
+    uint local_cell = ((cy & edge_mask) << shift) | (cx & edge_mask);
+    uint element = tiles.words[word + (local_cell >> 1u)];
     return (element >> ((local_cell & 1u) * 16u)) & 0xFFFFu;
+}
+
+// Whether the neighbor cell (cx, cy) is resident and empty on the topmost layer.
+bool topmostHole(uint cx, uint cy) {
+    uint shift = uint(tm.layer_meta.z);
+    if (!chunkResident(cx >> shift, cy >> shift)) {
+        return false;
+    }
+    return tileAt(tm.chain.x, cx, cy) == uint(tm.grid.w);
 }
 
 void main() {
@@ -74,36 +81,34 @@ void main() {
     if (cx < 0 || cy < 0 || cx >= grid_w || cy >= grid_h) {
         discard;
     }
-
-    StoreLayout store_layout;
-    store_layout.shift = uint(tm.layer_meta.z);
-    store_layout.chunks_x = uint(tm.layer_meta.w);
-    uint chunks_y = (uint(grid_h) + (1u << store_layout.shift) - 1u) >> store_layout.shift;
-    uint directory_slots = uint(tm.layer_offsets.length()) * 4u;
-    store_layout.block_base = directory_slots * store_layout.chunks_x * chunks_y;
-    store_layout.block_words = max(1u, (1u << (2u * store_layout.shift)) >> 1u);
     uint ucx = uint(cx);
     uint ucy = uint(cy);
+    uint shift = uint(tm.layer_meta.z);
+    if (!chunkResident(ucx >> shift, ucy >> shift)) {
+        discard;
+    }
+    uint side = uint(tm.layer_meta.w);
 
     int layer_count = tm.layer_meta.x;
     uint tile_id = invalid_id;
     int resolved_depth = 0;
-    // Dynamically-uniform loop: every fragment in this draw shares layer_count,
-    // so this is an ordinary bounded loop, no toolchain risk. Stops at the first
-    // opaque hit walking topmost-first, so a hole in a shallower layer falls
-    // through to whichever composited layer beneath it is actually opaque.
+    // Dynamically-uniform loop: every fragment in this draw shares layer_count and
+    // the chain, so this is an ordinary bounded loop. Stops at the first opaque hit
+    // walking topmost-first, so a hole in a shallower layer falls through to
+    // whichever chained layer beneath it is actually opaque.
+    uint directory = tm.chain.x;
     for (int i = 0; i < layer_count; i++) {
-        uint directory_start = tm.layer_offsets[i / 4][i % 4];
-        uint candidate = tileAt(store_layout, directory_start, ucx, ucy);
+        uint candidate = tileAt(directory, ucx, ucy);
         if (candidate != invalid_id) {
             tile_id = candidate;
             resolved_depth = i;
             break;
         }
+        directory = tiles.words[directory + side * side];
     }
     if (tile_id == invalid_id) {
-        // Every composited layer is empty at this cell: see-through to whatever
-        // draws below (another composite draw, or the clear color).
+        // Every chained layer is empty at this cell: see-through to whatever draws
+        // below (another composite draw, or the clear color).
         discard;
     }
 
@@ -144,7 +149,6 @@ void main() {
     // the neighbor cells' actual tile data directly is deterministic regardless
     // of camera position.
     if (resolved_depth == 0 && layer_count > 0 && tm.layer_meta.y != 0) {
-        uint top_directory = tm.layer_offsets[0][0];
         const float rim_margin = 0.28;
         // Subtractive, not multiplicative: this tileset's floor/cave tiles sit at
         // ~0.09-0.19 luminance (measured from world_tileset.png), so scaling by a
@@ -156,22 +160,22 @@ void main() {
         float rim = 0.0;
 
         if (in_tile.x < rim_margin && cx > 0) {
-            if (tileAt(store_layout, top_directory, ucx - 1u, ucy) == invalid_id) {
+            if (topmostHole(ucx - 1u, ucy)) {
                 rim = max(rim, 1.0 - in_tile.x / rim_margin);
             }
         }
         if (in_tile.x > 1.0 - rim_margin && cx + 1 < grid_w) {
-            if (tileAt(store_layout, top_directory, ucx + 1u, ucy) == invalid_id) {
+            if (topmostHole(ucx + 1u, ucy)) {
                 rim = max(rim, 1.0 - (1.0 - in_tile.x) / rim_margin);
             }
         }
         if (in_tile.y < rim_margin && cy > 0) {
-            if (tileAt(store_layout, top_directory, ucx, ucy - 1u) == invalid_id) {
+            if (topmostHole(ucx, ucy - 1u)) {
                 rim = max(rim, 1.0 - in_tile.y / rim_margin);
             }
         }
         if (in_tile.y > 1.0 - rim_margin && cy + 1 < grid_h) {
-            if (tileAt(store_layout, top_directory, ucx, ucy + 1u) == invalid_id) {
+            if (topmostHole(ucx, ucy + 1u)) {
                 rim = max(rim, 1.0 - (1.0 - in_tile.y) / rim_margin);
             }
         }

@@ -29,7 +29,6 @@ const WorldDepth = @import("render_depth.zig").WorldDepth;
 const render_depth = @import("render_depth.zig");
 const WorldSystem = @import("world_system.zig").WorldSystem;
 const level_z_step = @import("world_system.zig").level_z_step;
-const k_max_dense_submit_stack_cap = @import("world_system.zig").k_max_dense_submit_stack_cap;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
@@ -342,13 +341,10 @@ pub fn ensureScenePrepCapacity(prep: *DynamicScenePrep, scene: GameplayScene) !v
     try prep.ensureCapacity(dynamicRecordCapacity(scene));
 }
 
-/// Peak retained static tilemap geometry for the world's dense render window.
-/// Grow-only; safe to call each gameplay frame before dense layer submit.
-/// Sourced from `maxDenseSubmitDrawCount()` — the worst-case composite-draw
-/// bound (`Renderer.k_max_dense_composite_draws`), not the raw in-window layer
-/// count — since `submitStaticDenseGeometry` now issues at most one
-/// `appendStaticTilemapSpan` per interleave-partitioned bucket rather than one
-/// per dense layer.
+/// Retained static tilemap geometry for the world's resident dense layers: one
+/// span per resident layer (`maxDenseSubmitDrawCount`), the most composite draws
+/// `submitStaticDenseGeometry` can cut. Grow-only; call after
+/// `syncDenseTileStore` sets the resident layers.
 pub fn staticGeometryCapacity(scene: GameplayScene) struct { vertex_capacity: usize, span_capacity: usize } {
     const span_capacity = scene.world.maxDenseSubmitDrawCount();
     return .{
@@ -372,7 +368,6 @@ pub fn submitGameplayFrame(
     interpolation_alpha: f32,
     camera_rect: Rect,
 ) !void {
-    try ensureStaticGeometryCapacity(scene, renderer);
     const visible = VisibleWorldRect.fromCameraRect(
         camera_rect,
         scene.overscan_chunks,
@@ -520,10 +515,9 @@ fn submitLayeredWorld(
 ) !void {
     try scene.world.ensureRenderDepthIndex();
 
-    var interleave_scratch: [k_max_dense_submit_stack_cap]i32 = undefined;
-    const interleave_depths = try collectDenseInterleaveDepths(scene, prep, &interleave_scratch);
-
     try scene.world.syncDenseTileStore(renderer, scene.player_level);
+    try ensureStaticGeometryCapacity(scene, renderer);
+    const interleave_depths = collectDenseInterleaveDepths(scene, prep);
     try scene.world.submitStaticDenseGeometry(renderer, runtime_assets, scene.player_level, interleave_depths);
 
     var sparse_index: usize = 0;
@@ -551,67 +545,46 @@ fn submitLayeredWorld(
 }
 
 /// Gathers this frame's dense-composite-draw cut points: `active_level`'s own
-/// actor depth (always included — this is what makes the common case behave
-/// exactly like before the dense stack was collapsed to composite draws),
-/// every distinct dynamic depth this frame (`prep.depthSpans()`, NOT bounded to
-/// `k_max_dense_submit_stack_cap` candidates), and every registered sparse-tile
-/// depth anywhere in the world (walked by index via
-/// `sparseDepthRangeCount`/`sparseDepthRangeAt`, closing the gap a sparse tile
-/// at any in-window level could otherwise fall through — `submitLayeredWorld`
-/// walks the same indexed sequence again for the actual merge/submit pass, so
-/// this only ever reads the already-computed `sparse_depth_ranges`, never
-/// rescans it) — also not bounded, since `WorldSystem.addSparseTile` takes an
-/// arbitrary caller-supplied depth.
+/// actor depth (always included, so the common case with no sandwiched content
+/// still splits exactly where an actor stands), every distinct dynamic depth this
+/// frame (`prep.depthSpans()`), and every registered sparse-tile depth anywhere in
+/// the world (`sparseDepthRangeCount`/`sparseDepthRangeAt`, the same indexed
+/// sequence `submitLayeredWorld` walks again for the merge), since a sparse tile
+/// at any in-window level needs its own sandwich point.
 ///
-/// `WorldSystem.partitionDenseCompositeBuckets` never needs more than one
-/// candidate per **gap** between two adjacent submitted dense layers to place
-/// a cut there, and the number of gaps is `submit_count - 1`, hard-bounded by
-/// `k_max_dense_submit_stack_cap - 1` regardless of how many raw candidate
-/// depths this frame's dynamic/sparse content produces. So candidates are
-/// deduplicated by which gap they would cut (`interleaveGapIndex`, matching
-/// the partition function's own boundary rule), not by raw depth value —
-/// dropping same-gap duplicates costs nothing since only the first
-/// representative per gap is ever consulted. Filters to the dense window's own
-/// depth span first (a depth outside it, or at/below the deepest submitted
-/// layer, cannot cut anything; the span itself is `denseWindowDepthSpan`'s
-/// cached value, recomputed only on a real structural/level/window change).
-/// `scratch` is a fixed stack buffer sized to the submit-stack cap, so this
-/// stays allocation-free every frame; the gap bound proves it can never
-/// overflow. Returns the sorted, deduplicated slice
-/// `submitStaticDenseGeometry` partitions on.
-fn collectDenseInterleaveDepths(
-    scene: GameplayScene,
-    prep: *const DynamicScenePrep,
-    scratch: *[k_max_dense_submit_stack_cap]i32,
-) error{TooManyDenseLayers}![]const i32 {
-    const span = (try scene.world.denseWindowDepthSpan(scene.player_level)) orelse return scratch[0..0];
+/// `WorldSystem.partitionDenseCompositeBuckets` needs at most one candidate per
+/// gap between two adjacent resident dense layers to cut there, so candidates
+/// dedupe by the gap they would cut (`interleaveGapIndex`, the partition's own
+/// boundary rule), not by depth value, and a depth outside the resident layers'
+/// span (`denseWindowDepthSpan`) cannot cut anything. The result fits the world's
+/// interleave scratch (one slot per gap), sized when the resident set was planned,
+/// so this allocates nothing. Returns the sorted, deduplicated cut points
+/// `submitStaticDenseGeometry` partitions on. Requires `syncDenseTileStore` first.
+fn collectDenseInterleaveDepths(scene: GameplayScene, prep: *const DynamicScenePrep) []const i32 {
+    const span = scene.world.denseWindowDepthSpan() orelse return &.{};
     const layer_depths = scene.world.denseWindowLayerDepths();
-    var gap_filled: [k_max_dense_interleave_gaps]bool = @splat(false);
+    const scratch = scene.world.denseInterleaveScratch();
     var count: usize = 0;
 
-    appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, scene.world.activeLevelActorDepth(scene.player_level), span);
+    appendInterleaveDepth(scratch.depths, &count, scratch.gap_filled, layer_depths, scene.world.activeLevelActorDepth(scene.player_level), span);
     for (prep.depthSpans()) |range| {
-        appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, range.depth, span);
+        appendInterleaveDepth(scratch.depths, &count, scratch.gap_filled, layer_depths, range.depth, span);
     }
     for (0..scene.world.sparseDepthRangeCount()) |index| {
-        appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, scene.world.sparseDepthRangeAt(index), span);
+        appendInterleaveDepth(scratch.depths, &count, scratch.gap_filled, layer_depths, scene.world.sparseDepthRangeAt(index), span);
     }
 
-    const collected = scratch[0..count];
+    const collected = scratch.depths[0..count];
     std.mem.sort(i32, collected, {}, std.sort.asc(i32));
     return collected;
 }
-
-/// Max gaps between adjacent submitted dense layers this frame: one fewer than
-/// the submit-stack cap, since a gap sits between two layers.
-const k_max_dense_interleave_gaps = k_max_dense_submit_stack_cap - 1;
 
 /// Finds which gap between two adjacent entries of `layer_depths` (ascending,
 /// `WorldSystem.denseWindowLayerDepths`) `depth` would cut, mirroring
 /// `WorldSystem.partitionDenseCompositeBuckets`'s own boundary rule
 /// (`layer_depths[i - 1] < depth <= layer_depths[i]`). Returns null when
-/// `depth` cannot cut any boundary — at or below the deepest submitted layer,
-/// nothing sits beneath it in-window to sandwich against.
+/// `depth` cannot cut any boundary — at or below the deepest resident layer,
+/// nothing sits beneath it to sandwich against.
 fn interleaveGapIndex(layer_depths: []const i32, depth: i32) ?usize {
     var i: usize = 1;
     while (i < layer_depths.len) : (i += 1) {
@@ -631,21 +604,16 @@ fn nextSparseDepth(scene: GameplayScene, index: *usize) ?i32 {
     return depth;
 }
 
-/// Appends `depth` to `scratch[0..count]` once per gap it could cut between
-/// two adjacent submitted dense layers (`interleaveGapIndex`). Silently drops
-/// `depth` when it falls outside `span` or cannot cut any gap (at/below the
-/// deepest submitted layer) — genuinely benign, since neither case can ever
-/// place a bucket boundary. Also silently drops a second (or later) candidate
-/// for a gap that already has a representative — redundant, not a capacity
-/// loss, since `partitionDenseCompositeBuckets` only consults one candidate
-/// per gap. `scratch` overflowing is unreachable here: gaps are bounded by
-/// `k_max_dense_interleave_gaps`, which is always `<= scratch.len`, so the
-/// assert documents a build invariant rather than a runtime condition to
-/// degrade around.
+/// Appends `depth` to `depths[0..count]` once per gap it could cut between two
+/// adjacent resident dense layers (`interleaveGapIndex`). Drops `depth` when it
+/// falls outside `span`, cannot cut any gap, or its gap already has a
+/// representative: `partitionDenseCompositeBuckets` consults one candidate per
+/// gap, so none of these can move a bucket boundary. `depths` holds one slot per
+/// gap, so it never overflows.
 fn appendInterleaveDepth(
-    scratch: *[k_max_dense_submit_stack_cap]i32,
+    depths: []i32,
     count: *usize,
-    gap_filled: *[k_max_dense_interleave_gaps]bool,
+    gap_filled: []bool,
     layer_depths: []const i32,
     depth: i32,
     span: WorldSystem.DenseWindowDepthSpan,
@@ -654,8 +622,8 @@ fn appendInterleaveDepth(
     const gap_index = interleaveGapIndex(layer_depths, depth) orelse return;
     if (gap_filled[gap_index]) return;
     gap_filled[gap_index] = true;
-    std.debug.assert(count.* < scratch.len);
-    scratch[count.*] = depth;
+    std.debug.assert(count.* < depths.len);
+    depths[count.*] = depth;
     count.* += 1;
 }
 
@@ -971,58 +939,36 @@ test "sprite command capacity sums sparse reserve visuals player and ui headroom
     );
 }
 
-test "static geometry capacity tracks maxDenseSubmitDrawCount and stays flat across levels_below" {
-    var world_shallow = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 1,
-        .height = 1,
-        .tile_size = 32,
-        .chunk_size_tiles = 8,
-        .render_window = .{ .levels_below = 0 },
-    };
-    defer world_shallow.deinit();
-
-    var world_deep = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 1,
-        .height = 1,
-        .tile_size = 32,
-        .chunk_size_tiles = 8,
-        .render_window = .{ .levels_below = 40 },
-    };
-    defer world_deep.deinit();
-
-    // maxDenseSubmitLayerCount (the old, over-provisioned reservation source)
-    // grows with window depth...
-    try std.testing.expect(world_deep.maxDenseSubmitLayerCount() > world_shallow.maxDenseSubmitLayerCount());
-
-    const scene_shallow = GameplayScene{
+test "static geometry capacity covers one span per resident layer" {
+    var meta = try testWorldTilesetMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 64, 64);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    for (1..5) |level_index| {
+        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+    world.render_window = .{ .levels_below = 3 };
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0, 0);
+    const scene = GameplayScene{
         .data = undefined,
-        .world = &world_shallow,
+        .world = &world,
         .player_entity = try EntityId.init(0, 1),
         .player_level = 0,
         .particles = undefined,
         .overscan_chunks = 0,
     };
-    const scene_deep = GameplayScene{
-        .data = undefined,
-        .world = &world_deep,
-        .player_entity = try EntityId.init(0, 1),
-        .player_level = 0,
-        .particles = undefined,
-        .overscan_chunks = 0,
-    };
+    var renderer = headlessRendererForTest(std.testing.allocator);
+    defer deinitHeadlessRendererForTest(&renderer);
+    try fakeTileStoreForTest(&renderer, &world);
 
-    const capacity_shallow = staticGeometryCapacity(scene_shallow);
-    const capacity_deep = staticGeometryCapacity(scene_deep);
-
-    // ...but staticGeometryCapacity now sources its span/vertex count from
-    // maxDenseSubmitDrawCount(), the fixed composite-draw bound, so it stays
-    // identical regardless of levels_below.
-    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, capacity_shallow.span_capacity);
-    try std.testing.expectEqual(capacity_shallow.span_capacity, capacity_deep.span_capacity);
-    try std.testing.expectEqual(capacity_shallow.span_capacity * 6, capacity_shallow.vertex_capacity);
-    try std.testing.expectEqual(capacity_deep.span_capacity * 6, capacity_deep.vertex_capacity);
+    // Nothing resident before the first sync.
+    try std.testing.expectEqual(@as(usize, 0), staticGeometryCapacity(scene).span_capacity);
+    try world.syncDenseTileStore(&renderer, 0);
+    const capacity = staticGeometryCapacity(scene);
+    try std.testing.expectEqual(@as(usize, 4), capacity.span_capacity);
+    try std.testing.expectEqual(capacity.span_capacity * 6, capacity.vertex_capacity);
 }
 
 test "collect dynamic records after structural growth stays within reserve and allocates only on warmup" {
@@ -1400,29 +1346,54 @@ test "visible world rect uses half-open point containment" {
     try std.testing.expect(!rect.containsPoint(.{ .x = 10, .y = 120 }));
 }
 
-// Registers a fake tile store in a headless renderer and hands it to `world`, so
-// `syncDenseTileStore` validates and queues uploads without touching SDL. The
-// capacity covers any test world, so no sync grows it.
+// Registers a store with no GPU buffer in a headless renderer and hands it to
+// `world`, laid out for its render window (set first), so `syncDenseTileStore`
+// validates and queues uploads without touching SDL. The capacity covers any test
+// world, so no sync grows it.
 fn fakeTileStoreForTest(renderer: *Renderer, world: *WorldSystem) !void {
+    std.debug.assert(world.visible_window_set);
     try renderer.tile_stores.append(renderer.allocator, .{
         .buffer = @ptrFromInt(0x1000),
         .element_capacity = 1 << 20,
-        .directory_elements = 0,
-        .block_elements = 1,
         .params = std.mem.zeroes(renderer_mod.TilemapParams),
     });
     // A test renderer holds a handful of fresh slots, all at generation 1.
     world.gpu_tiles.store = .{ .index = @intCast(renderer.tile_stores.items.len - 1), .generation = 1 };
+    world.gpu_tiles.store_side = world.render_side;
 }
 
-fn deinitFakeTileStoresForTest(renderer: *Renderer) void {
+// Headless Renderer: device/pipeline/sampler are never dereferenced by the CPU-only
+// static-geometry and tile-store queue paths.
+fn headlessRendererForTest(allocator: std.mem.Allocator) Renderer {
+    return .{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = @import("../render/sprite_batch.zig").SpriteBatch.init(allocator),
+    };
+}
+
+fn deinitHeadlessRendererForTest(renderer: *Renderer) void {
+    const allocator = renderer.allocator;
+    renderer.batch.deinit();
+    renderer.static_positions.deinit(allocator);
+    renderer.static_uvs.deinit(allocator);
+    renderer.static_colors.deinit(allocator);
+    renderer.static_groups.deinit(allocator);
+    renderer.tilemap_window_layers.deinit(allocator);
+    renderer.draw_list.deinit(allocator);
     for (renderer.tile_stores.items) |*store| {
-        store.pending_spans.deinit(renderer.allocator);
-        store.pending_values.deinit(renderer.allocator);
+        store.pending_spans.deinit(allocator);
+        store.pending_values.deinit(allocator);
     }
-    renderer.tile_stores.deinit(renderer.allocator);
-    renderer.tile_merge_spans.deinit(renderer.allocator);
-    renderer.tile_merge_values.deinit(renderer.allocator);
+    renderer.tile_stores.deinit(allocator);
+    renderer.tile_merge_spans.deinit(allocator);
+    renderer.tile_merge_values.deinit(allocator);
 }
 
 fn testWorldTilesetMeta() !WorldTilesetMeta {
@@ -1455,35 +1426,13 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
 
-    // Test-only: headless SpriteBatch construction (no live GPU). Kept inside the
-    // test so production game code stays on the renderer facade.
-    const sprite_batch = @import("../render/sprite_batch.zig");
     const Material = renderer_mod.Material;
     const DrawGroup = renderer_mod.DrawGroup;
     const mergeDrawList = renderer_mod.mergeDrawList;
 
-    // Headless Renderer: device/pipeline/sampler are never dereferenced by the
-    // CPU-only static-geometry path this test exercises. Mirrors renderer.zig's
-    // own headless test fixtures.
-    var renderer = Renderer{
-        .allocator = allocator,
-        .device = undefined,
-        .window = undefined,
-        .pipeline = undefined,
-        .tilemap_pipeline = undefined,
-        .sampler = undefined,
-        .vertex_streams = undefined,
-        .batch_capacity_vertices = 0,
-        .batch = sprite_batch.SpriteBatch.init(allocator),
-    };
-    defer renderer.batch.deinit();
-    defer renderer.static_positions.deinit(allocator);
-    defer renderer.static_uvs.deinit(allocator);
-    defer renderer.static_colors.deinit(allocator);
-    defer renderer.static_groups.deinit(allocator);
-    defer renderer.draw_list.deinit(allocator);
+    var renderer = headlessRendererForTest(allocator);
+    defer deinitHeadlessRendererForTest(&renderer);
     try fakeTileStoreForTest(&renderer, &world);
-    defer deinitFakeTileStoresForTest(&renderer);
 
     var prep = DynamicScenePrep.init(allocator);
     defer prep.deinit();
@@ -1518,31 +1467,29 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
     var meta = try testWorldTilesetMeta();
     defer meta.deinit();
 
-    // Surface level (0) plus `k_max_dense_submit_stack_cap - 1` deeper levels:
-    // exactly the worst-case submitted-layer count, giving
-    // `k_max_dense_submit_stack_cap - 1` gaps between adjacent submitted layers.
+    // Surface level (0) plus 39 deeper levels: 40 resident layers and 39 gaps.
+    const level_count = 40;
     var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64, 64);
     defer world.deinit();
     const grass = try world.requireTileByName(&meta, "grass");
     var extra_level_index: u16 = 1;
-    while (extra_level_index < k_max_dense_submit_stack_cap) : (extra_level_index += 1) {
+    while (extra_level_index < level_count) : (extra_level_index += 1) {
         const level = try world.addLevel(-@as(i32, @intCast(extra_level_index)) * level_z_step);
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
-    world.render_window = .{ .levels_below = k_max_dense_submit_stack_cap };
+    world.render_window = .{ .levels_below = level_count };
 
-    const num_gaps = k_max_dense_submit_stack_cap - 1;
-    // Feed 3 candidates per gap (2 dynamic, 1 sparse) — 3x this frame's real
-    // gap count and, summed across gaps, far more raw distinct depths than the
-    // fixed 32-slot scratch buffer could ever hold under a value-keyed dedup.
+    const num_gaps = level_count - 1;
+    // Feed 3 candidates per gap (2 dynamic, 1 sparse): far more raw distinct depths
+    // than gaps, which a value-keyed dedup into one slot per gap could not hold.
     var prep = DynamicScenePrep.init(allocator);
     defer prep.deinit();
     try prep.depth_spans.ensureTotalCapacity(allocator, 2 * num_gaps);
     for (0..num_gaps) |gap_index| {
-        // Gap `gap_index` sits between the submitted layer at level
-        // `k_max_dense_submit_stack_cap - 1 - gap_index` and the next
-        // shallower one; its own depth is `level_base_z - 2` (.floor band).
-        const deeper_level_index: i32 = @intCast(k_max_dense_submit_stack_cap - 1 - gap_index);
+        // Gap `gap_index` sits between the layer at level `level_count - 1 -
+        // gap_index` and the next shallower one; its own depth is `level_base_z -
+        // 2` (.floor band).
+        const deeper_level_index: i32 = @intCast(level_count - 1 - gap_index);
         const gap_start_depth = -deeper_level_index * level_z_step - 2;
         prep.depth_spans.appendAssumeCapacity(.{ .start = 0, .end = 0, .depth = gap_start_depth + 4 });
         prep.depth_spans.appendAssumeCapacity(.{ .start = 0, .end = 0, .depth = gap_start_depth + 10 });
@@ -1552,29 +1499,9 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
-
-    // Test-only headless SpriteBatch; production game code stays on the renderer facade.
-    const sprite_batch = @import("../render/sprite_batch.zig");
-
-    var renderer = Renderer{
-        .allocator = allocator,
-        .device = undefined,
-        .window = undefined,
-        .pipeline = undefined,
-        .tilemap_pipeline = undefined,
-        .sampler = undefined,
-        .vertex_streams = undefined,
-        .batch_capacity_vertices = 0,
-        .batch = sprite_batch.SpriteBatch.init(allocator),
-    };
-    defer renderer.batch.deinit();
-    defer renderer.static_positions.deinit(allocator);
-    defer renderer.static_uvs.deinit(allocator);
-    defer renderer.static_colors.deinit(allocator);
-    defer renderer.static_groups.deinit(allocator);
-    defer renderer.draw_list.deinit(allocator);
+    var renderer = headlessRendererForTest(allocator);
+    defer deinitHeadlessRendererForTest(&renderer);
     try fakeTileStoreForTest(&renderer, &world);
-    defer deinitFakeTileStoresForTest(&renderer);
 
     const scene = GameplayScene{
         .data = undefined,
@@ -1585,10 +1512,83 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
         .overscan_chunks = 0,
     };
 
-    // Must not error (TooManyDenseLayers would mean a needed gap overflowed
-    // the fixed scratch buffer) and must produce one composite draw per
-    // submitted layer, proving every one of the `num_gaps` cuts survived
-    // despite 3x as many raw candidate depths feeding the collector.
+    // One composite draw per resident layer: every one of the `num_gaps` cuts
+    // survived despite 3x as many raw candidate depths feeding the collector.
     try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
-    try std.testing.expectEqual(k_max_dense_submit_stack_cap, renderer.static_groups.items.len);
+    try std.testing.expectEqual(@as(usize, level_count), renderer.static_groups.items.len);
+}
+
+test "a warmed layered-world frame allocates nothing across a pan and a level change (FailingAllocator)" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldTilesetMeta();
+    defer meta.deinit();
+    // 64x64 tiles in 16-cell chunks (a 4x4 grid) on four levels, every chunk mixed.
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64 * 32, 64 * 32);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    for (1..4) |level_index| {
+        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+        const layer = try world.addDenseLayer(level, 0, .floor, grass);
+        for (0..4) |chunk_y| for (0..4) |chunk_x| {
+            _ = try world.clearDenseTile(layer, @intCast(chunk_x * 16 + 3), @intCast(chunk_y * 16 + 5));
+        };
+    }
+    // A sparse tile between levels 2 and 3 cuts the stack into two draws.
+    _ = try world.addSparseTile(3, 1, 1, tree, level_z_step - 1, .effect);
+    world.render_window = .{ .levels_below = 3 };
+    const chunk_px: f32 = 16 * 32;
+    const left = Rect{ .x = 0, .y = 0, .w = 2 * chunk_px, .h = 2 * chunk_px };
+    const right = Rect{ .x = chunk_px, .y = 0, .w = 2 * chunk_px, .h = 2 * chunk_px };
+    world.setVisibleChunksForWorldRect(left, 0, 0);
+
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+    var renderer = headlessRendererForTest(allocator);
+    defer deinitHeadlessRendererForTest(&renderer);
+    try fakeTileStoreForTest(&renderer, &world);
+    var prep = DynamicScenePrep.init(allocator);
+    defer prep.deinit();
+
+    const frames = [_]struct { rect: Rect, level: u16 }{
+        .{ .rect = left, .level = 0 },
+        .{ .rect = right, .level = 0 },
+        .{ .rect = right, .level = 1 },
+        .{ .rect = left, .level = 0 },
+        .{ .rect = right, .level = 1 },
+    };
+    for (frames, 0..) |frame, index| {
+        // The last frame pans and changes level under a failing allocator.
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        const last = index + 1 == frames.len;
+        if (last) {
+            world.allocator = failing.allocator();
+            renderer.allocator = failing.allocator();
+        }
+        defer {
+            world.allocator = allocator;
+            renderer.allocator = allocator;
+        }
+        renderer.batch.beginFrame();
+        world.setVisibleChunksForWorldRect(frame.rect, 0, frame.level);
+        const scene = GameplayScene{
+            .data = undefined,
+            .world = &world,
+            .player_entity = try EntityId.init(0, 1),
+            .player_level = frame.level,
+            .particles = undefined,
+            .overscan_chunks = 0,
+        };
+        try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+        // The frame copy pass drains the store's queued uploads.
+        renderer.tile_stores.items[0].pending_spans.clearRetainingCapacity();
+        renderer.tile_stores.items[0].pending_values.clearRetainingCapacity();
+        if (last) {
+            try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+            try std.testing.expect(!failing.has_induced_failure);
+        }
+    }
+    // Level 1 and below are resident and the sparse tile splits them.
+    try std.testing.expectEqual(@as(usize, 3), world.maxDenseSubmitDrawCount());
+    try std.testing.expectEqual(@as(usize, 2), renderer.static_groups.items.len);
 }
