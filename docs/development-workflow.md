@@ -362,6 +362,30 @@ Reading results:
   one chunk across mixed chunks and back (`chunk-scale-gpu-sync-pan`, item
   code `window edge * 10^7 + level side * 1000 + levels`), against a headless
   store.
+- `chunk-scale-nav-*` groups add the nav reaction to those changes, with nav
+  built over every level, serial and threaded: `-dig`, `-ramp`, `-cave-in`
+  and `-explosion-fill` (`--details` shows the terrain plan and write stages,
+  the nav reaction, the main thread's share, and timed reactions that fell
+  back to whole-level work), and `-level-add` (a level
+  added with a solid band, then nav updated for it, depth growing by one per
+  iteration; its revision case, item prefix `1 * 10^7`, instead times a
+  blocking band added to a newly added walkable level). A configuration whose
+  nav storage exceeds the bench's nav-size limit is skipped, and its required
+  MiB is printed above the table.
+- Nav scaling groups: `pathfinding-level-size` (64 cold routes through a wall
+  gap on one level of side 256, 1024, or 2048),
+  `pathfinding-cross-level-depth` and `-teleport` (64 cold routes from level 0
+  to level 4 on 256² worlds of 8, 32, or 128 levels joined by ramps; the
+  teleport group adds one long teleport away from the routes), both item code
+  `level side * 1000 + levels`, and each failing unless every route solves;
+  `pathfinding-evict` (one dig with 1,000, 10,000, or 50,000 cached results);
+  `pathfinding-elastic-ramp` (the agent count ramps to 1,000, 4,000, or
+  16,000; reports solves and re-solves past one per agent);
+  `nav-update-entity-obstacles` (one static body moved and committed with 10,
+  1,000, or 10,000 other static bodies) and `nav-update-static-population`
+  (the same move with 1,000, 10,000, or 50,000 dynamic bodies). Each passes
+  when flat in its item count, except the elastic ramp, whose solves are read
+  against the agent count. Size-limit skips print as above.
 - `render-sparse-window-frame`, `-pan`, and `-add` time one frame's sparse-tile
   prep (visibility update, depth walk, submit into a headless `SpriteBatch`)
   on a 2048² world of 8 levels holding 1,000, 16,000, or 256,000 sparse tiles

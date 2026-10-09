@@ -18,9 +18,18 @@ const PathfindingSystem = @import("../game/systems/pathfinding.zig").Pathfinding
 const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
+const cached_results_per_agent = @import("../game/systems/pathfinding/types.zig").cached_results_per_agent;
 const AiDir = @import("../game/systems/ai.zig").AiDir;
 const computeRequantizedGoal = @import("../game/systems/ai.zig").computeRequantizedGoal;
 const default_goal_requantization_hysteresis_distance = @import("../game/systems/ai.zig").default_goal_requantization_hysteresis_distance;
+const AssetStore = @import("../assets/assets.zig").AssetStore;
+const manifest = @import("../assets/manifest.zig");
+const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const WorldSystem = @import("../game/world_system.zig").WorldSystem;
+const CellCoord = @import("../game/world_system.zig").CellCoord;
+const TileId = @import("../game/world_system.zig").TileId;
+const level_z_step = @import("../game/world_system.zig").level_z_step;
+const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
 const suite = @import("suite.zig");
 
 // Headline solve curve: cold, DISTINCT-goal individual A* across the 512/frame ceiling.
@@ -161,6 +170,60 @@ pub const query_group = suite.BenchmarkGroup{
     .name = "pathfinding-query",
     .defaultItemCounts = queryDefaultItemCounts,
     .runCase = runQueryCase,
+};
+
+// Nav scaling groups over a world-backed nav (item counts in the size groups encode
+// `level side * 1000 + levels`). A config whose nav storage exceeds the bench's
+// nav-size limit is skipped, its figure printed (`navSizeSkip`). The route groups time
+// one cold step of 64 distinct-goal requests and fail unless every route solves that
+// step; `candidates` is the abstract nodes the last solve used.
+//   - `pathfinding-level-size`: one walkable level of side 256, 1024, or 2048 with a
+//     full-height wall and a two-cell central gap; every request crosses the gap, so
+//     the routes are the same at every size. Passes when flat in side.
+//   - `pathfinding-cross-level-depth`: a 256² world of 8, 32, or 128 walkable levels,
+//     consecutive levels joined by one ramp; requests go from level 0 to level 4, so
+//     the routes are the same at every depth. Passes when flat in depth.
+//   - `pathfinding-cross-level-teleport`: the depth fixture plus one bidirectional
+//     teleport between opposite corners of level 0 and the deepest level, far from the
+//     routes, whose span far exceeds its traversal cost. Passes when flat in depth.
+pub const level_size_group = suite.BenchmarkGroup{
+    .name = "pathfinding-level-size",
+    .defaultItemCounts = levelSizeItemCounts,
+    .runCase = runLevelSizeCase,
+};
+
+pub const cross_level_depth_group = suite.BenchmarkGroup{
+    .name = "pathfinding-cross-level-depth",
+    .defaultItemCounts = crossLevelItemCounts,
+    .runCase = runCrossLevelDepthCase,
+};
+
+pub const cross_level_teleport_group = suite.BenchmarkGroup{
+    .name = "pathfinding-cross-level-teleport",
+    .defaultItemCounts = crossLevelItemCounts,
+    .runCase = runCrossLevelTeleportCase,
+};
+
+// One timed dig on a 256² walkable level holding 1,000, 10,000, or 50,000 cached results
+// (the item count) of short paths: the cell turns blocking and the nav reaction runs,
+// eviction included. The dig crosses the same few paths at every count, so it passes
+// when flat in cached results. `outputs` is the results evicted. An untimed reset
+// reopens the cell and re-solves the evicted results.
+pub const evict_group = suite.BenchmarkGroup{
+    .name = "pathfinding-evict",
+    .defaultItemCounts = evictItemCounts,
+    .runCase = runEvictCase,
+};
+
+// The agent count ramps linearly to 1,000, 4,000, or 16,000 (the item count) over 64
+// steps, then holds until every agent's path is cached; each step every live agent
+// requests its own distinct goal. Times the pathfinding updates of the whole ramp;
+// `outputs` is the solves it took and `candidates` the solves past one per agent (cached
+// results lost to eviction or a resize, then solved again).
+pub const elastic_ramp_group = suite.BenchmarkGroup{
+    .name = "pathfinding-elastic-ramp",
+    .defaultItemCounts = elasticRampItemCounts,
+    .runCase = runElasticRampCase,
 };
 
 const quick_counts = [_]usize{ 128, 512, 1024 };
@@ -1405,6 +1468,589 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
     stats.deferred_count = built_total;
     stats.sample_count = samples_total;
     return stats;
+}
+
+const level_case_encoding: usize = 1000;
+const level_size_item_counts = [_]usize{ 256_001, 1_024_001, 2_048_001 };
+const cross_level_item_counts = [_]usize{ 256_008, 256_032, 256_128 };
+const evict_item_counts = [_]usize{ 1_000, 10_000, 50_000 };
+const elastic_ramp_item_counts = [_]usize{ 1_000, 4_000, 16_000 };
+
+fn levelSizeItemCounts(_: suite.Profile) []const usize {
+    return &level_size_item_counts;
+}
+
+fn crossLevelItemCounts(_: suite.Profile) []const usize {
+    return &cross_level_item_counts;
+}
+
+fn evictItemCounts(_: suite.Profile) []const usize {
+    return &evict_item_counts;
+}
+
+fn elasticRampItemCounts(_: suite.Profile) []const usize {
+    return &elastic_ramp_item_counts;
+}
+
+/// The capacity a nav scaling config's nav reserves; library defaults elsewhere.
+/// `suite.navStorageBytes` charges exactly these three fields.
+pub fn navSizeCapacity(config: suite.NavSizeConfig) PathfindingCapacity {
+    return .{
+        .worker_participant_count = config.participant_count,
+        .max_agent_budget = config.agent_budget,
+        .max_group_fields = config.group_fields,
+    };
+}
+
+// Walkable levels of `side`² tiles in default chunks, one floor band per level (level
+// `i` owns layer `i`); `blocking` blocks movement.
+const OpenWorld = struct {
+    world: WorldSystem,
+    walkable: TileId,
+    blocking: TileId,
+
+    fn floor(level: u16) usize {
+        return level;
+    }
+
+    fn cellCenter(self: *const OpenWorld, cell: CellCoord) math.Vec2 {
+        return .{
+            .x = (@as(f32, @floatFromInt(cell.x)) + 0.5) * self.world.tile_size,
+            .y = (@as(f32, @floatFromInt(cell.y)) + 0.5) * self.world.tile_size,
+        };
+    }
+};
+
+fn buildOpenWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16) !OpenWorld {
+    const asset_store = AssetStore.init(allocator, io, "assets");
+    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    var meta_owned = true;
+    defer if (meta_owned) meta.deinit();
+    var world = WorldSystem{
+        .allocator = allocator,
+        .width = side,
+        .height = side,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = default_chunk_size_tiles,
+    };
+    errdefer world.deinit();
+    try world.buildCatalog(&meta);
+    const walkable = try world.requireTileByName(&meta, "grass");
+    const blocking = try world.requireTileByName(&meta, "dirt");
+    for (0..levels) |level_index| {
+        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+        const layer = try world.addDenseLayer(level, 0, .floor, walkable);
+        std.debug.assert(layer == OpenWorld.floor(level));
+    }
+    world.adoptTilesetMeta(meta);
+    meta_owned = false;
+    return .{ .world = world, .walkable = walkable, .blocking = blocking };
+}
+
+// Writes `tile` into `cells` on level 0 in one reserve scope.
+fn writeLevelZeroCells(open: *OpenWorld, cells: []const CellCoord, tile: TileId) !void {
+    const layer = OpenWorld.floor(0);
+    open.world.beginDenseCellWriteReserve();
+    for (cells) |cell| try open.world.reserveDenseCellWrite(layer, cell.x, cell.y, tile);
+    for (cells) |cell| _ = try open.world.setDenseTile(layer, cell.x, cell.y, tile);
+}
+
+// Writes `requests` as one range, replacing the stream's contents.
+fn writeRequests(stream: *RangeOutputStream(PathRequest), requests: []const PathRequest) !void {
+    stream.clearRetainingCapacity();
+    if (requests.len == 0) return;
+    const range_base = try stream.appendRangeCounts(1);
+    stream.addCount(range_base, requests.len);
+    try stream.prefixAppendedRanges(range_base);
+    var writer = stream.rangeWriter(range_base);
+    for (requests) |request| writer.write(request);
+    writer.finish();
+    stream.finishWrite();
+}
+
+fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
+    if (!case.usesThreadSystem()) return null;
+    return try ThreadSystem.init(allocator, io, .{
+        .max_worker_threads = case.maxWorkerThreads(),
+        .items_per_range = suite.default_items_per_range,
+    });
+}
+
+// Nav update stages are independent chunks: one chunk per range is the fixed controls'
+// partition.
+fn navUpdateItemsPerRange(case: suite.BenchmarkCase) ?usize {
+    if (case.adaptive) return null;
+    return case.itemsPerRange(1) orelse suite.default_items_per_range;
+}
+
+// Gives the nav update stages this case's control config.
+fn configureNavUpdateThreads(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
+    system.nav_thread_adaptive = case.adaptive;
+    system.nav_thread_items_per_range = navUpdateItemsPerRange(case);
+}
+
+// Most abstract nodes any participant's last search claimed this step.
+fn lastAbstractNodesUsed(system: *const PathfindingSystem) usize {
+    var nodes: usize = 0;
+    for (system.scratch_slots.items) |*scratch| nodes = @max(nodes, scratch.abstract.nodes_used);
+    return nodes;
+}
+
+const route_request_count: usize = 64;
+// Requests run from level 0 to this level in the cross-level groups.
+const cross_level_goal_level: u16 = 4;
+
+fn routeSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize) suite.NavSizeConfig {
+    return .{
+        .side = side,
+        .levels = levels,
+        .links = links,
+        .participant_count = participant_count,
+        .agent_budget = route_request_count,
+        .group_fields = 1,
+    };
+}
+
+// A world-backed nav with a fixed request set, timed one cold step at a time.
+const RouteFixture = struct {
+    open: OpenWorld,
+    data: DataSystem,
+    requests: RangeOutputStream(PathRequest),
+    system: PathfindingSystem,
+
+    fn deinit(self: *RouteFixture) void {
+        self.system.deinit();
+        self.requests.deinit();
+        self.data.deinit();
+        self.open.world.deinit();
+        self.* = undefined;
+    }
+};
+
+// Takes ownership of `open`; adds one entity per request.
+fn initRouteFixture(allocator: std.mem.Allocator, open: OpenWorld, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !RouteFixture {
+    var owned_open = open;
+    errdefer owned_open.world.deinit();
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    for (requests) |*request| request.entity = try data.createEntity();
+    var stream = RangeOutputStream(PathRequest).init(allocator);
+    errdefer stream.deinit();
+    try writeRequests(&stream, requests);
+    var system = PathfindingSystem.init(allocator);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &owned_open.world, thread_system);
+    return .{ .open = owned_open, .data = data, .requests = stream, .system = system };
+}
+
+fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side: u16 = @intCast(item_count / level_case_encoding);
+    const levels: u16 = @intCast(item_count % level_case_encoding);
+    std.debug.assert(levels == 1 and side >= 256);
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = routeSizeConfig(side, levels, 0, participant_count);
+    if (suite.navSizeSkip(level_size_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var open = try buildOpenWorld(allocator, io, side, levels);
+    var open_owned = true;
+    errdefer if (open_owned) open.world.deinit();
+    // A full-height blocking wall on the center column, open only at the two center rows.
+    const center = side / 2;
+    const wall = try allocator.alloc(CellCoord, side - 2);
+    defer allocator.free(wall);
+    var wall_len: usize = 0;
+    for (0..side) |y| {
+        if (y == center - 1 or y == center) continue;
+        wall[wall_len] = .{ .x = center, .y = @intCast(y) };
+        wall_len += 1;
+    }
+    try writeLevelZeroCells(&open, wall[0..wall_len], open.blocking);
+
+    // An 8x8 block of starts left of the wall and their goals mirrored right of it,
+    // rows 4 apart around the gap: each route crosses the gap.
+    var requests: [route_request_count]PathRequest = undefined;
+    for (&requests, 0..) |*request, index| {
+        const column: u16 = @intCast(index % 8);
+        const row: u16 = @intCast(index / 8);
+        const y = center - 16 + row * 4;
+        request.* = .{
+            .entity = undefined,
+            .start = open.cellCenter(.{ .x = center - 6 - column, .y = y }),
+            .goal = open.cellCenter(.{ .x = center + 6 + column, .y = y + 1 }),
+        };
+    }
+    open_owned = false;
+    var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit();
+    return runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr);
+}
+
+fn runCrossLevelDepthCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCrossLevelCase(allocator, io, options, case, item_count, false);
+}
+
+fn runCrossLevelTeleportCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCrossLevelCase(allocator, io, options, case, item_count, true);
+}
+
+// The ramp between level `upper` and `upper + 1`: alternating sides of the level
+// center, so a route to level 4 crosses each level it passes.
+fn crossLevelRampCell(center: u16, upper: u16) CellCoord {
+    return .{ .x = if (upper % 2 == 0) center + 24 else center - 24, .y = center };
+}
+
+fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, teleport: bool) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side: u16 = @intCast(item_count / level_case_encoding);
+    const levels: u16 = @intCast(item_count % level_case_encoding);
+    std.debug.assert(levels > cross_level_goal_level and side >= 256);
+
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const link_count: usize = levels - 1 + @intFromBool(teleport);
+    const size_config = routeSizeConfig(side, levels, link_count, participant_count);
+    const group_name = if (teleport) cross_level_teleport_group.name else cross_level_depth_group.name;
+    if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
+
+    var open = try buildOpenWorld(allocator, io, side, levels);
+    var open_owned = true;
+    errdefer if (open_owned) open.world.deinit();
+    const center = side / 2;
+    for (0..levels - 1) |upper_index| {
+        const upper: u16 = @intCast(upper_index);
+        const cell = crossLevelRampCell(center, upper);
+        try open.world.addLevelLink(.{
+            .kind = .ramp,
+            .level_a = upper,
+            .cell_a = cell,
+            .level_b = upper + 1,
+            .cell_b = cell,
+            .traversal_cost = 1,
+            .bidirectional = true,
+        });
+    }
+    if (teleport) {
+        try open.world.addLevelLink(.{
+            .kind = .teleport,
+            .level_a = 0,
+            .cell_a = .{ .x = 8, .y = 8 },
+            .level_b = levels - 1,
+            .cell_b = .{ .x = side - 9, .y = side - 9 },
+            .traversal_cost = 1,
+            .bidirectional = true,
+        });
+    }
+
+    // Starts in an 8x8 block at the level-0 center, goals in an 8x8 block below it on
+    // level 4.
+    var requests: [route_request_count]PathRequest = undefined;
+    for (&requests, 0..) |*request, index| {
+        const column: u16 = @intCast(index % 8);
+        const row: u16 = @intCast(index / 8);
+        request.* = .{
+            .entity = undefined,
+            .start_level = 0,
+            .goal_level = cross_level_goal_level,
+            .start = open.cellCenter(.{ .x = center - 4 + column, .y = center - 4 + row }),
+            .goal = open.cellCenter(.{ .x = center - 4 + column, .y = center + 8 + row }),
+        };
+    }
+    open_owned = false;
+    var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit();
+    return runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr);
+}
+
+// One cold pathfinding step of the fixture's requests; fails unless every route solved
+// to a path that step, so a routing regression can never read as a speedup.
+fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !PathfindingStats {
+    const count = route_request_count;
+    const stats = try runColdOnce(system, &fixture.requests, thread_system, case, count, count, count);
+    if (stats.available_results != count or stats.unavailable_results != 0 or stats.deferred_requests != 0) return error.RouteUnsolved;
+    return stats;
+}
+
+// Times one cold pathfinding step of the fixture's requests per iteration (runtime
+// state cleared, untimed, before each).
+fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem) !suite.RunStats {
+    const system = &fixture.system;
+    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.fallback_tuner = tuner;
+    for (0..options.warmup_iterations) |_| {
+        system.clearRuntimeState();
+        _ = try runRouteStep(system, fixture, thread_system, case);
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = coldSettleLimit(options);
+        while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            system.clearRuntimeState();
+            _ = try runRouteStep(system, fixture, thread_system, case);
+        }
+    }
+    const settled = if (case.adaptive) system.fallback_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var last_stats = PathfindingStats{};
+    var abstract_nodes: usize = 0;
+    for (0..options.iterations) |_| {
+        system.clearRuntimeState();
+        const start_ns = suite.nowNs(io);
+        last_stats = try runRouteStep(system, fixture, thread_system, case);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solveBatch());
+        abstract_nodes = lastAbstractNodesUsed(system);
+    }
+    var stats = accumulator.finish();
+    stats.output_count = last_stats.available_results;
+    stats.candidate_pairs = abstract_nodes;
+    stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), settled);
+    return stats;
+}
+
+// Short distinct-goal requests over a walkable 256² level: goal `i` on a 240-wide grid
+// from cell (8, 8), its start 4 cells right and one down.
+const short_route_side: u16 = 256;
+const short_route_columns: usize = 240;
+
+fn shortRouteRequest(open: *const OpenWorld, entity: EntityId, index: usize) PathRequest {
+    const goal: CellCoord = .{ .x = @intCast(8 + index % short_route_columns), .y = @intCast(8 + index / short_route_columns) };
+    return .{
+        .entity = entity,
+        .start = open.cellCenter(.{ .x = goal.x + 4, .y = goal.y + 1 }),
+        .goal = open.cellCenter(goal),
+    };
+}
+
+fn buildShortRouteRequests(allocator: std.mem.Allocator, data: *DataSystem, open: *const OpenWorld, count: usize) ![]PathRequest {
+    std.debug.assert(8 + count / short_route_columns + 1 < short_route_side);
+    const requests = try allocator.alloc(PathRequest, count);
+    errdefer allocator.free(requests);
+    for (requests, 0..) |*request, index| request.* = shortRouteRequest(open, try data.createEntity(), index);
+    return requests;
+}
+
+// The result cache holds `cached_results_per_agent` results per agent.
+fn evictAgentBudget(result_count: usize) usize {
+    return (result_count + cached_results_per_agent - 1) / cached_results_per_agent;
+}
+
+// The evict dig: right of every goal column, so it crosses a few paths of the first
+// goal rows at every count and is no request's goal.
+const evict_dig_cell: CellCoord = .{ .x = 250, .y = 9 };
+
+const EvictFixture = struct {
+    open: OpenWorld,
+    data: DataSystem,
+    requests: []PathRequest,
+    stream: RangeOutputStream(PathRequest),
+    empty: RangeOutputStream(PathRequest),
+    system: PathfindingSystem,
+    agent_count: usize,
+
+    fn deinit(self: *EvictFixture, allocator: std.mem.Allocator) void {
+        self.system.deinit();
+        self.empty.deinit();
+        self.stream.deinit();
+        allocator.free(self.requests);
+        self.data.deinit();
+        self.open.world.deinit();
+        self.* = undefined;
+    }
+
+    // Requests every result in batches the intake admits and drains each batch, until
+    // every result is cached. Untimed.
+    fn fillCache(self: *EvictFixture, case: suite.BenchmarkCase, thread_system: ?*ThreadSystem) !void {
+        var start: usize = 0;
+        while (start < self.requests.len) : (start += self.agent_count) {
+            const end = @min(start + self.agent_count, self.requests.len);
+            try writeRequests(&self.stream, self.requests[start..end]);
+            var step_stats = try runColdOnce(&self.system, &self.stream, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+            var guard = suite.rangeCount(self.agent_count, default_max_solves_per_frame) + 2;
+            while (step_stats.pending_requests != 0) : (guard -= 1) {
+                if (guard == 0) return error.EvictFillStalled;
+                step_stats = try runColdOnce(&self.system, &self.empty, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+            }
+        }
+        if (self.cachedCount() != self.requests.len) return error.EvictFillIncomplete;
+    }
+
+    // Requests whose path the cache serves. Untimed: one status query per request.
+    fn cachedCount(self: *const EvictFixture) usize {
+        var cached: usize = 0;
+        for (self.requests) |request| {
+            const view = self.system.statusForWorld(request.start_level, request.start, request.goal_level, request.goal, request.agent_class, null);
+            if (view.status == .available) cached += 1;
+        }
+        return cached;
+    }
+
+    // Sets the dig cell to `tile` and runs the nav reaction; returns the reaction's time.
+    fn digAndReact(self: *EvictFixture, io: std.Io, tile: TileId, thread_system: ?*ThreadSystem) !u64 {
+        const changed = (try self.open.world.setDenseTile(OpenWorld.floor(0), evict_dig_cell.x, evict_dig_cell.y, tile)) orelse return error.EvictDigUnchanged;
+        if (changed.old_blocks_movement == changed.new_blocks_movement) return error.EvictDigUnchanged;
+        const start_ns = suite.nowNs(io);
+        try self.system.markNavDirty(changed.level, changed.x, changed.y);
+        const nav_stats = try self.system.applyBufferedNavUpdates(&self.data, &self.open.world, thread_system);
+        const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
+        if (nav_stats.version_bumps != 0) return error.EvictDigRebuiltNav;
+        return elapsed;
+    }
+};
+
+fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+    var open = try buildOpenWorld(allocator, io, short_route_side, 1);
+    errdefer open.world.deinit();
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try buildShortRouteRequests(allocator, &data, &open, result_count);
+    errdefer allocator.free(requests);
+    var system = PathfindingSystem.init(allocator);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_system);
+    return .{
+        .open = open,
+        .data = data,
+        .requests = requests,
+        .stream = RangeOutputStream(PathRequest).init(allocator),
+        .empty = RangeOutputStream(PathRequest).init(allocator),
+        .system = system,
+        .agent_count = capacity.max_agent_budget,
+    };
+}
+
+fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = suite.NavSizeConfig{
+        .side = short_route_side,
+        .levels = 1,
+        .participant_count = participant_count,
+        .agent_budget = evictAgentBudget(item_count),
+        .group_fields = 1,
+    };
+    if (suite.navSizeSkip(evict_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var fixture = try initEvictFixture(allocator, io, item_count, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
+        fixture.system.nav_remask_tuner = tuner;
+        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
+    }
+    configureNavUpdateThreads(&fixture.system, case);
+    try fixture.fillCache(case, thread_ptr);
+
+    for (0..options.warmup_iterations) |_| {
+        _ = try fixture.digAndReact(io, fixture.open.blocking, thread_ptr);
+        _ = try fixture.digAndReact(io, fixture.open.walkable, thread_ptr);
+        try fixture.fillCache(case, thread_ptr);
+    }
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var evicted: usize = 0;
+    for (0..options.iterations) |_| {
+        const elapsed = try fixture.digAndReact(io, fixture.open.blocking, thread_ptr);
+        evicted = item_count - fixture.cachedCount();
+        accumulator.record(elapsed, fixture.system.graph.last_remask_batch);
+        _ = try fixture.digAndReact(io, fixture.open.walkable, thread_ptr);
+        try fixture.fillCache(case, thread_ptr);
+    }
+    var stats = accumulator.finish();
+    stats.output_count = evicted;
+    stats.cache_evictions = evicted;
+    stats.candidate_pairs = item_count;
+    // Cached results the reaction's eviction scanned per second.
+    stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
+    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    return stats;
+}
+
+const elastic_ramp_steps: usize = 64;
+
+const ElasticRamp = struct {
+    elapsed_ns: u64 = 0,
+    solves: usize = 0,
+    // The solve stage of the step that solved the most.
+    busiest_solve_batch: BatchStats = .{},
+};
+
+fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = suite.NavSizeConfig{
+        .side = short_route_side,
+        .levels = 1,
+        .participant_count = participant_count,
+        .agent_budget = item_count,
+        .group_fields = 1,
+    };
+    if (suite.navSizeSkip(elastic_ramp_group.name, item_count, case, size_config)) |skip| return skip;
+    const capacity = navSizeCapacity(size_config);
+
+    var open = try buildOpenWorld(allocator, io, short_route_side, 1);
+    defer open.world.deinit();
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const requests = try buildShortRouteRequests(allocator, &data, &open, item_count);
+    defer allocator.free(requests);
+    var stream = RangeOutputStream(PathRequest).init(allocator);
+    defer stream.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
+    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.fallback_tuner = tuner;
+
+    for (0..options.warmup_iterations) |_| _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var last = ElasticRamp{};
+    for (0..options.iterations) |_| {
+        last = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
+        accumulator.record(last.elapsed_ns, last.busiest_solve_batch);
+    }
+    var stats = accumulator.finish();
+    stats.output_count = last.solves;
+    // A ramp ends with every agent's result cached once, so every solve past one per
+    // agent re-solved a lost result.
+    stats.candidate_pairs = last.solves - item_count;
+    stats.items_per_second = suite.itemsPerSecond(last.solves, stats.mean_ns);
+    return stats;
+}
+
+// One ramp from the reserved floor: resets the system to its reserve (untimed), then
+// steps until every agent's result is cached. Times the pathfinding updates only.
+fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSystem, capacity: PathfindingCapacity, stream: *RangeOutputStream(PathRequest), requests: []const PathRequest, thread_system: ?*ThreadSystem) !ElasticRamp {
+    try system.reserve(capacity);
+    system.clearRuntimeState();
+    const agent_total = requests.len;
+    const step_limit = elastic_ramp_steps + 4 * suite.rangeCount(agent_total, default_max_solves_per_frame) + elastic_ramp_steps;
+    var ramp = ElasticRamp{};
+    for (0..step_limit) |step| {
+        const live = if (step < elastic_ramp_steps) agent_total * (step + 1) / elastic_ramp_steps else agent_total;
+        try writeRequests(stream, requests[0..live]);
+        const start_ns = suite.nowNs(io);
+        const step_stats = try runColdOnce(system, stream, thread_system, case, live, live, live);
+        ramp.elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+        // Every goal is reachable, so each solve caches one result.
+        if (step_stats.unavailable_results != 0) return error.ElasticRampUnreachableGoal;
+        ramp.solves += step_stats.solved_requests;
+        if (step_stats.fallback_batch.item_count > ramp.busiest_solve_batch.item_count) ramp.busiest_solve_batch = step_stats.fallback_batch;
+        if (live == agent_total and step_stats.cache_hits == agent_total) return ramp;
+    }
+    return error.ElasticRampStalled;
 }
 
 fn appendRequest(stream: *RangeOutputStream(PathRequest), request: PathRequest) !void {

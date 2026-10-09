@@ -192,6 +192,8 @@ pub const RunStats = struct {
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
+    // Chunk-scale nav groups: timed nav reactions that fell back to whole-level work.
+    nav_fallbacks: usize = 0,
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
@@ -252,11 +254,13 @@ pub const RenderPrepPhaseSummary = struct {
     draw_group_ns: u64 = 0,
 };
 
-/// Mean per-iteration time of a batched terrain edit's plan and write stages, and
-/// the rest of the iteration (the main thread's serial share).
+/// Mean per-iteration time of a batched terrain edit's plan and write stages, its nav
+/// reaction (the nav groups only), and the rest of the iteration (the main thread's
+/// serial share).
 pub const TerrainEditPhaseSummary = struct {
     plan_ns: u64 = 0,
     write_ns: u64 = 0,
+    nav_ns: u64 = 0,
     main_ns: u64 = 0,
 };
 
@@ -699,8 +703,10 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
-    if (isChunkScaleBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
+    if (isChunkScaleBatchGroup(group_name) or isChunkScaleNavBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(window edge chunks * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(revision case * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "pathfinding-level-size") or std.mem.startsWith(u8, group_name, "pathfinding-cross-level-")) return "(level side * 1000 + levels)";
     if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
     return "items";
 }
@@ -708,6 +714,11 @@ fn itemLabel(group_name: []const u8) []const u8 {
 // Chunk-scale groups timing one batched terrain edit across its chunks.
 fn isChunkScaleBatchGroup(group_name: []const u8) bool {
     return std.mem.eql(u8, group_name, "chunk-scale-cave-in") or std.mem.eql(u8, group_name, "chunk-scale-explosion-fill");
+}
+
+// Chunk-scale groups timing one batched terrain edit plus its nav reaction.
+fn isChunkScaleNavBatchGroup(group_name: []const u8) bool {
+    return std.mem.eql(u8, group_name, "chunk-scale-nav-cave-in") or std.mem.eql(u8, group_name, "chunk-scale-nav-explosion-fill");
 }
 
 fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
@@ -1098,6 +1109,30 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
             .{ stats.output_count, stats.batch.item_count, plan_stage, write_stage, formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.main_ns), main_percent },
         ) catch "workload";
     }
+    if (isChunkScaleNavBatchGroup(group_name)) {
+        var remask_buffer: [32]u8 = undefined;
+        var patch_buffer: [32]u8 = undefined;
+        const remask_stage = formatStageShapeInto(&remask_buffer, stats.batch);
+        const patch_stage = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
+        const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
+        const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "cells={} remask={s} patch={s} fallbacks={} plan_t={f} write_t={f} nav_t={f} main={f} ({}%)",
+            .{ stats.output_count, remask_stage, patch_stage, stats.nav_fallbacks, formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.nav_ns), formatDuration(phases.main_ns), main_percent },
+        ) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "chunk-scale-nav-dig") or std.mem.eql(u8, group_name, "chunk-scale-nav-ramp")) {
+        var remask_buffer: [32]u8 = undefined;
+        var patch_buffer: [32]u8 = undefined;
+        const remask_stage = formatStageShapeInto(&remask_buffer, stats.batch);
+        const patch_stage = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
+        return std.fmt.bufPrint(
+            buffer,
+            "cells={} remask={s} patch={s} fallbacks={}",
+            .{ stats.output_count, remask_stage, patch_stage, stats.nav_fallbacks },
+        ) catch "workload";
+    }
     if (std.mem.eql(u8, group_name, "ai")) {
         if (stats.secondary_batch) |intent| {
             const tuning = stats.secondary_work_tuning;
@@ -1323,6 +1358,98 @@ fn u128ToU64Saturated(value: u128) u64 {
 
 // Items-per-second from a single mean duration. Lets a group override the throughput
 // numerator (e.g. items actually serviced vs requested) without re-deriving total_ns.
+const mib: usize = 1024 * 1024;
+
+/// The nav scaling groups' size limit: a config whose `navStorageBytes` exceeds it is
+/// skipped, so every later build of these groups runs the same configs.
+pub const nav_size_limit_bytes: usize = 512 * mib;
+
+/// What sizes the nav a nav scaling config builds: a square world of `side` cells per
+/// level in 16-cell chunks, its level links, the nav's threaded participants, and its
+/// path-request capacity (agent budget and group fields; library defaults elsewhere).
+pub const NavSizeConfig = struct {
+    side: usize,
+    levels: usize,
+    links: usize = 0,
+    participant_count: usize,
+    agent_budget: usize,
+    group_fields: usize,
+};
+
+/// Bytes the flat-grid nav takes for `config` at its agent-budget ceiling: per-level
+/// cell arrays and abstract graph, per-participant search and build scratch, group
+/// fields, and the result cache.
+pub fn navStorageBytes(config: NavSizeConfig) usize {
+    // Library capacity defaults: explored nodes, stored and stitched path cells, the
+    // abstract node ceiling, results cached per agent, and the per-step solve ceiling.
+    const explored_nodes: usize = 4096;
+    const stored_path_cells: usize = 512;
+    const stitched_path_cells: usize = 2048;
+    const abstract_nodes: usize = 16384;
+    const agents: usize = @max(8, config.agent_budget);
+    const cached_results: usize = agents * 4;
+    const solves_per_step: usize = @min(512, agents);
+    const chunk_tiles: usize = 16;
+    const participants: usize = @max(1, config.participant_count);
+    const levels: usize = @max(1, config.levels);
+    const cells = config.side * config.side;
+    const chunks_per_side = (config.side + chunk_tiles - 1) / chunk_tiles;
+    const chunks = chunks_per_side * chunks_per_side;
+
+    // Per level and cell: component label (4), blocked and static masks (2), flood queue (8).
+    const level_cells = levels * cells * 14;
+    // Per group field and cell: cost, flow, stamp, and bucket links (21).
+    const group_fields = config.group_fields * cells * 21;
+    // Per participant: a 13 B search row per cell, the open heap (16 B entries), and the
+    // path buffer.
+    const path_buffer_cells: usize = @max(explored_nodes, stored_path_cells);
+    const search = participants * (cells * 13 + explored_nodes * 16 + path_buffer_cells * 4);
+    // Per participant: the abstract search's slot table (26 B rows), open heap, and
+    // corridor (9 B entries).
+    const abstract_search = participants * (abstract_nodes * 2 * 26 + abstract_nodes * 4 * 16 + abstract_nodes * 9);
+    // Per participant: a chunk patch's edge list (12 B entries) and cursor, and a remask
+    // queue.
+    const portal_cap = 4 * chunk_tiles + 2 * config.links;
+    const build = participants * (portal_cap * portal_cap * 12 + portal_cap * 4 + chunk_tiles * chunk_tiles * 8);
+    // Result cache and worker stripes: plain path cells (4 B) and stitched cells (8 B).
+    const results = cached_results * stored_path_cells * 4 + solves_per_step * stored_path_cells * 4 +
+        (cached_results + solves_per_step) * stitched_path_cells * 8;
+    // Abstract graph: 4 portal slots per chunk side cell plus two per link on every level,
+    // a cell-to-portal word per cell, 32 B of slot arrays per slot, per-chunk lengths and
+    // geometry, and an edge arena of 8 edges per slot plus 32 per chunk, doubled, beside
+    // its 12 B staging entries.
+    const slots = levels * (4 * chunk_tiles * chunks + 2 * config.links);
+    const edge_slots = (slots * 8 + levels * chunks * 32) * 2;
+    const abstract_graph = levels * cells * 4 + slots * 32 + levels * chunks * 8 + chunks * 32 +
+        edge_slots * 8 + slots * 8 * 12;
+    return level_cells + group_fields + search + abstract_search + build + results + abstract_graph;
+}
+
+fn ceilMib(bytes: usize) usize {
+    return (bytes + mib - 1) / mib;
+}
+
+/// Skip for a config whose `navStorageBytes` exceeds `nav_size_limit_bytes`. Prints the
+/// figure once per config: on the serial case, and on a threaded case only when the
+/// serial config fits (more participants need more scratch). A skip reason cannot carry
+/// a formatted value past its case.
+pub fn navSizeSkip(group_name: []const u8, item_count: usize, case: BenchmarkCase, config: NavSizeConfig) ?RunStats {
+    const bytes = navStorageBytes(config);
+    if (bytes <= nav_size_limit_bytes) return null;
+    var serial = config;
+    serial.participant_count = 1;
+    if (!case.usesThreadSystem() or navStorageBytes(serial) <= nav_size_limit_bytes) {
+        std.debug.print("  {s} {} {s}: nav needs {} MiB against the {} MiB bench nav-size limit\n", .{
+            group_name,
+            item_count,
+            case.name,
+            ceilMib(bytes),
+            nav_size_limit_bytes / mib,
+        });
+    }
+    return RunStats.skipped("nav exceeds the bench nav-size limit (figure above)");
+}
+
 pub fn itemsPerSecond(items: usize, mean_ns: u64) u64 {
     if (mean_ns == 0) return 0;
     return u128ToU64Saturated((@as(u128, items) * std.time.ns_per_s) / mean_ns);
@@ -1550,4 +1677,40 @@ test "batch modes align to cache-line item boundaries" {
     const large = default_cases[5].itemsPerRange(16).?;
     try std.testing.expectEqual(@as(usize, 32), small);
     try std.testing.expectEqual(@as(usize, 256), large);
+}
+
+test "nav storage bytes equal the nav memory gate's estimate for every nav scaling config" {
+    const nav_memory = @import("../game/systems/pathfinding/nav_memory.zig");
+    const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
+    var configs: std.ArrayList(NavSizeConfig) = .empty;
+    defer configs.deinit(std.testing.allocator);
+    for ([_]usize{ 1, 2, 3, 9, 17, 24, 33, 65 }) |participants| {
+        for ([_]usize{ 256, 1024, 2048 }) |side| {
+            // Chunk-scale depths, and level-add's final depths after 2+10 and 5+30 iterations.
+            for ([_]usize{ 8, 20, 32, 43, 44, 67, 128, 140, 163 }) |levels| {
+                try configs.append(std.testing.allocator, .{ .side = side, .levels = levels, .participant_count = participants, .agent_budget = 8, .group_fields = 4 });
+            }
+            try configs.append(std.testing.allocator, .{ .side = side, .levels = 1, .participant_count = participants, .agent_budget = 64, .group_fields = 1 });
+        }
+        for ([_]usize{ 8, 32, 128 }) |levels| {
+            for ([_]usize{ levels - 1, levels }) |links| {
+                try configs.append(std.testing.allocator, .{ .side = 256, .levels = levels, .links = links, .participant_count = participants, .agent_budget = 64, .group_fields = 1 });
+            }
+        }
+        // Evict's agent budgets (a quarter of its cached results) and elastic's.
+        for ([_]usize{ 250, 2_500, 12_500, 1_000, 4_000, 16_000 }) |agents| {
+            try configs.append(std.testing.allocator, .{ .side = 256, .levels = 1, .participant_count = participants, .agent_budget = agents, .group_fields = 1 });
+        }
+    }
+    for (configs.items) |config| {
+        const capacity = PathfindingCapacity{
+            .worker_participant_count = config.participant_count,
+            .max_agent_budget = config.agent_budget,
+            .max_group_fields = config.group_fields,
+        };
+        var budget = nav_memory.budgetForCapacity(capacity, config.levels, config.links);
+        budget.chunk_tiles = 16;
+        try std.testing.expectEqual(budget.requiredBytes(config.side, config.side), navStorageBytes(config));
+        try std.testing.expectEqual(capacity.max_nav_memory_bytes, nav_size_limit_bytes);
+    }
 }

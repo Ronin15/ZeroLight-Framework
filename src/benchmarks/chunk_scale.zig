@@ -48,6 +48,29 @@
 //! headless renderer whose tile store has no GPU buffer: they time planning,
 //! commit, and the queued upload batch, which the bench drops after each sync as a
 //! frame copy pass would.
+//!
+//! The `chunk-scale-nav-*` groups add the nav reaction to these changes, with nav built
+//! over every level of the same fixture (no render window): each step's change events
+//! whose movement blocking flipped are marked dirty and applied as one buffered nav
+//! update, as the post-commit reaction does. A config whose nav storage exceeds the
+//! bench's nav-size limit is skipped with its figure. `--details` counts the timed
+//! reactions that fell back to whole-level work, and its stage shapes are the nav remask
+//! and patch of the last level the reaction touched.
+//!   - `chunk-scale-nav-dig`: the dig workload's 64 cells dug in one step and refilled in
+//!     the next, each step followed by the reaction. Flat.
+//!   - `chunk-scale-nav-ramp`: the ramp workload plus the reaction; the untimed reset
+//!     refills the cells, drops the links, and applies the reaction. Flat.
+//!   - `chunk-scale-nav-cave-in` and `chunk-scale-nav-explosion-fill`: the batched edits,
+//!     each followed by the reaction, serial and threaded. `--details` reports the terrain
+//!     plan and write stages, the nav reaction (marking and apply), and the rest (the main
+//!     thread's share). Linear in region chunks, flat in level size and depth.
+//!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav
+//!     updated for it. Its revision case (item prefix `1 * 10^7`) first adds a level with a
+//!     walkable floor and updates nav (untimed), then times a blocking band added to that
+//!     newest level and nav's update. Depth grows by one per iteration (warmup included),
+//!     so A/B runs use the same `--warmup` and `--iterations`.
+//! Every nav group runs serial and threaded: the threaded cases give the reaction or
+//! build the case's thread system (the single-cell world writes stay on the main thread).
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -73,6 +96,12 @@ const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const tile_store_max_elements = @import("../render/renderer.zig").tile_store_max_elements;
 const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
 const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
+const DataSystem = @import("../game/data_system.zig").DataSystem;
+const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
+const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
+const default_max_group_fields = @import("../game/systems/pathfinding/types.zig").default_max_group_fields;
+const navSizeCapacity = @import("pathfinding.zig").navSizeCapacity;
 const suite = @import("suite.zig");
 
 const level_sides = [_]u16{ 256, 1024, 2048 };
@@ -206,6 +235,52 @@ pub const gpu_sync_pan_group = suite.BenchmarkGroup{
     .defaultItemCounts = panItemCounts,
     .runCase = runGpuSyncPanCase,
 };
+
+pub const nav_dig_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-nav-dig",
+    .defaultItemCounts = scaleItemCounts,
+    .runCase = runNavDigCase,
+};
+
+pub const nav_ramp_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-nav-ramp",
+    .defaultItemCounts = scaleItemCounts,
+    .runCase = runNavRampCase,
+};
+
+pub const nav_cave_in_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-nav-cave-in",
+    .defaultItemCounts = regionItemCounts,
+    .runCase = runNavCaveInCase,
+};
+
+pub const nav_explosion_fill_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-nav-explosion-fill",
+    .defaultItemCounts = regionItemCounts,
+    .runCase = runNavExplosionFillCase,
+};
+
+pub const nav_level_add_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-nav-level-add",
+    .defaultItemCounts = levelAddItemCounts,
+    .runCase = runNavLevelAddCase,
+};
+
+// The level-add group's revision case, encoded above the level side and count.
+const level_add_revision_case: usize = 1;
+
+const level_add_item_counts = blk: {
+    var counts: [2 * scale_item_counts.len]usize = undefined;
+    @memcpy(counts[0..scale_item_counts.len], &scale_item_counts);
+    for (scale_item_counts, scale_item_counts.len..) |scale, index| {
+        counts[index] = level_add_revision_case * case_prefix_encoding + scale;
+    }
+    break :blk counts;
+};
+
+fn levelAddItemCounts(_: suite.Profile) []const usize {
+    return &level_add_item_counts;
+}
 
 fn scaleItemCounts(_: suite.Profile) []const usize {
     return &scale_item_counts;
@@ -420,7 +495,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             try fixture.setDigWindow();
             try fixture.attachHeadlessTileStore(allocator);
             // 64 mixed chunks on each level the window crosses.
-            for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel);
+            for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel, null);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
         },
         .gpu_sync_pan => {
@@ -443,7 +518,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     for (0..options.warmup_iterations) |_| {
         _ = try runIteration(&fixture, workload);
-        if (workload == .ramp) try undoRamps(&fixture);
+        if (workload == .ramp) try undoRamps(&fixture, null);
     }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var cells_changed: usize = 0;
@@ -451,7 +526,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const start_ns = suite.nowNs(io);
         cells_changed = try runIteration(&fixture, workload);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), suite.serialBatch(cells_changed, 1));
-        if (workload == .ramp) try undoRamps(&fixture);
+        if (workload == .ramp) try undoRamps(&fixture, null);
     }
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the cells written
@@ -466,12 +541,12 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 fn runIteration(fixture: *Fixture, workload: Workload) !usize {
     return switch (workload) {
         .dig => digAndRefill(fixture),
-        .ramp => digRamps(fixture),
+        .ramp => digRamps(fixture, null),
         .gpu_sync_dig => blk: {
             const level = fixture.levels - 1;
-            _ = try digCells(fixture, level, fixture.tunnel);
+            _ = try digCells(fixture, level, fixture.tunnel, null);
             const split = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-            _ = try digCells(fixture, level, fixture.dirt);
+            _ = try digCells(fixture, level, fixture.dirt, null);
             break :blk split + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         },
         .gpu_sync_level_enter => blk: {
@@ -517,8 +592,22 @@ fn rampCell(fixture: *const Fixture, cell_index: u16) CellCoord {
     return .{ .x = origin + (cell_index % 8) * chunk + 5, .y = origin + (cell_index / 8) * chunk + 7 };
 }
 
+// A step's tile change events, recorded by the dig and ramp workloads when given one.
+const ChangeLog = struct {
+    allocator: std.mem.Allocator,
+    events: std.ArrayList(WorldTileChangedEvent) = .empty,
+
+    fn deinit(self: *ChangeLog) void {
+        self.events.deinit(self.allocator);
+    }
+
+    fn record(self: *ChangeLog, event: WorldTileChangedEvent) !void {
+        try self.events.append(self.allocator, event);
+    }
+};
+
 // 64 ramps on the deepest level, each linked to the level above; returns the ramps dug.
-fn digRamps(fixture: *Fixture) !usize {
+fn digRamps(fixture: *Fixture, changes: ?*ChangeLog) !usize {
     const world = &fixture.world;
     const level = fixture.levels - 1;
     const layer = fixture.floor(level);
@@ -538,7 +627,8 @@ fn digRamps(fixture: *Fixture) !usize {
         world.beginDenseCellWriteReserve();
         try world.reserveDenseCellWrite(layer, cell.x, cell.y, fixture.ramp);
         try world.reserveLevelLink(link);
-        if (try world.setDenseTile(layer, cell.x, cell.y, fixture.ramp) == null) return error.RampTileUnchanged;
+        const changed = (try world.setDenseTile(layer, cell.x, cell.y, fixture.ramp)) orelse return error.RampTileUnchanged;
+        if (changes) |log| try log.record(changed);
         try world.addLevelLink(link);
     }
     return dig_cell_count;
@@ -549,7 +639,7 @@ fn digRamps(fixture: *Fixture) !usize {
 // and clears the ramp chunks' endpoint heads on both levels.
 // Relies on WorldSystem internals: `level_links`, `link_endpoint_next`, and
 // `LevelTerrain.link_heads` (one head per chunk, `no_link_endpoint` when empty).
-fn undoRamps(fixture: *Fixture) !void {
+fn undoRamps(fixture: *Fixture, changes: ?*ChangeLog) !void {
     const world = &fixture.world;
     const level = fixture.levels - 1;
     const layer = fixture.floor(level);
@@ -560,7 +650,8 @@ fn undoRamps(fixture: *Fixture) !void {
         if (world.rampLinkOtherLevel(level, cell) != level - 1) return error.RampNotLinked;
         world.beginDenseCellWriteReserve();
         try world.reserveDenseCellWrite(layer, cell.x, cell.y, fixture.dirt);
-        if (try world.setDenseTile(layer, cell.x, cell.y, fixture.dirt) == null) return error.RampTileUnchanged;
+        const changed = (try world.setDenseTile(layer, cell.x, cell.y, fixture.dirt)) orelse return error.RampTileUnchanged;
+        if (changes) |log| try log.record(changed);
         const chunk_coord = world.chunkCoordForCell(cell.x, cell.y);
         const chunk_index: usize = @intCast(chunk_coord.y * @as(i32, world.chunksX()) + chunk_coord.x);
         world.level_terrain.items[level].link_heads[chunk_index] = no_link_endpoint;
@@ -571,7 +662,7 @@ fn undoRamps(fixture: *Fixture) !void {
 }
 
 // Writes `tile` into the dig workload's 64 cells on `level`, one per chunk, in one step.
-fn digCells(fixture: *Fixture, level: u16, tile: TileId) !usize {
+fn digCells(fixture: *Fixture, level: u16, tile: TileId, changes: ?*ChangeLog) !usize {
     const world = &fixture.world;
     const layer = fixture.floor(level);
     const chunk = default_chunk_size_tiles;
@@ -584,8 +675,8 @@ fn digCells(fixture: *Fixture, level: u16, tile: TileId) !usize {
             const y = origin + (cell_index / 8) * chunk + 7;
             if (pass == 0) {
                 try world.reserveDenseCellWrite(layer, x, y, tile);
-            } else {
-                _ = try world.setDenseTile(layer, x, y, tile);
+            } else if (try world.setDenseTile(layer, x, y, tile)) |changed| {
+                if (changes) |log| try log.record(changed);
             }
         }
     }
@@ -849,4 +940,387 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         stats.secondary_work_tuning = suite.workTuningSummary(world.terrain_edit_plan_tuner.report(), plan_settled);
     }
     return stats;
+}
+
+// The nav groups' fixture: the chunk-scale world with nav built over every level and no
+// entities.
+const NavFixture = struct {
+    base: Fixture,
+    data: DataSystem,
+    system: PathfindingSystem,
+    changes: ChangeLog,
+    // The case's thread system for the dig and ramp reactions; null runs them serial.
+    threads: ?*ThreadSystem = null,
+
+    fn deinit(self: *NavFixture) void {
+        self.changes.deinit();
+        self.system.deinit();
+        self.data.deinit();
+        self.base.deinit();
+        self.* = undefined;
+    }
+
+    // Marks every changed cell whose movement blocking flipped, as the post-commit
+    // reaction filters its tile events; returns the cells marked.
+    fn markBlockingChanges(self: *NavFixture, events: []const WorldTileChangedEvent) !usize {
+        var marked: usize = 0;
+        for (events) |event| {
+            if (event.old_blocks_movement == event.new_blocks_movement) continue;
+            try self.system.markNavDirty(event.level, event.x, event.y);
+            marked += 1;
+        }
+        return marked;
+    }
+
+    // Applies the marked cells as one buffered nav update; returns 1 when it fell back
+    // to relabeling or rebuilding whole levels, else 0.
+    fn react(self: *NavFixture, thread_system: ?*ThreadSystem) !usize {
+        const stats = try self.system.applyBufferedNavUpdates(&self.data, &self.base.world, thread_system);
+        if (stats.incremental_rebuilds != 1) return error.NavReactionUnchanged;
+        return @intFromBool(stats.full_relabel != 0 or stats.edge_cap_fallback != 0);
+    }
+
+    // The recorded step's reaction: marks its blocking changes (at least `min_marked`)
+    // and applies them; returns the fallback count.
+    fn reactToChanges(self: *NavFixture, min_marked: usize) !usize {
+        const marked = try self.markBlockingChanges(self.changes.events.items);
+        self.changes.events.clearRetainingCapacity();
+        if (marked < min_marked) return error.NavWorkloadUnmarked;
+        return self.react(self.threads);
+    }
+};
+
+// No path requests: the agent budget stays at its floor.
+fn navSizeConfig(side: u16, levels: usize, participant_count: usize) suite.NavSizeConfig {
+    return .{
+        .side = side,
+        .levels = levels,
+        .participant_count = participant_count,
+        .agent_budget = min_capacity_floor,
+        .group_fields = default_max_group_fields,
+    };
+}
+
+fn buildNavFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !NavFixture {
+    var base = try buildFixture(allocator, io, side, levels);
+    errdefer base.deinit();
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    var system = PathfindingSystem.init(allocator);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &base.world, thread_system);
+    return .{ .base = base, .data = data, .system = system, .changes = .{ .allocator = allocator } };
+}
+
+// Gives the nav reaction's remask and patch stages this case's tuners and control
+// config; nav stage items are independent chunks, one per range for the fixed controls.
+fn setNavStageControls(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
+    system.nav_remask_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    system.nav_patch_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    system.nav_thread_adaptive = case.adaptive;
+    system.nav_thread_items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1;
+}
+
+fn navStageTunersSettled(system: *const PathfindingSystem) bool {
+    return system.nav_remask_tuner.isSettled() and system.nav_patch_tuner.isSettled();
+}
+
+fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
+    if (!case.usesThreadSystem()) return null;
+    return try ThreadSystem.init(allocator, io, .{
+        .max_worker_threads = case.maxWorkerThreads(),
+        .items_per_range = suite.default_items_per_range,
+    });
+}
+
+const NavWorkload = enum { dig, ramp };
+
+fn runNavDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runNavCase(allocator, io, options, case, item_count, .dig);
+}
+
+fn runNavRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runNavCase(allocator, io, options, case, item_count, .ramp);
+}
+
+fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: NavWorkload) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    std.debug.assert(item_count < case_prefix_encoding);
+    const side: u16 = @intCast(item_count / case_encoding);
+    const levels: u16 = @intCast(item_count % case_encoding);
+    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = navSizeConfig(side, levels, participant_count);
+    const group_name = switch (workload) {
+        .dig => nav_dig_group.name,
+        .ramp => nav_ramp_group.name,
+    };
+    if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
+
+    var nav = try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
+    defer nav.deinit();
+    nav.threads = thread_ptr;
+    setNavStageControls(&nav.system, case);
+
+    for (0..options.warmup_iterations) |_| {
+        _ = try runNavIteration(&nav, workload);
+        if (workload == .ramp) try resetNavRamps(&nav);
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!navStageTunersSettled(&nav.system) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runNavIteration(&nav, workload);
+            if (workload == .ramp) try resetNavRamps(&nav);
+        }
+    }
+    const remask_settled = if (case.adaptive) nav.system.nav_remask_tuner.isSettled() else false;
+    const patch_settled = if (case.adaptive) nav.system.nav_patch_tuner.isSettled() else false;
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var cells_changed: usize = 0;
+    var fallbacks: usize = 0;
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        const result = try runNavIteration(&nav, workload);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), nav.system.graph.last_remask_batch);
+        cells_changed = result.cells;
+        fallbacks += result.fallbacks;
+        if (workload == .ramp) try resetNavRamps(&nav);
+    }
+    var stats = accumulator.finish();
+    stats.output_count = cells_changed;
+    stats.nav_fallbacks = fallbacks;
+    stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
+    stats.batch = suite.batchSummaryFromBatch(nav.system.graph.last_remask_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(nav.system.graph.last_patch_batch);
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(nav.system.nav_remask_tuner.report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(nav.system.nav_patch_tuner.report(), patch_settled);
+    }
+    return stats;
+}
+
+const NavIteration = struct { cells: usize, fallbacks: usize };
+
+// One timed change with its nav reaction. The dig workload digs and refills its 64 cells
+// in two steps; the ramp workload digs its 64 ramps. Each step's reaction marks the
+// step's blocking changes, every workload cell among them.
+fn runNavIteration(nav: *NavFixture, workload: NavWorkload) !NavIteration {
+    const level = nav.base.levels - 1;
+    switch (workload) {
+        .dig => {
+            _ = try digCells(&nav.base, level, nav.base.tunnel, &nav.changes);
+            var fallbacks = try nav.reactToChanges(dig_cell_count);
+            _ = try digCells(&nav.base, level, nav.base.dirt, &nav.changes);
+            fallbacks += try nav.reactToChanges(dig_cell_count);
+            return .{ .cells = @as(usize, dig_cell_count) * 2, .fallbacks = fallbacks };
+        },
+        .ramp => {
+            const ramps = try digRamps(&nav.base, &nav.changes);
+            return .{ .cells = ramps, .fallbacks = try nav.reactToChanges(dig_cell_count) };
+        },
+    }
+}
+
+// Returns the ramp workload and its nav to the start state (untimed).
+fn resetNavRamps(nav: *NavFixture) !void {
+    try undoRamps(&nav.base, &nav.changes);
+    _ = try nav.reactToChanges(dig_cell_count);
+}
+
+fn runNavCaveInCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runNavBatchCase(allocator, io, options, case, item_count, .cave_in);
+}
+
+fn runNavExplosionFillCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runNavBatchCase(allocator, io, options, case, item_count, .explosion_fill);
+}
+
+// Per-stage time of one iteration's two batched edits and their nav reactions, and the
+// reactions' fallbacks.
+const NavBatchTiming = struct {
+    terrain: BatchTiming = .{},
+    nav_ns: u64 = 0,
+    fallbacks: usize = 0,
+};
+
+fn navTunersSettled(nav: *const NavFixture) bool {
+    return tunersSettled(&nav.base.world) and navStageTunersSettled(&nav.system);
+}
+
+// One timed batched change and its reversal, each followed by its nav reaction (marking
+// and apply, timed as the nav stage); returns the cells written.
+fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, edit_threads: ?TerrainEditThreads, thread_system: ?*ThreadSystem, timing: *NavBatchTiming) !usize {
+    for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }) |chunks| {
+        try applyBatch(&nav.base.world, chunks, &edit.events, edit_threads);
+        timing.terrain.add(&nav.base.world);
+        const start_ns = suite.nowNs(io);
+        if (try nav.markBlockingChanges(edit.events.items) == 0) return error.NavWorkloadUnmarked;
+        timing.fallbacks += try nav.react(thread_system);
+        timing.nav_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+    }
+    return edit.forward.items.len + edit.back.items.len;
+}
+
+fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const region_chunks = item_count / case_prefix_encoding;
+    const scale = item_count % case_prefix_encoding;
+    const side: u16 = @intCast(scale / case_encoding);
+    const levels: u16 = @intCast(scale % case_encoding);
+    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = navSizeConfig(side, levels, participant_count);
+    const group_name = switch (workload) {
+        .cave_in => nav_cave_in_group.name,
+        .explosion_fill => nav_explosion_fill_group.name,
+    };
+    if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
+
+    var nav = try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
+    defer nav.deinit();
+    var edit = switch (workload) {
+        .cave_in => try buildCaveInEdit(allocator, &nav.base, region_chunks),
+        .explosion_fill => try buildExplosionEdit(allocator, &nav.base, region_chunks),
+    };
+    defer edit.deinit(allocator);
+    // The cave-in region starts carved, so each iteration collapses then re-carves it.
+    if (workload == .cave_in) {
+        try applyBatch(&nav.base.world, edit.back_chunks.items, &edit.events, null);
+        _ = try nav.markBlockingChanges(edit.events.items);
+        _ = try nav.react(null);
+    }
+
+    const world = &nav.base.world;
+    const system = &nav.system;
+    world.terrain_edit_plan_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_write_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    setNavStageControls(system, case);
+    const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
+        .thread_system = thread_system,
+        .plan_tuner = &world.terrain_edit_plan_tuner,
+        .write_tuner = &world.terrain_edit_write_tuner,
+        .adaptive = case.adaptive,
+        .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1,
+    } else null;
+
+    var unused_timing: NavBatchTiming = .{};
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+        _ = try runNavBatchIteration(io, &nav, &edit, edit_threads, thread_ptr, &unused_timing);
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!navTunersSettled(&nav) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runNavBatchIteration(io, &nav, &edit, edit_threads, thread_ptr, &unused_timing);
+        }
+    }
+    const remask_settled = if (case.adaptive) system.nav_remask_tuner.isSettled() else false;
+    const patch_settled = if (case.adaptive) system.nav_patch_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var plan_total: u128 = 0;
+    var write_total: u128 = 0;
+    var nav_total: u128 = 0;
+    var main_total: u128 = 0;
+    var fallbacks: usize = 0;
+    var cells_changed: usize = 0;
+    for (0..options.iterations) |_| {
+        var timing: NavBatchTiming = .{};
+        const start_ns = suite.nowNs(io);
+        cells_changed = try runNavBatchIteration(io, &nav, &edit, edit_threads, thread_ptr, &timing);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        accumulator.record(elapsed_ns, system.graph.last_remask_batch);
+        plan_total += timing.terrain.plan_ns;
+        write_total += timing.terrain.write_ns;
+        nav_total += timing.nav_ns;
+        fallbacks += timing.fallbacks;
+        // Inline terrain stages report no duration, so in the serial case they count as main.
+        main_total += elapsed_ns -| (timing.terrain.plan_ns + timing.terrain.write_ns + timing.nav_ns);
+    }
+    var stats = accumulator.finish();
+    // The item count is a case code, so report throughput over the cells written.
+    stats.output_count = cells_changed;
+    stats.nav_fallbacks = fallbacks;
+    stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
+    stats.batch = suite.batchSummaryFromBatch(system.graph.last_remask_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(system.graph.last_patch_batch);
+    if (stats.iterations > 0) {
+        const iterations: u128 = stats.iterations;
+        stats.terrain_edit_phases = .{
+            .plan_ns = @intCast(plan_total / iterations),
+            .write_ns = @intCast(write_total / iterations),
+            .nav_ns = @intCast(nav_total / iterations),
+            .main_ns = @intCast(main_total / iterations),
+        };
+    }
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(system.nav_remask_tuner.report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(system.nav_patch_tuner.report(), patch_settled);
+    }
+    return stats;
+}
+
+fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const case_code = item_count / case_prefix_encoding;
+    std.debug.assert(case_code <= level_add_revision_case);
+    const revision = case_code == level_add_revision_case;
+    const scale = item_count % case_prefix_encoding;
+    const side: u16 = @intCast(scale / case_encoding);
+    const levels: u16 = @intCast(scale % case_encoding);
+    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+    // Every iteration (warmup included) adds a level, so the size check holds at the
+    // deepest the run gets.
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = navSizeConfig(side, levels + options.warmup_iterations + options.iterations, participant_count);
+    if (suite.navSizeSkip(nav_level_add_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var nav = try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
+    defer nav.deinit();
+    nav.threads = thread_ptr;
+    for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, revision);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    for (0..options.iterations) |_| {
+        accumulator.record(try levelAddIteration(io, &nav, revision), suite.serialBatch(1, 1));
+    }
+    var stats = accumulator.finish();
+    stats.output_count = nav.base.world.levelCount();
+    // One level (or band) added per iteration.
+    stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
+    return stats;
+}
+
+// One level-add iteration; returns its timed span. The main case adds a level with a
+// solid floor band, then updates nav. The revision case first adds a level with a
+// walkable floor and updates nav (untimed), then adds a blocking band to that newest
+// level and updates nav, so each level gains at most one band.
+fn levelAddIteration(io: std.Io, nav: *NavFixture, revision: bool) !u64 {
+    const world = &nav.base.world;
+    const new_level_z = -@as(i32, @intCast(world.levelCount())) * level_z_step;
+    if (revision) {
+        const level = try world.addLevel(new_level_z);
+        _ = try world.addDenseLayer(level, 0, .floor, nav.base.tunnel);
+        try nav.system.rebuildStaticNavGridWithWorld(&nav.data, world, nav.threads);
+        const start_ns = suite.nowNs(io);
+        _ = try world.addDenseLayer(level, 0, .obstacle, nav.base.dirt);
+        try nav.system.rebuildStaticNavGridWithWorld(&nav.data, world, nav.threads);
+        return suite.elapsedNs(start_ns, suite.nowNs(io));
+    }
+    const start_ns = suite.nowNs(io);
+    const level = try world.addLevel(new_level_z);
+    _ = try world.addDenseLayer(level, 0, .floor, nav.base.dirt);
+    try nav.system.rebuildStaticNavGridWithWorld(&nav.data, world, nav.threads);
+    return suite.elapsedNs(start_ns, suite.nowNs(io));
 }

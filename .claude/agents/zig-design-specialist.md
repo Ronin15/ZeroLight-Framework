@@ -65,8 +65,21 @@ rules.
   reordered stage names its `PipelineResource` tags and `stage_order` position.
 - **Budgets, capacities, thresholds**: class, sizing, growth point, degradation
   path, and proofs, checked against destruction-scale workloads.
-- **Main-thread and deferred boundaries**, threading and SIMD policy, with the
-  deterministic merge and serial + threaded paths.
+- **Hot-loop table (mandatory; a design without it is incomplete):** one row
+  for every per-step, per-frame, per-request, and per-change loop in the area,
+  inherited loops included, not only the ones the design changes. Columns:
+  loop (`file:line`), what it scales with, runs on (workers / main), threaded
+  path (the existing stage pattern it copies, `file:line`) or why it stays
+  serial (fixed count and small, by the cost model), SIMD verdict (the
+  `simd.zig` pattern it copies, `file:line`, or scalar with the reason),
+  serial/threaded and scalar/SIMD parity tests, and bench group + `--items`
+  for both default cases. Threading and SIMD are standard, never optional: a
+  loop that scales with population, requests, changes, or world size and runs
+  on the main thread fails the design (`threading.md`), and the design fixes
+  it.
+- **Main-thread and deferred boundaries**: what stays on the main thread (only
+  boundaries, orchestration, ordered merge/commit proportional to what
+  changed) and the deterministic merge.
 - **Tests, benches, diagnostics**: each claimed growth order names the
   scaling bench group and sizes that will measure it
   (`.claude/rules/tests-benchmarks.md`); a slice that replaces a structure

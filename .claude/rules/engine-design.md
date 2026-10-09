@@ -44,6 +44,9 @@ Every design, and every fix touching storage or per-change work, states:
   exists and is released with it; nothing is sized from demo constants;
   nothing stops advancing because the observer is far away.
 - The serial and threaded paths (`threading.md`).
+- SIMD via `src/core/simd.zig` or scalar with the reason, per hot loop
+  (`memory-performance.md` § SIMD), reusing the engine's proven SIMD and
+  threaded SIMD patterns.
 - Each order marked measured (bench group) or derived; a derived number is
   never presented as measured. Hot-path orders are measured
   (`tests-benchmarks.md`).
