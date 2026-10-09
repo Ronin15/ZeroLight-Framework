@@ -2,6 +2,7 @@
 paths:
   - "src/**/*.zig"
   - "tools/bench_run.py"
+  - "tools/bench_ab.py"
 ---
 
 # Tests And Benchmarks
@@ -44,8 +45,8 @@ paths:
 - Run targeted groups (`zig build bench -- --group <name>`), never the full
   suite filtered; full sweeps only when the owner or a slice asks.
 - Bench only changes that can move a hot path. Compare before/after on adjacent
-  commits in Debug with 3 interleaved reps and medians; a regression is a
-  change beyond the run-to-run spread.
+  commits in Debug with 3 interleaved reps and medians (`tools/bench_ab.py`);
+  a regression is a change beyond the run-to-run spread.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).

@@ -67,12 +67,14 @@ orchestrates, verifies every agent claim against live code, and reports.
   multi-commit slice, before it is committed; fixes fold into that commit.
   Every real finding is reported and checked against live code and
   `docs/architecture.md`; structural findings go to design, local ones to
-  `zig-specialist`; lows are fixed in the slice or become a checklist item in
-  the owning slice.
+  `zig-specialist`. A finding not fixed in its landing becomes a checklist
+  item in the owning slice with its `file:line` and failure scenario, never
+  only a memory note.
 - A second fix or redesign of the same subsystem on a branch, in one slice
   or across slices (a follow-up slice counts), or a second review round,
   stops the work: the next step is a design pass with measured costs, not
-  another patch.
+  another patch. Code deleted from the branch (for example restored to
+  main) takes its fix count with it; the restored code counts from zero.
 - `zig-debug-specialist` for failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
@@ -110,11 +112,15 @@ zig build fetch-sdl  # fetch and validate pinned Windows SDL packages
 - `rules/`: every technical rule (see Rules And Docs).
 - `agents/`: the four specialists, `opus` at `high` effort. Workflows call them
   by name (`agentType`), so names stay stable.
+- `reports/` (gitignored): design plans and review reports the agents write;
+  briefs cite the file instead of pasting it.
 - `workflows/`: `/pathfinder-review`, `/architecture-assessment`,
   `/zig-best-practices-review`, `/zig-deep-correctness-review-pass`; reports
   only, no edits.
 - `hooks/zig-fmt.sh`: runs `zig fmt` on each edited `.zig`/`.zon` file (needs
   `jq`); it does not replace validation.
+- `tools/bench_ab.py` (repo tools): the before/after bench, targeted groups,
+  base ref vs tree, interleaved Debug reps, medians and spread.
 - `settings.json`: shared permission allowlist, `Edit` denied under `zig-out/`
   and `.zig-cache/`, and the hook. Personal overrides: gitignored
   `settings.local.json`.

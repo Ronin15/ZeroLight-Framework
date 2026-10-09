@@ -36,7 +36,10 @@ touch. Follow them and cite them by file; never restate them.
 3. Make the change in the owning module (`docs/architecture.md` § Source
    Layout), with no unrelated refactor or reformat.
 4. Add the tests and scaling benches the rules require for the change.
-5. Validate per `.claude/rules/build-validation.md`.
+5. Validate per `.claude/rules/build-validation.md`. A change that can move a
+   hot path gets its before/after from `tools/bench_ab.py` on the groups that
+   cover it (targeted groups only, never the full suite); the brief's
+   bench list is the minimum, not a reason to skip it.
 
 ## Report
 

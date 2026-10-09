@@ -16,6 +16,8 @@
       "Bash(zig build bench -- *)",
       "Bash(zig fmt *)",
       "Bash(zig version)",
+      "Bash(tools/bench_ab.py *)",
+      "Bash(python3 tools/bench_ab.py *)",
       "Bash(git status *)",
       "Bash(git diff *)",
       "Bash(git log *)",

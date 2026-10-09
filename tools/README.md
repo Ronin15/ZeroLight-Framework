@@ -21,7 +21,8 @@ they are **not** part of the game binary.
 
 | Script | What it does |
 | --- | --- |
-| `bench_run.py` | Run `zig build bench`, save a timestamped copy to `benchmark_outputs/`, and rotate to the newest N runs. |
+| `bench_ab.py` | Targeted Debug before/after: named bench groups only, a base ref vs the working tree, interleaved reps, medians and spread. |
+| `bench_run.py` | Run `zig build bench` (full suite unless args narrow it), save a timestamped copy to `benchmark_outputs/`, and rotate to the newest N runs. |
 | `gen_atlas_orders.py` | Generate atlas **order manifests** (`atlas_orders/*.json`) from the procedural sprite registries. |
 | `generate_grim_sprites.py` | Generate the grim-dark fantasy character and item sprite atlases. |
 | `generate_world_tileset.py` | Generate the grim-dark 32×32 world tileset atlas. |
@@ -43,9 +44,29 @@ they are **not** part of the game binary.
 Order manifests consumed by the packing/generation step: `characters.json`,
 `items.json`, `world_tiles.json`. Regenerate with `gen_atlas_orders.py`.
 
+## Before/after comparison — `bench_ab.py`
+
+The tool for agent and day-to-day perf checks. It refuses to run without
+`--group` or `--group-prefix`, so it never sweeps the full suite. The base ref
+(default `HEAD`) is exported once with `git archive` to
+`benchmark_outputs/ab-base/<sha>/` and reused while it exists (the newest two
+exports are kept); the working tree is the after side. Reps interleave base and
+tree per group and case. The summary prints each side's median and min-max
+spread and a verdict: `slower`/`faster` only when the two ranges do not
+overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
+`benchmark_outputs/ab-<stamp>/`. Always Debug.
+
+```sh
+tools/bench_ab.py --group chunk-scale-dig
+tools/bench_ab.py --group chunk-scale-cave-in --case serial-direct --case thread-adaptive-tuned-range
+tools/bench_ab.py --group-prefix chunk-scale- --case serial-direct --base main
+tools/bench_ab.py --base none --group nav-update-scattered     # tree only, N reps
+tools/bench_ab.py --group pathfinding -- --items 2000          # forward bench args
+```
+
 ## Benchmark runner — `bench_run.py`
 
-Wraps `zig build bench`: streams output live, saves a header-stamped copy
+For owner- or slice-requested sweeps. Wraps `zig build bench`: streams output live, saves a header-stamped copy
 (date, commit, branch, host, cpu count, args) to `benchmark_outputs/`
 (gitignored), and prunes to the newest runs. `latest.txt` symlinks the most
 recent run for quick `diff`-ing. The repetitive `ThreadSystem initialized`

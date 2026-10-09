@@ -382,8 +382,10 @@ zig build bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallb
 zig build bench -- --details
 ```
 
-For scripted benchmark capture with timestamped output under `benchmark_outputs/`,
-use `tools/bench_run.py` (see [tools/README.md](../tools/README.md)).
+Before/after comparisons use `tools/bench_ab.py`: targeted groups only, a base
+ref vs the working tree, interleaved Debug reps, medians and spread. Full-suite
+capture with timestamped output under `benchmark_outputs/` uses
+`tools/bench_run.py`. Both: [tools/README.md](../tools/README.md).
 
 ## GPU Smoke
 
