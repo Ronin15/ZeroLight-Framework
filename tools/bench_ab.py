@@ -9,7 +9,11 @@ when the two sides' min-max ranges do not overlap
 
 The base ref is exported once with `git archive` under
 `benchmark_outputs/ab-base/<sha>/` and reused while it exists (its build cache
-stays warm). Raw outputs and the summary go to `benchmark_outputs/ab-<stamp>/`.
+stays warm; both sides share the repo's `.zig-cache`, so a new base rebuilds
+only what differs). Raw outputs and the summary go to
+`benchmark_outputs/ab-<stamp>/`. Cases default to `serial-direct` and
+`thread-adaptive-tuned-range`; the forced-thread cases are scheduler controls
+(`--all-cases` runs every case).
 
 Usage:
     tools/bench_ab.py --group chunk-scale-dig
@@ -39,6 +43,7 @@ READY_MARKER = ".bench-ab-ready"
 GROUP_HEADER = re.compile(r"^(\S+)\s+(\d+)\s+\S")
 CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s")
 UNIT_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
+DEFAULT_CASES = ("serial-direct", "thread-adaptive-tuned-range")
 
 
 def repo_root() -> Path:
@@ -70,8 +75,11 @@ def export_base(root: Path, ref: str) -> Path:
     return target
 
 
-def run_bench(cwd: Path, bench_args: list[str]) -> tuple[int, str]:
-    proc = subprocess.run(["zig", "build", "bench", "--", *bench_args], cwd=cwd, capture_output=True, text=True)
+def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path) -> tuple[int, str]:
+    # Both sides share the repo's local cache: it is content-addressed, so a base
+    # export of a new parent commit rebuilds only what differs instead of cold.
+    cmd = ["zig", "build", "bench", "--cache-dir", str(cache_dir), "--", *bench_args]
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -107,7 +115,13 @@ def main() -> int:
     )
     parser.add_argument("--group", action="append", default=[], help="bench group (repeatable)")
     parser.add_argument("--group-prefix", action="append", default=[], help="bench group prefix (repeatable)")
-    parser.add_argument("--case", action="append", default=[], help="bench case (repeatable; default: every case)")
+    parser.add_argument(
+        "--case",
+        action="append",
+        default=[],
+        help="bench case (repeatable; default: serial-direct and thread-adaptive-tuned-range)",
+    )
+    parser.add_argument("--all-cases", action="store_true", help="run every bench case")
     parser.add_argument("--base", default="HEAD", help="git ref for the before side, or 'none' (default: HEAD)")
     parser.add_argument("--reps", type=int, default=3, help="interleaved reps per side (default: 3)")
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
@@ -129,7 +143,9 @@ def main() -> int:
     out_dir.mkdir(parents=True)
 
     targets = [["--group", g] for g in args.group] + [["--group-prefix", p] for p in args.group_prefix]
-    cases: list[str | None] = list(args.case) or [None]
+    if args.all_cases and args.case:
+        parser.error("--all-cases and --case are exclusive")
+    cases: list[str | None] = [None] if args.all_cases else (list(args.case) or list(DEFAULT_CASES))
     samples: dict[tuple[str, str, str, str], list[float]] = {}
 
     total = args.reps * len(targets) * len(cases) * len(sides)
@@ -139,7 +155,7 @@ def main() -> int:
             for case in cases:
                 for name, cwd in sides:
                     bench_args = target + (["--case", case] if case else []) + args.bench_args
-                    code, text = run_bench(cwd, bench_args)
+                    code, text = run_bench(cwd, bench_args, root / ".zig-cache")
                     tag = "_".join([name.replace(":", "-").replace("/", "-"), target[1], case or "all", str(rep)])
                     (out_dir / f"{tag}.txt").write_text(text)
                     done += 1
@@ -156,7 +172,7 @@ def main() -> int:
     lines = [
         f"# bench_ab  {stamp}  head={git(root, 'rev-parse', '--short', 'HEAD')}"
         f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  Debug",
-        f"# args  {' '.join(sum(targets, []))}  cases={','.join(c for c in args.case) or 'all'}  extra={' '.join(args.bench_args) or '-'}",
+        f"# args  {' '.join(sum(targets, []))}  cases={'all' if args.all_cases else ','.join(c for c in cases)}  extra={' '.join(args.bench_args) or '-'}",
         "",
     ]
     header = f"{'group':30} {'item':>12} {'case':28}"

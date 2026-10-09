@@ -54,7 +54,10 @@ exports are kept); the working tree is the after side. Reps interleave base and
 tree per group and case. The summary prints each side's median and min-max
 spread and a verdict: `slower`/`faster` only when the two ranges do not
 overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
-`benchmark_outputs/ab-<stamp>/`. Always Debug.
+`benchmark_outputs/ab-<stamp>/`. Always Debug. Cases default to
+`serial-direct` and `thread-adaptive-tuned-range` (`--all-cases` for every
+scheduler case). Both sides build with the repo's `.zig-cache`, so a new
+base rebuilds only what differs.
 
 ```sh
 tools/bench_ab.py --group chunk-scale-dig
