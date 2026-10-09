@@ -33,22 +33,9 @@ harness (`.claude/rules/engine-design.md`).
 
 ## Module Ownership
 
-Add code under the owning module; detail in `docs/architecture.md` § Source
-Layout.
-
-- `src/main.zig`: entry and fixed-step loop, thin. `src/config.zig`:
-  `AppConfig` and defaults.
-- `src/app/`: engine, state stack, input and routing, gamepad, time loop,
-  frame pacing, pause, audio, thread system, resolution, runtime perf log.
-- `src/render/`: SDL_GPU rendering behind the `renderer.zig` facade.
-- `src/assets/`: asset catalog, safe paths, image decode, cache,
-  `manifest.zig` stable IDs.
-- `src/game/`: states and menus, `WorldSystem`, `data_system/`,
-  `SimulationPipeline`, controllers (dig, destructible, audio), render prep,
-  and `systems/` processors (movement, AI, affect, perception, steering,
-  collision, particles, `pathfinding/`).
-- `src/core/`: math, SIMD, RNG, logging. `src/platform/`: SDL wrappers, GPU
-  smoke. `src/benchmarks/`: benchmarks.
+Add code under the owning module: boundaries in
+`.claude/rules/engine-design.md` § Ownership boundaries, detail in
+`docs/architecture.md` § Source Layout.
 
 ## Agent Pipeline
 
@@ -87,40 +74,16 @@ orchestrates, verifies every agent claim against live code, and reports.
 
 ## Commands
 
-Zig 0.17.0 minimum; default mode `Debug`. Details and options: DW. Validation
-cadence: `.claude/rules/build-validation.md`.
-
-```sh
-zig build            # build and install app, assets, shaders
-zig build run        # build, install, run
-zig build dev        # shaders + assets + run
-zig build check      # compile coverage (game, gpu-smoke, bench), no install
-zig build test       # unit tests
-zig build bench      # CPU benchmarks (target a group: -- --group <name>)
-zig build verify     # full gate: check + test + shaders + atlas + idiom lint + fmt check
-zig build fmt        # format build files and src/
-zig build shaders    # compile GLSL to platform shaders
-zig build gpu-smoke  # renderer smoke (needs a display)
-zig build package    # install selected-mode binaries and assets
-zig build assets-lint # lint runtime atlases vs source sprites
-zig build idiom-lint # lint naming, stdlib currency, unsafe catch unreachable
-zig build fetch-sdl  # fetch and validate pinned Windows SDL packages
-```
+Zig 0.17.0 minimum; default mode `Debug`. `zig build -l` lists the steps;
+`zig build bench -- --group <name>` targets one bench group. Details and
+options: DW. Validation cadence: `.claude/rules/build-validation.md`.
 
 ## Claude Code Tooling (`.claude/`)
 
-- `rules/`: every technical rule (see Rules And Docs).
-- `agents/`: the four specialists, `opus` at `high` effort. Workflows call them
-  by name (`agentType`), so names stay stable.
-- `reports/` (gitignored): design plans and review reports the agents write;
-  briefs cite the file instead of pasting it.
-- `workflows/`: `/pathfinder-review`, `/architecture-assessment`,
-  `/zig-best-practices-review`, `/zig-deep-correctness-review-pass`; reports
-  only, no edits.
-- `hooks/zig-fmt.sh`: runs `zig fmt` on each edited `.zig`/`.zon` file (needs
+- Agent names stay stable: the `workflows/` call them by name (`agentType`).
+- Design and review agents write their plans and reports to
+  `.claude/reports/` (gitignored); briefs cite the file instead of pasting it.
+- `tools/bench_ab.py` is the before/after bench (targeted groups, base ref vs
+  tree, interleaved Debug reps, medians and spread).
+- `hooks/zig-fmt.sh` runs `zig fmt` on each edited `.zig`/`.zon` file (needs
   `jq`); it does not replace validation.
-- `tools/bench_ab.py` (repo tools): the before/after bench, targeted groups,
-  base ref vs tree, interleaved Debug reps, medians and spread.
-- `settings.json`: shared permission allowlist, `Edit` denied under `zig-out/`
-  and `.zig-cache/`, and the hook. Personal overrides: gitignored
-  `settings.local.json`.
