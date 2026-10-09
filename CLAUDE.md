@@ -64,11 +64,11 @@ orchestrates, verifies every agent claim against live code, and reports.
   runs whenever a design is open or the existing structure fails the cost
   model; local fixes go straight to `zig-specialist`.
 - `zig-review-specialist` reviews each slice, or each landing of a
-  multi-commit slice, before it is committed; fixes fold into that commit, and
-  re-reviewing folded fixes is not a second review round. Every real finding is
-  reported and checked against live code and `docs/architecture.md`; structural
-  findings go to design, local ones to `zig-specialist`; lows are fixed in the
-  slice or become a checklist item in the owning slice.
+  multi-commit slice, before it is committed; fixes fold into that commit.
+  Every real finding is reported and checked against live code and
+  `docs/architecture.md`; structural findings go to design, local ones to
+  `zig-specialist`; lows are fixed in the slice or become a checklist item in
+  the owning slice.
 - A second fix or redesign of the same subsystem on a branch, in one slice
   or across slices (a follow-up slice counts), or a second review round,
   stops the work: the next step is a design pass with measured costs, not
