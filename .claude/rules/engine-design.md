@@ -63,6 +63,10 @@ Every design, and every fix touching storage or per-change work, states:
 - App coordination lives in `src/app/`, SDL_GPU work in `src/render/`, gameplay
   in `src/game/`, math/SIMD/logging in `src/core/`, SDL wrappers in
   `src/platform/`. Never move a boundary for a local convenience.
+- Dependencies point down: `src/game/` may import `render/`, `assets/`,
+  `core/`, and `platform/`; `render/`, `assets/`, `core/`, and `platform/`
+  (gpu-smoke included) never import `src/game/`, and `core/` and `platform/`
+  never import `src/app/`.
 - Gameplay logic lives in states, controllers, and processors, never in
   `main.zig` or `Engine` conditionals.
 - App and game code use `Renderer`; never import `src/render/gpu/*` outside

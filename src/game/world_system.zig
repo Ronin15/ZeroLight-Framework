@@ -25,6 +25,7 @@ const Renderer = @import("../render/renderer.zig").Renderer;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const tileDataElementIndex = @import("../render/renderer.zig").tileDataElementIndex;
 const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
+const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
 const packTileDataElement = @import("../render/renderer.zig").packTileDataElement;
 const tile_store_uniform_bit = @import("../render/renderer.zig").tile_store_uniform_bit;
@@ -3205,6 +3206,58 @@ test "a reset GPU mirror re-enters every resident layer at the next sync" {
     try std.testing.expectEqual(@as(usize, 2), world.gpu_tiles.residentLayerCount());
     try std.testing.expectEqual(@as(u32, 3), world.gpu_tiles.block_count);
     try expectGpuStoreMatches(&world, &after);
+}
+
+test "after a GPU residency reset the re-submitted static tilemap draws name the store the next sync holds" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testMinimalSurfaceWorld(&meta, 2, 2);
+    defer world.deinit();
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+    // Headless: the static-geometry path never dereferences GPU handles.
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.static_positions.deinit(allocator);
+    defer renderer.static_uvs.deinit(allocator);
+    defer renderer.static_colors.deinit(allocator);
+    defer renderer.static_groups.deinit(allocator);
+
+    const retired = TileDataId{ .index = 0, .generation = 1 };
+    world.gpu_tiles.store = retired;
+    _ = try testSyncGpuTiles(&world, 0);
+    try world.submitStaticDenseGeometry(&renderer, &runtime_assets, 0, &.{});
+    try expectStaticTilemapStore(&renderer, retired);
+
+    // A failed claim resets residency; the next sync re-enters the window and
+    // creates a store, here the next generation of the same slot.
+    world.resetGpuResidency();
+    const replacement = TileDataId{ .index = 0, .generation = 2 };
+    _ = try testSyncGpuTiles(&world, 0);
+    world.gpu_tiles.store = replacement;
+    try world.submitStaticDenseGeometry(&renderer, &runtime_assets, 0, &.{});
+    try expectStaticTilemapStore(&renderer, replacement);
+}
+
+fn expectStaticTilemapStore(renderer: *const Renderer, store: TileDataId) !void {
+    var tilemap_draws: usize = 0;
+    for (renderer.static_groups.items) |group| {
+        if (group.material != .tilemap) continue;
+        tilemap_draws += 1;
+        try std.testing.expectEqual(store, group.tile_data);
+    }
+    try std.testing.expect(tilemap_draws > 0);
 }
 
 test "syncDenseTileStore claims its live store every frame and drops a retired one with its residency" {
