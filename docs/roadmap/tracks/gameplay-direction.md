@@ -28,6 +28,7 @@ The direction is `.claude/rules/engine-design.md` § Target scale (summary:
 | Concern | Slices |
 | --- | --- |
 | Chunk-owned terrain and nav | [64G](../slices/slice-64g.md) |
+| Cave-ins from digging | [76](../slices/slice-76.md) |
 | World instances (create, step, destroy in play) | [74](../slices/slice-74.md) |
 | Far simulation (fidelity by distance from the observer, every world) | [75](../slices/slice-75.md) |
 | Data-driven cognition | [73](../slices/slice-73.md) |

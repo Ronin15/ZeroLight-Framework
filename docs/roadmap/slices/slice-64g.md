@@ -1,6 +1,6 @@
 ## Slice 64G: Chunk-Owned Terrain And Nav
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md), [Slice 76](slice-76.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: in progress.** Last work on `ai_update3`, before merge. Kept as one
 slice by owner decision (2026-10-08).
@@ -147,6 +147,11 @@ Failure and limits:
   collision bodies in nav on every level; 74 creates and destroys worlds by
   their chunks; 75 paths far-off agents over the whole-world graph.
 - Accessor contracts used by gameplay, perception, and render stay the same.
+- Owner decision (2026-10-09): a ramp dig always digs out its exit cell on
+  the level above, so a ramp never leads into rock.
+- Owner decision (2026-10-09): cave-ins are a dig mechanic owned by
+  `DigController`, in [Slice 76](slice-76.md); 64G provides the dense
+  terrain path they write through.
 
 ### Checklist
 
@@ -182,13 +187,20 @@ Failure and limits:
 - [ ] A world's GPU tile store is released when its world is destroyed or
       replaced, never only at renderer shutdown.
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
-      the thread system, serial equals threaded (S3b); the gameplay producer's
-      slice is not yet named.
+      the thread system, serial equals threaded (S3b). Cave-in gameplay is
+      [Slice 76](slice-76.md); the explosion producer's slice is not yet
+      named (owner).
 - [ ] Perception's line-of-sight state lives on chunk storage, not a
       level-area bitmap; its rebuild threshold derives from operation cost, not
       level area.
 - [ ] A nav-apply failure leaves that step's perception and steering
       reactions intact.
+- [ ] Steering's static-obstacle index updates the changed bodies' bins on a
+      static add, move, or destroy, not a rebuild over every static body
+      (`steering.zig:206`, `invalidateStaticObstacleSpatial`: O(static
+      bodies) per change today).
+- [ ] Runtime ramps dig out their exit cell on the level above in the same
+      dig (owner decision above).
 - [ ] Level-sized load gates retired, so creating a world in play (74) and
       adding a link are never refused for capacity; index and format widths
       (cell, chunk, label, slot, edge offsets, level) fail loudly at world
@@ -221,5 +233,5 @@ Failure and limits:
       (`pathfinding*` groups), and a cross-level path of the same length costs
       the same at 8, 32, and 128 levels.
 - [ ] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
-- [ ] Manual (display, Debug): digs, ramps, and a cave-in in the demo; NPCs
-      route over the changes.
+- [ ] Manual (display, Debug): digs and ramps in the demo; NPCs route over
+      the changes. The in-demo cave-in check is Slice 76's.
