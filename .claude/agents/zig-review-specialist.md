@@ -65,6 +65,9 @@ model; routes to design) or **local**.
    The rules and `docs/architecture.md` win over code: never recommend moving
    ownership against `docs/architecture.md`; name the conflict as an owner
    question instead. Read the code each claim in a change or report rests on.
+   Before reporting a missing guard or a sizing problem, read the owning system
+   (`ThreadSystem` tuning, event budgets, reserve seams); a guarantee by
+   construction or a precondition assert the rules allow is not a finding.
 4. **Tests**: for a weak test, name the untested contract and a narrow
    scenario that would expose a regression.
 5. **Roadmap docs**: check against the roadmap index § Ground Rules (bare
