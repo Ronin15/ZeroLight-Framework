@@ -6,6 +6,11 @@
 //! on worlds of every level size and depth. The change is the same at every level
 //! size and depth, so the cost model expects each group flat across both axes:
 //!   - `chunk-scale-dig`: 64 single-cell digs and refills, each in its own chunk.
+//!   - `chunk-scale-ramp`: 64 ramp digs, each in its own chunk on the deepest level
+//!     and linked to the level above, the way `DigController` digs a ramp: the
+//!     dedupe lookup, one reserve scope for the tile write and the link, the write,
+//!     and the link add. Links are append-only in play, so each iteration's reset
+//!     (untimed) refills the cells and drops the links. Flat.
 //!   - `chunk-scale-cave-in`: a chunk-aligned tunnel region of 4, 64, or 256 chunks,
 //!     a quarter on each of four stacked levels, collapses to solid and is carved
 //!     back, each one batched edit (`applyDenseCellWrites`). Linear in region chunks.
@@ -36,7 +41,11 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
+const CellCoord = @import("../game/world_system.zig").CellCoord;
+const LevelLink = @import("../game/world_system.zig").LevelLink;
+const no_link_endpoint = @import("../game/world_terrain.zig").no_link_endpoint;
 const DenseCellWrite = @import("../game/world_system.zig").DenseCellWrite;
 const DenseChunkWrites = @import("../game/world_system.zig").DenseChunkWrites;
 const TerrainEditThreads = @import("../game/world_system.zig").TerrainEditThreads;
@@ -93,6 +102,12 @@ pub const dig_group = suite.BenchmarkGroup{
     .runCase = runDigCase,
 };
 
+pub const ramp_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-ramp",
+    .defaultItemCounts = scaleItemCounts,
+    .runCase = runRampCase,
+};
+
 pub const cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-cave-in",
     .defaultItemCounts = regionItemCounts,
@@ -125,12 +140,16 @@ fn regionItemCounts(_: suite.Profile) []const usize {
     return &region_item_counts;
 }
 
-const Workload = enum { dig, gpu_sync_dig, gpu_sync_level_enter };
+const Workload = enum { dig, ramp, gpu_sync_dig, gpu_sync_level_enter };
 
 const BatchWorkload = enum { cave_in, explosion_fill };
 
 fn runDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCase(allocator, io, options, case, item_count, .dig);
+}
+
+fn runRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, item_count, .ramp);
 }
 
 fn runCaveInCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -153,6 +172,7 @@ const Fixture = struct {
     world: WorldSystem,
     dirt: TileId,
     tunnel: TileId,
+    ramp: TileId,
     side: u16,
     levels: u16,
     // GPU sync groups only: a headless renderer holding the world's tile store.
@@ -241,6 +261,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
     const grass = try world.requireTileByName(&meta, "grass");
     const dirt = try world.requireTileByName(&meta, "dirt");
     const tunnel = try world.requireTileByName(&meta, "cave_0");
+    const ramp = (try DigConfig.fromMeta(&meta)).ramp_tile;
     for (0..levels) |level_index| {
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
         const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) grass else dirt);
@@ -248,11 +269,11 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
     }
     world.adoptTilesetMeta(meta);
     meta_owned = false;
-    return .{ .world = world, .dirt = dirt, .tunnel = tunnel, .side = side, .levels = levels };
+    return .{ .world = world, .dirt = dirt, .tunnel = tunnel, .ramp = ramp, .side = side, .levels = levels };
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs and GPU syncs run on the main thread");
+    if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs, ramps, and GPU syncs run on the main thread");
     const side: u16 = @intCast(item_count / case_encoding);
     const levels: u16 = @intCast(item_count % case_encoding);
     std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
@@ -270,16 +291,20 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
         },
-        .dig => {},
+        .dig, .ramp => {},
     }
 
-    for (0..options.warmup_iterations) |_| _ = try runIteration(&fixture, workload);
+    for (0..options.warmup_iterations) |_| {
+        _ = try runIteration(&fixture, workload);
+        if (workload == .ramp) try undoRamps(&fixture);
+    }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var cells_changed: usize = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         cells_changed = try runIteration(&fixture, workload);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), suite.serialBatch(cells_changed, 1));
+        if (workload == .ramp) try undoRamps(&fixture);
     }
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the cells written
@@ -294,6 +319,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 fn runIteration(fixture: *Fixture, workload: Workload) !usize {
     return switch (workload) {
         .dig => digAndRefill(fixture),
+        .ramp => digRamps(fixture),
         .gpu_sync_dig => blk: {
             const level = fixture.levels - 1;
             _ = try digCells(fixture, level, fixture.tunnel);
@@ -326,6 +352,67 @@ fn digAndRefill(fixture: *Fixture) !usize {
         _ = try world.setDenseTile(layer, x, y, fixture.dirt);
     }
     return @as(usize, dig_cell_count) * 2;
+}
+
+// The ramp workload's cell `cell_index`: one per chunk of an 8x8 chunk square at the
+// level center, like the dig workload's.
+fn rampCell(fixture: *const Fixture, cell_index: u16) CellCoord {
+    const chunk = default_chunk_size_tiles;
+    const origin = fixture.side / 2 - 4 * chunk;
+    return .{ .x = origin + (cell_index % 8) * chunk + 5, .y = origin + (cell_index / 8) * chunk + 7 };
+}
+
+// 64 ramps on the deepest level, each linked to the level above; returns the ramps dug.
+fn digRamps(fixture: *Fixture) !usize {
+    const world = &fixture.world;
+    const level = fixture.levels - 1;
+    const layer = fixture.floor(level);
+    var cell_index: u16 = 0;
+    while (cell_index < dig_cell_count) : (cell_index += 1) {
+        const cell = rampCell(fixture, cell_index);
+        if (world.rampLinkOtherLevel(level, cell) != null) return error.RampAlreadyLinked;
+        const link = LevelLink{
+            .kind = .ramp,
+            .level_a = level,
+            .cell_a = cell,
+            .level_b = level - 1,
+            .cell_b = cell,
+            .traversal_cost = 1,
+            .bidirectional = true,
+        };
+        world.beginDenseCellWriteReserve();
+        try world.reserveDenseCellWrite(layer, cell.x, cell.y, fixture.ramp);
+        try world.reserveLevelLink(link);
+        if (try world.setDenseTile(layer, cell.x, cell.y, fixture.ramp) == null) return error.RampTileUnchanged;
+        try world.addLevelLink(link);
+    }
+    return dig_cell_count;
+}
+
+// Returns the ramp workload to its start state: each ramp cell back to dirt and every
+// link dropped. Links are append-only in play, so the bench truncates the link rows
+// and clears the ramp chunks' endpoint heads on both levels.
+// Relies on WorldSystem internals: `level_links`, `link_endpoint_next`, and
+// `LevelTerrain.link_heads` (one head per chunk, `no_link_endpoint` when empty).
+fn undoRamps(fixture: *Fixture) !void {
+    const world = &fixture.world;
+    const level = fixture.levels - 1;
+    const layer = fixture.floor(level);
+    if (world.levelLinks().len != dig_cell_count) return error.RampLinkCountMismatch;
+    var cell_index: u16 = 0;
+    while (cell_index < dig_cell_count) : (cell_index += 1) {
+        const cell = rampCell(fixture, cell_index);
+        if (world.rampLinkOtherLevel(level, cell) != level - 1) return error.RampNotLinked;
+        world.beginDenseCellWriteReserve();
+        try world.reserveDenseCellWrite(layer, cell.x, cell.y, fixture.dirt);
+        if (try world.setDenseTile(layer, cell.x, cell.y, fixture.dirt) == null) return error.RampTileUnchanged;
+        const chunk_coord = world.chunkCoordForCell(cell.x, cell.y);
+        const chunk_index: usize = @intCast(chunk_coord.y * @as(i32, world.chunksX()) + chunk_coord.x);
+        world.level_terrain.items[level].link_heads[chunk_index] = no_link_endpoint;
+        world.level_terrain.items[level - 1].link_heads[chunk_index] = no_link_endpoint;
+    }
+    world.level_links.clearRetainingCapacity();
+    world.link_endpoint_next.clearRetainingCapacity();
 }
 
 // Writes `tile` into the dig workload's 64 cells on `level`, one per chunk, in one step.

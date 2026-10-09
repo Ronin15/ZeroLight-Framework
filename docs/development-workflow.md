@@ -354,8 +354,9 @@ Reading results:
   depth. `chunk-scale-cave-in` and `chunk-scale-explosion-fill` time a dense
   edit over 4, 64, and 256 chunks (an explosion's disk touches fewer chunks
   than its bounding square), serial and threaded; `--details` shows the main
-  thread's share. `chunk-scale-dig` and `chunk-scale-gpu-sync-*` measure the
-  serial case only (single-cell digs and GPU syncs run on the main thread); the
+  thread's share. `chunk-scale-dig`, `chunk-scale-ramp` (a ramp dig with its
+  level link), and `chunk-scale-gpu-sync-*` measure the serial case only
+  (single-cell digs, ramps, and GPU syncs run on the main thread); the
   GPU sync groups time the GPU tile store sync for a dig and for a level
   entering the render window, against a headless store.
 

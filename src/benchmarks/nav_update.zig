@@ -220,7 +220,7 @@ fn buildSharedFixture(allocator: std.mem.Allocator, io: std.Io, participant_coun
     // Size the per-participant nav scratch for the largest threaded case (workers + main) so the
     // threaded stages never fall back to serial for lack of scratch slots.
     try system.reserve(.{ .worker_participant_count = @max(@as(usize, 1), participant_count) });
-    try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size, null);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
 
     return .{
         .allocator = allocator,
@@ -484,7 +484,7 @@ fn buildEntityObstacleFixture(allocator: std.mem.Allocator, io: std.Io, particip
     // No obstacle dense layer here: every obstacle is an entity-driven static collision body,
     // so the grid starts fully open; obstacles are only ever created up to the count under
     // test (see ensureLiveObstacleCount), never a larger background population.
-    try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size, null);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
 
     const max_count = entity_obstacle_counts[entity_obstacle_counts.len - 1];
     var entities: std.ArrayList(EntityId) = .empty;

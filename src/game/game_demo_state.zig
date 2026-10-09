@@ -23,6 +23,7 @@ const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMo
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const DataSystem = @import("data_system.zig").DataSystem;
 const DigConfig = @import("dig_controller.zig").DigConfig;
+const DigController = @import("dig_controller.zig").DigController;
 const EntityId = @import("data_system.zig").EntityId;
 const Faction = @import("data_system.zig").Faction;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
@@ -1238,7 +1239,9 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
 fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
     demo.simulation_frame.beginStep();
     demo.simulation_frame.dig_intent = intent;
-    try demo.pipeline.dig.process(&demo.world, &demo.data, demo.player, &demo.simulation_frame);
+    // Stage order: reserve the dig, then commit it.
+    const edit = (try demo.pipeline.dig.reserveWorldEdit(&demo.world, &demo.data, demo.player, intent)) orelse return;
+    try DigController.commitWorldEdit(&demo.world, edit, &demo.simulation_frame);
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
@@ -1623,7 +1626,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 }
 
 test "demo ramp dig drives the real post-commit nav re-mask without panicking on an interior cell" {
-    // Regression: digRamp adds a LevelLink at runtime (dig_controller.zig). The dug cell's
+    // Regression: a ramp dig adds a LevelLink at runtime (dig_controller.zig). The dug cell's
     // chunk is re-masked at the structural-commit gate via processPostCommitEvents ->
     // applyNavUpdates. A faced interior cell whose endpoint has no init-built slot must be
     // DEFERRED by tryLinkPortal, not resolved against an absent run (linkTailIndex unreachable).

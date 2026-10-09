@@ -675,7 +675,6 @@ pub const SimulationPipeline = struct {
     dig: DigController,
     destructible: DestructibleController,
     audio_controller: AudioController,
-    nav_cell_size: f32,
     /// Tracked logical population capacity: every population-sized pipeline capacity is
     /// reserved to it. Grown only by `syncPopulationCapacity` at the commit seam.
     movement_body_capacity: usize,
@@ -727,7 +726,13 @@ pub const SimulationPipeline = struct {
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
-        try pathfinding.rebuildStaticNavGridWithWorld(data, config.navigation_world, bounds_width, bounds_height, config.nav_cell_size, config.nav_build_thread_system);
+        // With a world, nav covers its levels at its own tile and chunk dimensions; the
+        // bounds and `nav_cell_size` shape only a world-less build.
+        if (config.navigation_world) |world| {
+            try pathfinding.rebuildStaticNavGridWithWorld(data, world, config.nav_build_thread_system);
+        } else {
+            try pathfinding.rebuildStaticNavGrid(data, bounds_width, bounds_height, config.nav_cell_size);
+        }
         var collision = CollisionSystem.init(allocator);
         errdefer collision.deinit();
         var collision_response = CollisionResponseSystem.init(allocator);
@@ -785,7 +790,6 @@ pub const SimulationPipeline = struct {
             .dig = dig,
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
-            .nav_cell_size = config.nav_cell_size,
             .movement_body_capacity = population,
             .responder_capacity = rows.collision_responses,
             .perception_max_events_per_step = perception_events_per_observer_max * rows.ai_perceptions,
@@ -996,27 +1000,6 @@ pub const SimulationPipeline = struct {
         self.collision_response.deinit();
         self.collision.deinit();
         self.* = undefined;
-    }
-
-    /// Rebuilds the state-local static navigation grid after committed domain
-    /// changes invalidate obstacle occupancy.
-    pub fn rebuildStaticNavigation(
-        self: *SimulationPipeline,
-        data: *const DataSystem,
-        bounds_width: f32,
-        bounds_height: f32,
-    ) !void {
-        try self.pathfinding.rebuildStaticNavGrid(data, bounds_width, bounds_height, self.nav_cell_size);
-    }
-
-    pub fn rebuildStaticNavigationWithWorld(
-        self: *SimulationPipeline,
-        data: *const DataSystem,
-        world: *const WorldSystem,
-        bounds_width: f32,
-        bounds_height: f32,
-    ) !void {
-        try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size, null);
     }
 
     /// Clears the pathfinding system's dirty nav-cell buffer. Call once before a step's
@@ -1280,14 +1263,15 @@ pub const SimulationPipeline = struct {
 
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        // The dig's world growth (tile storage, a ramp's link) is reserved before the
-        // promote, so an OOM fails the stage with the deferred impacts still queued.
-        try self.dig.reserveWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
+        // The dig is planned and its world growth (tile storage, a ramp's link)
+        // reserved once, before the promote, so an OOM fails the stage with the
+        // deferred impacts still queued; the promote writes no world state.
+        const dig_edit = try self.dig.reserveWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         // Player-authored world edit. Its world_tile_changed event is deferred and
         // re-masks navigation in merge_outputs regardless of order.
-        try self.dig.process(context.world, context.data, context.player.*, context.frame);
+        if (dig_edit) |edit| try DigController.commitWorldEdit(context.world, edit, context.frame);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
@@ -2586,6 +2570,8 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const demoWorldWithChunkSize = @import("world_test_support.zig").demoWorldWithChunkSize;
+const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
 const AiAgent = @import("data_system.zig").AiAgent;
 const MovementBody = @import("data_system.zig").MovementBody;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
@@ -2595,19 +2581,6 @@ const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 fn testMinimalMultiLevelWorld(meta: *const world_tileset_meta.WorldTilesetMeta) !WorldSystem {
     const bounds = meta.tileSize() * 8;
     return WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, meta, bounds, bounds);
-}
-
-/// Takes and releases the tile block and composed-bits slot a landing carve into
-/// `cell` on `level` needs, so a later carve in that chunk reuses them: the terrain
-/// pools are warm, like the frame and data allocators the zero-allocation proofs warm.
-fn warmLandingTerrain(world: *WorldSystem, tunnel_tile: TileId, level: u16, cell: [2]u16) !void {
-    const floor = world.denseFloorLayerForLevel(level).?;
-    const original = world.denseTile(floor, cell[0], cell[1]);
-    world.beginDenseCellWriteReserve();
-    try world.reserveDenseCellWrite(floor, cell[0], cell[1], tunnel_tile);
-    _ = try world.setDenseTile(floor, cell[0], cell[1], tunnel_tile);
-    _ = try world.setDenseTile(floor, cell[0], cell[1], original);
-    world.beginDenseCellWriteReserve();
 }
 
 // Builds a 3-level minimal world and carves the given level-1 cells walkable so a
@@ -3594,7 +3567,7 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     // 16 tiles wide × chunk_size 8 → two chunks on X. Surface (level 0)
     // is fully walkable so the tile gate cannot undo the contact push.
     const tile_size = meta.tileSize();
-    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 8);
+    var world = try demoWorldWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 8);
     defer world.deinit();
     try std.testing.expectEqual(@as(u16, 8), world.chunk_size_tiles);
 
@@ -3684,7 +3657,7 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
     defer meta.deinit();
     // 16 x 8 tiles in 4-tile chunks: a 4 x 2 chunk grid.
     const tile_size = meta.tileSize();
-    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 4);
+    var world = try demoWorldWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 4);
     defer world.deinit();
 
     var data = DataSystem.init(std.testing.allocator);
@@ -3700,8 +3673,8 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
     try frame.reservePathRequests(2, 2);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    // The world-less nav knobs differ from the world on purpose; the world wins.
-    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, tile_size * 16, tile_size * 8, .{
+    // The world-less nav knobs and bounds differ from the world on purpose; the world wins.
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, tile_size * 25, tile_size * 3, .{
         .contact_capacity = 8,
         .nav_cell_size = tile_size / 4,
         .navigation_world = &world,
@@ -3719,6 +3692,8 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
     defer pipeline.deinit();
     try std.testing.expectEqual(world.chunk_size_tiles, pipeline.pathfinding.graph.chunk_tiles);
     try std.testing.expectEqual(world.tile_size, pipeline.pathfinding.graph.cell_size);
+    try std.testing.expectEqual(@as(usize, world.width), pipeline.pathfinding.graph.width);
+    try std.testing.expectEqual(@as(usize, world.height), pipeline.pathfinding.graph.height);
 
     frame.beginStep();
     _ = try pipeline.update(.{

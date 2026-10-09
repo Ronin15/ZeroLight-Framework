@@ -11,6 +11,7 @@
 //! Renderer handles stay outside this owner.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../core/math.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const PreparedSprite = @import("../assets/runtime_assets.zig").PreparedSprite;
@@ -54,6 +55,7 @@ const log = @import("../core/logging.zig").game;
 const logging = @import("../core/logging.zig");
 const world_terrain = @import("world_terrain.zig");
 const ChunkBits = @import("world_terrain.zig").ChunkBits;
+const ChunkBitsStore = @import("world_terrain.zig").ChunkBitsStore;
 const ChunkForm = @import("world_terrain.zig").ChunkForm;
 const ChunkGeometry = @import("world_terrain.zig").ChunkGeometry;
 const DenseLayerStore = @import("world_terrain.zig").DenseLayerStore;
@@ -413,7 +415,6 @@ const DenseEditWriteJob = struct {
 
 const SparseTileRow = struct {
     level_index: u16,
-    chunk_index: u32,
     cell_index: u32,
     tile_id: TileId,
     depth_value: i32,
@@ -426,6 +427,10 @@ pub const WorldSystem = struct {
     height: u16,
     tile_size: f32,
     chunk_size_tiles: u16,
+    // The level chunk grid of `width`, `height`, and `chunk_size_tiles`, which never
+    // change after create. Set when the first level is added: every level enters
+    // through `appendLevelBaseZ`, and no chunk storage exists before it.
+    chunk_geom: ChunkGeometry = .{ .width = 0, .height = 0, .edge = 0, .shift = 0, .chunks_x = 0, .chunks_y = 0 },
 
     /// Borrowed atlas metadata used for `sourceRect` lookups. Satisfied by
     /// `RuntimeAssets.worldTilesetMeta()` for production startup, or by
@@ -464,6 +469,10 @@ pub const WorldSystem = struct {
     terrain_edit_write_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     last_terrain_edit_plan_batch: BatchStats = .{},
     last_terrain_edit_write_batch: BatchStats = .{},
+    // Telemetry: reserves that grew a dense block or composed-bits pool. Pools grow
+    // geometrically at their reserve seams; the first growth logs once.
+    terrain_pool_grows: u64 = 0,
+    terrain_pool_growth_logged: bool = false,
     // Mirror of the renderer-owned GPU tile store holding the render window's dense
     // layers by chunk; `syncDenseTileStore` uploads what changed. Edits queued on
     // resident layers are drained every frame gameplay advances (the pause policy
@@ -652,17 +661,6 @@ pub const WorldSystem = struct {
         bounds_width: f32,
         bounds_height: f32,
     ) !WorldSystem {
-        return initDemoFromMetaWithChunkSize(allocator, meta, bounds_width, bounds_height, default_chunk_size_tiles);
-    }
-
-    /// `initDemoFromMeta` with an explicit chunk edge, which must pass `validateChunkGrid`.
-    pub fn initDemoFromMetaWithChunkSize(
-        allocator: std.mem.Allocator,
-        meta: *const WorldTilesetMeta,
-        bounds_width: f32,
-        bounds_height: f32,
-        chunk_size_tiles: u16,
-    ) !WorldSystem {
         const tile_size = meta.tileSize();
         const width = ceilTiles(bounds_width, tile_size);
         const height = ceilTiles(bounds_height, tile_size);
@@ -671,7 +669,7 @@ pub const WorldSystem = struct {
             .width = width,
             .height = height,
             .tile_size = tile_size,
-            .chunk_size_tiles = chunk_size_tiles,
+            .chunk_size_tiles = default_chunk_size_tiles,
             .atlas_texture = atlasTextureDesc(meta),
         };
         try validateChunkGrid(world.width, world.height, world.chunk_size_tiles);
@@ -856,38 +854,6 @@ pub const WorldSystem = struct {
             }
         }
         return visible_sparse_tiles;
-    }
-
-    pub fn visibleTileCount(self: *const WorldSystem) usize {
-        const visible_dense_cells = self.denseLayerCount() * self.visibleWindowCellCount();
-        var visible_sparse_tiles: usize = 0;
-        const sparse_cells = self.sparse_tiles.items(.cell_index);
-        for (sparse_cells) |cell| {
-            if (self.isSparseCellChunkVisible(cell) and self.cellInVisibleBounds(cell, self.visibleTileBounds())) {
-                visible_sparse_tiles += 1;
-            }
-        }
-        return visible_dense_cells + visible_sparse_tiles;
-    }
-
-    // Cells of one level inside both the visible tile bounds and the visible chunk
-    // window (the whole level before any window is set).
-    fn visibleWindowCellCount(self: *const WorldSystem) usize {
-        if (self.levelCount() == 0) return 0;
-        const bounds = self.visibleTileBounds();
-        var min_x = bounds.min_x;
-        var min_y = bounds.min_y;
-        var max_x = bounds.max_x_exclusive;
-        var max_y = bounds.max_y_exclusive;
-        if (self.visible_window_set) {
-            const chunk_size = self.chunk_size_tiles;
-            min_x = @max(min_x, self.last_min_chunk_x * chunk_size);
-            min_y = @max(min_y, self.last_min_chunk_y * chunk_size);
-            max_x = @min(max_x, @min(self.width, (self.last_max_chunk_x + 1) * chunk_size));
-            max_y = @min(max_y, @min(self.height, (self.last_max_chunk_y + 1) * chunk_size));
-        }
-        if (min_x >= max_x or min_y >= max_y) return 0;
-        return @as(usize, max_x - min_x) * @as(usize, max_y - min_y);
     }
 
     /// Inclusive tile and chunk bounds of a world rect; see `chunkWindowForWorldRect`.
@@ -1465,11 +1431,10 @@ pub const WorldSystem = struct {
     /// the next begin. Returns to uniform every chunk the previous scope gave an early
     /// block or slot that no write used. O(chunks reserved in the previous scope).
     pub fn beginDenseCellWriteReserve(self: *WorldSystem) void {
-        const geom = self.chunkGeometry();
         const stores = self.dense_layers.items(.store);
         for (self.dense_reserved_chunks.items) |reserved| switch (reserved.kind) {
-            .dense_block => stores[reserved.owner].releaseIfAllFill(reserved.chunk),
-            .blocked_slot => self.level_terrain.items[reserved.owner].blocked.releaseIfUniform(geom, reserved.chunk),
+            .dense_block => stores[reserved.owner].releaseIfUniform(reserved.chunk),
+            .blocked_slot => self.level_terrain.items[reserved.owner].blocked.releaseIfUniform(self.chunkGeometry(), reserved.chunk),
         };
         self.dense_reserved_chunks.clearRetainingCapacity();
         self.gpu_tiles.pending_reserved = 0;
@@ -1497,8 +1462,8 @@ pub const WorldSystem = struct {
 
         // Fallible growth first; the commits below only take what it guaranteed.
         try self.dense_reserved_chunks.ensureUnusedCapacity(self.allocator, @as(usize, @intFromBool(needs_block)) + @intFromBool(needs_slot));
-        if (needs_block) try store.ensureAvailable(self.allocator, geom.blockCells(), 1);
-        if (needs_slot) try blocked.ensureAvailable(self.allocator, 1);
+        if (needs_block) try self.ensureDenseBlocks(store, geom.blockCells(), 1);
+        if (needs_slot) try self.ensureBlockedSlots(blocked, 1);
         if (self.dense_layers.items(.gpu_slot)[layer_index] != world_gpu_tiles.no_slot) {
             try self.gpu_tiles.reserveEdits(self.allocator, 1);
         }
@@ -1535,8 +1500,8 @@ pub const WorldSystem = struct {
         // enters. The sync reads the value from the chunk store and coalesces repeats.
         const gpu_slot = self.dense_layers.items(.gpu_slot)[layer_index];
         if (gpu_slot != world_gpu_tiles.no_slot) try self.gpu_tiles.ensureEdit(self.allocator);
-        if (store.writeNeedsBlock(chunk, tile_id)) try store.ensureAvailable(self.allocator, geom.blockCells(), 1);
-        if (blocked.setNeedsSlot(chunk, local, new_composed)) try blocked.ensureAvailable(self.allocator, 1);
+        if (store.writeNeedsBlock(chunk, tile_id)) try self.ensureDenseBlocks(store, geom.blockCells(), 1);
+        if (blocked.setNeedsSlot(chunk, local, new_composed)) try self.ensureBlockedSlots(blocked, 1);
 
         store.write(geom, chunk, local, tile_id);
         blocked.set(geom, chunk, local, new_composed);
@@ -1578,6 +1543,8 @@ pub const WorldSystem = struct {
         self.last_terrain_edit_plan_batch = .{};
         self.last_terrain_edit_write_batch = .{};
         if (chunks.len == 0) return;
+        // A world with no level has no chunk grid; every entry's level is invalid.
+        if (self.level_terrain.items.len == 0) return error.InvalidWorldLevel;
         const geom = self.chunkGeometry();
         const block_cells = geom.blockCells();
         const stores = self.dense_layers.items(.store);
@@ -1663,9 +1630,9 @@ pub const WorldSystem = struct {
                 slot_count += @intFromBool(plan.slot_form != .mixed);
             }
             for (terrain.bandLayers(), block_counts[0..terrain.band_count]) |layer, count| {
-                if (count > 0) try stores[layer].ensureAvailable(self.allocator, block_cells, count);
+                if (count > 0) try self.ensureDenseBlocks(&stores[layer], block_cells, count);
             }
-            try terrain.blocked.ensureAvailable(self.allocator, slot_count);
+            try self.ensureBlockedSlots(&terrain.blocked, slot_count);
             run_start = run_end;
         }
         if (resident_writes > 0) try self.gpu_tiles.reserveEdits(self.allocator, resident_writes);
@@ -1734,10 +1701,30 @@ pub const WorldSystem = struct {
         for (groups) |group| {
             const terrain = &levels[group.level];
             var written_bands = group.plan.band_mask;
-            while (written_bands != 0) : (written_bands &= written_bands - 1) stores[terrain.bands[@ctz(written_bands)]].releaseIfAllFill(group.chunk);
+            while (written_bands != 0) : (written_bands &= written_bands - 1) stores[terrain.bands[@ctz(written_bands)]].releaseIfUniform(group.chunk);
             terrain.blocked.releaseIfUniform(geom, group.chunk);
         }
         self.gpu_tiles.pending_reserved -= resident_writes - gpu_queued;
+    }
+
+    // The terrain pools' reserve seams: each counts a reserve that grew its pool.
+    fn ensureDenseBlocks(self: *WorldSystem, store: *DenseLayerStore, block_cells: usize, count: usize) error{OutOfMemory}!void {
+        if (try store.ensureAvailable(self.allocator, block_cells, count)) self.countTerrainPoolGrowth();
+    }
+
+    fn ensureBlockedSlots(self: *WorldSystem, blocked: *ChunkBitsStore, count: usize) error{OutOfMemory}!void {
+        if (try blocked.ensureAvailable(self.allocator, count)) self.countTerrainPoolGrowth();
+    }
+
+    fn countTerrainPoolGrowth(self: *WorldSystem) void {
+        @branchHint(.cold);
+        self.terrain_pool_grows += 1;
+        if (self.terrain_pool_growth_logged) return;
+        self.terrain_pool_growth_logged = true;
+        if (comptime logging.enabled(.info) and !builtin.is_test) log.info(
+            "terrain pools grew at their reserve seam ({d} dense layers, {d} levels)",
+            .{ self.dense_layers.len, self.level_terrain.items.len },
+        );
     }
 
     // The cell's composed movement-blocked bit with `layer_index` holding `tile_id`:
@@ -1910,7 +1897,7 @@ pub const WorldSystem = struct {
     pub fn rampLinkOtherLevel(self: *const WorldSystem, level_index: u16, cell: CellCoord) ?u16 {
         if (@as(usize, level_index) >= self.level_terrain.items.len) return null;
         if (cell.x >= self.width or cell.y >= self.height) return null;
-        const heads = self.level_terrain.items[level_index].link_heads orelse return null;
+        const heads = self.level_terrain.items[level_index].link_heads;
         const links = self.level_links.items;
         var oldest: u32 = no_link_endpoint;
         var endpoint = heads[self.chunkGeometry().chunkOf(cell.x, cell.y)];
@@ -1945,16 +1932,13 @@ pub const WorldSystem = struct {
     }
 
     /// Reserves everything `addLevelLink(link)` needs without committing it: the
-    /// link row, its two endpoint entries, and both endpoint levels' lazy chunk heads
-    /// (O(chunks per level) the first time a link touches a level). Validates the link
-    /// first. Call before a world mutate that must pair with `addLevelLink`.
+    /// link row and its two endpoint entries (each level holds its chunk heads from
+    /// create). Validates the link first. O(1) amortized. Call before a world mutate
+    /// that must pair with `addLevelLink`.
     pub fn reserveLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, LevelLinkIndexOverflow, OutOfMemory }!void {
         try self.validateLevelLink(link);
         // Two endpoint entries per link must stay below the u32 list sentinel.
         if (self.level_links.items.len >= no_link_endpoint / 2) return error.LevelLinkIndexOverflow;
-        const chunk_count = self.chunkCountPerLevel();
-        try self.level_terrain.items[link.level_a].ensureLinkHeads(self.allocator, chunk_count);
-        try self.level_terrain.items[link.level_b].ensureLinkHeads(self.allocator, chunk_count);
         try self.level_links.ensureUnusedCapacity(self.allocator, 1);
         try self.link_endpoint_next.ensureUnusedCapacity(self.allocator, 2);
     }
@@ -1967,11 +1951,11 @@ pub const WorldSystem = struct {
         const geom = self.chunkGeometry();
         const endpoint_a: u32 = @intCast(self.level_links.items.len * 2);
         self.level_links.appendAssumeCapacity(link);
-        const heads_a = self.level_terrain.items[link.level_a].link_heads.?;
+        const heads_a = self.level_terrain.items[link.level_a].link_heads;
         const chunk_a = geom.chunkOf(link.cell_a.x, link.cell_a.y);
         self.link_endpoint_next.appendAssumeCapacity(heads_a[chunk_a]);
         heads_a[chunk_a] = endpoint_a;
-        const heads_b = self.level_terrain.items[link.level_b].link_heads.?;
+        const heads_b = self.level_terrain.items[link.level_b].link_heads;
         const chunk_b = geom.chunkOf(link.cell_b.x, link.cell_b.y);
         self.link_endpoint_next.appendAssumeCapacity(heads_b[chunk_b]);
         heads_b[chunk_b] = endpoint_a + 1;
@@ -2060,8 +2044,8 @@ pub const WorldSystem = struct {
         };
     }
 
-    /// Adds an empty level (no bands, every chunk open). Touches only its own
-    /// directory: O(chunks per level), whatever the depth.
+    /// Adds an empty level (no bands, every chunk open, no link endpoints). Touches
+    /// only its own directories: O(chunks per level), whatever the depth.
     pub fn addLevel(self: *WorldSystem, base_z: i32) !u16 {
         return self.appendLevelBaseZ(base_z);
     }
@@ -2074,6 +2058,9 @@ pub const WorldSystem = struct {
         try world_gpu_tiles.validateStoreWidth(self.chunkCountPerLevel(), self.chunk_size_tiles);
         const index = self.level_base_z.items.len;
         if (index > std.math.maxInt(u16)) return error.WorldLevelOverflow;
+        const geom = ChunkGeometry.init(self.width, self.height, self.chunk_size_tiles);
+        std.debug.assert(index == 0 or std.meta.eql(self.chunk_geom, geom));
+        self.chunk_geom = geom;
         try self.level_base_z.ensureUnusedCapacity(self.allocator, 1);
         try self.level_terrain.ensureUnusedCapacity(self.allocator, 1);
         const terrain = try LevelTerrain.init(self.allocator, self.chunkCountPerLevel());
@@ -2169,7 +2156,6 @@ pub const WorldSystem = struct {
         try self.validateTileId(tile_id);
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const cell = self.cellIndex(x, y);
-        const chunk_index = try self.sparseChunkIndexForCell(level_index, x, y);
         const local_chunk_index = self.localChunkIndexForCell(x, y);
         const flags = self.flagsFor(tile_id);
         const world_z = self.worldZForLevel(level_index, base_z, depth);
@@ -2188,13 +2174,12 @@ pub const WorldSystem = struct {
         try self.reserveSparseLevelIndexEntry(level_index);
         try self.reserveSparseChunkIndexEntry(level_index, local_chunk_index);
         if (flags.blocks_movement and blocked.setNeedsSlot(local_chunk_index, local_cell, true)) {
-            try blocked.ensureAvailable(self.allocator, 1);
+            try self.ensureBlockedSlots(blocked, 1);
         }
 
         const new_index: u32 = @intCast(self.sparse_tiles.len);
         self.sparse_tiles.appendAssumeCapacity(.{
             .level_index = level_index,
-            .chunk_index = chunk_index,
             .cell_index = cell,
             .tile_id = tile_id,
             .depth_value = world_z,
@@ -2382,7 +2367,8 @@ pub const WorldSystem = struct {
     }
 
     fn chunkGeometry(self: *const WorldSystem) ChunkGeometry {
-        return ChunkGeometry.init(self.width, self.height, self.chunk_size_tiles);
+        std.debug.assert(self.chunk_geom.edge != 0);
+        return self.chunk_geom;
     }
 
     pub fn requireTileByName(self: *const WorldSystem, meta: *const WorldTilesetMeta, name: []const u8) !TileId {
@@ -2481,21 +2467,10 @@ pub const WorldSystem = struct {
             chunk_y >= self.last_min_chunk_y and chunk_y <= self.last_max_chunk_y;
     }
 
-    fn sparseChunkIndexForCell(self: *const WorldSystem, level_index: u16, x: u16, y: u16) !u32 {
-        const chunks_x = self.chunksX();
-        const chunks_y = self.chunksY();
-        const local_chunk_index = self.localChunkIndexForCell(x, y);
-        const level_offset = @as(usize, level_index) * @as(usize, chunks_x) * @as(usize, chunks_y);
-        const index = level_offset + @as(usize, local_chunk_index);
-        if (index > std.math.maxInt(u32)) return error.WorldChunkOverflow;
-        return @intCast(index);
-    }
-
     // Flat level-local chunk offset for a cell (chunkY*chunksX+chunkX),
     // identical for every level since width/height/chunk_size_tiles are
     // world-wide, not per-level. Backs sparse_level_chunk_tiles' middle
-    // dimension; sparseChunkIndexForCell adds the level offset on top of this
-    // for the world-global chunk_index stored on each SparseTileRow.
+    // dimension.
     fn localChunkIndexForCell(self: *const WorldSystem, x: u16, y: u16) u32 {
         const chunks_x = self.chunksX();
         const chunk_x = x / self.chunk_size_tiles;
@@ -2603,7 +2578,6 @@ fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) 
         // Out-of-level cells of a border chunk hold the fill and are never written.
         @memset(cells, fill);
         var bits: world_terrain.ChunkBits = @splat(0);
-        var non_fill: u16 = 0;
         var blocked_count: u16 = 0;
         for (0..extent.rows) |row| {
             for (0..extent.cols) |col| {
@@ -2612,14 +2586,15 @@ fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) 
                 const tile = proceduralGroundTile(build.*, x, y);
                 const local = (row << geom.shift) | col;
                 cells[local] = tile;
-                if (tile != fill) non_fill += 1;
                 if (catalogFlags(build.catalog_flags, tile).blocks_movement) {
                     bits[local / 64] |= @as(u64, 1) << @intCast(local % 64);
                     blocked_count += 1;
                 }
             }
         }
-        build.block_fills[chunk_index].non_fill = non_fill;
+        // A chunk left holding one tile records it so `finishChunkFill` re-uniforms it.
+        const unequal_pairs = world_terrain.chainUnequalPairs(cells, geom.shift, extent);
+        build.block_fills[chunk_index] = .{ .fill = if (unequal_pairs == 0) cells[0] else fill, .unequal_pairs = unequal_pairs };
         build.blocked_bits[chunk_index] = bits;
         build.blocked_counts[chunk_index] = blocked_count;
     }
@@ -2717,7 +2692,7 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group: *DenseEditGroup, pa
     while (written_bands != 0) : (written_bands &= written_bands - 1) {
         const band = @ctz(written_bands);
         touched[band] = @splat(0);
-        blocks[band] = job.stores[bands[band]].ownBlock(block_cells, chunk);
+        blocks[band] = job.stores[bands[band]].ownBlock(geom, chunk);
         if (plan.block_mask & (@as(BandMask, 1) << @intCast(band)) != 0) blocks[band].?.fillFresh();
     }
     var blocked = terrain.blocked.ownSlot(chunk);
@@ -3385,7 +3360,7 @@ test "writeDenseTileCell reserves edit queue before mutating CPU tiles (FailingA
     }
 
     // Warm the block pool too, so the composed-bits slot is the first allocation.
-    try world.dense_layers.items(.store)[layer].ensureAvailable(std.testing.allocator, world.chunkGeometry().blockCells(), 1);
+    _ = try world.dense_layers.items(.store)[layer].ensureAvailable(std.testing.allocator, world.chunkGeometry().blockCells(), 1);
     {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         world.allocator = failing.allocator();
@@ -3489,7 +3464,6 @@ test "world create rejects a chunk size that is zero, not a power of two, or abo
 
     var meta = try testWorldMeta();
     defer meta.deinit();
-    try std.testing.expectError(error.InvalidChunkSize, WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, 64, 64, 12));
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     try std.testing.expectError(error.InvalidChunkSize, WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, .{
@@ -3547,7 +3521,6 @@ test "world add level keeps chunks renderable without manual rebuild" {
     for (world.level_terrain.items) |terrain| {
         try std.testing.expectEqual(world.chunkCountPerLevel(), terrain.blocked.dir.len);
     }
-    try std.testing.expectEqual(@as(usize, 2), world.visibleTileCount());
 }
 
 test "world add level preserves the existing visible chunk window" {
@@ -3574,8 +3547,6 @@ test "world add level preserves the existing visible chunk window" {
     const region = world.visibleChunkRegion() orelse return error.ExpectedRegion;
     try std.testing.expect(!region.containsChunk(.{ .x = 0, .y = 0 }));
     try std.testing.expect(region.containsChunk(.{ .x = 1, .y = 0 }));
-    // One visible cell per level: the window applies to the new level too.
-    try std.testing.expectEqual(@as(usize, 2), world.visibleTileCount());
 }
 
 test "world dense and sparse rendering respects z levels and chunk level filtering" {
@@ -3600,14 +3571,13 @@ test "world dense and sparse rendering respects z levels and chunk level filteri
     _ = try world.addSparseTile(level1, 0, 0, deco, 0, .obstacle);
 
     try std.testing.expectEqual(@as(usize, 2), world.level_terrain.items.len);
-    try std.testing.expectEqual(@as(usize, 3), world.visibleTileCount());
 
     try std.testing.expectEqual(render_depth.worldZ(.floor), world.worldZForLevel(level0, 0, .floor));
     try std.testing.expectEqual(@as(i32, 8), world.worldZForLevel(level1, 0, .floor));
     try std.testing.expectEqual(@as(i32, 9), world.worldZForLevel(level1, 0, .obstacle));
 }
 
-test "visible tile count crops inside visible chunks" {
+test "the visible chunk region covers exactly the chunks a world rect touches" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     // 4×4 tiles, chunk_size=2 → 2×2 chunk grid; each full chunk is 4 cells.
@@ -3628,10 +3598,14 @@ test "visible tile count crops inside visible chunks" {
 
     const chunk_pixels = @as(f32, @floatFromInt(2)) * tile_size;
     world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
-    try std.testing.expectEqual(@as(usize, 4), world.visibleTileCount());
+    var region = world.visibleChunkRegion() orelse return error.ExpectedRegion;
+    try std.testing.expectEqual(ChunkCoord{ .x = 0, .y = 0 }, region.min);
+    try std.testing.expectEqual(ChunkCoord{ .x = 1, .y = 1 }, region.max_exclusive);
 
     world.setVisibleChunksForWorldRect(.{ .x = chunk_pixels, .y = chunk_pixels, .w = chunk_pixels, .h = chunk_pixels }, 0, 0);
-    try std.testing.expectEqual(@as(usize, 4), world.visibleTileCount());
+    region = world.visibleChunkRegion() orelse return error.ExpectedRegion;
+    try std.testing.expectEqual(ChunkCoord{ .x = 1, .y = 1 }, region.min);
+    try std.testing.expectEqual(ChunkCoord{ .x = 2, .y = 2 }, region.max_exclusive);
 }
 
 test "level blocks movement is the OR of dense bands and sparse obstacles" {
@@ -3775,9 +3749,7 @@ test "sparseTileIndicesForChunk returns exactly the chunk-scoped subset of spars
     _ = try world.addSparseTile(level0, 1, 1, deco, 0, .obstacle); // level0 chunk0
     _ = try world.addSparseTile(level0, 3, 0, deco, 0, .obstacle); // level0 chunk1
     _ = try world.addSparseTile(level0, 1, 3, deco, 0, .obstacle); // level0 chunk2
-    // level1 > 0 so its global chunk_index (level_index*chunkCountPerLevel +
-    // local) differs from the level-local one this index is keyed by,
-    // proving the two are not conflated.
+    // Level 1 reuses level-local chunk indices; its tiles stay in its own buckets.
     _ = try world.addSparseTile(level1, 2, 2, deco, 0, .obstacle); // level1 chunk3
     _ = try world.addSparseTile(level1, 0, 1, deco, 0, .obstacle); // level1 chunk0
 
@@ -4940,7 +4912,8 @@ fn bruteForceLevelBlocked(world: *const WorldSystem, level: u16, x: u16, y: u16)
 
 // Checks every chunk-storage invariant against a flat reference (`reference[layer]`
 // row-major cells): tiles, composed bits against a brute-force scan, each block's
-// non-fill count, live block and slot counts, and the forms they imply.
+// unequal-pair count, live block and slot counts, and the forms they imply: a chunk
+// is uniform exactly when its in-level cells hold one tile.
 fn expectTerrainMatchesReference(world: *const WorldSystem, reference: []const []const TileId) !void {
     const geom = world.chunkGeometry();
     const stores = world.dense_layers.items(.store);
@@ -4950,24 +4923,26 @@ fn expectTerrainMatchesReference(world: *const WorldSystem, reference: []const [
         for (0..geom.chunkCount()) |chunk_index| {
             const chunk: u32 = @intCast(chunk_index);
             const extent = geom.extent(chunk);
-            var differs_from_fill: u16 = 0;
+            // Unequal neighbors along the in-level row-major chain.
+            var unequal_pairs: u16 = 0;
+            var previous: ?TileId = null;
             const uniform = store.uniformTile(chunk);
-            const fill = uniform orelse store.fills.items[store.dir[chunk]].fill;
             for (0..extent.rows) |row| {
                 for (0..extent.cols) |col| {
                     const x: u16 = @intCast(extent.min_x + col);
                     const y: u16 = @intCast(extent.min_y + row);
                     const expected = layer_cells[@as(usize, y) * world.width + x];
                     try std.testing.expectEqual(expected, world.denseTile(layer, x, y));
-                    if (expected != fill) differs_from_fill += 1;
+                    if (previous) |previous_tile| unequal_pairs += @intFromBool(expected != previous_tile);
+                    previous = expected;
                 }
             }
             if (uniform == null) {
                 mixed_chunks += 1;
-                try std.testing.expectEqual(differs_from_fill, store.fills.items[store.dir[chunk]].non_fill);
-                try std.testing.expect(differs_from_fill > 0);
+                try std.testing.expectEqual(unequal_pairs, store.fills.items[store.dir[chunk]].unequal_pairs);
+                try std.testing.expect(unequal_pairs > 0);
             } else {
-                try std.testing.expectEqual(@as(u16, 0), differs_from_fill);
+                try std.testing.expectEqual(@as(u16, 0), unequal_pairs);
             }
         }
         try std.testing.expectEqual(mixed_chunks, store.liveBlockCount());
@@ -5186,6 +5161,49 @@ test "repeated dig and fill of one cell re-uniforms its block and reuses one poo
     }
 }
 
+test "terrain pool growth is counted at its reserve seam and pool reuse counts nothing" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 32x32 tiles in 4x4 chunks: 64 chunks, more than the pools' first growth holds.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 32,
+        .height = 32,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const level = try world.addLevel(0);
+    const layer = try world.addDenseLayer(level, 0, .floor, tiles.dirt);
+    try std.testing.expectEqual(@as(u64, 0), world.terrain_pool_grows);
+    try std.testing.expect(!world.terrain_pool_growth_logged);
+
+    // The first carve into the solid level grows the block pool and the bits pool.
+    _ = try world.setDenseTile(layer, 1, 1, tiles.cave);
+    try std.testing.expectEqual(@as(u64, 2), world.terrain_pool_grows);
+    try std.testing.expect(world.terrain_pool_growth_logged);
+    // The refill releases both; a carve in another chunk reuses them.
+    _ = try world.setDenseTile(layer, 1, 1, tiles.dirt);
+    _ = try world.setDenseTile(layer, 5, 5, tiles.cave);
+    try std.testing.expectEqual(@as(u64, 2), world.terrain_pool_grows);
+    // A batched carve into every chunk outgrows both pools: one reserve each.
+    var writes: [64]DenseCellWrite = undefined;
+    var chunks: [64]DenseChunkWrites = undefined;
+    for (&writes, &chunks, 0..) |*write, *chunk, index| {
+        const chunk_x: u16 = @intCast(index % 8);
+        const chunk_y: u16 = @intCast(index / 8);
+        write.* = .{ .layer = @intCast(layer), .x = chunk_x * 4 + 2, .y = chunk_y * 4 + 2, .tile = tiles.cave };
+        chunk.* = .{ .level = level, .chunk_x = chunk_x, .chunk_y = chunk_y, .writes = write[0..1] };
+    }
+    var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.ensureTotalCapacity(std.testing.allocator, writes.len);
+    try world.applyDenseCellWrites(&chunks, null, &events);
+    try std.testing.expectEqual(@as(u64, 4), world.terrain_pool_grows);
+}
+
 test "a uniform chunk stays uniform while another chunk on its level is edited" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -5284,8 +5302,9 @@ test "addLevel touches only its own directory and fails without a partial level 
         world.allocator = failing.allocator();
         defer world.allocator = std.testing.allocator;
         if (world.addLevel(-5 * level_z_step)) |level| {
-            // At most the two level lists' growth plus the new level's own directory.
-            try std.testing.expect(failing.allocations <= 3);
+            // At most the two level lists' growth plus the new level's own directory
+            // and link heads.
+            try std.testing.expect(failing.allocations <= 4);
             break level;
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expectEqual(@as(usize, 5), world.levelCount());
@@ -5297,6 +5316,9 @@ test "addLevel touches only its own directory and fails without a partial level 
     try std.testing.expectEqual(chunk_count, terrain.blocked.dir.len);
     try std.testing.expectEqual(@as(u8, 0), terrain.band_count);
     for (0..chunk_count) |chunk| try std.testing.expectEqual(ChunkForm.open, terrain.blocked.form(@intCast(chunk)));
+    // Its link heads exist from create, every chunk without an endpoint.
+    try std.testing.expectEqual(chunk_count, terrain.link_heads.len);
+    for (terrain.link_heads) |head| try std.testing.expectEqual(no_link_endpoint, head);
     // Every earlier level and layer directory is the same allocation with the same entries.
     for (0..5) |index| {
         try std.testing.expectEqual(level_dirs[index].ptr, world.level_terrain.items[index].blocked.dir.ptr);
@@ -5318,7 +5340,7 @@ fn rampLinkForTest(level_a: u16, cell_a: CellCoord, level_b: u16, cell_b: CellCo
 }
 
 fn linkEndpointsInChunk(world: *const WorldSystem, level: u16, chunk: u32) usize {
-    const heads = world.level_terrain.items[level].link_heads orelse return 0;
+    const heads = world.level_terrain.items[level].link_heads;
     var count: usize = 0;
     var endpoint = heads[chunk];
     while (endpoint != no_link_endpoint) : (endpoint = world.link_endpoint_next.items[endpoint]) count += 1;
@@ -5387,10 +5409,10 @@ test "reserveLevelLink makes addLevelLink allocation-free and a failed add chang
     try world.buildCatalog(&meta);
     for (0..3) |level| _ = try world.addLevel(-@as(i32, @intCast(level)) * level_z_step);
 
-    // Each allocation of a first link (both levels' heads, the row, the endpoints)
-    // fails in turn and adds no link.
+    // Each allocation of a first link (the row, the endpoints) fails in turn and
+    // adds no link; the levels' chunk heads exist from create.
     const first = rampLinkForTest(1, .{ .x = 2, .y = 2 }, 0, .{ .x = 2, .y = 2 });
-    for (0..4) |fail_index| {
+    for (0..2) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
         world.allocator = failing.allocator();
         defer world.allocator = std.testing.allocator;
@@ -5401,10 +5423,6 @@ test "reserveLevelLink makes addLevelLink allocation-free and a failed add chang
         try std.testing.expectEqual(@as(?u16, null), world.rampLinkOtherLevel(1, .{ .x = 2, .y = 2 }));
         // Free what the failed reserve kept so the next index fails a later allocation.
         world.allocator = std.testing.allocator;
-        for (world.level_terrain.items) |*terrain| {
-            if (terrain.link_heads) |heads| std.testing.allocator.free(heads);
-            terrain.link_heads = null;
-        }
         world.level_links.clearAndFree(std.testing.allocator);
         world.link_endpoint_next.clearAndFree(std.testing.allocator);
     }
@@ -5471,6 +5489,62 @@ test "procedural world build is identical serial and threaded" {
     try std.testing.expectEqual(serial_store.liveBlockCount(), threaded_store.liveBlockCount());
     // The procedural ground is mixed somewhere, so the threaded fill really ran.
     try std.testing.expect(threaded_store.liveBlockCount() > 0);
+    try expectUniformExactlyWhenOneTile(&threaded, 0);
+}
+
+// Every chunk of `layer` is uniform exactly when its in-level cells hold one tile, by
+// brute force over the cells.
+fn expectUniformExactlyWhenOneTile(world: *const WorldSystem, layer: usize) !void {
+    const geom = world.chunkGeometry();
+    const store = world.dense_layers.items(.store)[layer];
+    for (0..geom.chunkCount()) |chunk_index| {
+        const chunk: u32 = @intCast(chunk_index);
+        const extent = geom.extent(chunk);
+        const first = world.denseTile(layer, extent.min_x, extent.min_y);
+        var one_tile = true;
+        for (0..extent.rows) |row| for (0..extent.cols) |col| {
+            one_tile = one_tile and world.denseTile(layer, @intCast(extent.min_x + col), @intCast(extent.min_y + row)) == first;
+        };
+        try std.testing.expectEqual(if (one_tile) @as(?TileId, first) else null, store.uniformTile(chunk));
+    }
+}
+
+test "procedural ground that paints a chunk with one non-fill tile leaves it uniform" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 18x16 tiles in 4x4 chunks: a short border column of chunks too.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 18,
+        .height = 16,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const stone = try world.requireTileByName(&meta, "stone_floor");
+    const level = try world.addLevel(0);
+    const layer = try world.addDenseLayer(level, 0, .floor, tiles.grass);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    const all_stone = ProceduralTiles{
+        .grass = stone,
+        .grass_patchy = stone,
+        .path = stone,
+        .stone = stone,
+        .water = stone,
+        .shore = stone,
+        .cliff = stone,
+        .tree = stone,
+        .deco = stone,
+    };
+    try world.buildProceduralGround(level, layer, all_stone, 0x5703e, &threads);
+    const store = world.dense_layers.items(.store)[layer];
+    for (0..world.chunkCountPerLevel()) |chunk| {
+        try std.testing.expectEqual(@as(?TileId, stone), store.uniformTile(@intCast(chunk)));
+    }
+    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
 }
 
 fn buildProceduralWorldForAllocationTest(allocator: std.mem.Allocator, meta: *const WorldTilesetMeta, threads: *ThreadSystem) !void {
@@ -5773,6 +5847,13 @@ test "a batched dense edit composes the same tiles and blocked cells as single-c
             for (0..batched.height) |y| for (0..batched.width) |x| {
                 try std.testing.expectEqual(single.denseTile(layer, @intCast(x), @intCast(y)), batched.denseTile(layer, @intCast(x), @intCast(y)));
             };
+            // Both paths re-uniform exactly the chunks left holding one tile.
+            const single_store = single.dense_layers.items(.store)[layer];
+            const batched_store = batched.dense_layers.items(.store)[layer];
+            for (0..batched.chunkCountPerLevel()) |chunk| {
+                try std.testing.expectEqual(single_store.uniformTile(@intCast(chunk)), batched_store.uniformTile(@intCast(chunk)));
+            }
+            try std.testing.expectEqual(single_store.liveBlockCount(), batched_store.liveBlockCount());
         }
         for (0..batched.level_terrain.items.len) |level| {
             for (0..batched.height) |y| for (0..batched.width) |x| {
@@ -5938,6 +6019,10 @@ test "a multi-level cave-in lands in one batched step and refills to uniform chu
     var world = try testBatchEditWorld(&meta);
     defer world.deinit();
     const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    // The fixture's sync batch uploads the resident layers whole.
+    var gpu_store: TestGpuStore = .{};
+    defer gpu_store.deinit();
+    try gpu_store.apply(&world);
     var reference = BatchReference.init(tiles);
     var write_buffer: [160]DenseCellWrite = undefined;
     const writes = caveInBatchWrites(tiles, &write_buffer);
@@ -5957,6 +6042,15 @@ test "a multi-level cave-in lands in one batched step and refills to uniform chu
     try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(1, 1 * 4 + 1));
     try std.testing.expectEqual(ChunkForm.mixed, world.levelChunkBlockedForm(1, 0));
     try std.testing.expect(world.levelBlocksMovement(0, 12, 4));
+    // A chunk every write left holding one non-fill tile stores no block: level 1's
+    // hollowed chunk at the tunnel, the surface's at the hole.
+    const stores = world.dense_layers.items(.store);
+    try std.testing.expectEqual(@as(?TileId, tiles.cave), stores[2].uniformTile(1 * 4 + 1));
+    try std.testing.expectEqual(@as(?TileId, invalid_tile_id), stores[0].uniformTile(1 * 4 + 1));
+    // The GPU store reads those chunks back at their new uniform tiles.
+    _ = try testSyncGpuTiles(&world, 0);
+    try gpu_store.apply(&world);
+    try expectGpuStoreMatches(&world, &gpu_store);
 
     // The refill in one step returns every block and slot to uniform.
     var refill_buffer: [160]DenseCellWrite = undefined;
@@ -5970,8 +6064,56 @@ test "a multi-level cave-in lands in one batched step and refills to uniform chu
     reference.apply(refills);
     layers = reference.layers();
     try expectTerrainMatchesReference(&world, &layers);
+    _ = try testSyncGpuTiles(&world, 0);
+    try gpu_store.apply(&world);
+    try expectGpuStoreMatches(&world, &gpu_store);
     for (world.dense_layers.items(.store)) |store| try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
     try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[1].blocked.liveSlotCount());
+}
+
+test "a 1x1 border chunk turning uniform at another tile reads back from the GPU store" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 5x5 tiles in 4x4 chunks: chunk 3 is the 1x1 corner (4, 4).
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 5,
+        .height = 5,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const level = try world.addLevel(0);
+    const layer = try world.addDenseLayer(level, 0, .floor, tiles.grass);
+    world.render_window = .{ .levels_below = 0 };
+    _ = try testSyncGpuTiles(&world, 0);
+    var gpu_store: TestGpuStore = .{};
+    defer gpu_store.deinit();
+    try gpu_store.apply(&world);
+    const store = &world.dense_layers.items(.store)[layer];
+
+    // Single-cell path, grass -> water in one frame: uniform to uniform, no block.
+    _ = try world.setDenseTile(layer, 4, 4, tiles.water);
+    try std.testing.expectEqual(@as(?TileId, tiles.water), store.uniformTile(3));
+    _ = try testSyncGpuTiles(&world, 0);
+    try gpu_store.apply(&world);
+    try expectGpuStoreMatches(&world, &gpu_store);
+
+    // Batched path, water -> cave in one frame.
+    const writes = [_]DenseCellWrite{.{ .layer = @intCast(layer), .x = 4, .y = 4, .tile = tiles.cave }};
+    const chunks = [_]DenseChunkWrites{.{ .level = level, .chunk_x = 1, .chunk_y = 1, .writes = &writes }};
+    var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.ensureTotalCapacity(std.testing.allocator, writes.len);
+    try world.applyDenseCellWrites(&chunks, null, &events);
+    try std.testing.expectEqual(@as(?TileId, tiles.cave), store.uniformTile(3));
+    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+    _ = try testSyncGpuTiles(&world, 0);
+    try gpu_store.apply(&world);
+    try expectGpuStoreMatches(&world, &gpu_store);
+    try std.testing.expectEqual(tiles.cave, gpu_store.tile(&world, world.dense_layers.items(.gpu_slot)[layer], 4, 4));
 }
 
 test "a one-chunk batched dense edit runs inline" {
@@ -6104,6 +6246,24 @@ fn expectRejectedBatch(world: *WorldSystem, threads: *ThreadSystem, chunks: []co
     try std.testing.expectEqualSlices(u8, before.items, after.items);
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
     try std.testing.expectEqual(event_capacity, events.capacity);
+}
+
+test "a batched dense edit on a world with no level is an invalid level" {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    const writes = [_]DenseCellWrite{.{ .layer = 0, .x = 1, .y = 1, .tile = 0 }};
+    const chunks = [_]DenseChunkWrites{.{ .level = 0, .chunk_x = 0, .chunk_y = 0, .writes = &writes }};
+    var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.ensureTotalCapacity(std.testing.allocator, writes.len);
+    try std.testing.expectError(error.InvalidWorldLevel, world.applyDenseCellWrites(&chunks, null, &events));
+    try std.testing.expectEqual(@as(usize, 0), events.items.len);
 }
 
 test "a batched dense edit rejects unordered chunks and invalid writes before any change" {

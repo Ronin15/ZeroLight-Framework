@@ -598,7 +598,7 @@ test "pathfinding nav grid blocked set matches per-level composed mask" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(baselineCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
 
     var expected_blocked: usize = 0;
     for (0..world.height) |y_usize| {

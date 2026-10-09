@@ -48,7 +48,7 @@ const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 pub const DigConfig = struct {
     // Default to the invalid sentinel, not tile 0: TileId 0 is a real,
     // movement-blocking tile, so a 0 default would silently carve it. Leaving
-    // these unresolved returns `error.UnresolvedDigTiles` from `process` before
+    // these unresolved returns `error.UnresolvedDigTiles` from `reserveWorldEdit` before
     // any world mutate (ReleaseFast-safe; not a Debug-only assert).
     // `fromMeta`/`fromRuntimeAssets` resolve them to valid ids.
     ramp_tile: TileId = invalid_tile_id,
@@ -104,7 +104,7 @@ pub const DigController = struct {
 
     /// Translates the held dig actions into this step's `dig_intent` on the rising
     /// edge so one press digs one cell. When several fire the same frame, hole
-    /// (forward) wins, then down, then ramp. `process` consumes the intent.
+    /// (forward) wins, then down, then ramp. `reserveWorldEdit` consumes the intent.
     pub fn captureIntent(self: *DigController, input: *const InputState, frame: *SimulationFrame) void {
         const hole_held = input.isHeld(.dig_hole);
         const down_held = input.isHeld(.dig_down);
@@ -121,23 +121,29 @@ pub const DigController = struct {
         self.ramp_held_last = ramp_held;
     }
 
-    /// Applies this step's dig intent to the cell the player faces on their current
-    /// plane. No-op when there is no intent, the player lacks a body/facing, the
-    /// plane has no floor layer, or the faced cell is off-world. Emits one
-    /// `world_tile_changed` event on an actual change. Reserves the world edit
-    /// first (allocation-free after `reserveWorldEdit` this step).
-    pub fn process(
+    /// Plans this step's dig (the cell the player faces on their current plane) and
+    /// reserves its world growth (tile storage, GPU edit,
+    /// and a ramp's link) once, so the stage can call it before anything else mutates
+    /// step state: an OOM here leaves the world and the step untouched for the retry.
+    /// Returns the reserved edit for `commitWorldEdit`, or null when the intent does
+    /// nothing: no intent, no body/facing, no floor layer, or an off-world cell.
+    pub fn reserveWorldEdit(
         self: *const DigController,
         world: *WorldSystem,
         data: *const DataSystem,
         player: Player,
-        frame: *SimulationFrame,
-    ) !void {
-        const edit = (try self.planEdit(world, data, player, frame.dig_intent)) orelse return;
+        intent: DigIntent,
+    ) !?DigEdit {
+        const edit = (try self.planEdit(world, data, player, intent)) orelse return null;
         try reserveEdit(world, edit);
+        return edit;
+    }
 
-        // Reserve event + stimulus slots before any world mutate so a capacity miss
-        // cannot leave the tile changed without matching outputs.
+    /// Writes an edit `reserveWorldEdit` reserved, with no world write between them:
+    /// allocation-free in the world. Event and stimulus capacity are preflighted
+    /// before the write, so a capacity miss leaves the tile unchanged. Emits one
+    /// `world_tile_changed` event and a dig stimulus on an actual change.
+    pub fn commitWorldEdit(world: *WorldSystem, edit: DigEdit, frame: *SimulationFrame) !void {
         if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
         try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
         try frame.ensureStimulusAppendCapacity(1);
@@ -152,26 +158,13 @@ pub const DigController = struct {
             .position = cellCenterWorldPos(world, edit.cell),
             .intensity = defaultStimulusIntensity(.dig),
             .kind = .dig,
-            .level = player.current_level,
+            .level = edit.level,
         }, true, &stimulus_dropped);
     }
 
-    /// Reserves this step's world edit (tile storage, GPU edit, and a ramp's link) so
-    /// the stage can call it before anything else mutates step state: an OOM here
-    /// leaves the world and the step untouched for the retry, and the later
-    /// `process` allocates nothing in the world. No-op when the intent does nothing.
-    pub fn reserveWorldEdit(
-        self: *const DigController,
-        world: *WorldSystem,
-        data: *const DataSystem,
-        player: Player,
-        intent: DigIntent,
-    ) !void {
-        const edit = (try self.planEdit(world, data, player, intent)) orelse return;
-        try reserveEdit(world, edit);
-    }
-
-    const DigEdit = struct {
+    /// One planned dig: a cell write on `level`'s floor and, for a ramp, its link.
+    pub const DigEdit = struct {
+        level: u16,
         floor_layer: usize,
         cell: CellCoord,
         /// `invalid_tile_id` punches a see-through hole.
@@ -200,32 +193,21 @@ pub const DigController = struct {
         return switch (intent) {
             // Surface: punch a see-through hole to fall through. Underground: mine a
             // walkable tunnel floor through the solid dirt of this plane.
-            .hole => .{ .floor_layer = floor_layer, .cell = cell, .tile = if (level == 0) invalid_tile_id else self.tunnel_tile },
+            .hole => .{ .level = level, .floor_layer = floor_layer, .cell = cell, .tile = if (level == 0) invalid_tile_id else self.tunnel_tile },
             // Dig down: punch a see-through hole in the faced cell on any plane to
             // drop to the level below; a no-op on the bottom plane.
             .down => if (@as(usize, level) + 1 >= world.levelCount())
                 null
             else
-                .{ .floor_layer = floor_layer, .cell = cell, .tile = invalid_tile_id },
+                .{ .level = level, .floor_layer = floor_layer, .cell = cell, .tile = invalid_tile_id },
             // Ramp: a walkable ramp tile plus a bidirectional link to the plane above;
             // a no-op on the surface or where a ramp already links this cell.
             .ramp => if (level == 0 or world.rampLinkOtherLevel(level, cell) != null)
                 null
             else
-                .{ .floor_layer = floor_layer, .cell = cell, .tile = self.ramp_tile, .ramp_link = rampLink(level, cell) },
+                .{ .level = level, .floor_layer = floor_layer, .cell = cell, .tile = self.ramp_tile, .ramp_link = rampLink(level, cell) },
             .none => unreachable,
         };
-    }
-
-    /// Carves a walkable ramp tile and adds a bidirectional ramp `LevelLink` to the
-    /// plane above (ramps ascend — they exist to climb out of a pit). Caller has
-    /// already filtered surface / existing-link no-ops; event + stimulus capacity is
-    /// preflighted in `process` before this runs. The link and the tile write are
-    /// reserved before the tile write so an OOM cannot leave an orphan ramp tile.
-    fn digRamp(self: *const DigController, world: *WorldSystem, level: u16, floor_layer: usize, cell: CellCoord) !?WorldTileChangedEvent {
-        const edit = DigEdit{ .floor_layer = floor_layer, .cell = cell, .tile = self.ramp_tile, .ramp_link = rampLink(level, cell) };
-        try reserveEdit(world, edit);
-        return applyEdit(world, edit);
     }
 
     /// Result of one entity's cell-entry plane traversal. `tile_change` is set when
@@ -545,7 +527,7 @@ fn setEntityLevel(world: *const WorldSystem, data: *DataSystem, entity: EntityId
 
 /// World cell the entity faces from body center + facing × tile size.
 /// Null when body/facing/visual is missing or the probe is off-world.
-/// Shared by dig process and action-intent capture so interact/destructible
+/// Shared by dig planning and action-intent capture so interact/destructible
 /// targets stay aligned with dig's faced-cell contract.
 pub fn facedCellForEntity(
     world: *const WorldSystem,
@@ -574,6 +556,13 @@ fn facingOffset(direction: Facing) math.Vec2 {
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
+
+// One dig in stage order: reserve, then commit the reserved edit.
+fn testDig(dig: *const DigController, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *SimulationFrame) !void {
+    const edit = (try dig.reserveWorldEdit(world, data, player, frame.dig_intent)) orelse return;
+    try DigController.commitWorldEdit(world, edit, frame);
+}
 
 fn testDigController(meta: anytype) !DigController {
     return DigController.init(.{
@@ -666,19 +655,6 @@ fn addCellEntryNpc(data: *DataSystem, from: CellCoord, to: CellCoord) !EntityId 
     body.position_x.* = @as(f32, @floatFromInt(to.x)) * 32;
     body.position_y.* = @as(f32, @floatFromInt(to.y)) * 32;
     return npc;
-}
-
-/// Takes and releases the tile block and composed-bits slot a landing carve into
-/// `cell` on `level` needs, so a later carve in that chunk reuses them: the terrain
-/// pools are warm, like the frame and data allocators the zero-allocation proofs warm.
-fn warmLandingTerrain(world: *WorldSystem, tunnel_tile: TileId, level: u16, cell: [2]u16) !void {
-    const floor = world.denseFloorLayerForLevel(level).?;
-    const original = world.denseTile(floor, cell[0], cell[1]);
-    world.beginDenseCellWriteReserve();
-    try world.reserveDenseCellWrite(floor, cell[0], cell[1], tunnel_tile);
-    _ = try world.setDenseTile(floor, cell[0], cell[1], tunnel_tile);
-    _ = try world.setDenseTile(floor, cell[0], cell[1], original);
-    world.beginDenseCellWriteReserve();
 }
 
 /// Opens surface holes at (4,3) and (6,3) with one NPC entering each this step.
@@ -834,11 +810,11 @@ fn runDig(tw: *TestWorld, dig: DigController, intent: @import("simulation.zig").
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     frame.beginStep();
     frame.dig_intent = intent;
-    try dig.process(&tw.world, &tw.data, tw.player, &frame);
+    try testDig(&dig, &tw.world, &tw.data, tw.player, &frame);
     return frame;
 }
 
-test "dig process returns UnresolvedDigTiles without mutating world" {
+test "a dig returns UnresolvedDigTiles without mutating world" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
     // Default DigConfig leaves ramp/tunnel as invalid_tile_id — must fail before carve.
@@ -851,7 +827,7 @@ test "dig process returns UnresolvedDigTiles without mutating world" {
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     frame.beginStep();
     frame.dig_intent = .hole;
-    try std.testing.expectError(error.UnresolvedDigTiles, dig.process(&tw.world, &tw.data, tw.player, &frame));
+    try std.testing.expectError(error.UnresolvedDigTiles, testDig(&dig, &tw.world, &tw.data, tw.player, &frame));
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
 }
@@ -1060,7 +1036,7 @@ test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell befo
     try std.testing.expectEqual(@as(f32, 3 * 32), body.position.y);
 }
 
-test "dig process reserves event capacity before world mutate (capacity miss leaves tile unchanged)" {
+test "a dig commit reserves event capacity before world mutate (capacity miss leaves tile unchanged)" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
@@ -1076,7 +1052,7 @@ test "dig process reserves event capacity before world mutate (capacity miss lea
     const before = tw.world.denseTile(floor, 4, 3);
     try std.testing.expect(before != invalid_tile_id);
 
-    try std.testing.expectError(error.EventCapacityExceeded, dig.process(&tw.world, &tw.data, tw.player, &frame));
+    try std.testing.expectError(error.EventCapacityExceeded, testDig(&dig, &tw.world, &tw.data, tw.player, &frame));
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
 }
@@ -1210,7 +1186,7 @@ test "player spawn pre-attaches world_level so first fall is allocation-free for
     try std.testing.expect(result.tile_change != null);
 }
 
-test "digRamp OOM on level_links growth leaves ramp tile unchanged" {
+test "a ramp dig whose link reserve fails leaves the ramp tile unchanged" {
     var tw = try TestWorld.init(.right, 1);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
@@ -1218,43 +1194,40 @@ test "digRamp OOM on level_links growth leaves ramp tile unchanged" {
     const floor = tw.world.denseFloorLayerForLevel(1).?;
     const before = tw.world.denseTile(floor, 4, 3);
     try std.testing.expect(before != dig.ramp_tile);
+    // Warm terrain pools leave the empty link rows as the reserve's first allocation.
+    try warmLandingTerrain(&tw.world, dig.ramp_tile, 1, .{ 4, 3 });
+    try std.testing.expectEqual(@as(usize, 0), tw.world.level_links.capacity);
 
-    // Exact capacity so the link reserve must grow.
-    try tw.world.level_links.ensureTotalCapacityPrecise(std.testing.allocator, tw.world.level_links.items.len);
     const original = tw.world.allocator;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     tw.world.allocator = failing.allocator();
     defer tw.world.allocator = original;
-
-    try std.testing.expectError(
-        error.OutOfMemory,
-        dig.digRamp(&tw.world, 1, floor, .{ .x = 4, .y = 3 }),
-    );
+    try std.testing.expectError(error.OutOfMemory, dig.reserveWorldEdit(&tw.world, &tw.data, tw.player, .ramp));
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
 }
 
-test "dig process after reserveWorldEdit allocates nothing in the world (FailingAllocator)" {
+test "a dig committed after its one reserve allocates nothing in the world (FailingAllocator)" {
     inline for (.{ DigIntent.hole, DigIntent.ramp }) |intent| {
         var tw = try TestWorld.init(.right, 1);
         defer tw.deinit();
         const dig = try testDigController(&tw.meta);
         // The faced level-1 cell sits in a uniform, fully blocked chunk, so the carve
-        // takes a fresh tile block and composed-bits slot (and a ramp its link heads).
+        // takes a fresh tile block and composed-bits slot (and a ramp its link row).
         const floor = tw.world.denseFloorLayerForLevel(1).?;
         try std.testing.expect(tw.world.denseTileBlocksMovement(floor, 4, 3));
 
-        try dig.reserveWorldEdit(&tw.world, &tw.data, tw.player, intent);
+        const edit = (try dig.reserveWorldEdit(&tw.world, &tw.data, tw.player, intent)).?;
+        try std.testing.expectEqual(@as(u16, 1), edit.level);
         var frame = SimulationFrame.init(std.testing.allocator);
         defer frame.deinit();
         try frame.reserveStreams(4, 8, 8, 8, 8, 8);
         frame.beginStep();
-        frame.dig_intent = intent;
 
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         tw.world.allocator = failing.allocator();
         defer tw.world.allocator = std.testing.allocator;
-        try dig.process(&tw.world, &tw.data, tw.player, &frame);
+        try DigController.commitWorldEdit(&tw.world, edit, &frame);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
         try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
         try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
@@ -1280,7 +1253,7 @@ test "dig reserveWorldEdit OOM leaves the world unchanged" {
     try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
 }
 
-test "dig process on a full live bus leaves the tile unchanged" {
+test "a dig commit on a full live bus leaves the tile unchanged" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
@@ -1304,13 +1277,13 @@ test "dig process on a full live bus leaves the tile unchanged" {
     const floor = tw.world.denseFloorLayerForLevel(0).?;
     const before = tw.world.denseTile(floor, 4, 3);
 
-    try std.testing.expectError(error.StimulusCapacityExceeded, dig.process(&tw.world, &tw.data, tw.player, &frame));
+    try std.testing.expectError(error.StimulusCapacityExceeded, testDig(&dig, &tw.world, &tw.data, tw.player, &frame));
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
     try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }
 
-test "dig process stimulus capacity miss leaves tile unchanged" {
+test "a dig commit stimulus capacity miss leaves tile unchanged" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
@@ -1331,7 +1304,7 @@ test "dig process stimulus capacity miss leaves tile unchanged" {
     frame.stimuli.allocator = failing.allocator();
     defer frame.stimuli.allocator = original_stimuli;
 
-    try std.testing.expectError(error.OutOfMemory, dig.process(&tw.world, &tw.data, tw.player, &frame));
+    try std.testing.expectError(error.OutOfMemory, testDig(&dig, &tw.world, &tw.data, tw.player, &frame));
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);

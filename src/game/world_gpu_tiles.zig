@@ -451,7 +451,7 @@ const TestLayers = struct {
 
     fn write(self: *TestLayers, layer: usize, x: u16, y: u16, tile: u16) !void {
         const store = &self.stores[layer];
-        try store.ensureAvailable(std.testing.allocator, self.geom.blockCells(), 1);
+        _ = try store.ensureAvailable(std.testing.allocator, self.geom.blockCells(), 1);
         store.write(self.geom, self.geom.chunkOf(x, y), self.geom.localOf(x, y), tile);
     }
 
@@ -477,7 +477,7 @@ test "a layer entering uploads its directory and mixed blocks; leaving frees its
     // Layer 0: chunks 0 and 3 mixed, chunk 1 holding an early block of only fill.
     try layers.write(0, 0, 0, TestLayers.dug);
     try layers.write(0, 7, 7, TestLayers.dug);
-    try layers.stores[0].ensureAvailable(std.testing.allocator, layers.geom.blockCells(), 1);
+    _ = try layers.stores[0].ensureAvailable(std.testing.allocator, layers.geom.blockCells(), 1);
     layers.stores[0].materializeChunk(layers.geom.blockCells(), 1);
 
     const entered = try layers.sync(&mirror, &.{0});

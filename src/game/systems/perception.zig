@@ -352,12 +352,8 @@ const invalid_build_step: u64 = std.math.maxInt(u64);
 // A pending edit to one level's blocked bitmap, awaiting the next
 // `ensureLevelBlockedCache` call that actually touches that level (see
 // `LevelBlockedSlot.pending_dirty`). Cell-rect shape mirrors
-// `WorldObstacleChangedEvent` (min inclusive, max exclusive) rather than
-// `pathfinding/nav_grid.zig`'s `NavCellEdit`/chunk-grid dirty model — this
-// cache works in raw world tiles, not nav cells/chunks, and reusing that
-// type would couple this file to nav's chunk-grid shape for no benefit (the
-// chunk grid is only consulted transiently, at patch time, to scope the
-// sparse-tile rescan — see `PerceptionSystem.patchLevelBlockedCache`).
+// `WorldObstacleChangedEvent` (min inclusive, max exclusive); the patch re-reads
+// each covered cell through `WorldSystem.levelBlocksMovement`.
 const DirtyRect = struct {
     min_x: u16,
     min_y: u16,
@@ -366,10 +362,9 @@ const DirtyRect = struct {
 };
 
 // Above this fraction of a level's total cell count, accumulated dirty area
-// makes the scoped patch path (a memset + rescan per pending rect, plus a
-// chunk-scoped sparse walk per rect) costlier than one dense full pass over
-// the whole level, so `ensureLevelBlockedCache` falls back to a full rebuild
-// instead — same spirit as `pathfinding/nav_graph.zig`'s
+// makes the scoped patch path (one O(1) blocked read per pending cell) costlier
+// than one full pass over the whole level, so `ensureLevelBlockedCache` falls
+// back to a full rebuild instead — same spirit as `pathfinding/nav_graph.zig`'s
 // `full_relabel_level_threshold` (there: a count of affected *levels*; here:
 // a fraction of one level's *cells*, the finer unit this cache works in).
 // `pending_dirty`'s rects are summed without deduplicating overlap, so this
@@ -399,10 +394,7 @@ fn dirtyAreaExceedsFullRebuildThreshold(pending_dirty: []const DirtyRect, cell_c
 // reuse of `pathfinding/nav_grid.zig`'s `NavGrid`: that grid's blocked mask is
 // world obstacles OR (level 0 only) DataSystem static collision bodies — a
 // different, broader set than `levelBlocksMovement`'s world-tiles-only
-// contract — and its `cell_size` is only incidentally equal to
-// `WorldSystem.tile_size` (two independently-set literals, not an enforced
-// invariant), so reusing it would risk both a silent LOS-granularity change
-// and a silent LOS-occlusion behavior change. This cache instead mirrors
+// contract — so reusing it would change what occludes LOS. This cache instead mirrors
 // `NavGrid.markWorldObstacles`'s shape (per-chunk composed blocked state)
 // but stays at raw world-tile granularity with no rect
 // rasterization, so it is a direct, provable stand-in for
@@ -3362,7 +3354,7 @@ test "PerceptionSystem's dirty-tracked patch path has no steady-state allocation
     defer spatial_sys.deinit();
 
     // A real asset-backed tileset (same pattern as the LOS/parity tests
-    // above): the patch path's dense-layer rescan needs a real "blocks
+    // above): the patch path's blocked re-read needs a real "blocks
     // movement" tile, not a hand-poked `minimalWorld`.
     const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
     var meta = try @import("../../assets/world_tileset_meta.zig").load(

@@ -1656,7 +1656,7 @@ test "steering sources path request start level from movement scope level" {
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
     try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
-    try pathfinding.rebuildStaticNavGridWithWorld(&data, &world, 160, 160, 32, null);
+    try pathfinding.rebuildStaticNavGridWithWorld(&data, &world, null);
     try std.testing.expect(pathfinding.graph.levelCount() >= 3);
 
     var frame = SimulationFrame.init(std.testing.allocator);

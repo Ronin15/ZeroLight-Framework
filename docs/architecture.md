@@ -80,7 +80,9 @@ Designs start here, then read the live structure below (rules:
 - `src/game/world_terrain.zig` holds `WorldSystem`'s chunk-owned terrain
   storage: per dense layer a chunk directory over a pool of tile blocks, per
   level a band list, a composed movement-blocked directory over a pool of bit
-  blocks, and lazy link-endpoint list heads.
+  blocks, and per-chunk link-endpoint list heads, all sized at level create.
+- `src/game/world_test_support.zig` holds test-only `WorldSystem` fixtures shared
+  across modules (a demo surface at any chunk edge, terrain pool warmup).
 - `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
   renderer-owned GPU tile store: resident layers' directory slots, the block
   allocator, and the queued cell edits it plans and commits each frame.
@@ -424,7 +426,9 @@ Large world surfaces belong to state-owned world storage rather than
 source-rect columns, level base-z columns, dense layers, and sparse tile
 columns. Dense tiles live per chunk: each layer's chunk directory holds a
 uniform tile or a block index into a pool of chunk-sized tile blocks, and a
-block returns to uniform when its last differing cell goes back to the fill.
+block returns to uniform when a write leaves its in-level cells holding one
+tile, whichever tile (an O(1) count of unequal neighbors along a row-major cell
+chain). Pool growth is counted (`terrain_pool_grows`) and logged once.
 Each level keeps its band list and composed movement-blocked bits per chunk
 (OPEN, BLOCKED, or a bit block), so `levelBlocksMovement` is O(1) and a write
 recomposes only its own cell. Level links are append-only and indexed per
@@ -749,8 +753,9 @@ stack their escalated cost into a single frame. A blocked
 goal projects to the nearest open cell on the goal level
 (`path_goal_projected`); `unavailable` is reserved for definitive negatives
 (disconnected component, no open cell near the goal, or no corridor across levels). With a world,
-nav takes the world's `tile_size` and `chunk_size_tiles`; `nav_cell_size` and
-`nav_chunk_tiles` shape only a world-less build. Index widths fail loud
+nav takes the world's width, height, `tile_size`, and `chunk_size_tiles`
+(`NavExtent.world`); bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a
+world-less build. Index widths fail loud
 (`validateChunkGrid`) at world create, level add, and nav build: the chunk edge,
 u32 level cell indices, and u32 chunk labels (`chunks × (edge² + 1)` below
 `no_cell`); the u16 level index fails with `WorldLevelOverflow`. Oversized worlds fail
@@ -858,8 +863,8 @@ graph stale. Unaffected chunks are never touched, and the whole-world build runs
 only at init. The abstract SLOT GEOMETRY — the per-chunk perimeter slots plus the
 per-chunk interior link-endpoint runs that index portal nodes — is a pure function of the
 dimensions and the INIT-TIME link set, computed once by `computePortalGeometry`; the
-incremental patch never renumbers it. A `LevelLink` ADDED at runtime (e.g.
-`dig_controller.digRamp` carving a ramp) is therefore handled by endpoint: a PERIMETER
+incremental patch never renumbers it. A `LevelLink` ADDED at runtime (e.g. a ramp
+dig through `DigController.commitWorldEdit`) is therefore handled by endpoint: a PERIMETER
 endpoint keeps its positional slot and is admitted as a portal incrementally, while an
 INTERIOR endpoint has no reserved slot and is DEFERRED — `tryLinkPortal` skips it, leaving
 it non-live in the abstract graph (no portal node), exactly as a blocked endpoint would,
