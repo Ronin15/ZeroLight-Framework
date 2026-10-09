@@ -19,9 +19,11 @@ How the renderer works: `docs/rendering-assets-shaders.md`.
 - Material descriptors list resource counts only and build shader paths with
   `shader_paths` helpers, never literal strings. Adding a material or shader
   follows the checklist in the rendering doc.
-- Presentation and debug-UI state stay in the renderer and debug-overlay path,
-  never in gameplay state or `DataSystem`. States gate debug draws on
-  `RenderContext.debug_overlay_visible` and own no toggle.
+- World render state (visibility window, draw records, GPU tile residency and
+  mirror) lives in `WorldSystem`'s render path (`docs/architecture.md`); other
+  presentation and debug-UI state stays in the renderer and debug-overlay
+  path. None of it is in `DataSystem` or read by simulation. States gate
+  debug draws on `RenderContext.debug_overlay_visible` and own no toggle.
 - Workers never read live renderer resource slots: snapshot texture metadata
   before dispatch and build draw groups on the main thread.
 
