@@ -51,7 +51,34 @@ const world_interest = @import("world_interest.zig");
 
 pub const TileId = u16;
 pub const invalid_tile_id: TileId = std.math.maxInt(TileId);
-pub const default_chunk_size_tiles: u16 = 8;
+pub const default_chunk_size_tiles: u16 = 16;
+/// Largest chunk edge. Terrain, nav, and scope share one edge: a power of two in
+/// [1, max_chunk_size_tiles].
+pub const max_chunk_size_tiles: u16 = 16;
+
+pub const ChunkGridError = error{ InvalidChunkSize, LevelCellIndexOverflow, ChunkLabelOverflow };
+
+// Cell indices and chunk-local labels are u32 with maxInt as the "none" sentinel.
+const chunk_grid_index_sentinel: u64 = std.math.maxInt(u32);
+
+/// O(1) loud index-width check for one level of `width` x `height` cells cut into
+/// `chunk_size`-cell chunks: the edge is a power of two in [1, max_chunk_size_tiles],
+/// every cell index is below the u32 sentinel, and so is every chunk-local label
+/// (`chunk * (chunk_size² + 1) + local`). World create, level add, and the nav build
+/// call it before sizing anything from these widths.
+pub fn validateChunkGrid(width: usize, height: usize, chunk_size: u16) ChunkGridError!void {
+    if (chunk_size == 0 or chunk_size > max_chunk_size_tiles or !std.math.isPowerOfTwo(chunk_size)) {
+        return error.InvalidChunkSize;
+    }
+    const cell_count = std.math.mul(u64, width, height) catch return error.LevelCellIndexOverflow;
+    if (cell_count >= chunk_grid_index_sentinel) return error.LevelCellIndexOverflow;
+    const chunk_edge: u64 = chunk_size;
+    const chunks_x = width / chunk_edge + @intFromBool(width % chunk_edge != 0);
+    const chunks_y = height / chunk_edge + @intFromBool(height % chunk_edge != 0);
+    const chunk_count = std.math.mul(u64, chunks_x, chunks_y) catch return error.ChunkLabelOverflow;
+    const label_space = std.math.mul(u64, chunk_count, chunk_edge * chunk_edge + 1) catch return error.ChunkLabelOverflow;
+    if (label_space >= chunk_grid_index_sentinel) return error.ChunkLabelOverflow;
+}
 // Z gap between stacked levels (planes). Exceeds the WorldDepth band span so a
 // lower plane's bands never sort above a higher plane's. Levels descend by this
 // step: level 0 (surface) is highest, deeper levels lower.
@@ -462,12 +489,13 @@ pub const WorldSystem = struct {
             .width = @max(config.width_tiles, 1),
             .height = @max(config.height_tiles, 1),
             .tile_size = meta.tileSize(),
-            .chunk_size_tiles = @max(config.chunk_size_tiles, 1),
+            .chunk_size_tiles = config.chunk_size_tiles,
             .atlas_texture = atlasTextureDesc(meta),
             .render_window = config.render_window,
             .max_dense_bands_per_level = config.max_dense_bands_per_level,
             .max_dense_tile_gpu_bytes = config.max_dense_tile_gpu_bytes,
         };
+        try validateChunkGrid(world.width, world.height, world.chunk_size_tiles);
         errdefer world.deinit();
 
         try world.buildCatalog(meta);
@@ -513,6 +541,17 @@ pub const WorldSystem = struct {
         bounds_width: f32,
         bounds_height: f32,
     ) !WorldSystem {
+        return initDemoFromMetaWithChunkSize(allocator, meta, bounds_width, bounds_height, default_chunk_size_tiles);
+    }
+
+    /// `initDemoFromMeta` with an explicit chunk edge, which must pass `validateChunkGrid`.
+    pub fn initDemoFromMetaWithChunkSize(
+        allocator: std.mem.Allocator,
+        meta: *const WorldTilesetMeta,
+        bounds_width: f32,
+        bounds_height: f32,
+        chunk_size_tiles: u16,
+    ) !WorldSystem {
         const tile_size = meta.tileSize();
         const width = ceilTiles(bounds_width, tile_size);
         const height = ceilTiles(bounds_height, tile_size);
@@ -521,9 +560,10 @@ pub const WorldSystem = struct {
             .width = width,
             .height = height,
             .tile_size = tile_size,
-            .chunk_size_tiles = default_chunk_size_tiles,
+            .chunk_size_tiles = chunk_size_tiles,
             .atlas_texture = atlasTextureDesc(meta),
         };
+        try validateChunkGrid(world.width, world.height, world.chunk_size_tiles);
         errdefer world.deinit();
 
         try world.buildCatalog(meta);
@@ -1662,7 +1702,11 @@ pub const WorldSystem = struct {
         return level;
     }
 
+    // Every level of a world, whether built, literal-constructed, or added in play,
+    // enters here, so the loud index-width checks run before anything is sized
+    // from them.
     fn appendLevelBaseZ(self: *WorldSystem, base_z: i32) !u16 {
+        try validateChunkGrid(self.width, self.height, self.chunk_size_tiles);
         const index = self.level_base_z.items.len;
         if (index > std.math.maxInt(u16)) return error.WorldLevelOverflow;
         try self.level_base_z.ensureUnusedCapacity(self.allocator, 1);
@@ -2332,7 +2376,7 @@ fn testWorldMeta() !WorldTilesetMeta {
 }
 
 /// Minimal grass-filled surface world (one dense floor layer, one chunk when
-/// `chunk_size_tiles >= max(width,height)`). Prefer this over `initDemoFromMeta`
+/// `max(width,height) <= max_chunk_size_tiles`). Prefer this over `initDemoFromMeta`
 /// in unit tests that only need levels/dense layers, not demo terrain paint.
 fn testMinimalSurfaceWorld(meta: *const WorldTilesetMeta, width: u16, height: u16) !WorldSystem {
     var world = WorldSystem{
@@ -2340,7 +2384,7 @@ fn testMinimalSurfaceWorld(meta: *const WorldTilesetMeta, width: u16, height: u1
         .width = width,
         .height = height,
         .tile_size = meta.tileSize(),
-        .chunk_size_tiles = @max(width, height),
+        .chunk_size_tiles = max_chunk_size_tiles,
     };
     errdefer world.deinit();
     try world.buildCatalog(meta);
@@ -2760,8 +2804,8 @@ test "world chunks map cells by chunk size" {
     // Pure coord math: two chunks wide/tall is enough; no catalog or demo paint.
     var world = WorldSystem{
         .allocator = std.testing.allocator,
-        .width = 16,
-        .height = 16,
+        .width = 2 * default_chunk_size_tiles,
+        .height = 2 * default_chunk_size_tiles,
         .tile_size = 32,
         .chunk_size_tiles = default_chunk_size_tiles,
     };
@@ -2773,6 +2817,62 @@ test "world chunks map cells by chunk size" {
     const next = world.chunkCoordForCell(default_chunk_size_tiles, default_chunk_size_tiles);
     try std.testing.expectEqual(@as(i32, 1), next.x);
     try std.testing.expectEqual(@as(i32, 1), next.y);
+}
+
+test "world create rejects a chunk size that is zero, not a power of two, or above the maximum" {
+    for ([_]u16{ 0, 3, 6, 12, 2 * max_chunk_size_tiles }) |bad_chunk_size| {
+        var world = WorldSystem{
+            .allocator = std.testing.allocator,
+            .width = 16,
+            .height = 16,
+            .tile_size = 32,
+            .chunk_size_tiles = bad_chunk_size,
+        };
+        defer world.deinit();
+        try std.testing.expectError(error.InvalidChunkSize, world.addLevel(0));
+        try std.testing.expectEqual(@as(usize, 0), world.levelCount());
+    }
+    var chunk_size: u16 = 1;
+    while (chunk_size <= max_chunk_size_tiles) : (chunk_size *= 2) {
+        try validateChunkGrid(16, 16, chunk_size);
+    }
+
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    try std.testing.expectError(error.InvalidChunkSize, WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, 64, 64, 12));
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    try std.testing.expectError(error.InvalidChunkSize, WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, .{
+        .width_tiles = 16,
+        .height_tiles = 16,
+        .chunk_size_tiles = 2 * max_chunk_size_tiles,
+        .underground_level_count = 0,
+    }, &threads));
+}
+
+test "chunk label width fails loudly at its u32 boundary" {
+    // chunk_size 1 gives 2 labels per chunk: 65535 x 32768 cells is the largest
+    // 65535-wide level whose label space stays below the sentinel.
+    try validateChunkGrid(65535, 32768, 1);
+    try std.testing.expectError(error.ChunkLabelOverflow, validateChunkGrid(65535, 32769, 1));
+    // Largest edge: a 2048² level fits; a u16-wide level does not.
+    try validateChunkGrid(2048, 2048, max_chunk_size_tiles);
+    try std.testing.expectError(error.ChunkLabelOverflow, validateChunkGrid(65535, 65535, max_chunk_size_tiles));
+    // Cell indices reach the sentinel before any label does.
+    try std.testing.expectError(error.LevelCellIndexOverflow, validateChunkGrid(65537, 65535, max_chunk_size_tiles));
+    try std.testing.expectError(error.LevelCellIndexOverflow, validateChunkGrid(std.math.maxInt(usize), 2, 1));
+
+    // A world over the label boundary is refused at its first level, before any storage.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 65535,
+        .height = 32769,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    try std.testing.expectError(error.ChunkLabelOverflow, world.addLevel(0));
+    try std.testing.expectEqual(@as(usize, 0), world.levelCount());
 }
 
 test "world add level keeps chunks renderable without manual rebuild" {

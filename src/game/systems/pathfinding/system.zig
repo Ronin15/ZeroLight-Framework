@@ -435,6 +435,9 @@ pub const PathfindingSystem = struct {
         try self.rebuildStaticNavGridWithWorld(data, null, bounds_width, bounds_height, cell_size, null);
     }
 
+    /// Builds nav over `world` when present: nav cells are its tiles and nav chunks its
+    /// chunks, and `cell_size` is ignored. Fails loudly (`ChunkGridError`) when the nav
+    /// grid's index widths do not fit, before sizing anything from them.
     pub fn rebuildStaticNavGridWithWorld(
         self: *PathfindingSystem,
         data: *const DataSystem,
@@ -449,10 +452,15 @@ pub const PathfindingSystem = struct {
         }
         const level_count: usize = if (world) |world_system| @max(@as(usize, 1), world_system.levelCount()) else 1;
         const link_count: usize = if (world) |world_system| world_system.levelLinks().len else 0;
+        // With a world, a nav cell is a tile and a nav chunk is the world's chunk; `cell_size`
+        // and `capacity.nav_chunk_tiles` shape only a world-less build.
+        const nav_cell_size = if (world) |world_system| world_system.tile_size else cell_size;
+        const nav_chunk_tiles = if (world) |world_system| world_system.chunk_size_tiles else self.capacity.nav_chunk_tiles;
         // Load-time gate against the configured elastic-ceiling caps (see budgetForCapacity).
         // A population raise past it is never refused.
-        const budget = nav_memory.budgetForCapacity(self.capacity, level_count, link_count);
-        try self.graph.rebuild(data, world, bounds_width, bounds_height, cell_size, self.capacity.nav_chunk_tiles, budget, thread_system);
+        var budget = nav_memory.budgetForCapacity(self.capacity, level_count, link_count);
+        budget.chunk_tiles = nav_chunk_tiles;
+        try self.graph.rebuild(data, world, bounds_width, bounds_height, nav_cell_size, nav_chunk_tiles, budget, thread_system);
         // The init per-level builds (inside rebuild) grow each level's portal/edge
         // buffers to their real size; clearRetainingCapacity keeps that high-water mark.
         // A later incremental applyNavUpdates within the high-water mark allocates nothing; a
@@ -2480,7 +2488,7 @@ test "pathfinding cross-level link steers an off-level agent toward the start-le
     const grass = try requireTestTile(&meta, "grass");
 
     // 384px = 12x12 nav cells; level 0 and level 1 both open grass floors.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2534,7 +2542,7 @@ test "pathfinding cross-level goal with no link is unavailable, not pending fore
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2570,7 +2578,7 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
     const tree = try requireTestTile(&meta, "tree_0");
 
     // World with the level-1 link endpoint cell (2,2) blocked: the link is not live.
-    var blocked_world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var blocked_world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer blocked_world.deinit();
     _ = try blocked_world.addLevel(0);
     _ = try blocked_world.addDenseLayer(1, 0, .floor, grass);
@@ -2605,7 +2613,7 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
 
     // Identical world but the endpoint is open. Rebuilding the same system bumps
     // nav_version (invalidating the prior negative) and the link becomes live.
-    var open_world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var open_world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer open_world.deinit();
     _ = try open_world.addLevel(0);
     _ = try open_world.addDenseLayer(1, 0, .floor, grass);
@@ -2643,7 +2651,7 @@ test "pathfinding per-level obstacle independence: level 0 obstacle is absent on
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2690,7 +2698,7 @@ test "pathfinding multi-hop same-level corridor travels obstacle-free past a con
     // local), so a corridor exists. Driving the agent in single CELL steps toward each
     // returned waypoint and FAILING on any step into a blocked or non-adjacent cell
     // proves continuous obstacle-free travel -- not a straight-line snap.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer world.deinit();
     for (0..16) |y| {
         _ = try world.addSparseTile(0, 8, @intCast(y), tree, 0, .obstacle);
@@ -2779,7 +2787,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     // how many total portals exist. This proves seeding is per-level-bounded.
     var one_data = DataSystem.init(std.testing.allocator);
     defer one_data.deinit();
-    var one_world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var one_world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer one_world.deinit();
     var one_system = PathfindingSystem.init(std.testing.allocator);
     defer one_system.deinit();
@@ -2789,7 +2797,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
 
     var four_data = DataSystem.init(std.testing.allocator);
     defer four_data.deinit();
-    var four_world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var four_world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer four_world.deinit();
     _ = try four_world.addLevel(0);
     _ = try four_world.addLevel(0);
@@ -2815,7 +2823,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     for (extents) |extent| {
         var data = DataSystem.init(std.testing.allocator);
         defer data.deinit();
-        var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+        var world = try test_support.abstractTestWorld(&meta, extent, extent);
         defer world.deinit();
         var system = PathfindingSystem.init(std.testing.allocator);
         defer system.deinit();
@@ -2841,7 +2849,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2921,7 +2929,7 @@ test "pathfinding directed link traverses one way only" {
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2978,7 +2986,7 @@ test "pathfinding cross-level corridor stays obstacle-free on the destination le
 
     // Level 0 open; level 1 open except a concave wall between the link exit (2,2)
     // and the goal (13,8), forcing the destination-level segment to route around it.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -3059,7 +3067,7 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -3191,7 +3199,7 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -3393,7 +3401,7 @@ test "pathfinding warmed cross-level abstract solve does not allocate" {
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -3453,7 +3461,7 @@ fn tileCenter(cx: u16, cy: u16) math.Vec2 {
 fn buildCorridorWorld(meta: *const @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta, open_rows: []const u16) !struct { world: WorldSystem, wall_layer: usize } {
     const grass = try requireTestTile(meta, "grass");
     const tree = try requireTestTile(meta, "tree_0");
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, meta, 384, 384);
+    var world = try test_support.abstractTestWorld(meta, 384, 384);
     errdefer world.deinit();
     const wall_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
     var y: u16 = 0;
@@ -3675,7 +3683,7 @@ test "pathfinding incremental update leaves an unaffected second level untouched
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     const level1_layer = try world.addDenseLayer(1, 0, .floor, grass);
@@ -3714,7 +3722,7 @@ test "pathfinding incremental update with no real change does no work" {
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -3741,7 +3749,7 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
     // 512 extent at cell_size 32 is 16 nav cells/side; with 4-tile chunks that is a 4x4 chunk
     // grid, so the far block below lands in the opposite-corner chunk from the near block.
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -3786,6 +3794,66 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
     try system.markNavDirty(0, 0, 0);
     system.clearNavDirty();
     try std.testing.expect(!system.hasPendingNavUpdates());
+}
+
+test "nav over a world takes the world's chunk edge and tile size; a world-less build takes its config" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    // World chunk 8 and a deliberately different config: nav chunk 16, cell size 8.
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, 512, 256, 8);
+    defer world.deinit();
+    var capacity = baselineCapacity();
+    capacity.nav_chunk_tiles = 16;
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, world.worldWidthPixels(), world.worldHeightPixels(), 8, null);
+    try std.testing.expectEqual(world.chunk_size_tiles, system.graph.chunk_tiles);
+    try std.testing.expectEqual(world.tile_size, system.graph.cell_size);
+    try std.testing.expectEqual(@as(usize, world.width), system.graph.width);
+    try std.testing.expectEqual(@as(usize, world.height), system.graph.height);
+    const level_grid = system.graph.grid(0).?;
+    try std.testing.expectEqual(world.chunk_size_tiles, level_grid.chunk_tiles);
+    try std.testing.expectEqual(@as(usize, world.chunksX()), level_grid.chunksX());
+    try std.testing.expectEqual(@as(usize, world.chunksY()), level_grid.chunksY());
+    // Every tile's nav chunk is its world chunk.
+    for (0..world.height) |y| {
+        for (0..world.width) |x| {
+            const tile_chunk = world.chunkCoordForCell(@intCast(x), @intCast(y));
+            const expected: u32 = @intCast(tile_chunk.y * @as(i32, world.chunksX()) + tile_chunk.x);
+            try std.testing.expectEqual(expected, level_grid.chunkOfCell(y * level_grid.width + x));
+        }
+    }
+
+    try system.rebuildStaticNavGrid(&data, 512, 256, 8);
+    try std.testing.expectEqual(capacity.nav_chunk_tiles, system.graph.chunk_tiles);
+    try std.testing.expectEqual(@as(f32, 8), system.graph.cell_size);
+}
+
+test "nav build fails loudly when its chunk edge or index widths do not fit" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var bad_edge = baselineCapacity();
+    bad_edge.nav_chunk_tiles = 3;
+    var bad_edge_system = PathfindingSystem.init(std.testing.allocator);
+    defer bad_edge_system.deinit();
+    try bad_edge_system.reserve(bad_edge);
+    try std.testing.expectError(error.InvalidChunkSize, bad_edge_system.rebuildStaticNavGrid(&data, 256, 256, 32));
+
+    // Chunk edge 1 gives 2 labels per chunk. 65535 x 32768 cells clears the label check and
+    // stops at the memory gate; one more row crosses the label sentinel first.
+    var unit_edge = baselineCapacity();
+    unit_edge.nav_chunk_tiles = 1;
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(unit_edge);
+    try std.testing.expectError(error.NavWorldTooLarge, system.rebuildStaticNavGrid(&data, 65535, 32768, 1));
+    try std.testing.expectError(error.ChunkLabelOverflow, system.rebuildStaticNavGrid(&data, 65535, 32769, 1));
+    try std.testing.expectError(error.LevelCellIndexOverflow, system.rebuildStaticNavGrid(&data, 1.0e6, 1.0e6, 1));
 }
 
 test "reactToPostCommitNavEvents preserves buffered marks across a failed apply instead of dropping them" {
@@ -3847,7 +3915,7 @@ test "reactToPostCommitNavEvents maps world_obstacle_changed to one cell-span (n
     // 256 world units / 32 cell size = 8 nav cells; with nav_chunk_tiles=4 that is a
     // 2×2 chunk grid so a rect crossing x=4 spans two chunks on the same row.
     const extent: f32 = 256;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -4103,7 +4171,7 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     const tree = try requireTestTile(&meta, "tree_0");
 
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -4168,7 +4236,7 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     // Opening a block later expands the abstract graph past it. This is the documented
     // amortized-growth exception (a cold, event-triggered path), NOT the alloc-free
     // contract: it must SUCCEED and produce the new topology, using the real allocator.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     const wall_layer = try world.addDenseLayer(0, 0, .obstacle, tree);
     var y: u16 = 0;
@@ -4230,7 +4298,7 @@ test "pathfinding incremental update flips cross-level link liveness when the en
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     const level1_floor = try world.addDenseLayer(1, 0, .floor, grass);

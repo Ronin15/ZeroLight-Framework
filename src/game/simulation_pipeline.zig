@@ -394,6 +394,8 @@ pub const SimulationPipelineConfig = struct {
     /// `SimulationPipeline.syncPopulationCapacity` grows it.
     movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
+    /// Nav cell size for a world-less nav build. With `navigation_world`, nav cells are
+    /// its tiles and nav chunks its chunks.
     nav_cell_size: f32 = 32.0,
     navigation_world: ?*const WorldSystem = null,
     /// When set, the one-time static nav build fans mask/abstract work across levels.
@@ -3153,7 +3155,7 @@ fn shareTestWorld() !WorldSystem {
         .width = 64,
         .height = 1,
         .tile_size = 32,
-        .chunk_size_tiles = 64,
+        .chunk_size_tiles = 16,
     };
     errdefer world.deinit();
     _ = try world.addLevel(0);
@@ -3572,10 +3574,10 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
-    // 16 tiles wide × default chunk_size 8 → two chunks on X. Surface (level 0)
+    // 16 tiles wide × chunk_size 8 → two chunks on X. Surface (level 0)
     // is fully walkable so the tile gate cannot undo the contact push.
     const tile_size = meta.tileSize();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, tile_size * 16, tile_size * 8);
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 8);
     defer world.deinit();
     try std.testing.expectEqual(@as(u16, 8), world.chunk_size_tiles);
 
@@ -3655,6 +3657,76 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     try std.testing.expectEqual(settled.y, meta_after.chunk.y);
     // Contact must have crossed the chunk-0 / chunk-1 boundary (cell 8 = chunk 1).
     try std.testing.expect(settled.x >= 1);
+}
+
+test "pipeline scope chunks and nav chunks are the world's chunks" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    // 16 x 8 tiles in 4-tile chunks: a 4 x 2 chunk grid.
+    const tile_size = meta.tileSize();
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 4);
+    defer world.deinit();
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    try data.setWorldLevel(player.entity, 0);
+    placePlayerFlush(&data, player, .{ 9, 5 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    // The world-less nav knobs differ from the world on purpose; the world wins.
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, tile_size * 16, tile_size * 8, .{
+        .contact_capacity = 8,
+        .nav_cell_size = tile_size / 4,
+        .navigation_world = &world,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+            .nav_chunk_tiles = 16,
+        },
+    });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(world.chunk_size_tiles, pipeline.pathfinding.graph.chunk_tiles);
+    try std.testing.expectEqual(world.tile_size, pipeline.pathfinding.graph.cell_size);
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = tile_size * 16,
+        .bounds_height = tile_size * 8,
+        .sim_view = fullWorldSimView(&world),
+    });
+
+    const body = data.movementBodyConst(player.entity).?;
+    const world_chunk = world.chunkCoordForWorldPos(body.position.x, body.position.y);
+    try std.testing.expectEqual(@as(i32, 2), world_chunk.x);
+    try std.testing.expectEqual(@as(i32, 1), world_chunk.y);
+    const scope_chunk = data.simulationMetadata(player.entity).?.chunk;
+    try std.testing.expectEqual(world_chunk.x, scope_chunk.x);
+    try std.testing.expectEqual(world_chunk.y, scope_chunk.y);
+    const nav_grid = pipeline.pathfinding.graph.grid(0).?;
+    const nav_cell = nav_grid.indexForCell(nav_grid.worldToCellClamped(body.position)).?;
+    const world_chunk_index: u32 = @intCast(world_chunk.y * @as(i32, world.chunksX()) + world_chunk.x);
+    try std.testing.expectEqual(world_chunk_index, nav_grid.chunkOfCell(nav_cell));
 }
 
 test "pipeline plane traversal batches fall landing tile events into one range" {

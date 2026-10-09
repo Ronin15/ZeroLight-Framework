@@ -1726,7 +1726,7 @@ fn minimalWorld(allocator: std.mem.Allocator, width: u16, height: u16, tile_size
         .width = width,
         .height = height,
         .tile_size = tile_size,
-        .chunk_size_tiles = width,
+        .chunk_size_tiles = @import("../world_system.zig").max_chunk_size_tiles,
     };
     _ = try world.addLevel(0);
     return world;

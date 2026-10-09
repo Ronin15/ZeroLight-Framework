@@ -134,8 +134,9 @@ pub const default_max_nav_memory_bytes: usize = 512 * 1024 * 1024;
 // Bounded outward radius (in cells) for projecting a blocked goal to the nearest
 // open cell on its level.
 pub const default_goal_projection_radius: i32 = 16;
-// Side length (in nav cells) of one abstract chunk. The chunk-portal graph is the
-// structure that bounds per-query work independent of total cell count.
+// Side length (in nav cells) of one abstract chunk for a world-less nav build; with a
+// world, nav chunks are the world's chunks. The chunk-portal graph is the structure that
+// bounds per-query work independent of total cell count.
 pub const default_nav_chunk_tiles: u16 = 16;
 // Slack multiplier applied to a chunk's measured init edge count to size its fixed edge
 // window, so an in-place dig that adds a few edges stays within the window instead of
@@ -440,7 +441,7 @@ pub const PathfindingCapacity = struct {
     max_explored_nodes: usize = default_max_explored_nodes,
     max_stored_path_cells: usize = default_max_stored_path_cells,
     // Abstract chunk-portal tier sizing. nav_chunk_tiles sets the abstract chunk side
-    // length. max_abstract_nodes/max_stitched_path_cells bound the ESCALATED (tier-1)
+    // length of a world-less build (a world supplies its own). max_abstract_nodes/max_stitched_path_cells bound the ESCALATED (tier-1)
     // abstract A*/stitched-corridor work — FIXED constants (default_tier1_*), never
     // derived from or scaled to world/graph size (see those constants' doc comments).
     nav_chunk_tiles: u16 = default_nav_chunk_tiles,

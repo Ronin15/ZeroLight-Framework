@@ -13,6 +13,7 @@ const logging = @import("../../../core/logging.zig");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
+const validateChunkGrid = @import("../../world_system.zig").validateChunkGrid;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
@@ -37,6 +38,11 @@ const GridCell = types.GridCell;
 const setLen = types.setLen;
 const octileCells = types.octileCells;
 const orderU32 = types.orderU32;
+
+// `validateChunkGrid` bounds cell indices and chunk labels below maxInt(u32).
+comptime {
+    std.debug.assert(no_cell == std.math.maxInt(u32));
+}
 
 // Re-exported from types so callers can import either module.
 pub const PortalNode = types.PortalNode;
@@ -469,18 +475,24 @@ pub const NavGraph = struct {
         const safe_cell_size = if (std.math.isFinite(cell_size) and cell_size > 0) cell_size else 1.0;
         const safe_w: f32 = if (std.math.isFinite(bounds_width) and bounds_width > 0) bounds_width else 0;
         const safe_h: f32 = if (std.math.isFinite(bounds_height) and bounds_height > 0) bounds_height else 0;
+        if (world) |world_system| {
+            std.debug.assert(cell_size == world_system.tile_size);
+            std.debug.assert(chunk_tiles == world_system.chunk_size_tiles);
+        }
+        const width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_w / safe_cell_size))));
+        const height = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_h / safe_cell_size))));
+        // Cell indices and chunk labels are u32 below `no_cell`; fail loud before any
+        // dimension is stored or array sized.
+        try validateChunkGrid(width, height, chunk_tiles);
         self.cell_size = safe_cell_size;
-        self.chunk_tiles = @max(@as(u16, 1), chunk_tiles);
-        self.width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_w / safe_cell_size))));
-        self.height = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_h / safe_cell_size))));
+        self.chunk_tiles = chunk_tiles;
+        self.width = width;
+        self.height = height;
 
         // Fail loud at build instead of degrading at query time.
         try memory_budget.check(self.width, self.height);
 
-        const level_count: u16 = if (world) |world_system|
-            @intCast(@max(@as(usize, 1), world_system.levelCount()))
-        else
-            1;
+        const level_count: usize = if (world) |world_system| @max(@as(usize, 1), world_system.levelCount()) else 1;
 
         self.version +%= 1;
         if (self.version == 0) self.version = 1;
@@ -1901,7 +1913,7 @@ test "incremental nav update remask matches the composed world mask across level
     );
     defer meta.deinit();
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    var world = try test_support.abstractTestWorld(&meta, 256, 256);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -1971,7 +1983,7 @@ test "threaded initial nav build matches a serial build across levels" {
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    var world = try test_support.abstractTestWorld(&meta, 256, 256);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
     try std.testing.expect(world.levelCount() > 1);
@@ -2004,7 +2016,7 @@ test "whole-level dirty re-derives the level from the world and matches a full r
     const tree = try requireTestTile(&meta, "tree_0");
 
     // 12x12 open world, 4-tile chunks (abstractCapacity) -> a 3x3 chunk grid.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     const obstacle_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -2054,7 +2066,7 @@ test "incremental nav update splitting a chunk-local component matches a full re
 
     // 12x12 open world, 4-tile chunks. Chunk (1,1) spans cells x4..7, y4..7 and starts
     // as one open local component.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -2104,7 +2116,7 @@ test "incremental nav update on a chunk border flips a neighbor chunk's portal" 
     // an isolated 1-cell run, so it is unambiguously the run's own representative portal
     // under discoverChunkPortals' run consolidation (see that function's doc comment),
     // rather than depending on which cell a multi-cell run's midpoint happens to land on.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     const isolation_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
     for ([_]u16{ 4, 6, 7 }) |wy| {
@@ -2183,7 +2195,7 @@ test "incremental nav update opening a ramp endpoint adds a live LevelLink edge"
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2234,7 +2246,7 @@ test "runtime interior link endpoint is deferred by the incremental patch, then 
 
     // 4-tile chunks (abstractCapacity): cell (2,2) is interior to chunk (0,0); (3,2) is a
     // diggable perimeter neighbor in the same chunk that triggers the chunk's incremental patch.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2286,7 +2298,7 @@ test "incremental underground dig leaves the surface level abstract graph byte-i
     // Open 12x12 surface (level 0) spanning many 4-tile chunks, plus an underground
     // level 1 with a diggable obstacle. The surface graph is large (the regression the
     // per-level split targets); an underground dig must do ZERO work on it.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2345,7 +2357,7 @@ test "incremental dig keeps the changed level's portal slots byte-identical to a
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(1, 0, .floor, grass);
@@ -2382,7 +2394,7 @@ test "incremental nav update applies the same edit batch deterministically" {
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -2432,7 +2444,7 @@ test "incremental dig overflowing a chunk edge window falls back to a full rebui
     // Wall the whole world at init so every chunk's edge window is sized to the floor. Then
     // open a large block so an affected chunk's edges blow past the floor*slack window,
     // forcing the loud edge-cap fallback.
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     const wall_layer = try world.addDenseLayer(0, 0, .obstacle, tree);
     var y: u16 = 0;
@@ -2486,7 +2498,7 @@ test "compactChunkEdges zeroes the chunk's edge counts on overflow instead of le
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    var world = try test_support.abstractTestWorld(&meta, 256, 256);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -2526,7 +2538,7 @@ test "compactChunkEdges keeps portal_edge_start in-bounds for the last chunk on 
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    var world = try test_support.abstractTestWorld(&meta, 256, 256);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -2583,7 +2595,7 @@ test "incremental single-chunk dig patches a constant chunk set independent of w
         const grass = try requireTestTile(&meta, "grass");
         const tree = try requireTestTile(&meta, "tree_0");
 
-        var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+        var world = try test_support.abstractTestWorld(&meta, extent, extent);
         defer world.deinit();
         const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -2612,7 +2624,7 @@ test "incremental nav update across distant chunks in one batch matches a full r
     // 512 extent at cell_size 32 is 16 nav cells/side; with 4-tile chunks that is a 4x4 chunk
     // grid, so the two digs below land in opposite-corner chunks with clear space between them.
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -2663,7 +2675,7 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
     const tree = try requireTestTile(&meta, "tree_0");
 
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -2718,7 +2730,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild"
     const tree = try requireTestTile(&meta, "tree_0");
 
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -2772,7 +2784,7 @@ test "entity obstacle create/destroy patches a constant chunk set independent of
         var meta = try loadTestWorldMeta(std.testing.allocator);
         defer meta.deinit();
 
-        var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+        var world = try test_support.abstractTestWorld(&meta, extent, extent);
         defer world.deinit();
 
         var system = PathfindingSystem.init(std.testing.allocator);
@@ -2821,7 +2833,7 @@ test "entity obstacle move marks both old and new spans dirty at a distance-inde
         var meta = try loadTestWorldMeta(std.testing.allocator);
         defer meta.deinit();
 
-        var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+        var world = try test_support.abstractTestWorld(&meta, extent, extent);
         defer world.deinit();
 
         var system = PathfindingSystem.init(std.testing.allocator);
@@ -2868,7 +2880,7 @@ test "overlapping static bodies: destroying one leaves the shared cell blocked b
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -2906,7 +2918,7 @@ test "static-to-dynamic-to-static toggle blocks and unblocks in place without mo
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
 
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -2948,7 +2960,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild 
     const tree = try requireTestTile(&meta, "tree_0");
 
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -2993,7 +3005,7 @@ test "entity-obstacle rect nav update is allocation-free at steady state" {
     defer meta.deinit();
 
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -3046,7 +3058,7 @@ test "threaded multi-worker chunk patch/remask is allocation-free at steady stat
     const tree = try requireTestTile(&meta, "tree_0");
 
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
     const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
 
@@ -3146,7 +3158,7 @@ test "reactToPostCommitNavEvents appends both old and new obstacle spans for one
     defer meta.deinit();
 
     const extent: f32 = 512;
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    var world = try test_support.abstractTestWorld(&meta, extent, extent);
     defer world.deinit();
 
     var system = PathfindingSystem.init(std.testing.allocator);

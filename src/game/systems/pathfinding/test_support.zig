@@ -18,6 +18,7 @@ const manifest = @import("../../../assets/manifest.zig");
 const world_tileset_meta = @import("../../../assets/world_tileset_meta.zig");
 const WorldTilesetMeta = world_tileset_meta.WorldTilesetMeta;
 const TileId = @import("../../world_system.zig").TileId;
+const WorldSystem = @import("../../world_system.zig").WorldSystem;
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
     const entity = try data.createEntity();
@@ -80,4 +81,10 @@ pub fn abstractCapacity() PathfindingCapacity {
         .max_stitched_path_cells = 256,
         .min_group_field_agents = 1,
     };
+}
+
+// Demo-painted world whose chunk edge is `abstractCapacity`'s nav chunk, so a world-backed
+// abstract test and a world-less one share the same small multi-chunk geometry.
+pub fn abstractTestWorld(meta: *const WorldTilesetMeta, bounds_width: f32, bounds_height: f32) !WorldSystem {
+    return WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, meta, bounds_width, bounds_height, abstractCapacity().nav_chunk_tiles);
 }

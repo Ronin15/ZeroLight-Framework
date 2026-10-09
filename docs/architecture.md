@@ -23,7 +23,9 @@ Designs start here, then read the live structure below (rules:
 - **Chunk** `(level, cx, cy)`: the unit of terrain and nav storage, change,
   work, threading, and save. A dig, ramp, or cave-in costs work in the chunks
   it touches. Nav covers the whole world; residency is a chunk's storage form,
-  never its presence in the simulation.
+  never its presence in the simulation. Terrain, nav, and scope share one
+  chunk edge, `WorldSystem.chunk_size_tiles` (a power of two up to 16, default
+  16), and a nav cell is a tile.
 - **Nav:** processed per chunk, so threading scales with any number of
   requests under a fixed per-step budget.
 - **Populations, items, links:** grow in play at the structural-commit seam.
@@ -715,7 +717,12 @@ attempts one fixed step admits, so several simultaneously-stuck agents cannot
 stack their escalated cost into a single frame. A blocked
 goal projects to the nearest open cell on the goal level
 (`path_goal_projected`); `unavailable` is reserved for definitive negatives
-(disconnected component, no open cell near the goal, or no corridor across levels). Oversized worlds fail
+(disconnected component, no open cell near the goal, or no corridor across levels). With a world,
+nav takes the world's `tile_size` and `chunk_size_tiles`; `nav_cell_size` and
+`nav_chunk_tiles` shape only a world-less build. Index widths fail loud
+(`validateChunkGrid`) at world create, level add, and nav build: the chunk edge,
+u32 level cell indices, and u32 chunk labels (`chunks × (edge² + 1)` below
+`no_cell`); the u16 level index fails with `WorldLevelOverflow`. Oversized worlds fail
 loud at `NavGrid.rebuild` with `error.NavWorldTooLarge` rather than degrading at
 query time. The managed flow field is built only on declared group requests
 (zero cost otherwise), rebuilt only when the goal crosses a nav cell and at most

@@ -427,9 +427,6 @@ pub const GameDemoState = struct {
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .contact_capacity = pop_cap.contact_capacity,
             .movement_body_capacity = pop_cap.mover_count + obstacle_count + 1,
-            // 512x512 tiles at a 32px nav cell = one nav cell per tile, full
-            // resolution.
-            .nav_cell_size = 32,
             // Elastic pathfinding capacity tracks the live steering-agent crowd:
             // the per-step request/cache caps derive from the agent count
             // automatically, and the group-field threshold is the fixed default
