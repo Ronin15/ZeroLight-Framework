@@ -43,8 +43,11 @@ One world per gameplay state; nothing models a set of worlds.
   id (`Renderer.releaseTileStore`); nothing in game code releases it, so a
   world's store lives until `Renderer.deinit`.
 - Load-time checks that refuse: `NavMemoryBudget.check` (`NavWorldTooLarge`
-  at `max_nav_memory_bytes`). `validateDenseRenderBudget` keeps only the
-  presentation-side `DenseLayerWindowExceeded`.
+  at `max_nav_memory_bytes`). `DenseLayerWindowExceeded` still refuses
+  world creation past `k_max_dense_submit_stack_cap` or
+  `max_dense_bands_per_level`, and `addDenseLayer` past
+  `max_dense_bands_per_level` or `world_terrain.max_level_bands` (64G owns the
+  fix).
 
 ### Architecture notes
 

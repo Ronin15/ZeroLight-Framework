@@ -71,13 +71,13 @@ rules.
   (`.claude/rules/tests-benchmarks.md`); a slice that replaces a structure
   measures the old one first, so the baseline is measured, not derived.
 
-Every invariant stated, no restated code, no essays. End with the slice's
-Checklist refined into the plan's implementation steps, one line each; the
-design itself goes to the implementer, not into the slice file. Follow-ups are
-checklist items in this slice or an owning slice, or a new slice file stated as
-intent and constraints (roadmap index § Standard slice section shape; Status
-may be "gated on <trigger>"); an item you cannot plan fully is an open
-question. Cite an existing **Deferred By Owner**
+Every invariant stated, no restated code, no essays. End with the plan's
+implementation steps, one line each, for the implementer's brief; the design
+and its steps never go into the slice file. Follow-ups are checklist items in
+this slice or an owning slice, or a new slice file stated as intent and
+constraints (roadmap index § Standard slice section shape; Status may be "gated
+on <trigger>"); an item you cannot plan fully is an open question. Cite an
+existing **Deferred By Owner**
 entry, never add one.
 
 If a rule blocks the design the cost model says is right, name the rule file

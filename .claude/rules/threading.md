@@ -11,10 +11,10 @@ paths:
   implementation, under a named owner with immutable inputs and deterministic
   owned outputs. Small fixed or cold one-off work may stay serial; the cost
   model (`engine-design.md`) decides.
-- New threaded work follows the existing stage pattern (an optional
-  stage-threads value with its own tuner, `selectBatchProfile`,
-  `parallelForWithOptions`, per-participant scratch, an inline path); it adds
-  no new threading machinery.
+- New threaded processor or stage work follows the existing stage pattern (an
+  optional stage-threads value with its own tuner, `selectBatchProfile`,
+  `parallelForWithOptions`, per-participant scratch, an inline path); changes
+  to the threading machinery itself belong to `ThreadSystem` in `src/app/`.
 - Multi-threaded writes go, verifiably at the call site, to disjoint per-worker
   or per-range slots, never a shared appendable collection.
 - Reserve on the main thread strictly before dispatch, sized from the value the

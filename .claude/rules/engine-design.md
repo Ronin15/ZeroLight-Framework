@@ -50,9 +50,9 @@ Every design, and every fix touching storage or per-change work, states:
 - Where code already partitions by a unit (chunk, level, world), the first
   design evaluated has that unit own its storage and work. A shared arena,
   global rebuild, or level-wide shift needs a cost model that beats it.
-- If the existing structure cannot pass, redesign that structure; never patch
-  around it. Code, tests, and benches built on a failing structure go with it
-  and are never references or baselines.
+- If part of the existing structure cannot pass, redesign that part; never
+  patch around it. Code, tests, and benches built on a failing part go with
+  it and are never references or baselines.
 - Default is keep: replace only the parts that fail the cost model; replacing
   a part that passes needs a concrete performance or efficiency benefit
   against its cost and risk.

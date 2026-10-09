@@ -4,6 +4,9 @@ paths:
   - "src/platform/**"
   - "src/game/render_prep.zig"
   - "src/game/render_depth.zig"
+  - "src/game/world_system.zig"
+  - "src/game/world_gpu_tiles.zig"
+  - "src/game/world_terrain.zig"
   - "assets/shaders/**"
   - "build.zig"
 ---

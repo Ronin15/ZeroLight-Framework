@@ -19,7 +19,7 @@ with `zig build replay` (64C acceptance).
 | [64B](slice-64b.md) | Not started | 49, 50, 64A, 64G; before 46 | Checksum v2: NaN-canonical and counted, sectioned, terrain hashed per chunk on the thread system, comptime classification of all pipeline history, `normalizeDerivedState`, `buildFingerprint()` |
 | [64C](slice-64c.md) | Not started | 49, 51, 53B, 64B; before 57B | Headless `zig build replay` runner, session descriptor and build fingerprint in the replay header, New Game random seed root |
 | [64D](slice-64d.md) | Gated on the first simulation `atan2` consumer | 52D | Deterministic vector `atan2` |
-| [64G](slice-64g.md) | Not started | before 65B, 46 | Chunk-owned terrain and nav |
+| [64G](slice-64g.md) | In progress | before 65B, 46 | Chunk-owned terrain and nav |
 
 What makes the guarantee hold across targets:
 

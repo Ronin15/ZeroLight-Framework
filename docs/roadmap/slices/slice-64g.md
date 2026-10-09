@@ -2,7 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** Last work on `ai_update3`, before merge.
+**Status: in progress.** Last work on `ai_update3`, before merge. Kept as one
+slice by owner decision (2026-10-08).
 
 Goal: terrain and nav storage and work owned per chunk `(level, cx, cy)`, so a
 dig, ramp, cave-in, or explosion costs work only in the chunks it touches,
@@ -24,7 +25,8 @@ stages with per-stage tuners, cell-keyed level links, goal-keyed caches, and
 fixed node budgets with a two-attempt retry. Its storage, fallbacks, and
 per-change work are still sized by level, world, or content totals. Numbers are
 derived for one 2048² level (4,194,304 cells, 16-cell nav chunks, 16,384
-chunks); multiply by depth and world count.
+chunks); multiply by depth and world count. The defect lists describe main
+(`b39a46f`); the Checklist records what has landed since.
 
 Storage sized to level area:
 
@@ -172,9 +174,9 @@ Failure and limits:
 - [ ] Path search crosses chunks and levels through the chunked graph with
       budget-sized scratch; a cross-level path's cost follows path length, not
       levels explored; group flow fields not sized to level cells.
-- [ ] A level or world added in play builds only its own chunks, threaded, and
-      is never refused; other levels' nav, caches, and runtime state are
-      untouched.
+- [ ] A level added in play builds only its own chunks, threaded, and is never
+      refused; other levels' nav, caches, and runtime state are untouched; a
+      replaced world releases all its storage.
 - [x] Render terrain uploaded per chunk for the render window; dense layers
       added in play; GPU byte gate replaced by a report (`9bbfdc0`).
 - [ ] A world's GPU tile store is released when its world is destroyed or
@@ -188,6 +190,10 @@ Failure and limits:
       adding a link are never refused for capacity; index and format widths
       (cell, chunk, label, slot, edge offsets, level) fail loudly at world
       create, load, and growth. Index widths landed (`23c24ec`); gates remain.
+- [ ] World creation and dense-layer adds in play are never refused for
+      capacity: today `DenseLayerWindowExceeded` refuses at
+      `k_max_dense_submit_stack_cap`, `max_dense_bands_per_level`, and
+      `world_terrain.max_level_bands`.
 - [x] Replaced branch nav code and its tests removed; main's nav restored
       (`2c09cec`).
 - [ ] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
@@ -204,9 +210,10 @@ Failure and limits:
 
 - [ ] `chunk-scale-*` bench groups at 256², 1024², 2048², and 8 / 32 / 128
       levels (`.claude/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
-      explosion fill flat across sizes; level and world create and destroy flat
-      across depth and world count and linear in their own chunks. Fixtures
-      build once outside the timed loop and the groups run quickly in Debug.
+      explosion fill flat across sizes; level create and destroy flat across
+      depth and linear in their own chunks (the world-count axis is 74's).
+      Fixtures build once outside the timed loop and the groups run quickly in
+      Debug.
 - [ ] An A\* path of the same length costs the same at 2048² as at 256²
       (`pathfinding*` groups), and a cross-level path of the same length costs
       the same at 8, 32, and 128 levels.

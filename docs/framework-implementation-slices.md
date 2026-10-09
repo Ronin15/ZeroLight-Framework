@@ -54,8 +54,8 @@ files it links. Do not load the whole roadmap.
   end to end or keep every open item visible in the slice file.
 - Read [architecture.md](architecture.md) and the live owning modules first.
   The rules and architecture.md win over code; code that disagrees with them
-  is wrong. Code wins over stale slice prose. Module placement follows
-  architecture.md § Source Layout.
+  is wrong. Code wins over a stale Current foundation. Module placement
+  follows architecture.md § Source Layout.
 - Every slice follows the rules in `.claude/rules/`; a slice cites a rule file
   and never restates or adds a rule. A slice that needs a new rule has a
   checklist item to add it to the owning rule file when it lands. The planned
@@ -86,12 +86,14 @@ files it links. Do not load the whole roadmap.
    works out how to build the slice. The design goes to the implementer, not
    into the slice.
 4. **Implement only that slice's scope** in the owning `src/` modules.
-5. **Check off Checklist items** as each lands with its tests. Items marked
+5. **Review before commit** (`CLAUDE.md` § Agent Pipeline); fixes fold into
+   the commit.
+6. **Check off Checklist items** as each lands with its tests. Items marked
    "(added by Slice N)" are part of this slice's scope.
-6. **Pass every Acceptance check.**
-7. **Update durable docs** (`architecture.md`, rendering/sim docs) when
+7. **Pass every Acceptance check.**
+8. **Update durable docs** (`architecture.md`, rendering/sim docs) when
    contracts change, and Tables T1–T6 when a number moves.
-8. **Set Status**, run `zig build verify`, and when complete archive the file
+9. **Set Status**, run `zig build verify`, and when complete archive the file
    (Ground Rules). Follow-ups go into a slice Checklist or a new slice file.
 
 ### Standard slice section shape
@@ -100,7 +102,7 @@ files it links. Do not load the whole roadmap.
 | --- | --- |
 | Header line | Roadmap index link · Depends on (linked slices) · Track |
 | **Goal** | What "done" means for this chunk |
-| **Current foundation** | What already exists; build on it unless it fails the cost model (`.claude/rules/engine-design.md`), then replace it |
+| **Current foundation** | What already exists; build on it unless it fails the cost model (`.claude/rules/engine-design.md`), then replace the failing part |
 | **Architecture notes** / **Problem** | Constraints and ownership boundaries, citing rule files; never an internal design |
 | **Checklist** | `[ ]` / `[x]` intent-level steps — check off as you land each |
 | **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
@@ -159,7 +161,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**64B**](roadmap/slices/slice-64b.md) | Not started | Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74 |
 | [**64C**](roadmap/slices/slice-64c.md) | Not started | Headless Replay Runner, Session Descriptor, And New Game Seed Flow — after 49, 51, 53B, 64A, 64B, 74 |
 | [**64D**](roadmap/slices/slice-64d.md) | Gated: first simulation `atan2` consumer | Deterministic Vector `atan2` — after 52D |
-| [**64G**](roadmap/slices/slice-64g.md) | Not started | Chunk-Owned Terrain And Nav |
+| [**64G**](roadmap/slices/slice-64g.md) | In progress | Chunk-Owned Terrain And Nav |
 | [**65**](roadmap/slices/slice-65.md) | Not started (umbrella) | Threading Layout Cleanup And Background-Lane Heavy Consumers — after 50, 51 |
 | [**65A**](roadmap/slices/slice-65a.md) | Not started | Thread-Shared Layout Consolidation And Background-Lane OS Priority — after 50, 51 |
 | [**65B**](roadmap/slices/slice-65b.md) | Not started | Deferred Nav Rebuild On The Background Lane — after 51, 65A, 64G, 49, 64B |

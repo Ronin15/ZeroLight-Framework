@@ -48,4 +48,5 @@ bench numbers, decisions, deviations, and any validation that could not run.
 
 You cannot spawn agents. Recommend **zig-design-specialist** when a design is
 open or the structure fails the cost model, **zig-debug-specialist** when a
-failure needs diagnosis, and **zig-review-specialist** for the batch review.
+failure needs diagnosis, and **zig-review-specialist** to review the slice
+(or this landing) before commit.
