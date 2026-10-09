@@ -27,9 +27,9 @@ How the renderer works: `docs/rendering-assets-shaders.md`.
   presentation and debug-UI state stays in the renderer and debug-overlay
   path. None of it is in `DataSystem` or read by simulation. States gate
   debug draws on `RenderContext.debug_overlay_visible` and own no toggle.
-- Only the camera-focused world renders; every other world simulates with no
-  render state or render work. A secondary view (a mini camera) shows the
-  focused world, never another one.
+- The main view renders only the camera-focused world; a secondary view (a
+  mini camera) may show the same world or another one. A world in no view
+  simulates with no render state or render work.
 - Workers never read live renderer resource slots: snapshot texture metadata
   before dispatch and build draw groups on the main thread.
 
