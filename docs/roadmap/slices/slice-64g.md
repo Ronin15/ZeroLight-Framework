@@ -1,6 +1,6 @@
 ## Slice 64G: Chunk-Owned Terrain And Nav
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md), [Slice 76](slice-76.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md), [Slice 76](slice-76.md), [Slice 77](slice-77.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: in progress.** Last work on `ai_update3`, before merge. Kept as one
 slice by owner decision (2026-10-08).
@@ -149,9 +149,9 @@ Failure and limits:
 - Accessor contracts used by gameplay, perception, and render stay the same.
 - Owner decision (2026-10-09): a ramp dig always digs out its exit cell on
   the level above, so a ramp never leads into rock.
-- Owner decision (2026-10-09): cave-ins are a dig mechanic owned by
-  `DigController`, in [Slice 76](slice-76.md); 64G provides the dense
-  terrain path they write through.
+- Owner decision (2026-10-09): cave-ins ([Slice 76](slice-76.md)) and
+  explosions ([Slice 77](slice-77.md)) belong to `DestructibleController`;
+  64G provides the dense terrain path they write through.
 
 ### Checklist
 
@@ -187,9 +187,8 @@ Failure and limits:
 - [ ] A world's GPU tile store is released when its world is destroyed or
       replaced, never only at renderer shutdown.
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
-      the thread system, serial equals threaded (S3b). Cave-in gameplay is
-      [Slice 76](slice-76.md); the explosion producer's slice is not yet
-      named (owner).
+      the thread system, serial equals threaded (S3b). Their gameplay
+      producers are [Slice 76](slice-76.md) and [Slice 77](slice-77.md).
 - [ ] Perception's line-of-sight state lives on chunk storage, not a
       level-area bitmap; its rebuild threshold derives from operation cost, not
       level area.
