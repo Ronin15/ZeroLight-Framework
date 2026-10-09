@@ -406,7 +406,7 @@ capacity fails.
 
 ## Post-Commit Reactions
 
-After structural commit and event publication, `GameDemoState` calls three
+After structural commit and event publication, `GameDemoState` calls two
 independent `SimulationPipeline` reactions against the same committed event
 stream. The reactions run after `syncPopulationCapacity`, so they see grown
 capacities.
@@ -416,16 +416,14 @@ capacities.
   `world_obstacle_changed`, entity-driven obstacle changes) into dirty nav
   cells, applying the incremental nav-graph patch, and emitting
   `nav_region_invalidated`.
-- `reactToPostCommitPerceptionEvents` delegates to `PerceptionSystem`,
-  recording localized dirty rects from the same `world_tile_changed`/
-  `world_obstacle_changed` events to incrementally patch its per-level
-  LOS-blocked bitmap cache. It emits no event of its own.
 - `reactToPostCommitSteeringEvents` delegates to `SteeringSystem`, marking its
   static-obstacle snapshot and steering-to-movement index cache stale when
   committed events change static obstacles or renumber dense rows.
 
-The reactions are side effects on fully disjoint state, so call order
-between them does not matter.
+The reactions are side effects on fully disjoint state. The nav result is
+captured, the steering reaction runs, and only then is a nav error returned, so
+a nav failure never leaves steering's snapshot stale. Perception has no
+reaction: line of sight reads the world's chunk terrain directly.
 
 ## Current Integration
 

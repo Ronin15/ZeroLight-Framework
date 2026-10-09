@@ -145,7 +145,7 @@ pub const SteeringSystem = struct {
     spatial_obstacle_query_extra: f32 = 0,
     // Static-obstacle snapshot + spatial bins are rebuilt only when invalid.
     // Invalidation is event-driven (reactToPostCommitSteeringEvents), same shape
-    // as pathfinding/perception post-commit reactions — not a per-step poll.
+    // as the pathfinding post-commit reaction — not a per-step poll.
     // Also rebuilt when the agent-radius-derived cell size changes (bins wrong).
     obstacle_index_valid: bool = false,
     /// `spatial_cell_size` used when the obstacle index was last built.

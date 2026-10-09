@@ -36,11 +36,10 @@ content across world sizes.
   destructible cell resolve scans only the first
   `destructible_cell_scan_budget` (256) dense rows; the spatial-index dense
   window is halo-derived on every instance and clamps a wider populated box
-  out silently; LOS `los_max_cells` (64) assumes 32-unit tiles; AI scan radius
-  uses an unenforced `grid_cell_size` (32); `solved_paths` and the worker
-  path/stitched pool stripes share lines across workers; GPU static streams
-  and the tile-edit transfer buffer grow from exact sizes and GPU growth
-  waits for idle; `StateTransitions.reserve` sets the refusal bound.
+  out silently; AI scan radius uses an unenforced `grid_cell_size` (32);
+  `solved_paths` and the worker path/stitched pool stripes share lines across
+  workers; GPU static streams and the tile-edit transfer buffer grow from
+  exact sizes and GPU growth waits for idle; `StateTransitions.reserve` sets the refusal bound.
 - Per-level nav arrays, dense world arrays, the nav memory gate, and
   `SearchScratch` O(cells) are replaced by 64G's chunk storage.
 - Owned elsewhere: nav dirty buffers and level links (64G);
@@ -94,7 +93,7 @@ content across world sizes.
 - [ ] D1 · Destructible cell resolve reaches every row (one pass over
       destructibles per step, today's tie-break), with `destructible-resolve`
       bench; 61, 63, and 71D resolve text updated.
-- [ ] D3 · LOS visit limit from the ray's own length.
+- [x] D3 · LOS visit limit from the ray's own length.
 - [ ] D4 · AI scan radius from the live spatial cell size.
 - [ ] E1 · A pathfinding shrink never drops accepted work.
 - [ ] E2 · Elastic resizes preserve cache entries and pending work, with a

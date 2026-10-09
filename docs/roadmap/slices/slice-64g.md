@@ -50,9 +50,8 @@ Storage sized to level area:
   dense layer, up to `max_dense_bands_per_level` (2) layers per level → up to
   16 MiB per level; the uniform-fill flag is per layer and one dig clears it
   (`world_system.zig:127,291,1187`).
-- Perception: `LevelBlockedSlot` is a 1 B per cell bitmap → 4 MiB per level,
-  with a `pending_dirty` list that grows on levels nobody observes
-  (`perception.zig:429,462`).
+- Perception: line of sight reads the level's chunk terrain directly
+  (`WorldSystem.levelBlockedView`, O(1) per cell); it holds no LOS state.
 - Render: one world-wide dense tile buffer, 4 B per cell per dense layer,
   uploaded once at load; `addDenseLayer` is refused after the upload
   (`world_system.zig:643,1227-1234,1585`).
@@ -205,11 +204,12 @@ Failure and limits:
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
       the thread system, serial equals threaded (S3b). Their gameplay
       producers are [Slice 76](slice-76.md) and [Slice 77](slice-77.md).
-- [ ] Perception's line-of-sight state lives on chunk storage, not a
+- [x] Perception's line-of-sight state lives on chunk storage, not a
       level-area bitmap; its rebuild threshold derives from operation cost, not
-      level area.
-- [ ] A nav-apply failure leaves that step's perception and steering
-      reactions intact.
+      level area (nav N1: LOS reads chunk terrain; no LOS state or threshold).
+- [x] A nav-apply failure leaves that step's perception and steering
+      reactions intact (nav N1: steering runs before the nav error returns;
+      perception has no reaction).
 - [ ] One shared static-collider structure, synced once per entity per step,
       with nav as its first consumer; a static add, move, or destroy costs its
       own rows and chunks. Steering and collision move onto it in 71B.1.

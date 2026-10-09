@@ -116,8 +116,8 @@ Designs start here, then read the live structure below (rules:
 - `src/game/systems/perception.zig` owns `PerceptionSystem`: vision
   (range/FOV/LOS/faction-stance gating) and hearing (transient world
   stimuli), emitting `entity_perceived`/`entity_lost` events on acquire/lose
-  transitions and reacting to post-commit world edits to keep its per-level
-  LOS-blocked cache incrementally patched.
+  transitions. LOS reads the world's chunk terrain directly; it keeps no LOS
+  state.
 - `src/game/systems/ai_memory.zig` owns `AiMemorySystem`: decays last-known-
   target position, a fixed-capacity recent-contact ring, and spatial
   familiarity; refreshes last-known from continuous same-identity visibility
@@ -496,12 +496,12 @@ The current gameplay fixed-step pipeline is:
 5. Update the state-owned follow camera and visible world chunks.
 6. Commit deferred structural commands to `DataSystem`, run
    `SimulationPipeline.syncPopulationCapacity` (the population growth seam),
-   then run the pipeline's post-commit reactions (nav, perception, steering:
-   `SimulationPipeline.reactToPostCommitNavEvents`,
-   `.reactToPostCommitPerceptionEvents`, and `.reactToPostCommitSteeringEvents`,
-   independent side effects on disjoint state reacting to the same committed
-   event stream) so nav and perception caches patch from this step's world
-   edits.
+   then run the pipeline's post-commit reactions (nav, then steering:
+   `SimulationPipeline.reactToPostCommitNavEvents` and
+   `.reactToPostCommitSteeringEvents`, independent side effects on disjoint
+   state reacting to the same committed event stream) so nav patches from this
+   step's world edits. A nav error is returned only after the steering reaction
+   has run.
 7. Render current `WorldSystem`, `DataSystem`, and particle state with
    interpolation.
 
@@ -642,12 +642,17 @@ structural commands commit.
 cognition-scoped `AiPerception` subset right after the shared spatial index is
 built, reusing the same `SpatialIndexView` `AiSystem` consumes rather than
 building its own grid. Vision applies range/FOV/line-of-sight gating (faction
-stance and same-level checks included); LOS blocked-tile lookups are O(1)
-against `PerceptionSystem.level_blocked`, a per-level bitmap kept current by a
-skip/patch/rebuild decision driven by post-commit `world_tile_changed`/
-`world_obstacle_changed` events rather than an unconditional per-step rebuild,
-and `hasLineOfSight` itself walks every grid cell a ray's segment actually
-crosses (an Amanatides-Woo DDA), not fixed-distance samples. Hearing folds
+stance and same-level checks included). `hasLineOfSight` walks every grid
+cell the segment touches past the observer's own cell, bounded by the ray's
+own cell count (|dcx| + |dcy|). Through an exact grid corner either side cell
+blocks (pathfinding's no-corner-cutting rule), and a ray along a grid line also
+tests the cells across it, so LOS is symmetric between two open cells. The
+level's composed blocked bits are resolved once per ray
+(`WorldSystem.levelBlockedView`), then each cell is O(1) on its chunk's bits;
+an invalid level or a point off the world is blocked. Perception keeps no LOS
+state and has no post-commit reaction; `perception_update` reads `world_tiles`
+after `dig_world_edit`, so a same-step edit occludes, and serial and threaded
+ranges read the same const world. Hearing folds
 into the same per-agent pass as a same-level squared-distance check against
 `SimulationFrame.stimuli`, a transient per-step positional buffer that
 `SensoryBus` feeds (Slice 39, placed by Slice 48): deferred-promoted

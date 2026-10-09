@@ -545,13 +545,12 @@ pub const WorldSystem = struct {
     // `addSparseTile` — the sole sparse-tile inserter, which never removes a
     // tile and never changes a tile's level after insertion — so this needs no
     // dirty flag or deferred rebuild. That matters because gameplay consumers
-    // (nav rebuild after a dig, the perception LOS-blocked cache) read it
-    // within the same fixed-step tick a tile is placed, well before the next
-    // render window update would run; a lazily-rebuilt index keyed off a
-    // render dirty flag would be stale for them. A future bulk sparse-tile
-    // insert path must maintain this the same way. Lets per-level consumers
-    // walk only one level's tiles instead of scanning every sparse tile in the
-    // world and filtering by level. Grown lazily up to `level_index + 1`
+    // (nav rebuild after a dig) read it within the same fixed-step tick a tile
+    // is placed, well before the next render window update would run; a
+    // lazily-rebuilt index keyed off a render dirty flag would be stale for
+    // them. A future bulk sparse-tile insert path must maintain this the same
+    // way. Lets per-level consumers walk only one level's tiles instead of
+    // scanning every sparse tile in the world and filtering by level. Grown lazily up to `level_index + 1`
     // entries the first time a level gets a sparse tile; a level with no
     // sparse tiles yet simply has no entry (the accessor treats that the same
     // as an out-of-range level: an empty slice).
@@ -2031,6 +2030,23 @@ pub const WorldSystem = struct {
         return self.level_terrain.items[level_index].blocked.get(geom.chunkOf(x, y), geom.localOf(x, y));
     }
 
+    /// One level's composed movement-blocked bits with the geometry that indexes
+    /// them, for a reader that tests many cells of one level (a line-of-sight
+    /// ray): for an in-bounds cell, `blocked.get(geom.chunkOf(x, y),
+    /// geom.localOf(x, y))` equals `levelBlocksMovement`. The caller bounds-checks
+    /// cells. Valid while the world is not mutated (a level add can move it).
+    pub const LevelBlockedView = struct {
+        blocked: *const ChunkBitsStore,
+        geom: ChunkGeometry,
+    };
+
+    /// `LevelBlockedView` for `level_index`, or null for an invalid level (readers
+    /// fail closed, as `levelBlocksMovement` does). O(1).
+    pub fn levelBlockedView(self: *const WorldSystem, level_index: u16) ?LevelBlockedView {
+        if (@as(usize, level_index) >= self.level_terrain.items.len) return null;
+        return .{ .blocked = &self.level_terrain.items[level_index].blocked, .geom = self.chunkGeometry() };
+    }
+
     /// The chunk's composed movement-blocked form on `level_index`: every cell open,
     /// every cell blocked, or mixed (read cells through `levelBlocksMovement`). O(1).
     /// `chunk` is level-local (`chunkY * chunksX + chunkX`).
@@ -2269,7 +2285,7 @@ pub const WorldSystem = struct {
         // sparse_level_chunk_tiles, and the level's composed bits before
         // committing to any of them: an OOM partway through would otherwise leave
         // a tile in one structure but invisible to the lookups the others back
-        // (nav rebuild, perception's blocked cache, levelBlocksMovement). Either
+        // (nav rebuild, levelBlocksMovement and the LOS that reads it). Either
         // every reservation succeeds and the commits below are then infallible,
         // or the call fails here with none of the structures changed.
         const geom = self.chunkGeometry();
@@ -2460,9 +2476,8 @@ pub const WorldSystem = struct {
     }
 
     /// Level-local chunk grid width (world-wide, identical for every level —
-    /// see `localChunkIndexForCell`). Exposed for callers (e.g. perception's
-    /// LOS-blocked cache patch path) that need to bound a dirty rect to the
-    /// overlapping `sparseTileIndicesForChunk` range without duplicating this
+    /// see `localChunkIndexForCell`). Exposed for callers that walk chunks by
+    /// index (nav's world-obstacle mark, chunk benches) without duplicating this
     /// grid-shape arithmetic.
     pub fn chunksX(self: *const WorldSystem) u16 {
         return ceilDiv(self.width, self.chunk_size_tiles);

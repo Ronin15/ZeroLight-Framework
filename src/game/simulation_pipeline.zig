@@ -754,13 +754,6 @@ pub const SimulationPipeline = struct {
         // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
-        // Pays every level's first-ever `level_blocked` cache build once here,
-        // alongside pathfinding's own static grid build above, instead of
-        // scattered across whichever live steps first put an observer on each
-        // level (see `PerceptionSystem.prebuildLevelCaches`'s doc comment).
-        if (config.navigation_world) |world| {
-            try perception.prebuildLevelCaches(world);
-        }
         // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var ai_memory = AiMemorySystem.init(allocator);
         errdefer ai_memory.deinit();
@@ -1051,24 +1044,9 @@ pub const SimulationPipeline = struct {
         return self.pathfinding.reactToPostCommitNavEvents(frame, data, world, thread_system);
     }
 
-    /// Orchestrates the post-commit perception-cache reaction by delegating to
-    /// the cache-owning `PerceptionSystem`, which records localized dirty
-    /// rects for its LOS-blocked bitmap cache from the same committed events
-    /// `reactToPostCommitNavEvents` reacts to — a fully independent side
-    /// effect on disjoint state, so call order between the two does not
-    /// matter.
-    pub fn reactToPostCommitPerceptionEvents(
-        self: *SimulationPipeline,
-        frame: *SimulationFrame,
-        world: *const WorldSystem,
-    ) !void {
-        return self.perception.reactToPostCommitPerceptionEvents(frame, world);
-    }
-
     /// Orchestrates the post-commit static-obstacle spatial invalidation for
-    /// steering local avoidance. Same structural_commit event family as nav/
-    /// perception; call order among the three post-commit reactions does not
-    /// matter (disjoint state).
+    /// steering local avoidance. Same structural_commit event family as nav;
+    /// disjoint state, so it runs even when the nav reaction fails.
     pub fn reactToPostCommitSteeringEvents(
         self: *SimulationPipeline,
         frame: *const SimulationFrame,
@@ -2189,8 +2167,8 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
         .chunk_size_tiles = 1,
     };
     defer world.deinit();
-    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
-    // observer as fail-closed (blocked), never reporting a target visible.
+    // A level must exist or line of sight fails closed (an invalid level
+    // blocks every cell), never reporting a target visible.
     _ = try world.addLevel(0);
     // The level gives the world a chunk, so the full-world `sim_view` applies
     // stagger: keep both agents thinking this step.
@@ -2512,8 +2490,8 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
         .chunk_size_tiles = 1,
     };
     defer world.deinit();
-    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
-    // observer as fail-closed (blocked), never reporting a target visible.
+    // A level must exist or line of sight fails closed (an invalid level
+    // blocks every cell), never reporting a target visible.
     _ = try world.addLevel(0);
     // The level gives the world a chunk, so the full-world `sim_view` applies
     // stagger: pin the pursuer thinking on this single step (not a stagger test).
@@ -5506,17 +5484,19 @@ fn markAllAlwaysActive(data: *DataSystem) !void {
 }
 
 /// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: commit with the
-/// nav-reaction slot reserved, run the population seam, then the post-commit reactions.
+/// nav-reaction slot reserved, run the population seam, then the post-commit reactions
+/// (nav only after a successful seam; steering before a seam or nav error returns).
 fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
     const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
         SimulationPipeline.pendingEventsMayInvalidateNavigation(frame);
     const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
     _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
-    const sync = try pipeline.syncPopulationCapacity(frame, data);
-    _ = try pipeline.reactToPostCommitNavEvents(frame, data, world, null);
-    try pipeline.reactToPostCommitPerceptionEvents(frame, world);
+    const sync = pipeline.syncPopulationCapacity(frame, data);
+    const nav_update = if (sync) |_| pipeline.reactToPostCommitNavEvents(frame, data, world, null) else |err| err;
     pipeline.reactToPostCommitSteeringEvents(frame);
-    return sync;
+    const sync_stats = try sync;
+    _ = try nav_update;
+    return sync_stats;
 }
 
 fn writeStructuralCommands(frame: *SimulationFrame, commands: []const StructuralCommand) !void {

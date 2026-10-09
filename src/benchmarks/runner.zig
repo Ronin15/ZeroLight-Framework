@@ -72,8 +72,6 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     perception.group,
     perception.los_dense_group,
     perception.scattered_dense_index_group,
-    perception.cache_full_rebuild_group,
-    perception.cache_patch_group,
     steering.group,
 };
 
