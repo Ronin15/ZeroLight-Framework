@@ -56,7 +56,8 @@ spread and a verdict: `slower`/`faster` only when the two ranges do not
 overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
 `benchmark_outputs/ab-<stamp>/`. Always Debug. Cases default to
 `serial-direct` and `thread-adaptive-tuned-range` (`--all-cases` for every
-scheduler case). Both sides build with the repo's `.zig-cache`, so a new
+scheduler case) and to `--warmup 2 --iterations 10` per run (forward
+`-- --iterations N` to override). Both sides build with the repo's `.zig-cache`, so a new
 base rebuilds only what differs.
 
 ```sh

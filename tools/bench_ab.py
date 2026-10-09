@@ -13,7 +13,8 @@ stays warm; both sides share the repo's `.zig-cache`, so a new base rebuilds
 only what differs). Raw outputs and the summary go to
 `benchmark_outputs/ab-<stamp>/`. Cases default to `serial-direct` and
 `thread-adaptive-tuned-range`; the forced-thread cases are scheduler controls
-(`--all-cases` runs every case).
+(`--all-cases` runs every case). Runs use `--warmup 2 --iterations 10`
+unless the forwarded bench args set them.
 
 Usage:
     tools/bench_ab.py --group chunk-scale-dig
@@ -44,6 +45,8 @@ GROUP_HEADER = re.compile(r"^(\S+)\s+(\d+)\s+\S")
 CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s")
 UNIT_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
 DEFAULT_CASES = ("serial-direct", "thread-adaptive-tuned-range")
+# A regression check needs medians and spread over reps, not long runs per config.
+DEFAULT_TIMING = ("--warmup", "2", "--iterations", "10")
 
 
 def repo_root() -> Path:
@@ -142,6 +145,7 @@ def main() -> int:
     out_dir = root / OUTPUT_DIRNAME / f"ab-{stamp}"
     out_dir.mkdir(parents=True)
 
+    timing = [] if any(a.startswith(("--warmup", "--iterations")) for a in args.bench_args) else list(DEFAULT_TIMING)
     targets = [["--group", g] for g in args.group] + [["--group-prefix", p] for p in args.group_prefix]
     if args.all_cases and args.case:
         parser.error("--all-cases and --case are exclusive")
@@ -154,7 +158,7 @@ def main() -> int:
         for target in targets:
             for case in cases:
                 for name, cwd in sides:
-                    bench_args = target + (["--case", case] if case else []) + args.bench_args
+                    bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
                     code, text = run_bench(cwd, bench_args, root / ".zig-cache")
                     tag = "_".join([name.replace(":", "-").replace("/", "-"), target[1], case or "all", str(rep)])
                     (out_dir / f"{tag}.txt").write_text(text)
