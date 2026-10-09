@@ -51,8 +51,10 @@ model; routes to design) or **local**.
    is a size or acceptance number taken from the demo or a bench count; does
    world/level create, destroy, or growth force whole-world work; does it patch
    around a shared structure that the existing partition unit could own; does
-   anything stop advancing because the observer is far away? Is each claimed
-   order measured by a scaling bench at three or more sizes
+   anything stop advancing because the observer is far away; does work that
+   scales with population, terrain change, or world size run through the thread
+   system with serial and threaded paths and a parity test (`threading.md`)?
+   Is each claimed order measured by a scaling bench at three or more sizes
    (`.claude/rules/tests-benchmarks.md`), or marked derived? A flat-cost claim
    for a local change with no such bench is a finding.
 2. **Rule pass**: check the change against each loaded rule file.

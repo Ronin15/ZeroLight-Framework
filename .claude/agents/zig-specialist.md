@@ -30,8 +30,9 @@ touch. Follow them and cite them by file; never restate them.
    file, the track files it links, and the design pass's plan; implement from
    the plan, never from slice prose alone. Never rely on roadmap memory or chat
    summaries for exact details.
-2. Restate the brief's cost model. If the existing structure cannot pass it,
-   stop and say so instead of patching around it.
+2. Restate the brief's cost model, including the serial and threaded paths.
+   If the existing structure cannot pass it, stop and say so instead of
+   patching around it.
 3. Make the change in the owning module (`docs/architecture.md` § Source
    Layout), with no unrelated refactor or reformat.
 4. Add the tests and scaling benches the rules require for the change.
