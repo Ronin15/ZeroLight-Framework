@@ -745,7 +745,8 @@ registry, per-stage adaptive tuner state, and benchmark stats.
 future rule systems; path queues, scratch, thread state, and live path caches
 stay out of `DataSystem`. Each update runs four stages with their own adaptive
 tuners (`group_field_expand` has one per pass) and inline paths
-(`.claude/rules/threading.md`): `path_intake` runs one direct
+(`.claude/rules/threading.md`): `path_intake` converts start and goal cells
+four requests per `src/core/simd.zig` vector and runs one direct
 classify-and-accept pass when it stays on the main thread; on workers, ranges
 classify against step-start state and the main thread merges their windows in
 range order (group tallies, expired results, in-step duplicates folded per range,

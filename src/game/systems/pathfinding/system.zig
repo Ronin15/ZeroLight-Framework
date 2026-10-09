@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
+const simd = @import("../../../core/simd.zig");
 const logging = @import("../../../core/logging.zig");
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
@@ -1206,62 +1207,67 @@ pub const PathfindingSystem = struct {
         // A valid graph has level 0, and every level shares its extent.
         const extent_grid = self.graph.grid(0).?;
         const level_count = self.graph.levelCount();
-        for (requests) |request| {
-            if (request.goal_level >= level_count or request.start_level >= level_count) {
-                stats.dropped_requests += 1;
-                continue;
-            }
-            const cells = requestCells(extent_grid, request);
-            const key = PathQueryKey{
-                .nav_version = self.graph.version,
-                .agent_class = request.agent_class,
-                .goal_level = request.goal_level,
-                .goal = cells.goal,
-            };
-            const goal_grid = self.graph.grid(request.goal_level).?;
-            if (request.kind == .group) {
-                self.recordGroupRequestCount(key, 1);
-                if (request.start_level == request.goal_level and self.groupFieldServes(key, goal_grid, cells.start)) {
-                    stats.group_field_samples += 1;
-                    stats.duplicate_requests += 1;
+        var block_start: usize = 0;
+        while (block_start < requests.len) : (block_start += simd.lane_count) {
+            const block = requests[block_start..@min(block_start + simd.lane_count, requests.len)];
+            var block_cells: [simd.lane_count]IntakeCells = undefined;
+            intakeCells(extent_grid, block, block_cells[0..block.len]);
+            for (block, block_cells[0..block.len]) |request, cells| {
+                if (request.goal_level >= level_count or request.start_level >= level_count) {
+                    stats.dropped_requests += 1;
                     continue;
                 }
-            }
-            if (self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps)) |found| {
-                if (found.fresh) {
+                const key = PathQueryKey{
+                    .nav_version = self.graph.version,
+                    .agent_class = request.agent_class,
+                    .goal_level = request.goal_level,
+                    .goal = cells.goal,
+                };
+                const goal_grid = self.graph.grid(request.goal_level).?;
+                if (request.kind == .group) {
+                    self.recordGroupRequestCount(key, 1);
+                    if (request.start_level == request.goal_level and self.groupFieldServes(key, goal_grid, cells.start)) {
+                        stats.group_field_samples += 1;
+                        stats.duplicate_requests += 1;
+                        continue;
+                    }
+                }
+                if (self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps)) |found| {
+                    if (found.fresh) {
+                        stats.duplicate_requests += 1;
+                        stats.cache_hits += 1;
+                        stats.available_results += 1;
+                        continue;
+                    }
+                    // Removes the expired result.
+                    _ = self.completed.findFresh(key, self.step_counter, types.default_cache_ttl_steps);
+                }
+                if (self.unavailable.contains(key)) {
                     stats.duplicate_requests += 1;
                     stats.cache_hits += 1;
-                    stats.available_results += 1;
+                    stats.unavailable_results += 1;
                     continue;
                 }
-                // Removes the expired result.
-                _ = self.completed.findFresh(key, self.step_counter, types.default_cache_ttl_steps);
+                if (self.pending_keys.contains(key)) {
+                    stats.duplicate_requests += 1;
+                    continue;
+                }
+                if (self.pending.len >= self.capacity.max_pending_requests) {
+                    stats.dropped_requests += 1;
+                    continue;
+                }
+                const goal = projectGoal(goal_grid, key.goal);
+                self.pending.push(.{
+                    .entity = request.entity,
+                    .key = key,
+                    .start_level = request.start_level,
+                    .start = cells.start,
+                    .goal_index = goal.index,
+                });
+                _ = self.pending_keys.insert(key);
+                stats.accepted_requests += 1;
+                if (goal.projected) stats.goal_projected += 1;
             }
-            if (self.unavailable.contains(key)) {
-                stats.duplicate_requests += 1;
-                stats.cache_hits += 1;
-                stats.unavailable_results += 1;
-                continue;
-            }
-            if (self.pending_keys.contains(key)) {
-                stats.duplicate_requests += 1;
-                continue;
-            }
-            if (self.pending.len >= self.capacity.max_pending_requests) {
-                stats.dropped_requests += 1;
-                continue;
-            }
-            const goal = projectGoal(goal_grid, key.goal);
-            self.pending.push(.{
-                .entity = request.entity,
-                .key = key,
-                .start_level = request.start_level,
-                .start = cells.start,
-                .goal_index = goal.index,
-            });
-            _ = self.pending_keys.insert(key);
-            stats.accepted_requests += 1;
-            if (goal.projected) stats.goal_projected += 1;
         }
     }
 
@@ -1287,78 +1293,83 @@ pub const PathfindingSystem = struct {
         const group_window = group_counts[start..end];
         var recent_groups: RecentKeys = .{};
         var recent_records: RecentKeys = .{};
-        for (requests[start..end]) |request| {
-            // Reject (drop, never clamp) an out-of-range level: the query path
-            // rejects the same condition as unavailable, so a clamped solve could
-            // never be read back by its requester.
-            if (request.goal_level >= level_count or request.start_level >= level_count) {
-                tally.dropped_requests += 1;
-                continue;
-            }
-            const cells = requestCells(extent_grid, request);
-            const key = PathQueryKey{
-                .nav_version = self.graph.version,
-                .agent_class = request.agent_class,
-                .goal_level = request.goal_level,
-                .goal = cells.goal,
-            };
-            const goal_grid = self.graph.grid(request.goal_level).?;
-            if (request.kind == .group) {
-                if (recent_groups.find(key)) |entry| {
-                    group_window[entry].count += 1;
-                } else {
-                    group_window[tally.group_key_count] = .{ .key = key, .count = 1 };
-                    recent_groups.remember(key, tally.group_key_count);
-                    tally.group_key_count += 1;
-                }
-                if (request.start_level == request.goal_level and self.groupFieldServes(key, goal_grid, cells.start)) {
-                    tally.group_field_samples += 1;
-                    tally.duplicate_requests += 1;
+        var block_start = start;
+        while (block_start < end) : (block_start += simd.lane_count) {
+            const block = requests[block_start..@min(block_start + simd.lane_count, end)];
+            var block_cells: [simd.lane_count]IntakeCells = undefined;
+            intakeCells(extent_grid, block, block_cells[0..block.len]);
+            for (block, block_cells[0..block.len]) |request, cells| {
+                // Reject (drop, never clamp) an out-of-range level: the query path
+                // rejects the same condition as unavailable, so a clamped solve could
+                // never be read back by its requester.
+                if (request.goal_level >= level_count or request.start_level >= level_count) {
+                    tally.dropped_requests += 1;
                     continue;
                 }
-            }
-            const cached = self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps);
-            if (cached) |found| {
-                if (found.fresh) {
+                const key = PathQueryKey{
+                    .nav_version = self.graph.version,
+                    .agent_class = request.agent_class,
+                    .goal_level = request.goal_level,
+                    .goal = cells.goal,
+                };
+                const goal_grid = self.graph.grid(request.goal_level).?;
+                if (request.kind == .group) {
+                    if (recent_groups.find(key)) |entry| {
+                        group_window[entry].count += 1;
+                    } else {
+                        group_window[tally.group_key_count] = .{ .key = key, .count = 1 };
+                        recent_groups.remember(key, tally.group_key_count);
+                        tally.group_key_count += 1;
+                    }
+                    if (request.start_level == request.goal_level and self.groupFieldServes(key, goal_grid, cells.start)) {
+                        tally.group_field_samples += 1;
+                        tally.duplicate_requests += 1;
+                        continue;
+                    }
+                }
+                const cached = self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps);
+                if (cached) |found| {
+                    if (found.fresh) {
+                        tally.duplicate_requests += 1;
+                        tally.cache_hits += 1;
+                        tally.available_results += 1;
+                        continue;
+                    }
+                }
+                var record = IntakeRecord{
+                    .entity = request.entity,
+                    .key = key,
+                    .start_level = request.start_level,
+                    .start = cells.start,
+                    .goal_index = no_parent,
+                    .expired = cached != null,
+                    .candidate = false,
+                    .projected = false,
+                    .repeats = 0,
+                };
+                if (self.unavailable.contains(key)) {
                     tally.duplicate_requests += 1;
                     tally.cache_hits += 1;
-                    tally.available_results += 1;
+                    tally.unavailable_results += 1;
+                } else if (self.pending_keys.contains(key)) {
+                    tally.duplicate_requests += 1;
+                } else {
+                    const goal = projectGoal(goal_grid, key.goal);
+                    record.candidate = true;
+                    record.goal_index = goal.index;
+                    record.projected = goal.projected;
+                }
+                if (!record.candidate and !record.expired) continue;
+                // A repeat of a key in this range classifies as its first record did, so it
+                // folds into that record; only a candidate's repeats count in the merge.
+                if (recent_records.find(key)) |entry| {
+                    if (record.candidate) record_window[entry].repeats += 1;
                     continue;
                 }
+                recent_records.remember(key, tally.record_count);
+                record_window[tally.record_count] = record;
+                tally.record_count += 1;
             }
-            var record = IntakeRecord{
-                .entity = request.entity,
-                .key = key,
-                .start_level = request.start_level,
-                .start = cells.start,
-                .goal_index = no_parent,
-                .expired = cached != null,
-                .candidate = false,
-                .projected = false,
-                .repeats = 0,
-            };
-            if (self.unavailable.contains(key)) {
-                tally.duplicate_requests += 1;
-                tally.cache_hits += 1;
-                tally.unavailable_results += 1;
-            } else if (self.pending_keys.contains(key)) {
-                tally.duplicate_requests += 1;
-            } else {
-                const goal = projectGoal(goal_grid, key.goal);
-                record.candidate = true;
-                record.goal_index = goal.index;
-                record.projected = goal.projected;
-            }
-            if (!record.candidate and !record.expired) continue;
-            // A repeat of a key in this range classifies as its first record did, so it
-            // folds into that record; only a candidate's repeats count in the merge.
-            if (recent_records.find(key)) |entry| {
-                if (record.candidate) record_window[entry].repeats += 1;
-                continue;
-            }
-            recent_records.remember(key, tally.record_count);
-            record_window[tally.record_count] = record;
-            tally.record_count += 1;
         }
         return tally;
     }
@@ -1884,10 +1895,48 @@ const IntakeCells = struct {
     goal: GridCell,
 };
 
-// Every level shares one extent, so one grid converts for all of them. Scalar: the
-// 4-lane form measured 1.01 ms vs 631 us scalar (serial group-field-detour 4096, Debug).
-fn requestCells(grid: *const NavGrid, request: PathRequest) IntakeCells {
-    return .{ .start = grid.worldToCellClamped(request.start), .goal = grid.worldToCellClamped(request.goal) };
+// Start and goal cells of each request, four requests per vector (positions packed from
+// the AoS requests) with a scalar tail; bit-identical to `worldToCellClamped`. Every
+// level shares one extent, so one grid converts for all of them.
+fn intakeCells(grid: *const NavGrid, requests: []const PathRequest, out: []IntakeCells) void {
+    std.debug.assert(out.len == requests.len);
+    std.debug.assert(grid.width != 0 and grid.height != 0);
+    const cell_size = simd.splatFloat4(grid.cell_size);
+    const min_cell = simd.splatInt4(0);
+    // Grid dimensions fit i32, as in worldToCellClamped.
+    const max_x = simd.splatInt4(@intCast(grid.width - 1));
+    const max_y = simd.splatInt4(@intCast(grid.height - 1));
+    const vector_end = simd.vectorizedEnd(requests.len);
+    var index: usize = 0;
+    while (index < vector_end) : (index += simd.lane_count) {
+        var start_x: [simd.lane_count]f32 = undefined;
+        var start_y: [simd.lane_count]f32 = undefined;
+        var goal_x: [simd.lane_count]f32 = undefined;
+        var goal_y: [simd.lane_count]f32 = undefined;
+        inline for (0..simd.lane_count) |lane| {
+            const request = requests[index + lane];
+            start_x[lane] = request.start.x;
+            start_y[lane] = request.start.y;
+            goal_x[lane] = request.goal.x;
+            goal_y[lane] = request.goal.y;
+        }
+        const cell_start_x = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&start_x), cell_size)), min_cell, max_x));
+        const cell_start_y = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&start_y), cell_size)), min_cell, max_y));
+        const cell_goal_x = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&goal_x), cell_size)), min_cell, max_x));
+        const cell_goal_y = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&goal_y), cell_size)), min_cell, max_y));
+        inline for (0..simd.lane_count) |lane| {
+            out[index + lane] = .{
+                .start = .{ .x = cell_start_x[lane], .y = cell_start_y[lane] },
+                .goal = .{ .x = cell_goal_x[lane], .y = cell_goal_y[lane] },
+            };
+        }
+    }
+    while (index < requests.len) : (index += 1) {
+        out[index] = .{
+            .start = grid.worldToCellClamped(requests[index].start),
+            .goal = grid.worldToCellClamped(requests[index].goal),
+        };
+    }
 }
 
 // Batch stats of a stage that ran inline on the calling thread.
@@ -5564,6 +5613,35 @@ test "threaded intake folds a new goal's repeats per range and equals serial whe
         for (threaded.intake_tallies.items) |tally| merged_records += tally.record_count;
         try std.testing.expectEqual(threaded.intake_tallies.items.len, merged_records);
         try std.testing.expectEqual(intake_test_agents / 8, threaded.intake_tallies.items.len);
+    }
+}
+
+test "intake cell conversion in four lanes equals worldToCellClamped" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 512, 320, 32);
+    const grid = system.graph.grid(0).?;
+    const inf = std.math.inf(f32);
+    const positions = [_]math.Vec2{
+        .{ .x = 16, .y = 16 },               .{ .x = -5, .y = 40 },    .{ .x = 9000, .y = 9000 }, .{ .x = 511.9, .y = 319.9 },
+        .{ .x = std.math.nan(f32), .y = 3 }, .{ .x = inf, .y = -inf }, .{ .x = 31.999, .y = 32 }, .{ .x = -0.0, .y = 1e30 },
+        .{ .x = 100, .y = -1e30 },
+    };
+    const entity = try data.createEntity();
+    var requests: [positions.len]PathRequest = undefined;
+    for (&requests, 0..) |*request, index| {
+        request.* = .{ .entity = entity, .start = positions[index], .goal = positions[positions.len - 1 - index] };
+    }
+    for (0..requests.len + 1) |len| {
+        var cells: [positions.len]IntakeCells = undefined;
+        intakeCells(grid, requests[0..len], cells[0..len]);
+        for (requests[0..len], cells[0..len]) |request, cell| {
+            try std.testing.expectEqualDeep(grid.worldToCellClamped(request.start), cell.start);
+            try std.testing.expectEqualDeep(grid.worldToCellClamped(request.goal), cell.goal);
+        }
     }
 }
 
