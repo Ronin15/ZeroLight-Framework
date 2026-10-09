@@ -38,6 +38,12 @@ rules.
   what. The rules and `docs/architecture.md` win over code; code that
   disagrees with them is wrong. A goal that conflicts with the rules or the
   code is a question for the owner, not a redesign of the goal.
+- Extend the subsystem `docs/architecture.md` names as the owner of the work
+  before adding a new owner or module, and reuse its existing code patterns
+  (cite them by `file:line`).
+- Kept and inherited code in the area is checked against every rule file too;
+  a kept part that breaks a rule is a defect the design fixes, never a pattern
+  to extend.
 - Anything unconfirmed is a question for the owner, not part of the plan
   (`.claude/rules/engine-design.md`).
 

@@ -63,8 +63,10 @@ orchestrates, verifies every agent claim against live code, and reports.
 - `zig-design-specialist` opens every slice, right before implementation, and
   runs whenever a design is open or the existing structure fails the cost
   model; local fixes go straight to `zig-specialist`.
-- `zig-review-specialist` once per batch. Every real finding is reported and
-  checked against live code; structural findings go to design, local ones to
+- `zig-review-specialist` reviews every change before it is committed (a
+  slice is small enough to review whole); fixes fold into that commit. Every
+  real finding is reported and checked against live code and
+  `docs/architecture.md`; structural findings go to design, local ones to
   `zig-specialist`; lows are fixed in the batch or become a checklist item in
   the owning slice.
 - A second fix or redesign of the same subsystem on a branch, in one slice

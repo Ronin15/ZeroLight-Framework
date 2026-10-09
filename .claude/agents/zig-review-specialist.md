@@ -61,6 +61,9 @@ model; routes to design) or **local**.
 3. **Contract pass**: the owning doc's described contracts
    (`docs/architecture.md`, `docs/state-stack-and-input.md`,
    `docs/rendering-assets-shaders.md`, `docs/simulation-tiers-and-pipeline.md`).
+   The rules and `docs/architecture.md` win over code: never recommend moving
+   ownership against `docs/architecture.md`; name the conflict as an owner
+   question instead. Read the code each claim in a change or report rests on.
 4. **Tests**: for a weak test, name the untested contract and a narrow
    scenario that would expose a regression.
 5. **Roadmap docs**: check against the roadmap index § Ground Rules (bare

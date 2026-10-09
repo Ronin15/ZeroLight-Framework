@@ -29,6 +29,8 @@ files it links. Do not load the whole roadmap.
   tests are integrated. Partial wiring stays `[ ]` with remaining notes in the
   slice file. Landed slices awaiting manual/`gpu-smoke` confirmation (33, 43) stay open
   until that residual closes.
+- **A slice is small:** one feature, one owning area, designed, landed, and
+  reviewed as one batch. Larger work is several slices.
 - **One file per slice or sub-slice** (`slices/slice-<id>.md`, lowercase id;
   umbrellas such as `slice-64.md` summarize their sub-slices), each with exactly
   one row in the Open Frontier Slice Index that links to it.
