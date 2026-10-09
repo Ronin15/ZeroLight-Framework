@@ -106,6 +106,8 @@ content across world sizes.
 - [ ] E6 · Initial elastic capacity from the loaded population.
 - [ ] E7 · Solve result slots isolated per worker (65A's helper).
 - [ ] E8 · Worker path and stitched pool stripes start on a line.
+- [ ] E9 · Per-step solve and fallback budgets are fixed counts, not clamped
+      to population.
 - [x] E4 · Moved into 64G (nav storage).
 - [ ] F1 · Exact reserves for exact-size nav arrays (re-scoped by 64G).
 - [ ] F2 · Nav memory gate charges what load reserves (re-scoped by 64G).
@@ -130,8 +132,9 @@ content across world sizes.
 - [ ] J4 · MAL alignment wording in `docs/architecture.md` and the
       `hotStoreCapacity` doc comment.
 - [ ] K1 · `SimulationEvents.capacity_limit` justified at its site.
-- [ ] K2 · Pending-queue intake: its drop is unreachable by construction or
-      becomes deterministic deferral, never a capacity refusal.
+- [ ] K2 · Pending- and frame-request intake, including past
+      `max_agent_budget`: its drop is unreachable by construction or becomes
+      deterministic deferral, never a capacity refusal.
 - [x] K3 · Moved into 64G (ramps never refused).
 - [ ] K4 · Particle pool justified as presentation-only.
 - [ ] K5 · Collision-SFX cooldown table justified as audio policy.

@@ -20,53 +20,102 @@ extended, reused, or used as a baseline (owner decision, 2026-10-08). The Zig
 Main already partitions nav by chunk: positional per-chunk portal slots,
 chunk-local components (a flood never crosses a chunk border), a dirty-chunk
 patch that re-derives touched chunks from the world, threaded remask and patch
-stages, and cell-keyed level links. Its storage and fallbacks are still sized
-per level or world. Numbers are derived for one 2048² level (4,194,304 cells,
-16-tile nav chunks, 16,384 chunks); multiply by depth and world count:
+stages with per-stage tuners, cell-keyed level links, goal-keyed caches, and
+fixed node budgets with a two-attempt retry. Its storage, fallbacks, and
+per-change work are still sized by level, world, or content totals. Numbers are
+derived for one 2048² level (4,194,304 cells, 16-cell nav chunks, 16,384
+chunks); multiply by depth and world count.
+
+Storage sized to level area:
 
 - `NavGrid` (`nav_grid.zig:43,47,53`): `blocked` 1 B + `components` 4 B per
   cell, plus `static_blocked` 1 B per cell on level 0 → 20 MiB per level.
 - `NavLevelGraph.cell_to_portal` (`nav_graph.zig:83`): 4 B per cell → 16 MiB
   per level.
-- Slot geometry (`nav_graph.zig:355`, `computePortalGeometry` `:1116`):
-  64 perimeter slots for every chunk, all-solid or uniform included →
-  1,048,576 slots × 32 B (portal, edge range, order, label keys and starts,
-  `nav_graph.zig:1163-1168`) = 32 MiB per level.
+- Slot geometry (`nav_graph.zig:355`, `computePortalGeometry` `:1116`): 64
+  slots for every chunk (60 perimeter cells), all-solid or uniform included,
+  × 32 B (portal, edge range, order, label keys and starts,
+  `nav_graph.zig:1163-1168`) = 32 MiB per level. Every level also reserves the
+  interior link endpoints of every level (`:367-372,1122-1171`).
 - Together ≈ 68 MiB per level before edges, ≈ 8.5 GiB for 128 levels of one
   world, whatever the content.
-- `SearchScratch.cells` (`scratch.zig:218`, `system.zig:413`): resized to a
-  level's cell count, 13 B per cell per worker ≈ 52 MiB per worker.
-- Group flow fields (`group_field.zig:90-106`, `system.zig:405`): 21 B per
-  cell per field ≈ 84 MiB per field, every field up to `max_group_fields`.
-- Edge windows are fixed per chunk with slack; one overflowing chunk rebuilds
-  every level's abstract graph and bumps `nav_version`, invalidating every
-  cached path (`nav_graph.zig:725-737`).
-- A batch touching more than 8 levels relabels every level
-  (`nav_graph.zig:702`, `types.zig:142`): O(levels × cells).
-- `rebuildLinkEdges` scans every world link on every batch
-  (`nav_graph.zig:740,1249`); `WorldSystem.rampLinkOtherLevel` scans every
-  world link per lookup (`world_system.zig:1396`).
-- A ramp dug at runtime with an interior endpoint gets no portal until a full
-  rebuild, its partner level is not patched, and a ramp on an already-walkable
-  cell emits no nav event (`nav_graph.zig:2215` test; `digRamp` edits only
-  the dug level, `dig_controller.zig:169`).
-- `markStaticBodies` covers level 0 only and builds an `AutoHashMap` per call
-  (`nav_grid.zig:105,116`); `NavGraph.rebuild` writes dimensions before its
-  memory check can fail (`nav_graph.zig:466-470`).
+- `SearchScratch.cells` (`scratch.zig:218`, `system.zig:280,413`): a level's
+  cell count per participant (workers + main), 13 B per cell ≈ 52 MiB each.
+- Group flow fields (`group_field.zig:90-106`, `system.zig:404-406`): every
+  field up to `max_group_fields` reserved at nav build, 21 B per cell ≈ 84 MiB
+  each.
+- Terrain: `WorldSystem.dense_tile_ids` is one flat array, 2 B per cell per
+  dense layer, up to `max_dense_bands_per_level` (2) layers per level → up to
+  16 MiB per level; the uniform-fill flag is per layer and one dig clears it
+  (`world_system.zig:127,291,1187`).
+- Perception: `LevelBlockedSlot` is a 1 B per cell bitmap → 4 MiB per level,
+  with a `pending_dirty` list that grows on levels nobody observes
+  (`perception.zig:429,462`).
+- Render: one world-wide dense tile buffer, 4 B per cell per dense layer,
+  uploaded once at load; `addDenseLayer` is refused after the upload
+  (`world_system.zig:643,1227-1234,1585`).
+
+Work sized to the world, a level, or content totals:
+
+- Every incremental apply clears every pending request and negative result
+  and drops every group field, world-wide (`system.zig:494-495`).
+- Cached-path eviction scans the whole result cache per batch on the main
+  thread, and a stride-downsampled path is evicted whenever its level is
+  touched (`caches.zig:344-356,404`).
+- The blocked query behind every chunk remask scans every dense layer in the
+  world and the level's sparse tiles per cell (`world_system.zig:1413-1428`).
+- Static obstacles: the coverage refresh scans every static body per covered
+  cell (`nav_grid.zig:150-158,382-392`); an unresolvable rect marks the whole
+  level dirty (`system.zig:579-583`); `markStaticBodies` covers level 0 only
+  and builds an `AutoHashMap` per call (`nav_grid.zig:105,116`).
+- Links: each patched chunk scans every world link (`nav_graph.zig:1477-1484`);
+  endpoint dedupe is O(links²) (`:1174-1184`); `rebuildLinkEdges` rebuilds
+  every link edge per batch (`:740,1249`); `WorldSystem.rampLinkOtherLevel`
+  scans every link on every entity cell entry (`world_system.zig:1396`,
+  `dig_controller.zig:226,261`).
+- An edge-window overflow rebuilds every level's abstract graph, doubles the
+  edge slack of every chunk on every level for good, and bumps `nav_version`,
+  which clears every cache, pending request, and group field
+  (`nav_graph.zig:725-737,744-749`, `system.zig:479-482`).
+- A batch touching more than 8 levels relabels and rebuilds every level, with
+  the same version bump (`nav_graph.zig:702-709`, `types.zig:142`).
+- Runtime ramps: an interior endpoint is skipped until a full rebuild, which
+  runs only at init or in the fallbacks above (`nav_graph.zig:1497`, test
+  `:2215`); `digRamp` edits only the dug level, so the partner level is not
+  patched (`dig_controller.zig:169`); a ramp on walkable floor flips no
+  `blocks_movement`, so nav filters its tile event (`system.zig:684`).
+- Cross-level search uses a zero heuristic off the goal level
+  (`solve.zig:401-404`), so it explores every level it reaches within its node
+  budget and far cross-level goals exhaust both attempts.
+- Creating a level or world: the abstract build is serial per chunk and level
+  (`nav_graph.zig:580-593`), perception prebuilds every level serially
+  (`perception.zig:543-548`), and a nav rebuild clears all runtime state
+  (`system.zig:420`).
+- Perception rebuilds a whole level when dirty area passes 25% of it
+  (`perception.zig:394-404`).
+
+Failure and limits:
+
+- Not all-or-nothing: `NavGraph.rebuild` bumps the version and writes
+  dimensions and every level's arrays before steps that can fail
+  (`nav_graph.zig:466-500`); `applyNavUpdates` remasks before patching, a
+  worker OOM is treated as an edge overflow (`:237-243`), and
+  `rebuildLinkEdges` clears before it appends (`:1250-1268`).
+- A nav-apply error skips that step's perception and steering reactions
+  (`game_demo_state.zig:673-675`).
 - Load gates sized to level area refuse worlds: `NavMemoryBudget.check`
   (`nav_memory.zig:191`) and `validateDenseRenderBudget`
-  (`world_system.zig:647`).
-- Terrain: `WorldSystem.dense_tile_ids` is a flat per-dense-layer array,
-  2 B per cell per layer (8 MiB per layer per level), and `level_links` is
-  one world-wide list (`world_system.zig:288,291`).
-- Perception: `LevelBlockedSlot` keeps a per-level bitmap with a
-  `pending_dirty` list (`perception.zig:429,462`).
-- Render uploads terrain through a level-sized dense GPU window: 4 B per cell
-  per dense layer, 16 MiB per layer per level (`world_system.zig:643`).
+  (`world_system.zig:647`). The nav gate is also the only loud check on index
+  widths (cell, label, slot, edge); elsewhere they are Debug asserts
+  (`nav_graph.zig:1118`).
 - Chunk edge sizes differ by system: `chunk_size_tiles` 16 in
   `WorldBuildConfig` and 8 in `default_chunk_size_tiles`
-  (`world_system.zig:48,125`), nav chunks 16 (`types.zig:130`), test fixtures
-  4 and 8.
+  (`world_system.zig:48,125`), nav chunks 16 nav cells (`types.zig:130`) with
+  the nav cell size set apart from the tile size
+  (`simulation_pipeline.zig:288`), test fixtures 4 and 8.
+- No bench varies level size or depth at a fixed change: `nav-update-*` runs
+  one 256² world (`nav_update.zig:52`), and `pathfinding*` stays at or below
+  256² on one level.
 
 ### Architecture notes
 
@@ -99,44 +148,67 @@ per level or world. Numbers are derived for one 2048² level (4,194,304 cells,
 
 ### Checklist
 
-- [ ] One chunk edge size shared by terrain, nav, and scope; test fixtures are
-      multi-chunk (fixture rule in `.claude/rules/tests-benchmarks.md` updated
-      in the same change if it moves).
-- [ ] Terrain storage owned per chunk behind the existing accessors.
-- [ ] Level links stored with their endpoint chunks; a ramp lookup costs the
-      chunk, not the world's links.
-- [ ] Nav storage per chunk; nothing in nav sized to level cells or level
-      chunk count.
+- [ ] One chunk edge size and one cell resolution shared by terrain, nav, and
+      scope; test fixtures are multi-chunk (fixture rule in
+      `.claude/rules/tests-benchmarks.md` updated in the same change if it
+      moves).
+- [ ] Terrain storage owned per chunk behind the existing accessors; a cell's
+      blocked query costs its chunk, independent of level count, dense layers,
+      and the level's sparse tiles.
+- [ ] Uniform and all-solid chunks stay cheap after edits elsewhere on their
+      level.
+- [ ] Level links stored with their endpoint chunks; a link lookup, including
+      on entity cell entry, costs the chunk, not the world's links.
+- [ ] Nav storage per chunk; a level holds only a directory of its chunks,
+      and nothing in nav is sized to level cells.
 - [ ] Runtime ramps routable the same step on both levels, perimeter or
       interior, never refused.
 - [ ] Nav apply per step all-or-nothing over dirty chunks, threaded; no
       relabel or full-rebuild fallback.
-- [ ] Path search crosses chunks through the chunked graph with budget-sized
-      scratch; group flow fields not sized to level cells.
-- [ ] Render terrain upload per chunk.
+- [ ] A local nav change leaves pending requests, negative results, group
+      fields, and cached paths outside its chunks untouched; path eviction
+      costs the results that touch its chunks, not the cache size.
+- [ ] A static obstacle add, move, or destroy costs its footprint chunks,
+      independent of static-body and entity counts, on every level, with no
+      whole-level fallback and no per-call map.
+- [ ] Path search crosses chunks and levels through the chunked graph with
+      budget-sized scratch; a cross-level path's cost follows path length, not
+      levels explored; group flow fields not sized to level cells.
+- [ ] A level or world added in play builds only its own chunks, threaded, and
+      is never refused; other levels' nav, caches, and runtime state are
+      untouched.
+- [ ] Render terrain upload per chunk; dense layers added in play.
 - [ ] Perception's line-of-sight state lives on chunk storage, not a
-      level-area bitmap.
-- [ ] Static collision bodies reach nav on every level, without a per-call
-      map.
+      level-area bitmap; its rebuild threshold derives from operation cost, not
+      level area.
+- [ ] A nav-apply failure leaves that step's perception and steering
+      reactions intact.
 - [ ] Level-sized load gates retired, so creating a world in play (74) and
-      adding a link are never refused for capacity.
+      adding a link are never refused for capacity; index and format widths
+      (cell, chunk, label, slot, edge offsets, level) fail loudly at world
+      create, load, and growth.
 - [ ] The replaced branch nav code is gone, with its tests, as each part is
       replaced.
 - [ ] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
       every allocation leaves state intact and the retry equals a rebuild; one
       chunk's change leaves every other chunk untouched; a multi-level cave-in
-      in one step; a runtime ramp routable the same step on both levels.
+      in one step; a runtime ramp routable the same step on both levels; one
+      dig leaves unrelated pending requests, group fields, and cache entries
+      intact; a static-obstacle move costs the same at 10 and 10k static
+      bodies.
 - [ ] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
       and 64B checked against chunk storage.
 
 ### Acceptance checks
 
-- [ ] A `chunk-scale` bench group (dig, ramp, cave-in, explosion fill at
-      256², 1024², 2048², and 8 / 32 / 128 levels) shows per-change cost flat
-      across sizes (`.claude/rules/tests-benchmarks.md`); fixtures build once
-      outside the timed loop and the group runs quickly in Debug.
+- [ ] `chunk-scale-*` bench groups (dig, ramp, cave-in, explosion fill, and
+      level and world create and destroy, at 256², 1024², 2048², and 8 / 32 /
+      128 levels) shows per-change cost flat across sizes
+      (`.claude/rules/tests-benchmarks.md`); fixtures build once outside the
+      timed loop and the group runs quickly in Debug.
 - [ ] An A\* path of the same length costs the same at 2048² as at 256²
-      (`pathfinding*` groups).
+      (`pathfinding*` groups), and a cross-level path of the same length costs
+      the same at 8, 32, and 128 levels.
 - [ ] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
 - [ ] Manual (display, Debug): digs, ramps, and a cave-in in the demo; NPCs
       route over the changes.
