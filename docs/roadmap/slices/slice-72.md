@@ -117,10 +117,13 @@ content across world sizes.
 - [ ] G3 · `PathfindingCapacity` holds caller knobs only; derived values
       private.
 - [ ] H1 · GPU static streams created at the declared reservation.
-- [ ] H2 · Geometric tile-edit transfer growth.
-- [ ] H3 · `FailingAllocator` proof for the warmed tile-edit upload.
+- [x] H2 · Geometric tile-edit transfer growth.
+- [x] H3 · `FailingAllocator` proof for the warmed tile-edit upload: renderer
+      test "queueTileStoreUploads folds a carried batch allocation-free after
+      reserve".
 - [ ] H4 · GPU buffer growth without draining the device (`gpu-smoke` per
-      backend).
+      backend). Tile path landed; vertex and static streams
+      (`ensureBatchCapacity`, `ensureStaticCapacity`) still open.
 - [x] I1 · Perception events from per-row columns after the join.
 - [x] I2 · Affect crossings from per-row bits; checksum tag unchanged.
 - [ ] J1 · `StateTransitions` budget set at init, `reserve` follows it.

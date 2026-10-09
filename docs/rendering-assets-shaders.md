@@ -246,7 +246,10 @@ nothing a retry depends on), then commits and queues one upload batch
 (`Renderer.queueTileStoreUploads`) recorded in the frame's one copy pass. Spans
 are whole units (a directory, a word, a link, a block), so a batch
 carried from a skipped frame folds into the next (`mergeTileStoreSpans`), newer
-values winning.
+values winning. `Renderer.reserveTileStoreUploads` reserves the CPU upload lists
+before it grows the store's GPU buffer, so any reserve failure (`OutOfMemory`,
+`GpuBufferTooLarge`, `SdlError`) leaves the store's capacity, pending batch, and
+growth source unchanged for retry.
 
 - **Residency.** When the active level, the level window, the chunk window, the
   side, or the layer set changed: layers leaving free their directory and
@@ -402,7 +405,13 @@ backing, or the new write lands on memory the in-flight copy is still reading.
   visible tiles while CPU state stays correct.
 - The renderer's pooled tile-upload transfer buffer is reused across frames and
   fully re-staged each frame, so its source map passes `cycle=true`, exactly like
-  the vertex-stream staging in `stageVertices`.
+  the vertex-stream staging in `stageVertices`. A frame whose staged values
+  outgrow it replaces it pre-acquire with one at least twice its size (clamped to
+  the `u32` byte width): the new transfer is created first and the old one
+  released to SDL, which frees it after in-flight copies, so growth never drains
+  the device. Replacements count in `Renderer.tile_upload_transfer_grows`; the
+  first logs once at info. If the doubled transfer cannot be created, one retry
+  creates it at exactly the frame's size.
 
 | Resource | `cycle` on upload / map |
 | --- | --- |

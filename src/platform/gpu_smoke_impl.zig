@@ -135,6 +135,139 @@ pub fn main(init: std.process.Init) !void {
         log.err("SDL_GPU smoke wrap tile store did not survive its first frame", .{});
         return error.TileStoreNotLive;
     }
+
+    renderer.beginStaticGeometry();
+    try smokeTransferGrowth(&renderer, app_config, init.gpa);
+    try smokeTileUploadOom(&renderer, app_config, init.gpa, tile_quad);
+}
+
+// Frames uploading a small, a larger, then a small batch: only the larger one
+// replaces the pooled transfer, with at least twice its previous size, and the
+// small one after it reuses the grown transfer.
+fn smokeTransferGrowth(renderer: *Renderer, app_config: config.AppConfig, allocator: std.mem.Allocator) !void {
+    const small_elements: u32 = 1;
+    const larger_elements: u32 = renderer.tile_upload_transfer_byte_size / @sizeOf(u32) + 1;
+    const values = try allocator.alloc(u32, larger_elements);
+    defer allocator.free(values);
+    @memset(values, tileStoreUniformWord(1));
+    const store = try renderer.createTileStore(.{
+        .element_capacity = larger_elements,
+        .params = smokeTileParams(),
+    });
+    const grows_before = renderer.tile_upload_transfer_grows;
+    const bytes_before = renderer.tile_upload_transfer_byte_size;
+    try submitSmokeUploadFrame(renderer, app_config, store, values[0..small_elements], "small transfer upload");
+    try submitSmokeUploadFrame(renderer, app_config, store, values, "larger transfer upload");
+    try submitSmokeUploadFrame(renderer, app_config, store, values[0..small_elements], "small upload after transfer growth");
+    const grows = renderer.tile_upload_transfer_grows - grows_before;
+    if (grows != 1) {
+        log.err("SDL_GPU smoke tile upload transfer grew {d} times over small/larger/small, expected 1", .{grows});
+        return error.TransferGrowthMismatch;
+    }
+    if (renderer.tile_upload_transfer_byte_size < @as(u64, bytes_before) * 2) {
+        log.err("SDL_GPU smoke tile upload transfer grew {d} -> {d} bytes, less than double", .{
+            bytes_before,
+            renderer.tile_upload_transfer_byte_size,
+        });
+        return error.TransferGrowthNotGeometric;
+    }
+    log.info("SDL_GPU smoke tile upload transfer grew once over small/larger/small uploads ({d} -> {d} bytes)", .{
+        bytes_before,
+        renderer.tile_upload_transfer_byte_size,
+    });
+}
+
+fn submitSmokeUploadFrame(
+    renderer: *Renderer,
+    app_config: config.AppConfig,
+    store: TileDataId,
+    values: []const u32,
+    comptime label: []const u8,
+) !void {
+    if (!renderer.claimTileStore(store)) return error.TileStoreNotLive;
+    // Value counts fit u32: the store's capacity bounds them.
+    const count: u32 = @intCast(values.len);
+    const spans = [_]TileStoreSpan{.{ .dst_element = 0, .count = count }};
+    try renderer.reserveTileStoreUploads(store, count, spans.len, values.len);
+    try renderer.queueTileStoreUploads(store, &spans, values);
+    try submitSmokeFrame(renderer, app_config, label);
+}
+
+// Store state an out-of-memory reserve must leave unchanged.
+const TileStoreUploadState = struct {
+    element_capacity: u32,
+    pending_spans: usize,
+    pending_values: usize,
+    growth_source: ?*c.SDL_GPUBuffer,
+};
+
+fn tileStoreUploadState(renderer: *const Renderer, id: TileDataId) TileStoreUploadState {
+    const store = renderer.tile_stores.items[id.index];
+    return .{
+        .element_capacity = store.element_capacity,
+        .pending_spans = store.pending_spans.items.len,
+        .pending_values = store.pending_values.items.len,
+        .growth_source = store.growth_source,
+    };
+}
+
+// Fails each allocation of a growing reserve folded into a carried batch in turn:
+// every OOM leaves the store's capacity, pending batch, and growth source as they
+// were, the first success queues without allocating, and the frame draws the store.
+fn smokeTileUploadOom(
+    renderer: *Renderer,
+    app_config: config.AppConfig,
+    allocator: std.mem.Allocator,
+    quad: VertexColumnsConst,
+) !void {
+    const store = try renderer.createTileStore(.{
+        .element_capacity = smoke_directory_elements,
+        .params = smokeTileParams(),
+    });
+    const batch = smokeTileBatch();
+    // A carried batch no frame recorded, so the next reserve also sizes the merge.
+    try renderer.reserveTileStoreUploads(store, smoke_directory_elements, 1, smoke_directory_elements);
+    try renderer.queueTileStoreUploads(store, batch.spans[0..1], batch.values[0..smoke_directory_elements]);
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        if (fail_index > 64) return error.TileUploadOomSweepDidNotFinish;
+        const before = tileStoreUploadState(renderer, store);
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
+        renderer.allocator = failing.allocator();
+        defer renderer.allocator = allocator;
+        renderer.reserveTileStoreUploads(store, smoke_block + smoke_block_elements, batch.spans.len, batch.values.len) catch |err| switch (err) {
+            error.OutOfMemory => {
+                if (!std.meta.eql(before, tileStoreUploadState(renderer, store))) {
+                    log.err("SDL_GPU smoke tile upload reserve changed the store on OOM at fail index {d}", .{fail_index});
+                    return error.TileUploadOomChangedStore;
+                }
+                continue;
+            },
+            else => return err,
+        };
+        const allocations = failing.allocations;
+        try renderer.queueTileStoreUploads(store, &batch.spans, &batch.values);
+        if (failing.allocations != allocations) {
+            log.err("SDL_GPU smoke tile upload queue allocated after its reserve", .{});
+            return error.TileUploadQueueAllocated;
+        }
+        break;
+    }
+    if (fail_index == 0) {
+        log.err("SDL_GPU smoke tile upload reserve never ran out of memory; the sweep checked nothing", .{});
+        return error.TileUploadOomSweepVacuous;
+    }
+
+    renderer.beginStaticGeometry();
+    try appendSmokeTilemap(renderer, quad, store);
+    try submitSmokeFrame(renderer, app_config, "tilemap after an OOM-swept growing upload");
+    const after = tileStoreUploadState(renderer, store);
+    if (after.pending_spans != 0 or after.growth_source != null or !renderer.claimTileStore(store)) {
+        log.err("SDL_GPU smoke OOM-swept tile store did not flush and survive its frame", .{});
+        return error.TileUploadNotFlushed;
+    }
+    log.info("SDL_GPU smoke tile upload reserve left the store unchanged on {d} OOM fail indices, then drew", .{fail_index});
 }
 
 // A 3x1 grid in one 4x4-cell chunk, two chained layers in a tile store of
@@ -146,38 +279,56 @@ pub fn main(init: std.process.Init) !void {
 // elements, so queueing the block grows it: the frame copy pass copies the old
 // buffer's contents forward around the uploaded spans.
 fn createSmokeTileStore(renderer: *Renderer) !TileDataId {
-    const invalid_tile_id: u16 = 65535;
-    const chunk_edge: u16 = 4;
-    const block_elements = comptime tileStoreBlockElements(chunk_edge);
-    const directory_a: u32 = 0;
+    const batch = smokeTileBatch();
+    const tile_store = try renderer.createTileStore(.{
+        .element_capacity = smoke_directory_elements,
+        .params = smokeTileParams(),
+    });
+    try renderer.reserveTileStoreUploads(tile_store, smoke_block + smoke_block_elements, batch.spans.len, batch.values.len);
+    try renderer.queueTileStoreUploads(tile_store, &batch.spans, &batch.values);
+    return tile_store;
+}
+
+const smoke_invalid_tile_id: u16 = 65535;
+const smoke_chunk_edge: u16 = 4;
+const smoke_block_elements = tileStoreBlockElements(smoke_chunk_edge);
+// Directories A (at 0) and B (at 2), one word plus a link each.
+const smoke_directory_elements: u32 = 4;
+const smoke_block: u32 = smoke_directory_elements;
+
+const SmokeTileBatch = struct {
+    spans: [2]TileStoreSpan,
+    values: [smoke_directory_elements + smoke_block_elements]u32,
+};
+
+fn smokeTileBatch() SmokeTileBatch {
     const directory_b: u32 = 2;
-    const block: u32 = 4;
-    var block_cells: [chunk_edge * chunk_edge]u16 = @splat(1);
-    block_cells[0] = invalid_tile_id;
-    var values: [4 + block_elements]u32 = undefined;
-    values[0] = block; // A: chunk (0, 0) is mixed
-    values[1] = directory_b; // A's link
-    values[2] = tileStoreUniformWord(1); // B: chunk (0, 0) is uniform
-    values[3] = tile_store_no_link; // B is the deepest
-    packTileData(&block_cells, values[4..]);
-    const spans = [_]TileStoreSpan{
-        .{ .dst_element = directory_a, .count = 4 },
-        .{ .dst_element = block, .count = block_elements },
+    var block_cells: [smoke_chunk_edge * smoke_chunk_edge]u16 = @splat(1);
+    block_cells[0] = smoke_invalid_tile_id;
+    var batch: SmokeTileBatch = .{
+        .spans = .{
+            .{ .dst_element = 0, .count = smoke_directory_elements },
+            .{ .dst_element = smoke_block, .count = smoke_block_elements },
+        },
+        .values = undefined,
     };
+    batch.values[0] = smoke_block; // A: chunk (0, 0) is mixed
+    batch.values[1] = directory_b; // A's link
+    batch.values[2] = tileStoreUniformWord(1); // B: chunk (0, 0) is uniform
+    batch.values[3] = tile_store_no_link; // B is the deepest
+    packTileData(&block_cells, batch.values[smoke_directory_elements..]);
+    return batch;
+}
+
+fn smokeTileParams() TilemapParams {
     var tile_params = TilemapParams{
-        .grid = .{ 16.0, 3.0, 1.0, @floatFromInt(invalid_tile_id) },
+        .grid = .{ 16.0, 3.0, 1.0, @floatFromInt(smoke_invalid_tile_id) },
         .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
         .window = .{ 0, 0, 1, 1 },
     };
-    tile_params.layer_meta[2] = @ctz(chunk_edge);
+    tile_params.layer_meta[2] = @ctz(smoke_chunk_edge);
     tile_params.layer_meta[3] = 1;
-    const tile_store = try renderer.createTileStore(.{
-        .element_capacity = 4,
-        .params = tile_params,
-    });
-    try renderer.reserveTileStoreUploads(tile_store, block + block_elements, spans.len, values.len);
-    try renderer.queueTileStoreUploads(tile_store, &spans, &values);
-    return tile_store;
+    return tile_params;
 }
 
 // A 12x4 grid in three 4x4-cell chunks, one layer in a directory of side 2 at 0

@@ -76,7 +76,7 @@ pub fn tileDataElementCount(cell_count: usize) usize {
     return (cell_count + tile_data_cells_per_element - 1) / tile_data_cells_per_element;
 }
 
-pub fn tileDataElementIndex(cell_index: usize) usize {
+fn tileDataElementIndex(cell_index: usize) usize {
     return cell_index / tile_data_cells_per_element;
 }
 
@@ -164,6 +164,13 @@ fn tileStoreGrownCapacity(current: u32, required: u32) error{GpuBufferTooLarge}!
     if (required > tile_store_max_elements) return error.GpuBufferTooLarge;
     const doubled = @as(u64, current) * 2;
     return @intCast(@min(@max(@as(u64, required), doubled), tile_store_max_elements));
+}
+
+// Byte size of a replacement tile-upload transfer: at least double the current one
+// so rising uploads create O(log peak) transfers, clamped to SDL's `u32` size.
+fn grownTransferBytes(current: u32, required: u32) u32 {
+    const doubled = @as(u64, current) * 2;
+    return @intCast(@min(@max(@as(u64, required), doubled), std.math.maxInt(u32)));
 }
 
 /// The ranges of a grown store's previous contents to copy forward: elements
@@ -411,6 +418,9 @@ pub const Renderer = struct {
     // Pooled transfer buffer holding every store's pending values for one copy pass.
     tile_upload_transfer: ?*c.SDL_GPUTransferBuffer = null,
     tile_upload_transfer_byte_size: u32 = 0,
+    // Times a larger transfer replaced the pooled one; the first replacement logs once.
+    tile_upload_transfer_grows: u64 = 0,
+    tile_upload_transfer_growth_logged: bool = false,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
     first_free_texture_slot: ?u32 = null,
@@ -823,9 +833,9 @@ pub const Renderer = struct {
         // gpu/buffer.zig): the map rotates to fresh backing storage rather than
         // overwriting bytes a prior frame's copy pass may still reference. The
         // static buffer uses the same cycle=true upload, only when dirty.
-        // Tile-store transfer grow (create → WaitForGPUIdle → release-old) and
-        // staging also live here so a capacity stall never holds an acquired
-        // swapchain and post-acquire work is record-only (matches dynamic verts).
+        // Tile-store transfer growth (create new, release old; SDL frees the old
+        // one after in-flight copies, so no drain) and staging also live here so
+        // post-acquire work is record-only (matches dynamic verts).
         if (self.batch.positions.items.len > 0) {
             try self.stageVertices();
         }
@@ -1164,13 +1174,15 @@ pub const Renderer = struct {
     /// nothing. Call before swapchain acquisition.
     pub fn reserveTileStoreUploads(self: *Renderer, id: TileDataId, required_elements: u32, span_count: usize, value_count: usize) !void {
         const store = self.tileStore(id) orelse return error.InvalidTileStore;
-        if (required_elements > store.element_capacity) try self.growTileStore(store, required_elements);
+        // CPU lists first, GPU growth last: an OOM leaves the store's capacity,
+        // growth source, and pending batch as they were.
         try store.pending_spans.ensureUnusedCapacity(self.allocator, span_count);
         try store.pending_values.ensureUnusedCapacity(self.allocator, value_count);
         if (store.pending_spans.items.len > 0) {
             try self.tile_merge_spans.ensureTotalCapacity(self.allocator, store.pending_spans.items.len + span_count);
             try self.tile_merge_values.ensureTotalCapacity(self.allocator, store.pending_values.items.len + value_count);
         }
+        if (required_elements > store.element_capacity) try self.growTileStore(store, required_elements);
     }
 
     /// Queues one upload batch for the store, flushed in the next frame copy pass
@@ -1338,25 +1350,32 @@ pub const Renderer = struct {
         c.SDL_UnmapGPUTransferBuffer(self.device, transfer);
     }
 
-    // Mirrors `ensureBatchCapacity`: create the new transfer first, idle the GPU,
-    // then release the old one, so a creation failure leaves the live transfer
-    // untouched and no in-flight copy still reads a freed buffer.
+    // Grows geometrically (`grownTransferBytes`). The new transfer is created before
+    // the old one is released, so a creation failure leaves the live transfer
+    // untouched; SDL frees the old one once in-flight copies finish, so no drain.
+    // A failed grown create retries once at exactly `required_bytes`.
     fn ensureTileUploadTransfer(self: *Renderer, required_bytes: u32) !void {
+        if (self.tile_upload_transfer != null and self.tile_upload_transfer_byte_size >= required_bytes) return;
+        var byte_size = grownTransferBytes(self.tile_upload_transfer_byte_size, required_bytes);
+        const transfer = gpu_buffer.createVertexTransferBuffer(self.device, byte_size) catch |err| exact: {
+            if (byte_size == required_bytes) return err;
+            byte_size = required_bytes;
+            break :exact try gpu_buffer.createVertexTransferBuffer(self.device, byte_size);
+        };
         if (self.tile_upload_transfer) |existing| {
-            if (self.tile_upload_transfer_byte_size >= required_bytes) return;
-
-            const new_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
-            errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_transfer);
-
-            _ = c.SDL_WaitForGPUIdle(self.device);
             c.SDL_ReleaseGPUTransferBuffer(self.device, existing);
-            self.tile_upload_transfer = new_transfer;
-            self.tile_upload_transfer_byte_size = required_bytes;
-            return;
+            self.countTileUploadTransferGrowth(byte_size);
         }
+        self.tile_upload_transfer = transfer;
+        self.tile_upload_transfer_byte_size = byte_size;
+    }
 
-        self.tile_upload_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
-        self.tile_upload_transfer_byte_size = required_bytes;
+    fn countTileUploadTransferGrowth(self: *Renderer, byte_size: u32) void {
+        @branchHint(.cold);
+        self.tile_upload_transfer_grows += 1;
+        if (self.tile_upload_transfer_growth_logged) return;
+        self.tile_upload_transfer_growth_logged = true;
+        if (comptime logging.enabled(.info)) log.info("tile upload transfer grew to {d} bytes", .{byte_size});
     }
 
     fn tileStore(self: *const Renderer, id: TileDataId) ?*TileStore {
@@ -2371,6 +2390,15 @@ test "tile store growth at least doubles, covers the request, and clamps to the 
     const near_max = tile_store_max_elements - 8;
     try std.testing.expectEqual(tile_store_max_elements, try tileStoreGrownCapacity(near_max - 1000, near_max));
     try std.testing.expectError(error.GpuBufferTooLarge, tileStoreGrownCapacity(80, tile_store_max_elements + 1));
+}
+
+test "tile upload transfer grows geometrically and clamps to the u32 byte width" {
+    try std.testing.expectEqual(@as(u32, 48), grownTransferBytes(0, 48));
+    try std.testing.expectEqual(@as(u32, 96), grownTransferBytes(48, 52));
+    try std.testing.expectEqual(@as(u32, 400), grownTransferBytes(48, 400));
+    const max_bytes = std.math.maxInt(u32);
+    try std.testing.expectEqual(max_bytes, grownTransferBytes(max_bytes / 2 + 1, max_bytes / 2 + 2));
+    try std.testing.expectEqual(max_bytes, grownTransferBytes(max_bytes - 4, max_bytes));
 }
 
 test "tile store layout bounds the chunk shift, directory side, grid, and capacity" {
