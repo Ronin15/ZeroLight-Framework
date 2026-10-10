@@ -673,6 +673,8 @@ pub const SimulationFrame = struct {
     events: SimulationEvents,
     navigation_intents: RangeOutputStream(NavigationIntent),
     action_intents: RangeOutputStream(ActionIntent),
+    /// At most one `.movement` intent per entity per step; consumers write the
+    /// entities' rows in parallel on this.
     intents: RangeOutputStream(SimulationIntent),
     path_requests: RangeOutputStream(PathRequest),
     contacts: RangeOutputStream(CollisionContact),

@@ -53,6 +53,7 @@ const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
 const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
+const MovementIntentStats = @import("systems/movement.zig").MovementIntentStats;
 const MovementStats = @import("systems/movement.zig").MovementStats;
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
@@ -474,6 +475,7 @@ pub const SimulationPipelineStats = struct {
     ai: AiStats = .{},
     steering: SteeringStats = .{},
     pathfinding: PathfindingStats = .{},
+    apply_intents: MovementIntentStats = .{},
     movement: MovementStats = .{},
     chunk_derive: BatchStats = .{},
     /// The plane stage's NPC cell-entry gather.
@@ -593,6 +595,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
         perf.recordTiming(.pathfinding_publish, pathfinding_stats.publish_ns);
 
+        perf.recordBatch(.apply_intents, self.apply_intents.batch);
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         perf.recordBatch(.movement, movement_stats.batch);
         perf.recordBatch(.chunk_derive, self.chunk_derive);
@@ -1158,6 +1161,7 @@ pub const SimulationPipeline = struct {
         ai: AiStats = .{},
         steering: SteeringStats = .{},
         pathfinding: PathfindingStats = .{},
+        apply_intents: MovementIntentStats = .{},
         movement: MovementStats = .{},
         chunk_derive: BatchStats = .{},
         plane_entry: BatchStats = .{},
@@ -1193,6 +1197,7 @@ pub const SimulationPipeline = struct {
                 .ai = self.ai,
                 .steering = self.steering,
                 .pathfinding = self.pathfinding,
+                .apply_intents = self.apply_intents,
                 .movement = self.movement,
                 .chunk_derive = self.chunk_derive,
                 .plane_entry = self.plane_entry,
@@ -1431,8 +1436,11 @@ pub const SimulationPipeline = struct {
     }
 
     fn stageApplyAiMovementIntents(self: *SimulationPipeline, step: *StepState) void {
+        // Steering is the stream's only writer, one intent per steering row; the
+        // threaded apply's disjoint row writes rely on it.
+        std.debug.assert(step.context.frame.intents.mergedItems().len == step.steering.movement_intent_count);
         var apply_intents_timer = StageTimer.start();
-        self.movement.applyIntents(step.context.data, step.context.frame);
+        step.apply_intents = self.movement.applyIntents(step.context.data, step.context.frame, step.context.thread_system, .{});
         apply_intents_timer.stop(step.context.perf, .pipeline_apply_intents);
     }
 
@@ -5457,6 +5465,7 @@ const TestAllocatorSwap = struct {
 fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveWorkProfile) void {
     const tuners = [_]*AdaptiveWorkTuner{
         &pipeline.movement.adaptive_tuner,
+        &pipeline.movement.apply_intents_tuner,
         &pipeline.collision.broadphase_tuner,
         &pipeline.collision.narrowphase_tuner,
         &pipeline.ai.separation_tuner,
@@ -5868,6 +5877,106 @@ test "population growth scenario is identical on the serial and multi-worker pat
         try std.testing.expectEqual(a[0], b[0]);
         try std.testing.expectEqual(a[1], b[1]);
     }
+}
+
+const apply_intents_agent_count: usize = 20;
+
+const ApplyIntentsScenarioResult = struct {
+    // The player's row plus one per agent.
+    velocity_x: [apply_intents_agent_count + 1]f32 = undefined,
+    velocity_y: [apply_intents_agent_count + 1]f32 = undefined,
+};
+
+/// `apply_intents_agent_count` wandering agents, each with a movement body, an AI agent,
+/// and a steering agent, so steering emits one movement intent each step. A chunkless
+/// world keeps every agent thinking every step. `max_worker_threads > 0` pins a
+/// 2-worker, 16-item partition (2 apply ranges). A warm step, then a step with every
+/// allocator failing; returns that step's velocities.
+fn runApplyIntentsScenario(max_worker_threads: usize) !ApplyIntentsScenarioResult {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    for (0..apply_intents_agent_count) |index| {
+        const position = math.Vec2{
+            .x = 40 + @as(f32, @floatFromInt(index % 5)) * 140,
+            .y = 40 + @as(f32, @floatFromInt(index / 5)) * 90,
+        };
+        const agent = try data.createEntity();
+        // Every 4th agent has no speed, so the apply's default speed runs too.
+        const speed: f32 = if (index % 4 == 0) 0 else 10 + @as(f32, @floatFromInt(index));
+        try data.setMovementBody(agent, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = speed });
+        try data.setAiAgent(agent, .{ .active_behavior = .wander, .wander_amplitude = 30, .gain_pursue = 0 });
+        try data.setSteeringAgent(agent, growthSteeringTemplate(.{ 0, 0 }).create_entity.steering_agent.?);
+    }
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = apply_intents_agent_count + 1,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, apply_intents_agent_count, 4, 4, 4);
+    try frame.reservePathRequests(1, apply_intents_agent_count);
+    try pipeline.reserve(&frame, 4);
+    if (max_worker_threads > 0) pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    const stats = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    try std.testing.expectEqual(apply_intents_agent_count, stats.steering.movement_intent_count);
+    try std.testing.expectEqual(stats.steering.movement_intent_count, stats.apply_intents.intent_count);
+    if (max_worker_threads > 0) {
+        try std.testing.expect(!stats.apply_intents.batch.ran_inline);
+        try std.testing.expectEqual(rangeCount(apply_intents_agent_count, 16), stats.apply_intents.batch.range_count);
+    }
+
+    const slice = data.movementBodySliceConst();
+    try std.testing.expectEqual(apply_intents_agent_count + 1, slice.entities.len);
+    var out: ApplyIntentsScenarioResult = .{};
+    @memcpy(&out.velocity_x, slice.velocity_x);
+    @memcpy(&out.velocity_y, slice.velocity_y);
+    return out;
+}
+
+test "the AI movement intent apply runs on workers in the pipeline, allocation-free and matching the serial step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const serial = try runApplyIntentsScenario(0);
+    const threaded = try runApplyIntentsScenario(2);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_x), std.mem.sliceAsBytes(&threaded.velocity_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
 }
 
 /// Adds dynamic collision bodies `first..end` of a row-major chain: 21 per row, 10 px

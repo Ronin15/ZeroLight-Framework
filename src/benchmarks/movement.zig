@@ -220,29 +220,70 @@ fn countAppliedRows(data: *const DataSystem) usize {
     return applied;
 }
 
-fn applyIntentsOnce(system: *MovementSystem, fixture: *ApplyIntentsFixture) BatchStats {
-    system.applyIntents(&fixture.data, &fixture.frame);
-    return suite.serialBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
+fn applyIntentsOnce(
+    system: *MovementSystem,
+    fixture: *ApplyIntentsFixture,
+    thread_system: ?*ThreadSystem,
+    case: suite.BenchmarkCase,
+) BatchStats {
+    if (!case.usesThreadSystem()) {
+        movement.applyIntentsSerial(&fixture.data, &fixture.frame);
+        return suite.serialBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
+    }
+    const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system.?, .{
+        .items_per_range = benchmarkItemsPerRange(case),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+    });
+    return stats.batch;
 }
 
 fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
     var fixture = try buildApplyIntentsFixture(allocator, item_count);
     defer fixture.deinit();
     var system = MovementSystem.init();
+    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
+        system.apply_intents_tuner = tuner;
+    }
+
+    // A fixed threaded case with more than one range of intents dispatches the apply.
+    const expect_dispatch = if (thread_ptr) |thread_system|
+        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > benchmarkItemsPerRange(case).?
+    else
+        false;
 
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
-        _ = applyIntentsOnce(&system, &fixture);
+        _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
     }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!system.apply_intents_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) system.apply_intents_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = applyIntentsOnce(&system, &fixture);
+        const batch = applyIntentsOnce(&system, &fixture, thread_ptr, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         std.debug.assert(batch.item_count == item_count);
+        std.debug.assert(!expect_dispatch or (batch.range_count > 1 and !batch.ran_inline));
         accumulator.record(elapsed_ns, batch);
         // Main is everything but an apply that ran on workers.
         main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
@@ -253,6 +294,9 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     stats.output_count = applied;
     if (stats.iterations > 0) {
         stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
+    }
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(system.apply_intents_tuner.report(), settled_before_measurement);
     }
     return stats;
 }

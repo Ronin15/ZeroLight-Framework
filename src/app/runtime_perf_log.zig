@@ -223,6 +223,7 @@ pub const BatchStage = enum {
     ai_intent,
     steering,
     path_fallback,
+    apply_intents,
     movement,
     chunk_derive,
     plane_entry,
