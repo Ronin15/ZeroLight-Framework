@@ -73,8 +73,14 @@ const shader_programs = [_]ShaderProgram{
 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Shipping modes default to the packaged CPU floor (x86-64-v2: SSE4.2 and
+    // POPCNT, which the chunk bit ops use; the aarch64 baseline includes NEON);
+    // Debug and ReleaseSafe stay native. -Dtarget/-Dcpu override.
+    const target = b.standardTargetOptions(.{ .default_target = switch (optimize) {
+        .fast, .small => shippedCpuFloor(b.graph.host.result.cpu.arch),
+        .debug, .safe => .{},
+    } });
     const app_name = b.option([]const u8, "app-name", "Executable name") orelse "my-sdl3-game";
     const window_title = b.option([]const u8, "window-title", "SDL window title") orelse "SDL3 Zig Game";
     const asset_root = b.option([]const u8, "asset-root", "Runtime asset directory") orelse "assets";
@@ -737,6 +743,13 @@ comptime {
 /// `link_libc` fail at `lld-link` with undefined mingw libc/libm symbols
 /// (`frexpf`, `lrintl`, `modfl`, `wmemcpy`, `strndup`, ...) for x86_64 and
 /// aarch64 windows-gnu. Without LTO, ReleaseFast links and emits the PDB.
+fn shippedCpuFloor(arch: std.Target.Cpu.Arch) std.Target.Query {
+    return switch (arch) {
+        .x86_64 => .{ .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v2 } },
+        else => .{ .cpu_model = .baseline },
+    };
+}
+
 fn ltoSupportedForTarget(target: std.Target) bool {
     return switch (target.ofmt) {
         .macho, .coff => false,
