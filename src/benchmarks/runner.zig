@@ -92,6 +92,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     perception.scattered_dense_index_group,
     steering.group,
     steering.static_change_group,
+    steering.static_dense_group,
 };
 
 pub fn main(init: std.process.Init) !void {

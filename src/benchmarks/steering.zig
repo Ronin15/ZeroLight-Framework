@@ -5,7 +5,8 @@
 //! `steering` times one steering step over its agent count. `steering-static-change` times
 //! one static collision body moved and committed, the steering post-commit reaction, and one
 //! steering step for a fixed agent population, with the static count as its item count; the
-//! cost model expects it flat in the static count.
+//! cost model expects it flat in the static count. `steering-static-dense` times one steering
+//! step for a fixed agent population among chunks holding the item count of statics each.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -32,6 +33,12 @@ pub const static_change_group = suite.BenchmarkGroup{
     .name = "steering-static-change",
     .defaultItemCounts = staticChangeItemCounts,
     .runCase = runStaticChangeCase,
+};
+
+pub const static_dense_group = suite.BenchmarkGroup{
+    .name = "steering-static-dense",
+    .defaultItemCounts = staticDenseItemCounts,
+    .runCase = runStaticDenseCase,
 };
 
 const quick_counts = [_]usize{ 128, 512, 1024 };
@@ -424,5 +431,140 @@ fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thre
     const stats = try steeringStep(system, &fixture.steering, thread_system, case);
     if (stats.movement_intent_count != fixture.steering.agents.items.len) return error.AgentIntentMissing;
     if (stats.obstacle_samples == 0) return error.NearStaticsUnsampled;
+    return stats;
+}
+
+// ----------------------------------------------------------------------------
+// Static dense: a fixed agent population among chunks dense with statics.
+// ----------------------------------------------------------------------------
+
+const static_dense_counts = [_]usize{ 4, 16, 64 };
+// Fixed agent population; the threaded case dispatches the steering stage to workers at it.
+const static_dense_agent_count: usize = 4096;
+
+const StaticDenseFixture = struct {
+    steering: Fixture,
+    // Obstacle visits and samples of the first step; every later step repeats them.
+    first_visits: ?usize = null,
+    first_samples: usize = 0,
+
+    fn deinit(self: *StaticDenseFixture, allocator: std.mem.Allocator) void {
+        self.steering.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn staticDenseItemCounts(_: suite.Profile) []const usize {
+    return &static_dense_counts;
+}
+
+// `statics_per_chunk` statics in every chunk the agent grid overlaps, each centered in its slot
+// of a square slot grid spanning the chunk, so every chunk the agents query holds exactly
+// `statics_per_chunk` statics and no static crosses a chunk edge.
+fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usize) !StaticDenseFixture {
+    if (statics_per_chunk == 0) return error.NoStatics;
+    const slot_side = std.math.sqrt(statics_per_chunk - 1) + 1;
+    std.debug.assert(slot_side * slot_side >= statics_per_chunk);
+    const slot_pitch = chunk_px / @as(f32, @floatFromInt(slot_side));
+    if (slot_pitch < static_size) return error.StaticsOverlap;
+
+    const agent_count = static_dense_agent_count;
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    var frame = SimulationFrame.init(allocator);
+    errdefer frame.deinit();
+    const range_count = suite.rangeCount(agent_count, steering_range_alignment_items);
+    try frame.reserveStreams(range_count, 0, agent_count, 0, 0, 0);
+    try frame.reservePathRequests(range_count, agent_count);
+    var pathfinding = PathfindingSystem.init(allocator);
+    errdefer pathfinding.deinit();
+    try pathfinding.reserve(.{
+        .max_frame_requests = agent_count,
+        .max_pending_requests = agent_count,
+        .max_cached_results = agent_count * 2,
+        .max_group_fields = 4,
+        .worker_participant_count = 1,
+        .max_solved_requests_per_step = agent_count,
+    });
+    var agents = std.ArrayList(EntityId).empty;
+    errdefer agents.deinit(allocator);
+    try agents.ensureTotalCapacity(allocator, agent_count);
+
+    const side = gridSide(agent_count);
+    for (0..agent_count) |index| {
+        agents.appendAssumeCapacity(try addAgent(&data, index, side));
+    }
+
+    // Chunks overlapped by the agent grid: columns and rows 0 through the last agent's chunk.
+    const last_agent_coord = @as(f32, @floatFromInt(side - 1)) * 18.0;
+    const chunks_per_axis: usize = @as(usize, @intFromFloat(@floor(last_agent_coord / chunk_px))) + 1;
+    const chunk_count = chunks_per_axis * chunks_per_axis;
+    const per_chunk_tally = try allocator.alloc(usize, chunk_count);
+    defer allocator.free(per_chunk_tally);
+    @memset(per_chunk_tally, 0);
+
+    const slot_inset = (slot_pitch - static_size) * 0.5;
+    for (0..chunk_count) |chunk_index| {
+        const chunk_x = @as(f32, @floatFromInt(chunk_index % chunks_per_axis)) * chunk_px;
+        const chunk_y = @as(f32, @floatFromInt(chunk_index / chunks_per_axis)) * chunk_px;
+        for (0..statics_per_chunk) |slot| {
+            const position = math.Vec2{
+                .x = chunk_x + @as(f32, @floatFromInt(slot % slot_side)) * slot_pitch + slot_inset,
+                .y = chunk_y + @as(f32, @floatFromInt(slot / slot_side)) * slot_pitch + slot_inset,
+            };
+            // Both corners land in the slot's chunk; coordinates are non-negative by construction.
+            const min_chunk_x: usize = @intFromFloat(@floor(position.x / chunk_px));
+            const min_chunk_y: usize = @intFromFloat(@floor(position.y / chunk_px));
+            const max_chunk_x: usize = @intFromFloat(@floor((position.x + static_size) / chunk_px));
+            const max_chunk_y: usize = @intFromFloat(@floor((position.y + static_size) / chunk_px));
+            if (min_chunk_x != max_chunk_x or min_chunk_y != max_chunk_y) return error.StaticCrossesChunk;
+            if (min_chunk_x >= chunks_per_axis or min_chunk_y >= chunks_per_axis) return error.StaticOutsideAgentChunks;
+            per_chunk_tally[min_chunk_y * chunks_per_axis + min_chunk_x] += 1;
+            _ = try addStatic(&data, position);
+        }
+    }
+    for (per_chunk_tally) |tally| {
+        if (tally != statics_per_chunk) return error.WrongStaticsPerChunk;
+    }
+
+    const nav_extent = @as(f32, @floatFromInt(chunks_per_axis)) * chunk_px;
+    try pathfinding.rebuildStaticNavGrid(&data, nav_extent, nav_extent, nav_cell_size);
+
+    return .{ .steering = .{
+        .data = data,
+        .frame = frame,
+        .pathfinding = pathfinding,
+        .agents = agents,
+        .obstacle_count = chunk_count * statics_per_chunk,
+    } };
+}
+
+fn runStaticDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var fixture = try createStaticDenseFixture(allocator, item_count);
+    defer fixture.deinit(allocator);
+    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, staticDenseOnce);
+    var stats = measured.stats;
+    stats.candidate_pairs = measured.last.obstacle_candidate_checks;
+    stats.sample_count = measured.last.obstacle_samples;
+    return stats;
+}
+
+// One steering step; fails when the obstacle workload is empty or differs from the first step's.
+fn staticDenseOnce(system: *SteeringSystem, fixture: *StaticDenseFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+    fixture.steering.frame.beginStep();
+    const stats = try steeringStep(system, &fixture.steering, thread_system, case);
+    if (stats.movement_intent_count != fixture.steering.agents.items.len) return error.AgentIntentMissing;
+    if (stats.obstacle_samples == 0) return error.StaticsUnsampled;
+    if (stats.obstacle_samples > stats.obstacle_candidate_checks) return error.SamplesExceedVisits;
+    if (fixture.first_visits) |first_visits| {
+        if (stats.obstacle_candidate_checks != first_visits or stats.obstacle_samples != fixture.first_samples) {
+            return error.ObstacleWorkloadDrifted;
+        }
+    } else {
+        fixture.first_visits = stats.obstacle_candidate_checks;
+        fixture.first_samples = stats.obstacle_samples;
+    }
     return stats;
 }

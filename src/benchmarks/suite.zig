@@ -1195,6 +1195,14 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
             .{ stats.candidate_pairs, stats.fallback_deferred_count, stats.deferred_count, stats.output_count, stats.cache_evictions },
         ) catch "workload";
     }
+    if (std.mem.eql(u8, group_name, "steering-static-dense")) {
+        const visits_per_agent_tenths = if (stats.output_count == 0) 0 else stats.candidate_pairs * 10 / stats.output_count;
+        return std.fmt.bufPrint(
+            buffer,
+            "obstacle_visits={} ({}.{}/agent) obstacle_samples={} intents={}",
+            .{ stats.candidate_pairs, visits_per_agent_tenths / 10, visits_per_agent_tenths % 10, stats.sample_count, stats.output_count },
+        ) catch "workload";
+    }
     if (std.mem.eql(u8, group_name, "steering")) {
         return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
     }
