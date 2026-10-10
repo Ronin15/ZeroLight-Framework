@@ -152,6 +152,10 @@ def main() -> int:
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = root / OUTPUT_DIRNAME / f"ab-{stamp}"
+    suffix = 2
+    while out_dir.exists():  # runs started within the same second
+        out_dir = root / OUTPUT_DIRNAME / f"ab-{stamp}-{suffix}"
+        suffix += 1
     out_dir.mkdir(parents=True)
 
     timing = [] if any(a.startswith(("--warmup", "--iterations")) for a in args.bench_args) else list(DEFAULT_TIMING)
