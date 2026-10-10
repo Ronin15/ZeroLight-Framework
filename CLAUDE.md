@@ -65,12 +65,18 @@ orchestrates, verifies every agent claim against live code, and reports.
 - `zig-debug-specialist` for failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
-- Terse reports and docs, never by dropping findings. Make reasonable
-  engineering calls without asking. No model/effort overrides unless the owner
-  asks.
+- Terse reports and docs, never by dropping findings. Make engineering calls
+  without asking and report them; only scope added or dropped,
+  product/gameplay behavior, rule changes, and a `ThreadSystem`/tuner
+  redesign go to the owner. No model/effort overrides unless the owner asks.
 - Implementation agents run sequentially in the main tree; parallelize only
-  read-only work. One commit per logical change with review fixes folded in;
-  no per-finding commits, worktrees, or merge commits.
+  read-only work, and let read-only agents finish rather than stopping them
+  midway. One commit per logical change with review fixes folded in; no
+  per-finding commits, worktrees, or merge commits. Never commit known-broken
+  or unfinished code; the owner pushes.
+- Docs wait until a slice's programming is done: each landing's doc changes
+  are notes in its commit message, and the slice's docs commit writes them
+  once from the code as landed (checklist check-offs, durable docs, tables).
 
 ## Commands
 
