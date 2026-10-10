@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Targeted before/after benchmark comparison in Debug.
+"""Targeted before/after benchmark comparison, in Debug by default.
 
 Runs only the named bench groups (never the full suite), interleaving a base
 git ref against the working tree for N reps, and prints per-(group, item,
@@ -16,7 +16,8 @@ only what differs). Raw outputs and the summary go to
 (`--all-cases` runs every case). A run must name its config with
 `-- --items N` (or pass `--grid` for every config): one config answers a
 regression question; a full grid is rarely the right signal. Runs use `--warmup 2 --iterations 10`
-unless the forwarded bench args set them.
+unless the forwarded bench args set them. `--optimize ReleaseFast` is only for a
+question Debug cannot answer (`.claude/rules/build-validation.md`).
 
 Usage:
     tools/bench_ab.py --group chunk-scale-dig -- --items 1024032
@@ -24,6 +25,7 @@ Usage:
     tools/bench_ab.py --group chunk-scale-gpu-sync-dig --case serial-direct --base 5439e36 -- --items 1024032
     tools/bench_ab.py --base none --grid --group chunk-scale-dig   # shape: tree only, every config
     tools/bench_ab.py --group pathfinding -- --items 2000         # forward bench args
+    tools/bench_ab.py --optimize ReleaseFast --group movement-apply-intents -- --items 16384
 """
 
 from __future__ import annotations
@@ -79,10 +81,10 @@ def export_base(root: Path, ref: str) -> Path:
     return target
 
 
-def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path) -> tuple[int, str]:
+def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str) -> tuple[int, str]:
     # Both sides share the repo's local cache: it is content-addressed, so a base
     # export of a new parent commit rebuilds only what differs instead of cold.
-    cmd = ["zig", "build", "bench", "--cache-dir", str(cache_dir), "--", *bench_args]
+    cmd = ["zig", "build", "bench", f"-Doptimize={optimize}", "--cache-dir", str(cache_dir), "--", *bench_args]
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -113,7 +115,7 @@ def fmt_us(v: float) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Targeted Debug A/B bench: base ref vs working tree, interleaved reps, medians.",
+        description="Targeted A/B bench (Debug by default): base ref vs working tree, interleaved reps, medians.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -133,6 +135,12 @@ def main() -> int:
     )
     parser.add_argument("--base", default="HEAD", help="git ref for the before side, or 'none' (default: HEAD)")
     parser.add_argument("--reps", type=int, default=3, help="interleaved reps per side (default: 3)")
+    parser.add_argument(
+        "--optimize",
+        choices=("Debug", "ReleaseFast"),
+        default="Debug",
+        help="build mode for both sides (default: Debug; ReleaseFast only for what Debug cannot show)",
+    )
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
     args = parser.parse_args()
 
@@ -172,7 +180,7 @@ def main() -> int:
             for case in cases:
                 for name, cwd in sides:
                     bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
-                    code, text = run_bench(cwd, bench_args, root / ".zig-cache")
+                    code, text = run_bench(cwd, bench_args, root / ".zig-cache", args.optimize)
                     tag = "_".join([name.replace(":", "-").replace("/", "-"), target[1], case or "all", str(rep)])
                     (out_dir / f"{tag}.txt").write_text(text)
                     done += 1
@@ -188,7 +196,7 @@ def main() -> int:
     names = [n for n, _ in sides]
     lines = [
         f"# bench_ab  {stamp}  head={git(root, 'rev-parse', '--short', 'HEAD')}"
-        f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  Debug",
+        f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  {args.optimize}",
         f"# args  {' '.join(sum(targets, []))}  cases={'all' if args.all_cases else ','.join(c for c in cases)}  extra={' '.join(args.bench_args) or '-'}",
         "",
     ]

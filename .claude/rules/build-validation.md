@@ -18,6 +18,11 @@ Commands and options: `docs/development-workflow.md`.
   comparisons included, runs in Debug. ReleaseFast is for the branch commit,
   release candidates, and shipping builds; ReleaseSafe for soaks. Packaged
   builds ship `ReleaseFast`.
+- Exception: a question Debug cannot answer by construction (false sharing
+  between worker ranges, a SIMD or inlining gain) gets one targeted
+  `tools/bench_ab.py --optimize ReleaseFast` run of the group that asks it,
+  reported beside its Debug numbers. It answers that question only; it is
+  never a baseline, gate, or reason to revert SIMD (`memory-performance.md`).
 - Before a ReleaseFast release candidate, a multi-hour ReleaseSafe soak across
   realistic to extreme entity counts and spawn/despawn churn must pass;
   ReleaseFast corrupts memory silently where ReleaseSafe reports.

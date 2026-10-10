@@ -85,10 +85,22 @@ rules.
 - **Main-thread and deferred boundaries**: what stays on the main thread (only
   boundaries, orchestration, ordered merge/commit proportional to what
   changed) and the deterministic merge.
+- **Pre-implementation check** (`.claude/rules/engine-design.md` § Cost
+  model) against the live code at the design's HEAD; every `file:line` taken
+  from an earlier brief or report is re-checked, never copied.
 - **Tests, benches, diagnostics**: each claimed growth order names the
   scaling bench group and sizes that will measure it
   (`.claude/rules/tests-benchmarks.md`); a slice that replaces a structure
-  measures the old one first, so the baseline is measured, not derived.
+  measures the old one first, so the baseline is measured, not derived (the
+  bench lands first, on today's code). A threaded stage gets serial ==
+  threaded bitwise parity across range sizes and worker counts, the
+  `FailingAllocator` proof on a real multi-worker `ThreadSystem`, and a
+  pipeline-level test that proves the stage ran on workers, not inline. Its
+  bench reports the threaded case's main-thread share.
+- **Files**: every file the implementation touches; the implementer stops on
+  any other.
+- **Doc notes**: the doc changes the work needs, as notes for the slice's
+  docs pass; the landing itself edits no docs.
 
 Every invariant stated, no restated code, no essays. End with the plan's
 implementation steps, one line each, for the implementer's brief; the design

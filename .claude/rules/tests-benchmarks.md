@@ -46,10 +46,11 @@ paths:
   (`--group <name> --items N`), never the full suite; full sweeps only when
   the owner or a slice asks.
 - Bench only changes that can move a hot path. Compare before/after on adjacent
-  commits in Debug with 3 interleaved reps and medians (`tools/bench_ab.py`);
-  a regression is a change beyond the run-to-run spread. Act on one only when
-  it shows a worse growth order or a material total; a nanosecond-per-item
-  constant is reported, not redesigned.
+  commits in Debug (ReleaseFast only per `build-validation.md`) with 3
+  interleaved reps and medians (`tools/bench_ab.py`); a regression is a change
+  beyond the run-to-run spread. Act on one only when it shows a worse growth
+  order or a material total; a nanosecond-per-item constant is reported, not
+  redesigned.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).

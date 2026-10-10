@@ -79,8 +79,14 @@ model; routes to design) or **local**.
    (`ThreadSystem` tuning, event budgets, reserve seams); a guarantee by
    construction or a precondition assert the rules allow is not a finding.
 4. **Tests**: for a weak test, name the untested contract and a narrow
-   scenario that would expose a regression.
-5. **Roadmap docs**: check against the roadmap index § Ground Rules (bare
+   scenario that would expose a regression. For each new test, name the
+   mutation it catches; one that passes with the change reverted is a
+   finding. A threaded stage needs a test proving it ran on workers; an
+   inline run proves no threaded parity. The bench reports the threaded
+   case's main-thread share, and main's time per item stays flat across sizes.
+5. **Scope**: the changed files against the brief's Files list; an unlisted
+   file is a finding.
+6. **Roadmap docs**: check against the roadmap index § Ground Rules (bare
    backlog lines, "out of scope" without an owning slice, leftover TBDs, rule
    text or an internal design in a slice).
 
