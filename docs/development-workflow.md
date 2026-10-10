@@ -395,9 +395,12 @@ Reading results:
   16,000; reports solves and re-solves past one per agent);
   `nav-update-entity-obstacles` (one static body moved and committed with 10,
   1,000, or 10,000 other static bodies) and `nav-update-static-population`
-  (the same move with 1,000, 10,000, or 50,000 dynamic bodies). Each passes
-  when flat in its item count, except the elastic ramp, whose solves are read
-  against the agent count. Size-limit skips print as above.
+  (the same move with 1,000, 10,000, or 50,000 dynamic bodies);
+  `steering-static-change` (one static body moved and committed, the steering
+  reaction, and one steering step for 4,096 agents, with 10, 1,000, or 10,000
+  static bodies, the item count). Each passes when flat in its item count,
+  except the elastic ramp, whose solves are read against the agent count.
+  Size-limit skips print as above.
 - `render-sparse-window-frame`, `-pan`, and `-add` time one frame's sparse-tile
   prep (visibility update, depth walk, submit into a headless `SpriteBatch`)
   on a 2048² world of 8 levels holding 1,000, 16,000, or 256,000 sparse tiles
