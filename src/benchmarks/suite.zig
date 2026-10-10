@@ -693,6 +693,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
     if (std.mem.eql(u8, group_name, "ai-memory")) return "AI agents";
     if (std.mem.eql(u8, group_name, "ai-affect")) return "AI agents";
+    if (std.mem.startsWith(u8, group_name, "plane-traversal")) return "AI agents";
     if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) return "perception agents";
     if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
@@ -1115,6 +1116,16 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.startsWith(u8, group_name, "nav-update-")) {
         var stage_buffer: [128]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
+    }
+    if (std.mem.startsWith(u8, group_name, "plane-traversal")) {
+        var gather_buffer: [32]u8 = undefined;
+        const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
+        const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "agents={} entries={} gather={s} main={f} ({}%)",
+            .{ stats.item_count, stats.output_count, formatStageShapeInto(&gather_buffer, stats.batch), formatDuration(phases.main_ns), main_percent },
+        ) catch "workload";
     }
     if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
     if (isChunkScaleBatchGroup(group_name)) {

@@ -71,6 +71,7 @@ comptime {
     _ = @import("game/systems/movement.zig");
     _ = @import("game/systems/pathfinding.zig");
     _ = @import("game/systems/particle.zig");
+    _ = @import("game/systems/plane_entry.zig");
     _ = @import("game/systems/perception.zig");
     _ = @import("game/systems/simulation_scope.zig");
     _ = @import("game/systems/world_gate.zig");

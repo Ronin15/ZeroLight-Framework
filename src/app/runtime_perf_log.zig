@@ -106,6 +106,7 @@ pub const Metric = enum {
     nav_levels_built,
     nav_records_patched,
     dig_plane_scratch_grown,
+    plane_entry_windows_grown,
     steering_static_snapshot_grown,
     collision_pair_bound_exceeded,
     population_capacity_grows,
@@ -224,6 +225,7 @@ pub const BatchStage = enum {
     path_fallback,
     movement,
     chunk_derive,
+    plane_entry,
     collision_broadphase,
     collision_narrowphase,
     particles,
@@ -716,7 +718,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} chunks_patched={} levels_built={} records_patched={} region_invalidated={} dig_plane_scratch_grown={} steering_static_snapshot_grown={} collision_pair_bound_exceeded={} population_capacity_grows={}",
+            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} chunks_patched={} levels_built={} records_patched={} region_invalidated={} dig_plane_scratch_grown={} plane_entry_windows_grown={} steering_static_snapshot_grown={} collision_pair_bound_exceeded={} population_capacity_grows={}",
             .{
                 elapsed_s,
                 self.metricValue(.nav_dirty_chunks),
@@ -726,6 +728,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.nav_records_patched),
                 self.metricValue(.simulation_events_nav_region_invalidated),
                 self.metricValue(.dig_plane_scratch_grown),
+                self.metricValue(.plane_entry_windows_grown),
                 self.metricValue(.steering_static_snapshot_grown),
                 self.metricValue(.collision_pair_bound_exceeded),
                 self.metricValue(.population_capacity_grows),

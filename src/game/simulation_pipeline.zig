@@ -62,6 +62,7 @@ const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PerceptionStats = @import("systems/perception.zig").PerceptionStats;
 const PerceptionSystem = @import("systems/perception.zig").PerceptionSystem;
 const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPerceptionCandidate;
+const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
@@ -475,6 +476,8 @@ pub const SimulationPipelineStats = struct {
     pathfinding: PathfindingStats = .{},
     movement: MovementStats = .{},
     chunk_derive: BatchStats = .{},
+    /// The plane stage's NPC cell-entry gather.
+    plane_entry: BatchStats = .{},
     collision: CollisionStats = .{},
     collision_response: CollisionResponseStats = .{},
     /// Live-bus stimuli dropped this step (promote and footstep optional
@@ -498,6 +501,9 @@ pub const SimulationPipelineStats = struct {
     /// Plane-traversal landing-carve scratch growths this step (reservation short of the
     /// live population; zero in steady state).
     dig_plane_scratch_grown: usize = 0,
+    /// Plane-entry gather window growths this step (reservation short of the live AI
+    /// rows; zero in steady state).
+    plane_entry_windows_grown: usize = 0,
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -591,6 +597,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         perf.recordBatch(.movement, movement_stats.batch);
         perf.recordBatch(.chunk_derive, self.chunk_derive);
+        perf.recordBatch(.plane_entry, self.plane_entry);
 
         perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
         perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
@@ -616,6 +623,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
         perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
         perf.recordMetric(.dig_plane_scratch_grown, metric(self.dig_plane_scratch_grown));
+        perf.recordMetric(.plane_entry_windows_grown, metric(self.plane_entry_windows_grown));
     }
 };
 
@@ -678,6 +686,9 @@ pub const SimulationPipeline = struct {
     /// stage only appraises and decays them.
     affect: AffectSystem,
     dig: DigController,
+    /// The plane stage's NPC cell-entry gather; the dig controller's plane reserve and
+    /// commit visit only its entries. Its windows follow the population seam.
+    plane_entry: PlaneEntrySystem,
     destructible: DestructibleController,
     audio_controller: AudioController,
     /// Tracked logical population capacity: every population-sized pipeline capacity is
@@ -775,6 +786,9 @@ pub const SimulationPipeline = struct {
         // The plane-traversal stage records its carves into nav; its record room follows the
         // same bound.
         try pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = population }));
+        var plane_entry = PlaneEntrySystem.init(allocator);
+        errdefer plane_entry.deinit();
+        try plane_entry.reserve(population);
         try ai.reserve(population);
         try perception.reserve(population);
         try ai_memory.reserve(population);
@@ -794,6 +808,7 @@ pub const SimulationPipeline = struct {
             .ai_memory = ai_memory,
             .affect = affect,
             .dig = dig,
+            .plane_entry = plane_entry,
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
             .movement_body_capacity = population,
@@ -940,6 +955,7 @@ pub const SimulationPipeline = struct {
         const body_grew = body != old_body;
         if (body_grew) {
             try self.scope.reserve(body);
+            try self.plane_entry.reserve(body);
             try self.spatial_index.reserveRows(body);
             try self.collision.reserve(body);
             try self.dig.ensurePlaneScratchReserve(body + 1);
@@ -995,6 +1011,7 @@ pub const SimulationPipeline = struct {
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.plane_entry.deinit();
         self.dig.deinit();
         self.affect.deinit();
         self.ai_memory.deinit();
@@ -1144,6 +1161,7 @@ pub const SimulationPipeline = struct {
         stimuli_promoted: usize = 0,
         action_intents_dropped: usize = 0,
         dig_plane_scratch_grown: usize = 0,
+        plane_entry_windows_grown: usize = 0,
         cognition_region: ?ActiveRegion = null,
         ai_halo_indices: []const u32 = &[_]u32{},
         ai_cognition_indices: []const u32 = &[_]u32{},
@@ -1157,6 +1175,7 @@ pub const SimulationPipeline = struct {
         pathfinding: PathfindingStats = .{},
         movement: MovementStats = .{},
         chunk_derive: BatchStats = .{},
+        plane_entry: BatchStats = .{},
         collision: CollisionStats = .{},
         collision_response: CollisionResponseStats = .{},
         destructible: DestructibleProcessStats = .{},
@@ -1191,6 +1210,7 @@ pub const SimulationPipeline = struct {
                 .pathfinding = self.pathfinding,
                 .movement = self.movement,
                 .chunk_derive = self.chunk_derive,
+                .plane_entry = self.plane_entry,
                 .collision = self.collision,
                 .collision_response = self.collision_response,
                 .stimuli_live_dropped = self.stimuli_live_dropped,
@@ -1202,6 +1222,7 @@ pub const SimulationPipeline = struct {
                 .destructibles_destroyed = self.destructible.destroyed,
                 .destructibles_hit = self.destructible.hits,
                 .dig_plane_scratch_grown = self.dig_plane_scratch_grown,
+                .plane_entry_windows_grown = self.plane_entry_windows_grown,
             };
         }
     };
@@ -1479,12 +1500,17 @@ pub const SimulationPipeline = struct {
     }
 
     /// After positions settle: follow a ramp on cell entry, or fall one level when
-    /// standing over a hole. Landing carves are one event range, recorded as nav marks
-    /// right after the write into room reserved before it.
+    /// standing over a hole. The NPC cell entries are gathered on workers first; the
+    /// reserve and commit visit only them. Landing carves are one event range, recorded
+    /// as nav marks right after the write into room reserved before it.
     fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const grown_before = self.dig.plane_scratch_grown;
-        const reservation = try self.dig.reservePlaneTraversalStage(context.world, context.data, context.player, context.frame);
+        const windows_grown_before = self.plane_entry.windows_grown;
+        const entries = try self.plane_entry.gather(context.data, context.world, context.player.entity, context.thread_system);
+        step.plane_entry = self.plane_entry.last_batch;
+        step.plane_entry_windows_grown = @intCast(self.plane_entry.windows_grown - windows_grown_before);
+        const reservation = try self.dig.reservePlaneTraversalStage(context.world, context.data, context.player, context.frame, entries);
         // The record room follows the carves the preflight counted, which may exceed the
         // tracked population's budget until a failed population seam succeeds.
         if (reservation.carves != 0) try self.pathfinding.reserveTerrainNavRecord(reservation.carves);
@@ -2573,6 +2599,7 @@ const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const GridCell = @import("systems/pathfinding/types.zig").GridCell;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const lane_count = @import("../core/simd.zig").lane_count;
+const plane_entry_range_alignment_items = @import("systems/plane_entry.zig").plane_entry_range_alignment_items;
 const DigIntent = @import("simulation.zig").DigIntent;
 const demoWorldWithChunkSize = @import("world_test_support.zig").demoWorldWithChunkSize;
 const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
@@ -2600,9 +2627,12 @@ fn gateTestWorld(meta: *const world_tileset_meta.WorldTilesetMeta, carve: []cons
     return world;
 }
 
-// One plane stage's dig half: reserve, then commit the reservation.
+// One plane stage's dig half: a serial entry gather, the reserve, then the commit.
 fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
-    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame);
+    var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
+    defer plane_entry.deinit();
+    const entries = try plane_entry.gather(data, world, player.entity, null);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries);
     try dig.commitPlaneTraversalStage(world, data, player, frame, reservation);
 }
 
@@ -4015,7 +4045,10 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
     defer dig.deinit();
     // The reserve covers the scratch, the events, every carve's world write, and the
     // world_level rows; after it the commit allocates from none of them.
-    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame);
+    var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
+    defer plane_entry.deinit();
+    const entries = try plane_entry.gather(&data, &world, player.entity, null);
+    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame, entries);
     try std.testing.expectEqual(@as(usize, 2), reservation.carves);
 
     const original_frame = frame.allocator;
@@ -5330,6 +5363,7 @@ const TestAllocatorSwap = struct {
     ai_memory: std.mem.Allocator = undefined,
     affect: std.mem.Allocator = undefined,
     dig: ?std.mem.Allocator = null,
+    plane_entry: std.mem.Allocator = undefined,
     threads: std.mem.Allocator = undefined,
 
     const Targets = struct {
@@ -5385,6 +5419,7 @@ const TestAllocatorSwap = struct {
             .ai_memory = t.pipeline.ai_memory.allocator,
             .affect = t.pipeline.affect.allocator,
             .dig = t.pipeline.dig.scratch_allocator,
+            .plane_entry = t.pipeline.plane_entry.allocator,
             .threads = t.threads.allocator,
         };
     }
@@ -5415,6 +5450,7 @@ const TestAllocatorSwap = struct {
         t.pipeline.affect.allocator = to.affect;
         // Dig scratch stays unset (null) until the plane scratch is reserved.
         if (t.pipeline.dig.scratch_allocator != null) t.pipeline.dig.scratch_allocator = to.dig;
+        t.pipeline.plane_entry.allocator = to.plane_entry;
         t.threads.allocator = to.threads;
     }
 };
@@ -5444,6 +5480,7 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.perception.compute_tuner,
         &pipeline.ai_memory.decay_tuner,
         &pipeline.affect.compute_tuner,
+        &pipeline.plane_entry.tuner,
     };
     for (tuners) |tuner| {
         tuner.config.threaded_batch_ns = 0;
@@ -5780,7 +5817,13 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     if (prove_zero_alloc) swap.install(targets, .uniform(failing.allocator()));
     const result = pipeline.update(context);
     if (prove_zero_alloc) swap.restore(targets);
-    _ = try result;
+    const fall_stats = try result;
+    if (max_worker_threads > 0) {
+        // The 24 AI rows' cell-entry gather ran on the pinned partition.
+        try std.testing.expect(!fall_stats.plane_entry.ran_inline);
+        try std.testing.expectEqual(rangeCount(24, 16), fall_stats.plane_entry.range_count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fall_stats.plane_entry_windows_grown);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
@@ -5795,6 +5838,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         out.positions[index] = .{ position.x, position.y };
     }
     try std.testing.expectEqual(@as(u64, 0), pipeline.dig.plane_scratch_grown);
+    try std.testing.expectEqual(@as(u64, 0), pipeline.plane_entry.windows_grown);
     try std.testing.expectEqual(@as(u64, 0), pipeline.steering.static_snapshot_grown_total);
     return out;
 }
@@ -6327,6 +6371,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
     const pathfinding = &fixture.pipeline.pathfinding;
     pathfinding.nav_thread_adaptive = false;
     pathfinding.nav_thread_items_per_range = 1;
+    fixture.pipeline.plane_entry.config = .{ .items_per_range = plane_entry_range_alignment_items, .adaptive = false };
     const spare_marks = pathfinding.nav_marks.capacity - pathfinding.nav_marks.items.len;
     // Past the spare marks and staging, and across at least two `nav_mark` ranges.
     const npc_count = @max(8 * lane_count, spare_marks, pathfinding.nav_mark_staging.capacity) + 1;
@@ -6389,6 +6434,10 @@ test "a plane traversal past a failed population seam reserves its nav record fr
     });
     try fixture.pipeline.stagePlaneTraversal(&step);
     try std.testing.expect(pathfinding.last_mark_batch.range_count >= 2 and !pathfinding.last_mark_batch.ran_inline);
+    // The gather's windows were short of the AI rows too: grown once on main, then dispatched.
+    try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.plane_entry.windows_grown);
+    try std.testing.expectEqual(@as(usize, 1), step.plane_entry_windows_grown);
+    try std.testing.expect(step.plane_entry.range_count >= 2 and !step.plane_entry.ran_inline);
     try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 1), fixture.frame.events.range_stats.items.len);
     for (landings.items) |cell| try std.testing.expect(!fixture.world.denseTileBlocksMovement(floor1, cell.x, cell.y));

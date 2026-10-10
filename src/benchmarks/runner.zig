@@ -15,6 +15,7 @@ const nav_update = @import("nav_update.zig");
 const particles = @import("particles.zig");
 const pathfinding = @import("pathfinding.zig");
 const perception = @import("perception.zig");
+const plane_traversal = @import("plane_traversal.zig");
 const render_prep = @import("render_prep.zig");
 const render_game_prep = @import("render_game_prep.zig");
 const scope = @import("scope.zig");
@@ -82,6 +83,9 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     sparse_window.pan_group,
     sparse_window.add_group,
     scope.group,
+    plane_traversal.group,
+    plane_traversal.falls_group,
+    plane_traversal.dense_falls_group,
     spatial_index.group,
     perception.group,
     perception.los_dense_group,

@@ -22,7 +22,6 @@ const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const InputState = @import("../app/input.zig").InputState;
 const DataSystem = @import("data_system.zig").DataSystem;
-const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const Player = @import("player.zig").Player;
@@ -43,6 +42,7 @@ const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const SensoryBus = @import("sensory_bus.zig").SensoryBus;
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const PlaneEntry = @import("systems/plane_entry.zig").PlaneEntry;
 
 /// Walkable tiles the dig carves, resolved by the gameplay state from the tileset
 /// meta and passed in at pipeline init, so the controller stays free of asset
@@ -293,12 +293,12 @@ pub const DigController = struct {
     /// appended to `carves` right after it is written, before any later fallible step,
     /// so a caller publishing `carves` on every exit publishes every written carve;
     /// `carves` needs room for it. Shared by the player (`applyPlaneTraversal`) and
-    /// NPCs (`commitPlaneTraversalStage`).
+    /// each gathered NPC entry (`commitPlaneTraversalStage`).
     ///
     /// Attaches `world_level` (at the current plane) before any tile mutate so
     /// `setEntityLevel` cannot OOM after `carveLandingCell` has already written.
-    /// The plane stage reserves and attaches `world_level` for every cell-entry
-    /// candidate before the first carve (multi-entity safety). Player.spawn
+    /// The plane stage reserves and attaches `world_level` for each gathered entry
+    /// missing it before the first carve (multi-entity safety). Player.spawn
     /// pre-attaches level 0; NPCs should carry the component before the plane stage.
     /// Missing-component attach here is the direct-call safety net.
     pub fn applyEntityPlaneTraversal(
@@ -383,30 +383,32 @@ pub const DigController = struct {
     }
 
     /// What `reservePlaneTraversalStage` reserved for the commit: the landing carves
-    /// (an upper bound on the carves the commit writes) and the missing `world_level`
-    /// rows. Valid until the commit, with no world, data, or event write in between.
+    /// (an upper bound on the carves the commit writes), the missing `world_level`
+    /// rows, and the gathered NPC entries the commit visits. Valid until the commit,
+    /// with no world, data, or event write in between.
     pub const PlaneTraversalReservation = struct {
         carves: usize,
         missing_world_level: usize,
+        npc_entries: []const PlaneEntry,
     };
 
-    /// The plane stage's preflight, before any write: counts the player's and every
-    /// NPC's landing carves this step, reserving each carve's world write
-    /// (`reserveDenseCellWrite`), the carve scratch (grown and counted when the count
-    /// exceeds the reservation), their event capacity, and the missing `world_level`
-    /// rows. On error nothing is written. The caller reserves anything else sized from
-    /// `carves` (the nav record) before `commitPlaneTraversalStage`.
+    /// The plane stage's preflight, before any write: counts the player's and each
+    /// gathered NPC entry's landing carves this step, reserving each carve's world
+    /// write (`reserveDenseCellWrite`), the carve scratch (grown and counted when the
+    /// count exceeds the reservation), their event capacity, and the missing
+    /// `world_level` rows. `npc_entries` is this step's `PlaneEntrySystem.gather` over
+    /// the same `world`, `data`, and `player`, valid through the commit. O(1) per entry. On error
+    /// nothing is written. The caller reserves anything else sized from `carves` (the
+    /// nav record) before `commitPlaneTraversalStage`.
     pub fn reservePlaneTraversalStage(
         self: *DigController,
         world: *WorldSystem,
         data: *DataSystem,
         player: *const Player,
         frame: *SimulationFrame,
+        npc_entries: []const PlaneEntry,
     ) !PlaneTraversalReservation {
         self.plane_tile_changes.clearRetainingCapacity();
-
-        const ai_slice = data.aiAgentSliceConst();
-        const scope_columns = data.scopeColumnsSliceConst();
 
         // One reserve scope covers every landing carve this step.
         world.beginDenseCellWriteReserve();
@@ -416,18 +418,17 @@ pub const DigController = struct {
             if (try self.reserveLandingCarve(world, entry)) carves += 1;
             if (data.worldLevelConst(player.entity) == null) missing_world_level += 1;
         }
-        for (ai_slice.entities) |entity| {
-            if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-                if (try self.reserveLandingCarve(world, entry)) carves += 1;
-                if (data.worldLevelConst(entity) == null) missing_world_level += 1;
-            }
+        for (npc_entries) |entry| {
+            std.debug.assert(!entry.entity.eql(player.entity));
+            if (try self.reserveLandingCarve(world, .{ .level = entry.level, .cell = entry.cell })) carves += 1;
+            missing_world_level += @intFromBool(entry.needs_world_level);
         }
         if (carves > self.plane_scratch_reserved) try self.growPlaneScratch(carves);
         try frame.events.ensureEventAppendCapacity(carves);
         if (missing_world_level > 0) {
             try data.world_levels.ensureCapacity(data.allocator, data.world_levels.len() + missing_world_level);
         }
-        return .{ .carves = carves, .missing_world_level = missing_world_level };
+        return .{ .carves = carves, .missing_world_level = missing_world_level, .npc_entries = npc_entries };
     }
 
     /// Player + NPC plane traversal for one step, after `reservePlaneTraversalStage`
@@ -452,7 +453,8 @@ pub const DigController = struct {
     }
 
     // The commit's writes: `world_level` attaches (allocation-free after the reserve),
-    // then the player, then each NPC. Each carve lands in `carves` as it is written.
+    // then the player, then each gathered NPC entry in AI row order, re-evaluated
+    // against this step's earlier carves. Each carve lands in `carves` as it is written.
     fn applyPlaneTraversals(
         self: *DigController,
         world: *WorldSystem,
@@ -461,27 +463,22 @@ pub const DigController = struct {
         reservation: PlaneTraversalReservation,
         carves: *std.ArrayList(WorldTileChangedEvent),
     ) !void {
-        const ai_slice = data.aiAgentSliceConst();
-        const scope_columns = data.scopeColumnsSliceConst();
         if (reservation.missing_world_level > 0) {
             if (playerCellEntry(self, world, data, player.*)) |entry| {
                 if (data.worldLevelConst(player.entity) == null) {
                     try data.setWorldLevel(player.entity, entry.level);
                 }
             }
-            for (ai_slice.entities) |entity| {
-                if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-                    if (data.worldLevelConst(entity) == null) {
-                        try data.setWorldLevel(entity, entry.level);
-                    }
+            for (reservation.npc_entries) |entry| {
+                if (entry.needs_world_level and data.worldLevelConst(entry.entity) == null) {
+                    try data.setWorldLevel(entry.entity, entry.level);
                 }
             }
         }
 
         try self.applyPlaneTraversal(world, data, player, carves);
-        for (ai_slice.entities) |entity| {
-            const entry = npcCellEntry(world, data, scope_columns, entity) orelse continue;
-            _ = try self.applyEntityPlaneTraversal(world, data, entity, entry.level, entry.cell, carves);
+        for (reservation.npc_entries) |entry| {
+            _ = try self.applyEntityPlaneTraversal(world, data, entry.entity, entry.level, entry.cell, carves);
         }
     }
 };
@@ -560,27 +557,6 @@ fn playerCellEntry(
     return .{ .level = player.current_level, .cell = cell };
 }
 
-fn npcCellEntry(
-    world: *const WorldSystem,
-    data: *const DataSystem,
-    scope_columns: ConstScopeColumnsSlice,
-    entity: EntityId,
-) ?PlaneCellEntry {
-    const dense_index = data.movementBodyDenseIndex(entity) orelse return null;
-    if (!scope_columns.tier[dense_index].allowsMovement()) return null;
-    const level = data.worldLevelConst(entity) orelse scope_columns.level[dense_index];
-    const body = data.movementBodyConst(entity) orelse return null;
-    const visual = data.primitiveVisualConst(entity) orelse return null;
-    const prev_center_x = body.previous_position.x + visual.size.x * 0.5;
-    const prev_center_y = body.previous_position.y + visual.size.y * 0.5;
-    const center_x = body.position.x + visual.size.x * 0.5;
-    const center_y = body.position.y + visual.size.y * 0.5;
-    const prev_cell = world.cellContaining(prev_center_x, prev_center_y) orelse return null;
-    const cell = world.cellContaining(center_x, center_y) orelse return null;
-    if (prev_cell.x == cell.x and prev_cell.y == cell.y) return null;
-    return .{ .level = level, .cell = CellCoord{ .x = cell.x, .y = cell.y } };
-}
-
 fn cellCenterWorldPos(world: *const WorldSystem, cell: CellCoord) math.Vec2 {
     return .{
         .x = (@as(f32, @floatFromInt(cell.x)) + 0.5) * world.tile_size,
@@ -639,6 +615,7 @@ const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
+const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 
 // One dig in stage order: reserve, then commit the reserved edit.
 fn testDig(dig: *const DigController, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *SimulationFrame) !void {
@@ -646,9 +623,12 @@ fn testDig(dig: *const DigController, world: *WorldSystem, data: *const DataSyst
     try DigController.commitWorldEdit(world, edit, frame);
 }
 
-// One plane stage: reserve, then commit the reservation.
+// One plane stage: a serial entry gather, the reserve, then the commit.
 fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
-    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame);
+    var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
+    defer plane_entry.deinit();
+    const entries = try plane_entry.gather(data, world, player.entity, null);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries);
     try dig.commitPlaneTraversalStage(world, data, player, frame, reservation);
 }
 
@@ -672,23 +652,23 @@ const TestWorld = struct {
     data: DataSystem,
     player: Player,
 
-    fn init(facing: Facing, level: u16) !TestWorld {
+    // Built in place: the world borrows `&self.meta`, so the fixture never moves after.
+    fn init(self: *TestWorld, facing: Facing, level: u16) !void {
         const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-        var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-        errdefer meta.deinit();
-        var world = try testMinimalMultiLevelWorld(&meta);
-        errdefer world.deinit();
-        var data = DataSystem.init(std.testing.allocator);
-        errdefer data.deinit();
-        var player = try Player.spawn(&data);
-        player.current_level = level;
-        try data.setWorldLevel(player.entity, level);
+        self.meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+        errdefer self.meta.deinit();
+        self.world = try testMinimalMultiLevelWorld(&self.meta);
+        errdefer self.world.deinit();
+        self.data = DataSystem.init(std.testing.allocator);
+        errdefer self.data.deinit();
+        self.player = try Player.spawn(&self.data);
+        self.player.current_level = level;
+        try self.data.setWorldLevel(self.player.entity, level);
         // Cell (3,3) top-left, facing right -> faced cell (4,3).
-        const body = data.movementBodyPtr(player.entity).?;
+        const body = self.data.movementBodyPtr(self.player.entity).?;
         body.position_x.* = 96;
         body.position_y.* = 96;
-        data.facingPtr(player.entity).?.* = facing;
-        return .{ .meta = meta, .world = world, .data = data, .player = player };
+        self.data.facingPtr(self.player.entity).?.* = facing;
     }
 
     fn deinit(self: *TestWorld) void {
@@ -697,6 +677,13 @@ const TestWorld = struct {
         self.meta.deinit();
     }
 };
+
+test "dig test world reads the fixture's own tileset meta" {
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
+    defer tw.deinit();
+    try std.testing.expect(tw.world.tilesetMeta().? == &tw.meta);
+}
 
 test "DigController plane scratch reserved-then-push is allocation-free (FailingAllocator)" {
     var dig = DigController.init(.{});
@@ -727,6 +714,11 @@ test "DigController plane scratch reserved-then-push is allocation-free (Failing
 /// this step (previous position on `from`, current on `to`), so plane traversal sees a
 /// cell entry. Mirrors the pipeline's plane-traversal NPC fixtures.
 fn addCellEntryNpc(data: *DataSystem, from: CellCoord, to: CellCoord) !EntityId {
+    return addCellEntryNpcOnLevel(data, from, to, 0);
+}
+
+/// `addCellEntryNpc` with `world_level` at `world_level`, or left off when null.
+fn addCellEntryNpcOnLevel(data: *DataSystem, from: CellCoord, to: CellCoord, world_level: ?u16) !EntityId {
     const npc = try data.createEntity();
     try data.setMovementBody(npc, .{});
     try data.setPrimitiveVisual(npc, .{
@@ -735,7 +727,7 @@ fn addCellEntryNpc(data: *DataSystem, from: CellCoord, to: CellCoord) !EntityId 
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
     try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setWorldLevel(npc, 0);
+    if (world_level) |level| try data.setWorldLevel(npc, level);
     try data.setSimulationTier(npc, .locomotion);
     const body = data.movementBodyPtr(npc).?;
     body.previous_x.* = @as(f32, @floatFromInt(from.x)) * 32;
@@ -768,9 +760,11 @@ fn worldTileChangesOf(frame: *const SimulationFrame, out: []WorldTileChangedEven
 }
 
 test "plane traversal grows an under-reserved scratch before any carve and matches a reserved run" {
-    var tw_short = try TestWorld.init(.right, 0);
+    var tw_short: TestWorld = undefined;
+    try tw_short.init(.right, 0);
     defer tw_short.deinit();
-    var tw_reserved = try TestWorld.init(.right, 0);
+    var tw_reserved: TestWorld = undefined;
+    try tw_reserved.init(.right, 0);
     defer tw_reserved.deinit();
     try setUpTwoFalls(&tw_short);
     try setUpTwoFalls(&tw_reserved);
@@ -820,7 +814,8 @@ test "plane traversal grows an under-reserved scratch before any carve and match
 }
 
 test "plane traversal counts carves past the reservation even inside the scratch's slack" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     try setUpTwoFalls(&tw);
 
@@ -847,7 +842,8 @@ test "plane traversal counts carves past the reservation even inside the scratch
 }
 
 test "plane traversal within the scratch reserve is allocation-free (FailingAllocator)" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     try setUpTwoFalls(&tw);
 
@@ -892,6 +888,105 @@ test "plane traversal within the scratch reserve is allocation-free (FailingAllo
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 }
 
+// Gathers this step's NPC entries serially, then reserves and commits the plane stage
+// over them. Returns the reservation's landing carves.
+fn runPlaneStageOverEntries(
+    dig: *DigController,
+    plane_entry: *PlaneEntrySystem,
+    tw: *TestWorld,
+    frame: *SimulationFrame,
+) !usize {
+    const entries = try plane_entry.gather(&tw.data, &tw.world, tw.player.entity, null);
+    const reservation = try dig.reservePlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, entries);
+    try dig.commitPlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, reservation);
+    return reservation.carves;
+}
+
+test "plane traversal attaches world_level only to cell-entry agents missing it, and skips plain crossings" {
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
+    defer tw.deinit();
+    var dig = try testDigController(&tw.meta);
+    defer dig.deinit();
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+
+    // Crosses a plain cell with no world_level, its scope on level 1.
+    const missing = try addCellEntryNpcOnLevel(&tw.data, .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 1 }, null);
+    try tw.data.setSimulationMetadata(missing, .{ .tier = .locomotion, .level = 1 });
+    // Crosses a plain cell with world_level.
+    const plain = try addCellEntryNpc(&tw.data, .{ .x = 1, .y = 2 }, .{ .x = 2, .y = 2 });
+    // No world_level, and stays in its cell.
+    const still = try addCellEntryNpcOnLevel(&tw.data, .{ .x = 5, .y = 5 }, .{ .x = 5, .y = 5 }, null);
+    try std.testing.expect(tw.data.worldLevelConst(missing) == null);
+    try std.testing.expect(tw.data.worldLevelConst(still) == null);
+    const plain_before = tw.data.movementBodyConst(plain).?;
+
+    var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
+    defer plane_entry.deinit();
+    const entries = try plane_entry.gather(&tw.data, &tw.world, tw.player.entity, null);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expect(entries[0].entity.eql(missing));
+    try std.testing.expectEqual(@as(u16, 1), entries[0].level);
+    try std.testing.expect(entries[0].needs_world_level);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 16, 8, 8, 8, 8);
+    frame.beginStep();
+    try std.testing.expectEqual(@as(usize, 0), try runPlaneStageOverEntries(&dig, &plane_entry, &tw, &frame));
+
+    try std.testing.expectEqual(@as(?u16, 1), tw.data.worldLevelConst(missing));
+    try std.testing.expectEqual(@as(?u16, 0), tw.data.worldLevelConst(plain));
+    try std.testing.expect(tw.data.worldLevelConst(still) == null);
+    try std.testing.expectEqual(plain_before, tw.data.movementBodyConst(plain).?);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+}
+
+test "plane traversal re-evaluates gathered entries against this step's earlier carves" {
+    // A on level 0 and B on level 1 both enter (4,3), a hole on both levels. A's fall
+    // carves level 1's (4,3), filling B's hole, so B falls only when it commits first.
+    inline for (.{ true, false }) |a_first| {
+        var tw: TestWorld = undefined;
+        try tw.init(.right, 0);
+        defer tw.deinit();
+        var dig = try testDigController(&tw.meta);
+        defer dig.deinit();
+        try dig.reservePlaneScratch(std.testing.allocator, 4);
+        const floor0 = tw.world.denseFloorLayerForLevel(0).?;
+        const floor1 = tw.world.denseFloorLayerForLevel(1).?;
+        const floor2 = tw.world.denseFloorLayerForLevel(2).?;
+        _ = try tw.world.clearDenseTile(floor0, 4, 3);
+        _ = try tw.world.clearDenseTile(floor1, 4, 3);
+
+        var a: EntityId = undefined;
+        var b: EntityId = undefined;
+        if (a_first) a = try addCellEntryNpc(&tw.data, .{ .x = 3, .y = 3 }, .{ .x = 4, .y = 3 });
+        b = try addCellEntryNpcOnLevel(&tw.data, .{ .x = 5, .y = 3 }, .{ .x = 4, .y = 3 }, 1);
+        if (!a_first) a = try addCellEntryNpc(&tw.data, .{ .x = 3, .y = 3 }, .{ .x = 4, .y = 3 });
+
+        var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
+        defer plane_entry.deinit();
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        try frame.reserveStreams(4, 16, 8, 8, 8, 8);
+        frame.beginStep();
+        // Both landings are reserved against the pre-commit world.
+        try std.testing.expectEqual(@as(usize, 2), try runPlaneStageOverEntries(&dig, &plane_entry, &tw, &frame));
+
+        try std.testing.expectEqual(@as(?u16, 1), tw.data.worldLevelConst(a));
+        try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(floor1, 4, 3));
+        if (a_first) {
+            try std.testing.expectEqual(@as(?u16, 1), tw.data.worldLevelConst(b));
+            try std.testing.expect(tw.world.denseTileBlocksMovement(floor2, 4, 3));
+            try std.testing.expectEqual(@as(usize, 1), frame.events.stats.world_tile_changed);
+        } else {
+            try std.testing.expectEqual(@as(?u16, 2), tw.data.worldLevelConst(b));
+            try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(floor2, 4, 3));
+            try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
+        }
+    }
+}
+
 fn runDig(tw: *TestWorld, dig: DigController, intent: @import("simulation.zig").DigIntent) !SimulationFrame {
     var frame = SimulationFrame.init(std.testing.allocator);
     errdefer frame.deinit();
@@ -903,7 +998,8 @@ fn runDig(tw: *TestWorld, dig: DigController, intent: @import("simulation.zig").
 }
 
 test "a dig returns UnresolvedDigTiles without mutating world" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     // Default DigConfig leaves ramp/tunnel as invalid_tile_id — must fail before carve.
     const dig = DigController.init(.{});
@@ -921,7 +1017,8 @@ test "a dig returns UnresolvedDigTiles without mutating world" {
 }
 
 test "dig controller punches a see-through hole in the faced cell" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -951,7 +1048,8 @@ test "dig controller punches a see-through hole in the faced cell" {
 }
 
 test "dig controller mines a walkable tunnel floor underground instead of a hole" {
-    var tw = try TestWorld.init(.right, 1);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 1);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -982,7 +1080,8 @@ test "dig controller mines a walkable tunnel floor underground instead of a hole
 }
 
 test "dig controller down punches a drop hole through the faced cell underground" {
-    var tw = try TestWorld.init(.right, 1);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 1);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1009,7 +1108,8 @@ test "dig controller down punches a drop hole through the faced cell underground
 }
 
 test "dig controller down is a no-op on the bottom plane" {
-    var tw = try TestWorld.init(.right, 2);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 2);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1024,7 +1124,8 @@ test "dig controller down is a no-op on the bottom plane" {
 }
 
 test "dig controller carves a ramp tile and one bidirectional link below the surface" {
-    var tw = try TestWorld.init(.right, 1);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 1);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1055,7 +1156,8 @@ test "dig controller carves a ramp tile and one bidirectional link below the sur
 }
 
 test "dig controller ramp is a no-op on the surface" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1068,7 +1170,8 @@ test "dig controller ramp is a no-op on the surface" {
 }
 
 test "dig controller is a no-op for none intent or an off-world target" {
-    var tw = try TestWorld.init(.left, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.left, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
     // Facing left from the left edge aims off-world.
@@ -1088,7 +1191,8 @@ test "dig controller is a no-op for none intent or an off-world target" {
 }
 
 test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell before it falls" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1127,7 +1231,8 @@ test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell befo
 }
 
 test "a dig commit reserves event capacity before world mutate (capacity miss leaves tile unchanged)" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1148,7 +1253,8 @@ test "a dig commit reserves event capacity before world mutate (capacity miss le
 
     // A ramp under rock needs two events; a budget of one leaves both cells and the
     // links as they were.
-    var ramp_tw = try TestWorld.init(.right, 2);
+    var ramp_tw: TestWorld = undefined;
+    try ramp_tw.init(.right, 2);
     defer ramp_tw.deinit();
     var ramp_frame = SimulationFrame.init(std.testing.allocator);
     defer ramp_frame.deinit();
@@ -1168,7 +1274,8 @@ test "a dig commit reserves event capacity before world mutate (capacity miss le
 }
 
 test "player_last_cell advances only after successful or intentional no-op traversal" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     var dig = try testDigController(&tw.meta);
 
@@ -1193,7 +1300,8 @@ test "player_last_cell advances only after successful or intentional no-op trave
 }
 
 test "player_last_cell stays put when plane traversal errors mid-transition" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     var dig = try testDigController(&tw.meta);
 
@@ -1274,7 +1382,8 @@ test "plane traversal OOM on world_level attach leaves landing tile unchanged" {
 }
 
 test "player spawn pre-attaches world_level so first fall is allocation-free for the store" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1306,7 +1415,8 @@ test "player spawn pre-attaches world_level so first fall is allocation-free for
 }
 
 test "a ramp dig whose link reserve fails leaves the ramp tile unchanged" {
-    var tw = try TestWorld.init(.right, 1);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 1);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1328,7 +1438,8 @@ test "a ramp dig whose link reserve fails leaves the ramp tile unchanged" {
 
 test "a dig committed after its one reserve allocates nothing in the world (FailingAllocator)" {
     inline for (.{ DigIntent.hole, DigIntent.ramp }) |intent| {
-        var tw = try TestWorld.init(.right, 1);
+        var tw: TestWorld = undefined;
+        try tw.init(.right, 1);
         defer tw.deinit();
         const dig = try testDigController(&tw.meta);
         // The faced level-1 cell sits in a uniform, fully blocked chunk, so the carve
@@ -1366,7 +1477,8 @@ test "a dig committed after its one reserve allocates nothing in the world (Fail
     // A ramp whose exit holds a solid floor, a blocking overlay, and blocking sparse
     // tiles: the exit's blocks, bits slot, and both events fit the one reserve and
     // the preflight, with room for exactly one more event range.
-    var tw = try TestWorld.init(.right, 2);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 2);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
     try addBlockingExitContent(&tw.world, &tw.meta);
@@ -1450,7 +1562,8 @@ fn eventsOf(frame: *const SimulationFrame) []const SimulationEvent {
 }
 
 test "a ramp dug under solid rock opens its exit cell on the level above in the same dig and emits both events" {
-    var tw = try TestWorld.init(.right, 2);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 2);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
     const ramp_floor = tw.world.denseFloorLayerForLevel(2).?;
@@ -1488,7 +1601,8 @@ test "a ramp dug under solid rock opens its exit cell on the level above in the 
 }
 
 test "a ramp exit clears a blocking obstacle band and blocking sparse tiles with the floor" {
-    var tw = try TestWorld.init(.right, 2);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 2);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
     try addBlockingExitContent(&tw.world, &tw.meta);
@@ -1519,7 +1633,8 @@ test "a ramp exit clears a blocking obstacle band and blocking sparse tiles with
 }
 
 test "a ramp whose exit is a hole writes nothing at the exit and still links" {
-    var tw = try TestWorld.init(.right, 2);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 2);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
     const exit_floor = tw.world.denseFloorLayerForLevel(1).?;
@@ -1536,7 +1651,8 @@ test "a ramp whose exit is a hole writes nothing at the exit and still links" {
 }
 
 test "a ramp exit on walkable floor emits only the ramp event" {
-    var tw = try TestWorld.init(.right, 2);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 2);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
     const exit_floor = tw.world.denseFloorLayerForLevel(1).?;
@@ -1559,7 +1675,8 @@ test "a ramp dig that runs out of memory at every allocation leaves both cells, 
     var fail_index: usize = 0;
     var failures: usize = 0;
     while (true) : (fail_index += 1) {
-        var tw = try TestWorld.init(.right, 2);
+        var tw: TestWorld = undefined;
+        try tw.init(.right, 2);
         defer tw.deinit();
         const dig = try testDigController(&tw.meta);
         try addBlockingExitContent(&tw.world, &tw.meta);
@@ -1605,7 +1722,8 @@ test "a ramp dig that runs out of memory at every allocation leaves both cells, 
 }
 
 test "dig reserveWorldEdit OOM leaves the world unchanged" {
-    var tw = try TestWorld.init(.right, 1);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 1);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
     const floor = tw.world.denseFloorLayerForLevel(1).?;
@@ -1621,7 +1739,8 @@ test "dig reserveWorldEdit OOM leaves the world unchanged" {
 }
 
 test "a dig commit on a full live bus leaves the tile unchanged" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
@@ -1651,7 +1770,8 @@ test "a dig commit on a full live bus leaves the tile unchanged" {
 }
 
 test "a dig commit stimulus capacity miss leaves tile unchanged" {
-    var tw = try TestWorld.init(.right, 0);
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
     defer tw.deinit();
     const dig = try testDigController(&tw.meta);
 
