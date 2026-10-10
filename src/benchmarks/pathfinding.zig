@@ -220,11 +220,18 @@ pub const evict_group = suite.BenchmarkGroup{
     .runCase = runEvictCase,
 };
 
-// Moving packs of 24 agents (the item count is the pack count) on an open 256² nav grid,
-// each with its own goal marching one nav cell per rekey cycle. Fields per pack and a
-// threshold of 8 make the packs' fields build at the same time, one
-// `group_field_expand` item per building field. Times every step of the measured
-// cycles; `outputs` is the fields built and `candidates` the field samples.
+// Item counts up to `group_field_tunnel_min_cells`: moving packs of 24 agents (the item
+// count is the pack count) on an open 256² nav grid, each with its own goal marching one
+// nav cell per rekey cycle. Fields per pack and a threshold of 8 make the packs' fields
+// build at the same time, one `group_field_expand` item per building field. Times every
+// step of the measured cycles; `outputs` is the fields built and `candidates` the field
+// samples.
+// Larger item counts: sparse-coverage fields. Four crowds on a 1024² level whose only
+// walkable cells are a lattice of 1-wide corridors every nav chunk (31 cells per
+// 256-cell chunk) each flood a field capped at the item count's cells. One iteration
+// rebuilds the four fields from scratch until all are ready; the time is that build and
+// `outputs` the cells covered.
+// `--details` prints per-field coverage, blocks, resident bytes, and pool growths.
 pub const group_field_packs_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-packs",
     .defaultItemCounts = groupFieldPacksItemCounts,
@@ -799,6 +806,7 @@ fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) voi
     if (suite.adaptiveTunerForCase(case, intake_range_alignment_items)) |tuner| system.intake_tuner = tuner;
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_tuner = tuner;
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_begin_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_stall_tuner = tuner;
 }
 
 // Worker-side time of an update's threaded stages; stages that ran inline add nothing.
@@ -1609,7 +1617,10 @@ const level_size_item_counts = [_]usize{ 256_001, 1_024_001, 2_048_001 };
 const cross_level_item_counts = [_]usize{ 256_008, 256_032, 256_128 };
 const evict_region_encoding: usize = 10_000_000;
 const evict_item_counts = [_]usize{ 1_000, 10_000, 50_000, 64 * evict_region_encoding + 10_000 };
-const group_field_packs_item_counts = [_]usize{4};
+// Four packs, then three tunnel field caps: sample points on the coverage curve.
+const group_field_packs_item_counts = [_]usize{ 4, 2048, 16384, 65536 };
+// Item counts from here up are tunnel field caps, not pack counts.
+const group_field_tunnel_min_cells: usize = 1024;
 const elastic_ramp_item_counts = [_]usize{ 1_000, 4_000, 16_000 };
 
 fn levelSizeItemCounts(_: suite.Profile) []const usize {
@@ -1729,10 +1740,11 @@ fn configureNavUpdateThreads(system: *PathfindingSystem, case: suite.BenchmarkCa
     system.nav_thread_items_per_range = navUpdateItemsPerRange(case);
 }
 
-// Most abstract nodes any participant's last search claimed this step.
+// Most abstract nodes any participant's or tier-1 pool entry's last search claimed this step.
 fn lastAbstractNodesUsed(system: *const PathfindingSystem) usize {
     var nodes: usize = 0;
-    for (system.scratch_slots.items) |*scratch| nodes = @max(nodes, scratch.abstract.nodes_used);
+    for (system.scratch_slots.items) |*scratch| nodes = @max(nodes, scratch.corridor.abstract.nodes_used);
+    for (system.tier1_scratch.items) |*entry| nodes = @max(nodes, entry.corridor.abstract.nodes_used);
     return nodes;
 }
 
@@ -2192,6 +2204,7 @@ fn writeGroupFieldPackRequests(requests: *RangeOutputStream(PathRequest), entiti
 }
 
 fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (item_count >= group_field_tunnel_min_cells) return runGroupFieldTunnelCase(allocator, io, options, case, item_count);
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = group_field_detour_grid_side;
     const packs = item_count;
@@ -2243,6 +2256,7 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         }
     }
     stage_report.print(options, group_field_packs_group.name, item_count, case);
+    printFieldMemory(options, group_field_packs_group.name, item_count, case, &system);
     // Every pack's field engages and is sampled.
     std.debug.assert(built_total >= packs * group_field_detour_moving_cycles);
     std.debug.assert(samples_total > 0);
@@ -2251,6 +2265,153 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     stats.output_count = built_total;
     stats.candidate_pairs = samples_total;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(built_total, stats.mean_ns * stats.iterations);
+    return stats;
+}
+
+// Per-field coverage and memory of a system's fields, averaged over the built fields.
+fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase, system: *const PathfindingSystem) void {
+    if (!options.details) return;
+    var fields: usize = 0;
+    var covered: usize = 0;
+    var blocks: usize = 0;
+    var resident: usize = 0;
+    for (system.group_fields.items) |*field| {
+        if (field.state == .empty) continue;
+        fields += 1;
+        covered += field.pushed_count;
+        blocks += field.used_blocks;
+        resident += field.residentBytes();
+    }
+    if (fields == 0) return;
+    std.debug.print("  {s} {} {s}: fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
+        group_name,
+        item_count,
+        case.name,
+        fields,
+        covered / fields,
+        blocks / fields,
+        resident / fields,
+        resident / @max(@as(usize, 1), covered),
+        system.group_field_pool_grows,
+        system.group_field_pool_failures,
+    });
+}
+
+const group_field_tunnel_side: usize = 1024;
+// Corridor pitch: one corridor row and column per default nav chunk.
+const group_field_tunnel_pitch: usize = 16;
+const group_field_tunnel_fields: usize = 4;
+const group_field_tunnel_agents: usize = 8;
+const group_field_tunnel_build_guard: usize = 256;
+
+// The lattice: a static body over each pitch-1 square between corridors.
+fn addTunnelLattice(data: *DataSystem) !void {
+    const pitch = group_field_tunnel_pitch;
+    const squares = group_field_tunnel_side / pitch;
+    const extent = @as(f32, @floatFromInt(pitch - 1)) * 32.0;
+    for (0..squares) |square_y| {
+        for (0..squares) |square_x| {
+            const entity = try data.createEntity();
+            const position = math.Vec2{ .x = @as(f32, @floatFromInt(square_x * pitch + 1)) * 32.0, .y = @as(f32, @floatFromInt(square_y * pitch + 1)) * 32.0 };
+            try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
+            try data.setCollisionBounds(entity, .{ .size = .{ .x = extent, .y = extent } });
+            try data.setCollisionResponse(entity, .{ .mobility = .static });
+        }
+    }
+}
+
+// Each field's crowd stands on the corridor row through its goal, the goal at a corridor
+// crossing in its own quadrant.
+fn writeTunnelRequests(requests: *RangeOutputStream(PathRequest), entities: []const EntityId) !void {
+    const side = group_field_tunnel_side;
+    const goals = [group_field_tunnel_fields]FixtureCell{ .{ .x = side / 4, .y = side / 4 }, .{ .x = 3 * side / 4, .y = side / 4 }, .{ .x = side / 4, .y = 3 * side / 4 }, .{ .x = 3 * side / 4, .y = 3 * side / 4 } };
+    requests.clearRetainingCapacity();
+    try requests.reserve(1, entities.len);
+    const range_base = try requests.appendRangeCounts(1);
+    requests.addCount(range_base, entities.len);
+    try requests.prefixAppendedRanges(range_base);
+    var writer = requests.rangeWriter(range_base);
+    for (entities, 0..) |entity, index| {
+        const goal = goals[index / group_field_tunnel_agents];
+        const start: FixtureCell = .{ .x = goal.x + 2 + index % group_field_tunnel_agents, .y = goal.y };
+        writer.write(.{
+            .entity = entity,
+            .kind = .group,
+            .start = .{ .x = @as(f32, @floatFromInt(start.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(start.y)) * 32.0 + 8.0 },
+            .goal = .{ .x = @as(f32, @floatFromInt(goal.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(goal.y)) * 32.0 + 8.0 },
+        });
+    }
+    writer.finish();
+    requests.finishWrite();
+}
+
+// Rebuilds the four fields from scratch (pools kept) until all are ready; times the steps.
+fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !struct { elapsed_ns: u64, batch: BatchStats } {
+    system.clearRuntimeState();
+    var elapsed_ns: u64 = 0;
+    var batch = BatchStats{};
+    for (0..group_field_tunnel_build_guard) |_| {
+        const start_ns = suite.nowNs(io);
+        const stats = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
+        elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+        if (stats.group_field_begin_batch.item_count > batch.item_count) batch = stats.group_field_begin_batch;
+        if (stats.group_field_batch.item_count > batch.item_count) batch = stats.group_field_batch;
+        var ready: usize = 0;
+        for (system.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
+        if (ready == group_field_tunnel_fields) return .{ .elapsed_ns = elapsed_ns, .batch = batch };
+    }
+    return error.GroupFieldTunnelBuildStalled;
+}
+
+fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side = group_field_tunnel_side;
+    const agent_count = group_field_tunnel_fields * group_field_tunnel_agents;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    try addTunnelLattice(&data);
+    const entities = try allocator.alloc(EntityId, agent_count);
+    defer allocator.free(entities);
+    for (entities) |*entity| entity.* = try data.createEntity();
+
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    setPathStageTuners(&system, case);
+    try system.reserve(PathfindingCapacity{
+        .max_group_fields = group_field_tunnel_fields,
+        .worker_participant_count = participant_count,
+        .max_agent_budget = agent_count,
+        .min_group_field_agents = group_field_tunnel_agents,
+        .group_field_max_cells = item_count,
+    });
+    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
+    try system.rebuildStaticNavGrid(&data, world_extent, world_extent, 32.0);
+    var requests = RangeOutputStream(PathRequest).init(allocator);
+    defer requests.deinit();
+    try writeTunnelRequests(&requests, entities);
+
+    const warmup = @min(options.warmup_iterations, cold_warmup_cap);
+    const iterations = @max(@as(usize, 1), @min(options.iterations, cold_iteration_cap));
+    for (0..warmup) |_| _ = try buildTunnelFields(io, &system, &requests, thread_ptr, case, agent_count);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    for (0..iterations) |_| {
+        const built = try buildTunnelFields(io, &system, &requests, thread_ptr, case, agent_count);
+        accumulator.record(built.elapsed_ns, built.batch);
+    }
+    var covered: usize = 0;
+    for (system.group_fields.items) |field| covered += field.pushed_count;
+    // Every field covers its cap: the lattice's 126,976 cells reach past the largest cap.
+    std.debug.assert(covered == group_field_tunnel_fields * item_count);
+    printFieldMemory(options, group_field_packs_group.name, item_count, case, &system);
+
+    var stats = accumulator.finish();
+    stats.output_count = covered;
+    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(covered, stats.mean_ns);
     return stats;
 }
 

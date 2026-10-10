@@ -14,6 +14,13 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const AbstractSlot = @import("../game/systems/pathfinding/scratch.zig").AbstractSlot;
+const SearchSlot = @import("../game/systems/pathfinding/scratch.zig").SearchSlot;
+const DirEntry = @import("../game/systems/pathfinding/group_field.zig").DirEntry;
+const field_block_bytes = @import("../game/systems/pathfinding/group_field.zig").field_block_bytes;
+const OpenNode = @import("../game/systems/pathfinding/types.zig").OpenNode;
+const StitchedCell = @import("../game/systems/pathfinding/types.zig").StitchedCell;
+const hashTableSlots = @import("../game/systems/pathfinding/types.zig").hashTableSlots;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
 
@@ -1524,22 +1531,26 @@ pub const NavSizeConfig = struct {
 /// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
 /// ceiling: per-level chunk directories, cell blocks, and records (every chunk mixed and
 /// holding portals), link slots, one level's batch window, per-participant search scratch,
-/// group fields, and the result cache. Search scratch and group fields are still sized per
-/// level cell, so they dominate large levels and threaded configs.
+/// the tier-1 corridor pool, group fields, and the result cache. Search scratch and group
+/// fields are sized by their node and cell budgets, never by level cells.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
-    // Library capacity defaults: explored nodes, stored and stitched path cells, the
-    // abstract node ceiling, results cached per agent, and the per-step solve ceiling.
+    // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
+    // abstract node and stitched cell caps, escalated solves per step, group field cells,
+    // results cached per agent, and the per-step solve ceiling.
     const explored_nodes: usize = 4096;
     const stored_path_cells: usize = 512;
-    const stitched_path_cells: usize = 2048;
+    const tier0_abstract_nodes: usize = 4096;
+    const tier0_stitched_cells: usize = 512;
     const abstract_nodes: usize = 16384;
+    const stitched_path_cells: usize = 2048;
+    const escalated_solves: usize = 1;
+    const group_field_cells: usize = 131072;
     const agents: usize = @max(8, config.agent_budget);
     const cached_results: usize = agents * 4;
     const solves_per_step: usize = @min(512, agents);
     const chunk_tiles: usize = 16;
     const participants: usize = @max(1, config.participant_count);
     const levels: usize = @max(1, config.levels);
-    const cells = config.side * config.side;
     const chunks_per_side = (config.side + chunk_tiles - 1) / chunk_tiles;
     const chunks = chunks_per_side * chunks_per_side;
 
@@ -1553,24 +1564,41 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     // One level's batch window: changed, patch, and dirty keys and three plan staging lists
     // (8 B each), patch info (8), and remask slots and deltas (4 + 4).
     const batch = chunks * (6 * 8 + 8 + 4 + 4);
-    // Per group field and cell: cost, flow, stamp, and bucket links (21).
-    const group_fields = config.group_fields * cells * 21;
-    // Per participant: a 13 B search row per cell, the open heap (16 B entries), and the
-    // path buffer.
-    const path_buffer_cells: usize = @max(explored_nodes, stored_path_cells);
-    const search = participants * (cells * 13 + explored_nodes * 16 + path_buffer_cells * 4);
-    // Per participant: the abstract search's slot table (26 B rows), open heap, and
-    // corridor (9 B entries).
-    const abstract_search = participants * (abstract_nodes * 2 * 26 + abstract_nodes * 4 * 16 + abstract_nodes * 9);
+    // Per group field: one block per goal-level chunk it can cover (at most its cell cap)
+    // and the chunk directory. A directory too wide to build saturates past any limit.
+    const field_blocks = @min(group_field_cells, chunks);
+    const directory_rows = hashTableSlots(field_blocks) catch std.math.maxInt(usize);
+    const group_fields = config.group_fields *| (field_blocks * field_block_bytes +| directory_rows *| @sizeOf(DirEntry));
+    // Per participant: the search table, the open heap (four entries per node), the path
+    // buffer, and the tier-0 corridor scratch.
+    const explored_heap_entries: usize = @max(16, explored_nodes * 4);
+    const search = participants * (tableRows(explored_nodes) * @sizeOf(SearchSlot) + explored_heap_entries * @sizeOf(OpenNode) +
+        explored_nodes * @sizeOf(u32) + corridorBytes(tier0_abstract_nodes, tier0_stitched_cells));
+    // Per escalated solve a step admits: one tier-1 corridor scratch.
+    const tier1_pool = escalated_solves * corridorBytes(abstract_nodes, stitched_path_cells);
     // Result cache, per entry: two 24 B probe slots, a 20 B payload, a 4 B free index, a
     // 16 B eviction-scratch key, and the inline stripe (4 B per stored path cell). A block
     // holds the longest plain (explored nodes, 4 B) or stitched (8 B) path: one worker
     // stripe per solve slot, and the long pool's worst case of one block (plus a 4 B free
     // index) per cached result.
-    const result_block_bytes = @max(explored_nodes * 4, stitched_path_cells * 8);
+    const result_block_bytes = @max(explored_nodes * @sizeOf(u32), stitched_path_cells * @sizeOf(StitchedCell));
     const results = cached_results * (2 * 24 + 20 + 4 + 16 + stored_path_cells * 4) + solves_per_step * result_block_bytes +
         cached_results * (result_block_bytes + 4);
-    return level_chunks + link_slots + batch + group_fields + search + abstract_search + results;
+    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results;
+}
+
+// Rows the pathfinding tables reserve for `keys` keys; the library defaults sized here
+// always fit, so an unbuildable table fails the build.
+fn tableRows(comptime keys: usize) usize {
+    return comptime hashTableSlots(keys) catch @compileError("nav table too wide");
+}
+
+// One corridor scratch: the abstract table, open heap, corridor refs and link flags, and
+// the stitched path (one spare cell).
+fn corridorBytes(comptime abstract_nodes: usize, comptime stitched_cells: usize) usize {
+    const heap_entries: usize = @max(16, abstract_nodes * 4);
+    return tableRows(abstract_nodes) * @sizeOf(AbstractSlot) + heap_entries * @sizeOf(OpenNode) +
+        abstract_nodes * (@sizeOf(usize) + @sizeOf(bool)) + (stitched_cells + 1) * @sizeOf(StitchedCell);
 }
 
 fn ceilMib(bytes: usize) usize {

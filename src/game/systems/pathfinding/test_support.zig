@@ -47,6 +47,9 @@ pub fn appendPathRequest(stream: *RangeOutputStream(PathRequest), request: PathR
     stream.finishWrite();
 }
 
+// Field cell cap for the small test worlds; keeps each field's table small.
+const test_group_field_max_cells: usize = 4096;
+
 pub fn baselineCapacity() PathfindingCapacity {
     // Per-step request/cache caps are derived elastically from the agent count
     // (floored at min_capacity_floor = 8), so only the non-derived knobs are set
@@ -57,6 +60,7 @@ pub fn baselineCapacity() PathfindingCapacity {
         .max_group_fields = 2,
         .worker_participant_count = 1,
         .min_group_field_agents = 1,
+        .group_field_max_cells = test_group_field_max_cells,
     };
 }
 
@@ -89,6 +93,7 @@ pub fn abstractCapacity() PathfindingCapacity {
         .nav_chunk_tiles = 4,
         .max_stitched_path_cells = 256,
         .min_group_field_agents = 1,
+        .group_field_max_cells = test_group_field_max_cells,
     };
 }
 

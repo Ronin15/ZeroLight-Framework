@@ -28,9 +28,9 @@ pub const default_max_frame_requests: usize = 1024;
 pub const default_max_pending_requests: usize = 1024;
 pub const default_max_cached_results: usize = 1024;
 // Threaded participant slots (workers + main thread). A FIXED property of the
-// configured thread system, not a per-frame discovery: exactly this many per-cell A*
-// scratch slots get O(cells) arrays, sized once during the nav build. Default 1 is
-// the serial path (slot 0 only); the pipeline plumbs the real participant count.
+// configured thread system, not a per-frame discovery: exactly this many search scratch
+// slots, each sized by the node budgets at the capacity seam. Default 1 is the serial
+// path (slot 0 only); the pipeline plumbs the real participant count.
 pub const default_worker_participant_count: usize = 1;
 pub const default_max_solved_requests_per_step: usize = 128;
 pub const default_max_fallback_requests_per_step: usize = 128;
@@ -205,8 +205,12 @@ pub const no_component: u32 = 0;
 pub const diagonal_cost: u32 = 14;
 pub const cardinal_cost: u32 = 10;
 pub const unreachable_cost: u32 = std.math.maxInt(u32);
-// Sentinel for "no parent ref" in the abstract search's packed-ref parent column.
-pub const no_ref: usize = std.math.maxInt(usize);
+/// Sentinel slot id of the open-addressed search and field tables: no parent, no bucket
+/// link. `hashTableSlots` keeps every real slot id below it.
+pub const no_slot: u32 = std.math.maxInt(u32);
+/// Largest generation of a table stamp `generation << 1 | flag`; the next one wraps to 1
+/// after clearing every stamp.
+pub const max_stamp_generation: u32 = std.math.maxInt(u32) >> 1;
 
 // Half-open-rect shrink applied to a max world coordinate before clamping to a cell, so a
 // rect whose edge lands exactly on a cell boundary does not spuriously include the next
@@ -220,16 +224,14 @@ comptime {
 }
 
 // Packs an abstract node identity: a portal cell on a level. A packed ref's top 16 bits are
-// always 0 (level is a u16), so no real packed ref equals no_ref/no_parent (maxInt).
-// refLevel/refLocal decode only a real packed ref, never the sentinel (`no_ref >> 32` would
-// panic refLevel's @intCast); callers guard the sentinel first.
+// always 0 (level is a u16), so no real packed ref equals no_parent (maxInt).
 pub fn packRef(level: u16, local: u32) usize {
     return (@as(usize, level) << 32) | local;
 }
 
 comptime {
-    if (packRef(std.math.maxInt(u16), std.math.maxInt(u32)) == no_ref) {
-        @compileError("packRef must never alias the no_ref sentinel");
+    if (packRef(std.math.maxInt(u16), std.math.maxInt(u32)) == no_parent) {
+        @compileError("packRef must never alias the no_parent sentinel");
     }
 }
 
@@ -413,8 +415,8 @@ pub const PathfindingCapacity = struct {
     max_solved_requests_per_step: usize = default_max_solved_requests_per_step,
     max_fallback_requests_per_step: usize = default_max_fallback_requests_per_step,
     // Threaded participant slots (workers + 1). Set from the configured thread system
-    // by the pipeline; each gets an O(cells) A* scratch slot sized during the build.
-    // NOT recomputed by deriveCapacity — a genuine caller-supplied value.
+    // by the pipeline; each gets a search scratch slot sized by the node budgets at the
+    // capacity seam. NOT recomputed by deriveCapacity — a genuine caller-supplied value.
     worker_participant_count: usize = default_worker_participant_count,
     // Budget-bounded A* sizing.
     max_explored_nodes: usize = default_max_explored_nodes,
@@ -791,25 +793,15 @@ pub const OpenNode = struct {
 pub fn orderU32(key: u32, item: u32) std.math.Order {
     return std.math.order(key, item);
 }
-// Octile distance between two cell indices, in the same cardinal/diagonal cost
-// units used by the local A*, so abstract and refined costs are comparable.
-// Shared octile cost core: diagonal steps plus straight steps, weighted by the step costs.
-// u64 so a pathological delta cannot overflow mid-formula; both callers saturate to u32.
+// Shared octile cost core: diagonal steps plus straight steps, in the local A*'s step
+// cost units so abstract and refined costs are comparable. u64 so a pathological delta
+// cannot overflow mid-formula; every caller saturates to u32.
 fn octileCost(dx: u64, dy: u64) u64 {
     const diagonal = @min(dx, dy);
     const straight = @max(dx, dy) - diagonal;
     return diagonal * diagonal_cost + straight * cardinal_cost;
 }
 
-pub fn octileCells(width: usize, a: u32, b: u32) u32 {
-    const ax: i64 = @intCast(a % width);
-    const ay: i64 = @intCast(a / width);
-    const bx: i64 = @intCast(b % width);
-    const by: i64 = @intCast(b / width);
-    const dx: u64 = @intCast(@abs(bx - ax));
-    const dy: u64 = @intCast(@abs(by - ay));
-    return @intCast(@min(octileCost(dx, dy), @as(u64, std.math.maxInt(u32))));
-}
 pub fn popHeap(heap: *std.ArrayList(OpenNode)) OpenNode {
     std.debug.assert(heap.items.len != 0); // empty pop would underflow `last` below
     const result = heap.items[0];
@@ -857,8 +849,8 @@ pub fn oppositeDirIndex(dir_index: usize) u8 {
 }
 
 // Octile heuristic over explicit cell coordinates; callers pass coordinates they
-// already hold so the hot loop avoids re-deriving them via div/mod. Shares octileCost
-// with octileCells so both saturate identically instead of one silently wrapping.
+// already hold so the hot loop avoids re-deriving them via div/mod. Saturates to
+// maxInt(u32) instead of wrapping.
 pub fn octileXY(from_x: i32, from_y: i32, to_x: i32, to_y: i32) u32 {
     const dx: u64 = @abs(to_x - from_x);
     const dy: u64 = @abs(to_y - from_y);
@@ -911,8 +903,7 @@ pub fn keysEqual(a: PathQueryKey, b: PathQueryKey) bool {
         a.goal.y == b.goal.y;
 }
 
-// FNV-1a 64-bit offset basis and prime, shared by both hash functions below so the
-// constants are defined once rather than duplicated per function.
+// FNV-1a 64-bit offset basis and prime of `hashPathKey`.
 const fnv_offset_basis: u64 = 14695981039346656037;
 const fnv_prime: u64 = 1099511628211;
 
@@ -925,11 +916,25 @@ pub fn hashPathKey(key: PathQueryKey) usize {
     return @intCast(h);
 }
 
-pub fn hashUsize(value: usize) usize {
-    var h: u64 = fnv_offset_basis;
-    h ^= @as(u64, @intCast(value));
-    h *%= fnv_prime;
-    return @intCast(h);
+/// Home slot of `key` in a power-of-two table of `2^(64 - shift)` slots (Fibonacci
+/// hashing: the multiply spreads adjacent keys over the table).
+pub fn fibonacciSlot(key: u64, shift: u6) usize {
+    return @intCast((key *% 0x9E3779B97F4A7C15) >> shift);
+}
+
+/// Slot count of an open-addressed table holding at most `max_keys` keys at load <= 1/2:
+/// `ceilPow2(max(16, 2 * max_keys))`. Fails as out of memory when the count overflows or
+/// a slot id would not fit `u32`.
+pub fn hashTableSlots(max_keys: usize) error{OutOfMemory}!usize {
+    const slots = std.math.ceilPowerOfTwo(usize, @max(@as(usize, 16), max_keys *| 2)) catch return error.OutOfMemory;
+    if (slots > std.math.maxInt(u32)) return error.OutOfMemory;
+    return slots;
+}
+
+/// The `fibonacciSlot` shift of a power-of-two table of `slot_count` slots.
+pub fn hashTableShift(slot_count: usize) u6 {
+    std.debug.assert(std.math.isPowerOfTwo(slot_count) and slot_count >= 2);
+    return @intCast(@as(usize, 64) - std.math.log2_int(usize, slot_count));
 }
 
 pub fn emptyKey(nav_version: u32) PathQueryKey {
@@ -1055,14 +1060,7 @@ pub fn resizeFilledArrayList(comptime T: type, list: *std.ArrayList(T), allocato
 // Tests
 // ----------------------------------------------------------------------------
 
-test "octileCells and octileXY saturate identically instead of one silently wrapping" {
-    // Both share octileCost's u64 core and the same maxInt(u32) saturation clamp, so a
-    // pathological delta produces the same capped result from either entry point rather
-    // than one wrapping to a small value.
-    const width: usize = 4;
-    const far_a: u32 = 0; // (0, 0)
-    const far_b: u32 = 3 + 3 * width; // (3, 3) on a 4-wide grid: a small, exact delta.
-    try std.testing.expectEqual(@as(u32, 3 * diagonal_cost), octileCells(width, far_a, far_b));
+test "octileXY is exact on a small delta and saturates instead of wrapping" {
     try std.testing.expectEqual(@as(u32, 3 * diagonal_cost), octileXY(0, 0, 3, 3));
 
     // A delta far beyond any real grid saturates to maxInt(u32) rather than wrapping.
