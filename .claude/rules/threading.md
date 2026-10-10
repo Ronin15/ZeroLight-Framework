@@ -46,7 +46,7 @@ paths:
 - Worker ranges never share writable cache lines; pad to 64 bytes only shared
   records with real false-sharing risk. Ranges writing rows that are disjoint
   by contract but scattered across a column are allowed when a scattered-order
-  bench shows no false-sharing penalty.
+  bench is within spread of the same stream in row order.
 - Keep state transitions, structural changes, SDL/GPU/audio, asset and save
   I/O, and resource ownership off workers unless a deferred boundary is
   designed. Workers never mutate `DataSystem` structurally; structural commits
