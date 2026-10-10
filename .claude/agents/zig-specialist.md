@@ -38,6 +38,8 @@ touch. Follow them and cite them by file; never restate them.
    brief lists; a needed file outside the list stops the work and is
    reported, never edited first.
 4. Add the tests and scaling benches the rules require for the change.
+   Doc edits wait until the slice's programming is done: until then, put the
+   doc changes as notes in the report.
 5. Validate per `.claude/rules/build-validation.md`. Write `zig build test`
    output to a file and judge it by the exit code; a "failed command:" line
    echoing warn output is not a failure; on a real failure keep the failing

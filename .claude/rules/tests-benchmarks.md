@@ -52,6 +52,8 @@ paths:
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
 - A scaling bench runs at least three sizes far enough apart to show the growth
-  shape and passes when the shape matches the cost model's order (flat for a
+  shape, each right-sized: large enough that the shape is clear and the
+  threaded case runs the changed stage, no larger (oversized runs slow the dev
+  cycle and show nothing more). It passes when the shape matches the cost model's order (flat for a
   local change, linear where linear is right). A cost that grows with world
   size on a local change is a design defect regardless of the absolute number.
