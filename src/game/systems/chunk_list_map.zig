@@ -4,7 +4,9 @@
 
 //! Per-key lists of owner ids: an open-addressed `u64 key -> {head, tail}` table over a
 //! pool of doubly linked entries, each list ordered by its entries' `order`, plus one
-//! chain per owner of the entries it holds. Keys are (level, chunk) pairs (`chunkKey`).
+//! chain per owner of the entries it holds. Keys are any u64 whose tier bits (62-63) are not
+//! both set; `chunkKey` builds the (level, chunk) keys. Each present key also holds one u32
+//! value for its owner (`no_value` until set); a key holding a value is never dropped.
 //! Lists change in batches: between `beginBatch` and `commitBatch` the owner unlinks and
 //! staged inserts cost O(1) each on the caller's thread, and `commitBatch` places every
 //! staged entry in its list's order, the sorted placement threaded per key. Only the
@@ -22,6 +24,8 @@ const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 
 /// End of a list or owner chain, and "no entry" from a lookup.
 pub const no_entry: u32 = std.math.maxInt(u32);
+/// A key's value when none is set, and the value of an absent key.
+pub const no_value: u32 = std.math.maxInt(u32);
 // No valid key sets both tier bits (62-63), so all-ones marks an empty table slot.
 const empty_key: u64 = std.math.maxInt(u64);
 const min_slot_count: usize = 16;
@@ -64,10 +68,10 @@ const SpliceRecord = struct {
     after: u32,
 };
 
-// Splice ranges cover a multiple of this many keys (bounding the range count, and so the
-// window padding), and each range's record window starts on a cache line, so no two ranges
-// write one line.
-const splice_range_alignment_items: usize = 8;
+/// Splice ranges cover a multiple of this many keys (bounding the range count, and so the
+/// window padding), and each range's record window starts on a cache line, so no two
+/// ranges write one line.
+pub const splice_range_alignment_items: usize = 8;
 const thread_shared_record_alignment: usize = 64;
 const SpliceRecordList = std.ArrayListAligned(SpliceRecord, .fromByteUnits(thread_shared_record_alignment));
 
@@ -86,10 +90,14 @@ pub const SpliceThreads = struct {
 
 pub const ChunkListMap = struct {
     allocator: std.mem.Allocator,
+    /// What the lists hold, naming this map in its growth log.
+    name: []const u8,
     // Table slots, a power of two at load <= 1/2.
     slot_keys: []u64 = &.{},
     slot_heads: []u32 = &.{},
     slot_tails: []u32 = &.{},
+    // Per slot, its key's value (`no_value` when unset); moves with the key.
+    slot_values: []u32 = &.{},
     // Per slot, its `touched` index while touched in the current batch; valid only when
     // `touched[slot_touch[slot]].slot == slot`, so it is never cleared.
     slot_touch: []u32 = &.{},
@@ -118,8 +126,9 @@ pub const ChunkListMap = struct {
     grows: u64 = 0,
     growth_logged: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator) ChunkListMap {
-        return .{ .allocator = allocator };
+    /// `name` outlives the map.
+    pub fn init(allocator: std.mem.Allocator, name: []const u8) ChunkListMap {
+        return .{ .allocator = allocator, .name = name };
     }
 
     pub fn deinit(self: *ChunkListMap) void {
@@ -131,6 +140,7 @@ pub const ChunkListMap = struct {
         self.entry_free.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.allocator.free(self.slot_touch);
+        self.allocator.free(self.slot_values);
         self.allocator.free(self.slot_tails);
         self.allocator.free(self.slot_heads);
         self.allocator.free(self.slot_keys);
@@ -152,7 +162,7 @@ pub const ChunkListMap = struct {
         if (self.growth_logged) return;
         self.growth_logged = true;
         if (comptime logging.enabled(.info) and !builtin.is_test)
-            logging.game.info("chunk list storage grew ({} growths so far)", .{self.grows});
+            logging.game.info("{s} storage grew ({} growths so far)", .{ self.name, self.grows });
     }
 
     /// Guarantees `new_keys` more keys, `new_entries` more inserts, and owner ids below
@@ -198,25 +208,31 @@ pub const ChunkListMap = struct {
         errdefer self.allocator.free(heads);
         const tails = try self.allocator.alloc(u32, slot_count);
         errdefer self.allocator.free(tails);
+        const values = try self.allocator.alloc(u32, slot_count);
+        errdefer self.allocator.free(values);
         const touch = try self.allocator.alloc(u32, slot_count);
         @memset(keys, empty_key);
         @memset(touch, untouched);
         const old_keys = self.slot_keys;
         const old_heads = self.slot_heads;
         const old_tails = self.slot_tails;
+        const old_values = self.slot_values;
         const old_touch = self.slot_touch;
         self.slot_keys = keys;
         self.slot_heads = heads;
         self.slot_tails = tails;
+        self.slot_values = values;
         self.slot_touch = touch;
-        for (old_keys, old_heads, old_tails) |key, old_head, old_tail| {
+        for (old_keys, old_heads, old_tails, old_values) |key, old_head, old_tail, old_value| {
             if (key == empty_key) continue;
             const slot = self.emptySlotFor(key);
             self.slot_keys[slot] = key;
             self.slot_heads[slot] = old_head;
             self.slot_tails[slot] = old_tail;
+            self.slot_values[slot] = old_value;
         }
         self.allocator.free(old_touch);
+        self.allocator.free(old_values);
         self.allocator.free(old_tails);
         self.allocator.free(old_heads);
         self.allocator.free(old_keys);
@@ -252,23 +268,18 @@ pub const ChunkListMap = struct {
         return self.slot_keys.len - 1;
     }
 
-    fn home(self: *const ChunkListMap, key: u64) usize {
-        // Fibonacci hashing: the multiply spreads chunk-adjacent keys over the table.
-        const shift: u6 = @intCast(@as(u7, 64) - std.math.log2_int(usize, self.slot_keys.len));
-        return @intCast((key *% 0x9E3779B97F4A7C15) >> shift);
+    fn homeShift(self: *const ChunkListMap) u6 {
+        return @intCast(@as(u7, 64) - std.math.log2_int(usize, self.slot_keys.len));
     }
 
-    // The slot holding `key`, or null. Linear probing; never writes.
-    // SIMD verdict: scalar. A probe at load <= 1/2 visits about 2.5 slots per miss, and
-    // `simd.zig` has no u64 lanes; list walks are pointer chases.
+    fn home(self: *const ChunkListMap, key: u64) usize {
+        return homeSlot(key, self.homeShift());
+    }
+
+    // The slot holding `key`, or null. Never writes.
     fn findSlot(self: *const ChunkListMap, key: u64) ?usize {
         if (self.slot_keys.len == 0) return null;
-        var slot = self.home(key);
-        while (true) : (slot = (slot + 1) & self.mask()) {
-            const stored = self.slot_keys[slot];
-            if (stored == key) return slot;
-            if (stored == empty_key) return null;
-        }
+        return probeSlot(self.slot_keys, self.homeShift(), key);
     }
 
     // The first empty slot on `key`'s probe path; the table has room by its reserve.
@@ -286,6 +297,7 @@ pub const ChunkListMap = struct {
         self.slot_keys[slot] = key;
         self.slot_heads[slot] = no_entry;
         self.slot_tails[slot] = no_entry;
+        self.slot_values[slot] = no_value;
         self.slot_touch[slot] = untouched;
         self.live_keys += 1;
         return slot;
@@ -297,11 +309,64 @@ pub const ChunkListMap = struct {
         return self.slot_heads[slot];
     }
 
+    /// `key`'s value, or `no_value` when it has none or is absent. O(1) expected; never
+    /// mutates.
+    pub fn value(self: *const ChunkListMap, key: u64) u32 {
+        const slot = self.findSlot(key) orelse return no_value;
+        return self.slot_values[slot];
+    }
+
+    /// Sets present `key`'s value; `no_value` clears it. A key whose list a `commitBatch`
+    /// leaves empty must hold `no_value` by then. Valid in or out of a batch; O(1)
+    /// expected; allocates nothing.
+    pub fn setValue(self: *ChunkListMap, key: u64, key_value: u32) void {
+        const slot = self.findSlot(key).?;
+        self.slot_values[slot] = key_value;
+    }
+
     /// Walks `key`'s owners in list order. Never mutates; valid until the next batch or
     /// append.
     pub fn iterator(self: *const ChunkListMap, key: u64) Iterator {
         return .{ .owners = self.entry_owner, .next_entries = self.entry_next, .entry = self.head(key) };
     }
+
+    /// The table and entry columns for lookups and list walks without the map: O(1) to
+    /// take, safe for concurrent reads, valid until the next reserve, batch, or append.
+    pub fn reader(self: *const ChunkListMap) Reader {
+        if (self.slot_keys.len == 0) return .{};
+        return .{
+            .keys = self.slot_keys,
+            .heads = self.slot_heads,
+            .values = self.slot_values,
+            .owners = self.entry_owner,
+            .next_entries = self.entry_next,
+            .shift = self.homeShift(),
+        };
+    }
+
+    pub const Reader = struct {
+        keys: []const u64 = &.{},
+        heads: []const u32 = &.{},
+        values: []const u32 = &.{},
+        /// Per entry, its owner id and the next entry of its list (`no_entry` at the end).
+        owners: []const u32 = &.{},
+        next_entries: []const u32 = &.{},
+        shift: u6 = 0,
+
+        /// The first entry of `key`'s list, or `no_entry`.
+        pub fn head(self: Reader, key: u64) u32 {
+            if (self.keys.len == 0) return no_entry;
+            const slot = probeSlot(self.keys, self.shift, key) orelse return no_entry;
+            return self.heads[slot];
+        }
+
+        /// `key`'s value, or `no_value` when it has none or is absent.
+        pub fn value(self: Reader, key: u64) u32 {
+            if (self.keys.len == 0) return no_value;
+            const slot = probeSlot(self.keys, self.shift, key) orelse return no_value;
+            return self.values[slot];
+        }
+    };
 
     pub const Iterator = struct {
         owners: []const u32,
@@ -466,7 +531,10 @@ pub const ChunkListMap = struct {
         // Slots stayed put through the links; now drop the keys still empty.
         for (self.emptied_keys.items) |key| {
             const slot = self.findSlot(key).?;
-            if (self.slot_heads[slot] == no_entry) self.removeSlot(slot);
+            if (self.slot_heads[slot] != no_entry) continue;
+            // A key holding a value is never dropped: its owner clears the value first.
+            std.debug.assert(self.slot_values[slot] == no_value);
+            self.removeSlot(slot);
         }
         self.in_batch = false;
         return batch;
@@ -512,6 +580,7 @@ pub const ChunkListMap = struct {
                 self.slot_keys[hole] = key;
                 self.slot_heads[hole] = self.slot_heads[slot];
                 self.slot_tails[hole] = self.slot_tails[slot];
+                self.slot_values[hole] = self.slot_values[slot];
                 hole = slot;
             }
         }
@@ -567,6 +636,25 @@ pub const ChunkListMap = struct {
         }
     }
 };
+
+// Fibonacci hashing: the multiply spreads chunk-adjacent keys over the table.
+fn homeSlot(key: u64, shift: u6) usize {
+    return @intCast((key *% 0x9E3779B97F4A7C15) >> shift);
+}
+
+// The slot holding `key` in a non-empty power-of-two table hashed at `shift`, or null.
+// Linear probing; never writes.
+// SIMD verdict: scalar. A probe at load <= 1/2 visits about 2.5 slots per miss, and
+// `simd.zig` has no u64 lanes; list walks are pointer chases.
+fn probeSlot(keys: []const u64, shift: u6, key: u64) ?usize {
+    const slot_mask = keys.len - 1;
+    var slot = homeSlot(key, shift);
+    while (true) : (slot = (slot + 1) & slot_mask) {
+        const stored = keys[slot];
+        if (stored == key) return slot;
+        if (stored == empty_key) return null;
+    }
+}
 
 fn orderLessThan(orders: []const u32, a: SpliceRecord, b: SpliceRecord) bool {
     return orders[a.entry] < orders[b.entry];
@@ -651,7 +739,7 @@ fn expectSameLists(a: *const ChunkListMap, b: *const ChunkListMap, keys: []const
 }
 
 test "batches keep every list in order and back-shift deletion keeps every key reachable" {
-    var map = ChunkListMap.init(std.testing.allocator);
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer map.deinit();
     const owner_count = 400;
     var prng = std.Random.DefaultPrng.init(0xc417);
@@ -701,7 +789,7 @@ test "batches keep every list in order and back-shift deletion keeps every key r
 }
 
 test "a batch links staged entries among the listed ones by order, after equal orders" {
-    var map = ChunkListMap.init(std.testing.allocator);
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer map.deinit();
     const key = chunkKey(2, 7);
     try map.reserve(1, 9, 9);
@@ -727,7 +815,7 @@ test "a batch links staged entries among the listed ones by order, after equal o
 }
 
 test "unlinkOwnerOutside keeps the owner's entries in the keep set and frees the rest" {
-    var map = ChunkListMap.init(std.testing.allocator);
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer map.deinit();
     try map.reserve(4, 6, 3);
     for (0..4) |chunk| map.appendTail(0, chunkKey(0, @intCast(chunk)), 0);
@@ -758,7 +846,7 @@ test "unlinkOwnerOutside keeps the owner's entries in the keep set and frees the
 }
 
 test "a key emptied and refilled in one batch keeps one key; a key a batch empties is dropped" {
-    var map = ChunkListMap.init(std.testing.allocator);
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer map.deinit();
     const refilled = chunkKey(1, 3);
     const emptied = chunkKey(1, 4);
@@ -815,14 +903,14 @@ test "a threaded batch commit equals the inline commit for any partition" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    var inline_map = ChunkListMap.init(std.testing.allocator);
+    var inline_map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer inline_map.deinit();
     _ = try randomBatches(&inline_map, 0x5a1ce, null);
     var keys: [64]u64 = undefined;
     for (&keys, 0..) |*key, chunk| key.* = chunkKey(1, @intCast(chunk));
     for ([_]usize{ 8, 16, 40 }) |items_per_range| {
         var tuner = AdaptiveWorkTuner.init(.{});
-        var map = ChunkListMap.init(std.testing.allocator);
+        var map = ChunkListMap.init(std.testing.allocator, "test lists");
         defer map.deinit();
         const ranges = try randomBatches(&map, 0x5a1ce, .{ .thread_system = &threads, .tuner = &tuner, .adaptive = false, .items_per_range = items_per_range });
         try std.testing.expect(ranges > 1);
@@ -836,7 +924,7 @@ test "reserve and reserveBatch, then a threaded batch, allocate nothing on a mul
     defer threads.deinit();
     var tuner = AdaptiveWorkTuner.init(.{});
     const splice: SpliceThreads = .{ .thread_system = &threads, .tuner = &tuner, .adaptive = false, .items_per_range = 8 };
-    var map = ChunkListMap.init(std.testing.allocator);
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer map.deinit();
     // Owners 0..255 over 32 keys, listed in descending order so each staged insert lands
     // mid-list.
@@ -909,12 +997,12 @@ fn stageArrivalOrders(map: *ChunkListMap, threads: ?SpliceThreads) !BatchStats {
 
 test "a key's ascending, descending, and mixed arrivals produce the same list as a tail rebuild, inline and threaded" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var inline_map = ChunkListMap.init(std.testing.allocator);
+    var inline_map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer inline_map.deinit();
     _ = try stageArrivalOrders(&inline_map, null);
 
     // The rebuild: every key's owners appended at the tail in order.
-    var rebuilt = ChunkListMap.init(std.testing.allocator);
+    var rebuilt = ChunkListMap.init(std.testing.allocator, "test lists");
     defer rebuilt.deinit();
     try rebuilt.reserve(arrival_key_count, arrival_key_count * arrival_owners_per_key, arrival_key_count * 128);
     var orders: [arrival_owners_per_key]u32 = undefined;
@@ -940,15 +1028,39 @@ test "a key's ascending, descending, and mixed arrivals produce the same list as
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var tuner = AdaptiveWorkTuner.init(.{});
-    var threaded_map = ChunkListMap.init(std.testing.allocator);
+    var threaded_map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer threaded_map.deinit();
     const batch = try stageArrivalOrders(&threaded_map, .{ .thread_system = &threads, .tuner = &tuner, .adaptive = false, .items_per_range = 1 });
     try std.testing.expect(!batch.ran_inline and batch.range_count > 1);
     try expectSameLists(&threaded_map, &inline_map, &keys);
 }
 
+test "Reader.head equals head for present and absent keys across a rehash" {
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer map.deinit();
+    try std.testing.expectEqual(no_entry, map.reader().head(chunkKey(0, 0)));
+    // Keys across levels and the query-class bits, enough to rehash the table twice.
+    var keys: [40]u64 = undefined;
+    for (&keys, 0..) |*key, at| key.* = (@as(u64, at % 3) << 48) | chunkKey(@intCast(at % 5), @intCast(at * 7));
+    for (keys, 0..) |key, at| {
+        const slots_before = map.slot_keys.len;
+        try map.reserve(1, 1, keys.len);
+        map.appendTail(@intCast(at), key, @intCast(at));
+        const view = map.reader();
+        for (keys, 0..) |probe, probe_at| {
+            try std.testing.expectEqual(map.head(probe), view.head(probe));
+            try std.testing.expectEqual(probe_at <= at, view.head(probe) != no_entry);
+        }
+        // Absent keys on and off the listed levels.
+        try std.testing.expectEqual(no_entry, view.head(chunkKey(0, 9999)));
+        try std.testing.expectEqual(no_entry, view.head((@as(u64, 7) << 48) | chunkKey(1, 7)));
+        if (map.slot_keys.len != slots_before) try std.testing.expect(view.keys.ptr == map.slot_keys.ptr);
+    }
+    try std.testing.expect(map.slot_keys.len > min_slot_count * 2);
+}
+
 test "an entry pool grow that fails after the pool moved keeps the column views on the live pool" {
-    var map = ChunkListMap.init(std.testing.allocator);
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer map.deinit();
     try map.reserve(1, 4, 8);
     for (0..4) |owner| map.appendTail(@intCast(owner), chunkKey(0, 0), @intCast(owner));
@@ -968,4 +1080,70 @@ test "an entry pool grow that fails after the pool moved keeps the column views 
     defer seen.deinit(std.testing.allocator);
     try collectOwners(&map, chunkKey(0, 0), &seen);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, seen.items);
+}
+
+test "a key's value survives a rehash and the back-shift deletion of its probe neighbours, and Reader.value equals value" {
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer map.deinit();
+    try std.testing.expectEqual(no_value, map.value(chunkKey(0, 0)));
+    try std.testing.expectEqual(no_value, map.reader().value(chunkKey(0, 0)));
+    // Enough keys to rehash the table twice; every third key holds a value.
+    const key_count = 48;
+    var keys: [key_count]u64 = undefined;
+    for (&keys, 0..) |*key, at| key.* = chunkKey(@intCast(at % 3), @intCast(at * 5));
+    for (keys, 0..) |key, at| {
+        try map.reserve(1, 1, key_count + 3);
+        map.appendTail(@intCast(at), key, @intCast(at));
+        // A new key holds no value.
+        try std.testing.expectEqual(no_value, map.value(key));
+        if (at % 3 == 0) map.setValue(key, @intCast(at * 11));
+    }
+    try std.testing.expect(map.slot_keys.len > min_slot_count * 2);
+    const expectValues = struct {
+        fn check(checked: *const ChunkListMap, checked_keys: []const u64) !void {
+            const view = checked.reader();
+            for (checked_keys, 0..) |key, at| {
+                const expected: u32 = if (checked.head(key) == no_entry) no_value else if (at % 3 == 0) @intCast(at * 11) else no_value;
+                try std.testing.expectEqual(expected, checked.value(key));
+                try std.testing.expectEqual(checked.value(key), view.value(key));
+            }
+        }
+    }.check;
+    try expectValues(&map, &keys);
+    try std.testing.expectEqual(no_value, map.reader().value(chunkKey(7, 9999)));
+
+    // Three fresh keys sharing one home slot: the second and third hold values and sit
+    // after the first on its probe run, so dropping the first back-shifts them.
+    var run: [3]u64 = undefined;
+    var found: usize = 0;
+    const shift = map.homeShift();
+    const run_home = homeSlot(chunkKey(5, 0), shift);
+    var candidate: u32 = 0;
+    while (found < run.len) : (candidate += 1) {
+        const key = chunkKey(5, candidate);
+        if (homeSlot(key, shift) != run_home) continue;
+        run[found] = key;
+        found += 1;
+    }
+    try map.reserve(run.len, run.len, key_count + run.len);
+    try std.testing.expectEqual(shift, map.homeShift());
+    for (run, 0..) |key, at| map.appendTail(@intCast(key_count + at), key, 0);
+    map.setValue(run[1], 101);
+    map.setValue(run[2], 202);
+    const slot_before = [2]usize{ map.findSlot(run[1]).?, map.findSlot(run[2]).? };
+    _ = try applyBatch(&map, &.{key_count}, &.{}, key_count + run.len, null);
+    try std.testing.expectEqual(no_entry, map.head(run[0]));
+    try std.testing.expect(map.findSlot(run[1]).? != slot_before[0] or map.findSlot(run[2]).? != slot_before[1]);
+    try std.testing.expectEqual(@as(u32, 101), map.value(run[1]));
+    try std.testing.expectEqual(@as(u32, 202), map.value(run[2]));
+    try std.testing.expectEqual(@as(u32, 101), map.reader().value(run[1]));
+    try std.testing.expectEqual(@as(u32, 202), map.reader().value(run[2]));
+    try std.testing.expectEqual(no_value, map.value(run[0]));
+    try expectValues(&map, &keys);
+
+    // Clearing a value lets a batch drop its key.
+    map.setValue(run[1], no_value);
+    _ = try applyBatch(&map, &.{key_count + 1}, &.{}, key_count + run.len, null);
+    try std.testing.expectEqual(no_entry, map.head(run[1]));
+    try std.testing.expectEqual(@as(u32, 202), map.value(run[2]));
 }

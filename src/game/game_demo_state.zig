@@ -670,8 +670,9 @@ const DemoCommitResult = struct {
 /// reactions. The nav apply runs only after a successful growth seam and collider sync,
 /// keeping every recorded mark for the next step otherwise; the steering reaction
 /// (allocation-free flag setting) always runs, and the first growth, collider, or nav error
-/// is returned only after it, so a failure never leaves steering's static-obstacle snapshot
-/// stale. A failed collider sync keeps its changes for the next step's sync.
+/// is returned only after it. Steering reads the synced collider rows, so a growth or nav
+/// failure still leaves it on the committed statics; a failed collider sync keeps steering
+/// on the pre-commit rows and keeps its changes for the next step's sync, which converges.
 fn commitStructuralAndReact(
     pipeline: *SimulationPipeline,
     frame: *SimulationFrame,
@@ -2149,7 +2150,7 @@ fn lateralSteeringOnceForTest(pipeline: *SimulationPipeline, frame: *SimulationF
     writer.write(.{ .entity = agent, .goal = goal, .direct_direction_x = 1 });
     writer.finish();
     frame.navigation_intents.finishWrite();
-    _ = try pipeline.steering.updateSerial(data, frame, &pipeline.pathfinding, .{});
+    _ = try pipeline.steering.updateSerial(data, frame, &pipeline.pathfinding, &pipeline.static_colliders, .{});
     for (frame.intents.mergedItems()) |intent| {
         if (intent.movement.entity.eql(agent)) return intent.movement.direction_y;
     }
@@ -2164,8 +2165,16 @@ const SteeringBoxForTest = struct {
     beside: math.Vec2,
 };
 
-// A steering agent heading +x and a static box parked far from it, on `level`.
+// A steering agent heading +x and a static box parked far from it, on `level`. The agent
+// is created last, so it is the last movement row: destroying any earlier movement body
+// swap-removes the agent into that body's row.
 fn addSteeringAgentAndParkedBoxForTest(data: *DataSystem, level: u16) !SteeringBoxForTest {
+    const parked = math.Vec2{ .x = 96, .y = 960 };
+    const box = try data.createEntity();
+    try data.setMovementBody(box, .{ .position = parked, .previous_position = parked, .velocity = .{}, .speed = 0 });
+    try data.setCollisionBounds(box, .{ .size = .{ .x = 20, .y = 20 } });
+    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    try data.setWorldLevel(box, level);
     const agent_position = math.Vec2{ .x = 96, .y = 96 };
     const agent = try data.createEntity();
     try data.setMovementBody(agent, .{ .position = agent_position, .previous_position = agent_position, .velocity = .{}, .speed = 32 });
@@ -2180,12 +2189,6 @@ fn addSteeringAgentAndParkedBoxForTest(data: *DataSystem, level: u16) !SteeringB
         .unavailable_backoff_steps = 12,
     });
     try data.setWorldLevel(agent, level);
-    const parked = math.Vec2{ .x = 96, .y = 960 };
-    const box = try data.createEntity();
-    try data.setMovementBody(box, .{ .position = parked, .previous_position = parked, .velocity = .{}, .speed = 0 });
-    try data.setCollisionBounds(box, .{ .size = .{ .x = 20, .y = 20 } });
-    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
-    try data.setWorldLevel(box, level);
     return .{
         .agent = agent,
         .box = box,
@@ -2206,23 +2209,49 @@ fn writeBoxMoveForTest(frame: *SimulationFrame, box: EntityId, position: math.Ve
     frame.structural_commands.finishWrite();
 }
 
+// Steering's last agent snapshot (the positions neighbors avoid) holds `agent` at its own
+// previous position.
+fn expectSteeringSeesOwnPositionForTest(pipeline: *const SimulationPipeline, data: *const DataSystem, agent: EntityId) !void {
+    const own = data.movementBodyConst(agent).?.previous_position;
+    const agents = pipeline.steering.agentSnapshotSliceConst();
+    for (agents.entity, agents.x, agents.y) |entity, x, y| {
+        if (!entity.eql(agent)) continue;
+        try std.testing.expectEqual(own, math.Vec2{ .x = x, .y = y });
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+// A movement body with no steering or collider component, far from the scene on `level`.
+fn addBystanderBodyForTest(data: *DataSystem, level: u16) !EntityId {
+    const far = math.Vec2{ .x = 900, .y = 900 };
+    const bystander = try data.createEntity();
+    try data.setMovementBody(bystander, .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 });
+    try data.setWorldLevel(bystander, level);
+    return bystander;
+}
+
 // Commits one step whose nav reaction runs out of memory: more recorded tile marks than
-// the nav batch storage holds, applied under a failing nav allocator. With
-// `move_static`, the same commit moves the parked static box beside the steering
-// agent. Returns the agent's lateral steering component on the next step.
+// the nav batch storage holds, applied under a failing nav allocator. The same commit
+// destroys a bystander body, swap-removing the steering agent into the bystander's movement
+// row, and places the static box: beside the agent with `move_static`, else where it is
+// parked. Returns the agent's lateral steering component on the next step.
 fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     const frame = &demo.simulation_frame;
 
-    // Agent and box on level 1, apart from the demo population on level 0.
+    // Agent, box, and bystander on level 1, apart from the demo population on level 0.
+    const bystander = try addBystanderBodyForTest(&demo.data, 1);
     const scene = try addSteeringAgentAndParkedBoxForTest(&demo.data, 1);
+    const parked = demo.data.movementBodyConst(scene.box).?.position;
 
-    // Population seam for the direct adds, then a step that builds steering's
-    // static snapshot with the box parked.
+    // Population seam for the direct adds, then a steering step that caches the agent's
+    // movement row.
     frame.beginStep();
     _ = try commitStructuralAndReact(&demo.pipeline, frame, &demo.data, &demo.world, null);
     try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal), 0.001);
+    try std.testing.expect(demo.pipeline.steering.steering_movement_index_valid);
 
     frame.beginStep();
     const nav = &demo.pipeline.pathfinding;
@@ -2242,7 +2271,8 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     }
     // The writer's nav record, before the nav allocator fails.
     try @import("systems/pathfinding/test_support.zig").recordTerrainEvents(nav, frame.events.mergedItems(), &demo.world);
-    if (move_static) try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{});
+    try writeBoxMoveForTest(frame, scene.box, if (move_static) scene.beside else parked, &.{.{ .destroy_entity = bystander }});
+    const agent_row = demo.data.movementBodyDenseIndex(scene.agent).?;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const nav_allocator = nav.allocator;
@@ -2253,15 +2283,20 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     nav.allocator = nav_allocator;
     nav.graph.allocator = graph_allocator;
     try std.testing.expectError(error.OutOfMemory, result);
+    // The agent's movement row moved, and the steering reaction dropped the cached row.
+    try std.testing.expect(demo.data.movementBodyDenseIndex(scene.agent).? != agent_row);
+    try std.testing.expect(!demo.pipeline.steering.steering_movement_index_valid);
 
-    return lateralSteeringOnceForTest(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal);
+    const lateral = try lateralSteeringOnceForTest(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal);
+    try expectSteeringSeesOwnPositionForTest(&demo.pipeline, &demo.data, scene.agent);
+    return lateral;
 }
 
 test "a nav reaction that runs out of memory still runs the steering reaction and returns the error" {
     const moved = try lateralSteeringAfterNavOutOfMemory(true);
     const control = try lateralSteeringAfterNavOutOfMemory(false);
     try std.testing.expectApproxEqAbs(@as(f32, 0), control, 0.001);
-    // Pushed away from the box (+y), which a stale snapshot would miss.
+    // The synced collider rows push the agent away from the moved box (+y).
     try std.testing.expect(moved > 0.05);
 }
 
@@ -2270,23 +2305,27 @@ test "a population growth seam that runs out of memory still runs the steering r
     try fixture.init(std.testing.allocator);
     defer fixture.deinit();
     const frame = &fixture.frame;
+    const bystander = try addBystanderBodyForTest(&fixture.data, 0);
     const scene = try addSteeringAgentAndParkedBoxForTest(&fixture.data, 0);
 
-    // Three bodies fit the 4-body reserve (the box's responder row may grow the
-    // responder share here). Build steering's snapshot with the box parked.
+    // Four bodies fit the 4-body reserve. A steering step caches the agent's movement row.
     frame.beginStep();
     _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
     try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
+    try std.testing.expect(fixture.pipeline.steering.steering_movement_index_valid);
 
-    // Two creates push the population past the reserve while the same commit
-    // moves the box beside the agent; the growth seam's first reserve fails.
+    // The commit moves the box beside the agent and destroys the bystander, swap-removing
+    // the agent into the bystander's row; two creates then push the population past the
+    // reserve, the first refilling the agent's old row. The growth seam's first reserve
+    // fails.
     const far = math.Vec2{ .x = 640, .y = 640 };
     const create: StructuralCommand = .{ .create_entity = .{
         .movement_body = .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 },
     } };
     frame.beginStep();
-    try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{ create, create });
+    try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{ .{ .destroy_entity = bystander }, create, create });
+    const agent_row = fixture.data.movementBodyDenseIndex(scene.agent).?;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const scope_allocator = fixture.pipeline.scope.allocator;
     fixture.pipeline.scope.allocator = failing.allocator();
@@ -2294,9 +2333,13 @@ test "a population growth seam that runs out of memory still runs the steering r
     fixture.pipeline.scope.allocator = scope_allocator;
     try std.testing.expectError(error.OutOfMemory, result);
     try std.testing.expectEqual(@as(usize, 5), fixture.data.movementBodySliceConst().entities.len);
+    try std.testing.expect(fixture.data.movementBodyDenseIndex(scene.agent).? != agent_row);
+    try std.testing.expect(!fixture.pipeline.steering.steering_movement_index_valid);
 
-    // Pushed away from the box (+y), which a stale snapshot would miss.
+    // The synced collider rows push the agent away from the moved box (+y), and the agent
+    // snapshot reads its own renumbered row, not the create now in its old one.
     try std.testing.expect(try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
+    try expectSteeringSeesOwnPositionForTest(&fixture.pipeline, &fixture.data, scene.agent);
 }
 
 test "a population-seam OOM still records the step's static changes" {
@@ -2347,6 +2390,54 @@ test "a population-seam OOM still records the step's static changes" {
         if (live.isBlockedCell(cell)) blocked += 1;
     };
     try std.testing.expect(blocked != 0);
+}
+
+test "a collider sync that runs out of memory leaves steering on the pre-commit rows and the next seam converges" {
+    var fixture: DemoConfigPipelineFixture = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const frame = &fixture.frame;
+    const scene = try addSteeringAgentAndParkedBoxForTest(&fixture.data, 0);
+    const colliders = &fixture.pipeline.static_colliders;
+
+    // The box was added outside a commit: a commit re-placing it where it is gives it its
+    // row, parked far from the agent.
+    const parked = fixture.data.movementBodyConst(scene.box).?.position;
+    frame.beginStep();
+    try writeBoxMoveForTest(frame, scene.box, parked, &.{});
+    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
+    try std.testing.expect(colliderRowLevelForTest(colliders, scene.box.index) != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
+
+    // The commit moves the box beside the agent. The sync's plan scratch is released
+    // first, so the sync must grow it, and every collider allocation fails: the sync after
+    // the commit fails.
+    colliders.sync_plan.clearAndFree(colliders.allocator);
+    frame.beginStep();
+    try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const allocators = .{ colliders.allocator, colliders.chunk_lists.allocator, colliders.query_lists.allocator };
+    colliders.allocator = failing.allocator();
+    colliders.chunk_lists.allocator = failing.allocator();
+    colliders.query_lists.allocator = failing.allocator();
+    const result = commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
+    colliders.allocator = allocators[0];
+    colliders.chunk_lists.allocator = allocators[1];
+    colliders.query_lists.allocator = allocators[2];
+    try std.testing.expectError(error.OutOfMemory, result);
+    // The commit applied; the sync kept the change for the next seam.
+    try std.testing.expectEqual(scene.beside, fixture.data.movementBodyConst(scene.box).?.position);
+    try std.testing.expect(colliders.hasPendingChanges());
+
+    // Steering reads the pre-commit rows: the box is still parked.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
+
+    // The next seam, with no command, syncs the kept change: steering pushes away from the
+    // box (+y).
+    frame.beginStep();
+    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
+    try std.testing.expect(!colliders.hasPendingChanges());
+    try std.testing.expect(try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
 }
 
 test "demo event bound is the pinned exhaustive producer sum" {

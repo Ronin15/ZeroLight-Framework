@@ -99,10 +99,7 @@ pub fn abstractTestWorld(meta: *const WorldTilesetMeta, bounds_width: f32, bound
 }
 
 /// No static colliders: for applies on a nav whose levels hold no static body.
-pub const no_colliders = StaticColliderSystem{
-    .allocator = std.testing.failing_allocator,
-    .chunk_lists = .{ .allocator = std.testing.failing_allocator },
-};
+pub const no_colliders = StaticColliderSystem.init(std.testing.failing_allocator);
 
 /// Static colliders built from `data` on `world`'s cell grid.
 pub fn worldColliders(data: *const DataSystem, world: *const WorldSystem) !StaticColliderSystem {

@@ -38,7 +38,6 @@ pub const PopulationRowCounts = struct {
     steering_agents: usize,
     ai_agents: usize,
     collision_bounds: usize,
-    collision_responses: usize,
     ai_perceptions: usize,
     ai_affects: usize,
 

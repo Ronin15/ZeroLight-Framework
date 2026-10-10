@@ -3,10 +3,12 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! `steering` times one steering step over its agent count. `steering-static-change` times
-//! one static collision body moved and committed, the steering post-commit reaction, and one
-//! steering step for a fixed agent population, with the static count as its item count; the
-//! cost model expects it flat in the static count. `steering-static-dense` times one steering
-//! step for a fixed agent population among chunks holding the item count of statics each.
+//! one static collision body moved and committed through the seam (collider reserve, commit,
+//! capture, and sync), the steering post-commit reaction, and one steering step for a fixed
+//! agent population, with the static count as its item count; the cost model expects it flat
+//! in the static count. `steering-static-dense` times one steering step for a fixed agent
+//! population among chunks holding the item count of statics each. Each reports the main
+//! thread's share: the iteration minus its off-main stage time.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -17,6 +19,8 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const NavigationIntent = @import("../game/simulation.zig").NavigationIntent;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const SteeringStats = @import("../game/systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("../game/systems/steering.zig").SteeringSystem;
 const steering_range_alignment_items = @import("../game/systems/steering.zig").steering_range_alignment_items;
@@ -49,11 +53,13 @@ const Fixture = struct {
     data: DataSystem,
     frame: SimulationFrame,
     pathfinding: PathfindingSystem,
+    // Built from the fixture's statics on nav's cell grid; steering reads them.
+    colliders: StaticColliderSystem,
     agents: std.ArrayList(EntityId) = .empty,
-    obstacle_count: usize = 0,
 
     fn deinit(self: *Fixture, allocator: std.mem.Allocator) void {
         self.agents.deinit(allocator);
+        self.colliders.deinit();
         self.pathfinding.deinit();
         self.frame.deinit();
         self.data.deinit();
@@ -95,16 +101,24 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
         agents.appendAssumeCapacity(try addAgent(&data, index, side));
     }
 
-    var obstacle_count: usize = 0;
     for (0..@min(@as(usize, 16), side)) |index| {
         _ = try addStatic(&data, nearStaticPosition(index));
-        obstacle_count += 1;
     }
 
     const world_extent = @as(f32, @floatFromInt(side + 4)) * 32.0;
     try pathfinding.rebuildStaticNavGrid(&data, world_extent, world_extent, 32.0);
+    var colliders = try buildColliders(allocator, &data, &pathfinding, world_extent, world_extent);
+    errdefer colliders.deinit();
 
-    return .{ .data = data, .frame = frame, .pathfinding = pathfinding, .agents = agents, .obstacle_count = obstacle_count };
+    return .{ .data = data, .frame = frame, .pathfinding = pathfinding, .colliders = colliders, .agents = agents };
+}
+
+// The static colliders of `data`'s statics on the cell grid of nav's `width` x `height` build.
+fn buildColliders(allocator: std.mem.Allocator, data: *const DataSystem, pathfinding: *const PathfindingSystem, width: f32, height: f32) !StaticColliderSystem {
+    var colliders = StaticColliderSystem.init(allocator);
+    errdefer colliders.deinit();
+    try colliders.rebuild(data, try pathfinding.boundsNavExtent(width, height, nav_cell_size).colliderGeometry());
+    return colliders;
 }
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -124,8 +138,14 @@ const MeasuredCase = struct {
     last: SteeringStats,
 };
 
-// Warms up, settles the adaptive tuner, and times `step(context)` over `steering`'s agents and
-// statics.
+// Off-main time of a stage batch: none when it ran inline.
+fn offMainNs(batch: BatchStats) u64 {
+    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
+}
+
+// Warms up, settles the adaptive tuners, and times `step(context)` over `steering`'s agents
+// and statics, with the main thread's share: each iteration minus the off-main time of the
+// steering stage and the colliders' splice stages.
 fn measureCase(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -138,7 +158,7 @@ fn measureCase(
 ) !MeasuredCase {
     var system = SteeringSystem.init(allocator);
     defer system.deinit();
-    try system.reserveForCapacity(steering.agents.items.len, steering.obstacle_count);
+    try system.reserve(steering.agents.items.len);
     if (suite.adaptiveTunerForCase(case, steering_range_alignment_items)) |tuner| {
         system.adaptive_tuner = tuner;
     }
@@ -167,14 +187,19 @@ fn measureCase(
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = SteeringStats{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         last_stats = try step(&system, context, thread_ptr, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        const off_main_ns = offMainNs(last_stats.batch) + offMainNs(steering.colliders.last_splice_batch) + offMainNs(steering.colliders.last_query_splice_batch);
+        main_total += elapsed_ns -| off_main_ns;
+        accumulator.record(elapsed_ns, last_stats.batch);
     }
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
     stats.output_count = last_stats.movement_intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(BatchStats{});
     if (case.adaptive) {
@@ -192,9 +217,9 @@ fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSy
 fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     try appendNavigationIntents(&fixture.frame, fixture.agents.items);
     if (!case.usesThreadSystem()) {
-        return try system.updateSerial(&fixture.data, &fixture.frame, &fixture.pathfinding, .{});
+        return try system.updateSerial(&fixture.data, &fixture.frame, &fixture.pathfinding, &fixture.colliders, .{});
     }
-    return try system.update(&fixture.data, &fixture.frame, thread_system.?, &fixture.pathfinding, .{
+    return try system.update(&fixture.data, &fixture.frame, thread_system.?, &fixture.pathfinding, &fixture.colliders, .{
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -379,9 +404,12 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
     const nav_width = @as(f32, @floatFromInt(filler_origin_chunk_x + block_side)) * chunk_px;
     const nav_height = @max(@as(f32, @floatFromInt(block_side)) * chunk_px, @as(f32, @floatFromInt(side + 4)) * nav_cell_size);
     try pathfinding.rebuildStaticNavGrid(&data, nav_width, nav_height, nav_cell_size);
+    var colliders = try buildColliders(allocator, &data, &pathfinding, nav_width, nav_height);
+    errdefer colliders.deinit();
+    if (colliders.rowCount() != static_count) return error.WrongStaticCount;
 
     return .{
-        .steering = .{ .data = data, .frame = frame, .pathfinding = pathfinding, .agents = agents, .obstacle_count = static_count },
+        .steering = .{ .data = data, .frame = frame, .pathfinding = pathfinding, .colliders = colliders, .agents = agents },
         .mover = mover,
         .mover_positions = mover_positions,
     };
@@ -400,6 +428,14 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
 
     var fixture = try createStaticChangeFixture(allocator, item_count);
     defer fixture.deinit(allocator);
+    const colliders = &fixture.steering.colliders;
+    if (suite.adaptiveTunerForCase(case, splice_range_alignment_items)) |tuner| {
+        colliders.splice_tuner = tuner;
+        colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
+    }
+    colliders.splice_adaptive = case.adaptive;
+    colliders.splice_items_per_range = if (case.adaptive) null else case.itemsPerRange(splice_range_alignment_items) orelse
+        suite.alignItemCount(suite.default_items_per_range, splice_range_alignment_items);
     const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, staticChangeOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;
@@ -407,10 +443,12 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     return stats;
 }
 
-// One step: the mover's set_movement_body committed, the steering post-commit reaction, then
-// navigation intents and the steering update.
+// One step: the mover's set_movement_body through the commit seam (collider reserve, commit,
+// capture, and sync with its splice stages on the case's threads), the steering post-commit
+// reaction, then navigation intents and the steering update.
 fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const frame = &fixture.steering.frame;
+    const colliders = &fixture.steering.colliders;
     frame.beginStep();
     const target = if (fixture.at_second) fixture.mover_positions[0] else fixture.mover_positions[1];
     try frame.structural_commands.prepareRangeCounts(1);
@@ -423,8 +461,12 @@ fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thre
     } });
     writer.finish();
     frame.structural_commands.finishWrite();
+    try colliders.reserveForCommit(&fixture.steering.data, 1);
     const commit = try frame.applyStructuralCommandsBudgeted(&fixture.steering.data, .{});
     if (commit.components_set != 1) return error.StaticMoveNotApplied;
+    colliders.capture(frame);
+    try colliders.sync(&fixture.steering.data, if (case.usesThreadSystem()) thread_system else null);
+    if (colliders.changesThisStep().len != 1) return error.StaticChangeNotSynced;
     fixture.at_second = !fixture.at_second;
     system.reactToPostCommitSteeringEvents(frame);
 
@@ -529,13 +571,16 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
 
     const nav_extent = @as(f32, @floatFromInt(chunks_per_axis)) * chunk_px;
     try pathfinding.rebuildStaticNavGrid(&data, nav_extent, nav_extent, nav_cell_size);
+    var colliders = try buildColliders(allocator, &data, &pathfinding, nav_extent, nav_extent);
+    errdefer colliders.deinit();
+    if (colliders.rowCount() != chunk_count * statics_per_chunk) return error.WrongStaticCount;
 
     return .{ .steering = .{
         .data = data,
         .frame = frame,
         .pathfinding = pathfinding,
+        .colliders = colliders,
         .agents = agents,
-        .obstacle_count = chunk_count * statics_per_chunk,
     } };
 }
 

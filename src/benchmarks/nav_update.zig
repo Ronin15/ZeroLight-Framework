@@ -58,6 +58,7 @@ const PathfindingSystem = @import("../game/systems/pathfinding.zig").Pathfinding
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const TileId = @import("../game/world_system.zig").TileId;
 const suite = @import("suite.zig");
 
@@ -111,9 +112,6 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     return case.itemsPerRange(nav_range_alignment_items) orelse
         suite.alignItemCount(suite.default_items_per_range, nav_range_alignment_items);
 }
-
-// The collider splice stage's range alignment (keys per range multiple).
-const splice_range_alignment_items: usize = 8;
 
 // The splice stage's fixed range size for a non-adaptive control case; adaptive cases return
 // null.
@@ -669,6 +667,7 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
         fixture.system.nav_mark_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
         fixture.colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
+        fixture.colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
     fixture.system.nav_thread_adaptive = case.adaptive;
     fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
@@ -849,7 +848,8 @@ const StaticDenseFixture = struct {
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
         const splice = self.colliders.last_splice_batch;
-        const splice_off_main_ns = if (splice.ran_inline) 0 else splice.batch_duration_ns;
+        const query_splice = self.colliders.last_query_splice_batch;
+        const splice_off_main_ns = (if (splice.ran_inline) 0 else splice.batch_duration_ns) + (if (query_splice.ran_inline) 0 else query_splice.batch_duration_ns);
         return .{
             .ns = suite.elapsedNs(start_ns, end_ns),
             .commit_ns = suite.elapsedNs(start_ns, sync_start_ns),
@@ -995,6 +995,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
         fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
         fixture.colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
+        fixture.colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
     fixture.system.nav_thread_adaptive = case.adaptive;
     fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
@@ -1005,7 +1006,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.colliders.splice_tuner.isSettled() or !fixture.system.nav_plan_tuner.isSettled() or !fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!fixture.colliders.splice_tuner.isSettled() or !fixture.colliders.query_splice_tuner.isSettled() or !fixture.system.nav_plan_tuner.isSettled() or !fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try fixture.changeAndReact(io, thread_ptr);
         }
     }
@@ -1036,6 +1037,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_splice_batch);
+    stats.query_splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_query_splice_batch);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.

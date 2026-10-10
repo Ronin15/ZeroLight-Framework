@@ -370,6 +370,30 @@ pub fn normalizeOrZero2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
     };
 }
 
+/// Per-lane length paired with the unit direction.
+pub const LengthDirection4 = struct {
+    length: Float4,
+    direction: Vec2x4,
+};
+
+/// Per-lane length and unit direction of `(x, y)` from one `@sqrt`: SIMD counterpart of
+/// `math.lengthDirection`, equal to it bit for bit in every lane, including the zero
+/// length and direction of a lane whose input or squared length is non-finite or whose
+/// squared length is at or below `epsilon`.
+pub fn lengthDirection2Float4(x: Float4, y: Float4, epsilon: f32) LengthDirection4 {
+    const finite_max = splatFloat4(std.math.floatMax(f32));
+    const len2 = lengthSquared2Float4(x, y);
+    // `@abs(v) <= floatMax` is false for inf and NaN lanes.
+    const valid = (@abs(x) <= finite_max) & (@abs(y) <= finite_max) & (@abs(len2) <= finite_max) & greaterThanFloat4(len2, splatFloat4(epsilon));
+    const len = @sqrt(len2);
+    const inv = splatFloat4(1) / len;
+    const zero = splatFloat4(0);
+    return .{
+        .length = selectFloat4(valid, len, zero),
+        .direction = .{ .x = selectFloat4(valid, x * inv, zero), .y = selectFloat4(valid, y * inv, zero) },
+    };
+}
+
 /// Per-lane linear interpolation of 2D vectors between `start` and `end` by
 /// `amount`. SIMD counterpart of `math.lerpVec2`.
 pub fn lerpVec2Float4(start: Vec2x4, end: Vec2x4, amount: Float4) Vec2x4 {
@@ -588,6 +612,41 @@ test "normalize or zero matches scalar and zeroes short lanes" {
             try std.testing.expectApproxEqAbs(xs[lane] * inv, x_out[lane], 0.001);
             try std.testing.expectApproxEqAbs(ys[lane] * inv, y_out[lane], 0.001);
             try std.testing.expectApproxEqAbs(@as(f32, 1), x_out[lane] * x_out[lane] + y_out[lane] * y_out[lane], 0.001);
+        }
+    }
+}
+
+test "lengthDirection2Float4 matches math.lengthDirection in every lane" {
+    const inf = std.math.inf(f32);
+    const nan = std.math.nan(f32);
+    const max = std.math.floatMax(f32);
+    // Finite, zero, at and just past epsilon, overflowing squares, NaN, and inf lanes.
+    const cases = [_][2]f32{
+        .{ 3, 4 },   .{ -0.75, 12.5 }, .{ 0, 0 },       .{ -0.0, 0 },
+        .{ 0.5, 0 }, .{ 0.5001, 0 },   .{ 1e-3, 0 },    .{ 1e-20, -1e-20 },
+        .{ max, 0 }, .{ max, max },    .{ 1e20, 1e20 }, .{ nan, 1 },
+        .{ 1, nan }, .{ inf, 0 },      .{ 0, -inf },    .{ 7, -24 },
+    };
+    // 0.25 makes (0.5, 0) a lane exactly at epsilon.
+    for ([_]f32{ 0, 0.25 }) |epsilon| {
+        var index: usize = 0;
+        while (index < cases.len) : (index += lane_count) {
+            var xs: [lane_count]f32 = undefined;
+            var ys: [lane_count]f32 = undefined;
+            for (cases[index..][0..lane_count], &xs, &ys) |case, *x, *y| {
+                x.* = case[0];
+                y.* = case[1];
+            }
+            const lanes = lengthDirection2Float4(loadFloat4(&xs), loadFloat4(&ys), epsilon);
+            const lengths = toFloatArray(lanes.length);
+            const directions_x = toFloatArray(lanes.direction.x);
+            const directions_y = toFloatArray(lanes.direction.y);
+            for (0..lane_count) |lane| {
+                const expected = math.lengthDirection(xs[lane], ys[lane], epsilon);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.length)), @as(u32, @bitCast(lengths[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.direction.x)), @as(u32, @bitCast(directions_x[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.direction.y)), @as(u32, @bitCast(directions_y[lane])));
+            }
         }
     }
 }

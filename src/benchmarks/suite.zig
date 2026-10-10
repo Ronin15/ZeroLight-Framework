@@ -190,8 +190,9 @@ pub const RunStats = struct {
     // Nav groups: the mark stage (null when the workload marks no events) and the key plan.
     nav_mark_batch: ?BatchSummary = null,
     nav_plan_batch: ?BatchSummary = null,
-    // Static-collider groups: the chunk lists' splice stage.
+    // Static-collider groups: the chunk lists' and the query lists' splice stages.
     splice_batch: ?BatchSummary = null,
+    query_splice_batch: ?BatchSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
@@ -701,6 +702,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
+    if (std.mem.eql(u8, group_name, "steering-static-change")) return "static bodies";
     if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
     if (isRenderGamePrepGroup(group_name)) return "render entities";
     if (std.mem.startsWith(u8, group_name, "render-sparse-window-")) return "sparse tiles in the world";
@@ -1104,13 +1106,15 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.startsWith(u8, group_name, "nav-update-static-dense")) {
         var stage_buffer: [128]u8 = undefined;
         var splice_buffer: [32]u8 = undefined;
+        var query_splice_buffer: [32]u8 = undefined;
         const splice = stats.splice_batch orelse BatchSummary{};
+        const query_splice = stats.query_splice_batch orelse BatchSummary{};
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "statics={} keys={} splice={s} patched={} {s} commit_t={f} sync_t={f} nav_t={f} main={f} ({}%)",
-            .{ stats.candidate_pairs, splice.item_count, formatStageShapeInto(&splice_buffer, splice), stats.output_count, formatNavStagesInto(&stage_buffer, stats), formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.nav_ns), formatDuration(phases.main_ns), main_percent },
+            "statics={} keys={} splice={s} qkeys={} qsplice={s} patched={} {s} commit_t={f} sync_t={f} nav_t={f} main={f} ({}%)",
+            .{ stats.candidate_pairs, splice.item_count, formatStageShapeInto(&splice_buffer, splice), query_splice.item_count, formatStageShapeInto(&query_splice_buffer, query_splice), stats.output_count, formatNavStagesInto(&stage_buffer, stats), formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.nav_ns), formatDuration(phases.main_ns), main_percent },
         ) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "nav-update-")) {
@@ -1196,15 +1200,35 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "steering-static-dense")) {
+        var steer_buffer: [32]u8 = undefined;
         const visits_per_agent_tenths = if (stats.output_count == 0) 0 else stats.candidate_pairs * 10 / stats.output_count;
+        const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
+        const main_percent = if (stats.mean_ns == 0) 0 else main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "obstacle_visits={} ({}.{}/agent) obstacle_samples={} intents={}",
-            .{ stats.candidate_pairs, visits_per_agent_tenths / 10, visits_per_agent_tenths % 10, stats.sample_count, stats.output_count },
+            "obstacle_visits={} ({}.{}/agent) obstacle_samples={} intents={} steer={s} main={f} ({}%)",
+            .{ stats.candidate_pairs, visits_per_agent_tenths / 10, visits_per_agent_tenths % 10, stats.sample_count, stats.output_count, formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
+        ) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "steering-static-change")) {
+        var steer_buffer: [32]u8 = undefined;
+        const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
+        const main_percent = if (stats.mean_ns == 0) 0 else main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "obstacle_checks={} obstacle_samples={} steer={s} main={f} ({}%)",
+            .{ stats.candidate_pairs, stats.sample_count, formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "steering")) {
-        return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
+        var steer_buffer: [32]u8 = undefined;
+        const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
+        const main_percent = if (stats.mean_ns == 0) 0 else main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "avoidance_checks={} samples={} intents={} steer={s} main={f} ({}%)",
+            .{ stats.candidate_pairs, stats.sample_count, stats.output_count, formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
+        ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) {
         return std.fmt.bufPrint(

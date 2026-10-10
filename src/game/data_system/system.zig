@@ -162,7 +162,6 @@ pub const DataSystem = struct {
             .steering_agents = self.steering_agents.len(),
             .ai_agents = self.ai_agents.len(),
             .collision_bounds = self.collision_bounds.len(),
-            .collision_responses = self.collision_responses.len(),
             .ai_perceptions = self.ai_perceptions.len(),
             .ai_affects = self.ai_affects.len(),
         };

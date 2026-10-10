@@ -561,7 +561,6 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.obstacle_samples));
         perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
         perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
-        perf.recordMetric(.steering_static_snapshot_grown, metric(steering_stats.static_snapshot_grown));
         perf.recordBatch(.steering, steering_stats.batch);
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
@@ -639,7 +638,7 @@ pub fn grownPopulationCapacity(rows: usize) usize {
 
 /// What one `syncPopulationCapacity` call did. All-false on the O(1) fast path.
 pub const PopulationSyncStats = struct {
-    /// A tracked population/responder capacity grew this call.
+    /// A tracked population capacity grew this call.
     grew: bool = false,
 
     pub fn recordTo(self: PopulationSyncStats, perf: runtime_perf_log.Context) void {
@@ -659,7 +658,7 @@ pub const SimulationPipeline = struct {
     pathfinding: PathfindingSystem,
     /// Static navigation obstacles as shared rows on nav's cell grid, changed only at the
     /// commit seam (`reserveStaticColliders`, `captureStaticColliderChanges`,
-    /// `syncStaticColliders`); nav reads them.
+    /// `syncStaticColliders`); nav and steering read them.
     static_colliders: StaticColliderSystem,
     /// Backbone scope system: recomputes chunks, gathers the unstaggered
     /// cognition halo and the stagger-filtered think set, and drives auto tier
@@ -694,9 +693,6 @@ pub const SimulationPipeline = struct {
     /// Tracked logical population capacity: every population-sized pipeline capacity is
     /// reserved to it. Grown only by `syncPopulationCapacity` at the commit seam.
     movement_body_capacity: usize,
-    /// Tracked collision-response capacity; the steering static-obstacle snapshot is
-    /// reserved to it (statics are a subset of responders).
-    responder_capacity: usize,
     /// Telemetry: population seam growths (perf metric `population_capacity_grows`).
     population_capacity_grows: u64 = 0,
     /// Once-only flag for the first-growth log.
@@ -736,9 +732,7 @@ pub const SimulationPipeline = struct {
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
         errdefer steering.deinit();
-        // Statics are a subset of collision responders, so the responder count bounds
-        // the obstacle snapshot, including later dynamic->static mobility flips.
-        try steering.reserveForCapacity(population, rows.collision_responses);
+        try steering.reserve(population);
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
@@ -812,7 +806,6 @@ pub const SimulationPipeline = struct {
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
             .movement_body_capacity = population,
-            .responder_capacity = rows.collision_responses,
             .perception_max_events_per_step = perception_events_per_observer_max * rows.ai_perceptions,
             .affect_max_events_per_step = affect_events_per_row_max * rows.ai_affects,
             .structural_headroom = config.structural_headroom,
@@ -908,7 +901,6 @@ pub const SimulationPipeline = struct {
         const rows = data.populationRowCounts();
         const population = rows.population();
         if (population <= self.movement_body_capacity and
-            rows.collision_responses <= self.responder_capacity and
             rows.ai_perceptions * perception_events_per_observer_max <= self.perception_max_events_per_step and
             rows.ai_affects * affect_events_per_row_max <= self.affect_max_events_per_step and
             self.pathfinding.coversAgentCount(rows.steering_agents))
@@ -927,10 +919,7 @@ pub const SimulationPipeline = struct {
         var stats: PopulationSyncStats = .{};
         const population = rows.population();
         const old_body = self.movement_body_capacity;
-        const old_responders = self.responder_capacity;
         const body = if (population > old_body) grownPopulationCapacity(population) else old_body;
-        const responders_grew = rows.collision_responses > old_responders;
-        const responders = if (responders_grew) grownPopulationCapacity(rows.collision_responses) else old_responders;
         const old_perception_share = self.perception_max_events_per_step;
         const old_affect_share = self.affect_max_events_per_step;
         const perception_share = if (rows.ai_perceptions * perception_events_per_observer_max > old_perception_share)
@@ -947,7 +936,6 @@ pub const SimulationPipeline = struct {
         errdefer {
             self.collision.reserved_pair_bound = old_pair_bound;
             self.movement_body_capacity = old_body;
-            self.responder_capacity = old_responders;
             self.perception_max_events_per_step = old_perception_share;
             self.affect_max_events_per_step = old_affect_share;
         }
@@ -960,14 +948,10 @@ pub const SimulationPipeline = struct {
             try self.collision.reserve(body);
             try self.dig.ensurePlaneScratchReserve(body + 1);
             try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = body }));
+            try self.steering.reserve(body);
         }
-        // The obstacle snapshot is reserved to the responder capacity, not the live
-        // statics: statics are a subset of responders, so statics committed within the
-        // responder headroom (or a dynamic->static mobility flip) never grow it in-stage.
-        try self.steering.reserveForCapacity(body, responders);
 
         self.movement_body_capacity = body;
-        self.responder_capacity = responders;
         const shares_grew = perception_share != old_perception_share or affect_share != old_affect_share;
         self.perception_max_events_per_step = perception_share;
         self.affect_max_events_per_step = affect_share;
@@ -994,7 +978,7 @@ pub const SimulationPipeline = struct {
             try self.pathfinding.growForAgentCount(rows.steering_agents);
         }
 
-        if (body_grew or responders_grew or shares_grew) {
+        if (body_grew or shares_grew) {
             stats.grew = true;
             self.population_capacity_grows += 1;
             if (!self.population_growth_logged) {
@@ -1067,9 +1051,10 @@ pub const SimulationPipeline = struct {
         return self.pathfinding.reactToPostCommitNavEvents(frame, &self.static_colliders, world, thread_system);
     }
 
-    /// Orchestrates the post-commit static-obstacle spatial invalidation for
-    /// steering local avoidance. Same structural_commit event family as nav;
-    /// disjoint state, so it runs even when the nav reaction fails.
+    /// Orchestrates steering's post-commit reaction: its movement-index cache follows the
+    /// step's entity changes. Steering reads the synced collider rows directly, so no
+    /// static change reaches it here. Disjoint state, so it runs even when the nav
+    /// reaction fails.
     pub fn reactToPostCommitSteeringEvents(
         self: *SimulationPipeline,
         frame: *const SimulationFrame,
@@ -1432,7 +1417,7 @@ pub const SimulationPipeline = struct {
     fn stageSteeringUpdate(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var steering_timer = StageTimer.start();
-        step.steering = try self.steering.update(context.data, context.frame, context.thread_system, &self.pathfinding, .{});
+        step.steering = try self.steering.update(context.data, context.frame, context.thread_system, &self.pathfinding, &self.static_colliders, .{});
         steering_timer.stop(context.perf, .pipeline_steering);
     }
 
@@ -5334,7 +5319,8 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
 }
 
 /// The allocators of everything a pipeline step can reach: frame streams, data, world,
-/// pipeline systems, pathfinding, dig scratch, and the thread system. `install` swaps
+/// pipeline systems, pathfinding, the static colliders and both their list tiers, dig
+/// scratch, and the thread system. `install` swaps
 /// them all (to one failing allocator for a zero-allocation proof, or per-owner
 /// counters to see which owner allocated) and returns the originals for `restore`.
 /// Test-only local fixture.
@@ -5357,6 +5343,9 @@ const TestAllocatorSwap = struct {
     steering: std.mem.Allocator = undefined,
     pathfinding: std.mem.Allocator = undefined,
     graph: std.mem.Allocator = undefined,
+    static_colliders: std.mem.Allocator = undefined,
+    collider_chunk_lists: std.mem.Allocator = undefined,
+    collider_query_lists: std.mem.Allocator = undefined,
     scope: std.mem.Allocator = undefined,
     spatial_index: std.mem.Allocator = undefined,
     perception: std.mem.Allocator = undefined,
@@ -5413,6 +5402,9 @@ const TestAllocatorSwap = struct {
             .steering = t.pipeline.steering.allocator,
             .pathfinding = t.pipeline.pathfinding.allocator,
             .graph = t.pipeline.pathfinding.graph.allocator,
+            .static_colliders = t.pipeline.static_colliders.allocator,
+            .collider_chunk_lists = t.pipeline.static_colliders.chunk_lists.allocator,
+            .collider_query_lists = t.pipeline.static_colliders.query_lists.allocator,
             .scope = t.pipeline.scope.allocator,
             .spatial_index = t.pipeline.spatial_index.allocator,
             .perception = t.pipeline.perception.allocator,
@@ -5443,6 +5435,9 @@ const TestAllocatorSwap = struct {
         t.pipeline.steering.allocator = to.steering;
         t.pipeline.pathfinding.allocator = to.pathfinding;
         t.pipeline.pathfinding.graph.allocator = to.graph;
+        t.pipeline.static_colliders.allocator = to.static_colliders;
+        t.pipeline.static_colliders.chunk_lists.allocator = to.collider_chunk_lists;
+        t.pipeline.static_colliders.query_lists.allocator = to.collider_query_lists;
         t.pipeline.scope.allocator = to.scope;
         t.pipeline.spatial_index.allocator = to.spatial_index;
         t.pipeline.perception.allocator = to.perception;
@@ -5839,7 +5834,6 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     }
     try std.testing.expectEqual(@as(u64, 0), pipeline.dig.plane_scratch_grown);
     try std.testing.expectEqual(@as(u64, 0), pipeline.plane_entry.windows_grown);
-    try std.testing.expectEqual(@as(u64, 0), pipeline.steering.static_snapshot_grown_total);
     return out;
 }
 
@@ -6151,9 +6145,11 @@ test "a collider sync that runs out of memory keeps its change and the next step
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     pipeline.static_colliders.allocator = failing.allocator();
     pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
+    pipeline.static_colliders.query_lists.allocator = failing.allocator();
     const failed = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
     pipeline.static_colliders.allocator = std.testing.allocator;
     pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
+    pipeline.static_colliders.query_lists.allocator = std.testing.allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
     try std.testing.expect(!pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
 
@@ -6480,9 +6476,11 @@ test "a collider-sync OOM in a dig step still applies the dig the next step" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     fixture.pipeline.static_colliders.allocator = failing.allocator();
     fixture.pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
+    fixture.pipeline.static_colliders.query_lists.allocator = failing.allocator();
     const failed = fixture.seam();
     fixture.pipeline.static_colliders.allocator = std.testing.allocator;
     fixture.pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
+    fixture.pipeline.static_colliders.query_lists.allocator = std.testing.allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
     try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.static_colliders.rowCount());
     try std.testing.expect(fixture.navBlocked(1, 6, 3));
@@ -6547,7 +6545,7 @@ test "a nav apply OOM keeps the step's dig and static marks and the next step ap
     try fixture.expectNavMatchesRebuild();
 }
 
-test "statics committed within the responder headroom never grow the steering snapshot in-stage" {
+test "statics committed at the seam leave the next step allocation-free" {
     var world = try minimalSyncWorld();
     defer world.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -6589,20 +6587,15 @@ test "statics committed within the responder headroom never grow the steering sn
     try std.testing.expect((try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
     frame.beginStep();
     _ = try pipeline.update(context);
-    const responder_capacity = pipeline.responder_capacity;
-    try std.testing.expectEqual(grownPopulationCapacity(13), responder_capacity);
 
-    // 20 more statics: 21 statics, past any physical slack of a snapshot reserved to
-    // the 1 static seen at the growth, yet 33 responders stay within the capacity.
+    // 20 more statics within the population capacity: the seam syncs them into the rows.
     for (&commands, 0..) |*command, index| command.* = responderTemplate(13 + index, .static);
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
     try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
-    try std.testing.expectEqual(responder_capacity, pipeline.responder_capacity);
-    try std.testing.expectEqual(@as(usize, 21), SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()));
+    try std.testing.expectEqual(@as(usize, 21), pipeline.static_colliders.rowCount());
 
-    // The post-commit reaction invalidated the static snapshot; the rebuild this step
-    // must fit the seam's reservation.
+    // The next step reads the synced rows and allocates nothing on any owner.
     frame.beginStep();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     var swap: TestAllocatorSwap = .{};
@@ -6611,8 +6604,94 @@ test "statics committed within the responder headroom never grow the steering sn
     swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
     _ = try result;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), pipeline.steering.static_snapshot_grown_total);
-    try std.testing.expectEqual(@as(usize, 21), pipeline.steering.obstacleSnapshotSliceConst().min_x.len);
+}
+
+// Writes one navigation intent for `agent` heading +x, runs the steering stage alone, and
+// returns the agent's lateral (y) direction from the stage's last intent for it.
+fn steeringStageLateralForTest(pipeline: *SimulationPipeline, context: SimulationPipelineUpdateContext, agent: EntityId) !f32 {
+    const frame = context.frame;
+    try frame.navigation_intents.prepareRangeCounts(1);
+    frame.navigation_intents.addCount(0, 1);
+    try frame.navigation_intents.prefix();
+    var writer = frame.navigation_intents.rangeWriter(0);
+    writer.write(.{ .entity = agent, .goal = .{ .x = 600, .y = 96 }, .direct_direction_x = 1 });
+    writer.finish();
+    frame.navigation_intents.finishWrite();
+    var step = SimulationPipeline.StepState.init(pipeline, context);
+    try pipeline.runStage(.steering_update, &step);
+    var lateral: ?f32 = null;
+    for (frame.intents.mergedItems()) |intent| {
+        if (intent.movement.entity.eql(agent)) lateral = intent.movement.direction_y;
+    }
+    return lateral orelse error.TestExpectedEqual;
+}
+
+test "a static committed at the seam pushes steering agents on the next step" {
+    // The commit seam's collider sync writes the static rows the steering stage reads,
+    // outside the stage graph. Steering run between the commit and the sync still sees
+    // the box parked; after the sync it pushes away from the box.
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    const agent_position = math.Vec2{ .x = 96, .y = 96 };
+    const agent = try data.createEntity();
+    try data.setMovementBody(agent, .{ .position = agent_position, .previous_position = agent_position, .velocity = .{}, .speed = 32 });
+    try data.setSteeringAgent(agent, .{
+        .agent_radius = 8,
+        .waypoint_tolerance = 4,
+        .avoidance_radius = 48,
+        .avoidance_weight = 1.5,
+        .max_neighbor_samples = 8,
+        .stuck_step_threshold = 3,
+        .replan_cooldown_steps = 4,
+        .unavailable_backoff_steps = 12,
+    });
+    const parked = math.Vec2{ .x = 96, .y = 600 };
+    const box = try data.createEntity();
+    try data.setMovementBody(box, .{ .position = parked, .previous_position = parked, .velocity = .{}, .speed = 0 });
+    try data.setCollisionBounds(box, .{ .size = .{ .x = 20, .y = 20 } });
+    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 640, 640, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 16,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 4, 4, 4, 4, 4 + 16);
+    try frame.reservePathRequests(1, 4);
+    try pipeline.reserve(&frame, 4);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.static_colliders.rowCount());
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 640,
+        .bounds_height = 640,
+        .sim_view = fullWorldSimView(&world),
+    };
+
+    // The commit moves the box just above the agent; the sync has not run yet.
+    frame.beginStep();
+    const beside = math.Vec2{ .x = agent_position.x + 8, .y = agent_position.y - 32 };
+    try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = beside, .previous_position = beside, .velocity = .{}, .speed = 0 } } }});
+    try pipeline.reserveStaticColliders(&frame, &data);
+    _ = try frame.applyStructuralCommands(&data);
+    pipeline.captureStaticColliderChanges(&frame);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try steeringStageLateralForTest(&pipeline, context, agent), 0.001);
+
+    // After the seam's sync, the stage pushes the agent away from the box (+y).
+    try pipeline.syncStaticColliders(&data, null);
+    pipeline.reactToPostCommitSteeringEvents(&frame);
+    try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
 }
 
 const StructuralBurstOutcome = struct {
