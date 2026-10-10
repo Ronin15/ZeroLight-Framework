@@ -264,6 +264,51 @@ pub fn countUnequalU16Scalar(lhs: []const u16, rhs: []const u16) u32 {
     return count;
 }
 
+/// Subtracts one from every value, stopping at zero. Whole registers, then a scalar tail.
+pub fn decrementSaturatingU16(values: []u16) void {
+    const vector_end = values.len - values.len % u16_lane_count;
+    const one: Uint16x8 = @splat(1);
+    var index: usize = 0;
+    while (index < vector_end) : (index += u16_lane_count) {
+        const lanes: Uint16x8 = values[index..][0..u16_lane_count].*;
+        values[index..][0..u16_lane_count].* = lanes -| one;
+    }
+    decrementSaturatingU16Scalar(values[vector_end..]);
+}
+
+/// Scalar form of `decrementSaturatingU16`.
+pub fn decrementSaturatingU16Scalar(values: []u16) void {
+    for (values) |*value| value.* -|= 1;
+}
+
+/// Per-axis lanes of `math.normalizeOrZeroFinite`, equal to it bit for bit in every lane: zero
+/// for a lane whose input, squared length, or ratio is non-finite or whose squared length is
+/// at or below `epsilon`.
+pub fn normalizeOrZeroFinite2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
+    return lengthDirection2Float4(x, y, epsilon).direction;
+}
+
+/// Per-axis lanes of `math.normalizeOrDefaultFinite`, equal to it bit for bit in every lane:
+/// the lane of `default` wherever the scalar form returns its default.
+pub fn normalizeOrDefaultFinite2Float4(x: Float4, y: Float4, epsilon: f32, default: Vec2x4) Vec2x4 {
+    const finite_max = splatFloat4(std.math.floatMax(f32));
+    const len2 = lengthSquared2Float4(x, y);
+    const inputs_valid = finiteAboveEpsilon(x, y, len2, epsilon);
+    const inv = splatFloat4(1) / @sqrt(len2);
+    const normal_x = x * inv;
+    const normal_y = y * inv;
+    const valid = inputs_valid & (@abs(normal_x) <= finite_max) & (@abs(normal_y) <= finite_max);
+    return .{ .x = selectFloat4(valid, normal_x, default.x), .y = selectFloat4(valid, normal_y, default.y) };
+}
+
+// Lanes where the scalar finite forms normalize: `x`, `y`, and the squared length `len2`
+// finite, and `len2` above `epsilon`.
+fn finiteAboveEpsilon(x: Float4, y: Float4, len2: Float4, epsilon: f32) Mask4 {
+    const finite_max = splatFloat4(std.math.floatMax(f32));
+    // `@abs(v) <= floatMax` is false for inf and NaN lanes.
+    return (@abs(x) <= finite_max) & (@abs(y) <= finite_max) & (@abs(len2) <= finite_max) & greaterThanFloat4(len2, splatFloat4(epsilon));
+}
+
 /// Per-lane pair of 2D components (one `Float4` per axis).
 pub const Vec2x4 = struct {
     x: Float4,
@@ -381,10 +426,8 @@ pub const LengthDirection4 = struct {
 /// length and direction of a lane whose input or squared length is non-finite or whose
 /// squared length is at or below `epsilon`.
 pub fn lengthDirection2Float4(x: Float4, y: Float4, epsilon: f32) LengthDirection4 {
-    const finite_max = splatFloat4(std.math.floatMax(f32));
     const len2 = lengthSquared2Float4(x, y);
-    // `@abs(v) <= floatMax` is false for inf and NaN lanes.
-    const valid = (@abs(x) <= finite_max) & (@abs(y) <= finite_max) & (@abs(len2) <= finite_max) & greaterThanFloat4(len2, splatFloat4(epsilon));
+    const valid = finiteAboveEpsilon(x, y, len2, epsilon);
     const len = @sqrt(len2);
     const inv = splatFloat4(1) / len;
     const zero = splatFloat4(0);
@@ -570,6 +613,95 @@ test "countUnequalU16 matches its scalar form over every tail length and random,
     // Overlapping views, as a chain of adjacent cells is compared.
     for (&lhs) |*value| value.* = random.uintLessThan(u16, 2);
     try std.testing.expectEqual(countUnequalU16Scalar(lhs[0..32], lhs[1..33]), countUnequalU16(lhs[0..32], lhs[1..33]));
+}
+
+test "decrementSaturatingU16 matches its scalar form over every tail length, stopping at zero" {
+    var prng = std.Random.DefaultPrng.init(0x0dec_0016);
+    const random = prng.random();
+    var lanes: [33]u16 = undefined;
+    var scalar: [33]u16 = undefined;
+    for (0..lanes.len + 1) |len| {
+        for (lanes[0..len], 0..) |*value, index| {
+            // Zero, one, the maximum, and random values.
+            value.* = switch (index % 4) {
+                0 => 0,
+                1 => 1,
+                2 => std.math.maxInt(u16),
+                else => random.int(u16),
+            };
+        }
+        @memcpy(scalar[0..len], lanes[0..len]);
+        decrementSaturatingU16(lanes[0..len]);
+        decrementSaturatingU16Scalar(scalar[0..len]);
+        try std.testing.expectEqualSlices(u16, scalar[0..len], lanes[0..len]);
+        for (lanes[0..len], 0..) |value, index| {
+            const expected: u16 = switch (index % 4) {
+                0, 1 => 0,
+                2 => std.math.maxInt(u16) - 1,
+                else => value,
+            };
+            try std.testing.expectEqual(expected, value);
+        }
+    }
+}
+
+// Finite, zero, at and just past epsilon, overflowing squares, NaN, and inf lanes; with
+// epsilon 0.25, (0.5, 0) sits exactly at epsilon.
+const finite_normalize_cases = [_][2]f32{
+    .{ 3, 4 },                              .{ -0.75, 12.5 },           .{ 0, 0 },                 .{ -0.0, 0 },
+    .{ 0.5, 0 },                            .{ 0.5001, 0 },             .{ 1e-3, 0 },              .{ 1e-20, -1e-20 },
+    .{ std.math.floatMax(f32), 0 },         .{ 1e20, 1e20 },            .{ std.math.nan(f32), 1 }, .{ 1, std.math.nan(f32) },
+    .{ std.math.inf(f32), 0 },              .{ 0, -std.math.inf(f32) }, .{ 7, -24 },               .{ std.math.floatMin(f32), 0 },
+    .{ std.math.floatTrueMin(f32), 1e-30 }, .{ -1e19, 1e19 },           .{ 0.1, -0.2 },            .{ -0.0, -0.0 },
+};
+
+test "normalizeOrZeroFinite2Float4 matches math.normalizeOrZeroFinite in every lane" {
+    for ([_]f32{ 0, 0.0001, 0.25 }) |epsilon| {
+        var index: usize = 0;
+        while (index < finite_normalize_cases.len) : (index += lane_count) {
+            var xs: [lane_count]f32 = undefined;
+            var ys: [lane_count]f32 = undefined;
+            for (finite_normalize_cases[index..][0..lane_count], &xs, &ys) |case, *x, *y| {
+                x.* = case[0];
+                y.* = case[1];
+            }
+            const lanes = normalizeOrZeroFinite2Float4(loadFloat4(&xs), loadFloat4(&ys), epsilon);
+            const out_x = toFloatArray(lanes.x);
+            const out_y = toFloatArray(lanes.y);
+            for (0..lane_count) |lane| {
+                const expected = math.normalizeOrZeroFinite(xs[lane], ys[lane], epsilon);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(out_x[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(out_y[lane])));
+            }
+        }
+    }
+}
+
+test "normalizeOrDefaultFinite2Float4 matches math.normalizeOrDefaultFinite in every lane" {
+    // Per-lane defaults, one of them NaN, so a wrong lane pick shows.
+    const default_x = float4(0.6, -1, std.math.nan(f32), 0);
+    const default_y = float4(0.8, 0, 2, -1);
+    for ([_]f32{ 0, 0.0001, 0.25 }) |epsilon| {
+        var index: usize = 0;
+        while (index < finite_normalize_cases.len) : (index += lane_count) {
+            var xs: [lane_count]f32 = undefined;
+            var ys: [lane_count]f32 = undefined;
+            for (finite_normalize_cases[index..][0..lane_count], &xs, &ys) |case, *x, *y| {
+                x.* = case[0];
+                y.* = case[1];
+            }
+            const lanes = normalizeOrDefaultFinite2Float4(loadFloat4(&xs), loadFloat4(&ys), epsilon, .{ .x = default_x, .y = default_y });
+            const out_x = toFloatArray(lanes.x);
+            const out_y = toFloatArray(lanes.y);
+            const defaults_x = toFloatArray(default_x);
+            const defaults_y = toFloatArray(default_y);
+            for (0..lane_count) |lane| {
+                const expected = math.normalizeOrDefaultFinite(xs[lane], ys[lane], epsilon, .{ .x = defaults_x[lane], .y = defaults_y[lane] });
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(out_x[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(out_y[lane])));
+            }
+        }
+    }
 }
 
 test "gather and scatter move lanes through sparse indices" {

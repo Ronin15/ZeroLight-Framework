@@ -143,9 +143,22 @@ fn offMainNs(batch: BatchStats) u64 {
     return if (batch.ran_inline) 0 else batch.batch_duration_ns;
 }
 
-// Warms up, settles the adaptive tuners, and times `step(context)` over `steering`'s agents
+// Off-main time of one steering step's stages.
+fn stagesOffMainNs(stats: SteeringStats) u64 {
+    return offMainNs(stats.agents_batch) + offMainNs(stats.select_resolve_batch) + offMainNs(stats.select_claim_batch) + offMainNs(stats.directions_batch) + offMainNs(stats.batch);
+}
+
+// Every steering stage tuner has settled; the claim's counts only when the last step
+// dispatched it (an inline selection never does).
+fn stageTunersSettled(system: *const SteeringSystem, last: SteeringStats) bool {
+    const claim_settled = last.select_claim_batch.item_count == 0 or system.select_claim_tuner.isSettled();
+    return claim_settled and system.adaptive_tuner.isSettled() and system.agents_tuner.isSettled() and
+        system.select_resolve_tuner.isSettled() and system.directions_tuner.isSettled();
+}
+
+// Warms up, settles the stage tuners, and times `step(context)` over `steering`'s agents
 // and statics, with the main thread's share: each iteration minus the off-main time of the
-// steering stage and the colliders' splice stages.
+// steering stages and the colliders' splice stages.
 fn measureCase(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -161,6 +174,10 @@ fn measureCase(
     try system.reserve(steering.agents.items.len);
     if (suite.adaptiveTunerForCase(case, steering_range_alignment_items)) |tuner| {
         system.adaptive_tuner = tuner;
+        system.agents_tuner = tuner;
+        system.select_resolve_tuner = tuner;
+        system.directions_tuner = tuner;
+        system.select_claim_tuner = suite.adaptiveTunerForCase(case, 1).?;
     }
 
     var threads: ?ThreadSystem = null;
@@ -173,27 +190,27 @@ fn measureCase(
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
+    var last_stats = SteeringStats{};
     for (0..options.warmup_iterations) |_| {
-        _ = try step(&system, context, thread_ptr, case);
+        last_stats = try step(&system, context, thread_ptr, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try step(&system, context, thread_ptr, case);
+        while (!stageTunersSettled(&system, last_stats) and settle_guard < settle_limit) : (settle_guard += 1) {
+            last_stats = try step(&system, context, thread_ptr, case);
         }
     }
-    const settled_before_measurement = if (case.adaptive) system.adaptive_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system, last_stats) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
-    var last_stats = SteeringStats{};
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         last_stats = try step(&system, context, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        const off_main_ns = offMainNs(last_stats.batch) + offMainNs(steering.colliders.last_splice_batch) + offMainNs(steering.colliders.last_query_splice_batch);
+        const off_main_ns = stagesOffMainNs(last_stats) + offMainNs(steering.colliders.last_splice_batch) + offMainNs(steering.colliders.last_query_splice_batch);
         main_total += elapsed_ns -| off_main_ns;
         accumulator.record(elapsed_ns, last_stats.batch);
     }
@@ -202,6 +219,12 @@ fn measureCase(
     if (stats.iterations > 0) stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
     stats.output_count = last_stats.movement_intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(BatchStats{});
+    stats.steering_stages = .{
+        .agents = suite.batchSummaryFromBatch(last_stats.agents_batch),
+        .select_resolve = suite.batchSummaryFromBatch(last_stats.select_resolve_batch),
+        .select_claim = suite.batchSummaryFromBatch(last_stats.select_claim_batch),
+        .directions = suite.batchSummaryFromBatch(last_stats.directions_batch),
+    };
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
     }
@@ -217,7 +240,7 @@ fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSy
 fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     try appendNavigationIntents(&fixture.frame, fixture.agents.items);
     if (!case.usesThreadSystem()) {
-        return try system.updateSerial(&fixture.data, &fixture.frame, &fixture.pathfinding, &fixture.colliders, .{});
+        return try system.updateSerial(&fixture.data, &fixture.frame, &fixture.pathfinding, &fixture.colliders);
     }
     return try system.update(&fixture.data, &fixture.frame, thread_system.?, &fixture.pathfinding, &fixture.colliders, .{
         .items_per_range = benchmarkItemsPerRange(case),

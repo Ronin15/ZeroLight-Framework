@@ -198,8 +198,9 @@ pub const Timing = enum {
     pathfinding_group_service,
     pathfinding_solve,
     pathfinding_publish,
-    // Steering prepareUpdate breakdown (main-thread setup before the avoidance
-    // batch). Compare against batch steering avg_ms to isolate serial overhead.
+    // Steering prepare stages before the avoidance batch: wall time of selection, of the
+    // agents stage with its rekey and the agent grid, and of directions, each inline or
+    // dispatched to workers.
     steering_select,
     steering_snapshot,
     steering_directions,

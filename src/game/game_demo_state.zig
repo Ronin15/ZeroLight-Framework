@@ -405,7 +405,6 @@ pub const GameDemoState = struct {
         }, world_render_overscan_chunks, player.current_level);
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
-        try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
         // Multi-producer sensory bus (dig, footstep, promoted impacts): warm to the
         // fixed live ceiling so optional emitters stay allocation-free after init.
         try simulation_frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
@@ -443,6 +442,7 @@ pub const GameDemoState = struct {
         // seam stays allocation-free on churn frames. The event value capacity and
         // limit are set by `pipeline.reserve` below.
         try simulation_frame.reserveStreams(pipeline.eventCapacitySum(), 0, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.intent_capacity + pipeline.structuralCommandHeadroom());
+        try simulation_frame.reservePathRequests(pipeline.eventCapacitySum(), pop_cap.mover_count);
         // Raises `frame.events.capacity_limit` to the exhaustive producer sum.
         try pipeline.reserve(&simulation_frame, pop_cap.intent_capacity);
 
@@ -2150,7 +2150,7 @@ fn lateralSteeringOnceForTest(pipeline: *SimulationPipeline, frame: *SimulationF
     writer.write(.{ .entity = agent, .goal = goal, .direct_direction_x = 1 });
     writer.finish();
     frame.navigation_intents.finishWrite();
-    _ = try pipeline.steering.updateSerial(data, frame, &pipeline.pathfinding, &pipeline.static_colliders, .{});
+    _ = try pipeline.steering.updateSerial(data, frame, &pipeline.pathfinding, &pipeline.static_colliders);
     for (frame.intents.mergedItems()) |intent| {
         if (intent.movement.entity.eql(agent)) return intent.movement.direction_y;
     }

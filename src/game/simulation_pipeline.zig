@@ -962,7 +962,7 @@ pub const SimulationPipeline = struct {
             try frame.navigation_intents.reserve(range_count, body);
             try frame.intents.reserve(range_count, body);
             try frame.structural_commands.reserve(range_count, body + self.structuralCommandHeadroom());
-            try frame.reservePathRequests(1, body);
+            try frame.reservePathRequests(range_count, body);
             // Raises the event limit, re-runs the cognition reserves and the contact
             // streams + response reserves to the grown pair bound (and every other
             // reserve attached to `reserve`).
@@ -5462,6 +5462,10 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.ai.separation_tuner,
         &pipeline.ai.intent_tuner,
         &pipeline.steering.adaptive_tuner,
+        &pipeline.steering.agents_tuner,
+        &pipeline.steering.select_resolve_tuner,
+        &pipeline.steering.select_claim_tuner,
+        &pipeline.steering.directions_tuner,
         &pipeline.pathfinding.fallback_tuner,
         &pipeline.pathfinding.nav_remask_tuner,
         &pipeline.pathfinding.nav_patch_tuner,

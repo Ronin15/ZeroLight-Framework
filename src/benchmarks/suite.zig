@@ -193,6 +193,8 @@ pub const RunStats = struct {
     // Static-collider groups: the chunk lists' and the query lists' splice stages.
     splice_batch: ?BatchSummary = null,
     query_splice_batch: ?BatchSummary = null,
+    // Steering groups: the prepare stages ahead of the avoidance pass (`batch`).
+    steering_stages: ?SteeringStageSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
@@ -256,6 +258,14 @@ pub const RenderPrepPhaseSummary = struct {
     snapshot_ns: u64 = 0,
     vertex_emit_ns: u64 = 0,
     draw_group_ns: u64 = 0,
+};
+
+/// Steering's prepare stage batches, in stage order.
+pub const SteeringStageSummary = struct {
+    agents: BatchSummary = .{},
+    select_resolve: BatchSummary = .{},
+    select_claim: BatchSummary = .{},
+    directions: BatchSummary = .{},
 };
 
 /// Mean per-iteration time of a batched terrain edit's plan and write stages, its nav
@@ -1201,33 +1211,36 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     }
     if (std.mem.eql(u8, group_name, "steering-static-dense")) {
         var steer_buffer: [32]u8 = undefined;
+        var stage_buffer: [160]u8 = undefined;
         const visits_per_agent_tenths = if (stats.output_count == 0) 0 else stats.candidate_pairs * 10 / stats.output_count;
         const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
         const main_percent = if (stats.mean_ns == 0) 0 else main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "obstacle_visits={} ({}.{}/agent) obstacle_samples={} intents={} steer={s} main={f} ({}%)",
-            .{ stats.candidate_pairs, visits_per_agent_tenths / 10, visits_per_agent_tenths % 10, stats.sample_count, stats.output_count, formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
+            "obstacle_visits={} ({}.{}/agent) obstacle_samples={} intents={} {s} steer={s} main={f} ({}%)",
+            .{ stats.candidate_pairs, visits_per_agent_tenths / 10, visits_per_agent_tenths % 10, stats.sample_count, stats.output_count, formatSteeringStagesInto(&stage_buffer, stats), formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "steering-static-change")) {
         var steer_buffer: [32]u8 = undefined;
+        var stage_buffer: [160]u8 = undefined;
         const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
         const main_percent = if (stats.mean_ns == 0) 0 else main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "obstacle_checks={} obstacle_samples={} steer={s} main={f} ({}%)",
-            .{ stats.candidate_pairs, stats.sample_count, formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
+            "obstacle_checks={} obstacle_samples={} {s} steer={s} main={f} ({}%)",
+            .{ stats.candidate_pairs, stats.sample_count, formatSteeringStagesInto(&stage_buffer, stats), formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "steering")) {
         var steer_buffer: [32]u8 = undefined;
+        var stage_buffer: [160]u8 = undefined;
         const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
         const main_percent = if (stats.mean_ns == 0) 0 else main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "avoidance_checks={} samples={} intents={} steer={s} main={f} ({}%)",
-            .{ stats.candidate_pairs, stats.sample_count, stats.output_count, formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
+            "avoidance_checks={} samples={} intents={} {s} steer={s} main={f} ({}%)",
+            .{ stats.candidate_pairs, stats.sample_count, stats.output_count, formatSteeringStagesInto(&stage_buffer, stats), formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) {
@@ -1337,6 +1350,28 @@ fn formatNavStagesInto(buffer: []u8, stats: RunStats) []const u8 {
         return std.fmt.bufPrint(buffer, "mark={s} plan={s} remask={s} patch={s}", .{ formatStageShapeInto(&mark_buffer, mark), plan, remask, patch }) catch "stages";
     }
     return std.fmt.bufPrint(buffer, "plan={s} remask={s} patch={s}", .{ plan, remask, patch }) catch "stages";
+}
+
+// Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the
+// claim after selection's inline single pass).
+fn formatSteeringStagesInto(buffer: []u8, stats: RunStats) []const u8 {
+    const stages = stats.steering_stages orelse SteeringStageSummary{};
+    var agents_buffer: [32]u8 = undefined;
+    var resolve_buffer: [32]u8 = undefined;
+    var claim_buffer: [32]u8 = undefined;
+    var directions_buffer: [32]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "agents={s} resolve={s} claim={s} dir={s}", .{
+        formatRunStageShapeInto(&agents_buffer, stages.agents),
+        formatRunStageShapeInto(&resolve_buffer, stages.select_resolve),
+        formatRunStageShapeInto(&claim_buffer, stages.select_claim),
+        formatRunStageShapeInto(&directions_buffer, stages.directions),
+    }) catch "stages";
+}
+
+// A stage's batch shape, or `-` when it covered no items.
+fn formatRunStageShapeInto(buffer: []u8, batch: BatchSummary) []const u8 {
+    if (batch.item_count == 0) return "-";
+    return formatStageShapeInto(buffer, batch);
 }
 
 // A stage's batch shape as `inline` or workers/ranges.
@@ -1708,6 +1743,18 @@ test "benchmark table formatters keep compact text" {
             .cache_evictions = 1,
         }),
     );
+}
+
+test "steering stage label tells a stage that did not run from an inline one" {
+    var buffer: [160]u8 = undefined;
+    // Selection ran its inline single pass: the claim never ran.
+    try std.testing.expectEqualStrings("agents=2w/4r resolve=inline claim=- dir=2w/3r", formatSteeringStagesInto(&buffer, .{
+        .steering_stages = .{
+            .agents = .{ .item_count = 64, .range_count = 4, .active_worker_threads = 2, .ran_inline = false },
+            .select_resolve = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
+            .directions = .{ .item_count = 48, .range_count = 3, .active_worker_threads = 2, .ran_inline = false },
+        },
+    }));
 }
 
 test "benchmark skipped status keeps skip reason visible" {
