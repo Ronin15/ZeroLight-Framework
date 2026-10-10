@@ -1241,14 +1241,17 @@ pub const SimulationPipeline = struct {
 
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        // The dig is planned and its world growth (tile storage, a ramp's link)
-        // reserved once, before the promote, so an OOM fails the stage with the
-        // deferred impacts still queued; the promote writes no world state.
+        // The dig is planned and its world growth (tile storage, a ramp's exit
+        // clear and link) reserved once, before the promote, so an OOM fails the
+        // stage with the deferred impacts still queued; the promote writes no world
+        // state.
         const dig_edit = try self.dig.reserveWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
-        // Player-authored world edit. Its world_tile_changed event is deferred and
-        // re-masks navigation in merge_outputs regardless of order.
+        // Player-authored world edit, plus a ramp's exit cleared walkable on the
+        // level above. Its world_tile_changed event (and the exit's
+        // world_obstacle_changed) is deferred and re-masks navigation in
+        // merge_outputs regardless of order.
         if (dig_edit) |edit| try DigController.commitWorldEdit(context.world, edit, context.frame);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
@@ -1876,9 +1879,9 @@ test "eventCapacitySum equals capacity_limit after reserve" {
     try frame.reserveStreams(4, 0, 4, 4, 4, 4);
     try pipeline.reserve(&frame, 8);
 
-    // dig 1 + perception 0 + affect 0 (no AiPerception/AiAffect rows) + plane (8 + 1) +
+    // dig 2 + perception 0 + affect 0 (no AiPerception/AiAffect rows) + plane (8 + 1) +
     // action_react 64 + structural (pipeline destructible 64 + caller 4) + nav 1.
-    try std.testing.expectEqual(@as(usize, 143), pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(usize, 144), pipeline.eventCapacitySum());
     try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
 }
 

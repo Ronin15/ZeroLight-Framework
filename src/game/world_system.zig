@@ -217,7 +217,8 @@ const SparseDepthRange = struct {
 // The sparse tiles the render window draws: those on the window's levels inside
 // its tile bounds, ordered by (depth, cell, tile id), with one range per distinct
 // depth. Rebuilt by the window update when the window moves or `dirty` is set
-// (a tile added inside the current window); render-only.
+// (a tile added or removed inside the current window, or a removal that moved a
+// row the list holds); render-only.
 const SparseWindow = struct {
     tiles: std.ArrayList(u32) = .empty,
     ranges: std.ArrayList(SparseDepthRange) = .empty,
@@ -468,6 +469,10 @@ const SparseTileRow = struct {
     tile_id: TileId,
     depth_value: i32,
     flags: TileFlags,
+    // The row's position in its level list (`sparse_level_tiles`) and its chunk list
+    // (`sparse_level_chunk_tiles`), so a removal fixes both lists in O(1).
+    level_pos: u32,
+    chunk_pos: u32,
 };
 
 pub const WorldSystem = struct {
@@ -541,12 +546,12 @@ pub const WorldSystem = struct {
     sparse_tiles: std.MultiArrayList(SparseTileRow) = .{},
 
     // Reverse per-level index over `sparse_tiles`: one growable list of indices
-    // per level, indexed by level. Maintained eagerly (appended to) inside
-    // `addSparseTile` — the sole sparse-tile inserter, which never removes a
-    // tile and never changes a tile's level after insertion — so this needs no
-    // dirty flag or deferred rebuild. That matters because gameplay consumers
-    // (nav rebuild after a dig) read it within the same fixed-step tick a tile
-    // is placed, well before the next render window update would run; a
+    // per level, indexed by level, in no order. Maintained eagerly by
+    // `addSparseTile` (the sole inserter, which never changes a tile's level after
+    // insertion) and `removeSparseTile` (a swap-remove through the row's stored
+    // positions), so this needs no dirty flag or deferred rebuild. That matters
+    // because gameplay consumers (nav rebuild after a dig) read it within the same
+    // fixed-step tick a tile is placed, well before the next render window update would run; a
     // lazily-rebuilt index keyed off a render dirty flag would be stale for
     // them. A future bulk sparse-tile insert path must maintain this the same
     // way. Lets per-level consumers walk only one level's tiles instead of
@@ -559,8 +564,7 @@ pub const WorldSystem = struct {
     // Finer sibling of sparse_level_tiles: outer by level_index, middle by the
     // level-local chunk index (chunkY*chunksX+chunkX, see
     // `localChunkIndexForCell`), inner the sparse_tiles indices in that chunk.
-    // Same eager-maintenance contract as sparse_level_tiles (see above) —
-    // maintained by `addSparseTile` only, never removed from or resorted.
+    // Same eager-maintenance contract as sparse_level_tiles (see above).
     sparse_level_chunk_tiles: std.ArrayList(std.ArrayList(std.ArrayList(u32))) = .empty,
 
     sparse_window: SparseWindow = .{},
@@ -1871,7 +1875,8 @@ pub const WorldSystem = struct {
         return self.dense_layers.items(.level_index)[layer_index];
     }
 
-    /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index.
+    /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index. A
+    /// sparse index is valid only until the next sparse tile removal.
     pub fn sparseTileCellCoord(self: *const WorldSystem, index: usize) CellCoord {
         const cell = self.sparse_tiles.items(.cell_index)[index];
         return .{
@@ -1885,6 +1890,8 @@ pub const WorldSystem = struct {
     /// has no sparse tiles yet — callers do not need to distinguish the two.
     /// Backed by `sparse_level_tiles`, maintained eagerly by `addSparseTile` (see
     /// that field's doc comment), so this is always current with no rebuild step.
+    /// The slice and its indices are valid only until the next sparse tile add or
+    /// removal.
     pub fn sparseTileIndicesForLevel(self: *const WorldSystem, level_index: u16) []const u32 {
         if (level_index >= self.sparse_level_tiles.items.len) return &.{};
         return self.sparse_level_tiles.items[level_index].items;
@@ -1898,7 +1905,8 @@ pub const WorldSystem = struct {
     /// `sparse_level_tiles` (see that field's comment) so this is always
     /// current with no rebuild step. Finer-grained than
     /// `sparseTileIndicesForLevel` for consumers that only need one chunk's
-    /// worth of sparse tiles.
+    /// worth of sparse tiles. The slice and its indices are valid only until the
+    /// next sparse tile add or removal.
     pub fn sparseTileIndicesForChunk(self: *const WorldSystem, level_index: u16, chunk_index: u32) []const u32 {
         return chunkSparseTiles(self.sparse_level_chunk_tiles.items, level_index, chunk_index);
     }
@@ -2003,19 +2011,71 @@ pub const WorldSystem = struct {
     pub fn rampLinkOtherLevel(self: *const WorldSystem, level_index: u16, cell: CellCoord) ?u16 {
         if (@as(usize, level_index) >= self.level_terrain.items.len) return null;
         if (cell.x >= self.width or cell.y >= self.height) return null;
-        const heads = self.level_terrain.items[level_index].link_heads;
-        const links = self.level_links.items;
-        var oldest: u32 = no_link_endpoint;
-        var endpoint = heads[self.chunkGeometry().chunkOf(cell.x, cell.y)];
-        while (endpoint != no_link_endpoint) : (endpoint = self.link_endpoint_next.items[endpoint]) {
-            const link = links[endpoint / 2];
-            if (link.kind != .ramp) continue;
-            const end_cell = if (endpoint % 2 == 0) link.cell_a else link.cell_b;
-            if (end_cell.x == cell.x and end_cell.y == cell.y) oldest = @min(oldest, endpoint);
+        var endpoints = self.levelChunkLinkEndpoints(level_index, self.chunkGeometry().chunkOf(cell.x, cell.y));
+        // Newest first, so the last match is the oldest.
+        var oldest: ?u16 = null;
+        while (endpoints.next()) |endpoint| {
+            if (endpoint.kind != .ramp) continue;
+            if (endpoint.cell.x == cell.x and endpoint.cell.y == cell.y) oldest = endpoint.other_level;
         }
-        if (oldest == no_link_endpoint) return null;
-        const link = links[oldest / 2];
-        return if (oldest % 2 == 0) link.level_b else link.level_a;
+        return oldest;
+    }
+
+    /// Which end of a `LevelLink` an endpoint is.
+    pub const LinkSide = enum { a, b };
+
+    /// One link endpoint in a (level, chunk): the link's row in `levelLinks()`, the
+    /// end that lies here, and the link's other end.
+    pub const LinkEndpoint = struct {
+        link: u32,
+        side: LinkSide,
+        kind: LevelLinkKind,
+        cell: CellCoord,
+        other_level: u16,
+        other_cell: CellCoord,
+        traversal_cost: u32,
+        bidirectional: bool,
+    };
+
+    /// Walks one (level, chunk)'s link endpoints, newest first. Valid until the next
+    /// link add.
+    pub const LinkEndpointIterator = struct {
+        links: []const LevelLink,
+        next_endpoints: []const u32,
+        endpoint: u32,
+
+        pub fn next(self: *LinkEndpointIterator) ?LinkEndpoint {
+            if (self.endpoint == no_link_endpoint) return null;
+            const endpoint = self.endpoint;
+            self.endpoint = self.next_endpoints[endpoint];
+            const link = self.links[endpoint / 2];
+            const at_a = endpoint % 2 == 0;
+            return .{
+                .link = endpoint / 2,
+                .side = if (at_a) .a else .b,
+                .kind = link.kind,
+                .cell = if (at_a) link.cell_a else link.cell_b,
+                .other_level = if (at_a) link.level_b else link.level_a,
+                .other_cell = if (at_a) link.cell_b else link.cell_a,
+                .traversal_cost = link.traversal_cost,
+                .bidirectional = link.bidirectional,
+            };
+        }
+    };
+
+    /// The link endpoints in `chunk` (level-local, `chunkY * chunksX + chunkX`) on
+    /// `level_index`, newest first; empty for an invalid level or chunk. O(1) to
+    /// create, O(1) per endpoint.
+    pub fn levelChunkLinkEndpoints(self: *const WorldSystem, level_index: u16, chunk: u32) LinkEndpointIterator {
+        var endpoints = LinkEndpointIterator{
+            .links = self.level_links.items,
+            .next_endpoints = self.link_endpoint_next.items,
+            .endpoint = no_link_endpoint,
+        };
+        if (@as(usize, level_index) >= self.level_terrain.items.len) return endpoints;
+        const heads = self.level_terrain.items[level_index].link_heads;
+        if (chunk < heads.len) endpoints.endpoint = heads[chunk];
+        return endpoints;
     }
 
     /// Per-level composed navigability: whether any dense band on the level or any
@@ -2099,11 +2159,13 @@ pub const WorldSystem = struct {
         return self.sparse_tiles.len;
     }
 
+    /// A sparse index is valid only until the next sparse tile removal.
     pub fn sparseTileBlocksMovement(self: *const WorldSystem, index: usize) bool {
         if (index >= self.sparse_tiles.len) return false;
         return self.sparse_tiles.items(.flags)[index].blocks_movement;
     }
 
+    /// A sparse index is valid only until the next sparse tile removal.
     pub fn sparseTileRect(self: *const WorldSystem, index: usize) ?Rect {
         if (index >= self.sparse_tiles.len) return null;
         const cell = self.sparse_tiles.items(.cell_index)[index];
@@ -2299,12 +2361,17 @@ pub const WorldSystem = struct {
         }
 
         const new_index: u32 = @intCast(self.sparse_tiles.len);
+        // Each list holds at most every row, so its positions fit u32 like the index.
+        const level_pos: u32 = @intCast(self.sparse_level_tiles.items[level_index].items.len);
+        const chunk_pos: u32 = @intCast(self.sparse_level_chunk_tiles.items[level_index].items[local_chunk_index].items.len);
         self.sparse_tiles.appendAssumeCapacity(.{
             .level_index = level_index,
             .cell_index = cell,
             .tile_id = tile_id,
             .depth_value = world_z,
             .flags = flags,
+            .level_pos = level_pos,
+            .chunk_pos = chunk_pos,
         });
         self.commitSparseLevelIndexEntry(level_index, new_index);
         self.commitSparseChunkIndexEntry(level_index, local_chunk_index, new_index);
@@ -2319,6 +2386,160 @@ pub const WorldSystem = struct {
             .max_x_exclusive = @min(self.width, x +| 1),
             .max_y_exclusive = @min(self.height, y +| 1),
         };
+    }
+
+    /// Reserves what `clearCellBlocking(level_index, x, y, floor_tile)` writes, in the
+    /// current reserve scope (`beginDenseCellWriteReserve`): a tile block for each
+    /// band whose blocking tile sits in a uniform chunk, and the composed-bits slot
+    /// when the cell is blocked in a uniform chunk. Reads are unchanged; an OOM
+    /// leaves the world's contents as they were. O(bands + sparse tiles in the chunk),
+    /// plus a one-time O(edge²) block per band and pool growth.
+    pub fn reserveClearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y: u16, floor_tile: TileId) !void {
+        try self.validateLevelIndex(level_index);
+        if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
+        try self.validateTileId(floor_tile);
+        // A blocking floor tile would leave the cell blocked.
+        if (self.flagsFor(floor_tile).blocks_movement) return error.InvalidWorldTile;
+        if (!self.cellComposedBlocked(level_index, x, y)) return;
+
+        const geom = self.chunkGeometry();
+        const chunk = geom.chunkOf(x, y);
+        const stores = self.dense_layers.items(.store);
+        const floor_layer = self.denseFloorLayerForLevel(level_index);
+        const terrain = &self.level_terrain.items[level_index];
+        var block_count: usize = 0;
+        for (terrain.bandLayers()) |layer| {
+            if (!self.flagsFor(stores[layer].tile(geom, x, y)).blocks_movement) continue;
+            block_count += @intFromBool(stores[layer].writeNeedsBlock(chunk, clearedBandTile(layer, floor_layer, floor_tile)));
+        }
+        const needs_slot = terrain.blocked.setNeedsSlot(chunk, geom.localOf(x, y), false);
+
+        // Fallible growth first; each materialized chunk is recorded for the scope.
+        try self.dense_reserved_chunks.ensureUnusedCapacity(self.allocator, block_count + @intFromBool(needs_slot));
+        for (terrain.bandLayers()) |layer| {
+            if (!self.flagsFor(stores[layer].tile(geom, x, y)).blocks_movement) continue;
+            if (!stores[layer].writeNeedsBlock(chunk, clearedBandTile(layer, floor_layer, floor_tile))) continue;
+            try self.ensureDenseBlocks(&stores[layer], geom.blockCells(), 1);
+            stores[layer].materializeChunk(geom.blockCells(), chunk);
+            self.dense_reserved_chunks.appendAssumeCapacity(.{ .kind = .dense_block, .owner = layer, .chunk = chunk });
+        }
+        if (needs_slot) {
+            try self.ensureBlockedSlots(&terrain.blocked, 1);
+            terrain.blocked.materializeChunk(geom, chunk);
+            self.dense_reserved_chunks.appendAssumeCapacity(.{ .kind = .blocked_slot, .owner = level_index, .chunk = chunk });
+        }
+    }
+
+    /// Makes one cell walkable: each band whose tile blocks movement is cleared (the
+    /// level's floor band to the non-blocking `floor_tile`, any other band to empty)
+    /// and each blocking sparse tile in the cell is removed; non-blocking content, an
+    /// empty floor included, stays. Returns a 1x1 obstacle event when anything
+    /// changed, else null. Reserves first, so an OOM changes nothing; allocation-free
+    /// after `reserveClearCellBlocking` for this cell. O(bands + sparse tiles in the
+    /// chunk).
+    pub fn clearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y: u16, floor_tile: TileId) !?WorldObstacleChangedEvent {
+        try self.reserveClearCellBlocking(level_index, x, y, floor_tile);
+        const geom = self.chunkGeometry();
+        const chunk = geom.chunkOf(x, y);
+        const rows = self.dense_layers.slice();
+        const stores = rows.items(.store);
+        const gpu_slots = rows.items(.gpu_slot);
+        const render_changed = rows.items(.render_changed);
+        const floor_layer = self.denseFloorLayerForLevel(level_index);
+        var changed = false;
+        for (self.level_terrain.items[level_index].bandLayers()) |layer| {
+            if (!self.flagsFor(stores[layer].tile(geom, x, y)).blocks_movement) continue;
+            stores[layer].write(geom, chunk, geom.localOf(x, y), clearedBandTile(layer, floor_layer, floor_tile));
+            self.markRenderChanged(gpu_slots, render_changed, layer);
+            changed = true;
+        }
+
+        // Backwards, so each swap-remove moves into the visited position only an
+        // entry already visited.
+        const cell = self.cellIndex(x, y);
+        const sparse_cells = self.sparse_tiles.items(.cell_index);
+        const sparse_flags = self.sparse_tiles.items(.flags);
+        var position = self.sparseTileIndicesForChunk(level_index, chunk).len;
+        while (position > 0) {
+            position -= 1;
+            const sparse_index = self.sparseTileIndicesForChunk(level_index, chunk)[position];
+            if (sparse_cells[sparse_index] != cell or !sparse_flags[sparse_index].blocks_movement) continue;
+            self.removeSparseTile(sparse_index);
+            changed = true;
+        }
+        if (!changed) return null;
+
+        const composed = self.cellComposedBlocked(level_index, x, y);
+        std.debug.assert(!composed);
+        self.level_terrain.items[level_index].blocked.set(geom, chunk, geom.localOf(x, y), composed);
+        return .{
+            .level = level_index,
+            .min_x = x,
+            .min_y = y,
+            .max_x_exclusive = x + 1,
+            .max_y_exclusive = y + 1,
+        };
+    }
+
+    // The tile a cleared blocking band takes: the floor tile on the floor band,
+    // empty on any other band.
+    fn clearedBandTile(layer: u32, floor_layer: ?usize, floor_tile: TileId) TileId {
+        const floor = floor_layer orelse return invalid_tile_id;
+        return if (floor == layer) floor_tile else invalid_tile_id;
+    }
+
+    // Removes sparse row `index` from its level list, its chunk list, and the rows,
+    // each by swap-remove: the entry moved into a freed list position, and the last
+    // row's two entries, are repointed through the rows' stored positions. The window
+    // list rebuilds at the next window update when it may hold the removed or the
+    // moved row. The caller recomposes the cell's blocked bit. O(1), allocation-free.
+    fn removeSparseTile(self: *WorldSystem, index: u32) void {
+        const geom = self.chunkGeometry();
+        const rows = self.sparse_tiles.slice();
+        const levels = rows.items(.level_index);
+        const cells = rows.items(.cell_index);
+        const level_positions = rows.items(.level_pos);
+        const chunk_positions = rows.items(.chunk_pos);
+        const last: u32 = @intCast(self.sparse_tiles.len - 1);
+
+        const level = levels[index];
+        const coord = self.cellCoordOf(cells[index]);
+        const level_list = &self.sparse_level_tiles.items[level];
+        const level_pos = level_positions[index];
+        std.debug.assert(level_list.items[level_pos] == index);
+        _ = level_list.swapRemove(level_pos);
+        if (level_pos < level_list.items.len) level_positions[level_list.items[level_pos]] = level_pos;
+        const chunk_list = &self.sparse_level_chunk_tiles.items[level].items[geom.chunkOf(coord.x, coord.y)];
+        const chunk_pos = chunk_positions[index];
+        std.debug.assert(chunk_list.items[chunk_pos] == index);
+        _ = chunk_list.swapRemove(chunk_pos);
+        if (chunk_pos < chunk_list.items.len) chunk_positions[chunk_list.items[chunk_pos]] = chunk_pos;
+        if (self.sparseTileInWindow(level, coord.x, coord.y)) self.sparse_window.dirty = true;
+
+        if (index != last) {
+            const moved_level = levels[last];
+            const moved = self.cellCoordOf(cells[last]);
+            self.sparse_level_tiles.items[moved_level].items[level_positions[last]] = index;
+            self.sparse_level_chunk_tiles.items[moved_level].items[geom.chunkOf(moved.x, moved.y)].items[chunk_positions[last]] = index;
+            if (self.sparseTileInWindow(moved_level, moved.x, moved.y)) self.sparse_window.dirty = true;
+        }
+        self.sparse_tiles.swapRemove(index);
+    }
+
+    // The cell's composed movement-blocked bit from its bands and sparse tiles as
+    // they stand. O(bands + sparse tiles in the chunk).
+    fn cellComposedBlocked(self: *const WorldSystem, level: u16, x: u16, y: u16) bool {
+        const geom = self.chunkGeometry();
+        const stores = self.dense_layers.items(.store);
+        for (self.level_terrain.items[level].bandLayers()) |layer| {
+            if (self.flagsFor(stores[layer].tile(geom, x, y)).blocks_movement) return true;
+        }
+        return self.sparseBlocksCell(level, geom.chunkOf(x, y), self.cellIndex(x, y));
+    }
+
+    // Tile-cell coordinate of a cell index (below width * height, so both fit u16).
+    fn cellCoordOf(self: *const WorldSystem, cell: u32) CellCoord {
+        return .{ .x = @intCast(cell % self.width), .y = @intCast(cell / self.width) };
     }
 
     fn submitTile(
@@ -4431,6 +4652,300 @@ test "addSparseTile reserves sparse_tiles, sparse_level_tiles, and sparse_level_
     }
 }
 
+// Every sparse row is listed exactly once in its level list and once in its chunk
+// list, at its stored positions, and the lists list nothing else.
+fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
+    const rows = world.sparse_tiles.slice();
+    const geom = world.chunkGeometry();
+    var level_total: usize = 0;
+    for (world.sparse_level_tiles.items, 0..) |list, level| {
+        level_total += list.items.len;
+        for (list.items, 0..) |row, position| {
+            try std.testing.expect(row < rows.len);
+            try std.testing.expectEqual(level, rows.items(.level_index)[row]);
+            try std.testing.expectEqual(position, rows.items(.level_pos)[row]);
+        }
+    }
+    try std.testing.expectEqual(rows.len, level_total);
+    var chunk_total: usize = 0;
+    for (world.sparse_level_chunk_tiles.items, 0..) |level_chunks, level| {
+        for (level_chunks.items, 0..) |list, chunk| {
+            chunk_total += list.items.len;
+            for (list.items, 0..) |row, position| {
+                try std.testing.expect(row < rows.len);
+                try std.testing.expectEqual(level, rows.items(.level_index)[row]);
+                const coord = world.sparseTileCellCoord(row);
+                try std.testing.expectEqual(chunk, geom.chunkOf(coord.x, coord.y));
+                try std.testing.expectEqual(position, rows.items(.chunk_pos)[row]);
+            }
+        }
+    }
+    try std.testing.expectEqual(rows.len, chunk_total);
+}
+
+// The sparse rows as sorted (level, cell, tile id) keys, into `out`.
+const TestSparseRowKey = struct { level: u16, cell: u32, tile_id: TileId };
+
+fn testSparseRowKeys(world: *const WorldSystem, out: []TestSparseRowKey) []TestSparseRowKey {
+    const rows = world.sparse_tiles.slice();
+    for (out[0..rows.len], 0..) |*key, row| key.* = .{
+        .level = rows.items(.level_index)[row],
+        .cell = rows.items(.cell_index)[row],
+        .tile_id = rows.items(.tile_id)[row],
+    };
+    std.mem.sort(TestSparseRowKey, out[0..rows.len], {}, testSparseRowKeyLessThan);
+    return out[0..rows.len];
+}
+
+fn testSparseRowKeyLessThan(_: void, lhs: TestSparseRowKey, rhs: TestSparseRowKey) bool {
+    if (lhs.level != rhs.level) return lhs.level < rhs.level;
+    if (lhs.cell != rhs.cell) return lhs.cell < rhs.cell;
+    return lhs.tile_id < rhs.tile_id;
+}
+
+// An 8x8 world in 4-tile chunks with `level_count` levels that have no bands.
+fn testSparseRemovalWorld(meta: *const WorldTilesetMeta, level_count: u16) !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    errdefer world.deinit();
+    try world.buildCatalog(meta);
+    for (0..level_count) |level_index| _ = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+    return world;
+}
+
+test "removing sparse tiles at the first, middle, last, and sole list positions keeps every index consistent" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseRemovalWorld(&meta, 2);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    const tunnel = try world.requireTileByName(&meta, "cave_0");
+
+    // Level 0 chunk 0 holds five tiles, chunk 1 one; level 1 holds two in chunk 0 and
+    // one in chunk 3. One blocking tile per cell, so clearing a cell removes one row.
+    const placements = [_]struct { level: u16, x: u16, y: u16 }{
+        .{ .level = 0, .x = 0, .y = 0 }, .{ .level = 1, .x = 0, .y = 1 }, .{ .level = 0, .x = 1, .y = 0 },
+        .{ .level = 0, .x = 2, .y = 0 }, .{ .level = 0, .x = 5, .y = 0 }, .{ .level = 1, .x = 1, .y = 1 },
+        .{ .level = 0, .x = 3, .y = 0 }, .{ .level = 1, .x = 5, .y = 5 }, .{ .level = 0, .x = 3, .y = 3 },
+    };
+    for (placements) |placement| _ = try world.addSparseTile(placement.level, placement.x, placement.y, deco, 0, .obstacle);
+    try expectSparseIndexConsistent(&world);
+
+    // (level, chunk, which position of the chunk list): first, middle, last, then a
+    // sole tile, then level 0 chunk 0 down to empty.
+    const Removal = struct { level: u16, chunk: u32, at: enum { first, middle, last } };
+    const removals = [_]Removal{
+        .{ .level = 0, .chunk = 0, .at = .first },
+        .{ .level = 0, .chunk = 0, .at = .middle },
+        .{ .level = 0, .chunk = 0, .at = .last },
+        .{ .level = 0, .chunk = 1, .at = .first },
+        .{ .level = 1, .chunk = 0, .at = .last },
+        .{ .level = 0, .chunk = 0, .at = .first },
+        .{ .level = 0, .chunk = 0, .at = .first },
+        .{ .level = 1, .chunk = 3, .at = .first },
+        .{ .level = 1, .chunk = 0, .at = .first },
+    };
+    var before_buf: [placements.len]TestSparseRowKey = undefined;
+    var after_buf: [placements.len]TestSparseRowKey = undefined;
+    for (removals, 0..) |removal, step| {
+        const list = world.sparseTileIndicesForChunk(removal.level, removal.chunk);
+        if (removal.at == .middle) try std.testing.expect(list.len >= 3);
+        const position = switch (removal.at) {
+            .first => 0,
+            .middle => list.len / 2,
+            .last => list.len - 1,
+        };
+        const removed = list[position];
+        const coord = world.sparseTileCellCoord(removed);
+        const before = testSparseRowKeys(&world, &before_buf);
+        try std.testing.expect(world.levelBlocksMovement(removal.level, coord.x, coord.y));
+
+        const event = (try world.clearCellBlocking(removal.level, coord.x, coord.y, tunnel)).?;
+        try std.testing.expectEqual(WorldObstacleChangedEvent{ .level = removal.level, .min_x = coord.x, .min_y = coord.y, .max_x_exclusive = coord.x + 1, .max_y_exclusive = coord.y + 1 }, event);
+        try std.testing.expect(!world.levelBlocksMovement(removal.level, coord.x, coord.y));
+        try expectSparseIndexConsistent(&world);
+
+        // Exactly the removed tile is gone.
+        const after = testSparseRowKeys(&world, &after_buf);
+        try std.testing.expectEqual(placements.len - step - 1, after.len);
+        const removed_key = TestSparseRowKey{ .level = removal.level, .cell = world.cellIndex(coord.x, coord.y), .tile_id = deco };
+        var skipped = false;
+        var after_index: usize = 0;
+        for (before) |key| {
+            if (!skipped and std.meta.eql(key, removed_key)) {
+                skipped = true;
+                continue;
+            }
+            try std.testing.expectEqual(key, after[after_index]);
+            after_index += 1;
+        }
+        try std.testing.expect(skipped);
+        // Every remaining tile still blocks its cell.
+        for (0..world.sparseTileCount()) |row| {
+            const remaining = world.sparseTileCellCoord(row);
+            try std.testing.expect(world.levelBlocksMovement(world.sparse_tiles.items(.level_index)[row], remaining.x, remaining.y));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), world.sparseTileCount());
+}
+
+test "repeated sparse add and clear cycles keep rows, lists, and composed bits at the live count" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseRemovalWorld(&meta, 1);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    const stone = try world.requireTileByName(&meta, "stone_floor");
+    const tunnel = try world.requireTileByName(&meta, "cave_0");
+    // One live walkable decal stays throughout.
+    _ = try world.addSparseTile(0, 2, 2, stone, 0, .floor);
+
+    var row_capacity: usize = 0;
+    var level_capacity: usize = 0;
+    for (0..16) |cycle| {
+        for (0..3) |_| _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
+        _ = try world.addSparseTile(0, 6, 6, deco, 0, .obstacle);
+        try std.testing.expectEqual(@as(usize, 5), world.sparseTileCount());
+        try std.testing.expect((try world.clearCellBlocking(0, 1, 1, tunnel)) != null);
+        try std.testing.expect((try world.clearCellBlocking(0, 6, 6, tunnel)) != null);
+
+        try std.testing.expectEqual(@as(usize, 1), world.sparseTileCount());
+        try std.testing.expectEqual(@as(usize, 1), world.sparseTileIndicesForLevel(0).len);
+        try expectSparseIndexConsistent(&world);
+        // No blocked cell remains, so the level holds no composed-bits slot.
+        try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[0].blocked.liveSlotCount());
+        if (cycle == 0) {
+            row_capacity = world.sparse_tiles.capacity;
+            level_capacity = world.sparse_level_tiles.items[0].capacity;
+        }
+        try std.testing.expectEqual(row_capacity, world.sparse_tiles.capacity);
+        try std.testing.expectEqual(level_capacity, world.sparse_level_tiles.items[0].capacity);
+    }
+}
+
+test "clearCellBlocking leaves non-blocking content and returns no event when nothing blocks" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseRemovalWorld(&meta, 1);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    const dirt = try world.requireTileByName(&meta, "dirt");
+    const stone = try world.requireTileByName(&meta, "stone_floor");
+    const tunnel = try world.requireTileByName(&meta, "cave_0");
+    const floor = try world.addDenseLayer(0, 0, .floor, grass);
+    const overlay = try world.addDenseLayer(0, 0, .obstacle, grass);
+    _ = try world.addSparseTile(0, 2, 2, stone, 0, .floor);
+    _ = try world.clearDenseTile(floor, 3, 3);
+    const slots_before = world.level_terrain.items[0].blocked.liveSlotCount();
+
+    // Walkable floor and overlay with a walkable decal, and a hole: nothing to clear.
+    try std.testing.expectEqual(@as(?WorldObstacleChangedEvent, null), try world.clearCellBlocking(0, 2, 2, tunnel));
+    try std.testing.expectEqual(@as(?WorldObstacleChangedEvent, null), try world.clearCellBlocking(0, 3, 3, tunnel));
+    try std.testing.expectEqual(grass, world.denseTile(floor, 2, 2));
+    try std.testing.expectEqual(grass, world.denseTile(overlay, 2, 2));
+    try std.testing.expectEqual(invalid_tile_id, world.denseTile(floor, 3, 3));
+    try std.testing.expectEqual(@as(usize, 1), world.sparseTileCount());
+    try std.testing.expectEqual(slots_before, world.level_terrain.items[0].blocked.liveSlotCount());
+
+    // A blocking floor clears to the floor tile; the walkable overlay and decal stay.
+    _ = try world.setDenseTile(floor, 2, 2, dirt);
+    try std.testing.expect(world.levelBlocksMovement(0, 2, 2));
+    try std.testing.expect((try world.clearCellBlocking(0, 2, 2, tunnel)) != null);
+    try std.testing.expectEqual(tunnel, world.denseTile(floor, 2, 2));
+    try std.testing.expectEqual(grass, world.denseTile(overlay, 2, 2));
+    try std.testing.expectEqual(@as(usize, 1), world.sparseTileCount());
+    try std.testing.expect(!world.levelBlocksMovement(0, 2, 2));
+
+    // A blocking floor tile could not make the cell walkable.
+    try std.testing.expectError(error.InvalidWorldTile, world.clearCellBlocking(0, 2, 2, dirt));
+    try std.testing.expectError(error.InvalidWorldCell, world.clearCellBlocking(0, 8, 0, tunnel));
+    try std.testing.expectError(error.InvalidWorldLevel, world.clearCellBlocking(1, 0, 0, tunnel));
+}
+
+test "clearCellBlocking after its reserve allocates nothing and opens a solid chunk's cell (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseRemovalWorld(&meta, 1);
+    defer world.deinit();
+    const dirt = try world.requireTileByName(&meta, "dirt");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    const tunnel = try world.requireTileByName(&meta, "cave_0");
+    // Every chunk uniform and blocked on both bands and in the composed bits, so the
+    // clear takes two tile blocks and a bits slot, all at the reserve.
+    const floor = try world.addDenseLayer(0, 0, .floor, dirt);
+    const overlay = try world.addDenseLayer(0, 0, .obstacle, tree);
+    _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
+    _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
+    try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(0, 0));
+
+    world.beginDenseCellWriteReserve();
+    try world.reserveClearCellBlocking(0, 1, 1, tunnel);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    world.allocator = failing.allocator();
+    defer world.allocator = std.testing.allocator;
+    const event = try world.clearCellBlocking(0, 1, 1, tunnel);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(tunnel, world.denseTile(floor, 1, 1));
+    try std.testing.expectEqual(invalid_tile_id, world.denseTile(overlay, 1, 1));
+    try std.testing.expectEqual(@as(usize, 0), world.sparseTileCount());
+    try std.testing.expect(!world.levelBlocksMovement(0, 1, 1));
+    try std.testing.expect(world.levelBlocksMovement(0, 0, 1));
+    try expectSparseIndexConsistent(&world);
+}
+
+test "a cleared sparse tile no longer blocks and is not in the window list; an unrelated removal keeps the draw order" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 2);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const stone = try world.requireTileByName(&meta, "stone_floor");
+    const tunnel = try world.requireTileByName(&meta, "cave_0");
+
+    // Row 0 lies outside the window; the last row lies inside it, so removing row 0
+    // moves an in-window row.
+    _ = try world.addSparseTile(0, 12, 12, deco, 0, .obstacle);
+    _ = try world.addSparseTile(0, 2, 2, tree, 0, .obstacle);
+    _ = try world.addSparseTile(0, 2, 2, stone, 0, .floor);
+    _ = try world.addSparseTile(1, 3, 1, deco, 0, .obstacle);
+    _ = try world.addSparseTile(0, 5, 6, deco, 0, .effect);
+    _ = try world.addSparseTile(0, 1, 7, tree, 0, .obstacle);
+    try testShowTiles(&world, 0, 8, 0, 0);
+    var keys_buf: [8]TestSparseKey = undefined;
+    var before_buf: [8]TestSparseKey = undefined;
+    const before = testWindowSparseKeys(&world, &before_buf);
+    try std.testing.expectEqual(@as(usize, 5), before.len);
+
+    // The unrelated removal moves a window row: the list rebuilds, same draw order.
+    try std.testing.expect((try world.clearCellBlocking(0, 12, 12, tunnel)) != null);
+    try std.testing.expect(world.sparse_window.dirty);
+    try testShowTiles(&world, 0, 8, 0, 0);
+    try std.testing.expectEqualSlices(TestSparseKey, before, testWindowSparseKeys(&world, &keys_buf));
+    try expectSparseRangesCoverWindow(&world);
+
+    // Clearing (2, 2) drops its blocking tree and keeps the walkable decal.
+    try std.testing.expect(world.levelBlocksMovement(0, 2, 2));
+    try std.testing.expect((try world.clearCellBlocking(0, 2, 2, tunnel)) != null);
+    try std.testing.expect(!world.levelBlocksMovement(0, 2, 2));
+    try std.testing.expect(world.sparse_window.dirty);
+    try testShowTiles(&world, 0, 8, 0, 0);
+    const after = testWindowSparseKeys(&world, &keys_buf);
+    try std.testing.expectEqual(@as(usize, 4), after.len);
+    const cleared_cell = world.cellIndex(2, 2);
+    for (after) |key| try std.testing.expect(key.cell != cleared_cell or key.tile_id == stone);
+    try expectSparseRangesCoverWindow(&world);
+    try expectSparseIndexConsistent(&world);
+}
+
 test "levelBlocksMovement scopes sparse obstacles to their own level at the same cell" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -5758,6 +6273,63 @@ test "chunk terrain accessors match a flat reference model under random writes" 
     }
 }
 
+test "clearCellBlocking and refills match the flat reference in uniform blocked chunks" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 8x8 tiles, 4x4 chunks: four chunks, every one uniform at the start.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const cell_count = world.cellCount();
+    _ = try world.addLevel(0);
+
+    // Two blocking bands and one walkable band the clear must leave alone.
+    const fills = [_]TileId{ tiles.dirt, tiles.tree, tiles.grass };
+    const depths = [_]WorldDepth{ .floor, .obstacle, .obstacle };
+    var reference_storage: [fills.len][64]TileId = undefined;
+    var reference: [fills.len][]TileId = undefined;
+    for (fills, depths, 0..) |fill, depth, layer| {
+        _ = try world.addDenseLayer(0, 0, depth, fill);
+        reference[layer] = reference_storage[layer][0..cell_count];
+        @memset(reference[layer], fill);
+    }
+    try expectTerrainMatchesReference(&world, &reference);
+
+    // Exit cells in chunks 0 and 3; the first also holds a blocking sparse tile.
+    const exits = [_]CellCoord{ .{ .x = 1, .y = 2 }, .{ .x = 6, .y = 5 } };
+    for (0..3) |_| {
+        _ = try world.addSparseTile(0, exits[0].x, exits[0].y, tiles.deco, 0, .obstacle);
+        try expectTerrainMatchesReference(&world, &reference);
+        for (exits) |exit| {
+            const cell = @as(usize, exit.y) * world.width + exit.x;
+            try std.testing.expect((try world.clearCellBlocking(0, exit.x, exit.y, tiles.cave)) != null);
+            reference[0][cell] = tiles.cave;
+            reference[1][cell] = invalid_tile_id;
+            // No reserve scope is closed here, so a block or slot the clear took and
+            // left unused would show up as a live count above the mixed chunks.
+            try expectTerrainMatchesReference(&world, &reference);
+        }
+        for (exits) |exit| {
+            const cell = @as(usize, exit.y) * world.width + exit.x;
+            _ = try world.setDenseTile(0, exit.x, exit.y, fills[0]);
+            _ = try world.setDenseTile(1, exit.x, exit.y, fills[1]);
+            reference[0][cell] = fills[0];
+            reference[1][cell] = fills[1];
+            try expectTerrainMatchesReference(&world, &reference);
+        }
+        // Refilled: every chunk is uniform again with no block or slot held.
+        for (0..fills.len) |layer| try std.testing.expectEqual(@as(usize, 0), world.dense_layers.items(.store)[layer].liveBlockCount());
+        try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[0].blocked.liveSlotCount());
+    }
+}
+
 test "a multi-chunk change in one step on two levels writes allocation-free after its reserve" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -6087,6 +6659,74 @@ test "rampLinkOtherLevel walks only the cell's chunk list and keeps the oldest r
     var level1_endpoints: usize = 0;
     for (0..geom.chunkCount()) |chunk| level1_endpoints += linkEndpointsInChunk(&world, 1, @intCast(chunk));
     try std.testing.expectEqual(@as(usize, 5), level1_endpoints);
+}
+
+test "levelChunkLinkEndpoints yields exactly the chunk's endpoints, newest first" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 16x16 tiles, 4x4 chunks.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 16,
+        .height = 16,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    for (0..3) |level| _ = try world.addLevel(-@as(i32, @intCast(level)) * level_z_step);
+
+    try world.addLevelLink(rampLinkForTest(1, .{ .x = 5, .y = 5 }, 0, .{ .x = 5, .y = 5 }));
+    try world.addLevelLink(rampLinkForTest(2, .{ .x = 5, .y = 6 }, 1, .{ .x = 6, .y = 6 }));
+    var stair = rampLinkForTest(1, .{ .x = 4, .y = 4 }, 2, .{ .x = 15, .y = 15 });
+    stair.kind = .stair;
+    stair.traversal_cost = 7;
+    stair.bidirectional = false;
+    try world.addLevelLink(stair);
+    // Both ends on one level and in one chunk.
+    var teleport = rampLinkForTest(1, .{ .x = 7, .y = 7 }, 1, .{ .x = 6, .y = 4 });
+    teleport.kind = .teleport;
+    try world.addLevelLink(teleport);
+    try world.addLevelLink(rampLinkForTest(0, .{ .x = 0, .y = 0 }, 2, .{ .x = 1, .y = 1 }));
+
+    const geom = world.chunkGeometry();
+    const links = world.levelLinks();
+    for (0..world.levelCount()) |level_index| {
+        const level: u16 = @intCast(level_index);
+        for (0..geom.chunkCount()) |chunk_index| {
+            const chunk: u32 = @intCast(chunk_index);
+            var expected_count: usize = 0;
+            for (links) |link| {
+                expected_count += @intFromBool(link.level_a == level and geom.chunkOf(link.cell_a.x, link.cell_a.y) == chunk);
+                expected_count += @intFromBool(link.level_b == level and geom.chunkOf(link.cell_b.x, link.cell_b.y) == chunk);
+            }
+            var endpoints = world.levelChunkLinkEndpoints(level, chunk);
+            var count: usize = 0;
+            var previous: ?u32 = null;
+            while (endpoints.next()) |endpoint| : (count += 1) {
+                const link = links[endpoint.link];
+                const at_a = endpoint.side == .a;
+                try std.testing.expectEqual(level, if (at_a) link.level_a else link.level_b);
+                try std.testing.expectEqual(if (at_a) link.cell_a else link.cell_b, endpoint.cell);
+                try std.testing.expectEqual(chunk, geom.chunkOf(endpoint.cell.x, endpoint.cell.y));
+                try std.testing.expectEqual(if (at_a) link.level_b else link.level_a, endpoint.other_level);
+                try std.testing.expectEqual(if (at_a) link.cell_b else link.cell_a, endpoint.other_cell);
+                try std.testing.expectEqual(link.kind, endpoint.kind);
+                try std.testing.expectEqual(link.traversal_cost, endpoint.traversal_cost);
+                try std.testing.expectEqual(link.bidirectional, endpoint.bidirectional);
+                // Newest first: endpoint ids strictly descend, so none repeats.
+                const id = endpoint.link * 2 + @intFromBool(!at_a);
+                if (previous) |newer| try std.testing.expect(id < newer);
+                previous = id;
+            }
+            try std.testing.expectEqual(expected_count, count);
+        }
+    }
+    // An invalid level or chunk yields nothing.
+    var missing_level = world.levelChunkLinkEndpoints(3, 0);
+    try std.testing.expect(missing_level.next() == null);
+    var missing_chunk = world.levelChunkLinkEndpoints(1, @intCast(geom.chunkCount()));
+    try std.testing.expect(missing_chunk.next() == null);
 }
 
 test "reserveLevelLink makes addLevelLink allocation-free and a failed add changes nothing (FailingAllocator)" {

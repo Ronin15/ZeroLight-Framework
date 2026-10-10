@@ -12,8 +12,9 @@
 //!   - dig down: punches a see-through hole in the faced cell on any plane to drop
 //!     to the level below (no-op on the bottom plane).
 //!   - dig ramp: carves a walkable ramp tile plus a bidirectional `LevelLink` to
-//!     climb between planes.
-//! Emits the resulting `world_tile_changed` event for the post-commit nav re-mask.
+//!     climb between planes, and clears its exit cell on the plane above walkable.
+//! Emits the resulting `world_tile_changed` event (and a ramp exit's
+//! `world_obstacle_changed`) for the post-commit nav re-mask.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,7 +32,9 @@ const invalid_tile_id = @import("world_system.zig").invalid_tile_id;
 const CellCoord = @import("world_system.zig").CellCoord;
 const LevelLink = @import("world_system.zig").LevelLink;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
+const WorldObstacleChangedEvent = @import("simulation.zig").WorldObstacleChangedEvent;
 const StimulusKind = @import("simulation.zig").StimulusKind;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const DigIntent = @import("simulation.zig").DigIntent;
@@ -122,9 +125,9 @@ pub const DigController = struct {
     }
 
     /// Plans this step's dig (the cell the player faces on their current plane) and
-    /// reserves its world growth (tile storage, GPU edit,
-    /// and a ramp's link) once, so the stage can call it before anything else mutates
-    /// step state: an OOM here leaves the world and the step untouched for the retry.
+    /// reserves its world growth (tile storage, and a ramp's exit and link) once, so
+    /// the stage can call it before anything else mutates step state: an OOM here
+    /// leaves the world and the step untouched for the retry.
     /// Returns the reserved edit for `commitWorldEdit`, or null when the intent does
     /// nothing: no intent, no body/facing, no floor layer, or an off-world cell.
     pub fn reserveWorldEdit(
@@ -141,18 +144,26 @@ pub const DigController = struct {
 
     /// Writes an edit `reserveWorldEdit` reserved, with no world write between them:
     /// allocation-free in the world. Event and stimulus capacity are preflighted
-    /// before the write, so a capacity miss leaves the tile unchanged. Emits one
-    /// `world_tile_changed` event and a dig stimulus on an actual change.
+    /// before the write, so a capacity miss leaves the world unchanged. Emits the
+    /// cell's `world_tile_changed` event, a ramp exit's `world_obstacle_changed`, and
+    /// one dig stimulus when either changed.
     pub fn commitWorldEdit(world: *WorldSystem, edit: DigEdit, frame: *SimulationFrame) !void {
         if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
         try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
         try frame.ensureStimulusAppendCapacity(1);
-        const changed = (try applyEdit(world, edit)) orelse return;
+        const applied = try applyEdit(world, edit);
+        if (applied.tile == null and applied.exit == null) return;
 
-        try frame.events.appendRequired(.{
-            .stage = .structural_commit,
-            .payload = .{ .world_tile_changed = changed },
-        });
+        // One range within the preflighted capacity, so publishing allocates nothing.
+        const event_count = @as(usize, @intFromBool(applied.tile != null)) + @intFromBool(applied.exit != null);
+        const range = try frame.events.appendRangeCounts(1);
+        frame.events.addCount(range, event_count);
+        try frame.events.prefixAppendedRanges(range);
+        var writer = frame.events.rangeWriter(range);
+        if (applied.tile) |changed| writer.write(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+        if (applied.exit) |cleared| writer.write(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = cleared } });
+        writer.finish();
+        frame.events.finishWrite();
         var stimulus_dropped: usize = 0;
         _ = try SensoryBus.emit(frame, .{
             .position = cellCenterWorldPos(world, edit.cell),
@@ -162,7 +173,8 @@ pub const DigController = struct {
         }, true, &stimulus_dropped);
     }
 
-    /// One planned dig: a cell write on `level`'s floor and, for a ramp, its link.
+    /// One planned dig: a cell write on `level`'s floor and, for a ramp, its link and
+    /// its exit.
     pub const DigEdit = struct {
         level: u16,
         floor_layer: usize,
@@ -170,6 +182,15 @@ pub const DigController = struct {
         /// `invalid_tile_id` punches a see-through hole.
         tile: TileId,
         ramp_link: ?LevelLink = null,
+        exit: ?RampExit = null,
+    };
+
+    /// A ramp's exit: the cell on the plane above, cleared of every blocking band and
+    /// sparse tile, its blocking floor becoming `floor_tile`.
+    pub const RampExit = struct {
+        level: u16,
+        cell: CellCoord,
+        floor_tile: TileId,
     };
 
     // Resolves the intent to one cell write, or null for an intentional no-op.
@@ -205,7 +226,14 @@ pub const DigController = struct {
             .ramp => if (level == 0 or world.rampLinkOtherLevel(level, cell) != null)
                 null
             else
-                .{ .level = level, .floor_layer = floor_layer, .cell = cell, .tile = self.ramp_tile, .ramp_link = rampLink(level, cell) },
+                .{
+                    .level = level,
+                    .floor_layer = floor_layer,
+                    .cell = cell,
+                    .tile = self.ramp_tile,
+                    .ramp_link = rampLink(level, cell),
+                    .exit = .{ .level = level - 1, .cell = cell, .floor_tile = self.tunnel_tile },
+                },
             .none => unreachable,
         };
     }
@@ -442,22 +470,31 @@ fn rampLink(level: u16, cell: CellCoord) LevelLink {
     };
 }
 
-// Opens a reserve scope and reserves the edit's tile write and ramp link.
+// Opens a reserve scope and reserves the edit's tile write, ramp exit, and ramp link.
 fn reserveEdit(world: *WorldSystem, edit: DigController.DigEdit) !void {
     world.beginDenseCellWriteReserve();
     try world.reserveDenseCellWrite(edit.floor_layer, edit.cell.x, edit.cell.y, edit.tile);
+    if (edit.exit) |exit| try world.reserveClearCellBlocking(exit.level, exit.cell.x, exit.cell.y, exit.floor_tile);
     if (edit.ramp_link) |link| try world.reserveLevelLink(link);
 }
 
-// Writes the reserved edit; allocation-free after `reserveEdit`. A ramp's link is
-// added even when the cell already held the ramp tile.
-fn applyEdit(world: *WorldSystem, edit: DigController.DigEdit) !?WorldTileChangedEvent {
-    const changed = if (edit.tile == invalid_tile_id)
+// What one applied edit changed: the dug cell and a ramp's exit.
+const AppliedEdit = struct {
+    tile: ?WorldTileChangedEvent = null,
+    exit: ?WorldObstacleChangedEvent = null,
+};
+
+// Writes the reserved edit; allocation-free after `reserveEdit`. A ramp's exit is
+// cleared and its link added even when the cell already held the ramp tile.
+fn applyEdit(world: *WorldSystem, edit: DigController.DigEdit) !AppliedEdit {
+    var applied = AppliedEdit{};
+    applied.tile = if (edit.tile == invalid_tile_id)
         try world.clearDenseTile(edit.floor_layer, edit.cell.x, edit.cell.y)
     else
         try world.setDenseTile(edit.floor_layer, edit.cell.x, edit.cell.y, edit.tile);
+    if (edit.exit) |exit| applied.exit = try world.clearCellBlocking(exit.level, exit.cell.x, exit.cell.y, exit.floor_tile);
     if (edit.ramp_link) |link| try world.addLevelLink(link);
-    return changed;
+    return applied;
 }
 
 fn playerCellEntry(
@@ -1055,6 +1092,26 @@ test "a dig commit reserves event capacity before world mutate (capacity miss le
     try std.testing.expectError(error.EventCapacityExceeded, testDig(&dig, &tw.world, &tw.data, tw.player, &frame));
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+
+    // A ramp under rock needs two events; a budget of one leaves both cells and the
+    // links as they were.
+    var ramp_tw = try TestWorld.init(.right, 2);
+    defer ramp_tw.deinit();
+    var ramp_frame = SimulationFrame.init(std.testing.allocator);
+    defer ramp_frame.deinit();
+    try ramp_frame.reserveStreams(4, 1, 8, 8, 8, 8);
+    ramp_frame.beginStep();
+    ramp_frame.dig_intent = .ramp;
+    const ramp_floor = ramp_tw.world.denseFloorLayerForLevel(2).?;
+    const exit_floor = ramp_tw.world.denseFloorLayerForLevel(1).?;
+    const ramp_before = ramp_tw.world.denseTile(ramp_floor, 4, 3);
+    const exit_before = ramp_tw.world.denseTile(exit_floor, 4, 3);
+    try std.testing.expectError(error.EventCapacityExceeded, testDig(&dig, &ramp_tw.world, &ramp_tw.data, ramp_tw.player, &ramp_frame));
+    try std.testing.expectEqual(ramp_before, ramp_tw.world.denseTile(ramp_floor, 4, 3));
+    try std.testing.expectEqual(exit_before, ramp_tw.world.denseTile(exit_floor, 4, 3));
+    try std.testing.expect(ramp_tw.world.levelBlocksMovement(1, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), ramp_tw.world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 0), ramp_frame.events.mergedItems().len);
 }
 
 test "player_last_cell advances only after successful or intentional no-op traversal" {
@@ -1233,6 +1290,241 @@ test "a dig committed after its one reserve allocates nothing in the world (Fail
         try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
         if (intent == .ramp) {
             try std.testing.expectEqual(@as(?u16, 0), tw.world.rampLinkOtherLevel(1, .{ .x = 4, .y = 3 }));
+        }
+    }
+
+    // A ramp whose exit holds a solid floor, a blocking overlay, and blocking sparse
+    // tiles: the exit's blocks, bits slot, and both events fit the one reserve and
+    // the preflight, with room for exactly one more event range.
+    var tw = try TestWorld.init(.right, 2);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+    try addBlockingExitContent(&tw.world, &tw.meta);
+    const edit = (try dig.reserveWorldEdit(&tw.world, &tw.data, tw.player, .ramp)).?;
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 64, 8, 8, 8, 8);
+    frame.beginStep();
+    const filler = SimulationEvent{
+        .stage = .domain_reaction,
+        .payload = .{ .world_tile_changed = .{ .level = 0, .x = 0, .y = 0, .old_tile_id = 0, .new_tile_id = 1 } },
+    };
+    while (spareEventRanges(&frame) > 1) try frame.events.appendRequired(filler);
+    try std.testing.expectEqual(@as(usize, 1), spareEventRanges(&frame));
+    const events_before = frame.events.mergedItems().len;
+
+    const original_events = frame.events.stream.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    tw.world.allocator = failing.allocator();
+    frame.events.stream.allocator = failing.allocator();
+    defer {
+        tw.world.allocator = std.testing.allocator;
+        frame.events.stream.allocator = original_events;
+    }
+    try DigController.commitWorldEdit(&tw.world, edit, &frame);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
+    try std.testing.expect(!tw.world.levelBlocksMovement(2, 4, 3));
+    try std.testing.expectEqual(events_before + 2, frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(?u16, 1), tw.world.rampLinkOtherLevel(2, .{ .x = 4, .y = 3 }));
+}
+
+// Event ranges the frame can still append without growing any per-range list.
+fn spareEventRanges(frame: *const SimulationFrame) usize {
+    const stream = &frame.events.stream;
+    return @min(
+        @min(stream.counts.capacity - stream.counts.items.len, frame.events.range_stats.capacity - frame.events.range_stats.items.len),
+        @min(stream.offsets.capacity - stream.offsets.items.len, stream.write_offsets.capacity - stream.write_offsets.items.len),
+    );
+}
+
+// Puts blocking content in the ramp exit cell (4, 3) on level 1 besides its solid
+// floor: a blocking overlay band (filled solid, so the clear takes a block), two
+// blocking sparse tiles and one walkable decal there, and one blocking sparse tile
+// next door at (5, 3).
+fn addBlockingExitContent(world: *WorldSystem, meta: *const world_tileset_meta.WorldTilesetMeta) !void {
+    const tree = try world.requireTileByName(meta, "tree_0");
+    const deco = try world.requireTileByName(meta, "deco_0");
+    const stone = try world.requireTileByName(meta, "stone_floor");
+    _ = try world.addDenseLayer(1, 0, .obstacle, tree);
+    _ = try world.addSparseTile(1, 4, 3, deco, 0, .obstacle);
+    _ = try world.addSparseTile(1, 4, 3, stone, 0, .floor);
+    _ = try world.addSparseTile(1, 5, 3, deco, 0, .obstacle);
+    _ = try world.addSparseTile(1, 4, 3, tree, 0, .obstacle);
+}
+
+// The level's overlay band: the last dense layer, added by `addBlockingExitContent`.
+fn exitOverlayLayer(world: *const WorldSystem) usize {
+    return world.denseLayerCount() - 1;
+}
+
+// Level `level`'s sparse tiles as (cell, tile) pairs in its list order, into `out`.
+fn sparseRowsOf(world: *const WorldSystem, level: u16, out: []CellTile) []CellTile {
+    const indices = world.sparseTileIndicesForLevel(level);
+    for (out[0..indices.len], indices) |*row, index| row.* = .{
+        .cell = world.sparseTileCellCoord(index),
+        .tile = world.sparse_tiles.items(.tile_id)[index],
+    };
+    return out[0..indices.len];
+}
+
+const CellTile = struct { cell: CellCoord, tile: TileId };
+
+fn eventsOf(frame: *const SimulationFrame) []const SimulationEvent {
+    return frame.events.mergedItems();
+}
+
+test "a ramp dug under solid rock opens its exit cell on the level above in the same dig and emits both events" {
+    var tw = try TestWorld.init(.right, 2);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+    const ramp_floor = tw.world.denseFloorLayerForLevel(2).?;
+    const exit_floor = tw.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(tw.world.levelBlocksMovement(1, 4, 3));
+
+    var frame = try runDig(&tw, dig, .ramp);
+    defer frame.deinit();
+
+    try std.testing.expectEqual(dig.ramp_tile, tw.world.denseTile(ramp_floor, 4, 3));
+    try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(exit_floor, 4, 3));
+    try std.testing.expect(!tw.world.levelBlocksMovement(2, 4, 3));
+    try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
+    // Only the exit cell opens on the level above.
+    try std.testing.expect(tw.world.levelBlocksMovement(1, 5, 3));
+    try std.testing.expectEqual(@as(?u16, 1), tw.world.rampLinkOtherLevel(2, .{ .x = 4, .y = 3 }));
+    try std.testing.expectEqual(@as(?u16, 2), tw.world.rampLinkOtherLevel(1, .{ .x = 4, .y = 3 }));
+
+    const events = eventsOf(&frame);
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    const ramp_change = switch (events[0].payload) {
+        .world_tile_changed => |change| change,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(u16, 2), ramp_change.level);
+    try std.testing.expectEqual(@as(u16, 4), ramp_change.x);
+    try std.testing.expectEqual(@as(u16, 3), ramp_change.y);
+    try std.testing.expectEqual(dig.ramp_tile, ramp_change.new_tile_id);
+    const exit_change = switch (events[1].payload) {
+        .world_obstacle_changed => |change| change,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(WorldObstacleChangedEvent{ .level = 1, .min_x = 4, .min_y = 3, .max_x_exclusive = 5, .max_y_exclusive = 4 }, exit_change);
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+}
+
+test "a ramp exit clears a blocking obstacle band and blocking sparse tiles with the floor" {
+    var tw = try TestWorld.init(.right, 2);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+    try addBlockingExitContent(&tw.world, &tw.meta);
+    const overlay = exitOverlayLayer(&tw.world);
+    const tree = try tw.world.requireTileByName(&tw.meta, "tree_0");
+    const deco = try tw.world.requireTileByName(&tw.meta, "deco_0");
+    const stone = try tw.world.requireTileByName(&tw.meta, "stone_floor");
+
+    var frame = try runDig(&tw, dig, .ramp);
+    defer frame.deinit();
+
+    const exit_floor = tw.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(exit_floor, 4, 3));
+    try std.testing.expectEqual(invalid_tile_id, tw.world.denseTile(overlay, 4, 3));
+    try std.testing.expectEqual(tree, tw.world.denseTile(overlay, 5, 3));
+    try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
+    try std.testing.expect(tw.world.levelBlocksMovement(1, 5, 3));
+    // The walkable decal and the neighbour's blocking tile remain.
+    var rows_buf: [4]CellTile = undefined;
+    const rows = sparseRowsOf(&tw.world, 1, &rows_buf);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows) |row| {
+        const expected: CellTile = if (row.cell.x == 4) .{ .cell = .{ .x = 4, .y = 3 }, .tile = stone } else .{ .cell = .{ .x = 5, .y = 3 }, .tile = deco };
+        try std.testing.expectEqual(expected, row);
+    }
+    try std.testing.expectEqual(@as(usize, 2), eventsOf(&frame).len);
+    try std.testing.expectEqual(@as(?u16, 1), tw.world.rampLinkOtherLevel(2, .{ .x = 4, .y = 3 }));
+}
+
+test "a ramp whose exit is a hole writes nothing at the exit and still links" {
+    var tw = try TestWorld.init(.right, 2);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+    const exit_floor = tw.world.denseFloorLayerForLevel(1).?;
+    _ = try tw.world.clearDenseTile(exit_floor, 4, 3);
+
+    var frame = try runDig(&tw, dig, .ramp);
+    defer frame.deinit();
+
+    try std.testing.expectEqual(invalid_tile_id, tw.world.denseTile(exit_floor, 4, 3));
+    try std.testing.expectEqual(@as(?u16, 1), tw.world.rampLinkOtherLevel(2, .{ .x = 4, .y = 3 }));
+    const events = eventsOf(&frame);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0].payload == .world_tile_changed);
+}
+
+test "a ramp exit on walkable floor emits only the ramp event" {
+    var tw = try TestWorld.init(.right, 2);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+    const exit_floor = tw.world.denseFloorLayerForLevel(1).?;
+    _ = try tw.world.setDenseTile(exit_floor, 4, 3, dig.tunnel_tile);
+    const stone = try tw.world.requireTileByName(&tw.meta, "stone_floor");
+    _ = try tw.world.addSparseTile(1, 4, 3, stone, 0, .floor);
+
+    var frame = try runDig(&tw, dig, .ramp);
+    defer frame.deinit();
+
+    try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(exit_floor, 4, 3));
+    try std.testing.expectEqual(@as(usize, 1), tw.world.sparseTileIndicesForLevel(1).len);
+    try std.testing.expectEqual(@as(?u16, 1), tw.world.rampLinkOtherLevel(2, .{ .x = 4, .y = 3 }));
+    const events = eventsOf(&frame);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0].payload == .world_tile_changed);
+}
+
+test "a ramp dig that runs out of memory at every allocation leaves both cells, the sparse tiles, and the links unchanged" {
+    var fail_index: usize = 0;
+    var failures: usize = 0;
+    while (true) : (fail_index += 1) {
+        var tw = try TestWorld.init(.right, 2);
+        defer tw.deinit();
+        const dig = try testDigController(&tw.meta);
+        try addBlockingExitContent(&tw.world, &tw.meta);
+        const overlay = exitOverlayLayer(&tw.world);
+        const ramp_floor = tw.world.denseFloorLayerForLevel(2).?;
+        const exit_floor = tw.world.denseFloorLayerForLevel(1).?;
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+        frame.beginStep();
+        frame.dig_intent = .ramp;
+        const ramp_before = tw.world.denseTile(ramp_floor, 4, 3);
+        const exit_before = tw.world.denseTile(exit_floor, 4, 3);
+        const overlay_before = tw.world.denseTile(overlay, 4, 3);
+        var rows_before_buf: [4]CellTile = undefined;
+        const rows_before = sparseRowsOf(&tw.world, 1, &rows_before_buf);
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        tw.world.allocator = failing.allocator();
+        const result = testDig(&dig, &tw.world, &tw.data, tw.player, &frame);
+        tw.world.allocator = std.testing.allocator;
+        if (result) |_| {
+            // Every allocation index up to the dig's last failed once before this run.
+            try std.testing.expect(failures > 0);
+            try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
+            try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try std.testing.expectEqual(ramp_before, tw.world.denseTile(ramp_floor, 4, 3));
+            try std.testing.expectEqual(exit_before, tw.world.denseTile(exit_floor, 4, 3));
+            try std.testing.expectEqual(overlay_before, tw.world.denseTile(overlay, 4, 3));
+            try std.testing.expect(tw.world.levelBlocksMovement(2, 4, 3));
+            try std.testing.expect(tw.world.levelBlocksMovement(1, 4, 3));
+            var rows_after_buf: [4]CellTile = undefined;
+            try std.testing.expectEqualSlices(CellTile, rows_before, sparseRowsOf(&tw.world, 1, &rows_after_buf));
+            try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
+            try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+            try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
         }
     }
 }

@@ -453,11 +453,15 @@ batched edit carries per-group band bits sized to the widest touched level) and
 composed movement-blocked bits per chunk
 (OPEN, BLOCKED, or a bit block), so `levelBlocksMovement` is O(1) and a write
 recomposes only its own cell. Level links are append-only and indexed per
-endpoint chunk, so `rampLinkOtherLevel` walks one chunk's endpoints. A dig or
-fall carve reserves its growth with `reserveDenseCellWrite` (and
-`reserveLevelLink`) before any mutation, so an OOM leaves the step's state
-intact; a local change costs only the chunks it touches, and adding a level
-costs only its own directories. A dense one-step change (cave-in, explosion)
+endpoint chunk, so `levelChunkLinkEndpoints` (and `rampLinkOtherLevel` on it)
+walks one chunk's endpoints. A dig or fall carve reserves its growth with
+`reserveDenseCellWrite` (and `reserveLevelLink`) before any mutation, so an OOM
+leaves the step's state intact; a ramp dig also clears its exit cell on the
+level above (`reserveClearCellBlocking`/`clearCellBlocking`: blocking bands to
+the floor tile or empty, blocking sparse tiles swap-removed, O(bands + sparse
+tiles in the chunk)) and emits its `world_obstacle_changed` with the ramp's
+`world_tile_changed`; a local change costs only the chunks it touches, and
+adding a level costs only its own directories. A dense one-step change (cave-in, explosion)
 goes through `applyDenseCellWrites`: writes arrive grouped by chunk, storage is
 reserved on the main thread first, chunks are written in parallel on the
 `ThreadSystem`, and results merge in a fixed order, so threaded equals serial

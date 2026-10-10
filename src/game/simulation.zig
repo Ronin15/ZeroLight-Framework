@@ -93,7 +93,8 @@ pub const pipeline_structural_event_share: usize = structuralEventHeadroom(0, ac
 
 pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) usize {
     return switch (producer) {
-        .dig_world_edit => 1,
+        // The dug cell, plus a ramp exit's obstacle change.
+        .dig_world_edit => 2,
         .perception_update => budgets.perception_max_events_per_step,
         .affect_update => budgets.affect_max_events_per_step,
         .plane_traversal => budgets.movement_body_capacity + 1,

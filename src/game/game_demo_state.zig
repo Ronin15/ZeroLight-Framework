@@ -2274,9 +2274,9 @@ test "demo event bound is the pinned exhaustive producer sum" {
 
     // Hand-pinned, not re-derived: a formula drift on either side must fail here.
     // 37 movement bodies (player + 32 movers + 4 obstacles), 12 cognition agents:
-    // dig 1 + perception 24 + affect 48 + plane (37 + 1) + action_react 64 +
-    // structural (1 create x 15 + 64) + nav 1 = 255.
-    const pinned_event_bound: usize = 255;
+    // dig 2 + perception 24 + affect 48 + plane (37 + 1) + action_react 64 +
+    // structural (1 create x 15 + 64) + nav 1 = 256.
+    const pinned_event_bound: usize = 256;
     try std.testing.expectEqual(@as(?usize, pinned_event_bound), demo.simulation_frame.events.capacity_limit);
     try std.testing.expectEqual(pinned_event_bound, demo.pipeline.eventCapacitySum());
 }
@@ -2361,7 +2361,7 @@ test "every producer budget fits the demo event bound allocation-free in one ste
 
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.dropped);
-    try std.testing.expectEqual(@as(usize, 255), appended);
+    try std.testing.expectEqual(@as(usize, 256), appended);
     try std.testing.expectEqual(appended, demo.simulation_frame.events.mergedItems().len);
     try std.testing.expectError(error.EventCapacityExceeded, demo.simulation_frame.events.appendRequired(event));
 }
@@ -2523,12 +2523,12 @@ test "demo commit seam grows pipeline capacity" {
     try std.testing.expectEqual(@as(usize, 5), grown.structural.created);
 
     // 6 bodies -> 6 + 3 + 16 = 25, hot-store aligned to 32. The bound follows:
-    // dig 1 + perception 2 + affect 4 + plane (32 + 1) + action_react 64 +
-    // structural 79 (fixed) + nav 1 = 184.
+    // dig 2 + perception 2 + affect 4 + plane (32 + 1) + action_react 64 +
+    // structural 79 (fixed) + nav 1 = 185.
     try std.testing.expect(grown.population_sync.grew);
     try std.testing.expectEqual(@as(usize, 32), fixture.pipeline.movement_body_capacity);
-    try std.testing.expectEqual(@as(usize, 184), fixture.pipeline.eventCapacitySum());
-    try std.testing.expectEqual(@as(?usize, 184), fixture.frame.events.capacity_limit);
+    try std.testing.expectEqual(@as(usize, 185), fixture.pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(?usize, 185), fixture.frame.events.capacity_limit);
 
     fixture.frame.beginStep();
     const unchanged = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);

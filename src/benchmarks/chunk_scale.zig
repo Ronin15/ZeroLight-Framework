@@ -8,9 +8,10 @@
 //!   - `chunk-scale-dig`: 64 single-cell digs and refills, each in its own chunk.
 //!   - `chunk-scale-ramp`: 64 ramp digs, each in its own chunk on the deepest level
 //!     and linked to the level above, the way `DigController` digs a ramp: the
-//!     dedupe lookup, one reserve scope for the tile write and the link, the write,
-//!     and the link add. Links are append-only in play, so each iteration's reset
-//!     (untimed) refills the cells and drops the links. Flat.
+//!     dedupe lookup, one reserve scope for the tile write, the exit, and the link,
+//!     the write, the exit cleared walkable on the level above, and the link add.
+//!     Links are append-only in play, so each iteration's reset (untimed) refills
+//!     the cells and exits and drops the links. Flat.
 //!   - `chunk-scale-cave-in`: a chunk-aligned tunnel region of 4, 64, or 256 chunks,
 //!     a quarter on each of four stacked levels, collapses to solid and is carved
 //!     back, each one batched edit (`applyDenseCellWrites`). Linear in region chunks.
@@ -61,8 +62,9 @@
 //! and patch of the last level the reaction touched.
 //!   - `chunk-scale-nav-dig`: the dig workload's 64 cells dug in one step and refilled in
 //!     the next, each step followed by the reaction. Flat.
-//!   - `chunk-scale-nav-ramp`: the ramp workload plus the reaction; the untimed reset
-//!     refills the cells, drops the links, and applies the reaction. Flat.
+//!   - `chunk-scale-nav-ramp`: the ramp workload plus the reaction (each exit's obstacle
+//!     rect marked as one span); the untimed reset refills the cells and exits, drops
+//!     the links, and applies the reaction. Flat.
 //!   - `chunk-scale-nav-cave-in` and `chunk-scale-nav-explosion-fill`: the batched edits,
 //!     each followed by the reaction, serial and threaded. `--details` reports the terrain
 //!     plan and write stages, the nav reaction (marking and apply), and the rest (the main
@@ -91,6 +93,7 @@ const DenseCellWrite = @import("../game/world_system.zig").DenseCellWrite;
 const DenseChunkWrites = @import("../game/world_system.zig").DenseChunkWrites;
 const TerrainEditThreads = @import("../game/world_system.zig").TerrainEditThreads;
 const WorldTileChangedEvent = @import("../game/simulation.zig").WorldTileChangedEvent;
+const WorldObstacleChangedEvent = @import("../game/simulation.zig").WorldObstacleChangedEvent;
 const TileId = @import("../game/world_system.zig").TileId;
 const invalid_tile_id = @import("../game/world_system.zig").invalid_tile_id;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
@@ -619,21 +622,29 @@ fn rampCell(fixture: *const Fixture, cell_index: u16) CellCoord {
     return .{ .x = origin + (cell_index % 8) * chunk + 5, .y = origin + (cell_index / 8) * chunk + 7 };
 }
 
-// A step's tile change events, recorded by the dig and ramp workloads when given one.
+// A step's tile and obstacle change events, recorded by the dig and ramp workloads
+// when given one.
 const ChangeLog = struct {
     allocator: std.mem.Allocator,
     events: std.ArrayList(WorldTileChangedEvent) = .empty,
+    obstacles: std.ArrayList(WorldObstacleChangedEvent) = .empty,
 
     fn deinit(self: *ChangeLog) void {
+        self.obstacles.deinit(self.allocator);
         self.events.deinit(self.allocator);
     }
 
     fn record(self: *ChangeLog, event: WorldTileChangedEvent) !void {
         try self.events.append(self.allocator, event);
     }
+
+    fn recordObstacle(self: *ChangeLog, event: WorldObstacleChangedEvent) !void {
+        try self.obstacles.append(self.allocator, event);
+    }
 };
 
-// 64 ramps on the deepest level, each linked to the level above; returns the ramps dug.
+// 64 ramps on the deepest level, each linked to the level above with its solid exit
+// there cleared to the tunnel floor; returns the ramps dug.
 fn digRamps(fixture: *Fixture, changes: ?*ChangeLog) !usize {
     const world = &fixture.world;
     const level = fixture.levels - 1;
@@ -653,17 +664,20 @@ fn digRamps(fixture: *Fixture, changes: ?*ChangeLog) !usize {
         };
         world.beginDenseCellWriteReserve();
         try world.reserveDenseCellWrite(layer, cell.x, cell.y, fixture.ramp);
+        try world.reserveClearCellBlocking(level - 1, cell.x, cell.y, fixture.tunnel);
         try world.reserveLevelLink(link);
         const changed = (try world.setDenseTile(layer, cell.x, cell.y, fixture.ramp)) orelse return error.RampTileUnchanged;
         if (changes) |log| try log.record(changed);
+        const exit = (try world.clearCellBlocking(level - 1, cell.x, cell.y, fixture.tunnel)) orelse return error.RampExitUnchanged;
+        if (changes) |log| try log.recordObstacle(exit);
         try world.addLevelLink(link);
     }
     return dig_cell_count;
 }
 
-// Returns the ramp workload to its start state: each ramp cell back to dirt and every
-// link dropped. Links are append-only in play, so the bench truncates the link rows
-// and clears the ramp chunks' endpoint heads on both levels.
+// Returns the ramp workload to its start state: each ramp cell and its exit back to
+// dirt and every link dropped. Links are append-only in play, so the bench truncates
+// the link rows and clears the ramp chunks' endpoint heads on both levels.
 // Relies on WorldSystem internals: `level_links`, `link_endpoint_next`, and
 // `LevelTerrain.link_heads` (one head per chunk, `no_link_endpoint` when empty).
 fn undoRamps(fixture: *Fixture, changes: ?*ChangeLog) !void {
@@ -679,6 +693,12 @@ fn undoRamps(fixture: *Fixture, changes: ?*ChangeLog) !void {
         try world.reserveDenseCellWrite(layer, cell.x, cell.y, fixture.dirt);
         const changed = (try world.setDenseTile(layer, cell.x, cell.y, fixture.dirt)) orelse return error.RampTileUnchanged;
         if (changes) |log| try log.record(changed);
+        const exit_layer = fixture.floor(level - 1);
+        if (world.denseTile(exit_layer, cell.x, cell.y) != fixture.tunnel) return error.RampExitNotCleared;
+        world.beginDenseCellWriteReserve();
+        try world.reserveDenseCellWrite(exit_layer, cell.x, cell.y, fixture.dirt);
+        const refilled = (try world.setDenseTile(exit_layer, cell.x, cell.y, fixture.dirt)) orelse return error.RampExitUnchanged;
+        if (changes) |log| try log.record(refilled);
         const chunk_coord = world.chunkCoordForCell(cell.x, cell.y);
         const chunk_index: usize = @intCast(chunk_coord.y * @as(i32, world.chunksX()) + chunk_coord.x);
         world.level_terrain.items[level].link_heads[chunk_index] = no_link_endpoint;
@@ -1013,12 +1033,17 @@ const NavFixture = struct {
     }
 
     // Marks every changed cell whose movement blocking flipped, as the post-commit
-    // reaction filters its tile events; returns the cells marked.
-    fn markBlockingChanges(self: *NavFixture, events: []const WorldTileChangedEvent) !usize {
+    // reaction filters its tile events, and each obstacle rect as one span; returns
+    // the cells and rects marked.
+    fn markBlockingChanges(self: *NavFixture, events: []const WorldTileChangedEvent, obstacles: []const WorldObstacleChangedEvent) !usize {
         var marked: usize = 0;
         for (events) |event| {
             if (event.old_blocks_movement == event.new_blocks_movement) continue;
             try self.system.markNavDirty(event.level, event.x, event.y);
+            marked += 1;
+        }
+        for (obstacles) |rect| {
+            try self.system.markNavTileRectDirty(&self.base.world, rect.level, rect.min_x, rect.min_y, rect.max_x_exclusive, rect.max_y_exclusive);
             marked += 1;
         }
         return marked;
@@ -1035,8 +1060,9 @@ const NavFixture = struct {
     // The recorded step's reaction: marks its blocking changes (at least `min_marked`)
     // and applies them; returns the fallback count.
     fn reactToChanges(self: *NavFixture, min_marked: usize) !usize {
-        const marked = try self.markBlockingChanges(self.changes.events.items);
+        const marked = try self.markBlockingChanges(self.changes.events.items, self.changes.obstacles.items);
         self.changes.events.clearRetainingCapacity();
+        self.changes.obstacles.clearRetainingCapacity();
         if (marked < min_marked) return error.NavWorkloadUnmarked;
         return navFallbacks(try self.react(self.threads));
     }
@@ -1218,7 +1244,7 @@ fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, edit_thr
         try applyBatch(&nav.base.world, chunks, &edit.events, edit_threads);
         timing.terrain.add(&nav.base.world);
         const start_ns = suite.nowNs(io);
-        if (try nav.markBlockingChanges(edit.events.items) == 0) return error.NavWorkloadUnmarked;
+        if (try nav.markBlockingChanges(edit.events.items, &.{}) == 0) return error.NavWorkloadUnmarked;
         const nav_stats = try nav.react(thread_system);
         timing.nav_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
         timing.fallbacks += navFallbacks(nav_stats);
@@ -1256,7 +1282,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // The cave-in region starts carved, so each iteration collapses then re-carves it.
     if (workload == .cave_in) {
         try applyBatch(&nav.base.world, edit.back_chunks.items, &edit.events, null);
-        _ = try nav.markBlockingChanges(edit.events.items);
+        _ = try nav.markBlockingChanges(edit.events.items, &.{});
         _ = try nav.react(null);
     }
 

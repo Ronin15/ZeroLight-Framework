@@ -345,7 +345,9 @@ then fills, so work and memory follow the tiles in the window (O(window levels
 depth; an allocation failure leaves the previous window and list in place and
 the next call retries. A still camera or sub-tile pan returns early.
 `addSparseTile` is O(1) and marks the list for rebuild only when the tile lands
-inside the current window; nothing is listed before a window is set. Dynamic
+inside the current window; a sparse tile removal (a ramp exit clear) marks it
+when the removed tile is inside the window or the removal moves a listed row to
+a new index. Nothing is listed before a window is set. Dynamic
 sparse prep reserves `reserveRenderRecords` (the list's length);
 `sparseDepthRangeCount`/`sparseDepthRangeAt` give the window's sparse depths
 for interleave points, and `submitVisibleSparseRange` submits one range. Draw

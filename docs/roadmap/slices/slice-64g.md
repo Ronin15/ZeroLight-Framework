@@ -232,7 +232,7 @@ Failure and limits:
 - [ ] One shared static-collider structure, synced once per entity per step,
       with nav as its first consumer; a static add, move, or destroy costs its
       own rows and chunks. Steering and collision move onto it in 71B.1.
-- [ ] Runtime ramps dig out their exit cell on the level above in the same
+- [x] Runtime ramps dig out their exit cell on the level above in the same
       dig, with the edge cases above (owner decision).
 - [ ] Slice 72 D3, G1, G2, E2, and E3 closed with the nav landings that
       rewrite the same code; their 72 lines checked off there.
