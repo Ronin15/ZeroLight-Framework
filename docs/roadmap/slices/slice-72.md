@@ -29,15 +29,15 @@ content across world sizes.
   (A1).
 - Measured: battle-scale contact density ≈0.03 pairs/body/step with
   `collision_pair_bound_exceeded = 0` (C7).
-- Open sites in live code: elastic pathfinding resizes wipe `completed` and
-  `unavailable`, and a shrink drops accepted work (`resize_dropped`);
+- Open sites in live code: a pathfinding shrink drops accepted work
+  (`resize_dropped`);
   `unavailable` never expires and refuses when full; the group tally is
   capped at `min(512, n)`; elastic capacity starts at a floor of 8;
   destructible cell resolve scans only the first
   `destructible_cell_scan_budget` (256) dense rows; the spatial-index dense
   window is halo-derived on every instance and clamps a wider populated box
   out silently; AI scan radius uses an unenforced `grid_cell_size` (32);
-  `solved_paths` and the worker path/stitched pool stripes share lines across
+  `solved_paths` and the worker path pool stripes share lines across
   workers; GPU static streams and the tile-edit transfer buffer grow from
   exact sizes and GPU growth waits for idle; `StateTransitions.reserve` sets the refusal bound.
 - Per-level nav arrays, dense world arrays, the nav memory gate, and
@@ -96,7 +96,7 @@ content across world sizes.
 - [x] D3 · LOS visit limit from the ray's own length.
 - [ ] D4 · AI scan radius from the live spatial cell size.
 - [ ] E1 · A pathfinding shrink never drops accepted work.
-- [ ] E2 · Elastic resizes preserve cache entries and pending work, with a
+- [x] E2 · Elastic resizes preserve cache entries and pending work, with a
       `pathfinding-elastic-ramp` bench (solves after ≤ before).
 - [ ] E3 · Negative cache expires and evicts deterministically instead of
       refusing.
@@ -111,7 +111,7 @@ content across world sizes.
 - [ ] F3 · Dense world arrays sized exactly (re-scoped by 64G).
 - [ ] G1 · Tier-1 search scratch sized per escalated solve, not per
       participant (re-scoped by 64G).
-- [ ] G2 · Result-cache path storage sized to the common bound plus a long
+- [x] G2 · Result-cache path storage sized to the common bound plus a long
       pool that never evicts a live entry (re-scoped by 64G).
 - [ ] G3 · `PathfindingCapacity` holds caller knobs only; derived values
       private.

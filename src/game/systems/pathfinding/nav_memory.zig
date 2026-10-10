@@ -9,7 +9,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const NavGridError = types.NavGridError;
-const StitchedCell = types.StitchedCell;
+const ProbeSlot = @import("caches.zig").ProbeSlot;
+const SlotPayload = @import("caches.zig").SlotPayload;
 const OpenNode = types.OpenNode;
 const PortalNode = types.PortalNode;
 const AbstractEdge = types.AbstractEdge;
@@ -86,6 +87,10 @@ pub const NavMemoryBudget = struct {
     // Parallel corridor/corridor_link reconstruction buffers: one usize ref plus one bool
     // flag per entry.
     const abstract_corridor_bytes: usize = @sizeOf(usize) + 1;
+    // A result-cache entry's fixed lists besides its inline stripe (caches.zig ResultCache):
+    // two probe slots (2x physical), the payload, a free payload index, and the eviction
+    // scratch key.
+    const cache_entry_bytes_without_stripe: usize = 2 * @sizeOf(ProbeSlot) + @sizeOf(SlotPayload) + @sizeOf(u32) + @sizeOf(types.PathQueryKey);
 
     // Saturating estimate of total nav memory. An overflowing term clamps to
     // maxInt so the gate rejects rather than wrapping to a small value.
@@ -137,20 +142,24 @@ pub const NavMemoryBudget = struct {
             (portal_cap_bound *| @sizeOf(u32)) +|
             (ct *| ct *| @sizeOf(usize));
         const build_scratch_bytes = self.worker_participant_count *| per_participant_build_bytes;
-        // Goal-keyed completed-path cache pool.
-        const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
-        // Per-request worker path stripes.
-        const worker_path_bytes = self.max_solved_requests_per_step *| self.max_stored_path_cells *| @sizeOf(u32);
-        // Goal-keyed stitched-corridor cache plus per-request worker stitched stripes
-        // (config-scaled, independent of cell count).
-        const stitched_bytes = (self.max_cached_results +| self.max_solved_requests_per_step) *|
-            self.max_stitched_path_cells *| @sizeOf(StitchedCell);
+        // Result cache, per entry: two probe slots, the payload, a free-list index, an
+        // eviction-scratch key, and the inline stripe of max_stored_path_cells words.
+        const result_bytes = self.max_cached_results *| cache_entry_bytes_without_stripe +|
+            (self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32));
+        // One block holds the longest plain or stitched path: a worker output stripe per
+        // solve slot, and a cache long block (plus its free-list index) per long result.
+        const long_block_bytes = types.resultBlockWords(self.max_explored_nodes, self.max_stitched_path_cells) *| @sizeOf(u32);
+        const worker_path_bytes = self.max_solved_requests_per_step *| long_block_bytes;
+        // The long pool grows with content at the publish reserve (only allocator OOM fails
+        // that growth) and never exceeds one block per entry, so its elastic worst case,
+        // every cached result long, is max_cached_results blocks.
+        const long_pool_bytes = self.max_cached_results *| (long_block_bytes +| @sizeOf(u32));
         // Realistic abstract chunk-portal graph buffers (cell_to_portal is exact;
         // portals/edges are estimated from border structure, not a per-cell worst case).
         const abstract_bytes = self.abstractGraphBytes(width, height, levels);
         return static_bytes +| group_registry_bytes +|
             scratch_bytes +| abstract_scratch_bytes +| build_scratch_bytes +|
-            result_path_bytes +| worker_path_bytes +| stitched_bytes +|
+            result_bytes +| worker_path_bytes +| long_pool_bytes +|
             abstract_bytes;
     }
 
@@ -218,7 +227,8 @@ comptime {
 // The single NavMemoryBudget constructor shared by the rebuild gate, the
 // auto-sizer, and tests. Counts the ELASTIC CEILING caps (deriveCapacity at
 // max_agent_budget), not the live derived values: the safe-point elastic resize
-// can grow the result cache and worker pools to the configured ceiling WITHOUT
+// can grow the result cache and worker pools to the configured ceiling, and the
+// publish reserve can grow the cache's long-block pool to one block per entry, WITHOUT
 // re-running the gate, so load-time admission covers that worst case.
 pub fn budgetForCapacity(capacity: types.PathfindingCapacity, level_count: usize, link_count: usize) NavMemoryBudget {
     const ceiling = types.deriveCapacity(capacity, @max(types.min_capacity_floor, capacity.max_agent_budget));

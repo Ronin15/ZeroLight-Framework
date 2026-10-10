@@ -991,10 +991,18 @@ pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         // derivation must locate a deep cell (the hint's target case).
         if (system.graph.keyForWorld(0, goal_world, .default)) |key| {
             if (system.completed.slotIndex(key)) |slot| {
-                const path = system.completed.pathSlice(slot, system.completed.resultAt(slot).path_len);
-                if (path.len > 0) {
-                    starts[i] = grid.cellCenter(path[path.len / 2]);
+                // A cross-chunk route is cached as its stitched corridor (one level here).
+                const result = system.completed.resultAt(slot);
+                if (result.stitched_len != 0) {
+                    const stitched = system.completed.stitchedSlice(slot, result.stitched_len);
+                    starts[i] = grid.cellCenter(stitched[stitched.len / 2].cell);
                     warm_paths += 1;
+                } else {
+                    const path = system.completed.pathSlice(slot, result.path_len);
+                    if (path.len > 0) {
+                        starts[i] = grid.cellCenter(path[path.len / 2]);
+                        warm_paths += 1;
+                    }
                 }
             }
         }

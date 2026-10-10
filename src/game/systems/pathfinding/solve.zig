@@ -192,10 +192,7 @@ fn solveAbstract(
 
     const stitched = scratch.stitched_scratch.items;
     if (stitched.len == 0) return .{ .unavailable = request.key };
-    // Record the start-level prefix as the plain path (a first-cell fallback) and the
-    // full stitched path the query walks.
-    recordStartLevelPrefix(system, ordinal, request.key, stitched, request.start_level);
-    recordStitched(system, ordinal, stitched);
+    recordStitched(system, ordinal, request.key, stitched, request.start_level);
     const solved = &system.solved_paths.items[ordinal];
     solved.via_abstract = true;
     solved.cross_level = corridor.crosses_level;
@@ -625,58 +622,38 @@ fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_index:
     std.mem.reverse(u32, scratch.path_scratch.items);
 }
 
+// Writes a plain path whole into this request's output stripe at its fallback ordinal.
+// The local solve bounds a path at one cell per explored node, which the stripe holds.
 fn recordPath(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, path: []const u32, path_level: u16) void {
-    const stride = system.capacity.max_stored_path_cells;
-    const offset = ordinal * stride;
-    // Downsample (not head-truncate) an over-stride plain path so the agent keeps
-    // progressing to the goal instead of stalling at the stride boundary. Shares the
-    // result cache's contract via downsamplePathInto.
-    const dst = system.worker_path_pool.items[offset .. offset + stride];
-    const stored_len = types.downsamplePathInto(dst, path);
+    const stripe_words = types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells);
+    const offset = ordinal * stripe_words;
+    std.debug.assert(path.len <= stripe_words);
+    @memcpy(system.worker_path_pool.items[offset .. offset + path.len], path);
     system.solved_paths.items[ordinal] = .{
         .key = key,
         .offset = offset,
-        .len = stored_len,
+        .len = path.len,
         .path_level = path_level,
     };
 }
 
-// Records the leading start-level run of the stitched path as the plain path buffer
-// (used only as a first-cell fallback in the query). Writes the rest of the
-// SolvedPath entry, mirroring recordPath's contract for a local solve.
-fn recordStartLevelPrefix(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, stitched: []const StitchedCell, start_level: u16) void {
-    const stride = system.capacity.max_stored_path_cells;
-    const offset = ordinal * stride;
-    var count: usize = 0;
-    for (stitched) |sc| {
-        if (sc.level != start_level) break; // first level change ends the prefix
-        if (count >= stride) break;
-        system.worker_path_pool.items[offset + count] = sc.cell;
-        count += 1;
-    }
+// Writes the full stitched (level,cell) corridor path whole into this request's output
+// stripe; `path_level` is the start level. stitchCorridor's cap (at most
+// max_stitched_path_cells) bounds it at the stripe, asserted so a drift fails loud
+// instead of truncating the corridor.
+fn recordStitched(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, stitched: []const StitchedCell, start_level: u16) void {
+    const stripe_words = types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells);
+    const offset = ordinal * stripe_words;
+    std.debug.assert(stitched.len * types.stitched_cell_words <= stripe_words);
+    const stripe = system.worker_path_pool.items[offset .. offset + stripe_words];
+    @memcpy(types.stitchedCells(stripe, stitched.len), stitched);
     system.solved_paths.items[ordinal] = .{
         .key = key,
         .offset = offset,
-        .len = count,
+        .len = 0,
+        .stitched_len = stitched.len,
         .path_level = start_level,
     };
-}
-
-// Copies the full stitched (level,cell) corridor path into this request's disjoint
-// stripe. Must run after recordStartLevelPrefix, which writes the rest of the entry.
-fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell) void {
-    const stride = system.capacity.max_stitched_path_cells;
-    if (stride == 0) return;
-    // stitchCorridor's cap (tier0_stitched_cell_cap or max_stitched_path_cells, both
-    // <= max_stitched_path_cells) already bounds `stitched` before this is ever called,
-    // so it is genuinely stored whole here. Assert rather than @min-and-truncate so a
-    // future drift between the solve-side cap and this stride fails loud instead of
-    // silently dead-ending the agent at the truncation point.
-    std.debug.assert(stitched.len <= stride);
-    const offset = ordinal * stride;
-    @memcpy(system.worker_stitched_pool.items[offset .. offset + stitched.len], stitched);
-    system.solved_paths.items[ordinal].stitched_offset = offset;
-    system.solved_paths.items[ordinal].stitched_len = stitched.len;
 }
 
 // ----------------------------------------------------------------------------

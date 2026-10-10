@@ -61,8 +61,7 @@ Work sized to the world, a level, or content totals:
 - Every incremental apply clears every pending request and negative result
   and drops every group field, world-wide (`system.zig:494-495`).
 - Cached-path eviction scans the whole result cache per batch on the main
-  thread, and a stride-downsampled path is evicted whenever its level is
-  touched (`caches.zig:344-356,404`).
+  thread (`ResultCache.evictCrossing`).
 - The blocked query behind every chunk remask scans every dense layer in the
   world and the level's sparse tiles per cell (`world_system.zig:1413-1428`).
 - Static obstacles: the coverage refresh scans every static body per covered

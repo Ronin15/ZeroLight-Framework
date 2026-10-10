@@ -67,7 +67,6 @@ const thread_shared_record_alignment = types.thread_shared_record_alignment;
 const resizeList = types.resizeList;
 const PathSolveResult = types.PathSolveResult;
 const GroupRequestTally = types.GroupRequestTally;
-const StitchedCell = types.StitchedCell;
 const PhaseTimer = types.PhaseTimer;
 const emptyKey = types.emptyKey;
 const keysEqual = types.keysEqual;
@@ -121,13 +120,10 @@ pub const PathfindingSystem = struct {
     // Reconstructed paths by fallback ordinal, written into completed by the main thread
     // after the worker batch finishes.
     solved_paths: std.ArrayList(SolvedPath) = .empty,
-    // Per-request path pool: the stripe at a request's fallback ordinal, so two
-    // requests never collide even when one worker solves several in the same range.
+    // Per-request solve output: one `resultBlockWords` stripe at the request's fallback
+    // ordinal holding its plain or stitched path, so two requests never collide even
+    // when one worker solves several in the same range.
     worker_path_pool: std.ArrayList(u32) = .empty,
-    // Per-solved-request disjoint stitched-path stripe, mirroring worker_path_pool,
-    // so a worker's stitched corridor never overwrites another request's during the
-    // batch. Plain local solves leave their stripe unused (stitched_len 0).
-    worker_stitched_pool: std.ArrayList(StitchedCell) = .empty,
     next_group_evict: usize = 0,
     // Pre-reserved per-level affected-flag scratch for incremental nav updates. Sized
     // to the level count at rebuild so `applyNavUpdates` allocates nothing per edit on
@@ -175,8 +171,10 @@ pub const PathfindingSystem = struct {
     // Consecutive steps the agent count has stayed below half the live capacity.
     // Shrink fires only after this reaches capacity_shrink_window (hysteresis).
     low_load_steps: u32 = 0,
-    // Reusable safe-point snapshot buffers. A resize wipes the goal-keyed caches
-    // (reconstructable) but preserves the non-reconstructable live deferred work and
+    /// Telemetry: publish reserves that grew the result cache's long-block pool.
+    long_block_grows: u64 = 0,
+    long_block_growth_logged: bool = false,
+    // Reusable safe-point snapshot buffers. A resize preserves the live deferred work and
     // group tally by round-tripping them through these. Allocated only at resize.
     resize_pending_snapshot: std.ArrayList(PendingRequest) = .empty,
     resize_group_snapshot: std.ArrayList(GroupRequestTally) = .empty,
@@ -197,9 +195,8 @@ pub const PathfindingSystem = struct {
         key: PathQueryKey,
         offset: usize,
         len: usize,
-        // Disjoint corridor stripe (offset/len into worker_stitched_pool) for this
-        // solved request. Zero len means a plain local solve with no corridor.
-        stitched_offset: usize = 0,
+        // Stitched corridor cells in the same stripe; zero for a plain local solve, whose
+        // cells are `len` words. A stitched result has `len` 0.
         stitched_len: usize = 0,
         // Level the stored cells index into (start level for cross-level corridors).
         path_level: u16 = 0,
@@ -228,7 +225,6 @@ pub const PathfindingSystem = struct {
         self.nav_dirty_levels.deinit(self.allocator);
         self.nav_dirty_cell_spans.deinit(self.allocator);
         self.nav_dirty_edits.deinit(self.allocator);
-        self.worker_stitched_pool.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
         self.solved_paths.deinit(self.allocator);
         self.scratch_slots.deinit(self.allocator);
@@ -269,9 +265,9 @@ pub const PathfindingSystem = struct {
 
     // Sizes every pool from caps derived for `agent_count`. Used by reserve() at init and
     // by adjustCapacityForAgentCount() at the safe point. ArrayList pools grow amortized
-    // and shrink-and-free; the open-addressed caches are re-reserved (which wipes them —
-    // reconstructable, and resizes are rare under hysteresis). The caller is responsible
-    // for preserving any live cross-step state across the wipe.
+    // and shrink-and-free; the result cache and the negative set keep their entries (a
+    // shrink evicts what no longer fits). The caller preserves the pending queue and group
+    // tally, which these pools do not carry across.
     //
     // The logical limits (`self.capacity`, `effective_agent_capacity`) are committed only
     // after every pool fits them. On a mid-resize OOM each pool still holds its old or its
@@ -307,7 +303,7 @@ pub const PathfindingSystem = struct {
         // Logical capacity only: every ProbeTable/ResultCache reserve internally doubles
         // physical slots for probe headroom, so callers pass the true entry-count ceiling,
         // never a caller-side multiplier (one load-factor policy, not two stacked).
-        try self.completed.reserve(self.allocator, capacity.max_cached_results, capacity.max_stored_path_cells, capacity.max_stitched_path_cells);
+        try self.completed.reserve(self.allocator, capacity.max_cached_results, capacity.max_stored_path_cells, types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells), self.step_counter);
         try self.unavailable.reserve(self.allocator, capacity.max_cached_results);
         try self.pending_keys.reserve(self.allocator, capacity.max_pending_requests);
         try self.group_fields.ensureTotalCapacity(self.allocator, capacity.max_group_fields);
@@ -342,10 +338,8 @@ pub const PathfindingSystem = struct {
         // One disjoint path stripe per solved request this step (indexed by the
         // dense fallback position), so workers never overwrite each other's
         // reconstructed paths even when one worker solves several requests.
-        const pool_cells = capacity.max_solved_requests_per_step * capacity.max_stored_path_cells;
-        try resizeFilledArrayList(u32, &self.worker_path_pool, self.allocator, pool_cells, no_cell);
-        const pool_stitched = capacity.max_solved_requests_per_step * capacity.max_stitched_path_cells;
-        try resizeFilledArrayList(StitchedCell, &self.worker_stitched_pool, self.allocator, pool_stitched, .{ .level = 0, .cell = no_cell });
+        const pool_words = capacity.max_solved_requests_per_step * types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells);
+        try resizeFilledArrayList(u32, &self.worker_path_pool, self.allocator, pool_words, no_cell);
         self.capacity = capacity;
         self.effective_agent_capacity = capacity.max_pending_requests;
     }
@@ -395,12 +389,12 @@ pub const PathfindingSystem = struct {
     //
     // Index/pointer-stability invariant verified for every resized pool: at this
     // point the per-step scratch pools (intake staging, solve_results,
-    // fallback_indices, solved_paths, worker_path_pool, worker_stitched_pool) are
-    // empty/cleared from last step's prepare*, so no live offset spans the resize.
+    // fallback_indices, solved_paths, worker_path_pool) are empty/cleared from last
+    // step's prepare*, so no live offset spans the resize.
     // pending/pending_keys/group_requests/completed/unavailable hold cross-step state;
-    // resize wipes the reconstructable caches and round-trips the non-reconstructable
-    // pending deferred work + group tally through reusable snapshots, then rebuilds
-    // pending_keys from the restored pending. The scratch_slots count is the fixed
+    // completed and unavailable keep their entries through the resize, while pending and
+    // the group tally round-trip through reusable snapshots and pending_keys is rebuilt
+    // from the restored pending. The scratch_slots count is the fixed
     // configured participant count (unchanged by an elastic resize) and its per-cell
     // arrays were sized at the nav build, so this never touches them. No worker runs.
     fn adjustCapacityForAgentCount(self: *PathfindingSystem, agent_count: usize) !void {
@@ -420,10 +414,9 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    // Re-sizes all pools to `agent_count` while preserving the non-reconstructable
-    // live deferred-work queue and group tally. The goal-keyed caches are wiped (a
-    // resize behaves like a routine cache miss; re-requests re-solve), exactly as a
-    // nav rebuild already does.
+    // Re-sizes all pools to `agent_count` while preserving the live deferred-work queue
+    // and group tally. The goal-keyed result cache and negative set keep their entries
+    // (a shrink evicts only what no longer fits), so a resize costs no re-solves.
     fn resizePreservingLiveState(self: *PathfindingSystem, agent_count: usize) !void {
         self.resize_pending_snapshot.clearRetainingCapacity();
         try self.resize_pending_snapshot.ensureTotalCapacity(self.allocator, self.pending.len);
@@ -925,7 +918,6 @@ pub const PathfindingSystem = struct {
         if (self.completed.freshSlotIndex(key, self.step_counter, types.default_cache_ttl_steps)) |slot| {
             const result = self.completed.resultAt(slot);
             const path_grid = self.graph.grid(result.path_level) orelse return .{ .status = .unavailable };
-            const path = self.completed.pathSlice(slot, result.path_len);
             // Abstract chunk/cross-level corridor: a full obstacle-aware stitched
             // (level,cell) path. Walk the run on the agent's CURRENT level cell by
             // cell (every consecutive pair is a traversable neighbor), so multi-hop
@@ -936,12 +928,11 @@ pub const PathfindingSystem = struct {
                     return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.stitched_len };
                 }
                 // Agent's level is not yet covered by the corridor (e.g. it has not
-                // reached the start-level run): steer toward the stored first cell.
-                if (path.len != 0) {
-                    return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .path_len = result.path_len };
-                }
-                return .{ .status = .unavailable };
+                // reached the start-level run): steer toward the corridor's first cell.
+                const first_grid = self.graph.grid(stitched[0].level) orelse return .{ .status = .unavailable };
+                return .{ .status = .available, .next_waypoint = first_grid.cellCenter(stitched[0].cell), .path_len = result.stitched_len };
             }
+            const path = self.completed.pathSlice(slot, result.path_len);
             // Plain same-component local solve: derive a forward waypoint from the
             // agent's current cell against the stored path.
             if (result.path_level == start_level) {
@@ -998,9 +989,11 @@ pub const PathfindingSystem = struct {
         return solve_count;
     }
 
-    // Shared publish + compaction epilogue; finalizes the pending/deferred counts.
-    pub fn finishUpdate(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
+    // Shared publish + compaction epilogue; finalizes the pending/deferred counts. On a
+    // publish-reserve OOM nothing is published and pending is left intact for retry.
+    pub fn finishUpdate(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) !void {
         var publish_timer = PhaseTimer.begin();
+        try self.reservePublish();
         self.publishSolvedResults(stats);
         self.compactPendingAfterSolve(solve_count, stats);
         stats.publish_ns = publish_timer.lap();
@@ -1068,7 +1061,7 @@ pub const PathfindingSystem = struct {
             });
         }
         stats.solve_ns = solve_timer.lap();
-        self.finishUpdate(solve_count, &stats);
+        try self.finishUpdate(solve_count, &stats);
         return stats;
     }
 
@@ -1096,7 +1089,7 @@ pub const PathfindingSystem = struct {
         }
         stats.fallback_batch = inlineBatch(self.fallback_indices.items.len, pathfinding_range_alignment_items);
         stats.solve_ns = solve_timer.lap();
-        self.finishUpdate(solve_count, &stats);
+        try self.finishUpdate(solve_count, &stats);
         return stats;
     }
 
@@ -1677,15 +1670,38 @@ pub const PathfindingSystem = struct {
         }
     }
 
+    // The publish reserve: frees one result-cache long block per result this step that
+    // does not fit an inline stripe, so publishing allocates nothing. O(solve count).
+    fn reservePublish(self: *PathfindingSystem) !void {
+        var long_results: usize = 0;
+        for (self.solve_results.items, 0..) |result, ordinal| {
+            if (result != .available) continue;
+            const solved = self.solved_paths.items[ordinal];
+            if (types.storedPathWords(solved.len, solved.stitched_len) > self.completed.inline_words) long_results += 1;
+        }
+        const blocks_before = self.completed.long_block_count;
+        try self.completed.reserveLongBlocks(self.allocator, long_results);
+        if (self.completed.long_block_count == blocks_before) return;
+        self.long_block_grows += 1;
+        if (!self.long_block_growth_logged) {
+            self.long_block_growth_logged = true;
+            if (comptime logging.enabled(.info) and !builtin.is_test) logging.game.info(
+                "path cache long-block pool grew to {d} blocks",
+                .{self.completed.long_block_count},
+            );
+        }
+    }
+
     // Publishes in fallback-ordinal order, which is pending order (ordinals increase with
-    // the pending index).
+    // the pending index). Each path is copied whole; allocates nothing after reservePublish.
     fn publishSolvedResults(self: *PathfindingSystem, stats: *PathfindingStats) void {
         for (self.solve_results.items, 0..) |result, ordinal| {
             switch (result) {
                 .available => |key| {
                     const solved = self.solved_paths.items[ordinal];
-                    const path = self.worker_path_pool.items[solved.offset .. solved.offset + solved.len];
-                    const stitched = self.worker_stitched_pool.items[solved.stitched_offset .. solved.stitched_offset + solved.stitched_len];
+                    const stripe = self.worker_path_pool.items[solved.offset..];
+                    const path = stripe[0..solved.len];
+                    const stitched = types.stitchedCellsConst(stripe, solved.stitched_len);
                     self.completed.put(key, path, stitched, solved.path_level, self.step_counter, stats);
                     stats.solved_requests += 1;
                     stats.available_results += 1;
@@ -2753,6 +2769,8 @@ test "pathfinding threaded multi-worker solve has no steady-state allocation aft
     cap.max_fallback_requests_per_step = count;
     cap.max_cached_results = count * 2;
     cap.worker_participant_count = threads.participantSlotCount();
+    // Two-word inline stripes: every multi-cell path publishes into a long block.
+    cap.max_stored_path_cells = 2;
     try system.reserve(cap);
     try system.rebuildStaticNavGrid(&data, 512, 512, 32);
 
@@ -2789,6 +2807,9 @@ test "pathfinding threaded multi-worker solve has no steady-state allocation aft
     const stats = try system.update(&stream, count, &threads, .{ .adaptive = false, .items_per_range = 1 });
     try std.testing.expect(!stats.fallback_batch.ran_inline);
     try std.testing.expect(stats.fallback_batch.item_count > 0);
+    try std.testing.expect(stats.available_results > 0);
+    // Every published result took a long block from the pool the warm step grew.
+    try std.testing.expectEqual(stats.available_results, system.completed.long_block_count - system.completed.free_long_blocks.items.len);
 }
 
 test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
@@ -4820,7 +4841,7 @@ test "pathfinding per-frame solve budget stays fixed while queue and cache scale
     try std.testing.expectEqual(default_max_solves_per_frame, system.capacity.max_solved_requests_per_step);
     try std.testing.expectEqual(default_max_solves_per_frame, system.capacity.max_fallback_requests_per_step);
     // The worker path-pool stride sizes off the fixed solve ceiling, not population.
-    try std.testing.expectEqual(default_max_solves_per_frame * system.capacity.max_stored_path_cells, system.worker_path_pool.items.len);
+    try std.testing.expectEqual(default_max_solves_per_frame * types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells), system.worker_path_pool.items.len);
     try std.testing.expect(system.solve_results.capacity <= default_max_solves_per_frame * 2);
 }
 
@@ -5081,8 +5102,7 @@ fn expectPoolsFitLogicalCaps(system: *const PathfindingSystem) !void {
     try std.testing.expect(system.solved_paths.capacity >= cap.max_solved_requests_per_step);
     try std.testing.expect(system.rotate_back_scratch.capacity >= cap.max_solved_requests_per_step);
     try std.testing.expect(system.group_requests.capacity >= cap.max_solved_requests_per_step);
-    try std.testing.expect(system.worker_path_pool.items.len >= cap.max_solved_requests_per_step * cap.max_stored_path_cells);
-    try std.testing.expect(system.worker_stitched_pool.items.len >= cap.max_solved_requests_per_step * cap.max_stitched_path_cells);
+    try std.testing.expect(system.worker_path_pool.items.len >= cap.max_solved_requests_per_step * types.resultBlockWords(cap.max_explored_nodes, cap.max_stitched_path_cells));
     try std.testing.expectEqual(cap.max_pending_requests, system.effective_agent_capacity);
 }
 
@@ -5876,7 +5896,7 @@ test "solve results land at their fallback ordinal and publish in pending order"
     try std.testing.expectEqual(@as(usize, 1), stats.escalated_deferred);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, system.fallback_indices.items);
     try std.testing.expectEqual(@as(usize, 3), system.solve_results.items.len);
-    const stride = system.capacity.max_stored_path_cells;
+    const stride = types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells);
     for (system.solve_results.items, system.solved_paths.items, 0..) |result, solved, ordinal| {
         const key = keys[system.fallback_indices.items[ordinal]];
         try std.testing.expectEqualDeep(key, result.available);
@@ -5942,4 +5962,180 @@ test "pending compaction keeps deferred, tail, and rotated order across a ring w
     try std.testing.expect(!system.pending_keys.contains(keys[0]));
     try std.testing.expect(!system.pending_keys.contains(keys[3]));
     try std.testing.expectEqual(@as(usize, 1), stats.escalated_dropped);
+}
+
+// Solves `goals` from cellWorld(1, 2) in one serial step with the default budgets.
+fn solveIndividualGoals(system: *PathfindingSystem, requester: EntityId, goals: []const math.Vec2, agent_count: usize) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (goals) |goal| try appendIndividual(&stream, requester, goal);
+    return system.updateSerial(&stream, agent_count, .{});
+}
+
+// The stored cells of `goal`'s cached plain path, copied out.
+fn cachedPathCells(system: *const PathfindingSystem, goal: math.Vec2) !std.ArrayList(u32) {
+    const key = system.graph.keyForWorld(0, goal, .default).?;
+    const slot = system.completed.slotIndex(key) orelse return error.TestExpectedCachedPath;
+    var cells: std.ArrayList(u32) = .empty;
+    errdefer cells.deinit(std.testing.allocator);
+    try cells.appendSlice(std.testing.allocator, system.completed.pathSlice(slot, system.completed.resultAt(slot).path_len));
+    return cells;
+}
+
+test "pathfinding an elastic grow and shrink keep cached paths, negatives, and pending" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var system = try intakeTestSystem(&data, 512);
+    defer system.deinit();
+    try std.testing.expectEqual(min_capacity_floor, system.effective_agent_capacity);
+    const no_fallback = PathfindingConfig{ .max_fallback_requests_per_step = 0 };
+
+    // Two paths cached at the floor capacity, two more after a grow to 40 agents (their
+    // payloads sit above the floor's cache limit, so the shrink must move them).
+    const cached_goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 9), cellWorld(12, 4), cellWorld(3, 13) };
+    try std.testing.expectEqual(@as(usize, 2), (try solveIndividualGoals(&system, requester, cached_goals[0..2], 8)).available_results);
+    var before: [cached_goals.len]std.ArrayList(u32) = undefined;
+    var copied: usize = 0;
+    defer for (before[0..copied]) |*cells| cells.deinit(std.testing.allocator);
+    for (cached_goals[0..2]) |goal| {
+        before[copied] = try cachedPathCells(&system, goal);
+        copied += 1;
+    }
+
+    try system.growForAgentCount(40);
+    try std.testing.expect(system.effective_agent_capacity >= 40);
+    for (cached_goals[0..2], before[0..2]) |goal, cells| {
+        var after = try cachedPathCells(&system, goal);
+        defer after.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u32, cells.items, after.items);
+    }
+    try std.testing.expectEqual(@as(usize, 2), (try solveIndividualGoals(&system, requester, cached_goals[2..4], 40)).available_results);
+    for (cached_goals[2..4]) |goal| {
+        before[copied] = try cachedPathCells(&system, goal);
+        copied += 1;
+    }
+
+    // A definitive negative and two requests left pending.
+    const negative_goal = cellWorld(14, 14);
+    _ = system.unavailable.insert(system.graph.keyForWorld(0, negative_goal, .default).?);
+    const pending_goals = [_]math.Vec2{ cellWorld(9, 12), cellWorld(2, 7) };
+    var pending_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer pending_stream.deinit();
+    for (pending_goals) |goal| try appendIndividual(&pending_stream, requester, goal);
+    _ = try system.updateSerial(&pending_stream, 40, no_fallback);
+
+    // Sustained low load shrinks back to the floor.
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    for (0..system.capacity.capacity_shrink_window) |_| _ = try system.updateSerial(&empty, 1, no_fallback);
+    try std.testing.expectEqual(min_capacity_floor, system.effective_agent_capacity);
+
+    for (cached_goals, before) |goal, cells| {
+        var after = try cachedPathCells(&system, goal);
+        defer after.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u32, cells.items, after.items);
+        try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
+    }
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, cellWorld(1, 2), 0, negative_goal, .default, null).status);
+    for (pending_goals) |goal| {
+        try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
+    }
+
+    // Re-requesting the cached goals hits the cache: no re-solve.
+    var again = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer again.deinit();
+    for (cached_goals) |goal| try appendIndividual(&again, requester, goal);
+    const again_stats = try system.updateSerial(&again, 8, no_fallback);
+    try std.testing.expectEqual(cached_goals.len, again_stats.cache_hits);
+    try std.testing.expectEqual(@as(usize, 0), again_stats.solved_requests);
+}
+
+test "pathfinding result publish after its reserve allocates nothing (FailingAllocator)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    // Two-word inline stripes: every multi-cell path is a long result.
+    var capacity = baselineCapacity();
+    capacity.max_stored_path_cells = 2;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+    const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 9), cellWorld(12, 4), cellWorld(3, 13) };
+
+    // Warm: the first publish grows the long pool at its reserve.
+    try std.testing.expectEqual(goals.len, (try solveIndividualGoals(&system, requester, &goals, 8)).available_results);
+    try std.testing.expect(system.completed.long_block_count >= goals.len);
+    const grows = system.long_block_grows;
+    try std.testing.expect(grows >= 1);
+
+    // Cleared (every block free again), the same results publish on a failing allocator.
+    system.completed.clear();
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    defer {
+        system.allocator = original;
+        system.graph.allocator = original;
+    }
+    const stats = try solveIndividualGoals(&system, requester, &goals, 8);
+    try std.testing.expectEqual(goals.len, stats.available_results);
+    try std.testing.expectEqual(grows, system.long_block_grows);
+    for (goals) |goal| {
+        var cells = try cachedPathCells(&system, goal);
+        defer cells.deinit(std.testing.allocator);
+        // Stored whole: the path runs from the start cell to the goal cell, past the stripe.
+        const grid = system.graph.grid(0).?;
+        try std.testing.expect(cells.items.len > capacity.max_stored_path_cells);
+        try std.testing.expectEqual(@as(u32, @intCast(grid.indexForCell(grid.worldToCellClamped(cellWorld(1, 2))).?)), cells.items[0]);
+        try std.testing.expectEqual(@as(u32, @intCast(grid.indexForCell(grid.worldToCellClamped(goal)).?)), cells.items[cells.items.len - 1]);
+    }
+}
+
+test "pathfinding a publish reserve out of memory publishes nothing and leaves pending for retry (FailingAllocator)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    // Two-word inline stripes: every multi-cell path is a long result.
+    var capacity = baselineCapacity();
+    capacity.max_stored_path_cells = 2;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+
+    // Warm the step on a one-cell (inline) result, then clear: the long pool stays empty.
+    try std.testing.expectEqual(@as(usize, 1), (try solveIndividualGoals(&system, requester, &.{cellWorld(1, 2)}, 8)).available_results);
+    system.completed.clear();
+    try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
+
+    const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 9), cellWorld(12, 4) };
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    const failed = solveIndividualGoals(&system, requester, &goals, 8);
+    system.allocator = original;
+    system.graph.allocator = original;
+    try std.testing.expectError(error.OutOfMemory, failed);
+
+    try std.testing.expectEqual(@as(usize, 0), system.completed.len);
+    try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
+    try std.testing.expectEqual(goals.len, system.pending.len);
+    for (goals) |goal| {
+        try std.testing.expect(system.pending_keys.contains(system.graph.keyForWorld(0, goal, .default).?));
+        try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
+    }
+
+    // With memory back, the next step publishes the same requests without new intake.
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    const retry = try system.updateSerial(&empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 0), retry.accepted_requests);
+    try std.testing.expectEqual(goals.len, retry.available_results);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expect(system.long_block_grows >= 1);
+    for (goals) |goal| {
+        try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
+    }
 }

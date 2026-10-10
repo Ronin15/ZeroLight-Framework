@@ -763,7 +763,8 @@ the pending cap); `group_field_expand` runs each building field's budgeted
 expansion as one item, in an advance pass before the main-thread slot
 decisions and a begin pass after them; the solve batch keeps branch-heavy A*
 frontier expansion scalar inside threaded ranges and writes every output at the
-request's fallback ordinal; publish is a serial, fixed-count ordered commit.
+request's fallback ordinal; publish is a serial, fixed-count ordered commit that
+copies each result whole into the cache after one long-block reserve.
 Pending is a ring, so compaction costs the solve window, not the queue. Path results
 are consumed on later fixed steps so missing or unreachable paths do not stall
 same-step movement. Cache and pending keys are goal-keyed
@@ -806,7 +807,17 @@ query time. The managed flow field is built only on declared group requests
 once per `group_field_rebuild_min_steps`, and budgeted across frames by
 `group_field_build_budget`. Completed-path, unavailable-key, and group-field
 registries are fixed-capacity runtime structures with explicit eviction or
-saturation behavior rather than unbounded growth.
+saturation behavior rather than unbounded growth. Cached paths are stored exactly,
+never downsampled: each entry owns an inline stripe of `max_stored_path_cells` words
+(a plain path of up to that many cells, or a stitched path of half as many), and a
+longer result takes one long block (`resultBlockWords`: the longest plain or
+stitched result) from a pool the publish reserve grows, at most one block per entry,
+so a live entry is never evicted for path storage. Removal returns a block to the
+pool's free list; a shrink releases the memory of blocks no live entry holds. An
+elastic resize keeps cached paths and negatives: a grow rehashes the probe slots, and
+a shrink evicts oldest first (steps since the stamp, then payload index) until the
+entries fit, then moves high payloads and long blocks down, so a grow costs no
+re-solves and a shrink re-solves only the entries it evicted.
 
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects are

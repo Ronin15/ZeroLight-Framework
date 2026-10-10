@@ -52,8 +52,9 @@ pub const open_heap_headroom_factor: usize = 4;
 pub fn openHeapLimit(node_budget: usize) usize {
     return @max(@as(usize, 16), node_budget *| open_heap_headroom_factor);
 }
-// Cap on the stored path length per cached individual result. Longer paths are
-// downsampled by stride so a moving agent can still derive a forward waypoint.
+// Words of the inline path stripe each cached result owns: a plain path of up to this
+// many cells, or a stitched path of half as many, is stored inline; a longer result is
+// stored whole in a long block (`resultBlockWords`).
 pub const default_max_stored_path_cells: usize = 512;
 // Demand-driven managed shared-goal flow fields.
 pub const default_max_group_fields: usize = 4;
@@ -744,17 +745,51 @@ pub const PendingRing = struct {
 // inter-level link the level changes between consecutive cells (a discrete jump,
 // the only non-adjacent step). The query walks the run matching the agent's current
 // level cell by cell, exactly like a single-level individual A* path.
-pub const StitchedCell = struct {
+// Extern so stored paths can hold it in `u32` words (`stitched_cell_words` each).
+pub const StitchedCell = extern struct {
     level: u16,
     cell: u32,
 };
 
+/// `u32` words one `StitchedCell` occupies in a stored path.
+pub const stitched_cell_words: usize = @sizeOf(StitchedCell) / @sizeOf(u32);
+
+/// Words of one solve-output stripe and of one result-cache long block: the longest plain
+/// path a local solve can return (one cell per explored node) or the longest stitched path.
+pub fn resultBlockWords(max_explored_nodes: usize, max_stitched_path_cells: usize) usize {
+    return @max(@as(usize, 1), @max(max_explored_nodes, max_stitched_path_cells *| stitched_cell_words));
+}
+
+/// Words a stored result occupies: one per plain cell, `stitched_cell_words` per stitched cell.
+pub fn storedPathWords(path_len: usize, stitched_len: usize) usize {
+    return if (stitched_len != 0) stitched_len * stitched_cell_words else path_len;
+}
+
+/// `words` viewed as stitched cells (the first `stitched_cell_words * len` words).
+pub fn stitchedCells(words: []u32, len: usize) []StitchedCell {
+    std.debug.assert(len * stitched_cell_words <= words.len);
+    // Extern StitchedCell is u32-aligned and `stitched_cell_words` words long.
+    const cells: [*]StitchedCell = @ptrCast(words.ptr);
+    return cells[0..len];
+}
+
+pub fn stitchedCellsConst(words: []const u32, len: usize) []const StitchedCell {
+    std.debug.assert(len * stitched_cell_words <= words.len);
+    // Extern StitchedCell is u32-aligned and `stitched_cell_words` words long.
+    const cells: [*]const StitchedCell = @ptrCast(words.ptr);
+    return cells[0..len];
+}
+
+comptime {
+    std.debug.assert(@alignOf(StitchedCell) == @alignOf(u32));
+    std.debug.assert(@sizeOf(StitchedCell) == stitched_cell_words * @sizeOf(u32));
+}
+
 pub const PathResult = struct {
     key: PathQueryKey,
-    // Plain-path cells (start-to-goal order) for a same-component local solve,
-    // stored in the cache slot's path buffer and indexed on path_level. u32 (not usize):
-    // cell counts are bounded by max_stored_path_cells, and this struct is stored in
-    // every cache slot (up to max_agent_budget of them), so the narrower field matters.
+    // Plain-path cells (start-to-goal order) for a same-component local solve, indexed
+    // on path_level; zero for a stitched result. u32: a path is bounded by the solve's
+    // node budget.
     path_len: u32,
     // Level the plain path cells index into (equals key.goal_level for a local solve).
     path_level: u16 = 0,
@@ -764,33 +799,6 @@ pub const PathResult = struct {
     // stitched from per-segment local A* and walked per-agent on its current level.
     stitched_len: u32 = 0,
 };
-
-// Copies a plain (same-component, single-level) path into `dst`, stride-downsampling
-// when `src` is longer than `dst` so the stored cells still span start->goal and keep
-// forward direction within the budget. Returns the cell count written. Head-truncating
-// instead would dead-end the agent at the stride boundary (no successor cell -> stall
-// until the cache TTL re-solves); downsampling keeps it progressing across the whole
-// span. Downsampled cells are NOT guaranteed grid-adjacent, so this is only valid for
-// the plain path the query treats as approximate — the abstract stitched corridor is
-// stored whole. Shared by the worker solve buffer (recordPath) and the result cache
-// (writePath) so both follow one contract.
-pub fn downsamplePathInto(dst: []u32, src: []const u32) usize {
-    if (src.len <= dst.len) {
-        @memcpy(dst[0..src.len], src);
-        return src.len;
-    }
-    if (dst.len <= 1) {
-        // A single-cell (or empty) budget can only keep the start; also guards the
-        // dst.len - 1 divisor below.
-        if (dst.len == 1) dst[0] = src[0];
-        return dst.len;
-    }
-    for (0..dst.len) |i| {
-        const src_index = (i * (src.len - 1)) / (dst.len - 1);
-        dst[i] = src[src_index];
-    }
-    return dst.len;
-}
 
 pub const PathSolveResult = union(enum) {
     // Successful solve; its solved path sits at the same fallback ordinal.
@@ -1056,6 +1064,18 @@ pub fn ListResize(comptime T: type) type {
             list.* = replacement;
             self.replacement = null;
         }
+
+        /// Infallible: like `commit`, but the list keeps its first `min(len, new_len)`
+        /// items (copied into a shrink replacement) and ends at `new_len` items; items
+        /// past the old length are undefined. `new_len` is at most the prepared capacity.
+        pub fn commitResized(self: *Self, list: *std.ArrayList(T), allocator: std.mem.Allocator, new_len: usize) void {
+            if (self.replacement) |*replacement| {
+                replacement.appendSliceAssumeCapacity(list.items[0..@min(list.items.len, new_len)]);
+            }
+            self.commit(list, allocator);
+            std.debug.assert(list.capacity >= new_len);
+            list.items.len = new_len;
+        }
     };
 }
 
@@ -1091,30 +1111,6 @@ test "octileCells and octileXY saturate identically instead of one silently wrap
     // A delta far beyond any real grid saturates to maxInt(u32) rather than wrapping.
     const huge: i32 = std.math.maxInt(i32);
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), octileXY(0, 0, huge, huge));
-}
-
-test "downsamplePathInto preserves start/goal and handles degenerate dst lengths" {
-    // src fits: exact copy, no downsampling.
-    var exact: [4]u32 = undefined;
-    try std.testing.expectEqual(@as(usize, 3), downsamplePathInto(exact[0..3], &.{ 10, 11, 12 }));
-    try std.testing.expectEqualSlices(u32, &.{ 10, 11, 12 }, exact[0..3]);
-
-    // dst.len == 0: guarded before the (dst.len - 1) divisor; returns 0 without touching dst.
-    var zero_dst: [0]u32 = .{};
-    try std.testing.expectEqual(@as(usize, 0), downsamplePathInto(&zero_dst, &.{ 1, 2, 3 }));
-
-    // dst.len == 1: keeps only the start cell (never the goal), per the single-cell-budget
-    // guard, and does not evaluate the (dst.len - 1) divisor.
-    var one_dst: [1]u32 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), downsamplePathInto(&one_dst, &.{ 7, 8, 9 }));
-    try std.testing.expectEqual(@as(u32, 7), one_dst[0]);
-
-    // src longer than dst: downsampled but start and goal are always preserved exactly.
-    var short_dst: [3]u32 = undefined;
-    const long_src = [_]u32{ 20, 21, 22, 23, 24, 25, 26 };
-    try std.testing.expectEqual(@as(usize, 3), downsamplePathInto(&short_dst, &long_src));
-    try std.testing.expectEqual(@as(u32, 20), short_dst[0]);
-    try std.testing.expectEqual(@as(u32, 26), short_dst[2]);
 }
 
 test "tileIndexClamped handles degenerate count, negative, and non-finite input" {

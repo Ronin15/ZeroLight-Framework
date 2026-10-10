@@ -1412,9 +1412,14 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     // queue.
     const portal_cap = 4 * chunk_tiles + 2 * config.links;
     const build = participants * (portal_cap * portal_cap * 12 + portal_cap * 4 + chunk_tiles * chunk_tiles * 8);
-    // Result cache and worker stripes: plain path cells (4 B) and stitched cells (8 B).
-    const results = cached_results * stored_path_cells * 4 + solves_per_step * stored_path_cells * 4 +
-        (cached_results + solves_per_step) * stitched_path_cells * 8;
+    // Result cache, per entry: two 24 B probe slots, a 20 B payload, a 4 B free index, a
+    // 16 B eviction-scratch key, and the inline stripe (4 B per stored path cell). A block
+    // holds the longest plain (explored nodes, 4 B) or stitched (8 B) path: one worker
+    // stripe per solve slot, and the long pool's worst case of one block (plus a 4 B free
+    // index) per cached result.
+    const result_block_bytes = @max(explored_nodes * 4, stitched_path_cells * 8);
+    const results = cached_results * (2 * 24 + 20 + 4 + 16 + stored_path_cells * 4) + solves_per_step * result_block_bytes +
+        cached_results * (result_block_bytes + 4);
     // Abstract graph: 4 portal slots per chunk side cell plus two per link on every level,
     // a cell-to-portal word per cell, 32 B of slot arrays per slot, per-chunk lengths and
     // geometry, and an edge arena of 8 edges per slot plus 32 per chunk, doubled, beside
