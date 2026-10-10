@@ -267,11 +267,8 @@ pub const NavCellEdit = struct {
 pub const NavMarkKind = enum(u8) {
     /// An inclusive world tile box (tile and obstacle events).
     tile_box,
-    /// An inclusive nav-cell span a static body covered or covers: the level-0 static
-    /// coverage over it is re-derived before the remask.
+    /// An inclusive nav-cell span a static collider covered or covers.
     static_span,
-    /// The whole level, with the level's static coverage rebuilt.
-    level,
 };
 
 /// One recorded nav change, consumed by the next nav batch. Coordinates are inclusive.
@@ -388,16 +385,6 @@ pub const ChunkGeometry = struct {
         return ct * ct + 1;
     }
 };
-
-// Tile index containing a world coordinate, clamped to [0, count-1]. Negatives map
-// to 0; the float floor guards against the inf/NaN illegal-behavior trap.
-pub fn tileIndexClamped(value: f32, tile_size: f32, count: u16) u16 {
-    if (count == 0) return 0; // empty grid: no valid index, and guards clamp(.,0,-1)
-    if (!(value > 0)) return 0;
-    const idx = math.floorToI32(value / tile_size);
-    const max_index: i32 = @as(i32, @intCast(count)) - 1;
-    return @intCast(std.math.clamp(idx, 0, max_index));
-}
 
 /// Goal-keyed query identity. nav_version invalidates old work on rebuild without
 /// pointer comparisons. The start cell is intentionally absent so a moving agent
@@ -1091,20 +1078,6 @@ test "octileU32 equals octileXY on small coordinates and stays exact past the i3
     const far: u32 = std.math.maxInt(u32) - 3;
     try std.testing.expectEqual(@as(u32, diagonal_cost + 2 * cardinal_cost), octileU32(far, 1, far + 3, 0));
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), octileU32(0, 0, far, far));
-}
-
-test "tileIndexClamped handles degenerate count, negative, and non-finite input" {
-    // Zero-sized grid: no valid index; also guards clamp(., 0, -1) below.
-    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(100, 32, 0));
-    // Non-positive value (including a would-be-negative tile) clamps to 0.
-    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(-5, 32, 10));
-    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(0, 32, 10));
-    // NaN fails every comparison, including `> 0`, so it also clamps to 0 rather than
-    // reaching the illegal-behavior floorToI32(NaN) path.
-    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(std.math.nan(f32), 32, 10));
-    // In-range value maps to its tile; a value past the last tile clamps to count-1.
-    try std.testing.expectEqual(@as(u16, 3), tileIndexClamped(100, 32, 10));
-    try std.testing.expectEqual(@as(u16, 9), tileIndexClamped(1_000_000, 32, 10));
 }
 
 test "lessNode ties break deterministically on f, then h, then index" {

@@ -12,7 +12,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const logging = @import("../../../core/logging.zig");
-const DataSystem = @import("../../data_system.zig").DataSystem;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
 const validateChunkGrid = @import("../../world_system.zig").validateChunkGrid;
 const max_chunk_size_tiles = @import("../../world_system.zig").max_chunk_size_tiles;
@@ -26,6 +25,9 @@ const JobFn = @import("../../../app/thread_system.zig").JobFn;
 const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
+const no_block = @import("nav_grid.zig").no_block;
+const ColliderView = @import("../static_colliders.zig").ColliderView;
+const ColliderGeometry = @import("../static_colliders.zig").ColliderGeometry;
 const types = @import("types.zig");
 const default_cell_size = types.default_cell_size;
 const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
@@ -237,6 +239,8 @@ pub const NavLevelGraph = struct {
         std.debug.assert(total < no_record);
         if (total > self.records.capacity) {
             try self.records.ensureTotalCapacity(allocator, @max(total, self.records.capacity *| 2));
+            // The pool moved: the column views follow it before anything else can fail.
+            self.refreshColumns();
             pool_grows.* += 1;
         }
         try self.border.ensureTotalCapacity(allocator, self.records.capacity * self.border_stride);
@@ -258,6 +262,8 @@ pub const NavLevelGraph = struct {
         std.debug.assert(total < no_link_slot);
         if (total > self.link_slots.capacity) {
             try self.link_slots.ensureTotalCapacity(allocator, @max(total, self.link_slots.capacity *| 2));
+            // The pool moved: the column views follow it before anything else can fail.
+            self.refreshColumns();
             pool_grows.* += 1;
         }
         try self.link_free.ensureTotalCapacity(allocator, self.link_slots.capacity);
@@ -312,17 +318,9 @@ pub const NavLevelGraph = struct {
 // simulation_scope.zig and spatial_index.zig.
 const thread_shared_record_alignment: usize = 64;
 
-// Per-participant BFS queue for the remask's chunk-local component flood, sized to one
-// chunk's cells. One slot per participant so chunks re-flood in parallel; the inline path
-// uses slot 0. Aligned to a cache line so adjacent slots never share one.
-const ChunkRemaskScratch = struct {
-    queue: std.ArrayList(usize) align(thread_shared_record_alignment) = .empty,
-
-    comptime {
-        std.debug.assert(@alignOf(ChunkRemaskScratch) == thread_shared_record_alignment);
-        std.debug.assert(@sizeOf(ChunkRemaskScratch) % thread_shared_record_alignment == 0);
-    }
-};
+// A changed key's remask slot before the commit claims it: the chunk may end mixed and
+// holds no cell block yet.
+const claim_pending: u32 = no_block - 1;
 
 // Threading for one batch stage (remask or patch): the shared thread system plus that
 // stage's own tuner. `adaptive`/`items_per_range` let a bench pin a fixed partition.
@@ -492,33 +490,30 @@ const BatchLevels = struct {
     }
 };
 
-// One range of the remask stage: each key re-derives its own chunk's cells and labels and
-// writes its blocked-count delta at its item index.
+// One range of the remask stage: each key composes its own chunk's cells from the world and
+// the colliders listed there, writes them (and its labels) into its own directory entry and
+// claimed block, and adds its new blocked count to its item's delta.
 const RemaskJob = struct {
     levels: BatchLevels,
-    data: *const DataSystem,
+    colliders: ColliderView,
     world: ?*const WorldSystem,
     keys: []const u64,
+    slots: []const u32,
     deltas: []i32,
-    scratch: []ChunkRemaskScratch,
     range_count: usize = 0,
 };
 
-fn remaskJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
+fn remaskJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *RemaskJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= job.keys.len and range.end <= job.deltas.len);
-    // The batch reserve sized the scratch to the dispatching thread system's participants.
-    std.debug.assert(worker_id.index < job.scratch.len);
-    const queue = &job.scratch[worker_id.index].queue;
+    std.debug.assert(range.end <= job.keys.len and range.end <= job.slots.len and range.end <= job.deltas.len);
     for (range.start..range.end) |item| {
         const key = job.keys[item];
         const grid = job.levels.grid(keyLevel(key));
-        const delta = grid.remaskChunkFromWorld(keyChunk(key), job.data, job.world);
+        const bits = grid.composeChunk(keyChunk(key), job.world, job.colliders);
         // A chunk holds at most max_chunk_size_tiles^2 cells.
-        job.deltas[item] = @intCast(delta);
-        grid.recomputeChunkComponents(keyChunk(key), queue);
+        job.deltas[item] += @intCast(grid.writeChunk(keyChunk(key), job.slots[item], bits));
     }
 }
 
@@ -609,6 +604,40 @@ pub const NavExtent = union(enum) {
     world: *const WorldSystem,
     /// One world-less level over a `width` x `height` rect cut into `cell_size` cells.
     bounds: struct { width: f32, height: f32, cell_size: f32, chunk_tiles: u16 },
+
+    /// The cell grid a build over this extent uses; the static colliders a nav reads must
+    /// be placed on it. Fails loudly (`ChunkGridError`) when its index widths do not fit.
+    pub fn colliderGeometry(self: NavExtent) !ColliderGeometry {
+        const cells = self.cellGrid();
+        try validateChunkGrid(cells.width, cells.height, cells.chunk_tiles);
+        // `validateChunkGrid` keeps the cell count below 2^32, so each side fits u32.
+        return .{ .cell_size = cells.cell_size, .width = @intCast(cells.width), .height = @intCast(cells.height), .chunk_tiles = cells.chunk_tiles };
+    }
+
+    const CellGrid = struct { cell_size: f32, width: usize, height: usize, chunk_tiles: u16 };
+
+    fn cellGrid(self: NavExtent) CellGrid {
+        return switch (self) {
+            // A nav cell is a tile and a nav chunk the world's chunk.
+            .world => |world_system| blk: {
+                std.debug.assert(std.math.isFinite(world_system.tile_size) and world_system.tile_size > 0);
+                break :blk .{ .cell_size = world_system.tile_size, .width = world_system.width, .height = world_system.height, .chunk_tiles = world_system.chunk_size_tiles };
+            },
+            // A 0/negative/non-finite cell_size or bound would make @intFromFloat see
+            // inf/NaN (illegal behavior); degenerate config collapses to a 1x1 grid.
+            .bounds => |bounds| blk: {
+                const cell_size: f32 = if (std.math.isFinite(bounds.cell_size) and bounds.cell_size > 0) bounds.cell_size else 1.0;
+                const safe_w: f32 = if (std.math.isFinite(bounds.width) and bounds.width > 0) bounds.width else 0;
+                const safe_h: f32 = if (std.math.isFinite(bounds.height) and bounds.height > 0) bounds.height else 0;
+                break :blk .{
+                    .cell_size = cell_size,
+                    .width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_w / cell_size)))),
+                    .height = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_h / cell_size)))),
+                    .chunk_tiles = bounds.chunk_tiles,
+                };
+            },
+        };
+    }
 };
 
 // Per-level cell grids and chunk records, built from a world (or bounds) and changed only
@@ -632,10 +661,12 @@ pub const NavGraph = struct {
     links_applied: usize = 0,
     // The world-wide content revision every level was last checked against.
     built_world_revision: u32 = 0,
-    remask_scratch: std.ArrayList(ChunkRemaskScratch) = .empty,
     // Batch buffers, reused across batches. `batch_spans` is the last marks batch's changed
     // cell spans plus a one-cell halo and its new link endpoints, valid until the next batch.
     changed_keys: KeyList = .empty,
+    // Per changed key: the block slot its remask may fill (`no_block` when it can only end
+    // uniform) and its blocked-count delta.
+    remask_slots: std.ArrayList(u32) = .empty,
     remask_deltas: std.ArrayList(i32) = .empty,
     patch_keys: KeyList = .empty,
     // The batch result's keys: the changed keys plus both endpoint chunks of each new link.
@@ -669,9 +700,8 @@ pub const NavGraph = struct {
         self.patch_info.deinit(self.allocator);
         self.patch_keys.deinit(self.allocator);
         self.remask_deltas.deinit(self.allocator);
+        self.remask_slots.deinit(self.allocator);
         self.changed_keys.deinit(self.allocator);
-        for (self.remask_scratch.items) |*scratch| scratch.queue.deinit(self.allocator);
-        self.remask_scratch.deinit(self.allocator);
         for (self.level_graphs.items) |*level_graph| level_graph.deinit(self.allocator);
         self.level_graphs.deinit(self.allocator);
         for (self.levels.items) |*level_grid| level_grid.deinit(self.allocator);
@@ -729,20 +759,15 @@ pub const NavGraph = struct {
             self.patch_keys.capacity * @sizeOf(u64) +
             self.dirty_keys.capacity * @sizeOf(u64) +
             self.remask_deltas.capacity * @sizeOf(i32) +
+            self.remask_slots.capacity * @sizeOf(u32) +
             self.patch_info.capacity * @sizeOf(PatchInfo) +
             self.batch_spans.capacity * @sizeOf(ChangedSpan) +
             self.plan_windows.capacity * @sizeOf(PlanWindow) +
             self.plan_tallies.capacity * @sizeOf(PlanTally) +
             self.merge_heap.capacity * @sizeOf(MergeHead);
         for (self.plan_staging) |staging| bytes += staging.capacity * @sizeOf(u64);
-        for (self.levels.items) |level_grid| {
-            bytes += level_grid.blocked.capacity * @sizeOf(bool) +
-                level_grid.components.capacity * @sizeOf(u32) +
-                level_grid.component_queue.capacity * @sizeOf(usize) +
-                level_grid.static_blocked.capacity * @sizeOf(bool);
-        }
+        for (self.levels.items) |*level_grid| bytes += level_grid.residentBytes();
         for (self.level_graphs.items) |*level_graph| bytes += level_graph.residentBytes();
-        for (self.remask_scratch.items) |scratch| bytes += scratch.queue.capacity * @sizeOf(usize);
         return bytes;
     }
 
@@ -788,40 +813,29 @@ pub const NavGraph = struct {
 
     // Rebuilds every level into a fresh graph and swaps it in. The previous graph stays
     // intact until every level built, so an error leaves it unchanged. Bumps `version`.
+    // `colliders` must be placed on this extent's cell grid (`NavExtent.colliderGeometry`).
     pub fn rebuild(
         self: *NavGraph,
-        data: *const DataSystem,
+        colliders: ColliderView,
         extent: NavExtent,
-        participant_count: usize,
         threads: ?NavUpdateThreads,
     ) !void {
         const world: ?*const WorldSystem = switch (extent) {
             .world => |world_system| world_system,
             .bounds => null,
         };
-        const safe_cell_size: f32, const width: usize, const height: usize, const chunk_tiles: u16 = switch (extent) {
-            // A nav cell is a tile and a nav chunk the world's chunk.
-            .world => |world_system| blk: {
-                std.debug.assert(std.math.isFinite(world_system.tile_size) and world_system.tile_size > 0);
-                break :blk .{ world_system.tile_size, world_system.width, world_system.height, world_system.chunk_size_tiles };
-            },
-            // A 0/negative/non-finite cell_size or bound would make @intFromFloat see
-            // inf/NaN (illegal behavior); degenerate config collapses to a 1x1 grid.
-            .bounds => |bounds| blk: {
-                const cell_size: f32 = if (std.math.isFinite(bounds.cell_size) and bounds.cell_size > 0) bounds.cell_size else 1.0;
-                const safe_w: f32 = if (std.math.isFinite(bounds.width) and bounds.width > 0) bounds.width else 0;
-                const safe_h: f32 = if (std.math.isFinite(bounds.height) and bounds.height > 0) bounds.height else 0;
-                break :blk .{
-                    cell_size,
-                    @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_w / cell_size)))),
-                    @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_h / cell_size)))),
-                    bounds.chunk_tiles,
-                };
-            },
-        };
+        const cells = extent.cellGrid();
+        const safe_cell_size = cells.cell_size;
+        const width = cells.width;
+        const height = cells.height;
+        const chunk_tiles = cells.chunk_tiles;
         // Cell indices and chunk labels are u32 below `no_cell`; fail loud before any
         // dimension is stored or array sized.
         try validateChunkGrid(width, height, chunk_tiles);
+        if (colliders.geometry) |geometry| {
+            std.debug.assert(geometry.cell_size == safe_cell_size and geometry.width == width and
+                geometry.height == height and geometry.chunk_tiles == chunk_tiles);
+        }
 
         var version = self.version +% 1;
         if (version == 0) version = 1;
@@ -835,13 +849,12 @@ pub const NavGraph = struct {
             .world_backed = world != null,
         };
         errdefer fresh.deinit();
-        try fresh.reserveRemaskScratch(participant_count);
         // A world builds exactly its levels; bounds build one.
         const level_count: usize = if (world) |world_system| world_system.levelCount() else 1;
         try fresh.levels.ensureTotalCapacity(self.allocator, level_count);
         try fresh.level_graphs.ensureTotalCapacity(self.allocator, level_count);
         var stats = NavUpdateStats{};
-        for (0..level_count) |level| try fresh.buildLevel(data, world, @intCast(level), threads, &stats);
+        for (0..level_count) |level| try fresh.buildLevel(colliders, world, @intCast(level), threads, &stats);
         if (world) |world_system| {
             fresh.links_applied = world_system.levelLinks().len;
             fresh.built_world_revision = world_system.contentRevision();
@@ -854,32 +867,16 @@ pub const NavGraph = struct {
             logging.game.info("nav built: {} levels, {} resident bytes", .{ self.levels.items.len, self.residentBytes() });
     }
 
-    // Grows the per-participant remask scratch to `participants` slots, each queue holding
-    // one chunk's cells. Main thread, before a dispatch.
-    fn reserveRemaskScratch(self: *NavGraph, participants: usize) !void {
-        const count = @max(@as(usize, 1), participants);
-        try self.remask_scratch.ensureTotalCapacity(self.allocator, count);
-        while (self.remask_scratch.items.len < count) self.remask_scratch.appendAssumeCapacity(.{});
-        const chunk_cells = @as(usize, self.chunk_tiles) * self.chunk_tiles;
-        for (self.remask_scratch.items) |*scratch| try scratch.queue.ensureTotalCapacity(self.allocator, chunk_cells);
-    }
-
-    fn reserveStageScratch(self: *NavGraph, threads: ?NavUpdateThreads) !void {
-        const participants: usize = if (threads) |t| t.thread_system.participantSlotCount() else 1;
-        try self.reserveRemaskScratch(participants);
-    }
-
     /// Builds level `level_index` from `world` (or bounds when null) into fresh storage and
     /// swaps it in: appended when `level_index == levelCount()`, else replacing that level and
     /// freeing the old one. An error leaves the graph unchanged. O(chunks of the level); the
     /// remask and patch stages thread over its chunks. Never touches `links_applied`.
-    pub fn buildLevel(self: *NavGraph, data: *const DataSystem, world: ?*const WorldSystem, level_index: u16, threads: ?NavUpdateThreads, stats: *NavUpdateStats) !void {
+    pub fn buildLevel(self: *NavGraph, colliders: ColliderView, world: ?*const WorldSystem, level_index: u16, threads: ?NavUpdateThreads, stats: *NavUpdateStats) !void {
         std.debug.assert(@as(usize, level_index) <= self.levels.items.len);
         const chunk_count = self.chunkCount();
         var fresh_grid = NavGrid{};
         errdefer fresh_grid.deinit(self.allocator);
         try fresh_grid.prepare(self.allocator, level_index, self.width, self.height, self.cell_size, self.chunk_tiles);
-        if (level_index == 0) try fresh_grid.markStaticBodies(self.allocator, data);
         var fresh_graph = NavLevelGraph{ .border_stride = borderPortalBound(self.chunk_tiles) };
         errdefer fresh_graph.deinit(self.allocator);
         try setLen(&fresh_graph.record_dir, self.allocator, chunk_count);
@@ -908,12 +905,11 @@ pub const NavGraph = struct {
             .fresh = .{ .index = level_index, .grid = &fresh_grid, .graph = &fresh_graph },
         };
         try self.planPatchInfo(world);
-        try setLen(&self.remask_deltas, self.allocator, chunk_count);
-        try self.reserveStageScratch(threads);
+        try self.reserveCellBlocks(levels, world, colliders);
         try self.reserveRecords(levels);
 
         // Commit.
-        self.remaskKeys(levels, data, world, remaskThreads(threads), stats);
+        self.remaskKeys(levels, colliders, world, remaskThreads(threads), stats);
         self.claimRecords(levels);
         self.patchKeys(levels, world, patchThreads(threads), stats);
         _ = self.releaseRecords(levels);
@@ -941,18 +937,17 @@ pub const NavGraph = struct {
     }
 
     /// Prepares `marks` and every link added since the last batch as one transaction, the
-    /// fallible half: plan (changed, dirty, and patch keys) and reserve (records, link slots,
-    /// scratch). No cell, label, or record changes, so a failed or aborted prepare leaves the
-    /// graph and `links_applied` as they were; reserved pool entries stay free capacity. One
-    /// exception: a whole-level mark rebuilds level 0's static coverage cache here (it may
-    /// fail), which then holds the current statics ahead of the mask until the commit or the
-    /// retry remasks. Null when there is nothing to apply. Follow with exactly one
-    /// `commitMarks` or `abortMarks`. Each referenced level must be built. O(marked chunks log
-    /// + their records + new link endpoints) on the main thread, the key plan threaded.
+    /// fallible half: plan (changed, dirty, and patch keys) and reserve (cell blocks, records,
+    /// link slots). No cell, label, or record changes, so a failed or aborted prepare leaves
+    /// the graph and `links_applied` as they were; reserved pool entries stay free capacity.
+    /// Null when there is nothing to apply. Follow with exactly one `commitMarks` or
+    /// `abortMarks`, with the same `colliders`. Each referenced level must be built.
+    /// O(marked chunks log + their records + new link endpoints) on the main thread, the key
+    /// plan threaded.
     pub fn prepareMarks(
         self: *NavGraph,
-        data: *const DataSystem,
         world: *const WorldSystem,
+        colliders: ColliderView,
         marks: []const NavMark,
         threads: ?NavUpdateThreads,
         stats: *NavUpdateStats,
@@ -968,38 +963,25 @@ pub const NavGraph = struct {
         };
         try self.planKeys(world, marks, new_links, planThreads(threads), stats);
         if (self.patch_keys.items.len != 0) {
+            const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
             try self.planPatchInfo(prepared.world);
-            try setLen(&self.remask_deltas, self.allocator, self.changed_keys.items.len);
-            try self.reserveStageScratch(threads);
-            for (marks) |mark| {
-                if (mark.kind != .level or @as(usize, mark.level) >= self.levels.items.len) continue;
-                try self.levels.items[mark.level].markStaticBodies(self.allocator, data);
-            }
-            try self.reserveRecords(.{ .grids = self.levels.items, .graphs = self.level_graphs.items });
+            try self.reserveCellBlocks(levels, prepared.world, colliders);
+            try self.reserveRecords(levels);
         }
         self.batch_prepared = true;
         return prepared;
     }
 
-    /// Commits a prepared batch, the infallible half: refreshes static coverage over the
-    /// marked spans, remasks the changed chunks, re-derives every patch key's record, and
-    /// advances `links_applied`. Remask and patch thread over keys.
-    pub fn commitMarks(self: *NavGraph, prepared: PreparedMarks, data: *const DataSystem, threads: ?NavUpdateThreads, stats: *NavUpdateStats) NavBatchResult {
+    /// Commits a prepared batch, the infallible half: remasks the changed chunks from the
+    /// world and `colliders`, re-derives every patch key's record, and advances
+    /// `links_applied`. Remask and patch thread over keys.
+    pub fn commitMarks(self: *NavGraph, prepared: PreparedMarks, colliders: ColliderView, threads: ?NavUpdateThreads, stats: *NavUpdateStats) NavBatchResult {
         std.debug.assert(self.batch_prepared);
         self.batch_prepared = false;
         self.links_applied += prepared.new_link_count;
         if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .spans = &.{} };
-        for (prepared.marks) |mark| {
-            if (mark.kind != .static_span or @as(usize, mark.level) >= self.levels.items.len) continue;
-            self.levels.items[mark.level].refreshStaticCoverageSpan(data, .{
-                .min_x = mark.min_x,
-                .min_y = mark.min_y,
-                .max_x = mark.max_x,
-                .max_y = mark.max_y,
-            });
-        }
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
-        self.remaskKeys(levels, data, prepared.world, remaskThreads(threads), stats);
+        self.remaskKeys(levels, colliders, prepared.world, remaskThreads(threads), stats);
         self.claimRecords(levels);
         self.patchKeys(levels, prepared.world, patchThreads(threads), stats);
         stats.records_patched += self.releaseRecords(levels);
@@ -1034,7 +1016,6 @@ pub const NavGraph = struct {
         return switch (mark.kind) {
             .tile_box => self.levels.items[mark.level].cellSpanForTileBox(world, mark.min_x, mark.min_y, mark.max_x, mark.max_y),
             .static_span => .{ .min_x = mark.min_x, .min_y = mark.min_y, .max_x = mark.max_x, .max_y = mark.max_y },
-            .level => .{ .min_x = 0, .min_y = 0, .max_x = self.width - 1, .max_y = self.height - 1 },
         };
     }
 
@@ -1324,24 +1305,61 @@ pub const NavGraph = struct {
         }
     }
 
-    // Remasks every changed key (threaded over keys) and applies the per-key blocked-count
-    // deltas to their levels in key order.
-    fn remaskKeys(self: *NavGraph, levels: BatchLevels, data: *const DataSystem, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
+    // Per changed key, the block slot its remask may fill: the one its chunk holds, a claim
+    // when the chunk may end mixed (`chunkMayMix`), or none. Grows each level's block pool
+    // to cover the claims (worst case: every such key ends mixed). O(keys).
+    fn reserveCellBlocks(self: *NavGraph, levels: BatchLevels, world: ?*const WorldSystem, colliders: ColliderView) !void {
         const keys = self.changed_keys.items;
-        std.debug.assert(self.remask_deltas.items.len == keys.len);
+        try setLen(&self.remask_slots, self.allocator, keys.len);
+        try setLen(&self.remask_deltas, self.allocator, keys.len);
+        var start: usize = 0;
+        while (start < keys.len) {
+            const level = keyLevel(keys[start]);
+            var end = start + 1;
+            while (end < keys.len and keyLevel(keys[end]) == level) end += 1;
+            const level_grid = levels.grid(level);
+            var claims: usize = 0;
+            for (keys[start..end], self.remask_slots.items[start..end]) |key, *slot| {
+                const chunk = keyChunk(key);
+                if (level_grid.chunkBlock(chunk)) |held| {
+                    slot.* = held;
+                } else if (chunkMayMix(level_grid, world, colliders, chunk)) {
+                    slot.* = claim_pending;
+                    claims += 1;
+                } else {
+                    slot.* = no_block;
+                }
+            }
+            try level_grid.ensureFreeBlocks(self.allocator, claims, &self.pool_grows);
+            start = end;
+        }
+    }
+
+    // Claims the planned block slots in key order and seeds each key's delta with its
+    // chunk's old blocked count; then remasks every changed key (threaded over keys) and,
+    // in key order, releases the slots whose chunk ended uniform and applies the deltas.
+    fn remaskKeys(self: *NavGraph, levels: BatchLevels, colliders: ColliderView, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
+        const keys = self.changed_keys.items;
+        std.debug.assert(self.remask_deltas.items.len == keys.len and self.remask_slots.items.len == keys.len);
+        for (keys, self.remask_slots.items, self.remask_deltas.items) |key, *slot, *delta| {
+            const level_grid = levels.grid(keyLevel(key));
+            // A chunk holds at most max_chunk_size_tiles^2 cells.
+            delta.* = -@as(i32, @intCast(level_grid.chunkBlockedCount(keyChunk(key))));
+            if (slot.* == claim_pending) slot.* = level_grid.claimBlock();
+        }
         var job = RemaskJob{
             .levels = levels,
-            .data = data,
+            .colliders = colliders,
             .world = world,
             .keys = keys,
+            .slots = self.remask_slots.items,
             .deltas = self.remask_deltas.items,
-            .scratch = self.remask_scratch.items,
         };
-        if (threads) |stage| std.debug.assert(stage.thread_system.participantSlotCount() <= self.remask_scratch.items.len);
         self.last_remask_batch = runStage(threads, keys.len, &job, &job.range_count, remaskJob);
         stats.off_main_stage_ns += offMainNs(self.last_remask_batch);
-        for (keys, self.remask_deltas.items) |key, delta| {
+        for (keys, self.remask_slots.items, self.remask_deltas.items) |key, slot, delta| {
             const level_grid = levels.grid(keyLevel(key));
+            if (slot != no_block and level_grid.chunkBlock(keyChunk(key)) != slot) level_grid.releaseBlock(slot);
             const count: isize = @as(isize, @intCast(level_grid.blocked_count)) + delta;
             std.debug.assert(count >= 0);
             level_grid.blocked_count = @intCast(@max(count, 0));
@@ -1399,39 +1417,45 @@ pub const NavGraph = struct {
         if (record == no_record) return;
         const bounds = level_grid.chunkBounds(chunk);
         const w = self.width;
+        const cols = bounds.x1 - bounds.x0;
+        const rows = bounds.y1 - bounds.y0;
+        const shift: u4 = level_grid.chunk_shift;
+        const chunks_x = self.chunksX();
         var portals: [max_border_portals]NavPortal = undefined;
         var count: usize = 0;
-        const sides = [_]struct { present: bool, lo: usize, hi: usize, base: usize, step: usize, offset: isize, flags: PortalFlags }{
-            .{ .present = bounds.x0 > 0, .lo = bounds.y0, .hi = bounds.y1, .base = bounds.y0 * w + bounds.x0, .step = w, .offset = -1, .flags = .{ .west = true } },
-            .{ .present = bounds.x1 < w, .lo = bounds.y0, .hi = bounds.y1, .base = bounds.y0 * w + bounds.x1 - 1, .step = w, .offset = 1, .flags = .{ .east = true } },
-            .{ .present = bounds.y0 > 0, .lo = bounds.x0, .hi = bounds.x1, .base = bounds.y0 * w + bounds.x0, .step = 1, .offset = -@as(isize, @intCast(w)), .flags = .{ .north = true } },
-            .{ .present = bounds.y1 < self.height, .lo = bounds.x0, .hi = bounds.x1, .base = (bounds.y1 - 1) * w + bounds.x0, .step = 1, .offset = @as(isize, @intCast(w)), .flags = .{ .south = true } },
+        const Side = NavGrid.ChunkSide;
+        const sides = [_]struct { present: bool, side: Side, mirror: Side, neighbour: u32, length: usize, flags: PortalFlags }{
+            .{ .present = bounds.x0 > 0, .side = .west, .mirror = .east, .neighbour = chunk -% 1, .length = rows, .flags = .{ .west = true } },
+            .{ .present = bounds.x1 < w, .side = .east, .mirror = .west, .neighbour = chunk +% 1, .length = rows, .flags = .{ .east = true } },
+            .{ .present = bounds.y0 > 0, .side = .north, .mirror = .south, .neighbour = chunk -% @as(u32, @intCast(chunks_x)), .length = cols, .flags = .{ .north = true } },
+            .{ .present = bounds.y1 < self.height, .side = .south, .mirror = .north, .neighbour = chunk +% @as(u32, @intCast(chunks_x)), .length = cols, .flags = .{ .south = true } },
         };
-        const blocked = level_grid.blocked.items;
         for (sides) |side| {
             if (!side.present) continue;
+            // A pair is open when this side's cell and its mirror across the border are both
+            // open; the neighbour shares this chunk's rows (west/east) or columns.
+            const blocked: u32 = level_grid.sideBits(chunk, side.side) | level_grid.sideBits(side.neighbour, side.mirror);
+            const open = ~blocked & ((@as(u32, 1) << @intCast(side.length)) - 1);
             var run_start: ?usize = null;
-            var index = side.lo;
-            while (index <= side.hi) : (index += 1) {
-                const open = index < side.hi and blk: {
-                    const cell = side.base + (index - side.lo) * side.step;
-                    const mirror: usize = @intCast(@as(isize, @intCast(cell)) + side.offset);
-                    break :blk !blocked[cell] and !blocked[mirror];
-                };
-                if (open) {
+            for (0..side.length + 1) |index| {
+                if (index < side.length and (open >> @intCast(index)) & 1 != 0) {
                     if (run_start == null) run_start = index;
                     continue;
                 }
                 const start = run_start orelse continue;
                 run_start = null;
                 const mid = start + (index - start) / 2;
-                const cell = side.base + (mid - side.lo) * side.step;
-                const local = self.localOf(cell);
+                const local: u8 = @intCast(switch (side.side) {
+                    .west => mid << shift,
+                    .east => (mid << shift) | (cols - 1),
+                    .north => mid,
+                    .south => ((rows - 1) << shift) | mid,
+                });
                 if (findLocalLinear(portals[0..count], local)) |existing| {
                     portals[existing].flags = mergeFlags(portals[existing].flags, side.flags);
                 } else {
                     std.debug.assert(count < level_graph.border_stride);
-                    portals[count] = .{ .local = local, .label = level_grid.labelAt(cell), .flags = side.flags };
+                    portals[count] = .{ .local = local, .label = level_grid.labelAtLocal(chunk, local), .flags = side.flags };
                     count += 1;
                 }
             }
@@ -1521,11 +1545,29 @@ fn findLocalLinear(portals: []const NavPortal, local: u8) ?usize {
 fn mergeFlags(a: PortalFlags, b: PortalFlags) PortalFlags {
     return @bitCast(@as(u8, @bitCast(a)) | @as(u8, @bitCast(b)));
 }
+
+// Whether `chunk` of `level_grid` may compose mixed: a world-BLOCKED chunk stays BLOCKED
+// (colliders only add blocked cells), a world-OPEN one only mixes with a collider listed
+// there, and a mixed one may stay mixed. O(1) expected.
+fn chunkMayMix(level_grid: *const NavGrid, world: ?*const WorldSystem, colliders: ColliderView, chunk: u32) bool {
+    if (world) |world_system| {
+        if (@as(usize, level_grid.level) >= world_system.levelCount()) return false;
+        switch (world_system.levelChunkBlockedForm(level_grid.level, chunk)) {
+            .blocked => return false,
+            .mixed => return true,
+            .open => {},
+        }
+    }
+    return colliders.chunkHasRows(level_grid.level, chunk);
+}
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
 
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const DataSystem = @import("../../data_system.zig").DataSystem;
+const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
+const no_colliders = &test_support.no_colliders;
 const EntityId = @import("../../data_system.zig").EntityId;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const test_support = @import("test_support.zig");
@@ -1539,11 +1581,18 @@ const no_component = types.no_component;
 const PathStatus = types.PathStatus;
 const appendPathRequest = test_support.appendPathRequest;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
+const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
+const EntityTemplate = @import("../../data_system.zig").EntityTemplate;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const TileId = @import("../../world_system.zig").TileId;
+const DenseCellWrite = @import("../../world_system.zig").DenseCellWrite;
+const DenseChunkWrites = @import("../../world_system.zig").DenseChunkWrites;
+const WorldTileChangedEvent = @import("../../simulation.zig").WorldTileChangedEvent;
+const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 
-// Asserts graph `a` equals graph `b` level by level: blocked mask and count, chunk-local
-// labels, and every chunk's record content (border portals, extra portals, links).
+// Asserts graph `a` equals graph `b` level by level: every chunk's form, cell bits, and
+// labels, the blocked count, and every chunk's record content (border portals, extra
+// portals, links).
 fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
     const t = std.testing;
     try t.expectEqual(a.levels.items.len, b.levels.items.len);
@@ -1556,8 +1605,16 @@ fn levelsEquivalent(a: *const NavGraph, b: *const NavGraph, level: u16) bool {
     const ga = a.grid(level) orelse return b.grid(level) == null;
     const gb = b.grid(level) orelse return false;
     if (ga.blocked_count != gb.blocked_count) return false;
-    if (!std.mem.eql(bool, ga.blocked.items, gb.blocked.items)) return false;
-    if (!std.mem.eql(u32, ga.components.items, gb.components.items)) return false;
+    if (ga.dir.items.len != gb.dir.items.len) return false;
+    for (0..ga.dir.items.len) |chunk_index| {
+        const chunk: u32 = @intCast(chunk_index);
+        if (ga.chunkForm(chunk) != gb.chunkForm(chunk)) return false;
+        const slot_a = ga.chunkBlock(chunk) orelse continue;
+        const slot_b = gb.chunkBlock(chunk).?;
+        if (!std.mem.eql(u64, &ga.block_bits[slot_a], &gb.block_bits[slot_b])) return false;
+        if (!std.mem.eql(u8, &ga.block_labels[slot_a], &gb.block_labels[slot_b])) return false;
+        if (ga.block_counts[slot_a] != gb.block_counts[slot_b]) return false;
+    }
     for (0..a.chunkCount()) |chunk| {
         const pa = a.chunkPortals(level, @intCast(chunk));
         const pb = b.chunkPortals(level, @intCast(chunk));
@@ -1606,40 +1663,6 @@ fn fullRebuild(data: *const DataSystem, world: *const WorldSystem, capacity: typ
     return system;
 }
 
-test "regression: destroying a static body and remasking leaves its cell correctly open (coverage-cache staleness)" {
-    // NavGrid.markStaticBodies rasterizes a per-cell static-body coverage cache
-    // (static_blocked) only when the WHOLE graph rebuilds. Before the fix, neither the
-    // whole-level-dirty path nor the incremental patch ever refreshed that cache, so
-    // staticBodyCoversNavCell's O(1) fast path kept reporting a destroyed/moved body's old
-    // cells as covered forever after the first rebuild. This spawns a static body, destroys
-    // it, and remasks via the whole-level-dirty path (markNavLevelDirty), asserting the
-    // vacated cell is correctly open — this would fail (stay blocked) without the
-    // refreshStaticCoverageSpan calls in NavGraph.applyNavUpdates.
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
-    defer world.deinit();
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(baselineCapacity());
-
-    const entity = try addNavBody(&data, .{ .x = 100, .y = 100 }, .{ .x = 16, .y = 16 }, true);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-
-    const cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 100, .y = 100 });
-    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
-
-    _ = data.destroyEntity(entity);
-    try system.markNavLevelDirty(0);
-    _ = try system.applyBufferedNavUpdates(&data, &world, null);
-
-    try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(cell));
-}
-
 test "incremental nav update remask matches the composed world mask across levels" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1677,7 +1700,7 @@ test "incremental nav update remask matches the composed world mask across level
         .{ .level = 1, .x = 4, .y = 3 },
         .{ .level = 0, .x = 2, .y = 2 },
     };
-    _ = try system.applyNavUpdates(&data, &world, &edits);
+    _ = try system.applyNavUpdates(no_colliders, &world, &edits);
 
     // The incremental remask must equal the authoritative composed mask on every
     // level and cell, with a consistent blocked_count — i.e. identical to a full
@@ -1745,48 +1768,6 @@ test "threaded initial nav build matches a serial build across levels" {
     try expectGraphsEquivalent(&threaded.graph, &serial.graph);
 }
 
-test "whole-level dirty re-derives the level from the world and matches a full rebuild" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    const grass = try requireTestTile(&meta, "grass");
-    const tree = try requireTestTile(&meta, "tree_0");
-
-    // 12x12 open world, 4-tile chunks (abstractCapacity) -> a 3x3 chunk grid.
-    var world = try test_support.abstractTestWorld(&meta, 384, 384);
-    defer world.deinit();
-    const obstacle_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-
-    // Block a cell far from chunk (0,0) WITHOUT recording it as an individual dirty cell.
-    // A cell-less reaction (markNavLevelDirty, used for entity-driven obstacle changes whose
-    // footprint is no longer resolvable) must still pick it up via the whole-level remask.
-    const far = (try world.setDenseTile(obstacle_layer, 10, 10, tree)) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u16, 0), far.level);
-    try system.markNavLevelDirty(0);
-    const version_before = system.graph.version;
-    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    // A whole-level remask keeps nav_version stable.
-    try std.testing.expectEqual(version_before, system.graph.version);
-
-    // The far cell is blocked even though it was never marked as an individual dirty cell —
-    // the old sentinel-cell reaction only remasked chunk (0,0) and would have missed it.
-    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 10, .y = 10 }));
-
-    // Byte-identical to a full rebuild against the same post-edit world.
-    var rebuilt = PathfindingSystem.init(std.testing.allocator);
-    defer rebuilt.deinit();
-    try rebuilt.reserve(abstractCapacity());
-    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, null);
-    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
-}
-
 test "incremental nav update splitting a chunk-local component matches a full rebuild" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1820,7 +1801,7 @@ test "incremental nav update splitting a chunk-local component matches a full re
         const changed = (try world.setDenseTile(wall_layer, 5, wy, tree)) orelse return error.TestExpectedEqual;
         try edits.append(std.testing.allocator, .{ .level = changed.level, .x = changed.x, .y = changed.y });
     }
-    _ = try system.applyNavUpdates(&data, &world, edits.items);
+    _ = try system.applyNavUpdates(no_colliders, &world, edits.items);
 
     // After: the chunk-local component split into two distinct labels.
     try std.testing.expect(grid.componentOf(left) != no_component);
@@ -1870,7 +1851,7 @@ test "incremental nav update on a chunk border flips a neighbor chunk's portal" 
     // the NEIGHBOR chunk (1,1)'s portal at (4,5) flips off even though only chunk (0,1)
     // is relabeled.
     const changed = (try world.setDenseTile(isolation_layer, 3, 5, tree)) orelse return error.TestExpectedEqual;
-    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
     try std.testing.expect(!isPortal(&system.graph, 0, near));
     try std.testing.expect(!isPortal(&system.graph, 0, neighbor));
@@ -1943,7 +1924,7 @@ test "incremental nav update opening a ramp endpoint adds a live LevelLink edge"
     // Dig the ramp endpoint open: the endpoint's record gains its links.
     const changed = (try world.setDenseTile(level1_obstacle, 2, 2, grass)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
-    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     // The bidirectional link is live both ways.
     try std.testing.expectEqual(@as(usize, 2), countLiveLinks(&system.graph));
 
@@ -1987,7 +1968,7 @@ test "incremental underground dig leaves the surface level abstract graph byte-i
     // Dig an UNDERGROUND-only cell open (level 1).
     const changed = (try world.setDenseTile(level1_obstacle, 5, 5, grass)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
-    const stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    const stats = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 
     // The surface's cells and records are untouched, record ids included.
@@ -2025,7 +2006,7 @@ test "incremental dig keeps the changed level's records identical to a full rebu
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
 
     const changed = (try world.setDenseTile(level1_obstacle, 5, 5, grass)) orelse return error.TestExpectedEqual;
-    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
     var rebuilt = try fullRebuild(&data, &world, abstractCapacity());
     defer rebuilt.deinit();
@@ -2055,7 +2036,7 @@ test "incremental nav update applies the same edit batch deterministically" {
     _ = (try world.setDenseTile(obstacle, 5, 5, tree)) orelse return error.TestExpectedEqual;
     _ = (try world.setDenseTile(obstacle, 6, 5, tree)) orelse return error.TestExpectedEqual;
     _ = (try world.setDenseTile(obstacle, 5, 6, tree)) orelse return error.TestExpectedEqual;
-    _ = try system.applyNavUpdates(&data, &world, &edits);
+    _ = try system.applyNavUpdates(no_colliders, &world, &edits);
 
     // The same post-edit world built twice and patched once all agree.
     var second = try fullRebuild(&data, &world, abstractCapacity());
@@ -2090,7 +2071,7 @@ test "incremental single-chunk dig patches a constant chunk set independent of w
 
         // Cell (5,5) sits in chunk (1,1) (4-tile chunks): interior for both worlds.
         const changed = (try world.setDenseTile(obstacle, 5, 5, tree)) orelse return error.TestExpectedEqual;
-        const stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+        const stats = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
         patched[i] = stats.chunks_patched;
     }
     try std.testing.expectEqual(@as(usize, 5), patched[0]);
@@ -2127,7 +2108,7 @@ test "incremental nav update across distant chunks in one batch matches a full r
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         edits[i] = .{ .level = 0, .x = cell.x, .y = cell.y };
     }
-    _ = try system.applyNavUpdates(&data, &world, &edits);
+    _ = try system.applyNavUpdates(no_colliders, &world, &edits);
 
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
     defer rebuilt.deinit();
@@ -2183,7 +2164,7 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         try system.markNavDirty(0, cell.x, cell.y);
     }
-    _ = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
 
     // Both stages must have actually threaded, not fallen back to the inline slot-0 path.
     try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
@@ -2234,7 +2215,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild"
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         try system.markNavDirty(0, cell.x, cell.y);
     }
-    _ = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
 
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
     defer rebuilt.deinit();
@@ -2244,286 +2225,340 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild"
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
 
+// A world-backed nav with colliders built from `data`, seam-driven by `frame`.
+const StaticNav = struct {
+    data: DataSystem,
+    world: WorldSystem,
+    colliders: StaticColliderSystem,
+    system: PathfindingSystem,
+    frame: SimulationFrame,
+
+    fn deinit(self: *StaticNav) void {
+        self.frame.deinit();
+        self.system.deinit();
+        self.colliders.deinit();
+        self.world.deinit();
+        self.data.deinit();
+    }
+
+    // Commits `commands` through the seam and runs the nav reaction.
+    fn commitAndReact(self: *StaticNav, commands: []const StructuralCommand, thread_system: ?*ThreadSystem) !NavUpdateStats {
+        try test_support.commitWithColliders(&self.frame, &self.data, &self.colliders, &self.system, commands);
+        return self.system.reactToPostCommitNavEvents(&self.frame, &self.colliders, &self.world, thread_system);
+    }
+
+    // A fresh full build of the current data and world.
+    fn rebuilt(self: *const StaticNav) !PathfindingSystem {
+        return fullRebuild(&self.data, &self.world, abstractCapacity());
+    }
+};
+
+// `world` with `statics` (position, size) added to an empty `DataSystem` before nav builds.
+fn staticNav(meta: *const @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta, extent: f32, statics: []const [2]math.Vec2, capacity: types.PathfindingCapacity) !StaticNav {
+    var data = DataSystem.init(std.testing.allocator);
+    errdefer data.deinit();
+    for (statics) |body| _ = try addNavBody(&data, body[0], body[1], true);
+    var world = try test_support.abstractTestWorld(meta, extent, extent);
+    errdefer world.deinit();
+    var colliders = try test_support.worldColliders(&data, &world);
+    errdefer colliders.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildNavFromColliders(&colliders, PathfindingSystem.worldNavExtent(&world), null);
+    return .{ .data = data, .world = world, .colliders = colliders, .system = system, .frame = SimulationFrame.init(std.testing.allocator) };
+}
+
+fn staticTemplate(position: math.Vec2, size: math.Vec2) EntityTemplate {
+    return .{
+        .movement_body = .{ .position = position, .previous_position = position },
+        .collision_bounds = .{ .size = size },
+        .collision_response = .{ .mobility = .static },
+    };
+}
+
+fn moveCommand(entity: EntityId, position: math.Vec2) StructuralCommand {
+    return .{ .set_movement_body = .{ .entity = entity, .body = .{ .position = position, .previous_position = position } } };
+}
+
+test "destroying a static body and reacting leaves its cell open" {
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var nav = try staticNav(&meta, 256, &.{.{ .{ .x = 100, .y = 100 }, .{ .x = 16, .y = 16 } }}, abstractCapacity());
+    defer nav.deinit();
+    const entity = nav.data.movementBodySliceConst().entities[0];
+    const cell = nav.system.graph.grid(0).?.worldToCellClamped(.{ .x = 100, .y = 100 });
+    try std.testing.expect(nav.system.graph.grid(0).?.isBlockedCell(cell));
+
+    _ = try nav.commitAndReact(&.{.{ .destroy_entity = entity }}, null);
+    try std.testing.expect(!nav.system.graph.grid(0).?.isBlockedCell(cell));
+    var rebuilt = try nav.rebuilt();
+    defer rebuilt.deinit();
+    try expectGraphsEquivalent(&nav.system.graph, &rebuilt.graph);
+}
+
 test "entity obstacle create/destroy patches a constant chunk set independent of world size and matches a full rebuild" {
-    // Mirrors "incremental single-chunk dig patches a constant chunk set independent of world
-    // size" but for an entity-driven obstacle rect resolved through markNavObstacleRectDirty
-    // instead of a tile edit, proving the same chunk-bounded localization for entities.
+    // As "incremental single-chunk dig patches a constant chunk set independent of world
+    // size", for a static body created and destroyed through the commit seam.
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
     const extents = [_]f32{ 512, 1024 };
     var patched: [extents.len]usize = undefined;
     for (extents, 0..) |extent, i| {
-        var data = DataSystem.init(std.testing.allocator);
-        defer data.deinit();
-        var meta = try loadTestWorldMeta(std.testing.allocator);
-        defer meta.deinit();
-
-        var world = try test_support.abstractTestWorld(&meta, extent, extent);
-        defer world.deinit();
-
-        var system = PathfindingSystem.init(std.testing.allocator);
-        defer system.deinit();
-        try system.reserve(abstractCapacity());
-        try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-
+        var nav = try staticNav(&meta, extent, &.{}, abstractCapacity());
+        defer nav.deinit();
         // Cell (5,5) sits in chunk (1,1) (4-tile chunks): interior for both worlds.
-        const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
-        const rect = data.staticObstacleWorldRect(entity).?;
-        try system.markNavObstacleRectDirty(0, rect);
-        const create_stats = try system.applyBufferedNavUpdates(&data, &world, null);
+        const create_stats = try nav.commitAndReact(&.{.{ .create_entity = staticTemplate(.{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }) }}, null);
         patched[i] = create_stats.chunks_patched;
-
-        var rebuilt_created = PathfindingSystem.init(std.testing.allocator);
+        var rebuilt_created = try nav.rebuilt();
         defer rebuilt_created.deinit();
-        try rebuilt_created.reserve(abstractCapacity());
-        try rebuilt_created.rebuildStaticNavGridWithWorld(&data, &world, null);
-        try expectGraphsEquivalent(&system.graph, &rebuilt_created.graph);
+        try expectGraphsEquivalent(&nav.system.graph, &rebuilt_created.graph);
 
-        _ = data.destroyEntity(entity);
-        try system.markNavObstacleRectDirty(0, rect);
-        _ = try system.applyBufferedNavUpdates(&data, &world, null);
-
-        var rebuilt_destroyed = PathfindingSystem.init(std.testing.allocator);
+        const entity = nav.colliders.changesThisStep()[0].entity;
+        _ = try nav.commitAndReact(&.{.{ .destroy_entity = entity }}, null);
+        var rebuilt_destroyed = try nav.rebuilt();
         defer rebuilt_destroyed.deinit();
-        try rebuilt_destroyed.reserve(abstractCapacity());
-        try rebuilt_destroyed.rebuildStaticNavGridWithWorld(&data, &world, null);
-        try expectGraphsEquivalent(&system.graph, &rebuilt_destroyed.graph);
+        try expectGraphsEquivalent(&nav.system.graph, &rebuilt_destroyed.graph);
     }
     try std.testing.expectEqual(@as(usize, 5), patched[0]);
     try std.testing.expectEqual(patched[0], patched[1]);
 }
 
 test "entity obstacle move marks both old and new spans dirty at a distance-independent patch cost" {
-    // Moves a static obstacle corner-to-corner in one batch (two markNavObstacleRectDirty
-    // calls: old rect then new rect — never a bounding box spanning both). A corner chunk
-    // has exactly two orthogonal neighbors (self + 2), so each span patches 3 chunks; the two
-    // spans never share a chunk once the grid is at least 3 chunks wide, so the total (6) is
-    // identical regardless of how far apart the corners are in world units.
+    // Moves a static obstacle corner-to-corner in one commit: its old and new spans each
+    // patch a corner chunk and its two orthogonal neighbors, never a box spanning both, so
+    // the total (6) does not depend on how far apart the corners are.
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
     const extents = [_]f32{ 512, 1024 };
     var patched: [extents.len]usize = undefined;
     for (extents, 0..) |extent, i| {
-        var data = DataSystem.init(std.testing.allocator);
-        defer data.deinit();
-        var meta = try loadTestWorldMeta(std.testing.allocator);
-        defer meta.deinit();
-
-        var world = try test_support.abstractTestWorld(&meta, extent, extent);
-        defer world.deinit();
-
-        var system = PathfindingSystem.init(std.testing.allocator);
-        defer system.deinit();
-        try system.reserve(abstractCapacity());
-
-        const entity = try addNavBody(&data, .{ .x = 8, .y = 8 }, .{ .x = 8, .y = 8 }, true);
-        try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-        const old_rect = data.staticObstacleWorldRect(entity).?;
-        const old_cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 8, .y = 8 });
-        try std.testing.expect(system.graph.grid(0).?.isBlockedCell(old_cell));
-
+        var nav = try staticNav(&meta, extent, &.{.{ .{ .x = 8, .y = 8 }, .{ .x = 8, .y = 8 } }}, abstractCapacity());
+        defer nav.deinit();
+        const entity = nav.data.movementBodySliceConst().entities[0];
+        const old_cell = nav.system.graph.grid(0).?.worldToCellClamped(.{ .x = 8, .y = 8 });
+        try std.testing.expect(nav.system.graph.grid(0).?.isBlockedCell(old_cell));
         const cells_side: u16 = @intFromFloat(extent / 32.0);
         const far_coord: f32 = @as(f32, @floatFromInt(cells_side - 1)) * 32.0 + 8.0;
-        const body = data.movementBodyPtr(entity).?;
-        body.position_x.* = far_coord;
-        body.position_y.* = far_coord;
-        body.previous_x.* = far_coord;
-        body.previous_y.* = far_coord;
-        const new_rect = data.staticObstacleWorldRect(entity).?;
-        const new_cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = far_coord, .y = far_coord });
+        const new_cell = nav.system.graph.grid(0).?.worldToCellClamped(.{ .x = far_coord, .y = far_coord });
 
-        try system.markNavObstacleRectDirty(0, old_rect);
-        try system.markNavObstacleRectDirty(0, new_rect);
-        const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+        const stats = try nav.commitAndReact(&.{moveCommand(entity, .{ .x = far_coord, .y = far_coord })}, null);
         patched[i] = stats.chunks_patched;
-
-        try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(old_cell));
-        try std.testing.expect(system.graph.grid(0).?.isBlockedCell(new_cell));
-
-        var rebuilt = PathfindingSystem.init(std.testing.allocator);
+        try std.testing.expect(!nav.system.graph.grid(0).?.isBlockedCell(old_cell));
+        try std.testing.expect(nav.system.graph.grid(0).?.isBlockedCell(new_cell));
+        var rebuilt = try nav.rebuilt();
         defer rebuilt.deinit();
-        try rebuilt.reserve(abstractCapacity());
-        try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, null);
-        try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+        try expectGraphsEquivalent(&nav.system.graph, &rebuilt.graph);
     }
     try std.testing.expectEqual(@as(usize, 6), patched[0]);
     try std.testing.expectEqual(patched[0], patched[1]);
 }
 
 test "overlapping static bodies: destroying one leaves the shared cell blocked by the survivor" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
-
-    var world = try test_support.abstractTestWorld(&meta, 512, 512);
-    defer world.deinit();
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(abstractCapacity());
-
     // Two static bodies fully overlapping the same cell.
-    const a = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
-    const b = try addNavBody(&data, .{ .x = 162, .y = 162 }, .{ .x = 8, .y = 8 }, true);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    var nav = try staticNav(&meta, 512, &.{
+        .{ .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 } },
+        .{ .{ .x = 162, .y = 162 }, .{ .x = 8, .y = 8 } },
+    }, abstractCapacity());
+    defer nav.deinit();
+    const bodies = nav.data.movementBodySliceConst().entities;
+    const a = bodies[0];
+    const b = bodies[1];
+    const cell = nav.system.graph.grid(0).?.worldToCellClamped(.{ .x = 160, .y = 160 });
+    try std.testing.expect(nav.system.graph.grid(0).?.isBlockedCell(cell));
 
-    const cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 160, .y = 160 });
-    try std.testing.expectEqual(cell, system.graph.grid(0).?.worldToCellClamped(.{ .x = 162, .y = 162 }));
-    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
-
-    // Destroy body `a`; `b` still covers the shared cell, so it must stay blocked (proving
-    // refreshStaticCoverageSpan re-derives from the CURRENT live body set, not a blind toggle).
-    const rect_a = data.staticObstacleWorldRect(a).?;
-    _ = data.destroyEntity(a);
-    try system.markNavObstacleRectDirty(0, rect_a);
-    _ = try system.applyBufferedNavUpdates(&data, &world, null);
-    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
-
-    // Destroying the survivor `b` too finally opens the cell.
-    const rect_b = data.staticObstacleWorldRect(b).?;
-    _ = data.destroyEntity(b);
-    try system.markNavObstacleRectDirty(0, rect_b);
-    _ = try system.applyBufferedNavUpdates(&data, &world, null);
-    try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(cell));
+    _ = try nav.commitAndReact(&.{.{ .destroy_entity = a }}, null);
+    try std.testing.expect(nav.system.graph.grid(0).?.isBlockedCell(cell));
+    _ = try nav.commitAndReact(&.{.{ .destroy_entity = b }}, null);
+    try std.testing.expect(!nav.system.graph.grid(0).?.isBlockedCell(cell));
 }
 
 test "static-to-dynamic-to-static toggle blocks and unblocks in place without moving" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
+    var nav = try staticNav(&meta, 512, &.{.{ .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 } }}, abstractCapacity());
+    defer nav.deinit();
+    const entity = nav.data.movementBodySliceConst().entities[0];
+    const cell = nav.system.graph.grid(0).?.worldToCellClamped(.{ .x = 160, .y = 160 });
+    try std.testing.expect(nav.system.graph.grid(0).?.isBlockedCell(cell));
 
-    var world = try test_support.abstractTestWorld(&meta, 512, 512);
-    defer world.deinit();
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(abstractCapacity());
-
-    const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-    const cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 160, .y = 160 });
-    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
-
-    // Toggle static -> dynamic in place: old rect == new rect; only the "old" side fires
-    // (the entity is no longer a static obstacle, so there is no new-side rect to block).
-    const rect = data.staticObstacleWorldRect(entity).?;
-    try data.setCollisionResponse(entity, .{ .mobility = .dynamic });
-    try system.markNavObstacleRectDirty(0, rect);
-    _ = try system.applyBufferedNavUpdates(&data, &world, null);
-    try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(cell));
-
-    // Toggle back dynamic -> static in place: only the "new" side fires.
-    try data.setCollisionResponse(entity, .{ .mobility = .static });
-    const new_rect = data.staticObstacleWorldRect(entity).?;
-    try std.testing.expectEqual(rect, new_rect);
-    try system.markNavObstacleRectDirty(0, new_rect);
-    _ = try system.applyBufferedNavUpdates(&data, &world, null);
-    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
+    _ = try nav.commitAndReact(&.{.{ .set_collision_response = .{ .entity = entity, .response = .{ .mobility = .dynamic } } }}, null);
+    try std.testing.expect(!nav.system.graph.grid(0).?.isBlockedCell(cell));
+    _ = try nav.commitAndReact(&.{.{ .set_collision_response = .{ .entity = entity, .response = .{ .mobility = .static } } }}, null);
+    try std.testing.expect(nav.system.graph.grid(0).?.isBlockedCell(cell));
 }
 
-test "incremental nav update threaded chunk patch matches a serial full rebuild with an entity-obstacle cell edit" {
-    // Extends the threaded tile-edit parity test with a cell_edits-sourced entry (an
-    // entity-driven obstacle destroy) folded into the SAME threaded batch, proving the
-    // cell_edits path through NavGraph.applyNavUpdates/buildDirtySet/remaskChangedChunks
-    // matches a serial full rebuild exactly like the tile-edit path already does.
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
+test "a static on level 2 blocks level 2 only" {
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const fixture = try twoLevelWorld(&meta);
+    var nav = StaticNav{
+        .data = DataSystem.init(std.testing.allocator),
+        .world = fixture.world,
+        .colliders = undefined,
+        .system = PathfindingSystem.init(std.testing.allocator),
+        .frame = SimulationFrame.init(std.testing.allocator),
+    };
+    nav.colliders = try test_support.worldColliders(&nav.data, &nav.world);
+    defer nav.deinit();
+    _ = try nav.world.addLevel(-32);
+    _ = try nav.world.addDenseLayer(2, 0, .floor, fixture.grass);
+    try nav.system.reserve(abstractCapacity());
+    try nav.system.rebuildNavFromColliders(&nav.colliders, PathfindingSystem.worldNavExtent(&nav.world), null);
+
+    var template = staticTemplate(.{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 });
+    template.world_level = 2;
+    _ = try nav.commitAndReact(&.{.{ .create_entity = template }}, null);
+    for (0..3) |level| {
+        try std.testing.expectEqual(level == 2, nav.system.graph.grid(@intCast(level)).?.isBlockedCell(.{ .x = 5, .y = 5 }));
+    }
+    var rebuilt = try nav.rebuilt();
+    defer rebuilt.deinit();
+    try expectGraphsEquivalent(&nav.system.graph, &rebuilt.graph);
+}
+
+test "a static obstacle move costs the same at 10 and 10k statics" {
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    // 128 x 128 cells in 4-tile chunks; the moved body stays in chunk (1,1), and the other
+    // statics fill cells outside chunks 0..2 x 0..2 one per cell.
+    const other_counts = [_]usize{ 10, 10_000 };
+    var patched: [other_counts.len]usize = undefined;
+    var remasked: [other_counts.len]usize = undefined;
+    var listed: [other_counts.len]usize = undefined;
+    for (other_counts, 0..) |other_count, run| {
+        var statics: std.ArrayList([2]math.Vec2) = .empty;
+        defer statics.deinit(std.testing.allocator);
+        try statics.append(std.testing.allocator, .{ .{ .x = 164, .y = 164 }, .{ .x = 8, .y = 8 } });
+        var cell: usize = 0;
+        while (statics.items.len < other_count + 1) : (cell += 1) {
+            const x = cell % 128;
+            const y = cell / 128;
+            if (x < 12 and y < 12) continue;
+            try statics.append(std.testing.allocator, .{ .{ .x = @as(f32, @floatFromInt(x)) * 32 + 4, .y = @as(f32, @floatFromInt(y)) * 32 + 4 }, .{ .x = 8, .y = 8 } });
+        }
+        var nav = try staticNav(&meta, 4096, statics.items, abstractCapacity());
+        defer nav.deinit();
+        try std.testing.expectEqual(other_count + 1, nav.colliders.rowCount());
+        const moved = nav.data.movementBodySliceConst().entities[0];
+        const stats = try nav.commitAndReact(&.{moveCommand(moved, .{ .x = 196, .y = 196 })}, null);
+        patched[run] = stats.chunks_patched;
+        remasked[run] = stats.dirty_chunks;
+        // Rows the remask visited: those listed at the remasked chunks.
+        var visited: usize = 0;
+        for (nav.system.graph.changed_keys.items) |key| {
+            var rows = nav.colliders.view().chunkRows(keyLevel(key), keyChunk(key));
+            while (rows.next()) |_| visited += 1;
+        }
+        listed[run] = visited;
+    }
+    try std.testing.expectEqual(patched[0], patched[1]);
+    try std.testing.expectEqual(remasked[0], remasked[1]);
+    try std.testing.expectEqual(listed[0], listed[1]);
+    try std.testing.expectEqual(@as(usize, 1), listed[0]);
+}
+
+test "a ramp whose exit holds a static body routes only after the body moves" {
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const fixture = try twoLevelWorld(&meta);
+    var nav = StaticNav{
+        .data = DataSystem.init(std.testing.allocator),
+        .world = fixture.world,
+        .colliders = undefined,
+        .system = PathfindingSystem.init(std.testing.allocator),
+        .frame = SimulationFrame.init(std.testing.allocator),
+    };
+    nav.colliders = try test_support.worldColliders(&nav.data, &nav.world);
+    defer nav.deinit();
+    try nav.system.reserve(abstractCapacity());
+    try nav.system.rebuildNavFromColliders(&nav.colliders, PathfindingSystem.worldNavExtent(&nav.world), null);
+    // A static body on the ramp's level-0 exit cell (5,5).
+    _ = try nav.commitAndReact(&.{.{ .create_entity = staticTemplate(.{ .x = 164, .y = 164 }, .{ .x = 8, .y = 8 }) }}, null);
+    const body = nav.colliders.changesThisStep()[0].entity;
+    try nav.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 5, .y = 5 }, .level_b = 0, .cell_b = .{ .x = 5, .y = 5 }, .traversal_cost = 1, .bidirectional = true });
+    _ = try nav.system.applyBufferedNavUpdates(&nav.colliders, &nav.world, null);
+    try std.testing.expect(!try routes(&nav.system, &nav.data, &nav.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
+
+    _ = try nav.commitAndReact(&.{moveCommand(body, .{ .x = 292, .y = 36 })}, null);
+    try std.testing.expect(try routes(&nav.system, &nav.data, &nav.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
+    var rebuilt = try nav.rebuilt();
+    defer rebuilt.deinit();
+    try expectGraphsEquivalent(&nav.system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update threaded chunk patch matches a serial full rebuild with an entity-obstacle edit" {
+    // A static body destroyed through the seam, folded into the same threaded batch as four
+    // tile digs, must match a serial full rebuild exactly like the tile-only batch does.
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
-
-    const extent: f32 = 512;
-    var world = try test_support.abstractTestWorld(&meta, extent, extent);
-    defer world.deinit();
-    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
     var cap = abstractCapacity();
     cap.worker_participant_count = threads.participantSlotCount();
-    try system.reserve(cap);
+    var nav = try staticNav(&meta, 512, &.{.{ .{ .x = 224, .y = 224 }, .{ .x = 8, .y = 8 } }}, cap);
+    defer nav.deinit();
+    const obstacle = try nav.world.addDenseLayer(0, 0, .obstacle, grass);
+    // The layer add moved level 0's content revision: settle it before the batch.
+    _ = try nav.system.applyBufferedNavUpdates(&nav.colliders, &nav.world, null);
+    nav.system.nav_thread_adaptive = false;
+    nav.system.nav_thread_items_per_range = 1;
 
-    // A static body present at build time, destroyed as part of the same threaded batch below.
-    const entity = try addNavBody(&data, .{ .x = 224, .y = 224 }, .{ .x = 8, .y = 8 }, true);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-
+    const entity = nav.data.movementBodySliceConst().entities[0];
+    try test_support.commitWithColliders(&nav.frame, &nav.data, &nav.colliders, &nav.system, &.{.{ .destroy_entity = entity }});
     const cells = [_]struct { x: u16, y: u16 }{
         .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
         .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
     };
     for (cells) |cell| {
-        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
-        try system.markNavDirty(0, cell.x, cell.y);
+        _ = (try nav.world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try nav.system.markNavDirty(0, cell.x, cell.y);
     }
-    const rect = data.staticObstacleWorldRect(entity).?;
-    _ = data.destroyEntity(entity);
-    try system.markNavObstacleRectDirty(0, rect);
-    _ = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    _ = try nav.system.applyBufferedNavUpdates(&nav.colliders, &nav.world, &threads);
+    try std.testing.expect(!nav.system.graph.last_remask_batch.ran_inline);
 
-    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    var rebuilt = try nav.rebuilt();
     defer rebuilt.deinit();
-    try rebuilt.reserve(cap);
-    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, null);
-
-    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+    try expectGraphsEquivalent(&nav.system.graph, &rebuilt.graph);
 }
 
-test "entity-obstacle rect nav update is allocation-free at steady state" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
+test "a static obstacle commit and its nav reaction are allocation-free at steady state" {
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
+    var nav = try staticNav(&meta, 512, &.{.{ .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 } }}, abstractCapacity());
+    defer nav.deinit();
+    const entity = nav.data.movementBodySliceConst().entities[0];
+    // Warmup: the body moves out and back through the seam, so the mark buffer, batch keys,
+    // cell blocks, records, and the collider lists reach their high-water.
+    _ = try nav.commitAndReact(&.{moveCommand(entity, .{ .x = 228, .y = 228 })}, null);
+    _ = try nav.commitAndReact(&.{moveCommand(entity, .{ .x = 160, .y = 160 })}, null);
 
-    const extent: f32 = 512;
-    var world = try test_support.abstractTestWorld(&meta, extent, extent);
-    defer world.deinit();
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-
-    // Warmup: one entity-obstacle create+destroy churn through the real
-    // markNavObstacleRectDirty + applyBufferedNavUpdates path, so every buffer it touches
-    // (marks, batch keys and spans, record pools, remask scratch) reaches steady-state
-    // capacity before the failing-allocator proof below.
-    {
-        const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
-        const rect = data.staticObstacleWorldRect(entity).?;
-        try system.markNavObstacleRectDirty(0, rect);
-        _ = try system.applyBufferedNavUpdates(&data, &world, null);
-        _ = data.destroyEntity(entity);
-        try system.markNavObstacleRectDirty(0, rect);
-        _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    const original = nav.system.allocator;
+    nav.system.allocator = std.testing.failing_allocator;
+    nav.system.graph.allocator = std.testing.failing_allocator;
+    defer {
+        nav.system.graph.allocator = original;
+        nav.system.allocator = original;
     }
-
-    const original = system.allocator;
-    system.allocator = std.testing.failing_allocator;
-    system.graph.allocator = std.testing.failing_allocator;
-
-    const entity = try addNavBody(&data, .{ .x = 320, .y = 320 }, .{ .x = 8, .y = 8 }, true);
-    const rect = data.staticObstacleWorldRect(entity).?;
-    try system.markNavObstacleRectDirty(0, rect);
-    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+    // The same move again: the reaction allocates nothing.
+    try test_support.commitWithColliders(&nav.frame, &nav.data, &nav.colliders, &nav.system, &.{moveCommand(entity, .{ .x = 228, .y = 228 })});
+    const stats = try nav.system.reactToPostCommitNavEvents(&nav.frame, &nav.colliders, &nav.world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-
-    system.graph.allocator = original;
-    system.allocator = original;
 }
 
-test "threaded multi-worker chunk patch/remask is allocation-free at steady state (FailingAllocator)" {
-    // The serial slot-0 proof above swaps in a failing allocator with thread_system=null,
-    // so the worker append (scratch.edges.append / setLen on worker threads at
-    // remaskChangedChunks/patchChunkJob) is only ever proven allocation-free on the inline
-    // slot-0 path. This drives the SAME failing-allocator proof through a REAL multi-worker
-    // ThreadSystem so the reserve-before-dispatch invariant (patch/remask scratch sized to
-    // the participant count) is proven on the path that actually fans out to worker threads.
+test "remask and patch after reserve allocate nothing on a multi-worker ThreadSystem (FailingAllocator)" {
+    // The remask's cell blocks and the patch's records and link slots are reserved on the
+    // main thread before dispatch; workers only fill what was claimed. This proves it on a
+    // real multi-worker ThreadSystem, with a static collider listed in a remasked chunk.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 164, .y = 164 }, .{ .x = 8, .y = 8 }, true);
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     const grass = try requireTestTile(&meta, "grass");
@@ -2542,9 +2577,11 @@ test "threaded multi-worker chunk patch/remask is allocation-free at steady stat
     var cap = abstractCapacity();
     cap.worker_participant_count = threads.participantSlotCount();
     try system.reserve(cap);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    var colliders = try test_support.worldColliders(&data, &world);
+    defer colliders.deinit();
+    try system.rebuildNavFromColliders(&colliders, PathfindingSystem.worldNavExtent(&world), null);
     // Force the parallel schedule rather than letting the tuner keep the small batch inline,
-    // so the proof exercises the worker-thread append, not the serial slot-0 fallback.
+    // so the proof exercises the workers.
     system.nav_thread_adaptive = false;
     system.nav_thread_items_per_range = 1;
 
@@ -2564,17 +2601,16 @@ test "threaded multi-worker chunk patch/remask is allocation-free at steady stat
     };
 
     // Warmup: toggle the warm cells on then off through the THREADED path, so every buffer the
-    // threaded stages touch (batch keys and spans, plan windows, record pools, per-participant
-    // remask scratch) reaches steady-state capacity before the failing-allocator proof.
+    // threaded stages touch (batch keys and spans, plan windows, cell blocks, record pools)
+    // reaches steady-state capacity before the failing-allocator proof.
     for ([_]@TypeOf(tree){ tree, grass }) |tile| {
         for (warm_cells) |cell| {
             _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tile)) orelse return error.TestExpectedEqual;
             try system.markNavDirty(0, cell.x, cell.y);
         }
-        const warm_stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+        const warm_stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
         try std.testing.expectEqual(@as(usize, 1), warm_stats.incremental_rebuilds);
-        // The warmup itself must have threaded (not fallen back inline), or it would not have
-        // grown the per-participant worker scratch the proof relies on.
+        // The warmup itself must have threaded, so the proof below runs the same dispatch.
         try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
         try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
     }
@@ -2587,78 +2623,11 @@ test "threaded multi-worker chunk patch/remask is allocation-free at steady stat
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         try system.markNavDirty(0, cell.x, cell.y);
     }
-    const stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    const stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    // Both stages threaded under the failing allocator: the worker append allocated zero times.
+    // Both stages threaded under the failing allocator and allocated nothing.
     try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
     try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
-
-    system.graph.allocator = original;
-    system.allocator = original;
-}
-
-// Commits a single set_movement_body structural command through `frame` (real
-// structural-commit -> event pipeline, mirroring how the game state drives it) and
-// applies it, so the produced component_changed event carries real
-// old/new_obstacle_world_rect fields resolved from DataSystem, not a hand-built event.
-fn commitMovedStaticObstacle(frame: *SimulationFrame, data: *DataSystem, entity: EntityId, position: math.Vec2) !void {
-    frame.beginStep();
-    try frame.structural_commands.prepareRangeCounts(1);
-    frame.structural_commands.addCount(0, 1);
-    try frame.structural_commands.prefix();
-    var writer = frame.structural_commands.rangeWriter(0);
-    writer.write(.{ .set_movement_body = .{
-        .entity = entity,
-        .body = .{ .position = position, .previous_position = position },
-    } });
-    writer.finish();
-    frame.structural_commands.finishWrite();
-    _ = try frame.applyStructuralCommands(data);
-}
-
-test "reactToPostCommitNavEvents appends both old and new obstacle spans for one moved static obstacle, allocation-free at steady state (FailingAllocator)" {
-    // The steady-state test above only ever exercises ONE markNavObstacleRectDirty append
-    // per applyBufferedNavUpdates call (a create, then a destroy), called directly rather
-    // than through reactToPostCommitNavEvents. reactToPostCommitNavEvents's component_changed
-    // handling appends up to TWO spans per event -- old_obstacle_world_rect and
-    // new_obstacle_world_rect -- whenever a moving entity stays a static nav obstacle across
-    // the change, so this drives that real 2-appends-in-one-batch case through the actual
-    // structural-commit -> event -> react pipeline.
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-
-    const extent: f32 = 512;
-    var world = try test_support.abstractTestWorld(&meta, extent, extent);
-    defer world.deinit();
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(abstractCapacity());
-
-    const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-
-    // Warmup: move the obstacle once through the real pipeline (2 appends in one batch)
-    // so the mark buffer reaches its real steady-state high-water mark, along with
-    // every other buffer reactToPostCommitNavEvents touches, before the failing-allocator
-    // proof below.
-    try commitMovedStaticObstacle(&frame, &data, entity, .{ .x = 224, .y = 224 });
-    const warmup_stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
-    try std.testing.expectEqual(@as(usize, 1), warmup_stats.incremental_rebuilds);
-
-    const original = system.allocator;
-    system.allocator = std.testing.failing_allocator;
-    system.graph.allocator = std.testing.failing_allocator;
-
-    // Move it again: a second single-batch, 2-append occurrence must not allocate.
-    try commitMovedStaticObstacle(&frame, &data, entity, .{ .x = 64, .y = 64 });
-    const stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -2706,6 +2675,127 @@ fn twoLevelWorld(meta: *const @import("../../../assets/world_tileset_meta.zig").
     return .{ .world = world, .obstacle = .{ obstacle_0, obstacle_1 }, .grass = grass, .tree = tree };
 }
 
+test "a record or link-slot pool grow that fails after the pool moved keeps the column views on the live pool" {
+    var level_graph = NavLevelGraph{ .border_stride = 4 };
+    defer level_graph.deinit(std.testing.allocator);
+    var pool_grows: u64 = 0;
+    try level_graph.record_dir.appendNTimes(std.testing.allocator, no_record, 64);
+    try level_graph.ensureFreeRecords(std.testing.allocator, 4, &pool_grows);
+    try level_graph.ensureFreeLinkSlots(std.testing.allocator, 2, &pool_grows);
+    const first = level_graph.claimRecord(0);
+    level_graph.border_count[first] = 3;
+    level_graph.claimLinkSlot(first);
+
+    // Growing past each pool moves it (allocation 0); growing its next list (allocation 1,
+    // after a refused in-place resize) fails.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, level_graph.ensureFreeRecords(failing.allocator(), level_graph.records.capacity + 1, &pool_grows));
+    const records = level_graph.records.slice();
+    try std.testing.expectEqual(records.items(.border_count).ptr, level_graph.border_count.ptr);
+    try std.testing.expectEqual(records.items(.link_slot).ptr, level_graph.record_link_slot.ptr);
+    failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    // Past both the pool's and the free list's capacity, so both must grow.
+    const slots_needed = 2 * @max(level_graph.link_slots.capacity, level_graph.link_free.capacity);
+    try std.testing.expectError(error.OutOfMemory, level_graph.ensureFreeLinkSlots(failing.allocator(), slots_needed, &pool_grows));
+    const slots = level_graph.link_slots.slice();
+    try std.testing.expectEqual(slots.items(.extra).ptr, level_graph.slot_extra.ptr);
+    try std.testing.expectEqual(slots.items(.links).ptr, level_graph.slot_links.ptr);
+
+    // The retries grow both pools; the claimed record kept its fields.
+    try level_graph.ensureFreeRecords(std.testing.allocator, level_graph.records.capacity + 1, &pool_grows);
+    try level_graph.ensureFreeLinkSlots(std.testing.allocator, slots_needed, &pool_grows);
+    try std.testing.expectEqual(@as(u8, 3), level_graph.border_count[first]);
+    try std.testing.expect(level_graph.record_link_slot[first] != no_link_slot);
+    const second = level_graph.claimRecord(1);
+    level_graph.claimLinkSlot(second);
+    try std.testing.expect(level_graph.record_link_slot[second] != level_graph.record_link_slot[first]);
+}
+
+// A dense one-step edit over cells 2..9 of both levels (every chunk): `tile` on each
+// level's obstacle layer, grouped per (level, chunk) in order.
+const DenseRegionEdit = struct {
+    writes: [128]DenseCellWrite = undefined,
+    chunks: [18]DenseChunkWrites = undefined,
+
+    fn build(self: *DenseRegionEdit, fixture: *const TwoLevelWorld, tile: TileId) []const DenseChunkWrites {
+        var write_count: usize = 0;
+        var chunk_count: usize = 0;
+        for (0..2) |level| for (0..3) |chunk_y| for (0..3) |chunk_x| {
+            const first = write_count;
+            for (chunk_y * 4..chunk_y * 4 + 4) |y| for (chunk_x * 4..chunk_x * 4 + 4) |x| {
+                if (x < 2 or x > 9 or y < 2 or y > 9) continue;
+                self.writes[write_count] = .{ .layer = @intCast(fixture.obstacle[level]), .x = @intCast(x), .y = @intCast(y), .tile = tile };
+                write_count += 1;
+            };
+            self.chunks[chunk_count] = .{ .level = @intCast(level), .chunk_x = @intCast(chunk_x), .chunk_y = @intCast(chunk_y), .writes = self.writes[first..write_count] };
+            chunk_count += 1;
+        };
+        return self.chunks[0..chunk_count];
+    }
+};
+
+// A dense terrain writer's step: its nav record reserve, the world write, the step's
+// published tile events, then the record.
+fn denseWriterStep(system: *PathfindingSystem, world: *WorldSystem, frame: *SimulationFrame, chunks: []const DenseChunkWrites, events: *std.ArrayList(WorldTileChangedEvent)) !void {
+    var write_count: usize = 0;
+    for (chunks) |chunk| write_count += chunk.writes.len;
+    try system.reserveTerrainNavRecord(write_count);
+    events.clearRetainingCapacity();
+    try events.ensureTotalCapacity(std.testing.allocator, write_count);
+    try world.applyDenseCellWrites(chunks, null, events);
+    frame.beginStep();
+    try frame.publishWorldTileChanges(events.items);
+    system.recordTerrainNavEvents(frame.events.mergedItems(), world, null);
+}
+
+test "a nav-record reserve OOM before a cave-in or explosion dense write leaves world and nav intact and the retry applies it" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    for ([_]enum { cave_in, explosion_fill }{ .cave_in, .explosion_fill }) |workload| {
+        var fixture = try twoLevelWorld(&meta);
+        defer fixture.world.deinit();
+        var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
+        defer system.deinit();
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+        defer events.deinit(std.testing.allocator);
+        var edit = DenseRegionEdit{};
+        // A cave-in fills the region; an explosion clears a filled one.
+        if (workload == .explosion_fill) {
+            try denseWriterStep(&system, &fixture.world, &frame, edit.build(&fixture, fixture.tree), &events);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+            system.nav_marks.shrinkAndFree(system.allocator, 0);
+        }
+        const tile = if (workload == .cave_in) fixture.tree else fixture.grass;
+        const chunks = edit.build(&fixture, tile);
+        const before_tile = fixture.world.denseTile(fixture.obstacle[1], 5, 5);
+        // The record needs more room than the marks hold, and the reserve runs out of memory.
+        try std.testing.expect(system.nav_marks.capacity < 128);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        system.allocator = failing.allocator();
+        const failed = denseWriterStep(&system, &fixture.world, &frame, chunks, &events);
+        system.allocator = std.testing.allocator;
+        try std.testing.expectError(error.OutOfMemory, failed);
+        try std.testing.expectEqual(before_tile, fixture.world.denseTile(fixture.obstacle[1], 5, 5));
+        try std.testing.expectEqual(@as(usize, 0), system.nav_marks.items.len);
+        var unchanged = try fullRebuild(&data, &fixture.world, abstractCapacity());
+        defer unchanged.deinit();
+        try expectGraphsEquivalent(&system.graph, &unchanged.graph);
+
+        // The retried writer writes, records, and the apply equals a full rebuild.
+        try denseWriterStep(&system, &fixture.world, &frame, chunks, &events);
+        try std.testing.expect(fixture.world.denseTile(fixture.obstacle[1], 5, 5) != before_tile);
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        try std.testing.expectEqual(@as(usize, 18), stats.dirty_chunks);
+        var rebuilt = try fullRebuild(&data, &fixture.world, abstractCapacity());
+        defer rebuilt.deinit();
+        try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+    }
+}
+
 test "one chunk's change leaves every other chunk's record untouched" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2722,7 +2812,7 @@ test "one chunk's change leaves every other chunk's record untouched" {
 
     // (5,5) lies in chunk (1,1) of the 3x3 chunk grid.
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)).?;
-    const stats = try system.applyNavUpdates(&data, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    const stats = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
     const patched = [_]u32{ 4, 3, 5, 1, 7 };
     for (0..system.graph.chunkCount()) |chunk_index| {
@@ -2764,7 +2854,7 @@ test "a batch touching more than eight levels applies incrementally and never ch
         const changed = (try world.setDenseTile(layer, 3, @intCast(level % 8), tree)).?;
         edits[level] = .{ .level = changed.level, .x = changed.x, .y = changed.y };
     }
-    const stats = try system.applyNavUpdates(&data, &world, &edits);
+    const stats = try system.applyNavUpdates(no_colliders, &world, &edits);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 0), stats.levels_built);
     try std.testing.expectEqual(version, system.graph.version);
@@ -2774,7 +2864,7 @@ test "a batch touching more than eight levels applies incrementally and never ch
     _ = try world.addDenseLayer(added, 0, .floor, grass);
     _ = try world.addDenseLayer(2, 0, .obstacle, tree);
     try world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 1, .y = 1 }, .level_b = added, .cell_b = .{ .x = 1, .y = 1 }, .traversal_cost = 1, .bidirectional = true });
-    const update = try system.applyBufferedNavUpdates(&data, &world, null);
+    const update = try system.applyBufferedNavUpdates(no_colliders, &world, null);
     try std.testing.expectEqual(@as(usize, 2), update.levels_built);
     try std.testing.expectEqual(version, system.graph.version);
 
@@ -2808,7 +2898,7 @@ fn oomObstacle(world: *const WorldSystem, level: u16) usize {
     return if (level == 0) 1 else 2 * @as(usize, level) + 1;
 }
 
-fn applyOomEdit(edit: OomEdit, system: *PathfindingSystem, data: *DataSystem, world: *WorldSystem, meta: *const @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta) !void {
+fn applyOomEdit(edit: OomEdit, system: *PathfindingSystem, data: *DataSystem, colliders: *StaticColliderSystem, world: *WorldSystem, meta: *const @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta) !void {
     const grass = try requireTestTile(meta, "grass");
     const tree = try requireTestTile(meta, "tree_0");
     switch (edit) {
@@ -2828,8 +2918,9 @@ fn applyOomEdit(edit: OomEdit, system: *PathfindingSystem, data: *DataSystem, wo
             try world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 5, .y = 5 }, .level_b = 0, .cell_b = .{ .x = 5, .y = 5 }, .traversal_cost = 1, .bidirectional = true });
         },
         .static_add => {
-            const entity = try addNavBody(data, .{ .x = 200, .y = 200 }, .{ .x = 40, .y = 40 }, true);
-            try system.markNavObstacleRectDirty(0, data.staticObstacleWorldRect(entity).?);
+            var frame = SimulationFrame.init(std.testing.allocator);
+            defer frame.deinit();
+            try test_support.commitWithColliders(&frame, data, colliders, system, &.{.{ .create_entity = staticTemplate(.{ .x = 200, .y = 200 }, .{ .x = 40, .y = 40 }) }});
         },
         .level_add => {
             const level = try world.addLevel(-48);
@@ -2862,16 +2953,18 @@ fn expectNavApplyOutOfMemorySafe(edit: OomEdit, thread_system: ?*ThreadSystem) !
         defer system.deinit();
         system.nav_thread_adaptive = false;
         system.nav_thread_items_per_range = 1;
+        var colliders = try test_support.worldColliders(&data, &world);
+        defer colliders.deinit();
         var before = try fullRebuild(&data, &world, capacity);
         defer before.deinit();
-        try applyOomEdit(edit, &system, &data, &world, &meta);
+        try applyOomEdit(edit, &system, &data, &colliders, &world, &meta);
         var after = try fullRebuild(&data, &world, capacity);
         defer after.deinit();
 
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
         system.allocator = failing.allocator();
         system.graph.allocator = failing.allocator();
-        const result = system.applyBufferedNavUpdates(&data, &world, thread_system);
+        const result = system.applyBufferedNavUpdates(&colliders, &world, thread_system);
         system.allocator = std.testing.allocator;
         system.graph.allocator = std.testing.allocator;
         if (result) |_| {
@@ -2884,7 +2977,7 @@ fn expectNavApplyOutOfMemorySafe(edit: OomEdit, thread_system: ?*ThreadSystem) !
                     levelsEquivalent(&system.graph, &after.graph, @intCast(level)));
             }
             try std.testing.expect(system.hasPendingNavUpdates(&world));
-            _ = try system.applyBufferedNavUpdates(&data, &world, thread_system);
+            _ = try system.applyBufferedNavUpdates(&colliders, &world, thread_system);
             try expectGraphsEquivalent(&system.graph, &after.graph);
         }
     }
@@ -2917,7 +3010,7 @@ test "a runtime ramp is routable from both levels the same step, at an interior 
         try std.testing.expect(!try routes(&system, &data, &fixture.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
 
         try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = cell[0], .y = cell[1] }, .level_b = 0, .cell_b = .{ .x = cell[0], .y = cell[1] }, .traversal_cost = 1, .bidirectional = true });
-        const stats = try system.applyBufferedNavUpdates(&data, &fixture.world, null);
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
         try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
         try std.testing.expect(isPortal(&system.graph, 1, @as(usize, cell[1]) * system.graph.width + cell[0]));
         try std.testing.expect(try routes(&system, &data, &fixture.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
@@ -2942,7 +3035,7 @@ test "a ramp into a blocked partner goes live when the partner opens, in that st
     try std.testing.expect(!try routes(&system, &data, &fixture.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
 
     const opened = (try fixture.world.setDenseTile(fixture.obstacle[0], 6, 6, fixture.grass)).?;
-    _ = try system.applyNavUpdates(&data, &fixture.world, &.{.{ .level = opened.level, .x = opened.x, .y = opened.y }});
+    _ = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = opened.level, .x = opened.x, .y = opened.y }});
     try std.testing.expect(try routes(&system, &data, &fixture.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
 }
 
@@ -2962,7 +3055,7 @@ test "adding a blocking dense layer to a built level re-derives that level's nav
     // No event reports the fill: only the level's content revision moves.
     _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
     try std.testing.expect(system.navReactionMayEmit(&data, &frame, &fixture.world));
-    const stats = try system.reactToPostCommitNavEvents(&frame, &data, &fixture.world, null);
+    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     try std.testing.expectEqual(@as(usize, 1), frame.events.stats.nav_region_invalidated);
     try std.testing.expect(!system.navReactionMayEmit(&data, &frame, &fixture.world));
@@ -2990,7 +3083,7 @@ test "a level added in play builds only its own chunks and leaves other levels a
 
     const level = try fixture.world.addLevel(-32);
     _ = try fixture.world.addDenseLayer(level, 0, .floor, fixture.grass);
-    const stats = try system.applyBufferedNavUpdates(&data, &fixture.world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     try std.testing.expectEqual(@as(usize, 0), stats.chunks_patched);
     try std.testing.expectEqual(@as(usize, 3), system.graph.levelCount());
@@ -3018,7 +3111,7 @@ test "a world build that runs out of memory leaves the previous graph intact; a 
     while (true) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
         system.graph.allocator = failing.allocator();
-        const result = system.graph.rebuild(&data, .{ .world = &second }, 1, null);
+        const result = system.graph.rebuild(no_colliders.view(), .{ .world = &second }, null);
         system.graph.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
@@ -3059,7 +3152,7 @@ test "nav over a zero-level world builds no level; the first added level routes"
 
     _ = try world.addLevel(0);
     _ = try world.addDenseLayer(0, 0, .floor, grass);
-    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     try std.testing.expect(try routes(&system, &data, &world, 0, .{ 1, 1 }, 0, .{ 10, 10 }));
 }
@@ -3086,7 +3179,7 @@ test "the nav reaction runs when only the world gained a level, a link, or a con
         }
         frame.beginStep();
         try std.testing.expect(system.navReactionMayEmit(&data, &frame, &fixture.world));
-        const stats = try system.reactToPostCommitNavEvents(&frame, &data, &fixture.world, null);
+        const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, null);
         try std.testing.expect(stats.levels_built + stats.incremental_rebuilds == 1);
         try std.testing.expectEqual(@as(usize, 1), frame.events.stats.nav_region_invalidated);
         try std.testing.expect(!system.navReactionMayEmit(&data, &frame, &fixture.world));
@@ -3112,7 +3205,7 @@ test "a patch reads only its chunk's link endpoints" {
     var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer system.deinit();
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[1], 6, 5, fixture.tree)).?;
-    _ = try system.applyNavUpdates(&data, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
     // The patched record holds exactly its level-local link, and its link slot was sized to
     // the one planned endpoint, so reading more would have tripped the slot's append.
@@ -3149,13 +3242,13 @@ test "an aborted prepared batch leaves the graph and its pending work unchanged,
     try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 9, .y = 9 }, .level_b = 0, .cell_b = .{ .x = 9, .y = 9 }, .traversal_cost = 1, .bidirectional = true });
     const links_applied = system.graph.links_applied;
     var stats = NavUpdateStats{};
-    const prepared = (try system.graph.prepareMarks(&data, &fixture.world, system.nav_marks.items, null, &stats)).?;
+    const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats)).?;
     system.graph.abortMarks(prepared);
     try std.testing.expectEqual(links_applied, system.graph.links_applied);
     try expectGraphsEquivalent(&system.graph, &before.graph);
     try std.testing.expect(system.hasPendingNavUpdates(&fixture.world));
 
-    _ = try system.applyBufferedNavUpdates(&data, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(fixture.world.levelLinks().len, system.graph.links_applied);
     var after = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer after.deinit();
@@ -3189,7 +3282,7 @@ test "border portals never exceed 4 * ceil(E / 2) and random digs match a full r
             const changed = (try world.setDenseTile(obstacle, x, y, if (random.boolean()) tree else grass)) orelse continue;
             try system.markNavDirty(changed.level, changed.x, changed.y);
         }
-        _ = try system.applyBufferedNavUpdates(&data, &world, null);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &world, null);
         const bound = 4 * ((@as(usize, edge) + 1) / 2);
         // Each record's border window is sized from the level's own chunk edge.
         try std.testing.expectEqual(bound, system.graph.levelGraph(0).?.border_stride);
@@ -3256,8 +3349,9 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
         const changed = (try fixture.world.setDenseTile(fixture.obstacle[level], x, y, fixture.tree)) orelse continue;
         for (&systems) |*system| try system.markNavDirty(changed.level, changed.x, changed.y);
     }
-    for (&systems) |*system| try system.markNavTileRectDirty(&fixture.world, 0, 2, 2, 11, 5);
-    _ = try systems[0].applyBufferedNavUpdates(&data, &fixture.world, null);
+    const obstacle_rect = SimulationEvent{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{ .level = 0, .min_x = 2, .min_y = 2, .max_x_exclusive = 11, .max_y_exclusive = 5 } } };
+    for (&systems) |*system| try test_support.recordTerrainEvents(system, &.{obstacle_rect}, &fixture.world);
+    _ = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), systems[0].graph.plan_tallies.items.len);
     // The dirty keys are the union of the changed keys and the new link's endpoint chunks.
     {
@@ -3272,7 +3366,7 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
         try std.testing.expectEqualSlices(u64, union_keys.items, graph.dirty_keys.items);
     }
     for (systems[1..]) |*system| {
-        _ = try system.applyBufferedNavUpdates(&data, &fixture.world, &threads);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
         try std.testing.expect(system.graph.plan_tallies.items.len > 1);
         try std.testing.expectEqualSlices(u64, systems[0].graph.changed_keys.items, system.graph.changed_keys.items);
         try std.testing.expectEqualSlices(u64, systems[0].graph.patch_keys.items, system.graph.patch_keys.items);

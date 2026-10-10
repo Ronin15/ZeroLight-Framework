@@ -64,6 +64,7 @@ const PerceptionSystem = @import("systems/perception.zig").PerceptionSystem;
 const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPerceptionCandidate;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
+const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const EventBudgetInputs = @import("simulation.zig").EventBudgetInputs;
@@ -648,6 +649,10 @@ pub const SimulationPipeline = struct {
     ai: AiSystem,
     steering: SteeringSystem,
     pathfinding: PathfindingSystem,
+    /// Static navigation obstacles as shared rows on nav's cell grid, changed only at the
+    /// commit seam (`reserveStaticColliders`, `captureStaticColliderChanges`,
+    /// `syncStaticColliders`); nav reads them.
+    static_colliders: StaticColliderSystem,
     /// Backbone scope system: recomputes chunks, gathers the unstaggered
     /// cognition halo and the stagger-filtered think set, and drives auto tier
     /// wake/sleep.
@@ -727,12 +732,16 @@ pub const SimulationPipeline = struct {
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
         // With a world, nav covers its levels at its own tile and chunk dimensions; the
-        // bounds and `nav_cell_size` shape only a world-less build.
-        if (config.navigation_world) |world| {
-            try pathfinding.rebuildStaticNavGridWithWorld(data, world, config.nav_build_thread_system);
-        } else {
-            try pathfinding.rebuildStaticNavGrid(data, bounds_width, bounds_height, config.nav_cell_size);
-        }
+        // bounds and `nav_cell_size` shape only a world-less build. The colliders build first,
+        // on nav's cell grid, and nav reads them.
+        const nav_extent = if (config.navigation_world) |world|
+            PathfindingSystem.worldNavExtent(world)
+        else
+            pathfinding.boundsNavExtent(bounds_width, bounds_height, config.nav_cell_size);
+        var static_colliders = StaticColliderSystem.init(allocator);
+        errdefer static_colliders.deinit();
+        try static_colliders.rebuild(data, try nav_extent.colliderGeometry());
+        try pathfinding.rebuildNavFromColliders(&static_colliders, nav_extent, if (config.navigation_world != null) config.nav_build_thread_system else null);
         var collision = CollisionSystem.init(allocator);
         errdefer collision.deinit();
         var collision_response = CollisionResponseSystem.init(allocator);
@@ -763,6 +772,9 @@ pub const SimulationPipeline = struct {
         var dig = DigController.init(config.dig);
         errdefer dig.deinit();
         try dig.reservePlaneScratch(allocator, maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = population }));
+        // The plane-traversal stage records its carves into nav; its record room follows the
+        // same bound.
+        try pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = population }));
         try ai.reserve(population);
         try perception.reserve(population);
         try ai_memory.reserve(population);
@@ -775,6 +787,7 @@ pub const SimulationPipeline = struct {
             .ai = ai,
             .steering = steering,
             .pathfinding = pathfinding,
+            .static_colliders = static_colliders,
             .scope = scope,
             .spatial_index = spatial_index,
             .perception = perception,
@@ -930,6 +943,7 @@ pub const SimulationPipeline = struct {
             try self.spatial_index.reserveRows(body);
             try self.collision.reserve(body);
             try self.dig.ensurePlaneScratchReserve(body + 1);
+            try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = body }));
         }
         // The obstacle snapshot is reserved to the responder capacity, not the live
         // statics: statics are a subset of responders, so statics committed within the
@@ -987,6 +1001,7 @@ pub const SimulationPipeline = struct {
         self.perception.deinit();
         self.spatial_index.deinit();
         self.scope.deinit();
+        self.static_colliders.deinit();
         self.pathfinding.deinit();
         self.steering.deinit();
         self.ai.deinit();
@@ -995,23 +1010,44 @@ pub const SimulationPipeline = struct {
         self.* = undefined;
     }
 
-    /// Marks a whole level for re-derivation next update, for changes that cannot be reduced to
-    /// specific cells (e.g. a destroyed static obstacle whose nav cell is no longer resolvable).
-    pub fn markNavLevelDirty(self: *SimulationPipeline, level: u16) !void {
-        try self.pathfinding.markNavLevelDirty(level);
+    /// The commit seam's collider reserve, before the structural commit: sizes the static
+    /// colliders' dirty list to every entity index this step's commands can produce, so the
+    /// capture after the commit allocates nothing, and nav's static marks to every change
+    /// the next collider sync can record (the pending changes plus one per command). An
+    /// error commits nothing.
+    pub fn reserveStaticColliders(self: *SimulationPipeline, frame: *const SimulationFrame, data: *const DataSystem) !void {
+        const command_count = frame.structural_commands.mergedItems().len;
+        try self.static_colliders.reserveForCommit(data, command_count);
+        try self.pathfinding.reserveStaticColliderMarks(self.static_colliders.pendingChangeCount() + command_count);
+    }
+
+    /// Right after the structural commit: records the step's static changes into the
+    /// colliders' persistent dirty list. Allocation-free; never fails, so a later seam
+    /// failure cannot lose them.
+    pub fn captureStaticColliderChanges(self: *SimulationPipeline, frame: *const SimulationFrame) void {
+        self.static_colliders.capture(frame);
+    }
+
+    /// Applies the captured static changes to the collider rows, then records them for nav
+    /// into the marks `reserveStaticColliders` reserved, whether or not nav applies this
+    /// step. Main work is O(1) per changed static and per footprint chunk entering or
+    /// leaving; the per-chunk sorted placement threads under `thread_system`. On error the
+    /// rows are unchanged, nothing is recorded, and the changes stay for the next sync.
+    pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: ?*ThreadSystem) !void {
+        try self.static_colliders.sync(data, thread_system);
+        self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
     }
 
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
-    /// `PathfindingSystem`, which interprets nav-invalidating events into marks,
-    /// applies every pending nav change, and emits the invalidation event.
+    /// `PathfindingSystem`, which applies every recorded nav change and emits the
+    /// invalidation event. Runs after `syncStaticColliders` succeeded this step.
     pub fn reactToPostCommitNavEvents(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
-        data: *const DataSystem,
         world: *const WorldSystem,
         thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
-        return self.pathfinding.reactToPostCommitNavEvents(frame, data, world, thread_system);
+        return self.pathfinding.reactToPostCommitNavEvents(frame, &self.static_colliders, world, thread_system);
     }
 
     /// Orchestrates the post-commit static-obstacle spatial invalidation for
@@ -1025,11 +1061,11 @@ pub const SimulationPipeline = struct {
     }
 
     /// Whether the post-commit nav reaction may emit its event this step: a pending
-    /// structural command or committed event may change nav, or nav has marks, levels,
-    /// links, or a content revision still to apply. Used for the pre-commit event
-    /// capacity preflight.
+    /// structural command may change nav, a failed collider sync left static changes for
+    /// this step's sync, or nav has recorded marks, levels, links, or a content revision
+    /// still to apply. Used for the pre-commit event capacity preflight.
     pub fn navReactionMayEmit(self: *const SimulationPipeline, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
-        return self.pathfinding.navReactionMayEmit(data, frame, world);
+        return self.static_colliders.hasPendingChanges() or self.pathfinding.navReactionMayEmit(data, frame, world);
     }
 
     /// Queues ambient audio (music + movement-gated jet loop) through the owned
@@ -1212,13 +1248,21 @@ pub const SimulationPipeline = struct {
         // stage with the deferred impacts still queued; the promote writes no world
         // state.
         const dig_edit = try self.dig.reserveWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
+        // Nav records the edit's events right after the world write; its room is reserved
+        // with the world growth, so an OOM fails before anything is written.
+        if (dig_edit != null) try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.dig_world_edit, .{}));
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         // Player-authored world edit, plus a ramp's exit cleared walkable on the
         // level above. Its world_tile_changed event (and the exit's
-        // world_obstacle_changed) is deferred and re-masks navigation in
-        // merge_outputs regardless of order.
-        if (dig_edit) |edit| try DigController.commitWorldEdit(context.world, edit, context.frame);
+        // world_obstacle_changed) becomes nav marks here; the commit seam applies them.
+        if (dig_edit) |edit| {
+            const first_event = context.frame.events.mergedItems().len;
+            const written = DigController.commitWorldEdit(context.world, edit, context.frame);
+            // Earlier events keep their positions, so the tail is the edit's own events.
+            self.pathfinding.recordTerrainNavEvents(context.frame.events.mergedItems()[first_event..], context.world, null);
+            try written;
+        }
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
@@ -1435,11 +1479,20 @@ pub const SimulationPipeline = struct {
     }
 
     /// After positions settle: follow a ramp on cell entry, or fall one level when
-    /// standing over a hole. Landing carves are one event range.
+    /// standing over a hole. Landing carves are one event range, recorded as nav marks
+    /// right after the write into room reserved before it.
     fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const grown_before = self.dig.plane_scratch_grown;
-        try self.dig.applyPlaneTraversalStage(context.world, context.data, context.player, context.frame);
+        const reservation = try self.dig.reservePlaneTraversalStage(context.world, context.data, context.player, context.frame);
+        // The record room follows the carves the preflight counted, which may exceed the
+        // tracked population's budget until a failed population seam succeeds.
+        if (reservation.carves != 0) try self.pathfinding.reserveTerrainNavRecord(reservation.carves);
+        const first_event = context.frame.events.mergedItems().len;
+        const traversed = self.dig.commitPlaneTraversalStage(context.world, context.data, context.player, context.frame, reservation);
+        // Earlier events keep their positions, so the tail is the stage's own events.
+        self.pathfinding.recordTerrainNavEvents(context.frame.events.mergedItems()[first_event..], context.world, context.thread_system);
+        try traversed;
         step.dig_plane_scratch_grown = @intCast(self.dig.plane_scratch_grown - grown_before);
     }
 
@@ -2517,6 +2570,10 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const GridCell = @import("systems/pathfinding/types.zig").GridCell;
+const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const lane_count = @import("../core/simd.zig").lane_count;
+const DigIntent = @import("simulation.zig").DigIntent;
 const demoWorldWithChunkSize = @import("world_test_support.zig").demoWorldWithChunkSize;
 const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
 const AiAgent = @import("data_system.zig").AiAgent;
@@ -2541,6 +2598,12 @@ fn gateTestWorld(meta: *const world_tileset_meta.WorldTilesetMeta, carve: []cons
         _ = try world.setDenseTile(floor1, cell[0], cell[1], cave_0);
     }
     return world;
+}
+
+// One plane stage's dig half: reserve, then commit the reservation.
+fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame);
+    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation);
 }
 
 fn placePlayerFlush(data: *DataSystem, player: Player, cell: [2]u16) void {
@@ -3823,7 +3886,7 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
     defer dig.deinit();
     try std.testing.expectError(
         error.EventCapacityExceeded,
-        dig.applyPlaneTraversalStage(&world, &data, &player, &frame),
+        testPlaneTraversalStage(&dig, &world, &data, &player, &frame),
     );
     try std.testing.expectEqual(landing_before, world.denseTile(floor1, 4, 3));
     try std.testing.expect(world.denseTileBlocksMovement(floor1, 4, 3));
@@ -3900,16 +3963,14 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
 
     try std.testing.expectError(
         error.OutOfMemory,
-        dig.applyPlaneTraversalStage(&world, &data, &player, &frame),
+        testPlaneTraversalStage(&dig, &world, &data, &player, &frame),
     );
     try std.testing.expectEqual(landing_a, world.denseTile(floor1, 4, 3));
     try std.testing.expectEqual(landing_b, world.denseTile(floor1, 6, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.world_tile_changed);
 }
 
-test "plane traversal multi-fall after scratch reserve is allocation-free (FailingAllocator)" {
-    // Warm scratch + event capacity, arm FA at index 0, two falls publish
-    // with zero further allocations on the frame / events / data paths used.
+test "plane traversal multi-fall after its reserve commits and publishes allocation-free (FailingAllocator)" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
@@ -3947,34 +4008,44 @@ test "plane traversal multi-fall after scratch reserve is allocation-free (Faili
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
-    // Warm the exact event append path the stage preflights + publishes through.
-    try frame.events.ensureEventAppendCapacity(2);
     frame.beginStep();
-    // beginStep clears counts but retains capacity — re-warm event value capacity
-    // after clear so ensureEventAppendCapacity(2) inside the stage is free.
-    try frame.events.ensureEventAppendCapacity(2);
+
+    var dig = DigController.init(dig_config);
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+    defer dig.deinit();
+    // The reserve covers the scratch, the events, every carve's world write, and the
+    // world_level rows; after it the commit allocates from none of them.
+    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame);
+    try std.testing.expectEqual(@as(usize, 2), reservation.carves);
 
     const original_frame = frame.allocator;
     const original_events = frame.events.stream.allocator;
     const original_data = data.allocator;
+    const original_world = world.allocator;
+    const original_dig = dig.scratch_allocator.?;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const fail_alloc = failing.allocator();
     frame.allocator = fail_alloc;
     frame.events.stream.allocator = fail_alloc;
     data.allocator = fail_alloc;
+    world.allocator = fail_alloc;
+    dig.scratch_allocator = fail_alloc;
     defer {
         frame.allocator = original_frame;
         frame.events.stream.allocator = original_events;
         data.allocator = original_data;
+        world.allocator = original_world;
+        dig.scratch_allocator = original_dig;
     }
 
-    var dig = DigController.init(dig_config);
-    try dig.reservePlaneScratch(std.testing.allocator, 4);
-    defer dig.deinit();
-    try dig.applyPlaneTraversalStage(&world, &data, &player, &frame);
+    try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation);
 
-    try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    // Each landing carve is published once, in one range.
+    try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
+    try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.rangeCount());
     const floor1 = world.denseFloorLayerForLevel(1).?;
     try std.testing.expect(!world.denseTileBlocksMovement(floor1, 4, 3));
     try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
@@ -5454,16 +5525,22 @@ fn markAllAlwaysActive(data: *DataSystem) !void {
     }
 }
 
-/// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: commit with the
-/// nav-reaction slot reserved, run the population seam, then the post-commit reactions
-/// (nav only after a successful seam; steering before a seam or nav error returns).
+/// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: the collider and
+/// static mark reserve, the commit with the nav-reaction slot reserved, the collider
+/// capture, the population seam, the collider sync and its nav record, then the post-commit
+/// reactions (nav apply only after a successful population seam and collider sync; steering
+/// always), returning the first error.
 fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
     const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
+    try pipeline.reserveStaticColliders(frame, data);
     _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
+    pipeline.captureStaticColliderChanges(frame);
     const sync = pipeline.syncPopulationCapacity(frame, data);
-    const nav_update = if (sync) |_| pipeline.reactToPostCommitNavEvents(frame, data, world, null) else |err| err;
+    const colliders = pipeline.syncStaticColliders(data, null);
+    const nav_update = if (sync) |_| (if (colliders) |_| pipeline.reactToPostCommitNavEvents(frame, world, null) else |err| err) else |err| err;
     pipeline.reactToPostCommitSteeringEvents(frame);
     const sync_stats = try sync;
+    try colliders;
     _ = try nav_update;
     return sync_stats;
 }
@@ -6004,6 +6081,421 @@ fn responderTemplate(index: usize, mobility: CollisionResponseMobility) Structur
         .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
         .collision_response = .{ .mode = .solid, .mobility = mobility, .restitution = 0 },
     } };
+}
+
+test "a collider sync that runs out of memory keeps its change and the next step's seam reserves the nav event for it" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 128,
+        .pathfinding = sync_test_pathfinding,
+        .navigation_world = &world,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + 128);
+    try pipeline.reserve(&frame, 4);
+
+    // A static created over the one cell; its collider sync runs out of memory.
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{responderTemplate(0, .static)});
+    try pipeline.reserveStaticColliders(&frame, &data);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    pipeline.static_colliders.allocator = failing.allocator();
+    pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
+    const failed = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    pipeline.static_colliders.allocator = std.testing.allocator;
+    pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expect(!pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
+
+    // A step with no command: the kept change still makes the nav reaction emit, so the
+    // seam reserves its event, and the retried sync blocks the cell.
+    frame.beginStep();
+    try std.testing.expect(pipeline.navReactionMayEmit(&data, &frame, &world));
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.stats.nav_region_invalidated);
+    try std.testing.expect(pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
+    try std.testing.expect(!pipeline.navReactionMayEmit(&data, &frame, &world));
+}
+
+// World-backed nav over the minimal three-level world: a player at (5,3) facing right, so a
+// dig hits (6,3), stepped through `update` and the demo seam. On level 0 a dig is a hole
+// (walkable either way); `underground` puts the player on level 1's solid dirt, where a dig
+// mines a walkable tunnel and so changes nav.
+const NavSeamFixture = struct {
+    meta: world_tileset_meta.WorldTilesetMeta,
+    world: WorldSystem,
+    data: DataSystem,
+    frame: SimulationFrame,
+    threads: ThreadSystem,
+    player: Player,
+    pipeline: SimulationPipeline,
+
+    const Options = struct {
+        tiles_per_side: u32 = 8,
+        worker_threads: usize = 0,
+        structural_headroom: usize = 16,
+        pathfinding: PathfindingCapacity = sync_test_pathfinding,
+    };
+
+    fn init(self: *NavSeamFixture, options: Options) !void {
+        const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+        self.meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+        errdefer self.meta.deinit();
+        const bounds = self.meta.tileSize() * @as(f32, @floatFromInt(options.tiles_per_side));
+        self.world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &self.meta, bounds, bounds);
+        errdefer self.world.deinit();
+        self.data = DataSystem.init(std.testing.allocator);
+        errdefer self.data.deinit();
+        self.player = try Player.spawn(&self.data);
+        self.player.current_level = 0;
+        placePlayerFlush(&self.data, self.player, .{ 5, 3 });
+        self.data.facingPtr(self.player.entity).?.* = .right;
+        self.frame = SimulationFrame.init(std.testing.allocator);
+        errdefer self.frame.deinit();
+        try self.frame.reserveStreams(4, 8, 8, 8, 8, 8);
+        try self.frame.reservePathRequests(2, 2);
+        self.threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+            .max_worker_threads = options.worker_threads,
+            .items_per_range = if (options.worker_threads == 0) (ThreadSystemConfig{}).items_per_range else 1,
+        });
+        errdefer self.threads.deinit();
+        self.pipeline = try SimulationPipeline.init(std.testing.allocator, &self.data, 256, 256, .{
+            .dig = try DigConfig.fromMeta(&self.meta),
+            .movement_body_capacity = 4,
+            .structural_headroom = options.structural_headroom,
+            .pathfinding = options.pathfinding,
+            .navigation_world = &self.world,
+        });
+        errdefer self.pipeline.deinit();
+        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 8, 8, 8, 8, 8 + options.structural_headroom);
+        try self.pipeline.reserve(&self.frame, 4);
+    }
+
+    fn underground(self: *NavSeamFixture) void {
+        self.player.current_level = 1;
+    }
+
+    fn deinit(self: *NavSeamFixture) void {
+        self.pipeline.deinit();
+        self.threads.deinit();
+        self.frame.deinit();
+        self.data.deinit();
+        self.world.deinit();
+        self.meta.deinit();
+    }
+
+    // One step's stages with `intent`, without the commit seam.
+    fn update(self: *NavSeamFixture, intent: DigIntent) !void {
+        self.frame.beginStep();
+        self.frame.dig_intent = intent;
+        _ = try self.pipeline.update(.{
+            .data = &self.data,
+            .frame = &self.frame,
+            .world = &self.world,
+            .player = &self.player,
+            .thread_system = &self.threads,
+            .delta_seconds = 0.016,
+            .bounds_width = 256,
+            .bounds_height = 256,
+            .sim_view = fullWorldSimView(&self.world),
+        });
+    }
+
+    fn seam(self: *NavSeamFixture) !void {
+        _ = try commitAndSyncLikeDemo(&self.pipeline, &self.frame, &self.data, &self.world);
+    }
+
+    fn navBlocked(self: *const NavSeamFixture, level: u16, x: i32, y: i32) bool {
+        return self.pipeline.pathfinding.graph.grid(level).?.isBlockedCell(.{ .x = x, .y = y });
+    }
+
+    // Fills the recorded marks to their capacity, so the next mark reserve must grow.
+    fn fillNavMarks(self: *NavSeamFixture) void {
+        const marks = &self.pipeline.pathfinding.nav_marks;
+        while (marks.items.len < marks.capacity) marks.appendAssumeCapacity(.{ .level = 0, .kind = .tile_box, .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 });
+    }
+
+    // Nav holds no pending change and equals a fresh build of the world and statics.
+    fn expectNavMatchesRebuild(self: *const NavSeamFixture) !void {
+        const live = &self.pipeline.pathfinding.graph;
+        try std.testing.expect(!self.pipeline.pathfinding.hasPendingNavUpdates(&self.world));
+        var rebuilt = PathfindingSystem.init(std.testing.allocator);
+        defer rebuilt.deinit();
+        try rebuilt.reserve(sync_test_pathfinding);
+        try rebuilt.rebuildStaticNavGridWithWorld(&self.data, &self.world, null);
+        try std.testing.expectEqual(rebuilt.graph.levelCount(), live.levelCount());
+        for (0..live.levelCount()) |level_index| {
+            const level: u16 = @intCast(level_index);
+            for (0..self.world.height) |y| for (0..self.world.width) |x| {
+                const cell = GridCell{ .x = @intCast(x), .y = @intCast(y) };
+                try std.testing.expectEqual(rebuilt.graph.grid(level).?.isBlockedCell(cell), live.grid(level).?.isBlockedCell(cell));
+            };
+            try std.testing.expectEqual(rebuilt.graph.levelGraph(level).?.recordCount(), live.levelGraph(level).?.recordCount());
+        }
+        try std.testing.expectEqual(rebuilt.graph.totalPortals(), live.totalPortals());
+    }
+};
+
+test "a nav-mark reserve OOM before a dig leaves world and nav intact and the retry applies it" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    const floor1 = fixture.world.denseFloorLayerForLevel(1).?;
+    const tile_before = fixture.world.denseTile(floor1, 6, 3);
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    fixture.fillNavMarks();
+    const nav_allocator = fixture.pipeline.pathfinding.allocator;
+    var failing = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = failing.allocator();
+    const failed = fixture.update(.hole);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    // Nothing was written or promoted, and nav is as it was.
+    try std.testing.expectEqual(tile_before, fixture.world.denseTile(floor1, 6, 3));
+    try std.testing.expectEqual(@as(usize, 0), fixture.frame.events.mergedItems().len);
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // The re-issued dig writes, records, and the seam applies it.
+    try fixture.update(.hole);
+    try std.testing.expect(fixture.world.denseTile(floor1, 6, 3) != tile_before);
+    try fixture.seam();
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a nav-mark reserve OOM before plane traversal leaves world and nav intact and the retry applies it" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    // A hole at (6,3); the player then stands over it.
+    try fixture.update(.hole);
+    try fixture.seam();
+    const floor1 = fixture.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(fixture.world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // Control: a quiet step allocates nothing from nav, so the next failure is the
+    // traversal's record reserve.
+    const nav_allocator = fixture.pipeline.pathfinding.allocator;
+    var quiet = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = quiet.allocator();
+    try fixture.update(.none);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try fixture.seam();
+
+    placePlayerFlush(&fixture.data, fixture.player, .{ 6, 3 });
+    fixture.fillNavMarks();
+    var failing = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = failing.allocator();
+    const failed = fixture.update(.none);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    // No fall and no landing carve, and nav is as it was.
+    try std.testing.expectEqual(@as(u16, 0), fixture.player.current_level);
+    try std.testing.expect(fixture.world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // The retried step falls and carves the landing; the seam applies it.
+    try fixture.update(.none);
+    try std.testing.expectEqual(@as(u16, 1), fixture.player.current_level);
+    try std.testing.expect(!fixture.world.denseTileBlocksMovement(floor1, 6, 3));
+    try fixture.seam();
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a plane traversal past a failed population seam reserves its nav record from its carves and the seam then matches a rebuild" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{
+        .tiles_per_side = 16,
+        .worker_threads = 2,
+        .structural_headroom = 128,
+        .pathfinding = .{ .max_frame_requests = 4, .max_group_fields = 1, .worker_participant_count = 1 },
+    });
+    defer fixture.deinit();
+    const pathfinding = &fixture.pipeline.pathfinding;
+    pathfinding.nav_thread_adaptive = false;
+    pathfinding.nav_thread_items_per_range = 1;
+    const spare_marks = pathfinding.nav_marks.capacity - pathfinding.nav_marks.items.len;
+    // Past the spare marks and staging, and across at least two `nav_mark` ranges.
+    const npc_count = @max(8 * lane_count, spare_marks, pathfinding.nav_mark_staging.capacity) + 1;
+
+    // Each NPC enters its own surface hole from the west this step; level 1 below is solid.
+    const floor0 = fixture.world.denseFloorLayerForLevel(0).?;
+    const floor1 = fixture.world.denseFloorLayerForLevel(1).?;
+    var landings: std.ArrayList(CellCoord) = .empty;
+    defer landings.deinit(std.testing.allocator);
+    var y: u16 = 0;
+    fill: while (y < 16) : (y += 1) {
+        var x: u16 = 1;
+        while (x < 16) : (x += 1) {
+            if (landings.items.len == npc_count) break :fill;
+            if (x == 5 and y == 3) continue; // the player's cell
+            try std.testing.expect(fixture.world.denseTileBlocksMovement(floor1, x, y));
+            _ = try fixture.world.clearDenseTile(floor0, x, y);
+            try landings.append(std.testing.allocator, .{ .x = x, .y = y });
+            const npc = try fixture.data.createEntity();
+            try fixture.data.setMovementBody(npc, .{});
+            try fixture.data.setPrimitiveVisual(npc, growth_npc_visual);
+            try fixture.data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+            try fixture.data.setWorldLevel(npc, 0);
+            try fixture.data.setSimulationTier(npc, .locomotion);
+            const body = fixture.data.movementBodyPtr(npc).?;
+            body.previous_x.* = @as(f32, @floatFromInt(x - 1)) * 32;
+            body.previous_y.* = @as(f32, @floatFromInt(y)) * 32;
+            body.position_x.* = @as(f32, @floatFromInt(x)) * 32;
+            body.position_y.* = @as(f32, @floatFromInt(y)) * 32;
+        }
+    }
+    try std.testing.expectEqual(npc_count, landings.items.len);
+    fixture.pipeline.dig.player_last_cell = .{ .x = 5, .y = 3 };
+
+    // The population seam runs out of memory at its first reserve, so every population-sized
+    // reserve, the nav record's included, stays at the old capacity.
+    const old_capacity = fixture.pipeline.movement_body_capacity;
+    const scope_allocator = fixture.pipeline.scope.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.scope.allocator = failing.allocator();
+    const failed = fixture.pipeline.syncPopulationCapacity(&fixture.frame, &fixture.data);
+    fixture.pipeline.scope.allocator = scope_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(old_capacity, fixture.pipeline.movement_body_capacity);
+    try std.testing.expect(npc_count > maxEventsPerStep(.plane_traversal, fixture.pipeline.eventBudgets()));
+    try std.testing.expect(npc_count > pathfinding.nav_marks.capacity - pathfinding.nav_marks.items.len);
+    try std.testing.expect(npc_count > pathfinding.nav_mark_staging.capacity);
+
+    fixture.frame.beginStep();
+    var step = SimulationPipeline.StepState.init(&fixture.pipeline, .{
+        .data = &fixture.data,
+        .frame = &fixture.frame,
+        .world = &fixture.world,
+        .player = &fixture.player,
+        .thread_system = &fixture.threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 256,
+        .bounds_height = 256,
+        .sim_view = fullWorldSimView(&fixture.world),
+    });
+    try fixture.pipeline.stagePlaneTraversal(&step);
+    try std.testing.expect(pathfinding.last_mark_batch.range_count >= 2 and !pathfinding.last_mark_batch.ran_inline);
+    try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);
+    try std.testing.expectEqual(@as(usize, 1), fixture.frame.events.range_stats.items.len);
+    for (landings.items) |cell| try std.testing.expect(!fixture.world.denseTileBlocksMovement(floor1, cell.x, cell.y));
+
+    // The retried seam grows, and nav applies every recorded carve.
+    try fixture.seam();
+    try std.testing.expect(fixture.pipeline.movement_body_capacity > old_capacity);
+    for (landings.items) |cell| try std.testing.expect(!fixture.navBlocked(1, cell.x, cell.y));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a dig whose step fails before the commit seam reaches nav at the next seam" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    // The dig's stages run, then the step stops before its seam (a later stage failed).
+    try fixture.update(.hole);
+    try std.testing.expect(!fixture.world.levelBlocksMovement(1, 6, 3));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // The next step's events no longer hold the dig; its seam still applies it.
+    try fixture.update(.none);
+    try fixture.seam();
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a collider-sync OOM in a dig step still applies the dig the next step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    try fixture.update(.hole);
+    try writeStructuralCommands(&fixture.frame, &.{responderTemplate(1, .static)});
+    // The seam's collider reserve holds; the sync after the commit runs out of memory.
+    try fixture.pipeline.reserveStaticColliders(&fixture.frame, &fixture.data);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.static_colliders.allocator = failing.allocator();
+    fixture.pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
+    const failed = fixture.seam();
+    fixture.pipeline.static_colliders.allocator = std.testing.allocator;
+    fixture.pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // A step with no dig and no command: the retried sync and the kept dig marks apply.
+    try fixture.update(.none);
+    try fixture.seam();
+    try std.testing.expect(fixture.navBlocked(0, 2, 0));
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a static nav-mark reserve OOM commits nothing and the retried commit reaches nav" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.update(.none);
+    try writeStructuralCommands(&fixture.frame, &.{responderTemplate(1, .static)});
+    const entities_before = fixture.data.movementBodySliceConst().entities.len;
+    fixture.fillNavMarks();
+    const nav_allocator = fixture.pipeline.pathfinding.allocator;
+    var failing = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = failing.allocator();
+    const failed = fixture.pipeline.reserveStaticColliders(&fixture.frame, &fixture.data);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    // Nothing committed: no entity, no row, and nav unchanged.
+    try std.testing.expectEqual(entities_before, fixture.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expect(!fixture.navBlocked(0, 2, 0));
+
+    // The retried seam commits the same commands; nav takes the static.
+    try fixture.seam();
+    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expect(fixture.navBlocked(0, 2, 0));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a nav apply OOM keeps the step's dig and static marks and the next step applies both" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    try fixture.update(.hole);
+    try writeStructuralCommands(&fixture.frame, &.{responderTemplate(1, .static)});
+    const graph_allocator = fixture.pipeline.pathfinding.graph.allocator;
+    var failing = std.testing.FailingAllocator.init(graph_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.graph.allocator = failing.allocator();
+    const failed = fixture.seam();
+    fixture.pipeline.pathfinding.graph.allocator = graph_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expect(!fixture.navBlocked(0, 2, 0));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+    try std.testing.expect(fixture.pipeline.pathfinding.hasPendingNavUpdates(&fixture.world));
+
+    try fixture.update(.none);
+    try fixture.seam();
+    try std.testing.expect(fixture.navBlocked(0, 2, 0));
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
 }
 
 test "statics committed within the responder headroom never grow the steering snapshot in-stage" {

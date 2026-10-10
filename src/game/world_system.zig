@@ -2130,6 +2130,15 @@ pub const WorldSystem = struct {
         return self.level_terrain.items[level_index].blocked.form(chunk);
     }
 
+    /// A mixed chunk's composed movement-blocked bits on `level_index` (bit
+    /// `row * chunk_size_tiles + column` per in-level cell, out-of-level bits clear), or
+    /// null for an OPEN or BLOCKED chunk. Valid until the level's next terrain write. O(1).
+    pub fn levelChunkBlockedBits(self: *const WorldSystem, level_index: u16, chunk: u32) ?*const ChunkBits {
+        const blocked = &self.level_terrain.items[level_index].blocked;
+        if (blocked.form(chunk) != .mixed) return null;
+        return &blocked.bits.items[blocked.dir[chunk]];
+    }
+
     /// The level's content revision: it changes whenever the level's composed
     /// movement-blocked bits change through a path that emits no per-cell event (a blocking
     /// dense layer add, a procedural fill). Compared with `!=`; O(1).
@@ -6369,6 +6378,43 @@ test "clearCellBlocking and refills match the flat reference in uniform blocked 
         for (0..fills.len) |layer| try std.testing.expectEqual(@as(usize, 0), world.dense_layers.items(.store)[layer].liveBlockCount());
         try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[0].blocked.liveSlotCount());
     }
+}
+
+test "levelChunkBlockedBits holds a mixed chunk's cells and nothing for uniform chunks" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 6x6 tiles in 4-tile chunks: a full chunk and three border chunks.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 6,
+        .height = 6,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    _ = try world.addLevel(0);
+    const floor = try world.addDenseLayer(0, 0, .floor, tiles.grass);
+    for ([_][2]u16{ .{ 1, 2 }, .{ 3, 0 }, .{ 5, 5 } }) |cell| _ = try world.setDenseTile(floor, cell[0], cell[1], tiles.dirt);
+    for (0..4) |chunk_index| {
+        const chunk: u32 = @intCast(chunk_index);
+        const bits = world.levelChunkBlockedBits(0, chunk) orelse {
+            try std.testing.expect(world.levelChunkBlockedForm(0, chunk) != .mixed);
+            continue;
+        };
+        try std.testing.expectEqual(ChunkForm.mixed, world.levelChunkBlockedForm(0, chunk));
+        const geom = world.chunkGeometry();
+        const extent = geom.extent(chunk);
+        for (0..4) |row| for (0..4) |col| {
+            const local: u32 = @intCast(row * 4 + col);
+            const in_level = col < extent.cols and row < extent.rows;
+            const expected = in_level and world.levelBlocksMovement(0, @intCast(extent.min_x + col), @intCast(extent.min_y + row));
+            try std.testing.expectEqual(expected, world_terrain.bitIsSet(bits, local));
+        };
+    }
+    try std.testing.expect(world.levelChunkBlockedBits(0, 0) != null);
+    try std.testing.expect(world.levelChunkBlockedBits(0, 2) == null);
 }
 
 test "a multi-chunk change in one step on two levels writes allocation-free after its reserve" {

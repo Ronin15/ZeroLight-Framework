@@ -12,6 +12,7 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const NavGrid = @import("nav_grid.zig").NavGrid;
+const allowed_moves = @import("nav_grid.zig").allowed_moves;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavPortal = @import("nav_graph.zig").NavPortal;
 const AbstractScratch = @import("scratch.zig").AbstractScratch;
@@ -596,21 +597,19 @@ fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize,
         }
         // Derive current (x,y) once and step neighbors by the direction offset; the
         // neighbor coordinates feed the heuristic directly, so the inner loop has no
-        // per-neighbor div/mod.
-        const current_x: i32 = @intCast(current.index % grid.width);
-        const current_y: i32 = @intCast(current.index / grid.width);
+        // per-neighbor div/mod. One 3x3 neighborhood read and one table lookup give every
+        // allowed move, bounds and the corner rule included.
+        const current_y_index = current.index / grid.width;
+        const current_x_index = current.index - current_y_index * grid.width;
+        const moves = allowed_moves[grid.neighborhood(current_x_index, current_y_index)];
+        const current_x: i32 = @intCast(current_x_index);
+        const current_y: i32 = @intCast(current_y_index);
         const current_g = cell_g[current_slot];
-        for (neighbor_dirs) |dir| {
+        for (neighbor_dirs, 0..) |dir, dir_index| {
+            if (moves & (@as(u8, 1) << @intCast(dir_index)) == 0) continue;
             const nx = current_x + dir.x;
             const ny = current_y + dir.y;
-            if (nx < 0 or ny < 0 or nx >= width or ny >= @as(i32, @intCast(grid.height))) continue;
             const next_index: usize = @intCast(ny * width + nx);
-            if (grid.isBlockedIndex(next_index)) continue;
-            // nx/ny and current_x/current_y are already in-bounds, so the helper indexes the
-            // two orthogonal cells of a diagonal step directly, with no per-neighbor div/bounds.
-            if (dir.diagonal and grid.diagonalCornerBlocked(current_x, current_y, nx, ny)) {
-                continue;
-            }
             const next_slot = scratch.slotFor(next_index) orelse return .budget_exhausted;
             if (cell_closed[next_slot]) continue;
             const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;

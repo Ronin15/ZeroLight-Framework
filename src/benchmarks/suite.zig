@@ -190,6 +190,8 @@ pub const RunStats = struct {
     // Nav groups: the mark stage (null when the workload marks no events) and the key plan.
     nav_mark_batch: ?BatchSummary = null,
     nav_plan_batch: ?BatchSummary = null,
+    // Static-collider groups: the chunk lists' splice stage.
+    splice_batch: ?BatchSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
@@ -1098,6 +1100,18 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
     // Workload labels translate shared counters into subsystem language so the
     // report remains compact without hiding what was measured.
+    if (std.mem.startsWith(u8, group_name, "nav-update-static-dense")) {
+        var stage_buffer: [128]u8 = undefined;
+        var splice_buffer: [32]u8 = undefined;
+        const splice = stats.splice_batch orelse BatchSummary{};
+        const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
+        const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "statics={} keys={} splice={s} patched={} {s} commit_t={f} sync_t={f} nav_t={f} main={f} ({}%)",
+            .{ stats.candidate_pairs, splice.item_count, formatStageShapeInto(&splice_buffer, splice), stats.output_count, formatNavStagesInto(&stage_buffer, stats), formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.nav_ns), formatDuration(phases.main_ns), main_percent },
+        ) catch "workload";
+    }
     if (std.mem.startsWith(u8, group_name, "nav-update-")) {
         var stage_buffer: [128]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
@@ -1390,9 +1404,11 @@ pub const NavSizeConfig = struct {
     group_fields: usize,
 };
 
-/// An over-estimate of the bytes the flat-grid nav takes for `config` at its agent-budget
-/// ceiling: per-level cell arrays and abstract layer, per-participant search and build
-/// scratch, group fields, and the result cache.
+/// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
+/// ceiling: per-level chunk directories, cell blocks, and records (every chunk mixed and
+/// holding portals), link slots, one level's batch window, per-participant search scratch,
+/// group fields, and the result cache. Search scratch and group fields are still sized per
+/// level cell, so they dominate large levels and threaded configs.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Library capacity defaults: explored nodes, stored and stitched path cells, the
     // abstract node ceiling, results cached per agent, and the per-step solve ceiling.
@@ -1410,8 +1426,16 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     const chunks_per_side = (config.side + chunk_tiles - 1) / chunk_tiles;
     const chunks = chunks_per_side * chunks_per_side;
 
-    // Per level and cell: component label (4), blocked and static masks (2), flood queue (8).
-    const level_cells = levels * cells * 14;
+    // Per level and chunk: the cell and record directories (4 + 4), a cell block with its
+    // free-list entry (296), and a record with its 32-portal border window and free-list
+    // entry (104 + 4).
+    const level_chunks = levels * chunks * (8 + 296 + 104 + 4);
+    // Per link: two endpoint portals (3 B) and links (16 B), in two link slots (48 B of list
+    // headers and a 4 B free-list entry each).
+    const link_slots = config.links * 2 * (3 + 16 + 48 + 4);
+    // One level's batch window: changed, patch, and dirty keys and three plan staging lists
+    // (8 B each), patch info (8), and remask slots and deltas (4 + 4).
+    const batch = chunks * (6 * 8 + 8 + 4 + 4);
     // Per group field and cell: cost, flow, stamp, and bucket links (21).
     const group_fields = config.group_fields * cells * 21;
     // Per participant: a 13 B search row per cell, the open heap (16 B entries), and the
@@ -1421,10 +1445,6 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Per participant: the abstract search's slot table (26 B rows), open heap, and
     // corridor (9 B entries).
     const abstract_search = participants * (abstract_nodes * 2 * 26 + abstract_nodes * 4 * 16 + abstract_nodes * 9);
-    // Per participant: a chunk patch's edge list (12 B entries) and cursor, and a remask
-    // queue.
-    const portal_cap = 4 * chunk_tiles + 2 * config.links;
-    const build = participants * (portal_cap * portal_cap * 12 + portal_cap * 4 + chunk_tiles * chunk_tiles * 8);
     // Result cache, per entry: two 24 B probe slots, a 20 B payload, a 4 B free index, a
     // 16 B eviction-scratch key, and the inline stripe (4 B per stored path cell). A block
     // holds the longest plain (explored nodes, 4 B) or stitched (8 B) path: one worker
@@ -1433,15 +1453,7 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     const result_block_bytes = @max(explored_nodes * 4, stitched_path_cells * 8);
     const results = cached_results * (2 * 24 + 20 + 4 + 16 + stored_path_cells * 4) + solves_per_step * result_block_bytes +
         cached_results * (result_block_bytes + 4);
-    // Abstract graph: 4 portal slots per chunk side cell plus two per link on every level,
-    // a cell-to-portal word per cell, 32 B of slot arrays per slot, per-chunk lengths and
-    // geometry, and an edge arena of 8 edges per slot plus 32 per chunk, doubled, beside
-    // its 12 B staging entries.
-    const slots = levels * (4 * chunk_tiles * chunks + 2 * config.links);
-    const edge_slots = (slots * 8 + levels * chunks * 32) * 2;
-    const abstract_graph = levels * cells * 4 + slots * 32 + levels * chunks * 8 + chunks * 32 +
-        edge_slots * 8 + slots * 8 * 12;
-    return level_cells + group_fields + search + abstract_search + build + results + abstract_graph;
+    return level_chunks + link_slots + batch + group_fields + search + abstract_search + results;
 }
 
 fn ceilMib(bytes: usize) usize {

@@ -84,7 +84,7 @@ pub const DigController = struct {
     // on cell entry — anti-oscillation and the one-level-per-fall guard.
     player_last_cell: ?CellCoord = null,
     /// Fall-landing tile changes for one step. Reserved at pipeline init to the
-    /// `.plane_traversal` event budget. `applyPlaneTraversalStage` preflights it to the
+    /// `.plane_traversal` event budget. `reservePlaneTraversalStage` preflights it to the
     /// step's landing-carve count before any carve, growing it when short and counting
     /// in `plane_scratch_grown` a carve count past the reservation. After that the step
     /// only `appendAssumeCapacity`s.
@@ -146,24 +146,18 @@ pub const DigController = struct {
     /// allocation-free in the world. Event and stimulus capacity are preflighted
     /// before the write, so a capacity miss leaves the world unchanged. Emits the
     /// cell's `world_tile_changed` event, a ramp exit's `world_obstacle_changed`, and
-    /// one dig stimulus when either changed.
+    /// one dig stimulus when either changed. Every write that landed is published on
+    /// every exit, error included.
     pub fn commitWorldEdit(world: *WorldSystem, edit: DigEdit, frame: *SimulationFrame) !void {
         if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
         try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
         try frame.ensureStimulusAppendCapacity(1);
-        const applied = try applyEdit(world, edit);
+        var applied: AppliedEdit = .{};
+        const written = applyEdit(world, edit, &applied);
+        publishAppliedEdit(frame, applied);
+        try written;
         if (applied.tile == null and applied.exit == null) return;
 
-        // One range within the preflighted capacity, so publishing allocates nothing.
-        const event_count = @as(usize, @intFromBool(applied.tile != null)) + @intFromBool(applied.exit != null);
-        const range = try frame.events.appendRangeCounts(1);
-        frame.events.addCount(range, event_count);
-        try frame.events.prefixAppendedRanges(range);
-        var writer = frame.events.rangeWriter(range);
-        if (applied.tile) |changed| writer.write(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
-        if (applied.exit) |cleared| writer.write(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = cleared } });
-        writer.finish();
-        frame.events.finishWrite();
         var stimulus_dropped: usize = 0;
         _ = try SensoryBus.emit(frame, .{
             .position = cellCenterWorldPos(world, edit.cell),
@@ -238,41 +232,36 @@ pub const DigController = struct {
         };
     }
 
-    /// Result of one entity's cell-entry plane traversal. `tile_change` is set when
-    /// a fall carved its landing cell; callers batch these into one event range.
-    pub const PlaneTraversalResult = struct {
-        new_level: ?u16 = null,
-        tile_change: ?WorldTileChangedEvent = null,
-    };
-
     /// Updates the player's plane after movement. On entering a new cell: follow a
     /// ramp link to its other plane, else fall one level if standing over a hole
     /// with a level below (see `applyEntityPlaneTraversal`). The cell-entry guard
     /// (`player_last_cell`) advances only after a successful or intentional no-op
     /// traversal so a mid-transition error leaves the latch unchanged and the next
-    /// step retries. Returns any landing-cell tile change for the caller's batch
-    /// publish. NPCs share the same underlying traversal via
-    /// `applyEntityPlaneTraversal`, called by `simulation_pipeline` with their own
-    /// per-entity cell-entry guard (previous/current body centers).
-    pub fn applyPlaneTraversal(self: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player) !?WorldTileChangedEvent {
-        const body = data.movementBodyConst(player.entity) orelse return null;
-        const visual = data.primitiveVisualConst(player.entity) orelse return null;
+    /// step retries. A landing carve is appended to `carves` right after it is written,
+    /// before any later fallible step; `carves` needs room for it.
+    pub fn applyPlaneTraversal(
+        self: *DigController,
+        world: *WorldSystem,
+        data: *DataSystem,
+        player: *Player,
+        carves: *std.ArrayList(WorldTileChangedEvent),
+    ) !void {
+        const body = data.movementBodyConst(player.entity) orelse return;
+        const visual = data.primitiveVisualConst(player.entity) orelse return;
         const center_x = body.position.x + visual.size.x * 0.5;
         const center_y = body.position.y + visual.size.y * 0.5;
-        const target = world.cellContaining(center_x, center_y) orelse return null;
+        const target = world.cellContaining(center_x, center_y) orelse return;
         const cell = CellCoord{ .x = target.x, .y = target.y };
 
         if (self.player_last_cell) |last| {
-            if (last.x == cell.x and last.y == cell.y) return null;
+            if (last.x == cell.x and last.y == cell.y) return;
         }
 
-        const result = try self.applyEntityPlaneTraversal(world, data, player.entity, player.current_level, cell);
-        if (result.new_level) |new_level| {
+        if (try self.applyEntityPlaneTraversal(world, data, player.entity, player.current_level, cell, carves)) |new_level| {
             player.current_level = new_level;
         }
         // Advance only after successful / intentional no-op traversal (no error).
         self.player_last_cell = cell;
-        return result.tile_change;
     }
 
     /// Read-only: whether entering `cell` on `level` would fall and carve a landing
@@ -300,15 +289,18 @@ pub const DigController = struct {
     /// level below. Falling carves the landing cell walkable first — underground
     /// planes default to solid dirt, and landing embedded in it would have the
     /// tile gate shove the entity straight back out, a permanent soft-lock.
-    /// Does not publish events: the caller batches `tile_change` values. Shared by
-    /// the player (`applyPlaneTraversal`) and NPCs (`simulation_pipeline`).
+    /// Returns the entity's new level, or null when it stays. A landing carve is
+    /// appended to `carves` right after it is written, before any later fallible step,
+    /// so a caller publishing `carves` on every exit publishes every written carve;
+    /// `carves` needs room for it. Shared by the player (`applyPlaneTraversal`) and
+    /// NPCs (`commitPlaneTraversalStage`).
     ///
     /// Attaches `world_level` (at the current plane) before any tile mutate so
     /// `setEntityLevel` cannot OOM after `carveLandingCell` has already written.
-    /// The pipeline plane stage also preflights and attaches `world_level` for
-    /// every cell-entry candidate before the first carve (multi-entity safety).
-    /// Player.spawn pre-attaches level 0; NPCs should carry the component before
-    /// the plane stage. Missing-component attach here is the direct-call safety net.
+    /// The plane stage reserves and attaches `world_level` for every cell-entry
+    /// candidate before the first carve (multi-entity safety). Player.spawn
+    /// pre-attaches level 0; NPCs should carry the component before the plane stage.
+    /// Missing-component attach here is the direct-call safety net.
     pub fn applyEntityPlaneTraversal(
         self: *const DigController,
         world: *WorldSystem,
@@ -316,7 +308,8 @@ pub const DigController = struct {
         entity: EntityId,
         level: u16,
         cell: CellCoord,
-    ) !PlaneTraversalResult {
+        carves: *std.ArrayList(WorldTileChangedEvent),
+    ) !?u16 {
         // Allocation-free for entities that already have world_level; otherwise
         // attach at the current plane before any tile write.
         if (data.worldLevelConst(entity) == null) {
@@ -325,7 +318,7 @@ pub const DigController = struct {
 
         if (world.rampLinkOtherLevel(level, cell)) |other| {
             try setEntityLevel(world, data, entity, other, cell);
-            return .{ .new_level = other };
+            return other;
         }
         const below: usize = @as(usize, level) + 1;
         if (below < world.levelCount() and world.denseFloorIsEmpty(level, cell.x, cell.y)) {
@@ -334,11 +327,11 @@ pub const DigController = struct {
             // entity never lands embedded in rock (else the tile gate would shove
             // it straight back out). Carve only after world_level is known present
             // so setEntityLevel cannot fail from store growth mid-transition.
-            const tile_change = try self.carveLandingCell(world, below_level, cell);
+            if (try self.carveLandingCell(world, below_level, cell)) |change| carves.appendAssumeCapacity(change);
             try setEntityLevel(world, data, entity, below_level, cell);
-            return .{ .new_level = below_level, .tile_change = tile_change };
+            return below_level;
         }
-        return .{};
+        return null;
     }
 
     /// Carves a fall's landing cell to the walkable tunnel tile. Returns the tile
@@ -389,45 +382,89 @@ pub const DigController = struct {
         self.* = undefined;
     }
 
-    /// Player + NPC plane traversal for one step. Event capacity, every landing
-    /// carve's world write (`reserveDenseCellWrite`), and missing `world_level` rows
-    /// are reserved before any carve.
-    /// Landing tile changes go into `plane_tile_changes`, which is preflighted to this
-    /// step's carve count (grown and counted if short) before any carve.
-    pub fn applyPlaneTraversalStage(
+    /// What `reservePlaneTraversalStage` reserved for the commit: the landing carves
+    /// (an upper bound on the carves the commit writes) and the missing `world_level`
+    /// rows. Valid until the commit, with no world, data, or event write in between.
+    pub const PlaneTraversalReservation = struct {
+        carves: usize,
+        missing_world_level: usize,
+    };
+
+    /// The plane stage's preflight, before any write: counts the player's and every
+    /// NPC's landing carves this step, reserving each carve's world write
+    /// (`reserveDenseCellWrite`), the carve scratch (grown and counted when the count
+    /// exceeds the reservation), their event capacity, and the missing `world_level`
+    /// rows. On error nothing is written. The caller reserves anything else sized from
+    /// `carves` (the nav record) before `commitPlaneTraversalStage`.
+    pub fn reservePlaneTraversalStage(
         self: *DigController,
         world: *WorldSystem,
         data: *DataSystem,
-        player: *Player,
+        player: *const Player,
         frame: *SimulationFrame,
-    ) !void {
-        const scratch = &self.plane_tile_changes;
-        scratch.clearRetainingCapacity();
+    ) !PlaneTraversalReservation {
+        self.plane_tile_changes.clearRetainingCapacity();
 
         const ai_slice = data.aiAgentSliceConst();
         const scope_columns = data.scopeColumnsSliceConst();
 
         // One reserve scope covers every landing carve this step.
         world.beginDenseCellWriteReserve();
-        var pending_carves: usize = 0;
+        var carves: usize = 0;
         var missing_world_level: usize = 0;
-        const player_entry = playerCellEntry(self, world, data, player.*);
-        if (player_entry) |entry| {
-            if (try self.reserveLandingCarve(world, entry)) pending_carves += 1;
+        if (playerCellEntry(self, world, data, player.*)) |entry| {
+            if (try self.reserveLandingCarve(world, entry)) carves += 1;
             if (data.worldLevelConst(player.entity) == null) missing_world_level += 1;
         }
         for (ai_slice.entities) |entity| {
             if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-                if (try self.reserveLandingCarve(world, entry)) pending_carves += 1;
+                if (try self.reserveLandingCarve(world, entry)) carves += 1;
                 if (data.worldLevelConst(entity) == null) missing_world_level += 1;
             }
         }
-        if (pending_carves > self.plane_scratch_reserved) try self.growPlaneScratch(pending_carves);
-        try frame.events.ensureEventAppendCapacity(pending_carves);
-
+        if (carves > self.plane_scratch_reserved) try self.growPlaneScratch(carves);
+        try frame.events.ensureEventAppendCapacity(carves);
         if (missing_world_level > 0) {
             try data.world_levels.ensureCapacity(data.allocator, data.world_levels.len() + missing_world_level);
-            if (player_entry) |entry| {
+        }
+        return .{ .carves = carves, .missing_world_level = missing_world_level };
+    }
+
+    /// Player + NPC plane traversal for one step, after `reservePlaneTraversalStage`
+    /// with nothing written since: attaches the missing `world_level` rows, then
+    /// traverses. Publishes every landing carve it wrote as one event range on every
+    /// exit, error included, so the caller's nav record sees each written carve.
+    pub fn commitPlaneTraversalStage(
+        self: *DigController,
+        world: *WorldSystem,
+        data: *DataSystem,
+        player: *Player,
+        frame: *SimulationFrame,
+        reservation: PlaneTraversalReservation,
+    ) !void {
+        const scratch = &self.plane_tile_changes;
+        std.debug.assert(scratch.items.len == 0);
+        std.debug.assert(scratch.capacity >= reservation.carves);
+        const applied = self.applyPlaneTraversals(world, data, player, reservation, scratch);
+        std.debug.assert(scratch.items.len <= reservation.carves);
+        frame.publishWorldTileChangesAssumeCapacity(scratch.items);
+        try applied;
+    }
+
+    // The commit's writes: `world_level` attaches (allocation-free after the reserve),
+    // then the player, then each NPC. Each carve lands in `carves` as it is written.
+    fn applyPlaneTraversals(
+        self: *DigController,
+        world: *WorldSystem,
+        data: *DataSystem,
+        player: *Player,
+        reservation: PlaneTraversalReservation,
+        carves: *std.ArrayList(WorldTileChangedEvent),
+    ) !void {
+        const ai_slice = data.aiAgentSliceConst();
+        const scope_columns = data.scopeColumnsSliceConst();
+        if (reservation.missing_world_level > 0) {
+            if (playerCellEntry(self, world, data, player.*)) |entry| {
                 if (data.worldLevelConst(player.entity) == null) {
                     try data.setWorldLevel(player.entity, entry.level);
                 }
@@ -441,15 +478,11 @@ pub const DigController = struct {
             }
         }
 
-        if (try self.applyPlaneTraversal(world, data, player)) |change| {
-            scratch.appendAssumeCapacity(change);
-        }
+        try self.applyPlaneTraversal(world, data, player, carves);
         for (ai_slice.entities) |entity| {
             const entry = npcCellEntry(world, data, scope_columns, entity) orelse continue;
-            const result = try self.applyEntityPlaneTraversal(world, data, entity, entry.level, entry.cell);
-            if (result.tile_change) |change| scratch.appendAssumeCapacity(change);
+            _ = try self.applyEntityPlaneTraversal(world, data, entity, entry.level, entry.cell, carves);
         }
-        try frame.publishWorldTileChanges(scratch.items);
     }
 };
 
@@ -485,16 +518,28 @@ const AppliedEdit = struct {
 };
 
 // Writes the reserved edit; allocation-free after `reserveEdit`. A ramp's exit is
-// cleared and its link added even when the cell already held the ramp tile.
-fn applyEdit(world: *WorldSystem, edit: DigController.DigEdit) !AppliedEdit {
-    var applied = AppliedEdit{};
+// cleared and its link added even when the cell already held the ramp tile. Each
+// change lands in `applied` right after its write, before any later fallible step; a
+// link reaches nav through the link-count gap, not an event.
+fn applyEdit(world: *WorldSystem, edit: DigController.DigEdit, applied: *AppliedEdit) !void {
     applied.tile = if (edit.tile == invalid_tile_id)
         try world.clearDenseTile(edit.floor_layer, edit.cell.x, edit.cell.y)
     else
         try world.setDenseTile(edit.floor_layer, edit.cell.x, edit.cell.y, edit.tile);
     if (edit.exit) |exit| applied.exit = try world.clearCellBlocking(exit.level, exit.cell.x, exit.cell.y, exit.floor_tile);
     if (edit.ramp_link) |link| try world.addLevelLink(link);
-    return applied;
+}
+
+// Publishes an applied edit's 0-2 events as one range, into the event capacity
+// `commitWorldEdit` preflighted.
+fn publishAppliedEdit(frame: *SimulationFrame, applied: AppliedEdit) void {
+    const event_count = @as(usize, @intFromBool(applied.tile != null)) + @intFromBool(applied.exit != null);
+    if (event_count == 0) return;
+    var writer = frame.events.appendReservedRange(event_count);
+    if (applied.tile) |changed| writer.write(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+    if (applied.exit) |cleared| writer.write(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = cleared } });
+    writer.finish();
+    frame.events.finishWrite();
 }
 
 fn playerCellEntry(
@@ -599,6 +644,12 @@ const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
 fn testDig(dig: *const DigController, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *SimulationFrame) !void {
     const edit = (try dig.reserveWorldEdit(world, data, player, frame.dig_intent)) orelse return;
     try DigController.commitWorldEdit(world, edit, frame);
+}
+
+// One plane stage: reserve, then commit the reservation.
+fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame);
+    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation);
 }
 
 fn testDigController(meta: anytype) !DigController {
@@ -741,8 +792,8 @@ test "plane traversal grows an under-reserved scratch before any carve and match
     try frame_reserved.reserveStreams(4, 16, 8, 8, 8, 8);
     frame_reserved.beginStep();
 
-    try dig_short.applyPlaneTraversalStage(&tw_short.world, &tw_short.data, &tw_short.player, &frame_short);
-    try dig_reserved.applyPlaneTraversalStage(&tw_reserved.world, &tw_reserved.data, &tw_reserved.player, &frame_reserved);
+    try testPlaneTraversalStage(&dig_short, &tw_short.world, &tw_short.data, &tw_short.player, &frame_short);
+    try testPlaneTraversalStage(&dig_reserved, &tw_reserved.world, &tw_reserved.data, &tw_reserved.player, &frame_reserved);
 
     // Capacity changed only the telemetry: both runs carve both landings.
     inline for (.{ &tw_short, &tw_reserved }) |tw| {
@@ -787,7 +838,7 @@ test "plane traversal counts carves past the reservation even inside the scratch
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
     frame.beginStep();
 
-    try dig.applyPlaneTraversalStage(&tw.world, &tw.data, &tw.player, &frame);
+    try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
 
     // Two carves against a reservation of 1: drift, counted though nothing grew.
     try std.testing.expectEqual(capacity_before, dig.plane_tile_changes.capacity);
@@ -834,7 +885,7 @@ test "plane traversal within the scratch reserve is allocation-free (FailingAllo
         tw.world.allocator = original_world;
     }
 
-    try dig.applyPlaneTraversalStage(&tw.world, &tw.data, &tw.player, &frame);
+    try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(u64, 0), dig.plane_scratch_grown);
@@ -1057,16 +1108,18 @@ test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell befo
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
 
-    const result = try dig.applyEntityPlaneTraversal(&tw.world, &tw.data, npc, 0, .{ .x = 4, .y = 3 });
+    var carves_buffer: [1]WorldTileChangedEvent = undefined;
+    var carves = std.ArrayList(WorldTileChangedEvent).initBuffer(&carves_buffer);
+    const new_level = try dig.applyEntityPlaneTraversal(&tw.world, &tw.data, npc, 0, .{ .x = 4, .y = 3 }, &carves);
 
-    try std.testing.expectEqual(@as(?u16, 1), result.new_level);
+    try std.testing.expectEqual(@as(?u16, 1), new_level);
     try std.testing.expectEqual(@as(?u16, 1), tw.data.worldLevelConst(npc));
     // The landing cell was carved walkable instead of leaving the NPC embedded in
     // solid dirt, which would have soft-locked it against the tile gate.
     try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(floor1, 4, 3));
     try std.testing.expect(!tw.world.denseTileBlocksMovement(floor1, 4, 3));
-    try std.testing.expect(result.tile_change != null);
-    try std.testing.expectEqual(dig.tunnel_tile, result.tile_change.?.new_tile_id);
+    try std.testing.expectEqual(@as(usize, 1), carves.items.len);
+    try std.testing.expectEqual(dig.tunnel_tile, carves.items[0].new_tile_id);
 
     const body = tw.data.movementBodyConst(npc).?;
     try std.testing.expectEqual(@as(f32, 4 * 32), body.position.x);
@@ -1125,15 +1178,17 @@ test "player_last_cell advances only after successful or intentional no-op trave
     // Seed last_cell elsewhere so (3,3) counts as a new entry.
     dig.player_last_cell = .{ .x = 0, .y = 0 };
 
-    const change = try dig.applyPlaneTraversal(&tw.world, &tw.data, &tw.player);
-    try std.testing.expect(change != null);
+    var carves_buffer: [1]WorldTileChangedEvent = undefined;
+    var carves = std.ArrayList(WorldTileChangedEvent).initBuffer(&carves_buffer);
+    try dig.applyPlaneTraversal(&tw.world, &tw.data, &tw.player, &carves);
+    try std.testing.expectEqual(@as(usize, 1), carves.items.len);
     try std.testing.expectEqual(@as(u16, 1), tw.player.current_level);
     try std.testing.expectEqual(@as(u16, 3), dig.player_last_cell.?.x);
     try std.testing.expectEqual(@as(u16, 3), dig.player_last_cell.?.y);
 
     // Same cell again: intentional no-op early return, latch unchanged.
-    const no_change = try dig.applyPlaneTraversal(&tw.world, &tw.data, &tw.player);
-    try std.testing.expect(no_change == null);
+    try dig.applyPlaneTraversal(&tw.world, &tw.data, &tw.player, &carves);
+    try std.testing.expectEqual(@as(usize, 1), carves.items.len);
     try std.testing.expectEqual(@as(u16, 3), dig.player_last_cell.?.x);
 }
 
@@ -1154,9 +1209,11 @@ test "player_last_cell stays put when plane traversal errors mid-transition" {
     const landing_before = tw.world.denseTile(floor1, 3, 3);
 
     const dead = EntityId{ .index = 9999, .generation = 1 };
+    var carves_buffer: [1]WorldTileChangedEvent = undefined;
+    var carves = std.ArrayList(WorldTileChangedEvent).initBuffer(&carves_buffer);
     try std.testing.expectError(
         error.InvalidEntity,
-        dig.applyEntityPlaneTraversal(&tw.world, &tw.data, dead, 0, .{ .x = 3, .y = 3 }),
+        dig.applyEntityPlaneTraversal(&tw.world, &tw.data, dead, 0, .{ .x = 3, .y = 3 }, &carves),
     );
     // Latch was never in applyEntityPlaneTraversal; still at the seeded value.
     try std.testing.expectEqual(@as(u16, 0), dig.player_last_cell.?.x);
@@ -1168,8 +1225,8 @@ test "player_last_cell stays put when plane traversal errors mid-transition" {
     // (incomplete entry, retry next step once the body is available).
     var ghost = tw.player;
     ghost.entity = dead;
-    const no_body = try dig.applyPlaneTraversal(&tw.world, &tw.data, &ghost);
-    try std.testing.expect(no_body == null);
+    try dig.applyPlaneTraversal(&tw.world, &tw.data, &ghost, &carves);
+    try std.testing.expectEqual(@as(usize, 0), carves.items.len);
     try std.testing.expectEqual(@as(u16, 0), dig.player_last_cell.?.x);
     try std.testing.expectEqual(@as(u16, 0), dig.player_last_cell.?.y);
 }
@@ -1206,9 +1263,11 @@ test "plane traversal OOM on world_level attach leaves landing tile unchanged" {
     data.allocator = failing.allocator();
     defer data.allocator = original;
 
+    var carves_buffer: [1]WorldTileChangedEvent = undefined;
+    var carves = std.ArrayList(WorldTileChangedEvent).initBuffer(&carves_buffer);
     try std.testing.expectError(
         error.OutOfMemory,
-        dig.applyEntityPlaneTraversal(&world, &data, npc, 0, .{ .x = 4, .y = 3 }),
+        dig.applyEntityPlaneTraversal(&world, &data, npc, 0, .{ .x = 4, .y = 3 }, &carves),
     );
     try std.testing.expectEqual(landing_before, world.denseTile(floor1, 4, 3));
     try std.testing.expect(data.worldLevelConst(npc) == null);
@@ -1231,16 +1290,19 @@ test "player spawn pre-attaches world_level so first fall is allocation-free for
     tw.data.allocator = failing.allocator();
     defer tw.data.allocator = original;
 
-    const result = try dig.applyEntityPlaneTraversal(
+    var carves_buffer: [1]WorldTileChangedEvent = undefined;
+    var carves = std.ArrayList(WorldTileChangedEvent).initBuffer(&carves_buffer);
+    const new_level = try dig.applyEntityPlaneTraversal(
         &tw.world,
         &tw.data,
         tw.player.entity,
         0,
         .{ .x = 3, .y = 3 },
+        &carves,
     );
-    try std.testing.expectEqual(@as(?u16, 1), result.new_level);
+    try std.testing.expectEqual(@as(?u16, 1), new_level);
     try std.testing.expectEqual(@as(?u16, 1), tw.data.worldLevelConst(tw.player.entity));
-    try std.testing.expect(result.tile_change != null);
+    try std.testing.expectEqual(@as(usize, 1), carves.items.len);
 }
 
 test "a ramp dig whose link reserve fails leaves the ramp tile unchanged" {
@@ -1281,13 +1343,21 @@ test "a dig committed after its one reserve allocates nothing in the world (Fail
         try frame.reserveStreams(4, 8, 8, 8, 8, 8);
         frame.beginStep();
 
+        // The frame's streams are warm, so the event preflight and the publish allocate
+        // nothing either.
+        const original_events = frame.events.stream.allocator;
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         tw.world.allocator = failing.allocator();
-        defer tw.world.allocator = std.testing.allocator;
+        frame.events.stream.allocator = failing.allocator();
+        defer {
+            tw.world.allocator = std.testing.allocator;
+            frame.events.stream.allocator = original_events;
+        }
         try DigController.commitWorldEdit(&tw.world, edit, &frame);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
         try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
         try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
+        try std.testing.expectEqual(@as(usize, 1), frame.events.rangeCount());
         if (intent == .ramp) {
             try std.testing.expectEqual(@as(?u16, 0), tw.world.rampLinkOtherLevel(1, .{ .x = 4, .y = 3 }));
         }
@@ -1312,6 +1382,7 @@ test "a dig committed after its one reserve allocates nothing in the world (Fail
     while (spareEventRanges(&frame) > 1) try frame.events.appendRequired(filler);
     try std.testing.expectEqual(@as(usize, 1), spareEventRanges(&frame));
     const events_before = frame.events.mergedItems().len;
+    const ranges_before = frame.events.rangeCount();
 
     const original_events = frame.events.stream.allocator;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -1326,6 +1397,10 @@ test "a dig committed after its one reserve allocates nothing in the world (Fail
     try std.testing.expect(!tw.world.levelBlocksMovement(1, 4, 3));
     try std.testing.expect(!tw.world.levelBlocksMovement(2, 4, 3));
     try std.testing.expectEqual(events_before + 2, frame.events.mergedItems().len);
+    try std.testing.expectEqual(ranges_before + 1, frame.events.rangeCount());
+    const published = frame.events.mergedItems()[events_before..];
+    try std.testing.expect(published[0].payload == .world_tile_changed);
+    try std.testing.expect(published[1].payload == .world_obstacle_changed);
     try std.testing.expectEqual(@as(?u16, 1), tw.world.rampLinkOtherLevel(2, .{ .x = 4, .y = 3 }));
 }
 

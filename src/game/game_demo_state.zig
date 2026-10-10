@@ -663,11 +663,15 @@ const DemoCommitResult = struct {
     nav_update: NavUpdateStats,
 };
 
-/// The demo's structural-commit seam: the budgeted commit, the population growth
-/// seam, then the post-commit reactions, in that order. The nav reaction runs only
-/// after a successful growth seam; the steering reaction (allocation-free flag
-/// setting) always runs, and a growth or nav error is returned only after it, so a
-/// failure never leaves steering's static-obstacle snapshot stale.
+/// The demo's structural-commit seam, in order: the static-collider and static nav-mark
+/// reserve, the budgeted commit, the collider capture of the step's static changes, the
+/// population growth seam, the collider sync and its nav record (run even when the growth
+/// seam failed, so the step's static changes land and reach nav), then the post-commit
+/// reactions. The nav apply runs only after a successful growth seam and collider sync,
+/// keeping every recorded mark for the next step otherwise; the steering reaction
+/// (allocation-free flag setting) always runs, and the first growth, collider, or nav error
+/// is returned only after it, so a failure never leaves steering's static-obstacle snapshot
+/// stale. A failed collider sync keeps its changes for the next step's sync.
 fn commitStructuralAndReact(
     pipeline: *SimulationPipeline,
     frame: *SimulationFrame,
@@ -676,21 +680,26 @@ fn commitStructuralAndReact(
     thread_system: ?*ThreadSystem,
 ) !DemoCommitResult {
     // The post-commit nav reaction appends at most one nav_region_invalidated event,
-    // driven by structural commands applied this frame, invalidating world events already
-    // queued (a dig's world_tile_changed), or nav work the world left pending (a level,
-    // link, or content revision). Reserve the slot for every source so the append never
-    // trips a tight capacity_limit.
+    // driven by structural commands applied this frame, marks a terrain writer recorded (a
+    // dig's world_tile_changed), or nav work the world left pending (a level, link, or
+    // content revision). Reserve the slot for every source so the append never trips a
+    // tight capacity_limit.
     const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
+    try pipeline.reserveStaticColliders(frame, data);
     const structural = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
+    pipeline.captureStaticColliderChanges(frame);
     // Population growth seam: the post-commit reactions and the next step see grown
     // capacities. O(1) when the committed rows fit the tracked capacities.
     const population_sync = pipeline.syncPopulationCapacity(frame, data);
+    const collider_sync = pipeline.syncStaticColliders(data, thread_system);
     const nav_update = if (population_sync) |_|
-        pipeline.reactToPostCommitNavEvents(frame, data, world, thread_system)
+        (if (collider_sync) |_| pipeline.reactToPostCommitNavEvents(frame, world, thread_system) else |err| err)
     else |err|
         err;
     pipeline.reactToPostCommitSteeringEvents(frame);
-    return .{ .structural = structural, .population_sync = try population_sync, .nav_update = try nav_update };
+    const population = try population_sync;
+    try collider_sync;
+    return .{ .structural = structural, .population_sync = population, .nav_update = try nav_update };
 }
 
 const SpawnCellCoord = struct { x: u16, y: u16 };
@@ -1229,9 +1238,32 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
 fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
     demo.simulation_frame.beginStep();
     demo.simulation_frame.dig_intent = intent;
-    // Stage order: reserve the dig, then commit it.
+    // Stage order: reserve the dig and its nav record, commit it, then record its events.
     const edit = (try demo.pipeline.dig.reserveWorldEdit(&demo.world, &demo.data, demo.player, intent)) orelse return;
-    try DigController.commitWorldEdit(&demo.world, edit, &demo.simulation_frame);
+    try demo.pipeline.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.dig_world_edit, .{}));
+    const first_event = demo.simulation_frame.events.mergedItems().len;
+    const written = DigController.commitWorldEdit(&demo.world, edit, &demo.simulation_frame);
+    demo.pipeline.pathfinding.recordTerrainNavEvents(demo.simulation_frame.events.mergedItems()[first_event..], &demo.world, null);
+    try written;
+}
+
+const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
+
+// The level of entity `index`'s static-collider row, or null when it has none (a row id of
+// maxInt(u32)).
+fn colliderRowLevelForTest(colliders: *const StaticColliderSystem, index: u32) ?u16 {
+    if (index >= colliders.row_of_index.items.len) return null;
+    const row = colliders.row_of_index.items[index];
+    if (row == std.math.maxInt(u32)) return null;
+    return colliders.row_level[row];
+}
+
+// The player's cell-entry plane traversal; its landing carve is not published.
+fn traversePlaneForTest(demo: *GameDemoState) !void {
+    const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
+    var carves_buffer: [1]WorldTileChangedEvent = undefined;
+    var carves = std.ArrayList(WorldTileChangedEvent).initBuffer(&carves_buffer);
+    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &carves);
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
@@ -1547,8 +1579,10 @@ test "demo world tile event invalidates navigation after commit reaction" {
         .stage = .structural_commit,
         .payload = .{ .world_tile_changed = changed },
     });
+    // The writer's nav record of its event.
+    try @import("systems/pathfinding/test_support.zig").recordTerrainEvents(&demo.pipeline.pathfinding, demo.simulation_frame.events.mergedItems(), &demo.world);
 
-    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.world, null);
     demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
     var nav_invalidated = false;
@@ -1567,7 +1601,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
+    try traversePlaneForTest(&demo); // seed player_last_cell = (3,3)
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 
     // Dig a hole in the faced cell on the surface plane.
@@ -1577,7 +1611,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     // Walk into the hole -> fall exactly one level onto the dirt plane.
     placePlayerInCell(&demo, 4, 3);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(1), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
@@ -1587,14 +1621,14 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expect(!demo.world.denseTileBlocksMovement(floor1, 4, 3));
 
     // Standing put: no second fall.
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // On the dirt plane, dig a ramp in the faced cell (5,3), then walk onto it.
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(u16, 1), demo.world.levelLinks().len);
     placePlayerInCell(&demo, 5, 3);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(0), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 }
@@ -1606,17 +1640,17 @@ test "a demo ramp dig is routable from both levels the next step" {
     // Row 2, whose ramp exit on the surface holds no static body.
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 2);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
 
     // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,2).
     try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 2);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
     // The step's post-commit nav reaction.
-    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.world, null);
     demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
     // Next step: a request up the ramp from the dirt plane and one down it from the surface
@@ -1639,7 +1673,7 @@ test "a demo ramp dig is routable from both levels the next step" {
 
     // The link still climbs planes via the world tier.
     placePlayerInCell(&demo, 5, 2);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 }
 
@@ -1649,12 +1683,12 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
+    try traversePlaneForTest(&demo); // seed player_last_cell = (3,3)
 
     // Surface hole + fall onto the dirt plane (level 1), landing carved at (4,3).
     try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 3);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // Dig DOWN through the faced cell (5,3): a see-through hole, not a tunnel carve.
@@ -1664,7 +1698,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 
     // Walk into it -> fall one more level onto the void plane (level 2).
     placePlayerInCell(&demo, 5, 3);
-    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try traversePlaneForTest(&demo);
     try std.testing.expectEqual(@as(u16, 2), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(2), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
@@ -1714,9 +1748,11 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
             .max_y_exclusive = max_y_exclusive,
         } },
     });
+    // The writer's nav record of its event.
+    try @import("systems/pathfinding/test_support.zig").recordTerrainEvents(&demo.pipeline.pathfinding, demo.simulation_frame.events.mergedItems(), &demo.world);
 
     const version_before = demo.pipeline.pathfinding.graph.version;
-    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.world, null);
     demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
     // The incremental update ran and kept nav_version (caches are scope-evicted).
@@ -2170,8 +2206,8 @@ fn writeBoxMoveForTest(frame: *SimulationFrame, box: EntityId, position: math.Ve
     frame.structural_commands.finishWrite();
 }
 
-// Commits one step whose nav reaction runs out of memory: more tile events than
-// the nav mark buffer's reserved bound, under a failing nav allocator. With
+// Commits one step whose nav reaction runs out of memory: more recorded tile marks than
+// the nav batch storage holds, applied under a failing nav allocator. With
 // `move_static`, the same commit moves the parked static box beside the steering
 // agent. Returns the agent's lateral steering component on the next step.
 fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
@@ -2204,6 +2240,8 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
             .new_blocks_movement = true,
         } } });
     }
+    // The writer's nav record, before the nav allocator fails.
+    try @import("systems/pathfinding/test_support.zig").recordTerrainEvents(nav, frame.events.mergedItems(), &demo.world);
     if (move_static) try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{});
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -2259,6 +2297,56 @@ test "a population growth seam that runs out of memory still runs the steering r
 
     // Pushed away from the box (+y), which a stale snapshot would miss.
     try std.testing.expect(try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
+}
+
+test "a population-seam OOM still records the step's static changes" {
+    var fixture: DemoConfigPipelineFixture = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const frame = &fixture.frame;
+    const scene = try addSteeringAgentAndParkedBoxForTest(&fixture.data, 0);
+    frame.beginStep();
+    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
+    // The box was added outside a commit, so the colliders have not seen it yet.
+    try std.testing.expect(colliderRowLevelForTest(&fixture.pipeline.static_colliders, scene.box.index) == null);
+
+    // The commit moves the box while two creates push the population past its reserve;
+    // the growth seam's first reserve fails.
+    const far = math.Vec2{ .x = 640, .y = 640 };
+    const create: StructuralCommand = .{ .create_entity = .{
+        .movement_body = .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 },
+    } };
+    frame.beginStep();
+    try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{ create, create });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const scope_allocator = fixture.pipeline.scope.allocator;
+    fixture.pipeline.scope.allocator = failing.allocator();
+    const result = commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
+    fixture.pipeline.scope.allocator = scope_allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // The collider sync ran anyway: the moved box has its row.
+    const row_level = colliderRowLevelForTest(&fixture.pipeline.static_colliders, scene.box.index) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 0), row_level);
+    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.static_colliders.changesThisStep().len);
+
+    // The next step, with no command, applies the recorded change: nav equals a fresh
+    // build of the statics, the box's cells blocked.
+    frame.beginStep();
+    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
+    const live = fixture.pipeline.pathfinding.graph.grid(0).?;
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(fixture.pipeline.pathfinding.capacity);
+    try rebuilt.rebuildStaticNavGrid(&fixture.data, 64, 64, fixture.pipeline.pathfinding.graph.cell_size);
+    const fresh = rebuilt.graph.grid(0).?;
+    var blocked: usize = 0;
+    for (0..live.height) |y| for (0..live.width) |x| {
+        const cell: @import("systems/pathfinding/types.zig").GridCell = .{ .x = @intCast(x), .y = @intCast(y) };
+        try std.testing.expectEqual(fresh.isBlockedCell(cell), live.isBlockedCell(cell));
+        if (live.isBlockedCell(cell)) blocked += 1;
+    };
+    try std.testing.expect(blocked != 0);
 }
 
 test "demo event bound is the pinned exhaustive producer sum" {

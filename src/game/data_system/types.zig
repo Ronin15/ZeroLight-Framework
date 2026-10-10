@@ -843,19 +843,14 @@ fn metric(value: usize) u64 {
 }
 
 /// World-space AABB of a static navigation obstacle's collision body, resolved from its
-/// movement body position plus collision bounds offset/size. Lets nav invalidation localize
-/// to the covered nav cells instead of re-deriving the whole level. Same shape pathfinding's
-/// nav_grid.zig StaticBodyRect aliases: both derive from math.aabbFromOffsetSize so the two
-/// can never drift apart.
+/// movement body position plus collision bounds offset/size (`math.aabbFromOffsetSize`).
 pub const ObstacleWorldRect = math.Aabb;
 
 pub const StructuralEntityDestroyedChange = struct {
     entity: EntityId,
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool,
-    obstacle_world_rect: ?ObstacleWorldRect = null,
     /// World/level plane at destroy time (`world_level` component, else 0).
-    /// Lets post-commit nav invalidation mark the correct multi-level grid.
     level: u16 = 0,
 };
 
@@ -864,10 +859,7 @@ pub const StructuralComponentChangedChange = struct {
     component: Component,
     was_static_navigation_obstacle: bool,
     is_static_navigation_obstacle: bool,
-    old_obstacle_world_rect: ?ObstacleWorldRect = null,
-    new_obstacle_world_rect: ?ObstacleWorldRect = null,
     /// World/level plane at change time (`world_level` component, else 0).
-    /// Lets post-commit nav invalidation mark the correct multi-level grid.
     level: u16 = 0,
 };
 

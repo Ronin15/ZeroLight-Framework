@@ -765,7 +765,7 @@ test "DestructibleController explicit non-destructible target does not fall thro
     try std.testing.expect(data.isAlive(decoy));
 }
 
-test "DestructibleController destroy emits static-nav entity_destroyed with obstacle rect" {
+test "DestructibleController destroy emits a static-nav entity_destroyed with its level" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var world = makeMinimalWorld();
@@ -802,10 +802,6 @@ test "DestructibleController destroy emits static-nav entity_destroyed with obst
         const destroyed = event.payload.entity_destroyed;
         if (destroyed.entity.index != crate.index) continue;
         try std.testing.expect(destroyed.was_static_navigation_obstacle);
-        try std.testing.expect(destroyed.obstacle_world_rect != null);
-        const rect = destroyed.obstacle_world_rect.?;
-        try std.testing.expect(rect.max_x > rect.min_x);
-        try std.testing.expect(rect.max_y > rect.min_y);
         try std.testing.expectEqual(@as(u16, 0), destroyed.level);
         saw_nav_destroy = true;
     }

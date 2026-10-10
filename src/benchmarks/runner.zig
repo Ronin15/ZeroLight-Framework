@@ -60,6 +60,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     nav_update.multichunk_group,
     nav_update.entity_obstacle_group,
     nav_update.static_population_group,
+    nav_update.static_dense_group,
+    nav_update.static_dense_tail_group,
     chunk_scale.dig_group,
     chunk_scale.ramp_group,
     chunk_scale.cave_in_group,

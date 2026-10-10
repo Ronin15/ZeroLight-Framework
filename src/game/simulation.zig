@@ -19,7 +19,6 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const StructuralChange = @import("data_system.zig").StructuralChange;
-const ObstacleWorldRect = @import("data_system.zig").ObstacleWorldRect;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
 const AiAffectDrive = @import("data_system.zig").AiAffectDrive;
@@ -140,13 +139,7 @@ pub const ComponentChangedEvent = struct {
     component: Component,
     was_static_navigation_obstacle: bool = false,
     is_static_navigation_obstacle: bool = false,
-    // World-space obstacle rect before/after this change, when the entity was/is a static
-    // navigation obstacle. Lets the post-commit nav reaction localize invalidation to the
-    // covered nav cells instead of the whole level.
-    old_obstacle_world_rect: ?ObstacleWorldRect = null,
-    new_obstacle_world_rect: ?ObstacleWorldRect = null,
-    /// World/level plane at change time (`world_level`, else 0). Multi-level nav readiness;
-    /// defaults 0 when missing so level-0 demos stay correct.
+    /// World/level plane at change time (`world_level`, else 0).
     level: u16 = 0,
 };
 
@@ -154,11 +147,7 @@ pub const EntityDestroyedEvent = struct {
     entity: EntityId,
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool = false,
-    // World-space obstacle rect at destroy time, when the entity was a static navigation
-    // obstacle. Lets the post-commit nav reaction localize invalidation to the vacated cells.
-    obstacle_world_rect: ?ObstacleWorldRect = null,
-    /// World/level plane at destroy time (`world_level`, else 0). Multi-level nav readiness;
-    /// defaults 0 when missing so level-0 demos stay correct.
+    /// World/level plane at destroy time (`world_level`, else 0).
     level: u16 = 0,
 };
 
@@ -180,8 +169,8 @@ pub const AffectThresholdCrossedEvent = struct {
 
 /// Emitted at `domain_reaction` by `DestructibleController` while the target is
 /// still alive (before the deferred `destroy_entity` structural commit). Scalar
-/// payload only — no pointers/handles. Commit still emits `entity_destroyed`
-/// for nav local re-mask of static obstacles.
+/// payload only — no pointers/handles. Commit still emits `entity_destroyed`,
+/// whose change the static-collider capture reads.
 pub const DestructibleDestroyedEvent = struct {
     entity: EntityId,
     level: u16,
@@ -397,10 +386,32 @@ pub const SimulationEvents = struct {
     }
 
     pub fn ensureCanAppend(self: *const SimulationEvents, count: usize) !void {
-        const limit = self.capacity_limit orelse return;
-        if (count > limit or self.stream.mergedItems().len > limit - count) {
-            return error.EventCapacityExceeded;
-        }
+        if (!self.withinLimit(count)) return error.EventCapacityExceeded;
+    }
+
+    // Whether `count` more events fit under the capacity limit.
+    fn withinLimit(self: *const SimulationEvents, count: usize) bool {
+        const limit = self.capacity_limit orelse return true;
+        return count <= limit and self.stream.mergedItems().len <= limit - count;
+    }
+
+    /// Appends one range of `count` events and returns its writer; the caller writes
+    /// `count` events, then calls `finish()` and `finishWrite()` once. Allocation-free
+    /// after `ensureEventAppendCapacity(n)` with `n >= count` and no append since.
+    pub fn appendReservedRange(self: *SimulationEvents, count: usize) RangeWriter {
+        std.debug.assert(count > 0);
+        std.debug.assert(self.withinLimit(count));
+        const range = self.stream.counts.items.len;
+        std.debug.assert(self.stream.counts.capacity > range);
+        std.debug.assert(self.stream.offsets.capacity > range);
+        std.debug.assert(self.stream.write_offsets.capacity > range);
+        std.debug.assert(self.range_stats.capacity > range);
+        std.debug.assert(self.stream.values.capacity >= self.appendValueBase() + count);
+        _ = self.stream.appendRangeCountsAssumeCapacity(1);
+        self.range_stats.appendAssumeCapacity(.{});
+        self.stream.addCount(range, count);
+        self.stream.prefixAppendedRangesAssumeCapacity(range);
+        return self.rangeWriter(range);
     }
 
     /// Preflights the capacity limit and buffer growth for `count` more events
@@ -427,11 +438,13 @@ pub const SimulationEvents = struct {
         try self.stream.write_offsets.ensureTotalCapacity(self.stream.allocator, new_range_count);
         try self.range_stats.ensureTotalCapacity(self.stream.allocator, new_range_count);
 
-        const new_value_count = if (self.stream.prefix_ready)
-            self.stream.mergedItems().len + value_count
-        else
-            self.pendingCountFrom(0) + value_count;
-        try self.stream.values.ensureTotalCapacity(self.stream.allocator, new_value_count);
+        try self.stream.values.ensureTotalCapacity(self.stream.allocator, self.appendValueBase() + value_count);
+    }
+
+    // The values an append prefixes behind: the merged events, or every pending count
+    // before the first prefix.
+    fn appendValueBase(self: *const SimulationEvents) usize {
+        return if (self.stream.prefix_ready) self.stream.mergedItems().len else self.pendingCountFrom(0);
     }
 
     fn rebuildStatsFromRanges(self: *SimulationEvents) void {
@@ -907,7 +920,6 @@ pub const SimulationFrame = struct {
                         .entity = destroyed.entity,
                         .component_mask = destroyed.component_mask,
                         .was_static_navigation_obstacle = destroyed.was_static_navigation_obstacle,
-                        .obstacle_world_rect = destroyed.obstacle_world_rect,
                         .level = destroyed.level,
                     } },
                 },
@@ -918,8 +930,6 @@ pub const SimulationFrame = struct {
                         .component = changed.component,
                         .was_static_navigation_obstacle = changed.was_static_navigation_obstacle,
                         .is_static_navigation_obstacle = changed.is_static_navigation_obstacle,
-                        .old_obstacle_world_rect = changed.old_obstacle_world_rect,
-                        .new_obstacle_world_rect = changed.new_obstacle_world_rect,
                         .level = changed.level,
                     } },
                 },
@@ -933,13 +943,16 @@ pub const SimulationFrame = struct {
     /// finishWrite. Mirrors publishStructuralChanges so N plane-traversal carves
     /// stay O(N) rather than O(N^2) from per-event appendRequired.
     pub fn publishWorldTileChanges(self: *SimulationFrame, changes: []const WorldTileChangedEvent) !void {
+        try self.events.ensureEventAppendCapacity(changes.len);
+        self.publishWorldTileChangesAssumeCapacity(changes);
+    }
+
+    /// `publishWorldTileChanges` after `events.ensureEventAppendCapacity(n)` with
+    /// `n >= changes.len` and no append since: allocation-free and infallible, so a writer
+    /// can publish what it wrote on an error path.
+    pub fn publishWorldTileChangesAssumeCapacity(self: *SimulationFrame, changes: []const WorldTileChangedEvent) void {
         if (changes.len == 0) return;
-        try self.events.ensureCanAppend(changes.len);
-        try self.events.reserveAppendCapacity(1, changes.len);
-        const first_range = try self.events.appendRangeCounts(1);
-        self.events.addCount(first_range, changes.len);
-        try self.events.prefixAppendedRanges(first_range);
-        var writer = self.events.rangeWriter(first_range);
+        var writer = self.events.appendReservedRange(changes.len);
         for (changes) |changed| {
             writer.write(.{
                 .stage = .structural_commit,
@@ -997,12 +1010,17 @@ pub fn RangeOutputStream(comptime T: type) type {
         }
 
         pub fn appendRangeCounts(self: *Self, range_count: usize) !usize {
+            try self.counts.ensureTotalCapacity(self.allocator, self.counts.items.len + range_count);
+            return self.appendRangeCountsAssumeCapacity(range_count);
+        }
+
+        /// `appendRangeCounts` into reserved count capacity.
+        pub fn appendRangeCountsAssumeCapacity(self: *Self, range_count: usize) usize {
             if (self.prefix_ready) {
                 std.debug.assert(self.offsets.items.len == self.counts.items.len);
                 std.debug.assert(self.write_offsets.items.len == self.counts.items.len);
             }
             const first_range = self.counts.items.len;
-            try self.counts.ensureTotalCapacity(self.allocator, first_range + range_count);
             for (0..range_count) |_| {
                 self.counts.appendAssumeCapacity(0);
             }
@@ -1019,20 +1037,20 @@ pub fn RangeOutputStream(comptime T: type) type {
             self.write_offsets.clearRetainingCapacity();
             try self.offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
             try self.write_offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
-
-            var running_total: usize = 0;
-            for (self.counts.items) |count| {
-                self.offsets.appendAssumeCapacity(running_total);
-                self.write_offsets.appendAssumeCapacity(running_total);
-                running_total += count;
-            }
-
+            const running_total = self.appendRangeOffsets(0, 0);
             self.values.clearRetainingCapacity();
             try self.values.ensureTotalCapacity(self.allocator, running_total);
-            for (0..running_total) |_| {
-                self.values.appendAssumeCapacity(undefined);
-            }
-            self.merged_len = running_total;
+            self.extendValues(running_total);
+            self.prefix_ready = true;
+        }
+
+        /// `prefix` into reserved offset and value capacity (counts' length, and their sum).
+        pub fn prefixAssumeCapacity(self: *Self) void {
+            self.offsets.clearRetainingCapacity();
+            self.write_offsets.clearRetainingCapacity();
+            const running_total = self.appendRangeOffsets(0, 0);
+            self.values.clearRetainingCapacity();
+            self.extendValues(running_total);
             self.prefix_ready = true;
         }
 
@@ -1046,15 +1064,38 @@ pub fn RangeOutputStream(comptime T: type) type {
             std.debug.assert(first_range == self.write_offsets.items.len);
             try self.offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
             try self.write_offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
+            const running_total = self.appendRangeOffsets(first_range, self.merged_len);
+            try self.values.ensureTotalCapacity(self.allocator, running_total);
+            self.extendValues(running_total);
+        }
 
-            var running_total = self.merged_len;
+        /// `prefixAppendedRanges` into reserved offset and value capacity.
+        pub fn prefixAppendedRangesAssumeCapacity(self: *Self, first_range: usize) void {
+            if (!self.prefix_ready) {
+                self.prefixAssumeCapacity();
+                return;
+            }
+
+            std.debug.assert(first_range == self.offsets.items.len);
+            std.debug.assert(first_range == self.write_offsets.items.len);
+            const running_total = self.appendRangeOffsets(first_range, self.merged_len);
+            self.extendValues(running_total);
+        }
+
+        // Appends the offsets of ranges `first_range..` starting at `start`; returns the
+        // running total past them. Needs offset capacity for every range.
+        fn appendRangeOffsets(self: *Self, first_range: usize, start: usize) usize {
+            var running_total = start;
             for (self.counts.items[first_range..]) |count| {
                 self.offsets.appendAssumeCapacity(running_total);
                 self.write_offsets.appendAssumeCapacity(running_total);
                 running_total += count;
             }
+            return running_total;
+        }
 
-            try self.values.ensureTotalCapacity(self.allocator, running_total);
+        // Extends the values to `running_total` slots in reserved capacity.
+        fn extendValues(self: *Self, running_total: usize) void {
             while (self.values.items.len < running_total) {
                 self.values.appendAssumeCapacity(undefined);
             }
@@ -1689,6 +1730,47 @@ test "SimulationFrame.publishWorldTileChanges writes N events in a single range"
     try std.testing.expectEqual(ranges_before + 1, frame.events.rangeCount());
     try std.testing.expectEqual(@as(usize, 3), frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 3), frame.events.stats.world_tile_changed);
+}
+
+test "a reserved world-tile publish allocates nothing as a step's first range or after another (FailingAllocator)" {
+    const changes = [_]WorldTileChangedEvent{
+        .{ .level = 1, .x = 2, .y = 3, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 1, .x = 4, .y = 5, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 2, .x = 0, .y = 1, .old_tile_id = 3, .new_tile_id = 4, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 2, .x = 6, .y = 7, .old_tile_id = 3, .new_tile_id = 4, .old_blocks_movement = false, .new_blocks_movement = true },
+    };
+    for ([_]bool{ false, true }) |after_other_range| {
+        // The full reservation, and fewer events than reserved.
+        for ([_]usize{ changes.len, changes.len - 1 }) |count| {
+            var frame = SimulationFrame.init(std.testing.allocator);
+            defer frame.deinit();
+            frame.beginStep();
+            if (after_other_range) try frame.events.appendRequired(entityCreatedEvent(7));
+            const ranges_before = frame.events.rangeCount();
+            const merged_before = frame.events.mergedItems().len;
+            frame.events.setCapacityLimit(merged_before + changes.len);
+            try frame.events.ensureEventAppendCapacity(changes.len);
+
+            const real_allocator = frame.events.stream.allocator;
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+            frame.events.stream.allocator = failing.allocator();
+            frame.publishWorldTileChangesAssumeCapacity(changes[0..count]);
+            frame.events.stream.allocator = real_allocator;
+
+            try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(ranges_before + 1, frame.events.rangeCount());
+            const published = frame.events.mergedItems()[merged_before..];
+            try std.testing.expectEqual(count, published.len);
+            for (published, changes[0..count]) |event, change| {
+                try std.testing.expectEqual(SimulationEventStage.structural_commit, event.stage);
+                try std.testing.expectEqual(change, event.payload.world_tile_changed);
+            }
+            try std.testing.expectEqual(count, frame.events.stats.world_tile_changed);
+            try std.testing.expectEqual(@as(usize, @intFromBool(after_other_range)), frame.events.stats.entity_created);
+            try std.testing.expectEqual(merged_before + count, frame.events.stats.total);
+        }
+    }
 }
 
 test "SimulationFrame.clearRetainingCapacity clears stimuli" {

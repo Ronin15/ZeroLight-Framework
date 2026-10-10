@@ -20,6 +20,14 @@ const WorldTilesetMeta = world_tileset_meta.WorldTilesetMeta;
 const TileId = @import("../../world_system.zig").TileId;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
 const demoWorldWithChunkSize = @import("../../world_test_support.zig").demoWorldWithChunkSize;
+const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
+const NavExtent = @import("nav_graph.zig").NavExtent;
+const NavGrid = @import("nav_grid.zig").NavGrid;
+const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
+const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
+const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
+const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
     const entity = try data.createEntity();
@@ -88,4 +96,65 @@ pub fn abstractCapacity() PathfindingCapacity {
 // abstract test and a world-less one share the same small multi-chunk geometry.
 pub fn abstractTestWorld(meta: *const WorldTilesetMeta, bounds_width: f32, bounds_height: f32) !WorldSystem {
     return demoWorldWithChunkSize(std.testing.allocator, meta, bounds_width, bounds_height, abstractCapacity().nav_chunk_tiles);
+}
+
+/// No static colliders: for applies on a nav whose levels hold no static body.
+pub const no_colliders = StaticColliderSystem{
+    .allocator = std.testing.failing_allocator,
+    .chunk_lists = .{ .allocator = std.testing.failing_allocator },
+};
+
+/// Static colliders built from `data` on `world`'s cell grid.
+pub fn worldColliders(data: *const DataSystem, world: *const WorldSystem) !StaticColliderSystem {
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    errdefer colliders.deinit();
+    try colliders.rebuild(data, try (NavExtent{ .world = world }).colliderGeometry());
+    return colliders;
+}
+
+/// The commit seam for statics: reserves the colliders and `system`'s static marks,
+/// commits `commands`, captures and syncs the colliders, then records the sync's changes in
+/// `system` for the nav reaction.
+pub fn commitWithColliders(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, system: *PathfindingSystem, commands: []const StructuralCommand) !void {
+    frame.beginStep();
+    try colliders.reserveForCommit(data, commands.len);
+    try system.reserveStaticColliderMarks(colliders.pendingChangeCount() + commands.len);
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, commands.len);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    for (commands) |command| writer.write(command);
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    _ = try frame.applyStructuralCommands(data);
+    colliders.capture(frame);
+    try colliders.sync(data, null);
+    system.recordStaticColliderChanges(colliders.changesThisStep());
+}
+
+/// A terrain writer's nav record over `events` (terrain events only): its reserve, then the
+/// serial record.
+pub fn recordTerrainEvents(system: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem) !void {
+    try system.reserveTerrainNavRecord(events.len);
+    system.recordTerrainNavEvents(events, world, null);
+}
+
+/// Sets `cells` ((x, y) pairs) of an all-open prepared `grid` blocked, through the same
+/// chunk writes a remask makes.
+pub fn setBlockedCells(allocator: std.mem.Allocator, grid: *NavGrid, cells: []const [2]usize) !void {
+    var pool_grows: u64 = 0;
+    for (0..grid.dir.items.len) |chunk_index| {
+        const chunk: u32 = @intCast(chunk_index);
+        const bounds = grid.chunkBounds(chunk);
+        var bits: ChunkBits = @splat(0);
+        for (cells) |cell| {
+            if (cell[0] < bounds.x0 or cell[0] >= bounds.x1 or cell[1] < bounds.y0 or cell[1] >= bounds.y1) continue;
+            const local = (cell[1] - bounds.y0) * grid.chunk_tiles + (cell[0] - bounds.x0);
+            bits[local / 64] |= @as(u64, 1) << @intCast(local % 64);
+        }
+        try grid.ensureFreeBlocks(allocator, 1, &pool_grows);
+        const slot = grid.claimBlock();
+        grid.blocked_count += grid.writeChunk(chunk, slot, bits);
+        if (grid.chunkBlock(chunk) != slot) grid.releaseBlock(slot);
+    }
 }

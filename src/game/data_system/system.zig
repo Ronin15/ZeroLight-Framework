@@ -354,10 +354,8 @@ pub const DataSystem = struct {
     }
 
     /// World-space AABB of `id`'s collision body (movement body position plus collision
-    /// bounds offset/size), or null when either component is absent. Uses the same
-    /// math.aabbFromOffsetSize formula pathfinding's nav_grid.zig derives from the same
-    /// columns, so a caller can localize nav invalidation to the covered cells without
-    /// re-deriving the whole level.
+    /// bounds offset/size, `math.aabbFromOffsetSize`), or null when either component is
+    /// absent. The static-collider rows hold this rect for each static navigation obstacle.
     pub fn staticObstacleWorldRect(self: *const DataSystem, id: EntityId) ?types.ObstacleWorldRect {
         const body = self.movementBodyConst(id) orelse return null;
         const bounds = self.collisionBoundsConst(id) orelse return null;

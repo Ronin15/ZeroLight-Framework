@@ -9,6 +9,7 @@
 const std = @import("std");
 const math = @import("../../../core/math.zig");
 const NavGrid = @import("nav_grid.zig").NavGrid;
+const allowed_moves = @import("nav_grid.zig").allowed_moves;
 const types = @import("types.zig");
 const diagonal_cost = types.diagonal_cost;
 const cardinal_cost = types.cardinal_cost;
@@ -199,18 +200,17 @@ pub const GroupField = struct {
             };
             expansions += 1;
             const current_cost = self.costs.items[current_index];
-            const current_x: i32 = @intCast(current_index % grid.width);
-            const current_y: i32 = @intCast(current_index / grid.width);
+            // One 3x3 neighborhood read and one table lookup give every allowed move, bounds
+            // and the corner rule included.
+            const current_y_index = current_index / grid.width;
+            const current_x_index = current_index - current_y_index * grid.width;
+            const moves = allowed_moves[grid.neighborhood(current_x_index, current_y_index)];
             for (neighbor_dirs, 0..) |dir, dir_index| {
-                const nx = current_x + dir.x;
-                const ny = current_y + dir.y;
-                const next_index = grid.indexForCell(.{ .x = nx, .y = ny }) orelse continue;
-                if (grid.isBlockedIndex(next_index)) continue;
-                // next_index is in-bounds, so nx/ny and current_x/current_y are too; the helper
-                // indexes the orthogonal diagonal cells directly.
-                if (dir.diagonal and grid.diagonalCornerBlocked(current_x, current_y, nx, ny)) {
-                    continue;
-                }
+                if (moves & (@as(u8, 1) << @intCast(dir_index)) == 0) continue;
+                const nx = @as(i64, @intCast(current_x_index)) + dir.x;
+                const ny = @as(i64, @intCast(current_y_index)) + dir.y;
+                // In-grid: the move table admits only in-level neighbors.
+                const next_index: usize = @intCast(ny * @as(i64, @intCast(grid.width)) + nx);
                 const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;
                 const candidate = current_cost + step_cost;
                 const existing = self.cost(next_index);
@@ -349,7 +349,6 @@ test "GroupField generation wraparound clears both stamps and queued_stamp" {
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 8, 8, default_cell_size, default_nav_chunk_tiles);
-    grid.buildComponents();
 
     var field = GroupField{};
     defer field.deinit(std.testing.allocator);
@@ -400,7 +399,6 @@ test "GroupField build cost is bounded by max_cells independent of world size" {
     // A large, fully open grid: with no cap this would flood all 4096 cells from the
     // corner goal in a handful of steps; capped at 10, it must stop far short of that.
     try grid.prepare(std.testing.allocator, 0, 64, 64, default_cell_size, default_nav_chunk_tiles);
-    grid.buildComponents();
 
     var field = GroupField{};
     defer field.deinit(std.testing.allocator);
@@ -438,8 +436,7 @@ test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra fie
     // A diagonal-ish obstacle pattern so the field has equal-cost cells reachable from
     // multiple predecessors (the case where pop order could change flow directions).
     const blocked_cells = [_][2]usize{ .{ 5, 3 }, .{ 5, 4 }, .{ 5, 5 }, .{ 6, 5 }, .{ 7, 5 }, .{ 10, 10 }, .{ 11, 10 }, .{ 12, 10 }, .{ 3, 12 }, .{ 4, 12 }, .{ 14, 6 }, .{ 14, 7 } };
-    for (blocked_cells) |bc| grid.markBlockedIndex(bc[1] * grid.width + bc[0]);
-    grid.buildComponents();
+    try @import("test_support.zig").setBlockedCells(allocator, &grid, &blocked_cells);
 
     const cell_count = grid.cellCount();
     const ref_cost = try allocator.alloc(u32, cell_count);

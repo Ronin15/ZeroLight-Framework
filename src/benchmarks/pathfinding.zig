@@ -15,6 +15,7 @@ const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
@@ -1991,6 +1992,7 @@ const evict_dig_cell: CellCoord = .{ .x = 250, .y = 9 };
 const EvictFixture = struct {
     open: OpenWorld,
     data: DataSystem,
+    colliders: StaticColliderSystem,
     requests: []PathRequest,
     stream: RangeOutputStream(PathRequest),
     empty: RangeOutputStream(PathRequest),
@@ -2005,6 +2007,7 @@ const EvictFixture = struct {
         self.empty.deinit();
         self.stream.deinit();
         allocator.free(self.requests);
+        self.colliders.deinit();
         self.data.deinit();
         self.open.world.deinit();
         self.* = undefined;
@@ -2053,7 +2056,7 @@ const EvictFixture = struct {
         const version_before = self.system.graph.version;
         const start_ns = suite.nowNs(io);
         for (self.changed.items) |edit| try self.system.markNavDirty(edit.level, edit.x, edit.y);
-        _ = try self.system.applyBufferedNavUpdates(&self.data, &self.open.world, thread_system);
+        _ = try self.system.applyBufferedNavUpdates(&self.colliders, &self.open.world, thread_system);
         const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (self.system.graph.version != version_before) return error.EvictDigRebuiltNav;
         return elapsed;
@@ -2067,13 +2070,18 @@ fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usiz
     errdefer data.deinit();
     const requests = try buildShortRouteRequests(allocator, &data, &open, result_count);
     errdefer allocator.free(requests);
+    var colliders = StaticColliderSystem.init(allocator);
+    errdefer colliders.deinit();
+    const extent = PathfindingSystem.worldNavExtent(&open.world);
+    try colliders.rebuild(&data, try extent.colliderGeometry());
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_system);
+    try system.rebuildNavFromColliders(&colliders, extent, thread_system);
     return .{
         .open = open,
         .data = data,
+        .colliders = colliders,
         .requests = requests,
         .stream = RangeOutputStream(PathRequest).init(allocator),
         .empty = RangeOutputStream(PathRequest).init(allocator),

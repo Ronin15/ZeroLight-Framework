@@ -65,6 +65,7 @@ comptime {
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");
     _ = @import("game/systems/arbitration.zig");
+    _ = @import("game/systems/chunk_list_map.zig");
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");
     _ = @import("game/systems/movement.zig");
@@ -74,6 +75,7 @@ comptime {
     _ = @import("game/systems/simulation_scope.zig");
     _ = @import("game/systems/world_gate.zig");
     _ = @import("game/systems/spatial_index.zig");
+    _ = @import("game/systems/static_colliders.zig");
     _ = @import("game/systems/steering.zig");
     _ = @import("main.zig");
     _ = @import("render/gpu/buffer.zig");

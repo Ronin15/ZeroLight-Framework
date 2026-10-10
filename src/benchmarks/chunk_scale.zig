@@ -61,16 +61,17 @@
 //! reactions that fell back to whole-level work, and its stage shapes are the nav remask
 //! and patch of the last level the reaction touched.
 //!   - `chunk-scale-nav-dig`: the dig workload's 64 cells dug in one step and refilled in
-//!     the next, each step followed by the reaction. Flat.
+//!     the next, each step followed by the dig writers' nav records and the reaction. Flat.
 //!   - `chunk-scale-nav-ramp`: the ramp workload plus the reaction (each exit's obstacle
 //!     rect marked as one span); the untimed reset refills the cells and exits, drops
 //!     the links, and applies the reaction. Flat.
 //!   - `chunk-scale-nav-cave-in` and `chunk-scale-nav-explosion-fill`: the batched edits,
-//!     each followed by the post-commit nav reaction itself (`reactToPostCommitNavEvents`)
-//!     over the edit's tile events, published untimed into a simulation frame as the
-//!     structural commit does; serial and threaded. `--details` reports the terrain plan and
-//!     write stages, the nav reaction (event interpretation, marking, and apply), and the
-//!     rest (the main thread's share). Linear in region chunks, flat in level size and depth.
+//!     each followed by the writer's nav record of its tile events (published untimed into
+//!     a simulation frame, reserved before the write) and the post-commit nav reaction
+//!     itself (`reactToPostCommitNavEvents`); serial and threaded. `--details` reports the
+//!     terrain plan and write stages, the nav record and reaction (event interpretation,
+//!     marking, and apply), and the rest (the main thread's share). Linear in region
+//!     chunks, flat in level size and depth.
 //!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav
 //!     updated for it. Its revision case (item prefix `1 * 10^7`) first adds a level with a
 //!     walkable floor and updates nav (untimed), then times a blocking band added to that
@@ -97,6 +98,7 @@ const TerrainEditThreads = @import("../game/world_system.zig").TerrainEditThread
 const WorldTileChangedEvent = @import("../game/simulation.zig").WorldTileChangedEvent;
 const WorldObstacleChangedEvent = @import("../game/simulation.zig").WorldObstacleChangedEvent;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const SimulationEvent = @import("../game/simulation.zig").SimulationEvent;
 const TileId = @import("../game/world_system.zig").TileId;
 const invalid_tile_id = @import("../game/world_system.zig").invalid_tile_id;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
@@ -108,6 +110,7 @@ const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockE
 const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
@@ -631,8 +634,11 @@ const ChangeLog = struct {
     allocator: std.mem.Allocator,
     events: std.ArrayList(WorldTileChangedEvent) = .empty,
     obstacles: std.ArrayList(WorldObstacleChangedEvent) = .empty,
+    // The step's changes as the world events a terrain writer appends.
+    published: std.ArrayList(SimulationEvent) = .empty,
 
     fn deinit(self: *ChangeLog) void {
+        self.published.deinit(self.allocator);
         self.obstacles.deinit(self.allocator);
         self.events.deinit(self.allocator);
     }
@@ -1021,10 +1027,10 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 }
 
 // The nav groups' fixture: the chunk-scale world with nav built over every level and no
-// entities.
+// entities, so the static colliders hold no row.
 const NavFixture = struct {
     base: Fixture,
-    data: DataSystem,
+    colliders: StaticColliderSystem,
     system: PathfindingSystem,
     changes: ChangeLog,
     // The case's thread system for the dig and ramp reactions; null runs them serial.
@@ -1033,31 +1039,34 @@ const NavFixture = struct {
     fn deinit(self: *NavFixture) void {
         self.changes.deinit();
         self.system.deinit();
-        self.data.deinit();
+        self.colliders.deinit();
         self.base.deinit();
         self.* = undefined;
     }
 
-    // Marks every changed cell whose movement blocking flipped, as the post-commit
-    // reaction filters its tile events, and each obstacle rect as one span; returns
-    // the cells and rects marked.
+    // Records the step's changes as each dig writer does (its reserve, then the inline
+    // record of its world events): every changed cell whose movement blocking flipped
+    // becomes a mark and each obstacle rect one span. Returns the cells and rects that
+    // reach nav.
     fn markBlockingChanges(self: *NavFixture, events: []const WorldTileChangedEvent, obstacles: []const WorldObstacleChangedEvent) !usize {
+        const published = &self.changes.published;
+        published.clearRetainingCapacity();
+        try published.ensureTotalCapacity(self.changes.allocator, events.len + obstacles.len);
         var marked: usize = 0;
         for (events) |event| {
-            if (event.old_blocks_movement == event.new_blocks_movement) continue;
-            try self.system.markNavDirty(event.level, event.x, event.y);
-            marked += 1;
+            if (event.old_blocks_movement != event.new_blocks_movement) marked += 1;
+            published.appendAssumeCapacity(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = event } });
         }
-        for (obstacles) |rect| {
-            try self.system.markNavTileRectDirty(&self.base.world, rect.level, rect.min_x, rect.min_y, rect.max_x_exclusive, rect.max_y_exclusive);
-            marked += 1;
-        }
+        for (obstacles) |rect| published.appendAssumeCapacity(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = rect } });
+        marked += obstacles.len;
+        try self.system.reserveTerrainNavRecord(published.items.len);
+        self.system.recordTerrainNavEvents(published.items, &self.base.world, null);
         return marked;
     }
 
     // Applies the marked cells as one buffered nav update.
     fn react(self: *NavFixture, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        const stats = try self.system.applyBufferedNavUpdates(&self.data, &self.base.world, thread_system);
+        const stats = try self.system.applyBufferedNavUpdates(&self.colliders, &self.base.world, thread_system);
         if (stats.incremental_rebuilds != 1) return error.NavReactionUnchanged;
         return stats;
     }
@@ -1072,11 +1081,12 @@ const NavFixture = struct {
         _ = try self.react(self.threads);
     }
 
-    // The post-commit nav reaction over the step's published structural events; fails
-    // unless it applied one incremental update, drained every mark, and signaled the
-    // invalidation once.
+    // The writer's nav record of the step's published tile events (reserved before the
+    // write), then the post-commit nav reaction; fails unless it applied one incremental
+    // update, drained every mark, and signaled the invalidation once.
     fn reactToFrame(self: *NavFixture, frame: *SimulationFrame, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        const stats = try self.system.reactToPostCommitNavEvents(frame, &self.data, &self.base.world, thread_system);
+        self.system.recordTerrainNavEvents(frame.events.mergedItems(), &self.base.world, thread_system);
+        const stats = try self.system.reactToPostCommitNavEvents(frame, &self.colliders, &self.base.world, thread_system);
         if (stats.incremental_rebuilds != 1) return error.NavReactionUnchanged;
         if (self.system.hasPendingNavUpdates(&self.base.world)) return error.NavMarksPending;
         if (frame.events.stats.nav_region_invalidated != 1) return error.NavInvalidationMissing;
@@ -1107,12 +1117,16 @@ fn buildNavFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: 
     var base = try buildFixture(allocator, io, side, levels);
     errdefer base.deinit();
     var data = DataSystem.init(allocator);
-    errdefer data.deinit();
+    defer data.deinit();
+    var colliders = StaticColliderSystem.init(allocator);
+    errdefer colliders.deinit();
+    const extent = PathfindingSystem.worldNavExtent(&base.world);
+    try colliders.rebuild(&data, try extent.colliderGeometry());
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &base.world, thread_system);
-    return .{ .base = base, .data = data, .system = system, .changes = .{ .allocator = allocator } };
+    try system.rebuildNavFromColliders(&colliders, extent, thread_system);
+    return .{ .base = base, .colliders = colliders, .system = system, .changes = .{ .allocator = allocator } };
 }
 
 // Gives the nav reaction's mark, plan, remask, and patch stages this case's tuners and
@@ -1209,7 +1223,8 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
 
 // One timed change with its nav reaction; returns the cells changed. The dig workload digs
 // and refills its 64 cells in two steps; the ramp workload digs its 64 ramps. Each step's
-// reaction marks the step's blocking changes, every workload cell among them.
+// writers record their blocking changes, every workload cell among them, and the reaction
+// applies them.
 fn runNavIteration(nav: *NavFixture, workload: NavWorkload) !usize {
     const level = nav.base.levels - 1;
     switch (workload) {
@@ -1260,11 +1275,14 @@ fn navTunersSettled(nav: *const NavFixture) bool {
     return tunersSettled(&nav.base.world) and navStageTunersSettled(&nav.system, true);
 }
 
-// One batched change and its reversal, each followed by the post-commit nav reaction to
-// its published tile events (interpretation, marking, and apply, timed as the nav
-// stage); returns the cells written. Publishing the events is untimed setup.
+// One batched change and its reversal, each followed by the writer's nav record of its
+// published tile events and the post-commit nav reaction (interpretation, marking, and
+// apply, timed as the nav stage); returns the cells written. The record is reserved from
+// the cells written before each write, as a terrain writer reserves from its event budget.
+// Publishing the events is untimed setup.
 fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *SimulationFrame, edit_threads: ?TerrainEditThreads, thread_system: ?*ThreadSystem, timing: *NavBatchTiming) !usize {
-    for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }) |chunks| {
+    for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }, [_]usize{ edit.forward.items.len, edit.back.items.len }) |chunks, cell_count| {
+        try nav.system.reserveTerrainNavRecord(cell_count);
         const edit_start_ns = suite.nowNs(io);
         try applyBatch(&nav.base.world, chunks, &edit.events, edit_threads);
         timing.elapsed_ns += suite.elapsedNs(edit_start_ns, suite.nowNs(io));
@@ -1310,6 +1328,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer frame.deinit();
     // The cave-in region starts carved, so each iteration collapses then re-carves it.
     if (workload == .cave_in) {
+        try nav.system.reserveTerrainNavRecord(edit.back.items.len);
         try applyBatch(&nav.base.world, edit.back_chunks.items, &edit.events, null);
         try publishBatchEvents(&frame, edit.events.items);
         _ = try nav.reactToFrame(&frame, null);
@@ -1447,6 +1466,6 @@ fn levelAddIteration(io: std.Io, nav: *NavFixture, frame: *SimulationFrame, revi
 // revision; fails unless it built exactly one level.
 fn reactToLevelChange(nav: *NavFixture, frame: *SimulationFrame) !void {
     frame.beginStep();
-    const stats = try nav.system.reactToPostCommitNavEvents(frame, &nav.data, &nav.base.world, nav.threads);
+    const stats = try nav.system.reactToPostCommitNavEvents(frame, &nav.colliders, &nav.base.world, nav.threads);
     if (stats.levels_built != 1) return error.NavLevelNotBuilt;
 }
