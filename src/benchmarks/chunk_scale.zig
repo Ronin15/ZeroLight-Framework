@@ -66,9 +66,11 @@
 //!     rect marked as one span); the untimed reset refills the cells and exits, drops
 //!     the links, and applies the reaction. Flat.
 //!   - `chunk-scale-nav-cave-in` and `chunk-scale-nav-explosion-fill`: the batched edits,
-//!     each followed by the reaction, serial and threaded. `--details` reports the terrain
-//!     plan and write stages, the nav reaction (marking and apply), and the rest (the main
-//!     thread's share). Linear in region chunks, flat in level size and depth.
+//!     each followed by the post-commit nav reaction itself (`reactToPostCommitNavEvents`)
+//!     over the edit's tile events, published untimed into a simulation frame as the
+//!     structural commit does; serial and threaded. `--details` reports the terrain plan and
+//!     write stages, the nav reaction (event interpretation, marking, and apply), and the
+//!     rest (the main thread's share). Linear in region chunks, flat in level size and depth.
 //!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav
 //!     updated for it. Its revision case (item prefix `1 * 10^7`) first adds a level with a
 //!     walkable floor and updates nav (untimed), then times a blocking band added to that
@@ -94,6 +96,7 @@ const DenseChunkWrites = @import("../game/world_system.zig").DenseChunkWrites;
 const TerrainEditThreads = @import("../game/world_system.zig").TerrainEditThreads;
 const WorldTileChangedEvent = @import("../game/simulation.zig").WorldTileChangedEvent;
 const WorldObstacleChangedEvent = @import("../game/simulation.zig").WorldObstacleChangedEvent;
+const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const TileId = @import("../game/world_system.zig").TileId;
 const invalid_tile_id = @import("../game/world_system.zig").invalid_tile_id;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
@@ -1066,7 +1069,26 @@ const NavFixture = struct {
         if (marked < min_marked) return error.NavWorkloadUnmarked;
         return navFallbacks(try self.react(self.threads));
     }
+
+    // The post-commit nav reaction over the step's published structural events; fails
+    // unless it applied one incremental update, drained every mark, and signaled the
+    // invalidation once.
+    fn reactToFrame(self: *NavFixture, frame: *SimulationFrame, thread_system: ?*ThreadSystem) !NavUpdateStats {
+        const stats = try self.system.reactToPostCommitNavEvents(frame, &self.data, &self.base.world, thread_system);
+        if (stats.incremental_rebuilds != 1) return error.NavReactionUnchanged;
+        if (self.system.hasPendingNavUpdates()) return error.NavMarksPending;
+        if (frame.events.stats.nav_region_invalidated != 1) return error.NavInvalidationMissing;
+        return stats;
+    }
 };
+
+// Opens a fresh step in `frame` holding a batched edit's tile changes, published as the
+// structural commit publishes them.
+fn publishBatchEvents(frame: *SimulationFrame, events: []const WorldTileChangedEvent) !void {
+    frame.beginStep();
+    try frame.publishWorldTileChanges(events);
+    if (frame.events.stats.world_tile_changed != events.len) return error.BatchEventsUnpublished;
+}
 
 // 1 when a nav reaction fell back to whole-level work.
 fn navFallbacks(stats: NavUpdateStats) usize {
@@ -1227,6 +1249,8 @@ fn runNavExplosionFillCase(allocator: std.mem.Allocator, io: std.Io, options: su
 // reactions' fallbacks.
 const NavBatchTiming = struct {
     terrain: BatchTiming = .{},
+    // The timed edits and reactions; publishing each edit's events is not timed.
+    elapsed_ns: u64 = 0,
     nav_ns: u64 = 0,
     // Nav reaction stage time spent on workers.
     nav_off_main_ns: u64 = 0,
@@ -1237,16 +1261,21 @@ fn navTunersSettled(nav: *const NavFixture) bool {
     return tunersSettled(&nav.base.world) and navStageTunersSettled(&nav.system);
 }
 
-// One timed batched change and its reversal, each followed by its nav reaction (marking
-// and apply, timed as the nav stage); returns the cells written.
-fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, edit_threads: ?TerrainEditThreads, thread_system: ?*ThreadSystem, timing: *NavBatchTiming) !usize {
+// One batched change and its reversal, each followed by the post-commit nav reaction to
+// its published tile events (interpretation, marking, and apply, timed as the nav
+// stage); returns the cells written. Publishing the events is untimed setup.
+fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *SimulationFrame, edit_threads: ?TerrainEditThreads, thread_system: ?*ThreadSystem, timing: *NavBatchTiming) !usize {
     for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }) |chunks| {
+        const edit_start_ns = suite.nowNs(io);
         try applyBatch(&nav.base.world, chunks, &edit.events, edit_threads);
+        timing.elapsed_ns += suite.elapsedNs(edit_start_ns, suite.nowNs(io));
         timing.terrain.add(&nav.base.world);
-        const start_ns = suite.nowNs(io);
-        if (try nav.markBlockingChanges(edit.events.items, &.{}) == 0) return error.NavWorkloadUnmarked;
-        const nav_stats = try nav.react(thread_system);
-        timing.nav_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+        try publishBatchEvents(frame, edit.events.items);
+        const nav_start_ns = suite.nowNs(io);
+        const nav_stats = try nav.reactToFrame(frame, thread_system);
+        const nav_elapsed_ns = suite.elapsedNs(nav_start_ns, suite.nowNs(io));
+        timing.nav_ns += nav_elapsed_ns;
+        timing.elapsed_ns += nav_elapsed_ns;
         timing.fallbacks += navFallbacks(nav_stats);
         timing.nav_off_main_ns += nav_stats.off_main_stage_ns;
     }
@@ -1279,11 +1308,13 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .explosion_fill => try buildExplosionEdit(allocator, &nav.base, region_chunks),
     };
     defer edit.deinit(allocator);
+    var frame = SimulationFrame.init(allocator);
+    defer frame.deinit();
     // The cave-in region starts carved, so each iteration collapses then re-carves it.
     if (workload == .cave_in) {
         try applyBatch(&nav.base.world, edit.back_chunks.items, &edit.events, null);
-        _ = try nav.markBlockingChanges(edit.events.items, &.{});
-        _ = try nav.react(null);
+        try publishBatchEvents(&frame, edit.events.items);
+        _ = try nav.reactToFrame(&frame, null);
     }
 
     const world = &nav.base.world;
@@ -1301,13 +1332,13 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var unused_timing: NavBatchTiming = .{};
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
-        _ = try runNavBatchIteration(io, &nav, &edit, edit_threads, thread_ptr, &unused_timing);
+        _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &unused_timing);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!navTunersSettled(&nav) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runNavBatchIteration(io, &nav, &edit, edit_threads, thread_ptr, &unused_timing);
+            _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &unused_timing);
         }
     }
     const remask_settled = if (case.adaptive) system.nav_remask_tuner.isSettled() else false;
@@ -1322,9 +1353,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var cells_changed: usize = 0;
     for (0..options.iterations) |_| {
         var timing: NavBatchTiming = .{};
-        const start_ns = suite.nowNs(io);
-        cells_changed = try runNavBatchIteration(io, &nav, &edit, edit_threads, thread_ptr, &timing);
-        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        cells_changed = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &timing);
+        const elapsed_ns = timing.elapsed_ns;
         accumulator.record(elapsed_ns, system.graph.last_remask_batch);
         plan_total += timing.terrain.plan_ns;
         write_total += timing.terrain.write_ns;
