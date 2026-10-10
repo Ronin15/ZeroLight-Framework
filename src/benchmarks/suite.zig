@@ -266,6 +266,10 @@ pub const SteeringStageSummary = struct {
     select_resolve: BatchSummary = .{},
     select_claim: BatchSummary = .{},
     directions: BatchSummary = .{},
+    grid_bucket: BatchSummary = .{},
+    grid_sort: BatchSummary = .{},
+    // Entries in the agent grid's largest band after the last step.
+    band_max: usize = 0,
 };
 
 /// Mean per-iteration time of a batched terrain edit's plan and write stages, its nav
@@ -1243,12 +1247,13 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (isSteeringAgentGroup(group_name)) {
         var steer_buffer: [32]u8 = undefined;
         var stage_buffer: [160]u8 = undefined;
+        const band_max = (stats.steering_stages orelse SteeringStageSummary{}).band_max;
         const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
         const main_percent = if (stats.mean_ns == 0) 0 else main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "avoidance_checks={} samples={} intents={} {s} steer={s} main={f} ({}%)",
-            .{ stats.candidate_pairs, stats.sample_count, stats.output_count, formatSteeringStagesInto(&stage_buffer, stats), formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
+            "avoidance_checks={} samples={} intents={} {s} band_max={} steer={s} main={f} ({}%)",
+            .{ stats.candidate_pairs, stats.sample_count, stats.output_count, formatSteeringStagesInto(&stage_buffer, stats), band_max, formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) {
@@ -1361,18 +1366,22 @@ fn formatNavStagesInto(buffer: []u8, stats: RunStats) []const u8 {
 }
 
 // Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the
-// claim after selection's inline single pass).
+// claim and the grid sort on the serial path).
 fn formatSteeringStagesInto(buffer: []u8, stats: RunStats) []const u8 {
     const stages = stats.steering_stages orelse SteeringStageSummary{};
     var agents_buffer: [32]u8 = undefined;
     var resolve_buffer: [32]u8 = undefined;
     var claim_buffer: [32]u8 = undefined;
     var directions_buffer: [32]u8 = undefined;
-    return std.fmt.bufPrint(buffer, "agents={s} resolve={s} claim={s} dir={s}", .{
+    var bucket_buffer: [32]u8 = undefined;
+    var sort_buffer: [32]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "agents={s} resolve={s} claim={s} dir={s} bucket={s} sort={s}", .{
         formatRunStageShapeInto(&agents_buffer, stages.agents),
         formatRunStageShapeInto(&resolve_buffer, stages.select_resolve),
         formatRunStageShapeInto(&claim_buffer, stages.select_claim),
         formatRunStageShapeInto(&directions_buffer, stages.directions),
+        formatRunStageShapeInto(&bucket_buffer, stages.grid_bucket),
+        formatRunStageShapeInto(&sort_buffer, stages.grid_sort),
     }) catch "stages";
 }
 
@@ -1762,12 +1771,24 @@ test "steering layout groups share the steering agent label" {
 
 test "steering stage label tells a stage that did not run from an inline one" {
     var buffer: [160]u8 = undefined;
-    // Selection ran its inline single pass: the claim never ran.
-    try std.testing.expectEqualStrings("agents=2w/4r resolve=inline claim=- dir=2w/3r", formatSteeringStagesInto(&buffer, .{
+    // The serial path: the claim and the grid sort never ran.
+    try std.testing.expectEqualStrings("agents=inline resolve=inline claim=- dir=inline bucket=inline sort=-", formatSteeringStagesInto(&buffer, .{
+        .steering_stages = .{
+            .agents = .{ .item_count = 64, .range_count = 1, .ran_inline = true },
+            .select_resolve = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
+            .directions = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
+            .grid_bucket = .{ .item_count = 64, .range_count = 1, .ran_inline = true },
+        },
+    }));
+    // Threaded: the claim inline by its tuner, the grid sort on workers.
+    try std.testing.expectEqualStrings("agents=2w/4r resolve=inline claim=inline dir=2w/3r bucket=2w/4r sort=3w/64r", formatSteeringStagesInto(&buffer, .{
         .steering_stages = .{
             .agents = .{ .item_count = 64, .range_count = 4, .active_worker_threads = 2, .ran_inline = false },
             .select_resolve = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
+            .select_claim = .{ .item_count = 4, .range_count = 1, .ran_inline = true },
             .directions = .{ .item_count = 48, .range_count = 3, .active_worker_threads = 2, .ran_inline = false },
+            .grid_bucket = .{ .item_count = 64, .range_count = 4, .active_worker_threads = 2, .ran_inline = false },
+            .grid_sort = .{ .item_count = 64, .range_count = 64, .active_worker_threads = 3, .ran_inline = false },
         },
     }));
 }

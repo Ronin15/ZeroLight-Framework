@@ -5466,6 +5466,8 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.steering.select_resolve_tuner,
         &pipeline.steering.select_claim_tuner,
         &pipeline.steering.directions_tuner,
+        &pipeline.steering.grid_bucket_tuner,
+        &pipeline.steering.grid_sort_tuner,
         &pipeline.pathfinding.fallback_tuner,
         &pipeline.pathfinding.nav_remask_tuner,
         &pipeline.pathfinding.nav_patch_tuner,

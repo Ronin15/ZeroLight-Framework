@@ -6,10 +6,11 @@
 //! component data, then emits final movement intents and path requests for NPC movement.
 //! Thread-system stages, each with an inline path: `agents` (runtime tick, agent snapshot,
 //! movement-index refresh), `select_resolve` and `select_claim` (one intent per steering
-//! row), `directions` (path status and base direction), and the avoidance pass. Worker
-//! jobs read immutable slices and write their range's window or the steering rows they
-//! own. The main thread keeps per-range bookkeeping, the rekey of runtime rows a commit
-//! moved, and the agent grid build.
+//! row), `directions` (path status and base direction), `grid_bucket` and `grid_sort` (the
+//! agent grid in sampled cell-key bands), and the avoidance pass. Worker jobs read immutable
+//! slices and write their range's window, or the steering rows or band slice they own. The
+//! main thread keeps per-range and per-band bookkeeping, the band splitters, and the rekey
+//! of runtime rows a commit moved.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -50,8 +51,8 @@ const steering_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .smallest_range_items = steering_range_alignment_items,
 };
 
-// `select_claim` dispatches one item per band.
-const claim_tuner_config = AdaptiveWorkTunerConfig{
+// `select_claim` and `grid_sort` dispatch one item per band.
+const band_tuner_config = AdaptiveWorkTunerConfig{
     .initial_range_items = 1,
     .smallest_range_items = 1,
 };
@@ -88,7 +89,7 @@ const max_obstacle_work: u16 = 512;
 const direction_epsilon: f32 = 0.0001;
 
 const thread_shared_record_alignment: usize = 64;
-// Partition width of `select_claim`, not a capacity: results are independent of the band
+// Partition width of the band stages, not a capacity: results are independent of the band
 // count, and a range's band histogram stays on the worker stack.
 const max_bands: usize = 64;
 // Steering rows per claim block; a band owns whole blocks.
@@ -132,9 +133,12 @@ pub const SteeringStats = struct {
     batch: BatchStats = .{},
     agents_batch: BatchStats = .{},
     select_resolve_batch: BatchStats = .{},
-    /// Zero items when selection ran its inline single pass.
+    /// Zero items on the serial path, where selection runs its single pass.
     select_claim_batch: BatchStats = .{},
     directions_batch: BatchStats = .{},
+    grid_bucket_batch: BatchStats = .{},
+    /// Zero items on the serial path, where the grid runs its single sort.
+    grid_sort_batch: BatchStats = .{},
     // Wall time (ns) of the prepare stages, inline or dispatched: selection, the agents stage
     // with its rekey and the agent grid, and directions; zero when perf logging is disabled.
     select_ns: u64 = 0,
@@ -166,8 +170,15 @@ pub const SteeringSystem = struct {
     selected_windows: std.ArrayList(SelectedWindow) = .empty,
     // Previous positions by steering row; a row without a movement body holds no entity.
     agent_snapshot_rows: std.MultiArrayList(AgentSnapshotRow) = .{},
+    // The agent grid: entries sorted by (cell_y, cell_x, row), and per occupied cell its
+    // entry range. Built in cell-key bands, each band's ranges in its own slice of
+    // `agent_cell_ranges` (gaps between slices are unused); `agent_grid` finds a cell's band.
+    // `grid_bucket` places each range's entries by band in its window of
+    // `agent_cell_staging`, using its window of `agent_cell_entries` as scratch.
     agent_cell_entries: std.ArrayList(SpatialCellEntry) = .empty,
     agent_cell_ranges: std.ArrayList(SpatialCellRange) = .empty,
+    agent_cell_staging: std.ArrayList(SpatialCellEntry) = .empty,
+    agent_grid: AgentGridDirectory = .{},
     // Parallel to steering dense order: movement body dense index per steering row.
     // Rebuilt only when invalidated (structural create/destroy/component renumber),
     // not every cognition step — avoids per-agent slot resolve in the hot snapshot.
@@ -179,22 +190,28 @@ pub const SteeringSystem = struct {
     band_rows: SlotList(BandRow) = .empty,
     directions_tallies: SlotList(DirectionsTally) = .empty,
     movement_tallies: SlotList(MovementTally) = .empty,
+    // One slot per band of `grid_sort`.
+    grid_sort_tallies: SlotList(GridSortTally) = .empty,
     // One tuner per stage; `adaptive_tuner` drives the avoidance pass.
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     agents_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     select_resolve_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
-    select_claim_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(claim_tuner_config),
+    select_claim_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(band_tuner_config),
     directions_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
+    grid_bucket_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
+    grid_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(band_tuner_config),
 
     pub fn init(allocator: std.mem.Allocator) SteeringSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *SteeringSystem) void {
+        self.grid_sort_tallies.deinit(self.allocator);
         self.movement_tallies.deinit(self.allocator);
         self.directions_tallies.deinit(self.allocator);
         self.band_rows.deinit(self.allocator);
         self.agents_tallies.deinit(self.allocator);
+        self.agent_cell_staging.deinit(self.allocator);
         self.agent_cell_ranges.deinit(self.allocator);
         self.agent_cell_entries.deinit(self.allocator);
         self.agent_snapshot_rows.deinit(self.allocator);
@@ -347,7 +364,7 @@ pub const SteeringSystem = struct {
         if (stats.selected_intent_count == 0) return stats;
 
         var grid_timer = StageTimer.start();
-        try self.buildAgentGrid();
+        self.buildAgentGrid(threads, &stats);
         stats.snapshot_ns += grid_timer.lap();
 
         try self.writeMovementIntents(frame, threads, obstacles, steering, &stats);
@@ -368,14 +385,18 @@ pub const SteeringSystem = struct {
         try self.agent_snapshot_rows.ensureTotalCapacity(allocator, hotStoreCapacity(agent_count));
         try self.agent_cell_entries.ensureTotalCapacity(allocator, agent_count);
         try self.agent_cell_ranges.ensureTotalCapacity(allocator, agent_count);
-        try self.agents_tallies.ensureTotalCapacity(allocator, maxRangeCount(agent_count, steering_range_alignment_items));
+        try self.agent_cell_staging.ensureTotalCapacity(allocator, agent_count);
+        const agent_ranges = maxRangeCount(agent_count, steering_range_alignment_items);
+        try self.agents_tallies.ensureTotalCapacity(allocator, agent_ranges);
+        try self.grid_sort_tallies.ensureTotalCapacity(allocator, max_bands);
 
         try self.intent_rows.ensureTotalCapacity(allocator, hotStoreCapacity(intent_count));
         try self.intent_buckets.ensureTotalCapacity(allocator, intent_count);
         try self.selected.ensureTotalCapacity(allocator, intent_count);
         try self.selected_work_rows.ensureTotalCapacity(allocator, hotStoreCapacity(intent_count));
         const intent_ranges = maxRangeCount(intent_count, steering_range_alignment_items);
-        try self.band_rows.ensureTotalCapacity(allocator, intent_ranges);
+        // `select_resolve` ranges, then `grid_bucket` ranges.
+        try self.band_rows.ensureTotalCapacity(allocator, @max(intent_ranges, agent_ranges));
         try self.directions_tallies.ensureTotalCapacity(allocator, intent_ranges);
         try self.selected_windows.ensureTotalCapacity(allocator, intent_ranges);
         // The avoidance pass covers at most one selected intent per navigation intent.
@@ -512,12 +533,13 @@ pub const SteeringSystem = struct {
         self.claim_stamp += 1;
     }
 
-    // `select_resolve`, then `select_claim`. Inline (no threads, or a resolve batch kept on
-    // the main thread) one source-order pass resolves and claims each intent. Dispatched,
-    // ranges resolve their intents and place them by steering band in their window; then
-    // each band claims, for the steering rows it owns, every range's band segment in range
-    // order. Either way each steering row gets its first intent in source order and its
-    // best by priority, ties to the earlier.
+    // `select_resolve`, then `select_claim`. Serial (also when no stage can get a worker),
+    // one source-order pass resolves and claims each intent. Threaded, each stage runs inline or on workers as its tuner
+    // selects: ranges resolve their intents and place them by steering band in their window;
+    // then each band claims, for the steering rows it owns, every range's band segment in
+    // range order. The bands follow the steering rows only, never the resolve partition.
+    // Either way each steering row gets its first intent in source order and its best by
+    // priority, ties to the earlier.
     fn selectIntents(
         self: *SteeringSystem,
         data: *const DataSystem,
@@ -530,27 +552,13 @@ pub const SteeringSystem = struct {
         setRowCount(IntentRow, &self.intent_rows, intent_count);
         const intent_rows = self.intent_rows.slice();
         const claims = claimColumns(self.claims.slice());
-        const stage = threads orelse {
+        const stage = stageWithWorkers(threads) orelse {
             resolveAndClaim(data, intents, 0, intent_count, intent_rows.items(.steering), intent_rows.items(.movement), claims, self.claim_stamp);
             stats.select_resolve_batch = inlineBatch(intent_count, steering_range_alignment_items);
             return;
         };
         const selection = stage.select(&self.select_resolve_tuner, intent_count, steering_range_alignment_items, null);
-        if (selection.worker_threads == 0) {
-            // Inline in range order: the single pass, still dispatched so the tuner records it.
-            var direct = DirectSelectJob{
-                .data = data,
-                .intents = intents,
-                .intent_steering = intent_rows.items(.steering),
-                .intent_movement = intent_rows.items(.movement),
-                .claims = claims,
-                .stamp = self.claim_stamp,
-            };
-            stats.select_resolve_batch = stage.dispatch(intent_count, &direct, directSelectJob, selection, steering_range_alignment_items);
-            return;
-        }
-
-        const bands = BandPartition.init(agent_count, selection.range_count);
+        const bands = BandPartition.init(agent_count);
         setSlotCount(BandRow, &self.band_rows, selection.range_count);
         std.debug.assert(self.intent_buckets.capacity >= intent_count);
         self.intent_buckets.items.len = intent_count;
@@ -660,43 +668,85 @@ pub const SteeringSystem = struct {
         stats.path_request_count = request_count;
     }
 
-    fn buildAgentGrid(self: *SteeringSystem) !void {
-        self.fillAgentCellEntriesDense(self.spatial_cell_size);
-        try buildCellRanges(self.agent_cell_entries.items, &self.agent_cell_ranges, self.allocator);
+    // The agent grid over the snapshot's rows with a body: entries sorted by (cell_y, cell_x,
+    // row) and one range per occupied cell. Serial (also when no stage can get a worker), one
+    // fill and one sort in a single band. Threaded, the main thread samples the band splitters, `grid_bucket` places each range's
+    // entries by band in its window, then `grid_sort` gathers, sorts, and splits each band in
+    // its own slice; each stage runs inline or on workers as its tuner selects. A cell lies in
+    // one band and the bands follow cell order, so every cell holds the same entries in the
+    // same order for any splitters and partition.
+    fn buildAgentGrid(self: *SteeringSystem, threads: ?StageThreads, stats: *SteeringStats) void {
+        const stage = stageWithWorkers(threads) orelse {
+            self.buildAgentGridDirect();
+            stats.grid_bucket_batch = inlineBatch(self.agent_snapshot_rows.len, steering_range_alignment_items);
+            return;
+        };
+        const splitters = chooseGridSplitters(self.agentSnapshotSliceConst(), self.spatial_cell_size);
+        const selection = stage.select(&self.grid_bucket_tuner, self.agent_snapshot_rows.len, steering_range_alignment_items, null);
+        self.buildAgentGridBanded(stage, selection, splitters, stats);
     }
 
-    /// Assigns spatial cells over the snapshot's contiguous x/y columns (SIMD 4-wide +
-    /// scalar tail), bit-identical to `spatialCell`, keeping only rows with a movement body.
-    fn fillAgentCellEntriesDense(self: *SteeringSystem, cell_size: f32) void {
-        const agents = self.agentSnapshotSliceConst();
-        const n = agents.len();
-        self.agent_cell_entries.clearRetainingCapacity();
-        std.debug.assert(self.agent_cell_entries.capacity >= n);
+    // The serial grid: one fill and one sort, every cell range in the directory's one band.
+    fn buildAgentGridDirect(self: *SteeringSystem) void {
+        const agent_count = self.agent_snapshot_rows.len;
+        std.debug.assert(self.agent_cell_entries.capacity >= agent_count and self.agent_cell_ranges.capacity >= agent_count);
+        self.agent_cell_entries.items.len = agent_count;
+        self.agent_cell_ranges.items.len = agent_count;
+        self.agent_cell_entries.items.len = fillCellEntries(self.agentSnapshotSliceConst(), self.spatial_cell_size, 0, agent_count, self.agent_cell_entries.items);
+        const range_count = sortCellEntries(self.agent_cell_entries.items, self.agent_cell_ranges.items, 0);
+        self.agent_cell_ranges.items.len = range_count;
+        self.agent_grid = .{};
+        self.agent_grid.bands[0] = .{ .start = 0, .range_count = range_count };
+    }
 
-        const safe_cell = @max(cell_size, min_spatial_cell_size);
-        const cell_size_vec = simd.splatFloat4(safe_cell);
-        const xs = agents.x;
-        const ys = agents.y;
-        var i: usize = 0;
-        const vend = simd.vectorizedEnd(n);
-        while (i < vend) : (i += simd.lane_count) {
-            const px = simd.loadFloat4(xs[i..]);
-            const py = simd.loadFloat4(ys[i..]);
-            const cx = simd.toIntArray(simd.floorToI4(simd.divFloat4(px, cell_size_vec)));
-            const cy = simd.toIntArray(simd.floorToI4(simd.divFloat4(py, cell_size_vec)));
-            inline for (0..simd.lane_count) |lane| {
-                if (agents.entity[i + lane].isValid()) {
-                    self.agent_cell_entries.appendAssumeCapacity(.{ .cell_x = cx[lane], .cell_y = cy[lane], .index = i + lane });
-                }
-            }
+    // `grid_bucket` over the snapshot rows in `selection`'s ranges into the `max_bands` bands
+    // of `splitters` (nondecreasing), then `grid_sort` over the bands; the main thread lays
+    // out the band slices and the band directory.
+    fn buildAgentGridBanded(self: *SteeringSystem, stage: StageThreads, selection: BatchSelection, splitters: [max_bands - 1]CellKey, stats: *SteeringStats) void {
+        const agent_count = self.agent_snapshot_rows.len;
+        for (splitters[0 .. max_bands - 2], splitters[1..]) |lower, upper| std.debug.assert(!cellKeyLessThan(upper, lower));
+        std.debug.assert(self.agent_cell_entries.capacity >= agent_count and self.agent_cell_ranges.capacity >= agent_count);
+        std.debug.assert(self.agent_cell_staging.capacity >= agent_count);
+        self.agent_cell_entries.items.len = agent_count;
+        self.agent_cell_ranges.items.len = agent_count;
+        self.agent_cell_staging.items.len = agent_count;
+        setSlotCount(BandRow, &self.band_rows, selection.range_count);
+        self.agent_grid = .{ .splitters = splitters, .splitter_count = max_bands - 1 };
+        var bucket = BucketJob{
+            .agents = self.agentSnapshotSliceConst(),
+            .cell_size = self.spatial_cell_size,
+            .grid = &self.agent_grid,
+            .scratch = self.agent_cell_entries.items,
+            .staging = self.agent_cell_staging.items,
+            .items_per_range = selection.items_per_range,
+            .band_rows = self.band_rows.items,
+        };
+        stats.grid_bucket_batch = stage.dispatch(agent_count, &bucket, bucketJob, selection, steering_range_alignment_items);
+
+        // Each band's slice starts after every range's entries of the earlier bands.
+        var band_start: [max_bands + 1]usize = @splat(0);
+        for (self.band_rows.items) |slot| {
+            for (&band_start, slot.value.offsets) |*start, range_offset| start.* += range_offset;
         }
-        while (i < n) : (i += 1) {
-            if (!agents.entity[i].isValid()) continue;
-            self.agent_cell_entries.appendAssumeCapacity(.{
-                .cell_x = spatialCell(xs[i], cell_size),
-                .cell_y = spatialCell(ys[i], cell_size),
-                .index = i,
-            });
+
+        // A fixed shape (an explicit range size) sorts one band per range.
+        const sort_selection = stage.select(&self.grid_sort_tuner, max_bands, 1, if (stage.config.items_per_range != null) 1 else null);
+        setSlotCount(GridSortTally, &self.grid_sort_tallies, max_bands);
+        var sort = SortJob{
+            .staging = self.agent_cell_staging.items,
+            .band_rows = self.band_rows.items,
+            .bucket_items_per_range = selection.items_per_range,
+            .band_start = band_start,
+            .entries = self.agent_cell_entries.items,
+            .ranges = self.agent_cell_ranges.items,
+            .tallies = self.grid_sort_tallies.items,
+            .range_count = sort_selection.range_count,
+        };
+        stats.grid_sort_batch = stage.dispatch(max_bands, &sort, sortJob, sort_selection, 1);
+
+        self.agent_cell_entries.items.len = band_start[max_bands];
+        for (&self.agent_grid.bands, self.grid_sort_tallies.items, band_start[0..max_bands]) |*band, slot, band_entry_start| {
+            band.* = .{ .start = band_entry_start, .range_count = slot.value.range_count };
         }
     }
 
@@ -742,6 +792,7 @@ pub const SteeringSystem = struct {
             .obstacles = obstacles,
             .agent_cell_entries = self.agent_cell_entries.items,
             .agent_cell_ranges = self.agent_cell_ranges.items,
+            .agent_grid = &self.agent_grid,
             .spatial_cell_size = self.spatial_cell_size,
             .intents = &frame.intents,
             .requests = &frame.path_requests,
@@ -798,6 +849,13 @@ const StageThreads = struct {
         });
     }
 
+    // False when the thread system has no workers or the config allows none, so every stage
+    // runs inline whatever its tuner learns.
+    fn mayUseWorkers(self: StageThreads) bool {
+        const workers = self.thread_system.workerThreadCount();
+        return @min(self.config.max_worker_threads orelse workers, workers) > 0;
+    }
+
     fn dispatch(self: StageThreads, item_count: usize, context: *anyopaque, job: JobFn, selection: BatchSelection, range_alignment_items: usize) BatchStats {
         return self.thread_system.parallelForWithOptions(item_count, context, job, .{
             .items_per_range = selection.items_per_range,
@@ -809,6 +867,13 @@ const StageThreads = struct {
         });
     }
 };
+
+// `threads` when a stage there can get a worker, else null: the two-stage selection and
+// grid would only add main-thread passes over the serial ones.
+fn stageWithWorkers(threads: ?StageThreads) ?StageThreads {
+    const stage = threads orelse return null;
+    return if (stage.mayUseWorkers()) stage else null;
+}
 
 const SelectedWorkRow = struct {
     start_x: f32,
@@ -920,8 +985,8 @@ const AgentsTally = struct {
     largest_reach: f32 = min_spatial_cell_size,
 };
 
-// Per-band start offsets of a `select_resolve` range's intents within its window; entry
-// `band_count` is the range's resolved intent count.
+// Per-band start offsets of a `select_resolve` range's intents, or a `grid_bucket` range's
+// cell entries, within its window; entry `band_count` is the range's placed count.
 const BandRow = struct {
     offsets: [max_bands + 1]u32 = @splat(0),
 };
@@ -944,8 +1009,12 @@ const MovementTally = struct {
     obstacle_checks: usize = 0,
 };
 
+const GridSortTally = struct {
+    range_count: usize = 0,
+};
+
 comptime {
-    for ([_]type{ AgentsTally, BandRow, DirectionsTally, MovementTally }) |T| {
+    for ([_]type{ AgentsTally, BandRow, DirectionsTally, MovementTally, GridSortTally }) |T| {
         std.debug.assert(@sizeOf(PaddedSlot(T)) % thread_shared_record_alignment == 0);
     }
 }
@@ -969,11 +1038,11 @@ const BandPartition = struct {
     block_count: usize,
     agent_count: usize,
 
-    // At most `max_bands`, `range_count`, and one band per block.
-    fn init(agent_count: usize, range_count: usize) BandPartition {
+    // `max_bands`, or one band per block when fewer; independent of any stage's partition.
+    fn init(agent_count: usize) BandPartition {
         const block_count = @max((agent_count + band_block_rows - 1) / band_block_rows, 1);
         return .{
-            .band_count = @max(@min(max_bands, range_count, block_count), 1),
+            .band_count = @min(max_bands, block_count),
             .block_count = block_count,
             .agent_count = agent_count,
         };
@@ -986,6 +1055,62 @@ const BandPartition = struct {
     fn firstRow(self: BandPartition, band: usize) usize {
         const block = (band * self.block_count + self.band_count - 1) / self.band_count;
         return @min(block * band_block_rows, self.agent_count);
+    }
+};
+
+// A spatial cell, ordered by (cell_y, cell_x).
+const CellKey = struct {
+    cell_y: i32,
+    cell_x: i32,
+};
+
+fn cellKeyLessThan(lhs: CellKey, rhs: CellKey) bool {
+    return cellLessThan(lhs.cell_x, lhs.cell_y, rhs.cell_x, rhs.cell_y);
+}
+
+// The largest cell key; splitters at it leave the bands after them empty.
+const max_cell_key = CellKey{ .cell_y = std.math.maxInt(i32), .cell_x = std.math.maxInt(i32) };
+// Snapshot rows sampled per step for the grid's band splitters: four per band, a fixed
+// count. Balance only; the grid is the same for any splitters.
+const grid_sample_count: usize = 4 * max_bands;
+// The golden ratio's fractional part in 0.64 fixed point.
+const grid_sample_fraction_step: u64 = 0x9E3779B97F4A7C15;
+
+// One band's cell ranges: `range_count` from `start` in `agent_cell_ranges`.
+const CellBand = struct {
+    start: usize = 0,
+    range_count: usize = 0,
+};
+
+// Which band holds a cell, and where each band's cell ranges are. A cell's band is the
+// count of splitters at or below it; the splitters are nondecreasing, so the bands follow
+// cell order and every cell lies in exactly one. Without splitters there is one band.
+const AgentGridDirectory = struct {
+    splitters: [max_bands - 1]CellKey = @splat(max_cell_key),
+    // 0 for the serial grid's one band, else `max_bands - 1`.
+    splitter_count: usize = 0,
+    bands: [max_bands]CellBand = @splat(.{}),
+
+    // Upper-bound binary search over the splitters.
+    fn bandOfCell(self: *const AgentGridDirectory, cell_x: i32, cell_y: i32) usize {
+        const cell = CellKey{ .cell_y = cell_y, .cell_x = cell_x };
+        var low: usize = 0;
+        var high: usize = self.splitter_count;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (cellKeyLessThan(cell, self.splitters[mid])) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return low;
+    }
+
+    // The cell ranges of the band holding the cell, sorted by (cell_y, cell_x).
+    fn rangesOfCell(self: *const AgentGridDirectory, ranges: []const SpatialCellRange, cell_x: i32, cell_y: i32) []const SpatialCellRange {
+        const band = self.bands[self.bandOfCell(cell_x, cell_y)];
+        return ranges[band.start..][0..band.range_count];
     }
 };
 
@@ -1199,25 +1324,6 @@ fn resolveAndClaim(
         // Intent indices fit u32 (`max_step_items`).
         claimRow(claims, stamp, resolved.steering, @intCast(intent_index), intents);
     }
-}
-
-// Selection dispatched inline: each range, in order on the main thread, runs the single
-// pass.
-const DirectSelectJob = struct {
-    data: *const DataSystem,
-    intents: []const NavigationIntent,
-    intent_steering: []u32,
-    intent_movement: []u32,
-    claims: ClaimColumns,
-    stamp: u32,
-};
-
-fn directSelectJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
-    const job: *DirectSelectJob = @ptrCast(@alignCast(context));
-    std.debug.assert(worker_id.index == WorkerId.main.index);
-    std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= job.intents.len and range.end <= job.intent_steering.len);
-    resolveAndClaim(job.data, job.intents, range.start, range.end, job.intent_steering, job.intent_movement, job.claims, job.stamp);
 }
 
 // `select_resolve`: one range of intents.
@@ -1592,6 +1698,78 @@ fn updateProgress(
     }
 }
 
+// `grid_bucket`: one range of snapshot rows.
+const BucketJob = struct {
+    agents: ConstAgentSnapshotSlice,
+    cell_size: f32,
+    // Its splitters, written before dispatch.
+    grid: *const AgentGridDirectory,
+    // Range r's windows start at `r * items_per_range`.
+    scratch: []SpatialCellEntry,
+    staging: []SpatialCellEntry,
+    items_per_range: usize,
+    band_rows: []PaddedSlot(BandRow),
+};
+
+// Fills the range's cell entries into its scratch window, then places them in its staging
+// window by cell-key band, in row order within a band, and records the band offsets. The
+// band search runs twice per entry rather than storing each band: scalar, a six-step
+// binary search over two-field keys.
+fn bucketJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *BucketJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.band_rows.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.agents.len());
+    std.debug.assert(range.end <= job.scratch.len and range.end <= job.staging.len);
+    std.debug.assert(job.grid.splitter_count == max_bands - 1);
+    const filled = job.scratch[range.start..][0..fillCellEntries(job.agents, job.cell_size, range.start, range.end, job.scratch[range.start..range.end])];
+    var offsets: [max_bands + 1]u32 = @splat(0);
+    for (filled) |entry| offsets[job.grid.bandOfCell(entry.cell_x, entry.cell_y) + 1] += 1;
+    for (1..max_bands + 1) |band| offsets[band] += offsets[band - 1];
+    job.band_rows[range.index].value.offsets = offsets;
+    var cursor = offsets;
+    for (filled) |entry| {
+        const band = job.grid.bandOfCell(entry.cell_x, entry.cell_y);
+        job.staging[range.start + cursor[band]] = entry;
+        cursor[band] += 1;
+    }
+}
+
+// `grid_sort`: one range of the `max_bands` bands.
+const SortJob = struct {
+    staging: []const SpatialCellEntry,
+    band_rows: []const PaddedSlot(BandRow),
+    bucket_items_per_range: usize,
+    // Band b's entries and cell ranges go to `[band_start[b], band_start[b + 1])`.
+    band_start: [max_bands + 1]usize,
+    entries: []SpatialCellEntry,
+    ranges: []SpatialCellRange,
+    tallies: []PaddedSlot(GridSortTally),
+    range_count: usize,
+};
+
+// Each band gathers every bucket range's band segment in range order into its slice, sorts
+// it, and writes its cell ranges into the same slice of the range list.
+fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *SortJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= max_bands and max_bands <= job.tallies.len);
+    std.debug.assert(job.band_start[range.end] <= job.entries.len and job.band_start[range.end] <= job.ranges.len);
+    for (range.start..range.end) |band| {
+        const start = job.band_start[band];
+        const end = job.band_start[band + 1];
+        var cursor = start;
+        for (job.band_rows, 0..) |slot, bucket_range| {
+            const window = job.staging[bucket_range * job.bucket_items_per_range ..];
+            const segment = window[slot.value.offsets[band]..slot.value.offsets[band + 1]];
+            @memcpy(job.entries[cursor..][0..segment.len], segment);
+            cursor += segment.len;
+        }
+        std.debug.assert(cursor == end);
+        job.tallies[band].value = .{ .range_count = sortCellEntries(job.entries[start..end], job.ranges[start..end], start) };
+    }
+}
+
 const SteeringJobContext = struct {
     // Worker context is immutable input plus range-indexed output columns and
     // pre-prefixed SimulationFrame streams.
@@ -1605,6 +1783,7 @@ const SteeringJobContext = struct {
     obstacles: ColliderView,
     agent_cell_entries: []const SpatialCellEntry,
     agent_cell_ranges: []const SpatialCellRange,
+    agent_grid: *const AgentGridDirectory,
     spatial_cell_size: f32,
     intents: *RangeOutputStream(SimulationIntent),
     requests: *RangeOutputStream(PathRequest),
@@ -1857,11 +2036,17 @@ fn accumulateAgentAvoidanceBounded(
     const min_cell_y = spatialCell(start_y - query_radius, job.spatial_cell_size);
     const max_cell_y = spatialCell(start_y + query_radius, job.spatial_cell_size);
 
+    // The serial grid is one band: its ranges are resolved once, not per probed cell.
+    const one_band: ?[]const SpatialCellRange = if (job.agent_grid.splitter_count == 0)
+        job.agent_cell_ranges[job.agent_grid.bands[0].start..][0..job.agent_grid.bands[0].range_count]
+    else
+        null;
     var cell_y = min_cell_y;
     while (cell_y <= max_cell_y and sample_count.* < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_y += 1) {
         var cell_x = min_cell_x;
         while (cell_x <= max_cell_x and sample_count.* < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_x += 1) {
-            const range = findCellRange(job.agent_cell_ranges, cell_x, cell_y) orelse continue;
+            const band_ranges = one_band orelse job.agent_grid.rangesOfCell(job.agent_cell_ranges, cell_x, cell_y);
+            const range = findCellRange(band_ranges, cell_x, cell_y) orelse continue;
             for (job.agent_cell_entries[range.start..range.end]) |entry| {
                 if (sample_count.* >= max_samples or candidate_count.* >= max_agent_candidate_checks) break;
                 candidate_count.* += 1;
@@ -1930,17 +2115,14 @@ fn steeringAgentAt(slice: ConstSteeringAgentSlice, index: usize) SteeringAgentVi
     };
 }
 
-fn buildCellRanges(entries: []SpatialCellEntry, ranges: *std.ArrayList(SpatialCellRange), allocator: std.mem.Allocator) !void {
-    // The sorted entry array remains the payload; ranges only mark contiguous
-    // windows for each occupied spatial cell.
-    ranges.clearRetainingCapacity();
-    if (entries.len == 0) return;
-
-    // pdqsort: agents move slowly so order is often nearly sorted; still O(n log n)
-    // worst case, better constant factors than the previous generic sort on large N.
+// Sorts `entries` by (cell_y, cell_x, row) and writes one range per occupied cell to
+// `ranges`, its bounds offset by `base` (the slice's position in the entry list). Returns the
+// range count, at most the entry count.
+fn sortCellEntries(entries: []SpatialCellEntry, ranges: []SpatialCellRange, base: usize) usize {
+    std.debug.assert(ranges.len >= entries.len);
+    // pdqsort: agents move slowly so order is often nearly sorted; still O(n log n) worst case.
     std.sort.pdq(SpatialCellEntry, entries, {}, spatialCellEntryLessThan);
-    try ranges.ensureTotalCapacity(allocator, entries.len);
-
+    var range_count: usize = 0;
     var entry_index: usize = 0;
     while (entry_index < entries.len) {
         const cell_x = entries[entry_index].cell_x;
@@ -1949,13 +2131,67 @@ fn buildCellRanges(entries: []SpatialCellEntry, ranges: *std.ArrayList(SpatialCe
         while (entry_index < entries.len and entries[entry_index].cell_x == cell_x and entries[entry_index].cell_y == cell_y) {
             entry_index += 1;
         }
-        ranges.appendAssumeCapacity(.{
-            .cell_x = cell_x,
-            .cell_y = cell_y,
-            .start = start,
-            .end = entry_index,
-        });
+        ranges[range_count] = .{ .cell_x = cell_x, .cell_y = cell_y, .start = base + start, .end = base + entry_index };
+        range_count += 1;
     }
+    return range_count;
+}
+
+// The agent grid's `max_bands - 1` band splitters: the cells at the band quantiles of up to
+// `grid_sample_count` snapshot rows (rows without a body skipped), sorted. Every row when
+// they fit the sample, else rows at a golden-ratio sequence of fractions of the row count,
+// which shares no period with a periodic row order. Fixed work on the main thread; with no
+// sampled body every splitter is `max_cell_key`.
+fn chooseGridSplitters(agents: ConstAgentSnapshotSlice, cell_size: f32) [max_bands - 1]CellKey {
+    const row_count = agents.len();
+    const sample_count: usize = @min(grid_sample_count, row_count);
+    var samples: [grid_sample_count]SpatialCellEntry = undefined;
+    var valid: usize = 0;
+    // A 0.64 fixed-point fraction stepped by the golden ratio's fractional part.
+    var fraction: u64 = 0;
+    for (0..sample_count) |sample| {
+        fraction +%= grid_sample_fraction_step;
+        // The high word of fraction * row_count is below row_count, so it fits usize.
+        const row: usize = if (row_count <= grid_sample_count) sample else @intCast(std.math.mulWide(u64, fraction, row_count) >> 64);
+        if (!agents.entity[row].isValid()) continue;
+        samples[valid] = .{ .cell_x = spatialCell(agents.x[row], cell_size), .cell_y = spatialCell(agents.y[row], cell_size), .index = row };
+        valid += 1;
+    }
+    var splitters: [max_bands - 1]CellKey = @splat(max_cell_key);
+    if (valid == 0) return splitters;
+    std.sort.pdq(SpatialCellEntry, samples[0..valid], {}, spatialCellEntryLessThan);
+    for (&splitters, 1..) |*splitter, band| {
+        const sample = samples[band * valid / max_bands];
+        splitter.* = .{ .cell_y = sample.cell_y, .cell_x = sample.cell_x };
+    }
+    return splitters;
+}
+
+// Writes a cell entry to `out` for each row of `[start, end)` with a body, in row order, and
+// returns the count: cells over the snapshot's x/y columns in lanes with a scalar tail, bit
+// for bit `spatialCell`.
+fn fillCellEntries(agents: ConstAgentSnapshotSlice, cell_size: f32, start: usize, end: usize, out: []SpatialCellEntry) usize {
+    std.debug.assert(start <= end and end <= agents.len() and out.len >= end - start);
+    const cell_size_lanes = simd.splatFloat4(@max(cell_size, min_spatial_cell_size));
+    var count: usize = 0;
+    var row = start;
+    const vector_end = start + simd.vectorizedEnd(end - start);
+    while (row < vector_end) : (row += simd.lane_count) {
+        const cell_x = simd.toIntArray(simd.floorToI4(simd.divFloat4(simd.loadFloat4(agents.x[row..]), cell_size_lanes)));
+        const cell_y = simd.toIntArray(simd.floorToI4(simd.divFloat4(simd.loadFloat4(agents.y[row..]), cell_size_lanes)));
+        inline for (0..simd.lane_count) |lane| {
+            if (agents.entity[row + lane].isValid()) {
+                out[count] = .{ .cell_x = cell_x[lane], .cell_y = cell_y[lane], .index = row + lane };
+                count += 1;
+            }
+        }
+    }
+    while (row < end) : (row += 1) {
+        if (!agents.entity[row].isValid()) continue;
+        out[count] = .{ .cell_x = spatialCell(agents.x[row], cell_size), .cell_y = spatialCell(agents.y[row], cell_size), .index = row };
+        count += 1;
+    }
+    return count;
 }
 
 fn spatialCellEntryLessThan(_: void, lhs: SpatialCellEntry, rhs: SpatialCellEntry) bool {
@@ -3218,16 +3454,18 @@ test "steering stops the obstacle walk at the hit cap among dense co-located sta
 test "steering production stage tuners use the central gate and their stage's range alignment" {
     var system = SteeringSystem.init(std.testing.allocator);
     defer system.deinit();
-    const agent_and_intent_tuners = [_]*const AdaptiveWorkTuner{ &system.adaptive_tuner, &system.agents_tuner, &system.select_resolve_tuner, &system.directions_tuner };
+    const agent_and_intent_tuners = [_]*const AdaptiveWorkTuner{ &system.adaptive_tuner, &system.agents_tuner, &system.select_resolve_tuner, &system.directions_tuner, &system.grid_bucket_tuner };
     for (agent_and_intent_tuners) |tuner| {
         try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, tuner.config.threaded_batch_ns);
         try std.testing.expectEqual(steering_range_alignment_items, tuner.config.initial_range_items);
         try std.testing.expectEqual(steering_range_alignment_items, tuner.config.smallest_range_items);
     }
-    // The claim dispatches bands, one item each.
-    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.select_claim_tuner.config.threaded_batch_ns);
-    try std.testing.expectEqual(@as(usize, 1), system.select_claim_tuner.config.initial_range_items);
-    try std.testing.expectEqual(@as(usize, 1), system.select_claim_tuner.config.smallest_range_items);
+    // The claim and the grid sort dispatch bands, one item each.
+    for ([_]*const AdaptiveWorkTuner{ &system.select_claim_tuner, &system.grid_sort_tuner }) |tuner| {
+        try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, tuner.config.threaded_batch_ns);
+        try std.testing.expectEqual(@as(usize, 1), tuner.config.initial_range_items);
+        try std.testing.expectEqual(@as(usize, 1), tuner.config.smallest_range_items);
+    }
 }
 
 test "steering threaded prepare equals serial across range splits and worker counts" {
@@ -3256,6 +3494,32 @@ test "steering threaded prepare equals serial across range splits and worker cou
             try expectTracesEqual(&serial, &threaded);
         }
     }
+}
+
+test "steering with no worker to give runs the serial selection and grid and matches serial" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var serial = ParityTrace{};
+    defer serial.deinit();
+    try runParityScenario(null, .{}, &serial);
+
+    var no_workers = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer no_workers.deinit();
+    try std.testing.expectEqual(@as(usize, 0), no_workers.workerThreadCount());
+    for ([_]SteeringConfig{ .{ .adaptive = true }, .{ .items_per_range = 32, .adaptive = false } }) |config| {
+        var trace = ParityTrace{};
+        defer trace.deinit();
+        try runParityScenario(&no_workers, config, &trace);
+        try expectTracesEqual(&serial, &trace);
+    }
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var capped = ParityTrace{};
+    defer capped.deinit();
+    try runParityScenario(&threads, .{ .items_per_range = 32, .max_worker_threads = 0, .adaptive = false }, &capped);
+    try expectTracesEqual(&serial, &capped);
 }
 
 test "steering threaded arbitration keeps the first appearance and the best intent across ranges" {
@@ -3482,11 +3746,356 @@ test "steering claims stay correct across the claim stamp wrap" {
     }
 }
 
+test "steering banded agent grid gives every cell the same entries as one band" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
+    const inline_ranges = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 0, .adaptive = false } };
+
+    for (std.meta.tags(GridTestLayout)) |layout| {
+        var system = SteeringSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try fillGridTestSnapshot(&system, layout);
+        var stats = SteeringStats{};
+        system.buildAgentGrid(null, &stats);
+        try std.testing.expectEqual(@as(usize, 0), system.agent_grid.splitter_count);
+        var reference = try GridTestCells.capture(&system);
+        defer reference.deinit();
+        try std.testing.expectEqual(layout == .one_cell, reference.ranges.items.len == 1);
+
+        // Both stages inline in their ranges on the main thread.
+        const inline_selection = inline_ranges.select(&system.grid_bucket_tuner, system.agent_snapshot_rows.len, steering_range_alignment_items, null);
+        system.buildAgentGridBanded(inline_ranges, inline_selection, chooseGridSplitters(system.agentSnapshotSliceConst(), system.spatial_cell_size), &stats);
+        try std.testing.expect(stats.grid_bucket_batch.ran_inline and stats.grid_bucket_batch.range_count > 1);
+        try std.testing.expect(stats.grid_sort_batch.ran_inline);
+        try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
+        try expectGridMatches(&system, &reference);
+
+        // A config that allows no worker builds the serial grid.
+        stats = .{};
+        system.buildAgentGrid(inline_ranges, &stats);
+        try std.testing.expectEqual(@as(usize, 0), system.agent_grid.splitter_count);
+        try std.testing.expectEqual(@as(usize, 0), stats.grid_sort_batch.item_count);
+        try expectGridMatches(&system, &reference);
+
+        // Explicit splitter sets over the same bucket ranges.
+        const selection = threaded.select(&system.grid_bucket_tuner, system.agent_snapshot_rows.len, steering_range_alignment_items, null);
+        for (std.meta.tags(GridTestSplitters)) |set| {
+            system.buildAgentGridBanded(threaded, selection, gridTestSplitters(set, reference.ranges.items), &stats);
+            try std.testing.expect(!stats.grid_bucket_batch.ran_inline);
+            try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
+            try expectGridMatches(&system, &reference);
+        }
+
+        // The production splitters.
+        system.buildAgentGrid(threaded, &stats);
+        try std.testing.expect(!stats.grid_bucket_batch.ran_inline and !stats.grid_sort_batch.ran_inline);
+        try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
+        try expectGridMatches(&system, &reference);
+    }
+}
+
+test "steering agent grid splits a one-row corridor and a cluster with a far outlier across bands" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
+
+    for ([_]GridTestLayout{ .one_row, .cluster_outlier }) |layout| {
+        var system = SteeringSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try fillGridTestSnapshot(&system, layout);
+        var stats = SteeringStats{};
+        system.buildAgentGrid(threaded, &stats);
+        const entry_count = system.agent_cell_entries.items.len;
+        try std.testing.expect(entry_count > 0);
+        try std.testing.expect(largestBandEntries(&system) <= entry_count / 8);
+    }
+}
+
+test "steering agent grid splits rows that alternate between two clusters across bands" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
+
+    // Row counts at and near power-of-two multiples of the sample count, with the clusters
+    // alternating every row and every 16 rows.
+    const cases = [_]struct { row_count: usize, period: usize }{
+        .{ .row_count = 1024, .period = 2 },
+        .{ .row_count = 1030, .period = 2 },
+        .{ .row_count = 8192, .period = 32 },
+    };
+    for (cases) |case| {
+        var system = SteeringSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try fillAlternatingClustersSnapshot(&system, case.row_count, case.period);
+        var stats = SteeringStats{};
+        system.buildAgentGrid(threaded, &stats);
+        try std.testing.expectEqual(case.row_count, system.agent_cell_entries.items.len);
+        try std.testing.expect(largestBandEntries(&system) <= case.row_count / 8);
+    }
+}
+
+test "steering stages kept inline by their tuners run the threaded stage jobs inline" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var serial = ParityTrace{};
+    defer serial.deinit();
+    try runParityScenario(null, .{}, &serial);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    // Fresh adaptive tuners learn inline for a whole sample window, so every tuned stage
+    // stays on the main thread for a scenario no longer than one window.
+    try std.testing.expect(parity_step_count <= steering_adaptive_tuner_config.sample_window);
+    try std.testing.expect(parity_step_count <= band_tuner_config.sample_window);
+    var tuned = ParityTrace{};
+    defer tuned.deinit();
+    try runParityScenario(&threads, .{ .max_worker_threads = 3, .adaptive = true }, &tuned);
+    try expectTracesEqual(&serial, &tuned);
+}
+
+test "steering claim band count does not follow the resolve partition" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Far enough apart that no agent pushes another.
+    var agents: [40]EntityId = undefined;
+    for (&agents, 0..) |*agent, index| {
+        agent.* = try addSteeredEntity(&data, .{ .x = @floatFromInt(index % 8 * 200), .y = @floatFromInt(index / 8 * 200) });
+    }
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 64, .max_pending_requests = 64, .max_cached_results = 64, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 64 });
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+
+    // Each agent's first intent, then a second that beats, ties, or loses to it.
+    var intents: [80]NavigationIntent = undefined;
+    for (0..40) |index| intents[index] = selectionIntent(agents[index], index, 0, 1);
+    for (0..40) |index| {
+        const agent = index * 7 % 40;
+        intents[40 + index] = selectionIntent(agents[agent], agent, 1, @as(i16, 2) - @as(i16, @intCast(index % 3)));
+    }
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    // Serial, then five and two resolve ranges.
+    const resolve_ranges = [_]?usize{ null, 16, 48 };
+    var outputs: [resolve_ranges.len][40]MovementIntent = undefined;
+    var claims: [resolve_ranges.len][40]Claim = undefined;
+    for (resolve_ranges, &outputs, &claims) |items_per_range, *output, *claim| {
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        try frame.reserveStreams(8, 0, intents.len, 0, 0, 0);
+        try frame.reservePathRequests(8, intents.len);
+        var steering = SteeringSystem.init(std.testing.allocator);
+        defer steering.deinit();
+        try steering.reserve(intents.len);
+        frame.beginStep();
+        try appendNavigationIntents(&frame, &intents);
+        const stats = if (items_per_range) |range_items|
+            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = range_items, .max_worker_threads = 2, .adaptive = false })
+        else
+            try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        if (items_per_range) |range_items| {
+            try std.testing.expectEqual((intents.len + range_items - 1) / range_items, stats.select_resolve_batch.range_count);
+            // Three 16-row claim blocks over 40 steering rows, whatever the resolve ranges.
+            try std.testing.expectEqual(@as(usize, 3), stats.select_claim_batch.item_count);
+        }
+        try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
+        for (output, frame.intents.mergedItems()) |*slot, merged| slot.* = merged.movement;
+        for (claim, 0..) |*slot, row| slot.* = steering.claims.get(row);
+    }
+    for (outputs[1..], claims[1..]) |threaded_output, threaded_claims| {
+        for (outputs[0], threaded_output) |want, got| {
+            try std.testing.expect(want.entity.eql(got.entity));
+            try std.testing.expectEqual(@as(u32, @bitCast(want.direction_x)), @as(u32, @bitCast(got.direction_x)));
+            try std.testing.expectEqual(@as(u32, @bitCast(want.direction_y)), @as(u32, @bitCast(got.direction_y)));
+        }
+        for (claims[0], threaded_claims) |want, got| {
+            try std.testing.expectEqual(want.first, got.first);
+            try std.testing.expectEqual(want.best, got.best);
+        }
+    }
+}
+
+// Agent grid test layouts: every row in one cell row across about 200 cells; spread over
+// many cell rows; at negative coordinates with a NaN y, a -inf x, a +inf y, and a -inf y;
+// every row in one cell; and a 10x10-cell cluster with one row far outside it.
+const GridTestLayout = enum { one_row, spread, negative, one_cell, cluster_outlier };
+const grid_test_rows: usize = 1000;
+// A row with a body (`fillGridTestSnapshot` drops every seventh from row 3).
+const grid_test_outlier_row: usize = grid_test_rows - 1;
+
+// A snapshot of `grid_test_rows` rows in `layout`, every seventh row without a body.
+fn fillGridTestSnapshot(system: *SteeringSystem, layout: GridTestLayout) !void {
+    try system.ensureStepCapacity(grid_test_rows, 0);
+    setRowCount(AgentSnapshotRow, &system.agent_snapshot_rows, grid_test_rows);
+    const rows = system.agent_snapshot_rows.slice();
+    system.spatial_cell_size = 20;
+    var prng = std.Random.DefaultPrng.init(0x6e1d_b4d5);
+    const random = prng.random();
+    for (rows.items(.entity), rows.items(.x), rows.items(.y), rows.items(.world_level), 0..) |*entity, *x, *y, *level, row| {
+        entity.* = if (row % 7 == 3) EntityId.invalid else try EntityId.init(@intCast(row), 1);
+        level.* = 0;
+        switch (layout) {
+            .one_row => {
+                x.* = random.float(f32) * 4000;
+                y.* = 3 + random.float(f32) * 6;
+            },
+            .spread => {
+                x.* = random.float(f32) * 120;
+                y.* = random.float(f32) * 640;
+            },
+            .negative => {
+                x.* = random.float(f32) * 120 - 300;
+                y.* = -20 - random.float(f32) * 640;
+                if (row == 500) y.* = std.math.nan(f32);
+                if (row == 501) x.* = -std.math.inf(f32);
+                if (row == 502) y.* = std.math.inf(f32);
+                if (row == 503) y.* = -std.math.inf(f32);
+            },
+            .one_cell => {
+                x.* = 1 + random.float(f32) * 18;
+                y.* = 1 + random.float(f32) * 18;
+            },
+            .cluster_outlier => {
+                x.* = random.float(f32) * 200;
+                y.* = random.float(f32) * 200;
+                if (row == grid_test_outlier_row) {
+                    x.* = 1e6;
+                    y.* = 1e6;
+                }
+            },
+        }
+    }
+    std.debug.assert(rows.items(.entity)[grid_test_outlier_row].isValid());
+}
+
+// `row_count` rows with a body, alternating every `period / 2` rows between two far
+// clusters; each cluster's rows fill its block of cells, 32 wide, in row order.
+fn fillAlternatingClustersSnapshot(system: *SteeringSystem, row_count: usize, period: usize) !void {
+    std.debug.assert(period >= 2 and period % 2 == 0);
+    try system.ensureStepCapacity(row_count, 0);
+    setRowCount(AgentSnapshotRow, &system.agent_snapshot_rows, row_count);
+    const rows = system.agent_snapshot_rows.slice();
+    system.spatial_cell_size = 20;
+    const run = period / 2;
+    for (rows.items(.entity), rows.items(.x), rows.items(.y), rows.items(.world_level), 0..) |*entity, *x, *y, *level, row| {
+        entity.* = try EntityId.init(@intCast(row), 1);
+        level.* = 0;
+        const member = row / period * run + row % run;
+        const cluster_y: f32 = if (row % period < run) 0 else 100_000;
+        x.* = @floatFromInt(member % 32 * 20 + 10);
+        y.* = cluster_y + @as(f32, @floatFromInt(member / 32 * 20 + 10));
+    }
+}
+
+// The most entries any band of `system`'s grid holds.
+fn largestBandEntries(system: *const SteeringSystem) usize {
+    var largest: usize = 0;
+    for (system.agent_grid.bands) |band| {
+        var band_entries: usize = 0;
+        for (system.agent_cell_ranges.items[band.start..][0..band.range_count]) |range| band_entries += range.end - range.start;
+        largest = @max(largest, band_entries);
+    }
+    return largest;
+}
+
+// Explicit band splitter sets, each nondecreasing: all past every cell; all one occupied
+// cell; occupied cells at a stride (63 distinct when the grid has as many); the i32 extremes
+// around occupied cells; and occupied cells in equal pairs.
+const GridTestSplitters = enum { all_max, one_cell, stride, extremes, pairs };
+
+fn gridTestSplitters(set: GridTestSplitters, cells: []const SpatialCellRange) [max_bands - 1]CellKey {
+    std.debug.assert(cells.len > 0);
+    const min_key = CellKey{ .cell_y = std.math.minInt(i32), .cell_x = std.math.minInt(i32) };
+    var splitters: [max_bands - 1]CellKey = @splat(max_cell_key);
+    for (&splitters, 0..) |*splitter, index| {
+        const pick: usize = switch (set) {
+            .all_max => continue,
+            .one_cell => cells.len / 2,
+            .stride, .extremes => index * cells.len / (max_bands - 1),
+            .pairs => (index / 2) * cells.len / (max_bands / 2),
+        };
+        splitter.* = .{ .cell_y = cells[pick].cell_y, .cell_x = cells[pick].cell_x };
+        if (set == .extremes and index < 8) splitter.* = min_key;
+        if (set == .extremes and index >= max_bands - 9) splitter.* = max_cell_key;
+    }
+    return splitters;
+}
+
+// A copy of a grid's entries and cell ranges.
+const GridTestCells = struct {
+    entries: std.ArrayList(SpatialCellEntry) = .empty,
+    ranges: std.ArrayList(SpatialCellRange) = .empty,
+
+    fn capture(system: *const SteeringSystem) !GridTestCells {
+        var cells = GridTestCells{};
+        errdefer cells.deinit();
+        try cells.entries.appendSlice(std.testing.allocator, system.agent_cell_entries.items);
+        try cells.ranges.appendSlice(std.testing.allocator, system.agent_cell_ranges.items);
+        return cells;
+    }
+
+    fn deinit(self: *GridTestCells) void {
+        self.ranges.deinit(std.testing.allocator);
+        self.entries.deinit(std.testing.allocator);
+    }
+};
+
+// `system`'s grid, looked up through its band directory, holds exactly the reference's cells,
+// each with the same entries in the same order.
+fn expectGridMatches(system: *const SteeringSystem, reference: *const GridTestCells) !void {
+    const grid = &system.agent_grid;
+    const band_count: usize = if (grid.splitter_count == 0) 1 else max_bands;
+    var range_count: usize = 0;
+    for (grid.bands[0..band_count]) |band| range_count += band.range_count;
+    try std.testing.expectEqual(reference.ranges.items.len, range_count);
+    try std.testing.expectEqualSlices(SpatialCellEntry, reference.entries.items, system.agent_cell_entries.items);
+    for (reference.ranges.items) |cell| {
+        const band_ranges = grid.rangesOfCell(system.agent_cell_ranges.items, cell.cell_x, cell.cell_y);
+        const found = findCellRange(band_ranges, cell.cell_x, cell.cell_y) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(cell.start, found.start);
+        try std.testing.expectEqual(cell.end, found.end);
+    }
+}
+
 fn expectEveryStageThreaded(stats: SteeringStats) !void {
-    for ([_]BatchStats{ stats.agents_batch, stats.select_resolve_batch, stats.select_claim_batch, stats.directions_batch, stats.batch }) |batch| {
+    for ([_]BatchStats{ stats.agents_batch, stats.select_resolve_batch, stats.select_claim_batch, stats.directions_batch, stats.grid_bucket_batch, stats.grid_sort_batch, stats.batch }) |batch| {
         try std.testing.expect(!batch.ran_inline);
         try std.testing.expect(batch.active_worker_threads > 0);
     }
+}
+
+// A step whose stage tuners all kept their stages inline still ran every stage job: the
+// claim over its steering bands and the grid sort over every band.
+fn expectTunedStagesInline(stats: SteeringStats, agent_count: usize) !void {
+    for ([_]BatchStats{ stats.agents_batch, stats.select_resolve_batch, stats.select_claim_batch, stats.directions_batch, stats.grid_bucket_batch, stats.grid_sort_batch }) |batch| {
+        try std.testing.expect(batch.ran_inline);
+    }
+    try std.testing.expectEqual(BandPartition.init(agent_count).band_count, stats.select_claim_batch.item_count);
+    try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
+}
+
+// A step that could give no stage a worker resolved and claimed in one pass and built the
+// grid in one band, so neither the claim nor the grid sort ran.
+fn expectSerialSelectionAndGrid(stats: SteeringStats) !void {
+    try std.testing.expect(stats.select_resolve_batch.ran_inline and stats.grid_bucket_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 0), stats.select_claim_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.grid_sort_batch.item_count);
 }
 
 // An intent for `agent` (the `agent_index`th) whose direct direction is unique to the
@@ -3504,6 +4113,8 @@ fn behaviorStats(stats: SteeringStats) SteeringStats {
     behavior.select_resolve_batch = .{};
     behavior.select_claim_batch = .{};
     behavior.directions_batch = .{};
+    behavior.grid_bucket_batch = .{};
+    behavior.grid_sort_batch = .{};
     behavior.select_ns = 0;
     behavior.snapshot_ns = 0;
     behavior.directions_ns = 0;
@@ -3618,7 +4229,9 @@ fn buildParityIntents(intents: *std.ArrayList(NavigationIntent), agents: []const
     try intents.append(std.testing.allocator, .{ .entity = stale, .goal = .{ .x = 100, .y = 100 }, .direct_direction_x = 1 });
 }
 
-// Three steering steps over the parity crowd among the parity statics, with agents
+const parity_step_count: usize = 3;
+
+// `parity_step_count` steering steps over the parity crowd among the parity statics, with agents
 // destroyed and created between steps and each step's path requests served before the
 // next. A fixed range size of one alignment unit asserts every stage threaded.
 fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trace: *ParityTrace) !void {
@@ -3651,7 +4264,7 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
     defer intents.deinit(std.testing.allocator);
 
     var stale = EntityId.invalid;
-    for (0..3) |step_index| {
+    for (0..parity_step_count) |step_index| {
         if (step_index != 0) {
             // Destroys move the last steering rows into the holes; creates append rows.
             const removals: []const usize = if (step_index == 1) &.{ 40, 3 } else &.{0};
@@ -3669,7 +4282,15 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
             try system.update(&data, &frame, threads, &pathfinding, &colliders, config)
         else
             try system.updateSerial(&data, &frame, &pathfinding, &colliders);
-        if (thread_system != null and config.items_per_range == steering_range_alignment_items) try expectEveryStageThreaded(stats);
+        if (thread_system) |threads| {
+            if (threads.workerThreadCount() == 0 or (config.max_worker_threads orelse 1) == 0) {
+                try expectSerialSelectionAndGrid(stats);
+            } else if (config.items_per_range == steering_range_alignment_items) {
+                try expectEveryStageThreaded(stats);
+            } else if (config.adaptive and config.items_per_range == null) {
+                try expectTunedStagesInline(stats, data.steeringAgentSliceConst().entities.len);
+            }
+        }
         try expectRequestPrefixesCount(&system, stats);
         try trace.record(&frame, stats, &system);
         _ = try pathfinding.updateSerial(&frame.path_requests, agents.items.len, .{});

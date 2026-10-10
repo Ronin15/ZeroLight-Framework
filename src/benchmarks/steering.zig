@@ -226,15 +226,28 @@ fn offMainNs(batch: BatchStats) u64 {
 
 // Off-main time of one steering step's stages.
 fn stagesOffMainNs(stats: SteeringStats) u64 {
-    return offMainNs(stats.agents_batch) + offMainNs(stats.select_resolve_batch) + offMainNs(stats.select_claim_batch) + offMainNs(stats.directions_batch) + offMainNs(stats.batch);
+    return offMainNs(stats.agents_batch) + offMainNs(stats.select_resolve_batch) + offMainNs(stats.select_claim_batch) + offMainNs(stats.directions_batch) +
+        offMainNs(stats.grid_bucket_batch) + offMainNs(stats.grid_sort_batch) + offMainNs(stats.batch);
 }
 
-// Every steering stage tuner has settled; the claim's counts only when the last step
-// dispatched it (an inline selection never does).
-fn stageTunersSettled(system: *const SteeringSystem, last: SteeringStats) bool {
-    const claim_settled = last.select_claim_batch.item_count == 0 or system.select_claim_tuner.isSettled();
-    return claim_settled and system.adaptive_tuner.isSettled() and system.agents_tuner.isSettled() and
-        system.select_resolve_tuner.isSettled() and system.directions_tuner.isSettled();
+// Every steering stage tuner has settled.
+fn stageTunersSettled(system: *const SteeringSystem) bool {
+    return system.adaptive_tuner.isSettled() and system.agents_tuner.isSettled() and system.select_resolve_tuner.isSettled() and
+        system.select_claim_tuner.isSettled() and system.directions_tuner.isSettled() and system.grid_bucket_tuner.isSettled() and
+        system.grid_sort_tuner.isSettled();
+}
+
+// Entries in the agent grid's largest band after the last step.
+fn largestGridBand(system: *const SteeringSystem) usize {
+    const grid = &system.agent_grid;
+    const band_count: usize = if (grid.splitter_count == 0) 1 else grid.bands.len;
+    var largest: usize = 0;
+    for (grid.bands[0..band_count]) |band| {
+        var entries: usize = 0;
+        for (system.agent_cell_ranges.items[band.start..][0..band.range_count]) |range| entries += range.end - range.start;
+        largest = @max(largest, entries);
+    }
+    return largest;
 }
 
 // Warms up, settles the stage tuners, and times `step(context)` over `steering`'s agents
@@ -260,7 +273,9 @@ fn measureCase(
         system.agents_tuner = tuner;
         system.select_resolve_tuner = tuner;
         system.directions_tuner = tuner;
+        system.grid_bucket_tuner = tuner;
         system.select_claim_tuner = bandTunerForCase(case).?;
+        system.grid_sort_tuner = bandTunerForCase(case).?;
     }
 
     var threads: ?ThreadSystem = null;
@@ -281,12 +296,12 @@ fn measureCase(
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!stageTunersSettled(&system, last_stats) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while (!stageTunersSettled(&system) and settle_guard < settle_limit) : (settle_guard += 1) {
             try prepare(context);
             last_stats = try step(&system, context, thread_ptr, case);
         }
     }
-    const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system, last_stats) else false;
+    const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -310,6 +325,9 @@ fn measureCase(
         .select_resolve = suite.batchSummaryFromBatch(last_stats.select_resolve_batch),
         .select_claim = suite.batchSummaryFromBatch(last_stats.select_claim_batch),
         .directions = suite.batchSummaryFromBatch(last_stats.directions_batch),
+        .grid_bucket = suite.batchSummaryFromBatch(last_stats.grid_bucket_batch),
+        .grid_sort = suite.batchSummaryFromBatch(last_stats.grid_sort_batch),
+        .band_max = largestGridBand(&system),
     };
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
