@@ -50,8 +50,11 @@ paths:
   designed. Workers never mutate `DataSystem` structurally; structural commits
   batch at the commit seam.
 - The main thread is not a fallback owner: it holds only those boundaries,
-  orchestration, and ordered merge/commit proportional to what changed. Never
-  move scalable work to the main thread to ease ordering or testing.
+  orchestration, and ordered merge/commit with O(1) work per item (claims,
+  index writes, fixed-size record copies, event appends). Per-item work that
+  grows (path cells, bytes, scans, sorts) threads, even under a per-step
+  budget. Never move scalable work to the main thread to ease ordering or
+  testing.
 - Multi-stage processors have per-stage tuners and visible timing stats; a
   production processor owns its tuner state (`ThreadSystem`'s shared tuner is
   for generic callers). A stage that preselects a thread profile passes its own
