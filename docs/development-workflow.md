@@ -70,10 +70,10 @@ enabled by the current `--fetch` mode.
 **Packaged builds ship `ReleaseFast`** (no safety checks; why reserves need
 proofs: `.claude/rules/memory-performance.md`).
 
-CPU floor: `ReleaseFast` and `ReleaseSmall` builds default to the shipped CPU
-minimum, `x86_64_v2` (SSE4.2, POPCNT) on x86-64 and the baseline model (NEON)
-on aarch64, so the ReleaseFast gate tests what ships. Debug and ReleaseSafe
-build for the native CPU. `-Dcpu` or `-Dtarget` overrides; moving the floor
+CPU floor: every release mode (ReleaseSafe soaks included) defaults to the
+shipped CPU minimum, `x86_64_v2` (SSE4.2, POPCNT) on x86-64, `apple_m1` on
+macOS arm64, and the baseline model (NEON) on other aarch64, so gates and
+soaks test what ships. Debug builds for the native CPU. `-Dcpu` or `-Dtarget` overrides; moving the floor
 (for example to v3) is a deliberate decision.
 
 LTO: on Linux (ELF), `build.zig` enables `-flto=full` for the shipped **app
