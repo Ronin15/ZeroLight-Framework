@@ -712,6 +712,7 @@ fn isSteeringAgentGroup(group_name: []const u8) bool {
 
 fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
+    if (std.mem.eql(u8, group_name, "movement-apply-intents")) return "moving agents";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
     if (std.mem.eql(u8, group_name, "ai-memory")) return "AI agents";
@@ -1142,6 +1143,16 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.startsWith(u8, group_name, "nav-update-")) {
         var stage_buffer: [128]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "movement-apply-intents")) {
+        var apply_buffer: [32]u8 = undefined;
+        const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
+        const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "intents={} apply={s} main={f} ({}%)",
+            .{ stats.output_count, formatStageShapeInto(&apply_buffer, stats.batch), formatDuration(phases.main_ns), main_percent },
+        ) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "plane-traversal")) {
         var gather_buffer: [32]u8 = undefined;

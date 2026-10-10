@@ -9,6 +9,7 @@ const DataSystem = @import("../game/data_system.zig").DataSystem;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
 const movement = @import("../game/systems/movement.zig");
 const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
+const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
@@ -121,4 +122,137 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(movement_range_alignment_items) orelse
         suite.alignItemCount(suite.default_items_per_range, movement_range_alignment_items);
+}
+
+// `movement-apply-intents`: one AI movement intent per moving agent, written once in a
+// scattered row order. Timed: one apply of the merged intents into velocity; apply is
+// idempotent, so no reset runs between iterations. `--details` reports the applied
+// intents, the apply shape, and the main-thread time (everything but a dispatched
+// apply) and share.
+pub const apply_intents_group = suite.BenchmarkGroup{
+    .name = "movement-apply-intents",
+    .defaultItemCounts = applyIntentsItemCounts,
+    .runCase = runApplyIntentsCase,
+};
+
+const apply_intents_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
+// Every this-many agents has speed 0, so the apply takes its default-speed path.
+const zero_speed_every: usize = 5;
+// First stride tried for the scattered intent order; stepped by 2 until coprime with
+// the agent count so the order visits every row once.
+const scatter_stride_seed: usize = 7_919;
+// The apply's speed for a row whose speed is not positive.
+const default_intent_speed: f32 = 40.0;
+
+fn applyIntentsItemCounts(_: suite.Profile) []const usize {
+    return &apply_intents_item_counts;
+}
+
+const ApplyIntentsFixture = struct {
+    data: DataSystem,
+    frame: SimulationFrame,
+
+    fn deinit(self: *ApplyIntentsFixture) void {
+        self.frame.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+fn agentSpeed(index: usize) f32 {
+    return if (index % zero_speed_every == 0) 0 else 10.0 + @as(f32, @floatFromInt(index % 13));
+}
+
+fn agentDirection(index: usize) [2]f32 {
+    return .{
+        (@as(f32, @floatFromInt(index % 7)) - 3.0) / 3.0,
+        (@as(f32, @floatFromInt(index % 5)) - 2.0) / 2.0,
+    };
+}
+
+fn scatterStride(count: usize) usize {
+    var stride = scatter_stride_seed;
+    while (std.math.gcd(stride, count) != 1) stride += 2;
+    return stride;
+}
+
+// `count` agents with a movement body (zero velocity) and an AI agent, entity `index`
+// on movement row `index`; one movement intent each, in `index * stride mod count` order.
+fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize) !ApplyIntentsFixture {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    for (0..count) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .speed = agentSpeed(index) });
+        try data.setAiAgent(entity, .{});
+    }
+    const entities = data.movementBodySliceConst().entities;
+    std.debug.assert(entities.len == count);
+
+    var frame = SimulationFrame.init(allocator);
+    errdefer frame.deinit();
+    try frame.intents.prepareRangeCounts(1);
+    frame.intents.addCount(0, count);
+    try frame.intents.prefix();
+    var writer = frame.intents.rangeWriter(0);
+    const stride = scatterStride(count);
+    for (0..count) |order| {
+        const row = order * stride % count;
+        const direction = agentDirection(row);
+        writer.write(.{ .movement = .{ .entity = entities[row], .direction_x = direction[0], .direction_y = direction[1] } });
+    }
+    writer.finish();
+    frame.intents.finishWrite();
+    std.debug.assert(frame.intents.mergedItems().len == count);
+
+    return .{ .data = data, .frame = frame };
+}
+
+// Rows whose velocity is exactly their intent's direction times their effective speed.
+fn countAppliedRows(data: *const DataSystem) usize {
+    const slice = data.movementBodySliceConst();
+    var applied: usize = 0;
+    for (0..slice.entities.len) |row| {
+        const direction = agentDirection(row);
+        const speed = if (slice.speed[row] > 0) slice.speed[row] else default_intent_speed;
+        if (slice.velocity_x[row] == direction[0] * speed and slice.velocity_y[row] == direction[1] * speed) applied += 1;
+    }
+    return applied;
+}
+
+fn applyIntentsOnce(system: *MovementSystem, fixture: *ApplyIntentsFixture) BatchStats {
+    system.applyIntents(&fixture.data, &fixture.frame);
+    return suite.serialBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
+}
+
+fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var fixture = try buildApplyIntentsFixture(allocator, item_count);
+    defer fixture.deinit();
+    var system = MovementSystem.init();
+
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+        _ = applyIntentsOnce(&system, &fixture);
+    }
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        const batch = applyIntentsOnce(&system, &fixture);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        std.debug.assert(batch.item_count == item_count);
+        accumulator.record(elapsed_ns, batch);
+        // Main is everything but an apply that ran on workers.
+        main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
+    }
+    const applied = countAppliedRows(&fixture.data);
+    std.debug.assert(applied == item_count);
+    var stats = accumulator.finish();
+    stats.output_count = applied;
+    if (stats.iterations > 0) {
+        stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
+    }
+    return stats;
 }
