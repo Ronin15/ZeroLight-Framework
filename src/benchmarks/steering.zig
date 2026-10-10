@@ -2,7 +2,10 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `steering` times one steering step over its agent count. `steering-static-change` times
+//! `steering` times one steering step over its agent count on a row-major grid;
+//! `steering-shuffled`, `steering-corridor`, and `steering-cluster-outlier` time the same step
+//! with the agents created in a shuffled order, in one cell-row corridor, and in a cluster
+//! with one agent far outside it. `steering-static-change` times
 //! one static collision body moved and committed through the seam (collider reserve, commit,
 //! capture, and sync), the steering post-commit reaction, and one steering step for a fixed
 //! agent population, with the static count as its item count; the cost model expects it flat
@@ -11,6 +14,7 @@
 //! thread's share: the iteration minus its off-main stage time.
 
 const std = @import("std");
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const math = @import("../core/math.zig");
@@ -33,6 +37,24 @@ pub const group = suite.BenchmarkGroup{
     .runCase = runCase,
 };
 
+pub const shuffled_group = suite.BenchmarkGroup{
+    .name = "steering-shuffled",
+    .defaultItemCounts = layoutItemCounts,
+    .runCase = runShuffledCase,
+};
+
+pub const corridor_group = suite.BenchmarkGroup{
+    .name = "steering-corridor",
+    .defaultItemCounts = layoutItemCounts,
+    .runCase = runCorridorCase,
+};
+
+pub const cluster_outlier_group = suite.BenchmarkGroup{
+    .name = "steering-cluster-outlier",
+    .defaultItemCounts = layoutItemCounts,
+    .runCase = runClusterOutlierCase,
+};
+
 pub const static_change_group = suite.BenchmarkGroup{
     .name = "steering-static-change",
     .defaultItemCounts = staticChangeItemCounts,
@@ -48,6 +70,28 @@ pub const static_dense_group = suite.BenchmarkGroup{
 const quick_counts = [_]usize{ 128, 512, 1024 };
 const standard_counts = [_]usize{ 512, 1024, 4096 };
 const stress_counts = [_]usize{ 4096, 10000 };
+const layout_counts = [_]usize{ 1024, 4096, 16384 };
+
+// Where the steering agent groups place their agents.
+const Layout = enum {
+    // Row-major on a square grid at the agent pitch, created in row-major order.
+    grid,
+    // The grid's positions, created in a seeded random order.
+    shuffled,
+    // Two lanes inside the first spatial cell row, created in a seeded random order.
+    corridor,
+    // The grid's positions for all but one agent, which sits far outside the grid and the
+    // nav extent; created in a seeded random order.
+    cluster_outlier,
+};
+
+const layout_shuffle_seed: u64 = 0x64_6d_4e_42;
+// The corridor's lanes sit at these y offsets, both inside spatial cell row 0.
+const corridor_lane_y = [2]f32{ 4.0, 22.0 };
+// Nav rows of the corridor's nav extent; they cover the lanes and the near statics.
+const corridor_nav_rows: f32 = 8.0;
+// The outlier's coordinates, in multiples of the grid's nav extent.
+const outlier_extent_multiple: f32 = 64.0;
 
 const Fixture = struct {
     data: DataSystem,
@@ -75,7 +119,11 @@ pub fn defaultItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+fn layoutItemCounts(_: suite.Profile) []const usize {
+    return &layout_counts;
+}
+
+fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
@@ -97,17 +145,34 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     try agents.ensureTotalCapacity(allocator, count);
 
     const side = gridSide(count);
-    for (0..count) |index| {
-        agents.appendAssumeCapacity(try addAgent(&data, index, side));
+    const grid_extent = @as(f32, @floatFromInt(side + 4)) * nav_cell_size;
+    // Agent k takes position slot `creation_order[k]`; the grid layout keeps row-major order.
+    const creation_order = try allocator.alloc(usize, count);
+    defer allocator.free(creation_order);
+    for (creation_order, 0..) |*slot, index| slot.* = index;
+    if (layout != .grid) {
+        var prng = std.Random.DefaultPrng.init(layout_shuffle_seed);
+        prng.random().shuffle(usize, creation_order);
+    }
+    for (creation_order) |slot| {
+        agents.appendAssumeCapacity(try addAgent(&data, layoutPosition(layout, slot, count, side, grid_extent)));
     }
 
-    for (0..@min(@as(usize, 16), side)) |index| {
+    const near_static_total = @min(@as(usize, 16), side);
+    for (0..near_static_total) |index| {
         _ = try addStatic(&data, nearStaticPosition(index));
     }
 
-    const world_extent = @as(f32, @floatFromInt(side + 4)) * 32.0;
-    try pathfinding.rebuildStaticNavGrid(&data, world_extent, world_extent, 32.0);
-    var colliders = try buildColliders(allocator, &data, &pathfinding, world_extent, world_extent);
+    var nav_width = grid_extent;
+    var nav_height = grid_extent;
+    if (layout == .corridor) {
+        const corridor_length = @as(f32, @floatFromInt(count / 2 + 4)) * agent_pitch;
+        const static_row_end = nearStaticPosition(near_static_total - 1).x + static_size + nav_cell_size;
+        nav_width = @max(corridor_length, static_row_end);
+        nav_height = corridor_nav_rows * nav_cell_size;
+    }
+    try pathfinding.rebuildStaticNavGrid(&data, nav_width, nav_height, nav_cell_size);
+    var colliders = try buildColliders(allocator, &data, &pathfinding, nav_width, nav_height);
     errdefer colliders.deinit();
 
     return .{ .data = data, .frame = frame, .pathfinding = pathfinding, .colliders = colliders, .agents = agents };
@@ -122,11 +187,27 @@ fn buildColliders(allocator: std.mem.Allocator, data: *const DataSystem, pathfin
 }
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return try runLayoutCase(allocator, io, options, case, item_count, .grid);
+}
+
+fn runShuffledCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return try runLayoutCase(allocator, io, options, case, item_count, .shuffled);
+}
+
+fn runCorridorCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return try runLayoutCase(allocator, io, options, case, item_count, .corridor);
+}
+
+fn runClusterOutlierCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return try runLayoutCase(allocator, io, options, case, item_count, .cluster_outlier);
+}
+
+fn runLayoutCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, layout: Layout) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var fixture = try createFixture(allocator, item_count);
+    var fixture = try createFixture(allocator, item_count, layout);
     defer fixture.deinit(allocator);
-    const measured = try measureCase(allocator, io, options, case, item_count, &fixture, &fixture, runOnce);
+    const measured = try measureCase(allocator, io, options, case, item_count, &fixture, &fixture, prepareOnce, runOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.agent_candidate_checks + measured.last.obstacle_candidate_checks;
     stats.sample_count = measured.last.agent_neighbor_samples + measured.last.obstacle_samples;
@@ -158,7 +239,8 @@ fn stageTunersSettled(system: *const SteeringSystem, last: SteeringStats) bool {
 
 // Warms up, settles the stage tuners, and times `step(context)` over `steering`'s agents
 // and statics, with the main thread's share: each iteration minus the off-main time of the
-// steering stages and the colliders' splice stages.
+// steering stages and the colliders' splice stages. `prepare(context)` writes the step's
+// inputs before each step, outside the timed region.
 fn measureCase(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -167,6 +249,7 @@ fn measureCase(
     item_count: usize,
     steering: *const Fixture,
     context: anytype,
+    comptime prepare: fn (@TypeOf(context)) anyerror!void,
     comptime step: fn (*SteeringSystem, @TypeOf(context), ?*ThreadSystem, suite.BenchmarkCase) anyerror!SteeringStats,
 ) !MeasuredCase {
     var system = SteeringSystem.init(allocator);
@@ -177,7 +260,7 @@ fn measureCase(
         system.agents_tuner = tuner;
         system.select_resolve_tuner = tuner;
         system.directions_tuner = tuner;
-        system.select_claim_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.select_claim_tuner = bandTunerForCase(case).?;
     }
 
     var threads: ?ThreadSystem = null;
@@ -192,12 +275,14 @@ fn measureCase(
 
     var last_stats = SteeringStats{};
     for (0..options.warmup_iterations) |_| {
+        try prepare(context);
         last_stats = try step(&system, context, thread_ptr, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!stageTunersSettled(&system, last_stats) and settle_guard < settle_limit) : (settle_guard += 1) {
+            try prepare(context);
             last_stats = try step(&system, context, thread_ptr, case);
         }
     }
@@ -206,6 +291,7 @@ fn measureCase(
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
+        try prepare(context);
         const start_ns = suite.nowNs(io);
         last_stats = try step(&system, context, thread_ptr, case);
         const end_ns = suite.nowNs(io);
@@ -231,14 +317,28 @@ fn measureCase(
     return .{ .stats = stats, .last = last_stats };
 }
 
-fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
-    fixture.frame.beginStep();
-    return try steeringStep(system, fixture, thread_system, case);
+// The fixed-range cases' tuner for a stage dispatched over band items: one band per range,
+// so the fixed control dispatches the bands rather than keeping them in one inline range.
+fn bandTunerForCase(case: suite.BenchmarkCase) ?AdaptiveWorkTuner {
+    if (!case.adaptive or case.adaptive_range_mode != .fixed) return null;
+    return AdaptiveWorkTuner.init(.{ .initial_range_items = 1, .smallest_range_items = 1, .largest_range_items = 1 });
 }
 
-// Navigation intents for every agent, then the steering update for `case`.
-fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+// A new step with a navigation intent for every agent.
+fn prepareOnce(fixture: *Fixture) !void {
+    fixture.frame.beginStep();
     try appendNavigationIntents(&fixture.frame, fixture.agents.items);
+}
+
+// One steering step; fails when an agent writes no movement intent.
+fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+    const stats = try steeringStep(system, fixture, thread_system, case);
+    if (stats.movement_intent_count != fixture.agents.items.len) return error.AgentIntentMissing;
+    return stats;
+}
+
+// The steering update for `case` over the step's navigation intents.
+fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     if (!case.usesThreadSystem()) {
         return try system.updateSerial(&fixture.data, &fixture.frame, &fixture.pathfinding, &fixture.colliders);
     }
@@ -273,12 +373,30 @@ fn appendNavigationIntents(frame: *SimulationFrame, agents: []const EntityId) !v
     frame.navigation_intents.finishWrite();
 }
 
-// Agent `index` of a `side`-wide grid at the 18-px agent pitch.
-fn addAgent(data: *DataSystem, index: usize, side: usize) !EntityId {
+// Position slot `slot` of `layout` for `count` agents on a `side`-wide grid whose nav extent
+// is `grid_extent`.
+fn layoutPosition(layout: Layout, slot: usize, count: usize, side: usize, grid_extent: f32) math.Vec2 {
+    return switch (layout) {
+        .grid, .shuffled => gridPosition(slot, side),
+        .corridor => .{ .x = @as(f32, @floatFromInt(slot / 2)) * agent_pitch, .y = corridor_lane_y[slot % 2] },
+        .cluster_outlier => if (slot + 1 == count)
+            .{ .x = outlier_extent_multiple * grid_extent, .y = outlier_extent_multiple * grid_extent }
+        else
+            gridPosition(slot, side),
+    };
+}
+
+// Slot `index` of a `side`-wide row-major grid at the agent pitch.
+fn gridPosition(index: usize, side: usize) math.Vec2 {
+    return .{
+        .x = @as(f32, @floatFromInt(index % side)) * agent_pitch,
+        .y = @as(f32, @floatFromInt(index / side)) * agent_pitch,
+    };
+}
+
+// A steering agent at `position`.
+fn addAgent(data: *DataSystem, position: math.Vec2) !EntityId {
     const entity = try data.createEntity();
-    const x: f32 = @floatFromInt(index % side);
-    const y: f32 = @floatFromInt(index / side);
-    const position = math.Vec2{ .x = x * 18.0, .y = y * 18.0 };
     try data.setMovementBody(entity, .{
         .position = position,
         .previous_position = position,
@@ -337,6 +455,7 @@ const statics_per_filler_chunk: usize = 16;
 // Filler statics sit on a 4x4 grid in their chunk.
 const filler_grid_side: usize = 4;
 const nav_cell_size: f32 = 32.0;
+const agent_pitch: f32 = 18.0;
 const chunk_px: f32 = @as(f32, @floatFromInt(default_chunk_size_tiles)) * nav_cell_size;
 // First chunk column of the filler block; one empty chunk column separates it from the agents.
 const filler_origin_chunk_x: usize = 4;
@@ -389,7 +508,7 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
 
     const side = gridSide(agent_count);
     for (0..agent_count) |index| {
-        agents.appendAssumeCapacity(try addAgent(&data, index, side));
+        agents.appendAssumeCapacity(try addAgent(&data, gridPosition(index, side)));
     }
     // Every agent's obstacle query (avoidance plus agent radius, padded by the static
     // half-size) ends left of the empty chunk column before the filler block.
@@ -459,20 +578,23 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     colliders.splice_adaptive = case.adaptive;
     colliders.splice_items_per_range = if (case.adaptive) null else case.itemsPerRange(splice_range_alignment_items) orelse
         suite.alignItemCount(suite.default_items_per_range, splice_range_alignment_items);
-    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, staticChangeOnce);
+    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticChange, staticChangeOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;
     stats.sample_count = measured.last.obstacle_samples;
     return stats;
 }
 
+fn prepareStaticChange(fixture: *StaticChangeFixture) !void {
+    try prepareOnce(&fixture.steering);
+}
+
 // One step: the mover's set_movement_body through the commit seam (collider reserve, commit,
 // capture, and sync with its splice stages on the case's threads), the steering post-commit
-// reaction, then navigation intents and the steering update.
+// reaction, then the steering update.
 fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const frame = &fixture.steering.frame;
     const colliders = &fixture.steering.colliders;
-    frame.beginStep();
     const target = if (fixture.at_second) fixture.mover_positions[0] else fixture.mover_positions[1];
     try frame.structural_commands.prepareRangeCounts(1);
     frame.structural_commands.addCount(0, 1);
@@ -557,7 +679,7 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
 
     const side = gridSide(agent_count);
     for (0..agent_count) |index| {
-        agents.appendAssumeCapacity(try addAgent(&data, index, side));
+        agents.appendAssumeCapacity(try addAgent(&data, gridPosition(index, side)));
     }
 
     // Chunks overlapped by the agent grid: columns and rows 0 through the last agent's chunk.
@@ -612,16 +734,19 @@ fn runStaticDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 
     var fixture = try createStaticDenseFixture(allocator, item_count);
     defer fixture.deinit(allocator);
-    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, staticDenseOnce);
+    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticDense, staticDenseOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;
     stats.sample_count = measured.last.obstacle_samples;
     return stats;
 }
 
+fn prepareStaticDense(fixture: *StaticDenseFixture) !void {
+    try prepareOnce(&fixture.steering);
+}
+
 // One steering step; fails when the obstacle workload is empty or differs from the first step's.
 fn staticDenseOnce(system: *SteeringSystem, fixture: *StaticDenseFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
-    fixture.steering.frame.beginStep();
     const stats = try steeringStep(system, &fixture.steering, thread_system, case);
     if (stats.movement_intent_count != fixture.steering.agents.items.len) return error.AgentIntentMissing;
     if (stats.obstacle_samples == 0) return error.StaticsUnsampled;

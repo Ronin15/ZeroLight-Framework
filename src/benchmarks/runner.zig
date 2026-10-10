@@ -91,6 +91,9 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     perception.los_dense_group,
     perception.scattered_dense_index_group,
     steering.group,
+    steering.shuffled_group,
+    steering.corridor_group,
+    steering.cluster_outlier_group,
     steering.static_change_group,
     steering.static_dense_group,
 };

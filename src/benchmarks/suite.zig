@@ -698,6 +698,14 @@ fn isRenderGamePrepGroup(group_name: []const u8) bool {
         std.mem.startsWith(u8, group_name, "render-game-prep-");
 }
 
+// The steering groups timing one step over their agent count, one per agent layout.
+fn isSteeringAgentGroup(group_name: []const u8) bool {
+    return std.mem.eql(u8, group_name, "steering") or
+        std.mem.eql(u8, group_name, "steering-shuffled") or
+        std.mem.eql(u8, group_name, "steering-corridor") or
+        std.mem.eql(u8, group_name, "steering-cluster-outlier");
+}
+
 fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
@@ -711,7 +719,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
-    if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
+    if (isSteeringAgentGroup(group_name)) return "steering agents";
     if (std.mem.eql(u8, group_name, "steering-static-change")) return "static bodies";
     if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
     if (isRenderGamePrepGroup(group_name)) return "render entities";
@@ -1232,7 +1240,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
             .{ stats.candidate_pairs, stats.sample_count, formatSteeringStagesInto(&stage_buffer, stats), formatStageShapeInto(&steer_buffer, stats.batch), formatDuration(main_ns), main_percent },
         ) catch "workload";
     }
-    if (std.mem.eql(u8, group_name, "steering")) {
+    if (isSteeringAgentGroup(group_name)) {
         var steer_buffer: [32]u8 = undefined;
         var stage_buffer: [160]u8 = undefined;
         const main_ns = (stats.terrain_edit_phases orelse TerrainEditPhaseSummary{}).main_ns;
@@ -1743,6 +1751,13 @@ test "benchmark table formatters keep compact text" {
             .cache_evictions = 1,
         }),
     );
+}
+
+test "steering layout groups share the steering agent label" {
+    for ([_][]const u8{ "steering", "steering-shuffled", "steering-corridor", "steering-cluster-outlier" }) |group_name| {
+        try std.testing.expectEqualStrings("steering agents", itemLabel(group_name));
+    }
+    try std.testing.expect(!isSteeringAgentGroup("steering-static-dense"));
 }
 
 test "steering stage label tells a stage that did not run from an inline one" {
