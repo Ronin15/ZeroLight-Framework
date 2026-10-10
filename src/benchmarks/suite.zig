@@ -1154,6 +1154,17 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
             .{ stats.output_count, formatStageShapeInto(&apply_buffer, stats.batch), formatDuration(phases.main_ns), main_percent },
         ) catch "workload";
     }
+    if (std.mem.eql(u8, group_name, "collision-response-stage")) {
+        var gather_buffer: [32]u8 = undefined;
+        var apply_buffer: [32]u8 = undefined;
+        const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
+        const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
+        return std.fmt.bufPrint(
+            buffer,
+            "intents={} triggers={} gather={s} apply={s} main={f} ({}%)",
+            .{ stats.output_count, stats.candidate_pairs, formatStageShapeInto(&gather_buffer, stats.batch), formatStageShapeInto(&apply_buffer, stats.secondary_batch orelse .{}), formatDuration(phases.main_ns), main_percent },
+        ) catch "workload";
+    }
     if (std.mem.startsWith(u8, group_name, "plane-traversal")) {
         var gather_buffer: [32]u8 = undefined;
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};

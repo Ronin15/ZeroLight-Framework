@@ -39,6 +39,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     collision_response.bounce_group,
     collision_response.trigger_group,
     collision_response.mixed_group,
+    collision_response.stage_group,
     pathfinding.group,
     pathfinding.dedup_group,
     pathfinding.drain_group,
