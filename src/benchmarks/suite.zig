@@ -13,7 +13,9 @@ const AdaptiveWorkReport = @import("../app/thread_system.zig").AdaptiveWorkRepor
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const DiagnosticCount = @import("../app/thread_system.zig").DiagnosticCount;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const AbstractSlot = @import("../game/systems/pathfinding/scratch.zig").AbstractSlot;
 const SearchSlot = @import("../game/systems/pathfinding/scratch.zig").SearchSlot;
 const DirEntry = @import("../game/systems/pathfinding/group_field.zig").DirEntry;
@@ -331,6 +333,8 @@ pub const WorkTuningSummary = struct {
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     probing: bool = false,
+    probe_window_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
+    demotion_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
 };
 
 pub const StatsAccumulator = struct {
@@ -421,6 +425,8 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
         .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
         .has_threaded_profile = report.has_threaded_profile,
         .probing = report.probing,
+        .probe_window_count = report.probe_window_count,
+        .demotion_count = report.demotion_count,
     };
 }
 
@@ -796,7 +802,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
     printCell("worker_ranges", 14);
     printCell("wait", 11);
     printCell("items_per_range", 16);
-    printCell("work_tuning", 56);
+    printCell("work_tuning", 72);
     std.debug.print("workload\n", .{});
 
     for (results) |result| {
@@ -808,7 +814,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
             printCell("-", 14);
             printCell("-", 11);
             printCell("-", 16);
-            printCell("-", 56);
+            printCell("-", 72);
             std.debug.print("{s}\n", .{result.stats.skip_reason});
             continue;
         }
@@ -829,7 +835,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         printCell(formatUsizeInto(&worker_ranges_buffer, result.stats.batch.worker_thread_ranges), 14);
         printCell(formatDurationInto(&wait_buffer, result.stats.batch.main_thread_wait_ns), 11);
         printCell(formatUsizeInto(&items_per_range_buffer, result.stats.batch.items_per_range), 16);
-        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 56);
+        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 72);
         std.debug.print("{s}\n", .{formatWorkloadInto(&workload_buffer, group_name, result.stats)});
     }
 }
@@ -1100,34 +1106,27 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
     // Keep tuner state compact enough for aligned tables; detailed conclusions
     // belong in validation text, not in every cell.
     const summary = maybe_summary orelse return "-";
-    if (!summary.has_threaded_profile) {
-        if (summary.candidate_items_per_range) |candidate| {
-            const candidate_workers = summary.candidate_worker_threads orelse 0;
-            return std.fmt.bufPrint(
-                buffer,
-                "{s} settled={s} threaded=none cand={}/{}",
-                .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), candidate_workers, candidate },
-            ) catch "work";
-        }
-        return std.fmt.bufPrint(
-            buffer,
-            "{s} settled={s} threaded=none",
-            .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) },
-        ) catch "work";
+    var writer: std.Io.Writer = .fixed(buffer);
+    writeWorkTuning(&writer, summary) catch return "work";
+    return writer.buffered();
+}
+
+fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
+    try writer.print("{s} settled={s}", .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) });
+    if (summary.has_threaded_profile) {
+        try writer.print(
+            " best={}/{} final={}/{}",
+            .{ summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+        );
+    } else {
+        try writer.writeAll(" threaded=none");
     }
     if (summary.candidate_items_per_range) |candidate| {
-        const candidate_workers = summary.candidate_worker_threads orelse 0;
-        return std.fmt.bufPrint(
-            buffer,
-            "{s} settled={s} best={}/{} final={}/{} cand={}/{}",
-            .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range, candidate_workers, candidate },
-        ) catch "work";
+        try writer.print(" cand={}/{}", .{ summary.candidate_worker_threads orelse 0, candidate });
     }
-    return std.fmt.bufPrint(
-        buffer,
-        "{s} settled={s} best={}/{} final={}/{}",
-        .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
-    ) catch "work";
+    if (comptime diagnostics_enabled) {
+        try writer.print(" probes={} demotes={}", .{ summary.probe_window_count, summary.demotion_count });
+    }
 }
 
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
@@ -1716,12 +1715,24 @@ test "work tuning summary preserves settled phase" {
         .settled_window_count = 4,
         .retune_after_settled_windows = 10_000,
         .best_mean_batch_duration_ns = 42,
+        .has_threaded_profile = true,
+        .probe_window_count = if (diagnostics_enabled) 7 else {},
+        .demotion_count = if (diagnostics_enabled) 2 else {},
     }, true);
 
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, summary.phase);
     try std.testing.expect(summary.settled_before_measurement);
     try std.testing.expectEqual(@as(usize, 4), summary.best_worker_threads);
     try std.testing.expectEqual(@as(usize, 256), summary.best_items_per_range);
+    if (comptime diagnostics_enabled) {
+        try std.testing.expectEqual(@as(u64, 7), summary.probe_window_count);
+        try std.testing.expectEqual(@as(u64, 2), summary.demotion_count);
+        var tuning_buffer: [96]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "settled settled=yes best=4/256 final=4/256 probes=7 demotes=2",
+            formatWorkTuningInto(&tuning_buffer, summary),
+        );
+    }
 }
 
 test "fixed adaptive benchmark case disables range probing" {
@@ -1788,8 +1799,9 @@ test "benchmark table formatters keep compact text" {
             .available_worker_threads = 10,
         },
     }));
+    const counters_text = if (diagnostics_enabled) " probes=0 demotes=0" else "";
     try std.testing.expectEqualStrings(
-        "settled settled=yes best=4/256 final=4/256",
+        "settled settled=yes best=4/256 final=4/256" ++ counters_text,
         formatWorkTuningInto(&range_buffer, .{
             .phase = .settled,
             .best_worker_threads = 4,

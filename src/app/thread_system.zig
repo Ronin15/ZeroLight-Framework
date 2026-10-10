@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const logging = @import("../core/logging.zig");
+const diagnostics_enabled = @import("runtime_perf_log.zig").enabled;
 const log = logging.app;
 
 pub const WorkerId = struct {
@@ -129,6 +130,11 @@ const default_participant_overhead_ns: f64 = 25_000;
 const min_participant_overhead_ns: f64 = 5_000;
 const default_range_overhead_ns: f64 = 5_000;
 
+/// Cumulative tuner diagnostic count: `u64` where perf instrumentation is
+/// compiled in, zero-sized (and never written) in ReleaseFast/ReleaseSmall.
+pub const DiagnosticCount = if (diagnostics_enabled) u64 else void;
+const zero_diagnostic_count: DiagnosticCount = if (diagnostics_enabled) 0 else {};
+
 pub const AdaptiveWorkRequest = struct {
     item_count: usize,
     available_worker_threads: usize,
@@ -152,6 +158,8 @@ pub const AdaptiveWorkReport = struct {
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     probing: bool = false,
+    probe_window_count: DiagnosticCount = zero_diagnostic_count,
+    demotion_count: DiagnosticCount = zero_diagnostic_count,
 };
 
 pub const AdaptiveWorkTuner = struct {
@@ -198,6 +206,10 @@ pub const AdaptiveWorkTuner = struct {
     // last improvement, so the next loss settles on the best.
     climb_direction: i8 = -1,
     climb_reversed: bool = false,
+    // Diagnostics only: cumulative over the tuner's life (no reset path clears
+    // them) and never read by policy.
+    probe_window_count: DiagnosticCount = zero_diagnostic_count,
+    demotion_count: DiagnosticCount = zero_diagnostic_count,
 
     pub fn init(config: AdaptiveWorkTunerConfig) AdaptiveWorkTuner {
         const normalized = normalizeWorkTunerConfig(config);
@@ -274,7 +286,10 @@ pub const AdaptiveWorkTuner = struct {
         const sample_ns = self.sampleMedian();
         switch (self.phase) {
             .learning => self.finishLearningWindow(sample_ns),
-            .probing => self.finishProfileWindow(sample_ns),
+            .probing => {
+                if (comptime diagnostics_enabled) self.probe_window_count += 1;
+                self.finishProfileWindow(sample_ns);
+            },
             .settled => self.finishSettledWindow(sample_ns),
         }
         self.resetSamples();
@@ -296,6 +311,8 @@ pub const AdaptiveWorkTuner = struct {
             .baseline_mean_batch_duration_ns = self.baseline_mean_batch_duration_ns,
             .has_threaded_profile = self.has_threaded_profile,
             .probing = self.phase == .probing,
+            .probe_window_count = self.probe_window_count,
+            .demotion_count = self.demotion_count,
         };
     }
 
@@ -616,6 +633,7 @@ pub const AdaptiveWorkTuner = struct {
     // threaded. The cooldown blocks immediate re-probing off a stale slow sample; a
     // genuinely expensive later inline window re-enters probing on its own.
     fn demoteToInline(self: *AdaptiveWorkTuner) void {
+        if (comptime diagnostics_enabled) self.demotion_count += 1;
         self.phase = .settled;
         self.has_threaded_profile = false;
         self.best_profile = self.initial_profile;
@@ -1934,6 +1952,70 @@ test "adaptive work tuner demotes threaded to inline when the threaded cost coll
     try std.testing.expect(demoted);
     try std.testing.expect(!tuner.report().has_threaded_profile);
     try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(req).worker_threads);
+}
+
+test "adaptive work tuner counts probing windows and demotions" {
+    if (comptime !diagnostics_enabled) return error.SkipZigTest;
+    // Two-batch windows: a per-batch count would double the per-window one.
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
+        .sample_window = 2,
+        .threaded_batch_ns = 50_000,
+        .improvement_threshold_percent = 5,
+    });
+    const request = tunerTestRequest(2048, 4, 16, 64);
+
+    // The learning window closes without counting as a probe.
+    for (0..tuner.config.sample_window) |_| {
+        const inline_profile = tuner.selectProfile(request);
+        tuner.record(tunerTestBatchWithProfile(2048, inline_profile, 200_000));
+    }
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
+    try std.testing.expectEqual(@as(u64, 0), tuner.report().probe_window_count);
+
+    // Every window from here until settling closes in the probing phase.
+    var probing_windows: u64 = 0;
+    var settle_guard: usize = 0;
+    while (!tuner.isSettled() and settle_guard < 128) : (settle_guard += 1) {
+        try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
+        probing_windows += 1;
+        for (0..tuner.config.sample_window) |_| {
+            const selected = tuner.selectProfile(request);
+            const duration: u64 = if (selected.worker_threads == 0) 200_000 else 80_000;
+            tuner.record(tunerTestBatchWithProfile(2048, selected, duration));
+        }
+    }
+    try std.testing.expect(tuner.isSettled());
+    try std.testing.expect(tuner.report().has_threaded_profile);
+    try std.testing.expect(probing_windows > 0);
+    try std.testing.expectEqual(probing_windows, tuner.report().probe_window_count);
+    try std.testing.expectEqual(@as(u64, 0), tuner.report().demotion_count);
+
+    // Collapsed threaded cost demotes once; the settled windows count as no probe.
+    const participants = tuner.report().best_profile.worker_threads + 1;
+    const cheap_ns: u64 = (50_000 / participants) / 2;
+    var demoted = false;
+    var guard: usize = 0;
+    while (guard < 32) : (guard += 1) {
+        const selected = tuner.selectProfile(request);
+        if (selected.worker_threads == 0) {
+            demoted = true;
+            break;
+        }
+        tuner.record(tunerTestBatchWithProfile(2048, selected, cheap_ns));
+    }
+    try std.testing.expect(demoted);
+    try std.testing.expectEqual(@as(u64, 1), tuner.report().demotion_count);
+    try std.testing.expectEqual(probing_windows, tuner.report().probe_window_count);
+
+    // A sustained item-count shift resets learning but never the counters.
+    const shifted_request = tunerTestRequest(8192, 4, 16, 64);
+    for (0..tuner.config.sample_window) |_| _ = tuner.selectProfile(shifted_request);
+    try std.testing.expectEqual(AdaptiveWorkPhase.learning, tuner.report().phase);
+    try std.testing.expectEqual(@as(u64, 1), tuner.report().demotion_count);
+    try std.testing.expectEqual(probing_windows, tuner.report().probe_window_count);
 }
 
 // Settles `tuner` on a threaded profile that beat a measured 200 us inline baseline at
