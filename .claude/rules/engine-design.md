@@ -60,11 +60,13 @@ Every design, and every fix touching storage or per-change work, states:
   a part that passes needs a concrete performance or efficiency benefit
   against its cost and risk.
 - Right before implementation, check the design against the live code it
-  changes: the serial/inline path does no more work than the code it
-  replaces, and no per-item growing work stays on the main thread
-  (`threading.md`). A failure fixes the design before code; caught after
-  implementation it costs a rework cycle. File/line refs in anything written
-  earlier are re-checked here, never trusted.
+  changes: the serial/inline path adds no work that grows (a worse order or a
+  new per-item scan) over the code it replaces, and no per-item growing work
+  stays on the main thread (`threading.md`). A failure fixes the design before
+  code; caught after implementation it costs a rework cycle. A constant
+  per-item cost of nanoseconds is reported, never a reason to redesign.
+  File/line refs in anything written earlier are re-checked here, never
+  trusted.
 
 ## Ownership boundaries
 

@@ -47,13 +47,16 @@ paths:
   the owner or a slice asks.
 - Bench only changes that can move a hot path. Compare before/after on adjacent
   commits in Debug with 3 interleaved reps and medians (`tools/bench_ab.py`);
-  a regression is a change beyond the run-to-run spread.
+  a regression is a change beyond the run-to-run spread. Act on one only when
+  it shows a worse growth order or a material total; a nanosecond-per-item
+  constant is reported, not redesigned.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
 - A scaling bench runs at least three sizes far enough apart to show the growth
   shape, each right-sized: large enough that the shape is clear and the
   threaded case runs the changed stage, no larger (oversized runs slow the dev
-  cycle and show nothing more). It passes when the shape matches the cost model's order (flat for a
-  local change, linear where linear is right). A cost that grows with world
-  size on a local change is a design defect regardless of the absolute number.
+  cycle and show nothing more). It passes when the shape matches the cost
+  model's order (flat for a local change, linear where linear is right). A
+  cost that grows with world size on a local change is a design defect
+  regardless of the absolute number.
