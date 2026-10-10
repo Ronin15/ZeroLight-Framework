@@ -615,6 +615,8 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
         perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
+        perf.recordBatch(.collision_response_gather, collision_response_stats.gather_batch);
+        perf.recordBatch(.collision_response_apply, collision_response_stats.apply_batch);
 
         perf.recordMetric(.stimuli_live_dropped, metric(self.stimuli_live_dropped));
         perf.recordMetric(.stimuli_deferred_dropped, metric(self.stimuli_deferred_dropped));
@@ -836,8 +838,8 @@ pub const SimulationPipeline = struct {
         }
     }
 
-    /// Reserves `frame.contacts`, `frame.collision_triggers` and the response intents and
-    /// trigger pairs to `CollisionSystem.estimateContactCapacity(movement_body_capacity)`,
+    /// Reserves `frame.contacts`, `frame.collision_triggers` and the response's intent,
+    /// order, trigger, observer, and gather-range staging to `CollisionSystem.estimateContactCapacity(movement_body_capacity)`,
     /// the pair bound `collision.reserve` sizes the collision stores to (contacts are a
     /// subset of candidate pairs, triggers of contacts). Every scene within that bound
     /// runs `collision_detect` and `collision_respond` allocation-free under every
@@ -1081,9 +1083,11 @@ pub const SimulationPipeline = struct {
     }
 
     /// Queues collision SFX for this step's contacts through the owned audio
-    /// controller. Only contacts involving `player.entity` play a sound.
+    /// controller. Only contacts involving `player.entity` play a sound; they are the
+    /// collision response's observer contacts, so this runs after `update` on the same
+    /// frame.
     pub fn queueCollisionAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player: Player, delta_seconds: f32) void {
-        self.audio_controller.queueCollision(audio, frame, data, player.entity, delta_seconds);
+        self.audio_controller.queueCollision(audio, frame, data, self.collision_response.observerContacts(frame, player.entity), delta_seconds);
     }
 
     /// Flags the active jet loop to stop on resume (no command buffer at pause time).
@@ -1474,12 +1478,12 @@ pub const SimulationPipeline = struct {
     fn stageCollisionRespond(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var collision_response_timer = StageTimer.start();
-        step.collision_response = try self.collision_response.update(context.data, context.frame);
+        step.collision_response = try self.collision_response.update(context.data, context.frame, context.player.entity, context.thread_system, .{});
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
         self.sensory.enqueuePlayerImpacts(
             context.frame,
             context.data,
-            context.player.entity,
+            self.collision_response.observerContacts(context.frame, context.player.entity),
             context.player.current_level,
             &step.stimuli_deferred_dropped,
         );
@@ -4553,10 +4557,11 @@ test "deferred impact enqueue drops newest when deferred buffer is full" {
     pipeline.sensory.deferred_stimulus_count = stimulus_deferred_capacity;
 
     var deferred_dropped: usize = 0;
+    var player_contacts: [16]u32 = undefined;
     pipeline.sensory.enqueuePlayerImpacts(
         &frame,
         &data,
-        player.entity,
+        contactsNaming(&frame, player.entity, &player_contacts),
         0,
         &deferred_dropped,
     );
@@ -4780,10 +4785,11 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
     defer pipeline.deinit();
 
     var deferred_dropped: usize = 0;
+    var player_contacts: [16]u32 = undefined;
     pipeline.sensory.enqueuePlayerImpacts(
         &frame,
         &data,
-        player.entity,
+        contactsNaming(&frame, player.entity, &player_contacts),
         0,
         &deferred_dropped,
     );
@@ -5187,7 +5193,8 @@ test "standing player collision does not enqueue deferred impact without motion"
     defer pipeline.deinit();
 
     var deferred_dropped: usize = 0;
-    pipeline.sensory.enqueuePlayerImpacts(&frame, &data, player.entity, 0, &deferred_dropped);
+    var player_contacts: [16]u32 = undefined;
+    pipeline.sensory.enqueuePlayerImpacts(&frame, &data, contactsNaming(&frame, player.entity, &player_contacts), 0, &deferred_dropped);
     try std.testing.expectEqual(@as(usize, 0), pipeline.sensory.deferred_stimulus_count);
 }
 
@@ -5458,6 +5465,19 @@ const TestAllocatorSwap = struct {
     }
 };
 
+// Indices of the frame's contacts naming `entity`, in contact order, as the collision
+// response lists its observer contacts. Test-only local fixture.
+fn contactsNaming(frame: *const SimulationFrame, entity: EntityId, buffer: []u32) []const u32 {
+    var count: usize = 0;
+    for (frame.contacts.mergedItems(), 0..) |contact, index| {
+        if (!contact.a.eql(entity) and !contact.b.eql(entity)) continue;
+        // Test frames hold far fewer than 2^32 contacts.
+        buffer[count] = @intCast(index);
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
 /// Pins every pipeline batch tuner to one settled threaded `profile` that never
 /// re-probes, demotes, or resets on item-count drift, so the multi-worker path runs a
 /// deterministic multi-range partition. The tuners would otherwise keep this small
@@ -5468,6 +5488,8 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.movement.apply_intents_tuner,
         &pipeline.collision.broadphase_tuner,
         &pipeline.collision.narrowphase_tuner,
+        &pipeline.collision_response.gather_tuner,
+        &pipeline.collision_response.apply_tuner,
         &pipeline.ai.separation_tuner,
         &pipeline.ai.intent_tuner,
         &pipeline.steering.adaptive_tuner,
@@ -5492,18 +5514,21 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.affect.compute_tuner,
         &pipeline.plane_entry.tuner,
     };
-    for (tuners) |tuner| {
-        tuner.config.threaded_batch_ns = 0;
-        tuner.config.retune_after_settled_windows = std.math.maxInt(usize);
-        tuner.config.item_count_reset_percent = std.math.maxInt(u8);
-        tuner.phase = .settled;
-        tuner.has_threaded_profile = true;
-        tuner.current_profile = profile;
-        tuner.best_profile = profile;
-        tuner.candidate_profile = null;
-        // Forget the pre-pin item count so the first pinned batch does not reset.
-        tuner.learned_item_count = 0;
-    }
+    for (tuners) |tuner| pinThreadedProfile(tuner, profile);
+}
+
+/// Pins one tuner as `pinPipelineThreadedProfiles` does. Test-only local fixture.
+fn pinThreadedProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
+    tuner.config.threaded_batch_ns = 0;
+    tuner.config.retune_after_settled_windows = std.math.maxInt(usize);
+    tuner.config.item_count_reset_percent = std.math.maxInt(u8);
+    tuner.phase = .settled;
+    tuner.has_threaded_profile = true;
+    tuner.current_profile = profile;
+    tuner.best_profile = profile;
+    tuner.candidate_profile = null;
+    // Forget the pre-pin item count so the first pinned batch does not reset.
+    tuner.learned_item_count = 0;
 }
 
 /// One non-failing counting allocator per `TestAllocatorSwap` owner, to see which
@@ -6061,6 +6086,7 @@ fn runContactBoundScenario(mode: CollisionResponseMode) !void {
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!stats.collision.broadphase_batch.ran_inline);
     try std.testing.expect(!stats.collision.narrowphase_batch.ran_inline);
+    try std.testing.expect(!stats.collision_response.gather_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 3 * (2 * 21 - 3)), stats.collision.contact_count);
     try std.testing.expect(stats.collision.contact_count > population);
     try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.contact_count);
@@ -6083,6 +6109,141 @@ test "after population growth, ~2 solid contacts per body on the multi-worker pa
 test "after population growth, ~2 trigger contacts per body on the multi-worker path allocate nothing" {
     if (builtin.single_threaded) return error.SkipZigTest;
     try runContactBoundScenario(.trigger);
+}
+
+const respond_scenario_bodies: usize = 63;
+// The bodies plus the player.
+const respond_scenario_rows: usize = respond_scenario_bodies + 1;
+// 3 full chain rows of 21 before any correction.
+const respond_scenario_contacts: usize = 3 * (2 * 21 - 3);
+
+/// `addContactChainBodies` with the response by index (solid or bounce dynamic, a dynamic
+/// trigger, a static solid) and nonzero velocities of mixed sign on the dynamic bodies,
+/// small enough that the chain overlaps hold after one movement step.
+fn addMixedContactChainBodies(data: *DataSystem, first: usize, end: usize) !void {
+    for (first..end) |index| {
+        const column: f32 = @floatFromInt(index % 21);
+        const row: f32 = @floatFromInt(index / 21);
+        const position = math.Vec2{ .x = 20 + column * 10, .y = 20 + row * 40 };
+        const response: @import("data_system.zig").CollisionResponse = switch (index % 8) {
+            3 => .{ .mode = .trigger, .mobility = .dynamic, .restitution = 0 },
+            5 => .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+            1, 6 => .{ .mode = .bounce, .mobility = .dynamic, .restitution = 0.5 },
+            else => .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        };
+        const speed_x: f32 = 4 + @as(f32, @floatFromInt(index % 5));
+        const speed_y: f32 = 3 + @as(f32, @floatFromInt(index % 3));
+        const velocity: math.Vec2 = if (response.mobility == .static) .{} else .{
+            .x = if (index % 2 == 0) speed_x else -speed_x,
+            .y = if (index % 3 == 0) -speed_y else speed_y,
+        };
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = velocity, .speed = 0 });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 22, .y = 22 } });
+        try data.setCollisionResponse(entity, response);
+    }
+}
+
+const CollisionRespondScenarioResult = struct {
+    position_x: [respond_scenario_rows]f32 = undefined,
+    position_y: [respond_scenario_rows]f32 = undefined,
+    velocity_x: [respond_scenario_rows]f32 = undefined,
+    velocity_y: [respond_scenario_rows]f32 = undefined,
+    triggers: [respond_scenario_contacts]@import("simulation.zig").CollisionTriggerEvent = undefined,
+    trigger_count: usize = 0,
+    intent_count: usize = 0,
+};
+
+/// The mixed chain over 63 bodies plus the player, with the pipeline reserved for its 64
+/// rows. `max_worker_threads > 0` pins a 2-worker, 16-contact gather (8 ranges) and a
+/// one-band-per-range apply (4 bands). A warm step, then a step with every allocator
+/// failing; returns that step's movement columns and triggers.
+fn runCollisionRespondScenario(max_worker_threads: usize) !CollisionRespondScenarioResult {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    try addMixedContactChainBodies(&data, 0, respond_scenario_bodies);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = respond_scenario_rows,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    if (max_worker_threads > 0) {
+        pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+        pinThreadedProfile(&pipeline.collision_response.apply_tuner, .{ .worker_threads = 2, .items_per_range = 1 });
+    }
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    const stats = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    const response = stats.collision_response;
+    // The warm step's corrections separate some pairs; several gather ranges remain.
+    try std.testing.expect(response.contact_count <= respond_scenario_contacts);
+    try std.testing.expect(response.contact_count > 4 * 16);
+    try std.testing.expect(response.intent_count > 0);
+    try std.testing.expect(response.trigger_count > 0);
+    if (max_worker_threads > 0) {
+        try std.testing.expect(!response.gather_batch.ran_inline);
+        try std.testing.expectEqual(rangeCount(response.contact_count, 16), response.gather_batch.range_count);
+        try std.testing.expect(!response.apply_batch.ran_inline);
+        try std.testing.expectEqual(@as(usize, respond_scenario_rows / 16), response.apply_batch.item_count);
+    }
+
+    const slice = data.movementBodySliceConst();
+    try std.testing.expectEqual(respond_scenario_rows, slice.entities.len);
+    var out: CollisionRespondScenarioResult = .{ .trigger_count = response.trigger_count, .intent_count = response.intent_count };
+    @memcpy(&out.position_x, slice.position_x);
+    @memcpy(&out.position_y, slice.position_y);
+    @memcpy(&out.velocity_x, slice.velocity_x);
+    @memcpy(&out.velocity_y, slice.velocity_y);
+    @memcpy(out.triggers[0..response.trigger_count], frame.collision_triggers.mergedItems());
+    return out;
+}
+
+test "collision response runs on workers in the pipeline, allocation-free and matching the serial step" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const serial = try runCollisionRespondScenario(0);
+    const threaded = try runCollisionRespondScenario(2);
+    try std.testing.expectEqual(serial.intent_count, threaded.intent_count);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.position_x), std.mem.sliceAsBytes(&threaded.position_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.position_y), std.mem.sliceAsBytes(&threaded.position_y));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_x), std.mem.sliceAsBytes(&threaded.velocity_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
+    try std.testing.expectEqual(serial.trigger_count, threaded.trigger_count);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.triggers[0..serial.trigger_count]), std.mem.sliceAsBytes(threaded.triggers[0..threaded.trigger_count]));
 }
 
 fn minimalSyncWorld() !WorldSystem {

@@ -162,17 +162,20 @@ pub const SensoryBus = struct {
     }
 
     /// Enqueues player-involving collision contacts as next-step impact stimuli.
+    /// `player_contacts` indexes `frame.contacts`: the contacts naming the player, in
+    /// contact order.
     pub fn enqueuePlayerImpacts(
         self: *SensoryBus,
         frame: *const SimulationFrame,
         data: *const DataSystem,
-        player_entity: EntityId,
+        player_contacts: []const u32,
         player_level: u16,
         deferred_dropped: *usize,
     ) void {
+        const contacts = frame.contacts.mergedItems();
         var enqueued: usize = 0;
-        for (frame.contacts.mergedItems()) |contact| {
-            if (!contact_query.involvesEntity(contact, player_entity)) continue;
+        for (player_contacts) |contact_index| {
+            const contact = contacts[contact_index];
             if (!self.contactEligibleForImpact(contact)) continue;
             if (enqueued >= stimulus_max_impacts_per_step) {
                 deferred_dropped.* += 1;

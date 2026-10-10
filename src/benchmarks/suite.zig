@@ -1161,7 +1161,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "intents={} triggers={} gather={s} apply={s} main={f} ({}%)",
+            "intents={} triggers={} gather={s} apply={s} main_outside_stage_batches={f} ({}%)",
             .{ stats.output_count, stats.candidate_pairs, formatStageShapeInto(&gather_buffer, stats.batch), formatStageShapeInto(&apply_buffer, stats.secondary_batch orelse .{}), formatDuration(phases.main_ns), main_percent },
         ) catch "workload";
     }

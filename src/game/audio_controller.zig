@@ -93,11 +93,13 @@ pub const AudioController = struct {
     /// spam the mixer. Contacts between two non-player entities never play a
     /// sound: at high population counts, NPC-vs-NPC contacts dominate mass
     /// pileups and would otherwise overload the mixer with simultaneous
-    /// collision triggers every step.
-    pub fn queueCollision(self: *AudioController, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player_entity: EntityId, delta_seconds: f32) void {
+    /// collision triggers every step. `player_contacts` indexes `frame.contacts`: the contacts naming the player, in
+    /// contact order.
+    pub fn queueCollision(self: *AudioController, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player_contacts: []const u32, delta_seconds: f32) void {
         self.tickCooldowns(delta_seconds);
-        for (frame.contacts.mergedItems()) |contact| {
-            if (!contact_query.involvesEntity(contact, player_entity)) continue;
+        const contacts = frame.contacts.mergedItems();
+        for (player_contacts) |contact_index| {
+            const contact = contacts[contact_index];
             if (self.pairOnCooldown(contact.a, contact.b)) continue;
             const position = contact_query.midpoint(data, contact) orelse continue;
             const gain = contact_query.penetrationScale(contact.penetration);
@@ -288,6 +290,19 @@ fn contactFixture(a: EntityId, b: EntityId, penetration: f32) CollisionContact {
     };
 }
 
+// Indices of the frame's contacts naming `entity`, in contact order, as the collision
+// response lists its observer contacts.
+fn contactsNaming(frame: *const SimulationFrame, entity: EntityId, buffer: []u32) []const u32 {
+    var count: usize = 0;
+    for (frame.contacts.mergedItems(), 0..) |contact, index| {
+        if (!contact_query.involvesEntity(contact, entity)) continue;
+        // Test frames hold far fewer than 2^32 contacts.
+        buffer[count] = @intCast(index);
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
 fn countKind(commands: *const AudioCommandBuffer, comptime tag: std.meta.Tag(AudioCommand)) usize {
     var n: usize = 0;
     for (commands.items()) |command| {
@@ -445,7 +460,8 @@ test "queueCollision plays a sound for a contact involving the player" {
     var commands = AudioCommandBuffer.init(allocator, 8);
     defer commands.deinit();
     var controller = AudioController.init();
-    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+    var player_contacts: [4]u32 = undefined;
+    controller.queueCollision(&commands, &frame, &data, contactsNaming(&frame, player_entity, &player_contacts), 1.0 / 60.0);
 
     try std.testing.expectEqual(@as(usize, 1), commands.len());
     try std.testing.expectEqual(AudioAssetId.collision_sfx, commands.items()[0].play_sfx.asset);
@@ -470,7 +486,8 @@ test "queueCollision plays no sound for a contact between two non-player entitie
     var commands = AudioCommandBuffer.init(allocator, 8);
     defer commands.deinit();
     var controller = AudioController.init();
-    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+    var player_contacts: [4]u32 = undefined;
+    controller.queueCollision(&commands, &frame, &data, contactsNaming(&frame, player_entity, &player_contacts), 1.0 / 60.0);
 
     try std.testing.expectEqual(@as(usize, 0), commands.len());
     try std.testing.expectEqual(@as(usize, 0), controller.cooldown_count);
@@ -499,7 +516,8 @@ test "queueCollision skips non-player contacts and still plays player contacts i
     var commands = AudioCommandBuffer.init(allocator, 8);
     defer commands.deinit();
     var controller = AudioController.init();
-    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+    var player_contacts: [4]u32 = undefined;
+    controller.queueCollision(&commands, &frame, &data, contactsNaming(&frame, player_entity, &player_contacts), 1.0 / 60.0);
 
     try std.testing.expectEqual(@as(usize, 1), commands.len());
     try std.testing.expect(!controller.pairOnCooldown(npc_a, npc_b));

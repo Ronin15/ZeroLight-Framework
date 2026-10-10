@@ -229,6 +229,8 @@ pub const BatchStage = enum {
     plane_entry,
     collision_broadphase,
     collision_narrowphase,
+    collision_response_gather,
+    collision_response_apply,
     particles,
     sprite_prep,
 };

@@ -3,6 +3,9 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const CollisionResponse = @import("../game/data_system.zig").CollisionResponse;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -85,7 +88,7 @@ fn runMixedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 }
 
 fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, mode: FixtureMode) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("collision response v1 has deterministic serial apply");
+    if (case.usesThreadSystem()) return suite.RunStats.skipped("threaded response is benched by collision-response-stage");
 
     var fixture = try createFixture(allocator, item_count, mode);
     defer fixture.deinit();
@@ -101,7 +104,7 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     for (0..options.iterations) |_| {
         prepareFrameForRun(&fixture, mode);
         const start_ns = suite.nowNs(io);
-        last_stats = try system.update(&fixture.data, &fixture.frame);
+        last_stats = try system.updateSerial(&fixture.data, &fixture.frame, EntityId.invalid);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), suite.serialBatch(item_count, movement_range_alignment_items));
     }
@@ -114,7 +117,7 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
 fn runOnce(system: *CollisionResponseSystem, fixture: *Fixture, mode: FixtureMode) !CollisionResponseStats {
     prepareFrameForRun(fixture, mode);
-    return try system.update(&fixture.data, &fixture.frame);
+    return try system.updateSerial(&fixture.data, &fixture.frame, EntityId.invalid);
 }
 
 fn prepareFrameForRun(fixture: *Fixture, mode: FixtureMode) void {
@@ -200,7 +203,7 @@ fn addEntity(data: *DataSystem, position_x: f32, position_y: f32, velocity_x: f3
 // sits in several contacts as `a` and as `b`, written once in a scattered order. Timed:
 // one `update`; the movement columns are restored untimed before each run so every run
 // takes the same branch mix. `--details` reports intents, triggers, the gather and
-// apply shapes, and the main-thread time and share.
+// apply shapes, and the time and share on main outside the stage batches.
 pub const stage_group = suite.BenchmarkGroup{
     .name = "collision-response-stage",
     .defaultItemCounts = stageItemCounts,
@@ -223,6 +226,7 @@ const StageFixture = struct {
     observer: EntityId,
     expected_intents: usize,
     expected_triggers: usize,
+    expected_observer_contacts: usize,
     // Movement columns as built, restored before each run.
     position_x: []f32,
     position_y: []f32,
@@ -328,6 +332,7 @@ fn buildStageFixture(allocator: std.mem.Allocator, contact_count: usize) !StageF
     const stride = stageScatterStride(contact_count);
     var expected_intents: usize = 0;
     var expected_triggers: usize = 0;
+    var expected_observer_contacts: usize = 0;
     for (0..contact_count) |order| {
         const index = order * stride % contact_count;
         const bodies = stageContactBodies(index);
@@ -341,6 +346,7 @@ fn buildStageFixture(allocator: std.mem.Allocator, contact_count: usize) !StageF
             .normal_y = normal[1],
             .penetration = @as(f32, @floatFromInt(index % 5 + 1)) * 0.25,
         });
+        if (bodies[0] == 0) expected_observer_contacts += 1;
         const a_response = stageBodyResponse(bodies[0]);
         const b_response = stageBodyResponse(bodies[1]);
         if (a_response.mode == .trigger or b_response.mode == .trigger) {
@@ -368,6 +374,7 @@ fn buildStageFixture(allocator: std.mem.Allocator, contact_count: usize) !StageF
         .observer = entities[0],
         .expected_intents = expected_intents,
         .expected_triggers = expected_triggers,
+        .expected_observer_contacts = expected_observer_contacts,
         .position_x = position_x,
         .position_y = position_y,
         .velocity_x = velocity_x,
@@ -375,28 +382,95 @@ fn buildStageFixture(allocator: std.mem.Allocator, contact_count: usize) !StageF
     };
 }
 
-fn stageRunOnce(system: *CollisionResponseSystem, fixture: *StageFixture) !CollisionResponseStats {
-    const stats = try system.update(&fixture.data, &fixture.frame);
+fn stageRunOnce(
+    system: *CollisionResponseSystem,
+    fixture: *StageFixture,
+    thread_system: ?*ThreadSystem,
+    case: suite.BenchmarkCase,
+) !CollisionResponseStats {
+    const stats = if (thread_system) |threads|
+        try system.update(&fixture.data, &fixture.frame, fixture.observer, threads, .{
+            .items_per_range = stageItemsPerRange(case),
+            .max_worker_threads = case.maxWorkerThreads(),
+            .adaptive = case.adaptive,
+        })
+    else
+        try system.updateSerial(&fixture.data, &fixture.frame, fixture.observer);
     std.debug.assert(stats.contact_count == fixture.frame.contacts.mergedItems().len);
     std.debug.assert(stats.intent_count == fixture.expected_intents);
     std.debug.assert(stats.trigger_count == fixture.expected_triggers);
     std.debug.assert(fixture.frame.collision_triggers.mergedItems().len == fixture.expected_triggers);
+    std.debug.assert(stats.observer_contact_count == fixture.expected_observer_contacts);
+    std.debug.assert(system.observerContacts(&fixture.frame, fixture.observer).len == fixture.expected_observer_contacts);
     return stats;
+}
+
+fn stageItemsPerRange(case: suite.BenchmarkCase) ?usize {
+    if (case.adaptive) return null;
+    return case.itemsPerRange(movement_range_alignment_items) orelse
+        suite.alignItemCount(suite.default_items_per_range, movement_range_alignment_items);
+}
+
+// The fixed-range adaptive case's apply tuner: one band per range, so the fixed control
+// dispatches the bands rather than keeping them in one inline range.
+fn stageBandTunerForCase(case: suite.BenchmarkCase) ?AdaptiveWorkTuner {
+    if (!case.adaptive or case.adaptive_range_mode != .fixed) return null;
+    return AdaptiveWorkTuner.init(.{ .initial_range_items = 1, .smallest_range_items = 1, .largest_range_items = 1 });
+}
+
+// An inline-settled gather never dispatches the apply, so its tuner settles alone.
+fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
+    const gather = &system.gather_tuner;
+    return gather.isSettled() and (!gather.report().has_threaded_profile or system.apply_tuner.isSettled());
+}
+
+// Off-main time of a stage batch: none when it ran inline.
+fn offMainNs(batch: BatchStats) u64 {
+    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
 }
 
 fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
     var fixture = try buildStageFixture(allocator, item_count);
     defer fixture.deinit(allocator);
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
     try system.reserveForContacts(item_count);
+    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
+        system.gather_tuner = tuner;
+        system.apply_tuner = stageBandTunerForCase(case).?;
+    }
+
+    // A fixed threaded case with more than one range of contacts dispatches the gather.
+    const expect_dispatch = if (thread_ptr) |thread_system|
+        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > stageItemsPerRange(case).?
+    else
+        false;
 
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
         fixture.restoreMovement();
-        _ = try stageRunOnce(&system, &fixture);
+        _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
     }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!stageTunersSettled(&system) and settle_guard < settle_limit) : (settle_guard += 1) {
+            fixture.restoreMovement();
+            _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -404,19 +478,25 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     for (0..options.iterations) |_| {
         fixture.restoreMovement();
         const start_ns = suite.nowNs(io);
-        last_stats = try stageRunOnce(&system, &fixture);
+        last_stats = try stageRunOnce(&system, &fixture, thread_ptr, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        accumulator.record(elapsed_ns, suite.serialBatch(item_count, movement_range_alignment_items));
-        // Every stage runs on the calling thread.
-        main_total += elapsed_ns;
+        std.debug.assert(!expect_dispatch or (last_stats.gather_batch.range_count > 1 and !last_stats.gather_batch.ran_inline));
+        accumulator.record(elapsed_ns, last_stats.gather_batch);
+        // Main outside the stage batches: the main thread's own ranges inside a
+        // dispatched batch are not counted (see the batch's `main_ranges`).
+        main_total += elapsed_ns -| offMainNs(last_stats.gather_batch) -| offMainNs(last_stats.apply_batch);
     }
 
     var stats = accumulator.finish();
     stats.candidate_pairs = last_stats.trigger_count;
     stats.output_count = last_stats.intent_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.serialBatch(last_stats.intent_count, movement_range_alignment_items));
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.apply_batch);
     if (stats.iterations > 0) {
         stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
+    }
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(system.gather_tuner.report(), settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(system.apply_tuner.report(), settled_before_measurement);
     }
     return stats;
 }
