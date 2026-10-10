@@ -783,7 +783,7 @@ const EntryAge = struct {
 
 // Probe-hot slot: the fields a linear-probe scan touches (occupancy + key), plus the
 // indirection to this entry's payload/cell-stripe slot in the logical-capacity arrays.
-pub const ProbeSlot = struct {
+const ProbeSlot = struct {
     occupied: bool = false,
     key: PathQueryKey = emptyKey(0),
     payload_index: u32 = 0,
@@ -791,7 +791,7 @@ pub const ProbeSlot = struct {
 
 // Cold per-slot payload, parallel to ProbeSlot. Read only on a hit / TTL check, so it
 // is kept off the probe-scan cache lines. Four u32s, then the u16: 20 bytes.
-pub const SlotPayload = struct {
+const SlotPayload = struct {
     // step_counter when the entry was written, for TTL refresh.
     stamp: u32 = 0,
     path_len: u32 = 0,

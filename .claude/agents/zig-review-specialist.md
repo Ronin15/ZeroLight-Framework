@@ -59,7 +59,9 @@ model; routes to design) or **local**.
    Does every hot loop the change adds or touches have a SIMD verdict (a
    `simd.zig` pattern, or scalar with the reason)? Threading and SIMD are
    standard, never optional: a scalable loop left on the main thread or a hot
-   float/compare loop with no SIMD verdict is a finding. When reviewing a
+   float/compare loop with no SIMD verdict is a finding; so is main-thread
+   per-item work that grows (path cells, bytes, scans, sorts), even under a
+   per-step budget: main keeps O(1) work per item in its ordered merge. When reviewing a
    design, check its hot-loop table covers every loop in the area, inherited
    loops included. A serial/inline path that does more work than the code it
    replaces is a finding.

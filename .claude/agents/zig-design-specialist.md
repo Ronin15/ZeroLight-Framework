@@ -70,7 +70,11 @@ rules.
   inherited loops included, not only the ones the design changes. Columns:
   loop (`file:line`), what it scales with, runs on (workers / main), threaded
   path (the existing stage pattern it copies, `file:line`) or why it stays
-  serial (fixed count and small, by the cost model), SIMD verdict (the
+  serial (fixed count and small, by the cost model; work under a per-step
+  budget still scales with what the step handled: main keeps only the
+  ordered merge/commit of `threading.md` with O(1) work per item (claims,
+  index writes, fixed-size record compaction, event appends), and per-item
+  work that grows (path cells, bytes, scans, sorts) threads), SIMD verdict (the
   `simd.zig` pattern it copies, `file:line`, or scalar with the reason),
   serial/threaded and scalar/SIMD parity tests, the serial/inline path's cost
   against today's code (never more work than the code it replaces), and bench

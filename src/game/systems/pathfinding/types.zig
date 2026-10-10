@@ -48,7 +48,7 @@ pub const open_heap_headroom_factor: usize = 4;
 /// `open_heap_headroom_factor` entries per budgeted node (lazy-deletion duplicates),
 /// floored at 16. Search gates compare the heap length against this, never the list's
 /// physical capacity, so the spill point matches on every participant slot regardless
-/// of reserve history. The nav memory gate charges the same value.
+/// of reserve history.
 pub fn openHeapLimit(node_budget: usize) usize {
     return @max(@as(usize, 16), node_budget *| open_heap_headroom_factor);
 }
@@ -130,9 +130,6 @@ pub const cached_results_per_agent: usize = 4;
 // (raised from the single-thread-era 256). Clamped down to the population so a tiny
 // demo (8 agents) still caps at 8.
 pub const default_max_solves_per_frame: usize = 512;
-// Generous default nav-memory ceiling. The build-time gate fails loud well before
-// real allocation pressure; tests use a tiny ceiling to exercise the gate.
-pub const default_max_nav_memory_bytes: usize = 512 * 1024 * 1024;
 // Bounded outward radius (in cells) for projecting a blocked goal to the nearest
 // open cell on its level.
 pub const default_goal_projection_radius: i32 = 16;
@@ -140,18 +137,6 @@ pub const default_goal_projection_radius: i32 = 16;
 // world, nav chunks are the world's chunks. The chunk-portal graph is the structure that
 // bounds per-query work independent of total cell count.
 pub const default_nav_chunk_tiles: u16 = 16;
-// Slack multiplier applied to a chunk's measured init edge count to size its fixed edge
-// window, so an in-place dig that adds a few edges stays within the window instead of
-// triggering the loud full-rebuild fallback.
-pub const default_edge_slack: u32 = 2;
-// Smallest per-chunk edge window, so a chunk that builds with zero edges at init still has
-// headroom for a dig that opens a little connectivity before any fallback.
-pub const chunk_edge_floor: u32 = 32;
-// When an incremental nav update touches more than this many distinct levels, the
-// per-affected-level relabel degenerates into a full relabel of every level. It
-// increments a loud `nav_full_relabel` counter so a runaway batch is visible. The
-// demo's worlds have very few levels, so a real edit stays well under this.
-pub const default_nav_full_relabel_level_threshold: usize = 8;
 // Fixed abstract-cost penalty added when an abstract A* edge crosses a LevelLink.
 // Kept above any single octile step so the search prefers staying on one level.
 pub const inter_level_penalty: u32 = cardinal_cost * 4;
@@ -229,19 +214,15 @@ pub const no_ref: usize = std.math.maxInt(usize);
 pub const rect_edge_epsilon: f32 = 0.001;
 
 comptime {
-    // The abstract search identifies a node by a packed (level << 32) | local_node ref
+    // The abstract search identifies a node by a packed (level << 32) | cell ref
     // stored in a usize, so the target must have a 64-bit usize.
     if (@bitSizeOf(usize) < 64) @compileError("pathfinding abstract node refs require a 64-bit usize");
 }
 
-// Packs a per-level abstract node identity. local is a node index within the level's
-// own NavLevelGraph.portals run, so packing keeps cross-level search keys distinct
-// without a global node numbering. A packed ref's top 16 bits are always 0 (level is a
-// u16), so no real packed ref can ever equal no_ref/no_parent (maxInt, all 64 bits set) —
-// packRef never aliases the sentinel. Sentinel contract is one-directional instead:
-// refLevel/refLocal must only decode a real packed ref, never no_ref/no_parent directly,
-// since `no_ref >> 32` would panic refLevel's @intCast to u16 (0xFFFFFFFF does not fit).
-// Callers guard the sentinel first.
+// Packs an abstract node identity: a portal cell on a level. A packed ref's top 16 bits are
+// always 0 (level is a u16), so no real packed ref equals no_ref/no_parent (maxInt).
+// refLevel/refLocal decode only a real packed ref, never the sentinel (`no_ref >> 32` would
+// panic refLevel's @intCast); callers guard the sentinel first.
 pub fn packRef(level: u16, local: u32) usize {
     return (@as(usize, level) << 32) | local;
 }
@@ -260,8 +241,6 @@ pub fn refLocal(ref: usize) u32 {
     return @truncate(ref);
 }
 
-pub const NavGridError = error{NavWorldTooLarge};
-
 pub const PathStatus = enum {
     missing,
     pending,
@@ -275,53 +254,61 @@ pub const PathView = struct {
     path_len: usize = 0,
 };
 
-// One static-obstacle edit for incremental nav rebuild: a world tile flip on
-// `level` at tile `(x, y)`. Carries only compact coordinates (no world handle), so
-// the caller maps a single-cell `world_tile_changed` event into this before feeding
-// `applyNavUpdates`. Multi-cell `world_obstacle_changed` events map to one
-// `ChangedSpan` via `markNavTileRectDirty` instead (not an O(tiles) expand into
-// this form). The world reference is passed alongside the edit batch so the
-// affected level's blocked mask is re-derived from authoritative state.
+// One static-obstacle edit for an incremental nav update: a world tile flip on `level` at
+// tile `(x, y)`. Compact coordinates only (no world handle); the world is passed alongside
+// the batch so the level's mask is re-derived from authoritative state.
 pub const NavCellEdit = struct {
     level: u16,
     x: u16,
     y: u16,
 };
 
-// Diagnostics for one incremental `applyNavUpdates` batch. Recorded by the caller
-// into runtime perf metrics. A batch that finds no real obstacle change does no
-// work and leaves every counter zero.
+/// What one nav mark changed.
+pub const NavMarkKind = enum(u8) {
+    /// An inclusive world tile box (tile and obstacle events).
+    tile_box,
+    /// An inclusive nav-cell span a static body covered or covers: the level-0 static
+    /// coverage over it is re-derived before the remask.
+    static_span,
+    /// The whole level, with the level's static coverage rebuilt.
+    level,
+};
+
+/// One recorded nav change, consumed by the next nav batch. Coordinates are inclusive.
+pub const NavMark = struct {
+    level: u16,
+    kind: NavMarkKind,
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+};
+
+// Diagnostics for one nav update (level builds plus the marks batch). Recorded by the
+// caller into runtime perf metrics. A step with nothing to apply leaves every counter zero.
 pub const NavUpdateStats = struct {
-    // Distinct abstract chunks touched by the dirty cells (membership-counted, not
-    // double-counted) across affected levels.
+    // Chunks the marks batch remasked (the changed chunks).
     dirty_chunks: usize = 0,
-    // 1 when this batch recomputed affected-level masks/components and the abstract
-    // graph (an incremental rebuild that did NOT touch the whole world); else 0.
+    // 1 when the marks batch changed the graph; else 0.
     incremental_rebuilds: usize = 0,
-    // 1 when the affected-level count exceeded the configured full-relabel
-    // threshold and every level was relabeled (a loud bounded fallback); else 0.
-    full_relabel: usize = 0,
-    // 1 when this batch bumped `nav_version` (invalidating goal-keyed caches); else 0.
-    version_bumps: usize = 0,
-    // Distinct abstract chunks patched this batch (dirty chunks plus their
-    // border-adjacent neighbors), summed across affected levels. The dirty-bounded
-    // work proxy: independent of total level size.
+    // Chunks whose records the marks batch re-derived: the changed chunks, their orthogonal
+    // neighbours, and both endpoint chunks of every newly added link.
     chunks_patched: usize = 0,
-    // 1 when an affected chunk's transition/intra edges overflowed its fixed
-    // per-chunk edge window, forcing a loud full abstract-graph rebuild with more
-    // slack (a genuine topology blow-up); else 0.
-    edge_cap_fallback: usize = 0,
-    // Remask and patch dispatch time that ran on workers, summed over every level the
-    // batch touched; stages that ran inline add nothing. Diagnostic only.
+    // Levels built from the world this update: added levels and levels whose content
+    // changed without per-cell events.
+    levels_built: usize = 0,
+    // Records the marks batch left holding portals.
+    records_patched: usize = 0,
+    // Remask, patch, and mark dispatch time that ran on workers; inline stages add
+    // nothing. Diagnostic only.
     off_main_stage_ns: u64 = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
         perf.recordMetric(.nav_incremental_rebuilds, metric(self.incremental_rebuilds));
-        perf.recordMetric(.nav_full_relabel, metric(self.full_relabel));
-        perf.recordMetric(.nav_version_bumps, metric(self.version_bumps));
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
-        perf.recordMetric(.nav_edge_cap_fallback, metric(self.edge_cap_fallback));
+        perf.recordMetric(.nav_levels_built, metric(self.levels_built));
+        perf.recordMetric(.nav_records_patched, metric(self.records_patched));
     }
 };
 
@@ -466,12 +453,6 @@ pub const PathfindingCapacity = struct {
     // when several agents are simultaneously stuck. Tier-0 attempts are unaffected and
     // keep filling remaining slots up to max_fallback_requests_per_step as before.
     max_escalated_solves_per_step: usize = 1,
-    // Incremental nav update: when an `applyNavUpdates` batch touches more than this
-    // many levels, it relabels every level (a loud, counted fallback) rather than
-    // only the affected ones.
-    nav_full_relabel_level_threshold: usize = default_nav_full_relabel_level_threshold,
-    // Build-time nav memory ceiling. Exceeding it fails the rebuild loudly.
-    max_nav_memory_bytes: usize = default_max_nav_memory_bytes,
     // Managed shared-goal flow fields.
     max_group_fields: usize = default_max_group_fields,
     group_field_rebuild_min_steps: u32 = default_group_field_rebuild_min_steps,
@@ -497,9 +478,7 @@ pub const PathfindingCapacity = struct {
 // fallback budgets are pinned to a fixed amortization ceiling (clamped down to
 // the population so a tiny crowd caps low), so frame time stays bounded as the
 // army grows. Algorithm/memory sizing (scratch, path strides, chunk size, group
-// field count) is left untouched. Lives here (not system.zig) because the nav
-// memory gate must derive the same ELASTIC CEILING caps the elastic resize can
-// later grow to — one derivation, no drift.
+// field count) is left untouched.
 pub fn deriveCapacity(base: PathfindingCapacity, agent_count: usize) PathfindingCapacity {
     var cap = base;
     const clamped = std.math.clamp(agent_count, min_capacity_floor, @max(min_capacity_floor, base.max_agent_budget));
@@ -821,23 +800,6 @@ pub const OpenNode = struct {
     h: u32,
 };
 
-// An abstract-graph node: a portal cell on a specific level. Portals sit on the
-// open border between two adjacent chunks. Abstract A* searches over these nodes
-// plus inter-level link edges, never over raw cells.
-pub const PortalNode = struct {
-    level: u16,
-    cell_index: u32,
-    // Chunk this portal belongs to (chunk_y * chunks_x + chunk_x within a level).
-    chunk: u32,
-};
-
-// One directed intra-level abstract edge: `target` is a local node index on the
-// same level as the owning node, reached at `cost`. Cross-level transitions live
-// in NavGraph.link_edges, not here.
-pub const AbstractEdge = struct {
-    target: u32,
-    cost: u32,
-};
 // Comparator for binarySearch over a level's sorted compact label keys.
 pub fn orderU32(key: u32, item: u32) std.math.Order {
     return std.math.order(key, item);
@@ -913,6 +875,14 @@ pub fn oppositeDirIndex(dir_index: usize) u8 {
 pub fn octileXY(from_x: i32, from_y: i32, to_x: i32, to_y: i32) u32 {
     const dx: u64 = @abs(to_x - from_x);
     const dy: u64 = @abs(to_y - from_y);
+    return @intCast(@min(octileCost(dx, dy), @as(u64, std.math.maxInt(u32))));
+}
+
+/// Octile cost between two cells given by unsigned coordinates, valid for any level a
+/// validated grid allows (coordinates and indices up to 2^32). Saturates like `octileXY`.
+pub fn octileU32(ax: u32, ay: u32, bx: u32, by: u32) u32 {
+    const dx: u64 = @max(ax, bx) - @min(ax, bx);
+    const dy: u64 = @max(ay, by) - @min(ay, by);
     return @intCast(@min(octileCost(dx, dy), @as(u64, std.math.maxInt(u32))));
 }
 
@@ -1111,6 +1081,16 @@ test "octileCells and octileXY saturate identically instead of one silently wrap
     // A delta far beyond any real grid saturates to maxInt(u32) rather than wrapping.
     const huge: i32 = std.math.maxInt(i32);
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), octileXY(0, 0, huge, huge));
+}
+
+test "octileU32 equals octileXY on small coordinates and stays exact past the i32 range" {
+    for ([_][4]u32{ .{ 0, 0, 3, 3 }, .{ 7, 2, 1, 9 }, .{ 15, 15, 0, 0 }, .{ 5, 5, 5, 5 } }) |c| {
+        try std.testing.expectEqual(octileXY(@intCast(c[0]), @intCast(c[1]), @intCast(c[2]), @intCast(c[3])), octileU32(c[0], c[1], c[2], c[3]));
+    }
+    // Coordinates of cells past 2^31 on a wide validated level: no signed overflow.
+    const far: u32 = std.math.maxInt(u32) - 3;
+    try std.testing.expectEqual(@as(u32, diagonal_cost + 2 * cardinal_cost), octileU32(far, 1, far + 3, 0));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), octileU32(0, 0, far, far));
 }
 
 test "tileIndexClamped handles degenerate count, negative, and non-finite input" {

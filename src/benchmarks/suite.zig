@@ -187,13 +187,14 @@ pub const RunStats = struct {
     items_per_second: u64 = 0,
     batch: BatchSummary = .{},
     secondary_batch: ?BatchSummary = null,
+    // Nav groups: the mark stage (null when the workload marks no events) and the key plan.
+    nav_mark_batch: ?BatchSummary = null,
+    nav_plan_batch: ?BatchSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
-    // Chunk-scale nav groups: timed nav reactions that fell back to whole-level work.
-    nav_fallbacks: usize = 0,
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
@@ -705,7 +706,8 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
     if (std.mem.eql(u8, group_name, "chunk-scale-explosion-fill")) return "(sparse props * 10^10 + region chunks * 10^7 + level side * 1000 + levels)";
     if (isChunkScaleBatchGroup(group_name) or isChunkScaleNavBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
-    if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(window edge chunks * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(resident layers * 10^9 + window edge chunks * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-level-enter")) return "(resident layers * 10^9 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(revision case * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "pathfinding-level-size") or std.mem.startsWith(u8, group_name, "pathfinding-cross-level-")) return "(level side * 1000 + levels)";
     if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
@@ -1096,6 +1098,10 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
     // Workload labels translate shared counters into subsystem language so the
     // report remains compact without hiding what was measured.
+    if (std.mem.startsWith(u8, group_name, "nav-update-")) {
+        var stage_buffer: [128]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
+    }
     if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
     if (isChunkScaleBatchGroup(group_name)) {
         var plan_buffer: [32]u8 = undefined;
@@ -1111,28 +1117,19 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (isChunkScaleNavBatchGroup(group_name)) {
-        var remask_buffer: [32]u8 = undefined;
-        var patch_buffer: [32]u8 = undefined;
-        const remask_stage = formatStageShapeInto(&remask_buffer, stats.batch);
-        const patch_stage = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
+        var stage_buffer: [128]u8 = undefined;
+        const stages = formatNavStagesInto(&stage_buffer, stats);
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
         return std.fmt.bufPrint(
             buffer,
-            "cells={} remask={s} patch={s} fallbacks={} plan_t={f} write_t={f} nav_t={f} main={f} ({}%)",
-            .{ stats.output_count, remask_stage, patch_stage, stats.nav_fallbacks, formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.nav_ns), formatDuration(phases.main_ns), main_percent },
+            "cells={} {s} plan_t={f} write_t={f} nav_t={f} main={f} ({}%)",
+            .{ stats.output_count, stages, formatDuration(phases.plan_ns), formatDuration(phases.write_ns), formatDuration(phases.nav_ns), formatDuration(phases.main_ns), main_percent },
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-dig") or std.mem.eql(u8, group_name, "chunk-scale-nav-ramp")) {
-        var remask_buffer: [32]u8 = undefined;
-        var patch_buffer: [32]u8 = undefined;
-        const remask_stage = formatStageShapeInto(&remask_buffer, stats.batch);
-        const patch_stage = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
-        return std.fmt.bufPrint(
-            buffer,
-            "cells={} remask={s} patch={s} fallbacks={}",
-            .{ stats.output_count, remask_stage, patch_stage, stats.nav_fallbacks },
-        ) catch "workload";
+        var stage_buffer: [128]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "cells={} {s}", .{ stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "ai")) {
         if (stats.secondary_batch) |intent| {
@@ -1269,6 +1266,22 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     return std.fmt.bufPrint(buffer, "candidates={} outputs={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
 }
 
+// A nav reaction's stage shapes: `mark=` (when the workload marks events), `plan=`, then
+// `remask=` (the primary batch) and `patch=` (the secondary batch).
+fn formatNavStagesInto(buffer: []u8, stats: RunStats) []const u8 {
+    var mark_buffer: [32]u8 = undefined;
+    var plan_buffer: [32]u8 = undefined;
+    var remask_buffer: [32]u8 = undefined;
+    var patch_buffer: [32]u8 = undefined;
+    const plan = formatStageShapeInto(&plan_buffer, stats.nav_plan_batch orelse .{});
+    const remask = formatStageShapeInto(&remask_buffer, stats.batch);
+    const patch = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
+    if (stats.nav_mark_batch) |mark| {
+        return std.fmt.bufPrint(buffer, "mark={s} plan={s} remask={s} patch={s}", .{ formatStageShapeInto(&mark_buffer, mark), plan, remask, patch }) catch "stages";
+    }
+    return std.fmt.bufPrint(buffer, "plan={s} remask={s} patch={s}", .{ plan, remask, patch }) catch "stages";
+}
+
 // A stage's batch shape as `inline` or workers/ranges.
 fn formatStageShapeInto(buffer: []u8, batch: BatchSummary) []const u8 {
     if (batch.ran_inline or batch.active_worker_threads == 0) return "inline";
@@ -1377,9 +1390,9 @@ pub const NavSizeConfig = struct {
     group_fields: usize,
 };
 
-/// Bytes the flat-grid nav takes for `config` at its agent-budget ceiling: per-level
-/// cell arrays and abstract graph, per-participant search and build scratch, group
-/// fields, and the result cache.
+/// An over-estimate of the bytes the flat-grid nav takes for `config` at its agent-budget
+/// ceiling: per-level cell arrays and abstract layer, per-participant search and build
+/// scratch, group fields, and the result cache.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Library capacity defaults: explored nodes, stored and stitched path cells, the
     // abstract node ceiling, results cached per agent, and the per-step solve ceiling.
@@ -1683,40 +1696,4 @@ test "batch modes align to cache-line item boundaries" {
     const large = default_cases[5].itemsPerRange(16).?;
     try std.testing.expectEqual(@as(usize, 32), small);
     try std.testing.expectEqual(@as(usize, 256), large);
-}
-
-test "nav storage bytes equal the nav memory gate's estimate for every nav scaling config" {
-    const nav_memory = @import("../game/systems/pathfinding/nav_memory.zig");
-    const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
-    var configs: std.ArrayList(NavSizeConfig) = .empty;
-    defer configs.deinit(std.testing.allocator);
-    for ([_]usize{ 1, 2, 3, 9, 17, 24, 33, 65 }) |participants| {
-        for ([_]usize{ 256, 1024, 2048 }) |side| {
-            // Chunk-scale depths, and level-add's final depths after 2+10 and 5+30 iterations.
-            for ([_]usize{ 8, 20, 32, 43, 44, 67, 128, 140, 163 }) |levels| {
-                try configs.append(std.testing.allocator, .{ .side = side, .levels = levels, .participant_count = participants, .agent_budget = 8, .group_fields = 4 });
-            }
-            try configs.append(std.testing.allocator, .{ .side = side, .levels = 1, .participant_count = participants, .agent_budget = 64, .group_fields = 1 });
-        }
-        for ([_]usize{ 8, 32, 128 }) |levels| {
-            for ([_]usize{ levels - 1, levels }) |links| {
-                try configs.append(std.testing.allocator, .{ .side = 256, .levels = levels, .links = links, .participant_count = participants, .agent_budget = 64, .group_fields = 1 });
-            }
-        }
-        // Evict's agent budgets (a quarter of its cached results) and elastic's.
-        for ([_]usize{ 250, 2_500, 12_500, 1_000, 4_000, 16_000 }) |agents| {
-            try configs.append(std.testing.allocator, .{ .side = 256, .levels = 1, .participant_count = participants, .agent_budget = agents, .group_fields = 1 });
-        }
-    }
-    for (configs.items) |config| {
-        const capacity = PathfindingCapacity{
-            .worker_participant_count = config.participant_count,
-            .max_agent_budget = config.agent_budget,
-            .max_group_fields = config.group_fields,
-        };
-        var budget = nav_memory.budgetForCapacity(capacity, config.levels, config.links);
-        budget.chunk_tiles = 16;
-        try std.testing.expectEqual(budget.requiredBytes(config.side, config.side), navStorageBytes(config));
-        try std.testing.expectEqual(capacity.max_nav_memory_bytes, nav_size_limit_bytes);
-    }
 }

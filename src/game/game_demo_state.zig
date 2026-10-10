@@ -41,7 +41,6 @@ const Player = @import("player.zig").Player;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
-const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedMaxNavMemoryBytes;
 const default_min_group_field_agents = @import("systems/pathfinding.zig").default_min_group_field_agents;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const DigIntent = @import("simulation.zig").DigIntent;
@@ -185,8 +184,8 @@ fn demoAgentBudget(population: DemoPopulationCapacity, min_group_field_agents: u
     return @max(population.intent_capacity, min_group_field_agents);
 }
 
-fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_count: usize, population: DemoPopulationCapacity) PathfindingCapacity {
-    var cap: PathfindingCapacity = .{
+fn proceduralPathfindingCapacity(worker_participant_count: usize, population: DemoPopulationCapacity) PathfindingCapacity {
+    return .{
         .max_group_fields = 4,
         .max_agent_budget = demoAgentBudget(population, demo_min_group_field_agents),
         .worker_participant_count = worker_participant_count,
@@ -219,8 +218,6 @@ fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_cou
         // throttle (both pathfinding-owned), not a demo-specific judgment call — see
         // default_group_field_rebuild_min_steps' doc comment.
     };
-    cap.max_nav_memory_bytes = autoSizedMaxNavMemoryBytes(cap, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles, level_link_count);
-    return cap;
 }
 /// Chunk + pixel AABB margin for dynamic collect and sparse visibility.
 const world_render_overscan_chunks: u16 = 1;
@@ -335,7 +332,7 @@ pub const GameDemoState = struct {
             // The configured threaded participant count is fixed at this point; the
             // pathfinding A* scratch is sized for it during the nav build.
             thread_system.participantSlotCount(),
-            proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len, deriveDemoPopulationCapacity(battle_scale_demo_mover_count)),
+            proceduralPathfindingCapacity(thread_system.participantSlotCount(), deriveDemoPopulationCapacity(battle_scale_demo_mover_count)),
             thread_system,
             battle_scale_demo_mover_count,
             asset_store,
@@ -678,15 +675,12 @@ fn commitStructuralAndReact(
     world: *WorldSystem,
     thread_system: ?*ThreadSystem,
 ) !DemoCommitResult {
-    // The post-commit nav reaction appends at most one nav_region_invalidated
-    // event, driven by EITHER structural commands applied this frame OR
-    // invalidating world events already queued in the stream (e.g. a dig's
-    // world_tile_changed that did not originate from a structural command).
-    // Reserve the slot for both sources so the append never trips a tight
-    // capacity_limit.
-    const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
-        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame);
-    const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
+    // The post-commit nav reaction appends at most one nav_region_invalidated event,
+    // driven by structural commands applied this frame, invalidating world events already
+    // queued (a dig's world_tile_changed), or nav work the world left pending (a level,
+    // link, or content revision). Reserve the slot for every source so the append never
+    // trips a tight capacity_limit.
+    const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
     const structural = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     // Population growth seam: the post-commit reactions and the next step see grown
     // capacities. O(1) when the committed rows fit the tracked capacities.
@@ -1302,7 +1296,7 @@ test "GameDemoState owns test_squares via its own allocator field, not DataSyste
 
 test "proceduralPathfindingCapacity reserves the shared flow-field for a future battle-scale crowd" {
     const population = deriveDemoPopulationCapacity(battle_scale_demo_mover_count);
-    const capacity = proceduralPathfindingCapacity(1, 0, population);
+    const capacity = proceduralPathfindingCapacity(1, population);
     // Pinned so high the demo's pursuit pack can never cross it: a live capture measured
     // the shared flood building constantly but never once being sampled at this demo's
     // scale — pending-request dedup and the goal-keyed result cache already serve every
@@ -1318,32 +1312,17 @@ test "proceduralPathfindingCapacity at battle scale keeps the group-field thresh
     // Reserve only, no nav build: the threshold reads the ceiling frozen at reserve.
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
-    try system.reserve(proceduralPathfindingCapacity(1, 0, deriveDemoPopulationCapacity(battle_scale_demo_mover_count)));
+    try system.reserve(proceduralPathfindingCapacity(1, deriveDemoPopulationCapacity(battle_scale_demo_mover_count)));
     try std.testing.expectEqual(@as(usize, 2000), system.groupFieldThreshold());
 }
 
 test "proceduralPathfindingCapacity for a tiny population never clamps the threshold below its pin" {
-    const capacity = proceduralPathfindingCapacity(1, 0, deriveDemoPopulationCapacity(8));
+    const capacity = proceduralPathfindingCapacity(1, deriveDemoPopulationCapacity(8));
     try std.testing.expectEqual(@as(usize, 2000), capacity.max_agent_budget);
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(capacity);
     try std.testing.expectEqual(@as(usize, 2000), system.groupFieldThreshold());
-}
-
-test "content-sized agent ceiling never needs more nav memory than the retired fixed 4096" {
-    const population = deriveDemoPopulationCapacity(battle_scale_demo_mover_count);
-    const capacity = proceduralPathfindingCapacity(1, 0, population);
-    var fixed = capacity;
-    fixed.max_agent_budget = 4096;
-    // Compare the unrounded requirement: `autoSizedMaxNavMemoryBytes` rounds both up to the
-    // same power of two (536,870,912 B), which would hide the difference. At battle scale the
-    // ceiling is 2053 agents: 362,372,128 B vs 512,998,432 B for the fixed 4096.
-    const nav_memory = @import("systems/pathfinding/nav_memory.zig");
-    const after = nav_memory.budgetForCapacity(capacity, procedural_dense_layer_count, 0).requiredBytes(procedural_world_width_tiles, procedural_world_height_tiles);
-    const before = nav_memory.budgetForCapacity(fixed, procedural_dense_layer_count, 0).requiredBytes(procedural_world_width_tiles, procedural_world_height_tiles);
-    try std.testing.expect(capacity.max_agent_budget < fixed.max_agent_budget);
-    try std.testing.expect(after < before);
 }
 
 test "demo spawns atlas-backed moving actors" {
@@ -1620,32 +1599,46 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expectEqual(demo.world.levelBaseZ(0), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 }
 
-test "demo ramp dig drives the real post-commit nav re-mask without panicking on an interior cell" {
-    // Regression: a ramp dig adds a LevelLink at runtime (dig_controller.zig). The dug cell's
-    // chunk is re-masked at the structural-commit gate via processPostCommitEvents ->
-    // applyNavUpdates. A faced interior cell whose endpoint has no init-built slot must be
-    // DEFERRED by tryLinkPortal, not resolved against an absent run (linkTailIndex unreachable).
+test "a demo ramp dig is routable from both levels the next step" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
+    // Row 2, whose ramp exit on the surface holds no static body.
     demo.data.facingPtr(demo.player.entity).?.* = .right;
-    placePlayerInCell(&demo, 3, 3);
+    placePlayerInCell(&demo, 3, 2);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
 
-    // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,3).
+    // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,2).
     try digFacedForTest(&demo, .hole);
-    placePlayerInCell(&demo, 4, 3);
+    placePlayerInCell(&demo, 4, 2);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
-
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
-    // The real per-step nav re-mask the live game runs each frame. Must not panic.
+    // The step's post-commit nav reaction.
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
     demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
-    // The link still climbs planes via the world tier (independent of the abstract graph).
-    placePlayerInCell(&demo, 5, 3);
+    // Next step: a request up the ramp from the dirt plane and one down it from the surface
+    // both route across the link.
+    const RangeOutputStream = @import("simulation.zig").RangeOutputStream;
+    const PathRequest = @import("simulation.zig").PathRequest;
+    const appendPathRequest = @import("systems/pathfinding/test_support.zig").appendPathRequest;
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    const center = struct {
+        fn of(x: u16, y: u16) math.Vec2 {
+            return .{ .x = @as(f32, @floatFromInt(x)) * 32 + 16, .y = @as(f32, @floatFromInt(y)) * 32 + 16 };
+        }
+    }.of;
+    try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 1, .goal_level = 0, .start = center(4, 2), .goal = center(0, 4) });
+    try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 0, .goal_level = 1, .start = center(0, 4), .goal = center(4, 2) });
+    const stats = try demo.pipeline.pathfinding.updateSerial(&stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 2), stats.available_results);
+    try std.testing.expectEqual(@as(usize, 2), stats.cross_level_solves);
+
+    // The link still climbs planes via the world tier.
+    placePlayerInCell(&demo, 5, 2);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 }
@@ -1722,13 +1715,13 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
         } },
     });
 
+    const version_before = demo.pipeline.pathfinding.graph.version;
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
     demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
-    // The incremental update ran; a pure incremental dig keeps nav_version stable
-    // (caches are scope-evicted, not version-invalidated), so no version bump.
+    // The incremental update ran and kept nav_version (caches are scope-evicted).
     try std.testing.expectEqual(@as(usize, 1), demo.last_nav_update_stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), demo.last_nav_update_stats.version_bumps);
+    try std.testing.expectEqual(version_before, demo.pipeline.pathfinding.graph.version);
 
     // Every covered cell is blocked even though the rect overflowed the dirty scratch.
     yy = min_y;

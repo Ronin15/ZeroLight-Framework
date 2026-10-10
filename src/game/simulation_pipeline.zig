@@ -995,45 +995,15 @@ pub const SimulationPipeline = struct {
         self.* = undefined;
     }
 
-    /// Clears the pathfinding system's dirty nav-cell buffer. Call once before a step's
-    /// marking pass so a skipped apply never leaks stale edits into the next step.
-    pub fn clearNavDirty(self: *SimulationPipeline) void {
-        self.pathfinding.clearNavDirty();
-    }
-
-    /// Records one changed nav cell (from a structural event) for the next incremental
-    /// update. The system-owned buffer grows rather than drops, so any number of edits in
-    /// one step reach the nav graph.
-    pub fn markNavDirty(self: *SimulationPipeline, level: u16, x: u16, y: u16) !void {
-        try self.pathfinding.markNavDirty(level, x, y);
-    }
-
     /// Marks a whole level for re-derivation next update, for changes that cannot be reduced to
     /// specific cells (e.g. a destroyed static obstacle whose nav cell is no longer resolvable).
     pub fn markNavLevelDirty(self: *SimulationPipeline, level: u16) !void {
         try self.pathfinding.markNavLevelDirty(level);
     }
 
-    /// Whether any dirty nav cell or whole-level request is buffered for this step.
-    pub fn hasPendingNavUpdates(self: *const SimulationPipeline) bool {
-        return self.pathfinding.hasPendingNavUpdates();
-    }
-
-    /// Folds the buffered static-obstacle edits into the existing nav graph incrementally
-    /// (affected levels only, single `nav_version` bump) rather than rebuilding the whole
-    /// world, then clears the buffer. The whole-world build path stays init-only.
-    pub fn applyNavUpdates(
-        self: *SimulationPipeline,
-        data: *const DataSystem,
-        world: *const WorldSystem,
-        thread_system: ?*ThreadSystem,
-    ) !NavUpdateStats {
-        return self.pathfinding.applyBufferedNavUpdates(data, world, thread_system);
-    }
-
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
-    /// `PathfindingSystem`, which interprets nav-invalidating events into dirty
-    /// cells, applies the incremental update, and emits the invalidation event.
+    /// `PathfindingSystem`, which interprets nav-invalidating events into marks,
+    /// applies every pending nav change, and emits the invalidation event.
     pub fn reactToPostCommitNavEvents(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
@@ -1054,16 +1024,12 @@ pub const SimulationPipeline = struct {
         self.steering.reactToPostCommitSteeringEvents(frame);
     }
 
-    /// Whether any pending structural command may invalidate navigation once
-    /// applied. Delegates to `PathfindingSystem`; used for the pre-commit event
+    /// Whether the post-commit nav reaction may emit its event this step: a pending
+    /// structural command or committed event may change nav, or nav has marks, levels,
+    /// links, or a content revision still to apply. Used for the pre-commit event
     /// capacity preflight.
-    pub fn structuralCommandsMayInvalidateNavigation(data: *const DataSystem, frame: *const SimulationFrame) bool {
-        return PathfindingSystem.structuralCommandsMayInvalidateNavigation(data, frame);
-    }
-
-    /// Whether any queued structural-commit event will drive a nav invalidation.
-    pub fn pendingEventsMayInvalidateNavigation(frame: *const SimulationFrame) bool {
-        return PathfindingSystem.pendingEventsMayInvalidateNavigation(frame);
+    pub fn navReactionMayEmit(self: *const SimulationPipeline, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
+        return self.pathfinding.navReactionMayEmit(data, frame, world);
     }
 
     /// Queues ambient audio (music + movement-gated jet loop) through the owned
@@ -5397,6 +5363,8 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.pathfinding.fallback_tuner,
         &pipeline.pathfinding.nav_remask_tuner,
         &pipeline.pathfinding.nav_patch_tuner,
+        &pipeline.pathfinding.nav_mark_tuner,
+        &pipeline.pathfinding.nav_plan_tuner,
         &pipeline.scope.chunk_derive_tuner,
         &pipeline.scope.collision_gather_tuner,
         &pipeline.scope.ai_gather_tuner,
@@ -5490,9 +5458,7 @@ fn markAllAlwaysActive(data: *DataSystem) !void {
 /// nav-reaction slot reserved, run the population seam, then the post-commit reactions
 /// (nav only after a successful seam; steering before a seam or nav error returns).
 fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
-    const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(data, frame) or
-        SimulationPipeline.pendingEventsMayInvalidateNavigation(frame);
-    const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
+    const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
     _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     const sync = pipeline.syncPopulationCapacity(frame, data);
     const nav_update = if (sync) |_| pipeline.reactToPostCommitNavEvents(frame, data, world, null) else |err| err;
@@ -5991,7 +5957,7 @@ test "a population growth that fails after the collision reserve restores the de
     try std.testing.expectEqual(CollisionSystem.estimateContactCapacity(pipeline.movement_body_capacity), pipeline.collision.reserved_pair_bound);
 }
 
-test "population sync raises the agent budget past the load-time nav memory limit" {
+test "population sync that runs out of memory growing pathfinding keeps the old agent ceiling and the retry grows it" {
     var world = try minimalSyncWorld();
     defer world.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -6004,10 +5970,6 @@ test "population sync raises the agent budget past the load-time nav memory limi
     defer pipeline.deinit();
     try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 0, 0, 0, 0);
     try pipeline.reserve(&frame, 0);
-    // A ceiling exactly at the loaded 8-agent budget: any raise exceeds it.
-    const nav_memory = @import("systems/pathfinding/nav_memory.zig");
-    const graph = &pipeline.pathfinding.graph;
-    pipeline.pathfinding.capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(pipeline.pathfinding.capacity, graph.levelCount(), world.levelLinks().len).requiredBytes(graph.width, graph.height);
 
     for (0..12) |index| {
         const entity = try data.createEntity();

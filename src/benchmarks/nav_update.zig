@@ -360,9 +360,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
         fixture.system.nav_remask_tuner = tuner;
         fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
+        fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
     } else {
         fixture.system.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
         fixture.system.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
+        fixture.system.nav_plan_tuner = AdaptiveWorkTuner.init(.{});
     }
     // Drive the threaded stages with this case's control config: adaptive cases let the tuner
     // size ranges; fixed control cases pin a fixed partition so the tuner is measured against them.
@@ -379,7 +381,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!fixture.system.nav_plan_tuner.isSettled() or !fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runToggle(fixture, io, thread_ptr);
         }
     }
@@ -404,6 +406,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // serial ones (a tuner may keep a borderline footprint inline). Primary = the remask/re-flood
     // stage (runs first and dominates at scale); secondary = the abstract chunk patch.
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);
@@ -591,6 +594,8 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
         fixture.system.nav_remask_tuner = tuner;
         fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
+        fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
+        fixture.system.nav_mark_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
     }
     fixture.system.nav_thread_adaptive = case.adaptive;
     fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
@@ -599,7 +604,7 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!fixture.system.nav_mark_tuner.isSettled() or !fixture.system.nav_plan_tuner.isSettled() or !fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try fixture.moveAndReact(io, thread_ptr);
         }
     }
@@ -619,6 +624,8 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
+    stats.nav_mark_batch = suite.batchSummaryFromBatch(fixture.system.last_mark_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);

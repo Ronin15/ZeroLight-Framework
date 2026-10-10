@@ -2,10 +2,10 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Per-request solvers: the budget-bounded local A*, the abstract chunk-portal/link
+//! Per-request solvers: the budget-bounded local A*, the abstract chunk-record
 //! corridor search, the corridor stitcher, and the worker job entry point. These
-//! free functions borrow *PathfindingSystem plus per-worker scratch and reach into
-//! the NavGraph internals directly; they stay free functions to keep that wiring flat.
+//! free functions borrow *PathfindingSystem plus per-worker scratch and read the
+//! NavGraph's grids and chunk records; they stay free functions to keep that wiring flat.
 
 const std = @import("std");
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
@@ -13,7 +13,7 @@ const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
-const LinkEdgeRef = @import("nav_graph.zig").LinkEdgeRef;
+const NavPortal = @import("nav_graph.zig").NavPortal;
 const AbstractScratch = @import("scratch.zig").AbstractScratch;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const types = @import("types.zig");
@@ -33,6 +33,7 @@ const refLevel = types.refLevel;
 const refLocal = types.refLocal;
 const octileCells = types.octileCells;
 const octileXY = types.octileXY;
+const octileU32 = types.octileU32;
 const siftUp = types.siftUp;
 const popHeap = types.popHeap;
 const neighbor_dirs = types.neighbor_dirs;
@@ -200,7 +201,7 @@ fn solveAbstract(
 }
 
 // Stitches the chosen abstract corridor (scratch.abstract.corridor, ordered portal
-// node indices root->goal) into scratch.stitched_scratch as one (level,cell) path.
+// (level, cell) refs root->goal) into scratch.stitched_scratch as one (level,cell) path.
 // A NON-link transition (corridor_link[i] == false) is walked with local A* between
 // consecutive portal cells; a LINK transition (corridor_link[i] == true) is a single
 // discrete jump (no intermediate cells), whether it crosses Z or is a same-level
@@ -228,7 +229,7 @@ fn stitchCorridor(
     var prev_cell: usize = start_index;
     var segments_used: usize = 0;
     for (scratch.abstract.corridor.items, 0..) |ref, i| {
-        const portal = graph.level_graphs.items[refLevel(ref)].portals.items[refLocal(ref)];
+        const portal = StitchedCell{ .level = refLevel(ref), .cell = refLocal(ref) };
         // The first corridor portal (i == 0) is on the start level and reached from
         // the start cell by a walkable span; later portals follow corridor_link.
         const is_link = i != 0 and scratch.abstract.corridor_link.items[i];
@@ -236,25 +237,25 @@ fn stitchCorridor(
             // Discrete link jump: append the far endpoint cell with no intermediate
             // cells (the agent crosses the link rather than walking).
             if (scratch.stitched_scratch.items.len >= cap) return .budget_exhausted;
-            scratch.stitched_scratch.appendAssumeCapacity(.{ .level = portal.level, .cell = portal.cell_index });
+            scratch.stitched_scratch.appendAssumeCapacity(.{ .level = portal.level, .cell = portal.cell });
         } else {
             // prev_level indexes a live level by construction (it came from the corridor
             // we just built); spill rather than panic if a malformed graph ever violates that.
             const grid = graph.grid(prev_level) orelse return .none;
             // appendSegment no-ops (no localAStar call) when prev_cell already equals the
             // portal cell, so only a genuine local search counts against segment_cap.
-            if (prev_cell != portal.cell_index) {
+            if (prev_cell != portal.cell) {
                 if (segments_used >= segment_cap) return .budget_exhausted;
                 segments_used += 1;
                 if (segments_used > scratch.max_stitch_segments_used) scratch.max_stitch_segments_used = segments_used;
             }
-            switch (appendSegment(scratch, grid, prev_level, prev_cell, portal.cell_index, cap)) {
+            switch (appendSegment(scratch, grid, prev_level, prev_cell, portal.cell, cap)) {
                 .found => {},
                 else => |r| return r,
             }
         }
         prev_level = portal.level;
-        prev_cell = portal.cell_index;
+        prev_cell = portal.cell;
     }
     // Final span: last corridor cell -> goal cell, a walkable same-level segment.
     // abstractCorridor only returns .found after buildCorridor validates the corridor ends
@@ -336,30 +337,13 @@ fn relaxAbstractNode(
     return true;
 }
 
-// Lower bound into a link_edge_refs slice sorted by (level, cell): returns the index of
-// the first entry with (level, cell) >= (query_level, query_cell), or items.len when all
-// entries are smaller. Used by abstractCorridor to find the incident-link range in O(log n).
-fn lowerBoundLinkRef(items: []const LinkEdgeRef, query_level: u16, query_cell: u32) usize {
-    var lo: usize = 0;
-    var hi: usize = items.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const item = items[mid];
-        if (item.level < query_level or (item.level == query_level and item.cell < query_cell)) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
-
-// Runs abstract A* over per-level portal CSRs plus the global link_edges. Node identity
-// is a packed (level << 32) | local ref. On success it writes the ordered corridor of
-// refs (root start-level portal -> goal-level portal) into scratch.abstract.corridor for
-// the stitcher to refine, and reports whether the corridor crosses a level. Per-query
-// work is bounded by the abstract node budget; seeding scans only the start chunk's
-// local-component portals, so it stays bounded independent of total cell count.
+// Runs abstract A* over chunk records. A node is a portal cell, packed as (level << 32) | cell.
+// Expanding a node relaxes the other portals of its chunk with its label (octile cost), the
+// mirror cell across each border it sits on (one cardinal step), and every link leaving it
+// whose target cell is open. On success it writes the ordered corridor of refs (root
+// start-level portal -> goal-level portal) into scratch.abstract.corridor for the stitcher
+// to refine, and reports whether the corridor crosses a level. Per-query work is bounded by
+// the abstract node budget; seeding scans only the start chunk's record.
 fn abstractCorridor(
     graph: *const NavGraph,
     scratch: *SearchScratch,
@@ -382,36 +366,54 @@ fn abstractCorridor(
     const abstract_parent = abstract.slot_parent;
     const abstract_via_link = abstract.slot_via_link;
 
-    // Seed the open set with the start cell's chunk-local-component portals on the start
-    // level, costed by octile distance from the start.
-    const start_component = start_grid.components.items[start_index];
-    if (start_component == no_component) return .unseedable;
+    // Chunk geometry once per query: `validateChunkGrid` keeps the chunk edge a power of
+    // two, so a cell's chunk and chunk-local index are shifts and masks of its coordinates.
+    const width: u32 = @intCast(graph.width);
+    const shift: u5 = @intCast(@ctz(graph.chunk_tiles));
+    const mask: u32 = @as(u32, graph.chunk_tiles) - 1;
+    std.debug.assert(std.math.isPowerOfTwo(graph.chunk_tiles));
+    const chunks_x: u32 = (width + mask) >> shift;
+    // Coordinates and indices stay unsigned: a validated level's cell index can pass 2^31.
+    const goal: u32 = @intCast(goal_index);
+    const goal_y = goal / width;
+    const goal_x = goal - goal_y * width;
+
+    // Seed the open set with the start chunk's portals sharing the start cell's label,
+    // costed by octile distance from the start.
+    const start_label = start_grid.labelAt(start_index);
+    if (start_label == 0) return .unseedable;
+    const start_cell: u32 = @intCast(start_index);
+    const start_y = start_cell / width;
+    const start_x = start_cell - start_y * width;
+    const start_portals = graph.chunkPortals(start_level, (start_y >> shift) * chunks_x + (start_x >> shift));
     var seeded: usize = 0;
-    for (graph.levelComponentPortals(start_level, start_component)) |local_node| {
-        const portal = graph.level_graphs.items[start_level].portals.items[local_node];
-        const ref = packRef(start_level, local_node);
-        const slot = abstract.slotFor(ref) orelse return .saturated;
-        const g = octileCells(graph.width, @intCast(start_index), portal.cell_index);
-        abstract_g[slot] = g;
-        abstract_parent[slot] = no_ref;
-        abstract_via_link[slot] = false;
-        if (abstract.open.items.len >= abstract.open_limit) return .saturated;
-        // Only the goal level has a cell coordinate comparable to the goal; off-level seed
-        // portals use h=0 to keep the heuristic admissible (matches the relax paths below).
-        const h = if (start_level == goal_level)
-            octileCells(graph.width, portal.cell_index, @intCast(goal_index))
-        else
-            0;
-        abstract.open.appendAssumeCapacity(.{ .index = ref, .f = g +| h, .h = h });
-        siftUp(abstract.open.items, abstract.open.items.len - 1);
-        seeded += 1;
+    for ([_][]const NavPortal{ start_portals.border, start_portals.extra }) |portals| {
+        for (portals) |portal| {
+            if (portal.label != start_label) continue;
+            const px = (start_x & ~mask) + (portal.local & mask);
+            const py = (start_y & ~mask) + (@as(u32, portal.local) >> shift);
+            const cell = py * width + px;
+            const slot = abstract.slotFor(packRef(start_level, cell)) orelse return .saturated;
+            const g = octileU32(start_x, start_y, px, py);
+            abstract_g[slot] = g;
+            abstract_parent[slot] = no_ref;
+            abstract_via_link[slot] = false;
+            if (abstract.open.items.len >= abstract.open_limit) return .saturated;
+            // Only the goal level has a cell coordinate comparable to the goal; off-level seed
+            // portals use h=0 to keep the heuristic admissible (matches the relax paths below).
+            const h = if (start_level == goal_level) octileU32(px, py, goal_x, goal_y) else 0;
+            abstract.open.appendAssumeCapacity(.{ .index = packRef(start_level, cell), .f = g +| h, .h = h });
+            siftUp(abstract.open.items, abstract.open.items.len - 1);
+            seeded += 1;
+        }
     }
     // A labeled component with zero portals is structurally sealed off from every
     // other chunk: a definitive negative (the disconnected-goal contract), not a
     // transient start condition.
     if (seeded == 0) return .none;
 
-    const goal_component = goal_grid.components.items[goal_index];
+    const goal_label = goal_grid.labelAt(goal_index);
+    const goal_chunk = ((goal / width) >> shift) * chunks_x + ((goal % width) >> shift);
 
     while (abstract.open.items.len != 0) {
         const current = popHeap(&abstract.open);
@@ -424,14 +426,18 @@ fn abstractCorridor(
         abstract_closed[current_slot] = true;
 
         const level = refLevel(current_ref);
-        const local = refLocal(current_ref);
-        const lg = &graph.level_graphs.items[level];
-        const portal = lg.portals.items[local];
+        const cell = refLocal(current_ref);
+        const y = cell / width;
+        const x = cell - y * width;
+        const chunk = (y >> shift) * chunks_x + (x >> shift);
+        const local: u8 = @intCast(((y & mask) << shift) | (x & mask));
+        const portals = graph.chunkPortals(level, chunk);
+        // Every relaxed node is a portal of its chunk's record (mirror runs are symmetric and
+        // an open link endpoint is a portal); a miss is a dead end.
+        const portal = portals.find(local) orelse continue;
         // Goal reached: this portal is on the goal level and shares the goal's chunk-local
         // component, so the local refiner can finish from here.
-        if (level == goal_level and goal_component != no_component and
-            goal_grid.components.items[portal.cell_index] == goal_component)
-        {
+        if (level == goal_level and goal_label != 0 and chunk == goal_chunk and portal.label == goal_label) {
             switch (buildCorridor(abstract, current_ref, start_level)) {
                 .ok => {},
                 // Budget-truncated reconstruction: spill+retry, never a hard negative.
@@ -442,47 +448,65 @@ fn abstractCorridor(
         }
 
         const current_g = abstract_g[current_slot];
-        // Intra-level CSR edges (target is a node slot on the same level).
-        const begin = lg.portal_edge_start.items[local];
-        const end = begin + lg.portal_edge_count.items[local];
-        for (lg.portal_edges.items[begin..end]) |edge| {
-            const target_portal = lg.portals.items[edge.target];
-            // Same-level non-goal hops still have a comparable goal cell when level ==
-            // goal_level; otherwise h=0 keeps the estimate admissible.
-            const h = if (level == goal_level)
-                octileCells(graph.width, target_portal.cell_index, @intCast(goal_index))
-            else
-                0;
-            if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(level, edge.target), edge.cost, false, h)) return .saturated;
-        }
-        // Cross-level link edges: resolve the partner endpoint cell to its portal node on
-        // the partner level through that level's cell_to_portal. h=0 unless the partner is
-        // on the goal level (no cell coordinate is comparable to the goal until then).
-        // link_edge_refs is sorted by (level, cell) so a binary search finds only the links
-        // incident to this portal, avoiding the O(link_count) full scan per expansion.
-        const ref_start = lowerBoundLinkRef(graph.link_edge_refs.items, level, portal.cell_index);
-        var ri = ref_start;
-        while (ri < graph.link_edge_refs.items.len) {
-            const ref = graph.link_edge_refs.items[ri];
-            if (ref.level != level or ref.cell != portal.cell_index) break;
-            ri += 1;
-            const link = graph.link_edges.items[ref.index];
-            if (!ref.reverse) {
-                const to_local = graph.level_graphs.items[link.to_level].cell_to_portal.items[link.to_cell];
-                if (to_local != no_cell) {
-                    const h = if (link.to_level == goal_level) octileCells(graph.width, link.to_cell, @intCast(goal_index)) else 0;
-                    if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(link.to_level, to_local), link.cost, true, h)) return .saturated;
-                }
-            } else {
-                const from_local = graph.level_graphs.items[link.from_level].cell_to_portal.items[link.from_cell];
-                if (from_local != no_cell) {
-                    const h = if (link.from_level == goal_level) octileCells(graph.width, link.from_cell, @intCast(goal_index)) else 0;
-                    if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(link.from_level, from_local), link.cost, true, h)) return .saturated;
-                }
+        const on_goal_level = level == goal_level;
+        const origin_x = x & ~mask;
+        const origin_y = y & ~mask;
+        const local_mask: u8 = @intCast(mask);
+        const local_x: u8 = local & local_mask;
+        const local_y: u8 = local >> @intCast(shift);
+        // Same-label portals of the chunk. Off the goal level h=0 keeps the estimate admissible.
+        for ([_][]const NavPortal{ portals.border, portals.extra }) |peers| {
+            for (peers) |peer| {
+                if (peer.local == local or peer.label != portal.label) continue;
+                const peer_x: u8 = peer.local & local_mask;
+                const peer_y: u8 = peer.local >> @intCast(shift);
+                const px = origin_x + peer_x;
+                const py = origin_y + peer_y;
+                const h = if (on_goal_level) octileU32(px, py, goal_x, goal_y) else 0;
+                // In-grid: below the level's cell count.
+                const target = py * width + px;
+                const cost = chunk_octile[@max(local_x, peer_x) - @min(local_x, peer_x)][@max(local_y, peer_y) - @min(local_y, peer_y)];
+                if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(level, target), cost, false, h)) return .saturated;
             }
+        }
+        // The mirror cell across each border this portal sits on.
+        // A flag means the mirror cell exists in-grid.
+        if (portal.flags.west and !relaxMirror(abstract, current_ref, current_g, level, cell - 1, x - 1, y, on_goal_level, goal_x, goal_y)) return .saturated;
+        if (portal.flags.east and !relaxMirror(abstract, current_ref, current_g, level, cell + 1, x + 1, y, on_goal_level, goal_x, goal_y)) return .saturated;
+        if (portal.flags.north and !relaxMirror(abstract, current_ref, current_g, level, cell - width, x, y - 1, on_goal_level, goal_x, goal_y)) return .saturated;
+        if (portal.flags.south and !relaxMirror(abstract, current_ref, current_g, level, cell + width, x, y + 1, on_goal_level, goal_x, goal_y)) return .saturated;
+        // Links leaving this cell whose target cell is open on a built level; only a
+        // link-flagged portal has any.
+        if (!portal.flags.link) continue;
+        for (portals.linksAt(local)) |link| {
+            const target_grid = graph.grid(link.to_level) orelse continue;
+            if (target_grid.isBlockedIndex(link.to_cell)) continue;
+            const h = if (link.to_level == goal_level) octileCells(graph.width, link.to_cell, goal) else 0;
+            if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(link.to_level, link.to_cell), link.cost, true, h)) return .saturated;
         }
     }
     return .none;
+}
+
+// Octile cost of a step of (dx, dy) cells within one chunk, by table.
+const chunk_octile: [16][16]u32 = blk: {
+    @setEvalBranchQuota(16 * 16 * 16);
+    var table: [16][16]u32 = undefined;
+    for (0..16) |dx| {
+        for (0..16) |dy| table[dx][dy] = octileXY(0, 0, dx, dy);
+    }
+    break :blk table;
+};
+
+comptime {
+    // Chunk-local coordinates are below the largest chunk edge.
+    std.debug.assert(@import("../../world_system.zig").max_chunk_size_tiles <= chunk_octile.len);
+}
+
+// Relaxes the mirror cell `target` at (mx, my) across a border at one cardinal step.
+fn relaxMirror(abstract: *AbstractScratch, parent_ref: usize, parent_g: u32, level: u16, target: u32, mx: u32, my: u32, on_goal_level: bool, goal_x: u32, goal_y: u32) bool {
+    const h = if (on_goal_level) octileU32(mx, my, goal_x, goal_y) else 0;
+    return relaxAbstractNode(abstract, parent_ref, parent_g, packRef(level, target), cardinal_cost, false, h);
 }
 
 // Outcome of reconstructing the abstract corridor from the parent chain.
@@ -660,31 +684,6 @@ fn recordStitched(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey,
 // Tests
 // ----------------------------------------------------------------------------
 
-test "lowerBoundLinkRef finds incident range bounds without bleeding across levels" {
-    // Sorted by (level, cell): two refs at (0,5), one at (0,9), one at (1,5).
-    const refs = [_]LinkEdgeRef{
-        .{ .level = 0, .cell = 5, .index = 0, .reverse = false },
-        .{ .level = 0, .cell = 5, .index = 1, .reverse = false },
-        .{ .level = 0, .cell = 9, .index = 2, .reverse = false },
-        .{ .level = 1, .cell = 5, .index = 3, .reverse = false },
-    };
-
-    // Exact key lands on the FIRST of the equal (0,5) run; the incident loop yields both
-    // (0,5) entries and stops at (0,9).
-    try std.testing.expectEqual(@as(usize, 0), lowerBoundLinkRef(&refs, 0, 5));
-    // A gap key (0,7) lands on the next-greater (0,9); the incident loop sees no (0,7) and
-    // breaks immediately (no false links).
-    try std.testing.expectEqual(@as(usize, 2), lowerBoundLinkRef(&refs, 0, 7));
-    // (0,9) yields only the (0,9) entry and must NOT bleed across the level boundary into (1,5).
-    try std.testing.expectEqual(@as(usize, 2), lowerBoundLinkRef(&refs, 0, 9));
-    // First entry on the next level resolves to the (1,5) index, not the level-0 tail.
-    try std.testing.expectEqual(@as(usize, 3), lowerBoundLinkRef(&refs, 1, 5));
-    // A key past every entry returns items.len.
-    try std.testing.expectEqual(@as(usize, 4), lowerBoundLinkRef(&refs, 2, 0));
-    // The empty slice is well-defined.
-    try std.testing.expectEqual(@as(usize, 0), lowerBoundLinkRef(&.{}, 0, 0));
-}
-
 test "reconstructLocalPath walks the parent chain into start-to-goal order" {
     var scratch = SearchScratch{};
     defer scratch.deinit(std.testing.allocator);
@@ -791,4 +790,50 @@ test "buildCorridor truncates at corridor_limit regardless of physical capacity"
     try claimAbstractChain(&a, 20, 3);
     try std.testing.expectEqual(CorridorBuild.ok, buildCorridor(&a, 22, 0));
     try std.testing.expectEqualSlices(usize, &.{ 20, 21, 22 }, a.corridor.items);
+}
+
+test "abstract expansion visits only same-label peers, border mirrors, and live links" {
+    const test_support = @import("test_support.zig");
+    const DataSystem = @import("../../data_system.zig").DataSystem;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try test_support.loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try test_support.requireTestTile(&meta, "grass");
+    const tree = try test_support.requireTestTile(&meta, "tree_0");
+    // 12x12 cells in 4-tile chunks. A full-height wall at x=5 splits chunk column 1 into
+    // two labels, and a one-way teleport from (9,9) lands on the blocked cell (2,2).
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+    for (0..12) |y| _ = try world.setDenseTile(obstacle, 5, @intCast(y), tree);
+    _ = try world.setDenseTile(obstacle, 2, 2, tree);
+    try world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 9, .y = 9 }, .level_b = 0, .cell_b = .{ .x = 2, .y = 2 }, .traversal_cost = 1, .bidirectional = false });
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(test_support.abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    const graph = &system.graph;
+    const grid = graph.grid(0).?;
+    const start = grid.indexForCell(.{ .x = 6, .y = 5 }).?;
+    const goal = grid.indexForCell(.{ .x = 2, .y = 5 }).?;
+
+    const scratch = &system.scratch_slots.items[0];
+    try std.testing.expectEqual(AbstractResult.none, abstractCorridor(graph, scratch, grid, grid, 0, 0, start, goal, 4096));
+    // Every node the search touched is a portal of its chunk's record east of the wall:
+    // no other-label peer in the start chunk, and never the dead link's blocked target.
+    const abstract = &scratch.abstract;
+    var touched: usize = 0;
+    var reached_link_source = false;
+    for (abstract.slot_stamp, abstract.slot_node) |stamp, node| {
+        if (stamp != abstract.generation) continue;
+        touched += 1;
+        try std.testing.expectEqual(@as(u16, 0), refLevel(node));
+        const cell = refLocal(node);
+        try std.testing.expect(cell % grid.width > 5);
+        try std.testing.expect(graph.chunkPortals(0, graph.chunkOf(cell)).find(graph.localOf(cell)) != null);
+        if (cell == grid.indexForCell(.{ .x = 9, .y = 9 }).?) reached_link_source = true;
+    }
+    try std.testing.expect(touched > 1);
+    try std.testing.expect(reached_link_source);
 }

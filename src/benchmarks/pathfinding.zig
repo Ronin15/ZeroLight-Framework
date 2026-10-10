@@ -1100,8 +1100,8 @@ pub fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options:
         // Deliberately tiny so the FIRST (tier-0) attempt exhausts regardless of grid
         // size, exercising the real promote-to-tier-1 path against the fixed tier-1
         // budget (see the group doc comment). Must stay below the fewest abstract-graph
-        // hops any such detour could need — nav_graph.zig's discoverChunkPortals now
-        // consolidates open boundary runs to one portal per side, so the graph is far
+        // hops any such detour could need — the nav records hold one border portal per
+        // open boundary run per side, so the graph is far
         // sparser than a per-cell scheme and a merely-small cap (64) is no longer
         // guaranteed to exhaust; 1 is the true floor, matching the same pattern already
         // used to force guaranteed tier-0 exhaustion in system.zig's own tests.
@@ -2050,11 +2050,12 @@ const EvictFixture = struct {
             if (changed.old_blocks_movement == changed.new_blocks_movement) return error.EvictDigUnchanged;
             self.changed.appendAssumeCapacity(.{ .level = changed.level, .x = changed.x, .y = changed.y });
         }
+        const version_before = self.system.graph.version;
         const start_ns = suite.nowNs(io);
         for (self.changed.items) |edit| try self.system.markNavDirty(edit.level, edit.x, edit.y);
-        const nav_stats = try self.system.applyBufferedNavUpdates(&self.data, &self.open.world, thread_system);
+        _ = try self.system.applyBufferedNavUpdates(&self.data, &self.open.world, thread_system);
         const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
-        if (nav_stats.version_bumps != 0) return error.EvictDigRebuiltNav;
+        if (self.system.graph.version != version_before) return error.EvictDigRebuiltNav;
         return elapsed;
     }
 };
@@ -2121,6 +2122,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
         fixture.system.nav_remask_tuner = tuner;
         fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
     }
     configureNavUpdateThreads(&fixture.system, case);
     try fixture.fillCache(case, thread_ptr);

@@ -511,6 +511,12 @@ pub const WorldSystem = struct {
     // Intrusive per-(level, chunk) endpoint lists over `level_links`, headed by
     // `LevelTerrain.link_heads`; entry `e` is the next endpoint after `e`.
     link_endpoint_next: std.ArrayList(u32) = .empty,
+    // Per level, per chunk: the link endpoints in that chunk's `link_heads` list. Parallel
+    // to `level_terrain`; directory-shaped like `link_heads`.
+    link_endpoint_counts: std.ArrayList([]u32) = .empty,
+    // Advances with every level's `content_revision`, so a reader checks one value per
+    // step and walks levels only when it moved.
+    content_revision: u32 = 0,
 
     // Each row's `store` holds that layer's tiles by chunk.
     dense_layers: std.MultiArrayList(DenseLayerRow) = .{},
@@ -780,6 +786,8 @@ pub const WorldSystem = struct {
 
         self.link_endpoint_next.deinit(self.allocator);
         self.level_links.deinit(self.allocator);
+        for (self.link_endpoint_counts.items) |counts| self.allocator.free(counts);
+        self.link_endpoint_counts.deinit(self.allocator);
         for (self.level_terrain.items) |*terrain| terrain.deinit(self.allocator);
         self.level_terrain.deinit(self.allocator);
         self.level_base_z.deinit(self.allocator);
@@ -2078,6 +2086,14 @@ pub const WorldSystem = struct {
         return endpoints;
     }
 
+    /// The number of link endpoints `levelChunkLinkEndpoints(level_index, chunk)` yields;
+    /// 0 for an invalid level or chunk. O(1).
+    pub fn levelChunkLinkEndpointCount(self: *const WorldSystem, level_index: u16, chunk: u32) u32 {
+        if (@as(usize, level_index) >= self.link_endpoint_counts.items.len) return 0;
+        const counts = self.link_endpoint_counts.items[level_index];
+        return if (chunk < counts.len) counts[chunk] else 0;
+    }
+
     /// Per-level composed navigability: whether any dense band on the level or any
     /// sparse obstacle on it blocks the cell. Out-of-range x/y returns blocked,
     /// matching denseTileBlocksMovement; an invalid level also returns blocked
@@ -2114,6 +2130,19 @@ pub const WorldSystem = struct {
         return self.level_terrain.items[level_index].blocked.form(chunk);
     }
 
+    /// The level's content revision: it changes whenever the level's composed
+    /// movement-blocked bits change through a path that emits no per-cell event (a blocking
+    /// dense layer add, a procedural fill). Compared with `!=`; O(1).
+    pub fn levelContentRevision(self: *const WorldSystem, level_index: u16) u32 {
+        return self.level_terrain.items[level_index].content_revision;
+    }
+
+    /// The world-wide content revision: it changes with every level's content revision, so
+    /// a reader compares it once and walks `levelContentRevision` only when it moved. O(1).
+    pub fn contentRevision(self: *const WorldSystem) u32 {
+        return self.content_revision;
+    }
+
     /// Reserves everything `addLevelLink(link)` needs without committing it: the
     /// link row and its two endpoint entries (each level holds its chunk heads from
     /// create). Validates the link first. O(1) amortized. Call before a world mutate
@@ -2138,10 +2167,12 @@ pub const WorldSystem = struct {
         const chunk_a = geom.chunkOf(link.cell_a.x, link.cell_a.y);
         self.link_endpoint_next.appendAssumeCapacity(heads_a[chunk_a]);
         heads_a[chunk_a] = endpoint_a;
+        self.link_endpoint_counts.items[link.level_a][chunk_a] += 1;
         const heads_b = self.level_terrain.items[link.level_b].link_heads;
         const chunk_b = geom.chunkOf(link.cell_b.x, link.cell_b.y);
         self.link_endpoint_next.appendAssumeCapacity(heads_b[chunk_b]);
         heads_b[chunk_b] = endpoint_a + 1;
+        self.link_endpoint_counts.items[link.level_b][chunk_b] += 1;
     }
 
     fn validateLevelLink(self: *const WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell }!void {
@@ -2247,8 +2278,13 @@ pub const WorldSystem = struct {
         self.chunk_geom = geom;
         try self.level_base_z.ensureUnusedCapacity(self.allocator, 1);
         try self.level_terrain.ensureUnusedCapacity(self.allocator, 1);
+        try self.link_endpoint_counts.ensureUnusedCapacity(self.allocator, 1);
+        const endpoint_counts = try self.allocator.alloc(u32, self.chunkCountPerLevel());
+        errdefer self.allocator.free(endpoint_counts);
+        @memset(endpoint_counts, 0);
         const terrain = try LevelTerrain.init(self.allocator, self.chunkCountPerLevel());
         self.level_terrain.appendAssumeCapacity(terrain);
+        self.link_endpoint_counts.appendAssumeCapacity(endpoint_counts);
         self.level_base_z.appendAssumeCapacity(base_z);
         // The deepest level bounds the render window's dense submit and GPU
         // residency. The visible sparse count is unchanged: the new level is empty.
@@ -2292,6 +2328,7 @@ pub const WorldSystem = struct {
         if (self.flagsFor(fill_tile).blocks_movement) {
             for (0..terrain.blocked.dir.len) |chunk| terrain.blocked.setChunk(@intCast(chunk), true);
             terrain.content_revision +%= 1;
+            self.content_revision +%= 1;
         }
         // The window's draws and GPU residency include the new layer from the next frame.
         self.dense_quads_dirty = true;
@@ -2747,6 +2784,7 @@ pub const WorldSystem = struct {
         store.finishChunkFill();
         terrain.blocked.finishChunkFill(geom);
         terrain.content_revision +%= 1;
+        self.content_revision +%= 1;
     }
 
     fn addProceduralSparseTiles(self: *WorldSystem, level: u16, ids: ProceduralTiles, seed: u64) !void {
@@ -2775,7 +2813,10 @@ pub const WorldSystem = struct {
                 }
             }
         }
-        if (added_blocking) self.level_terrain.items[level].content_revision +%= 1;
+        if (added_blocking) {
+            self.level_terrain.items[level].content_revision +%= 1;
+            self.content_revision +%= 1;
+        }
     }
 };
 
@@ -6720,6 +6761,8 @@ test "levelChunkLinkEndpoints yields exactly the chunk's endpoints, newest first
                 previous = id;
             }
             try std.testing.expectEqual(expected_count, count);
+            // The O(1) count equals the list walk.
+            try std.testing.expectEqual(count, world.levelChunkLinkEndpointCount(level, chunk));
         }
     }
     // An invalid level or chunk yields nothing.
@@ -6727,6 +6770,8 @@ test "levelChunkLinkEndpoints yields exactly the chunk's endpoints, newest first
     try std.testing.expect(missing_level.next() == null);
     var missing_chunk = world.levelChunkLinkEndpoints(1, @intCast(geom.chunkCount()));
     try std.testing.expect(missing_chunk.next() == null);
+    try std.testing.expectEqual(@as(u32, 0), world.levelChunkLinkEndpointCount(3, 0));
+    try std.testing.expectEqual(@as(u32, 0), world.levelChunkLinkEndpointCount(1, @intCast(geom.chunkCount())));
 }
 
 test "reserveLevelLink makes addLevelLink allocation-free and a failed add changes nothing (FailingAllocator)" {
@@ -6882,6 +6927,36 @@ test "a blocking dense layer add and procedural fills advance the level's conten
     _ = try world.addSparseTile(level, 5, 5, tiles.tree, 0, .obstacle);
     try std.testing.expectEqual(@as(u32, 1), world.level_terrain.items[level].content_revision);
     try std.testing.expectEqual(@as(u32, 1), world.level_terrain.items[1].content_revision);
+}
+
+test "levelContentRevision reads each level's revision and contentRevision moves with every level bump" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const surface = try world.addLevel(0);
+    const below = try world.addLevel(-level_z_step);
+    const start = world.contentRevision();
+    _ = try world.addDenseLayer(surface, 0, .floor, tiles.grass);
+    // A walkable layer and a dig change no revision.
+    _ = (try world.setDenseTile(world.denseFloorLayerForLevel(surface).?, 1, 1, tiles.cave)).?;
+    try std.testing.expectEqual(start, world.contentRevision());
+    _ = try world.addDenseLayer(below, 0, .obstacle, tiles.dirt);
+    try std.testing.expectEqual(world.level_terrain.items[below].content_revision, world.levelContentRevision(below));
+    try std.testing.expectEqual(@as(u32, 0), world.levelContentRevision(surface));
+    try std.testing.expect(world.contentRevision() != start);
+    const after_below = world.contentRevision();
+    _ = try world.addDenseLayer(surface, 0, .obstacle, tiles.dirt);
+    try std.testing.expectEqual(@as(u32, 1), world.levelContentRevision(surface));
+    try std.testing.expect(world.contentRevision() != after_below);
 }
 
 // Every chunk of `layer` is uniform exactly when its in-level cells hold one tile, by

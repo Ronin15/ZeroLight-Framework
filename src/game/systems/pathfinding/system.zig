@@ -19,6 +19,7 @@ const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const JobFn = @import("../../../app/thread_system.zig").JobFn;
+const ParallelForOptions = @import("../../../app/thread_system.zig").ParallelForOptions;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -37,7 +38,6 @@ const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavExtent = @import("nav_graph.zig").NavExtent;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
-const nav_memory = @import("nav_memory.zig");
 const GroupField = @import("group_field.zig").GroupField;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const ResultCache = @import("caches.zig").ResultCache;
@@ -56,6 +56,7 @@ const PathfindingStats = types.PathfindingStats;
 const PathView = types.PathView;
 const PathQueryKey = types.PathQueryKey;
 const NavCellEdit = types.NavCellEdit;
+const NavMark = types.NavMark;
 const NavUpdateStats = types.NavUpdateStats;
 const PendingRequest = types.PendingRequest;
 const PendingRing = types.PendingRing;
@@ -87,6 +88,23 @@ const GridCell = types.GridCell;
 const IntakeRecordList = std.ArrayListAligned(IntakeRecord, .fromByteUnits(thread_shared_record_alignment));
 const GroupKeyCountList = std.ArrayListAligned(GroupKeyCount, .fromByteUnits(thread_shared_record_alignment));
 const IntakeTallyList = std.ArrayListAligned(IntakeTally, .fromByteUnits(thread_shared_record_alignment));
+const NavMarkList = std.ArrayListAligned(NavMark, .fromByteUnits(thread_shared_record_alignment));
+const NavMarkTallyList = std.ArrayListAligned(NavMarkTally, .fromByteUnits(thread_shared_record_alignment));
+
+// One `nav_mark` range's mark count, padded to its own cache line.
+const NavMarkTally = struct {
+    count: usize align(thread_shared_record_alignment) = 0,
+};
+
+// A static body's change marks its old and its new footprint.
+const max_marks_per_event: usize = 2;
+// `nav_mark` range alignment: every range's staging window starts on a cache line.
+const nav_mark_range_alignment_items: usize = 2 * simd.lane_count;
+
+comptime {
+    std.debug.assert((max_marks_per_event * nav_mark_range_alignment_items * @sizeOf(NavMark)) % thread_shared_record_alignment == 0);
+    std.debug.assert(@sizeOf(NavMarkTally) % thread_shared_record_alignment == 0);
+}
 
 pub const PathfindingSystem = struct {
     allocator: std.mem.Allocator,
@@ -125,27 +143,19 @@ pub const PathfindingSystem = struct {
     // when one worker solves several in the same range.
     worker_path_pool: std.ArrayList(u32) = .empty,
     next_group_evict: usize = 0,
-    // Pre-reserved per-level affected-flag scratch for incremental nav updates. Sized
-    // to the level count at rebuild so `applyNavUpdates` allocates nothing per edit on
-    // the steady path; it is the main-thread post-commit reaction, never a worker.
-    affected_levels: std.ArrayList(bool) = .empty,
-    // Per-edit changed nav-cell spans driving scoped cache eviction on incremental updates.
-    nav_changed_spans: std.ArrayList(types.ChangedSpan) = .empty,
-    // System-owned dirty nav-cell buffer for the per-step incremental update. Producers
-    // (e.g. the gameplay state's post-commit reaction) interpret structural events into
-    // changed cells and push them here via markNavDirty; applyBufferedNavUpdates coalesces
-    // them to a per-chunk remask and clears the buffer. Grows rather than drops, so any
-    // number of simultaneous diggers/obstacle edits in one step still reach the nav graph
-    // (a dropped cell would leave the graph stale against the world). Reserved at capacity
-    // so typical steps are allocation-free; a large step does one bounded amortized grow.
-    nav_dirty_edits: std.ArrayList(NavCellEdit) = .empty,
-    // Entity-driven obstacle-rect edits for this step, already resolved to nav-cell spans (see
-    // markNavObstacleRectDirty). Bounded/reserved and cleared alongside nav_dirty_edits.
-    nav_dirty_cell_spans: std.ArrayList(types.ChangedSpan) = .empty,
-    // Levels to remask + repatch in full this step (deduped). Used when a change cannot be
-    // localized to a cell — e.g. a destroyed/toggled static obstacle whose nav cell is no
-    // longer resolvable from the entity — so the whole level is re-derived from the world.
-    nav_dirty_levels: std.ArrayList(u16) = .empty,
+    // Nav changes recorded since the last nav batch, consumed and cleared by the next one;
+    // kept across a failed batch so the retry applies them. Grows at the mark seam (the
+    // `nav_mark` reserve) rather than dropping: a dropped mark leaves nav stale.
+    nav_marks: std.ArrayList(NavMark) = .empty,
+    // `nav_mark` staging: up to `max_marks_per_event` slots per event (each range writes
+    // only its own window) and one padded tally per range. Reserved to the step's event
+    // count before dispatch.
+    nav_mark_staging: NavMarkList = .empty,
+    nav_mark_tallies: NavMarkTallyList = .empty,
+    // Batch shape of the most recent `nav_mark` stage, for bench and diagnostic reporting.
+    last_mark_batch: BatchStats = .{},
+    /// Telemetry: mark reserves that grew the mark buffer.
+    nav_mark_grows: u64 = 0,
     // Every admitted solve runs in the worker-driven fallback batch; this tuner owns its
     // adaptive profile. The request-side stages own theirs.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -159,6 +169,10 @@ pub const PathfindingSystem = struct {
     // per stage, never shared across work shapes).
     nav_remask_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_patch_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The `nav_mark` stage (structural events interpreted into nav marks) and the nav
+    // batch's key plan each own a tuner.
+    nav_mark_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // Threaded nav-update control config. Production runs adaptive (the tuners decide range
     // sizing); the nav-update benchmark pins these to a FIXED partition so the adaptive tuner
     // can be measured against fixed controls (the shared cross-bench theme).
@@ -220,11 +234,9 @@ pub const PathfindingSystem = struct {
         self.rotate_back_scratch.deinit(self.allocator);
         self.resize_group_snapshot.deinit(self.allocator);
         self.resize_pending_snapshot.deinit(self.allocator);
-        self.affected_levels.deinit(self.allocator);
-        self.nav_changed_spans.deinit(self.allocator);
-        self.nav_dirty_levels.deinit(self.allocator);
-        self.nav_dirty_cell_spans.deinit(self.allocator);
-        self.nav_dirty_edits.deinit(self.allocator);
+        self.nav_mark_tallies.deinit(self.allocator);
+        self.nav_mark_staging.deinit(self.allocator);
+        self.nav_marks.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
         self.solved_paths.deinit(self.allocator);
         self.scratch_slots.deinit(self.allocator);
@@ -313,20 +325,8 @@ pub const PathfindingSystem = struct {
         try self.group_field_slots.ensureTotalCapacity(self.allocator, self.group_fields.items.len);
         try resizeArrayList(GroupRequestTally, &self.group_requests, self.allocator, capacity.max_solved_requests_per_step);
         try self.group_key_map.reserve(self.allocator, capacity.max_solved_requests_per_step);
-        // Pre-reserve the changed-span scratch so steady-path scoped eviction is alloc-free.
-        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
-        // Pre-reserve the dirty nav-cell buffer to the same steady-path high-water; it still
-        // grows (never drops) for an unusually large structural step.
-        try self.nav_dirty_edits.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
-        // 2x nav_dirty_edits's bound: reactToPostCommitNavEvents's component_changed handling
-        // appends up to two spans per structural change (old_obstacle_world_rect and
-        // new_obstacle_world_rect) whenever a moving entity stays a static nav obstacle
-        // across the change, not just one.
-        try self.nav_dirty_cell_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests * 2);
-        // Deduped whole-level dirty set: at most one entry per level. Pre-reserve a
-        // fixed small ceiling independent of map size so steady-path level marks are
-        // allocation-free; grows on demand for an unusually multi-level world.
-        try self.nav_dirty_levels.ensureTotalCapacity(self.allocator, @max(capacity.nav_full_relabel_level_threshold, @as(usize, 8)));
+        // The steady-path mark high-water; the `nav_mark` reserve grows it for a larger step.
+        try self.nav_marks.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
         // One scratch slot per threaded participant (workers + main). The configured
         // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
         // lazily on first solve.
@@ -358,8 +358,7 @@ pub const PathfindingSystem = struct {
     }
 
     /// Raises `max_agent_budget` to `requested` (never lowers it). Population is
-    /// runtime-growing, so the raise is never refused: `max_nav_memory_bytes` is checked
-    /// only at the nav build. Main thread, population seam. Never writes
+    /// runtime-growing, so the raise is never refused. Main thread, population seam. Never writes
     /// `group_field_threshold_ceiling`: a raise lifts capacity, not policy.
     pub fn raiseAgentBudget(self: *PathfindingSystem, requested: usize) void {
         self.capacity.max_agent_budget = @max(self.capacity.max_agent_budget, requested);
@@ -484,39 +483,20 @@ pub const PathfindingSystem = struct {
         if (self.scratch_slots.items.len == 0) {
             try self.reserve(self.capacity);
         }
-        const level_count: usize, const link_count: usize, const nav_chunk_tiles: u16 = switch (extent) {
-            .world => |world_system| .{ @max(@as(usize, 1), world_system.levelCount()), world_system.levelLinks().len, world_system.chunk_size_tiles },
-            .bounds => |bounds| .{ 1, 0, bounds.chunk_tiles },
-        };
-        // Load-time gate against the configured elastic-ceiling caps (see budgetForCapacity).
-        // A population raise past it is never refused.
-        var budget = nav_memory.budgetForCapacity(self.capacity, level_count, link_count);
-        budget.chunk_tiles = nav_chunk_tiles;
-        try self.graph.rebuild(data, extent, budget, thread_system);
-        // The init per-level builds (inside rebuild) grow each level's portal/edge
-        // buffers to their real size; clearRetainingCapacity keeps that high-water mark.
-        // A later incremental applyNavUpdates within the high-water mark allocates nothing; a
-        // genuine topology expansion past it does one bounded amortized growth (a cold,
-        // event-triggered main-thread path — see applyNavUpdates). No O(cells)
-        // pre-reserve, so large SPARSE worlds (few portals) stay cheap and pass the gate.
+        try self.graph.rebuild(data, extent, self.capacity.worker_participant_count, self.navUpdateThreads(thread_system));
+        // Per-cell scratch and group fields follow the level's cell count; every participant
+        // slot is sized here, never lazily per frame.
         const cell_count = self.graph.cellCount();
         for (self.group_fields.items) |*field| {
             try field.reserve(self.allocator, cell_count);
         }
-        // Per-cell A* scratch is O(cells) per slot. The participant count is a fixed
-        // configured property, so size EVERY participant slot here as part of the build
-        // (the O(cells) memset hides in this one-time build cost) — no lazy per-frame
-        // sizing. Resident scratch is bounded by participant count, not any slot cap.
-        // A nav rebuild with a new cell_count re-sizes all slots the same way.
         for (self.scratch_slots.items) |*scratch| {
             try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, cell_count);
         }
-        // Pre-reserve the per-level affected-flag scratch so a steady-path
-        // applyNavUpdates allocates nothing per edit.
-        try setLen(&self.affected_levels, self.allocator, self.graph.levelCount());
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
+        self.nav_marks.clearRetainingCapacity();
         // A rebuild can change cell/chunk counts and thus the per-item work cost, so the
         // adaptive tuners' learned profiles no longer apply — reset them to relearn against
         // the new topology rather than acting on a stale cost model.
@@ -526,110 +506,58 @@ pub const PathfindingSystem = struct {
         self.group_field_begin_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_mark_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_plan_tuner = AdaptiveWorkTuner.init(.{});
     }
 
-    // Incrementally folds a batch of static-obstacle edits into the existing nav
-    // graph at the main-thread post-commit reaction point (never on a worker). Only
-    // affected levels' masks/components are recomputed; the abstract graph is rebuilt
-    // once; `nav_version` bumps once so goal-keyed caches/pending entries re-solve.
-    // Runtime request/result state is cleared (caches invalidate on the version bump),
-    // while group fields are dropped to .empty so a stale field is never sampled. No
-    // whole-world rebuild and no scratch reallocation occur on the steady path.
-    // Serial incremental update over an explicit edit slice (tests, bench, direct callers).
-    // Production uses the buffered path, which can thread the chunk patch.
+    fn navUpdateThreads(self: *PathfindingSystem, thread_system: ?*ThreadSystem) ?NavUpdateThreads {
+        const threads = thread_system orelse return null;
+        return .{
+            .thread_system = threads,
+            .plan_tuner = &self.nav_plan_tuner,
+            .remask_tuner = &self.nav_remask_tuner,
+            .patch_tuner = &self.nav_patch_tuner,
+            .adaptive = self.nav_thread_adaptive,
+            .items_per_range = self.nav_thread_items_per_range,
+        };
+    }
+
+    /// Marks `edits` and applies them with every other pending nav change, serially. For
+    /// tests, benches, and direct callers; play marks from committed events.
     pub fn applyNavUpdates(
         self: *PathfindingSystem,
         data: *const DataSystem,
         world: *const WorldSystem,
         edits: []const NavCellEdit,
     ) !NavUpdateStats {
-        return self.applyNavUpdatesImpl(data, world, edits, &.{}, &.{}, null);
+        try self.reserveNavMarks(edits.len);
+        for (edits) |edit| appendMergedMark(&self.nav_marks, tileMark(edit.level, edit.x, edit.y, edit.x, edit.y), self.graph.chunk_tiles);
+        return self.applyBufferedNavUpdates(data, world, null);
     }
 
-    fn applyNavUpdatesImpl(
-        self: *PathfindingSystem,
-        data: *const DataSystem,
-        world: *const WorldSystem,
-        edits: []const NavCellEdit,
-        cell_edits: []const types.ChangedSpan,
-        full_level_ids: []const u16,
-        thread_system: ?*ThreadSystem,
-    ) !NavUpdateStats {
-        // The incremental update has two per-stage threaded processors (remask/re-flood and the
-        // abstract patch), each fanned across workers by its own tuner: small digs run inline,
-        // dig-storms thread. No fixed budget — the tuners are the work-sizing policy.
-        const update_threads: ?NavUpdateThreads = if (thread_system) |ts|
-            .{
-                .thread_system = ts,
-                .remask_tuner = &self.nav_remask_tuner,
-                .patch_tuner = &self.nav_patch_tuner,
-                .adaptive = self.nav_thread_adaptive,
-                .items_per_range = self.nav_thread_items_per_range,
-            }
-        else
-            null;
-        const stats = try self.graph.applyNavUpdates(
-            data,
-            world,
-            edits,
-            cell_edits,
-            full_level_ids,
-            &self.affected_levels,
-            self.capacity.nav_full_relabel_level_threshold,
-            update_threads,
-        );
-        if (stats.version_bumps != 0) {
-            // Full rebuild bumped nav_version: blunt-invalidate all work and group fields.
-            self.clearTransientRequestsRetainingFields();
-            self.dropGroupFields();
-        } else if (stats.incremental_rebuilds != 0) {
-            if (full_level_ids.len != 0) {
-                // A whole-level remask is not bounded by edit spans, so scoped eviction cannot
-                // find every stale path. Drop the entire completed cache instead. Graph node ids
-                // are unchanged (no topology rebuild), so nav_version stays stable.
-                self.completed.clear();
-            } else {
-                // Incremental edit: evict only cached paths that cross the changed cells.
-                try self.evictCachedPathsCrossingEdits(world, edits, cell_edits);
-            }
-            // Short-lived pending/unavailable/group state is dropped and rebuilt.
-            self.clearRequestStateKeepingCompleted();
-            self.dropGroupFields();
-        }
-        return stats;
-    }
-
-    // Clears the system-owned dirty nav-cell buffer. Call once before a step's marking pass so
-    // an error path that skips the apply never leaks stale edits into the next step.
+    /// Drops every recorded nav mark.
     pub fn clearNavDirty(self: *PathfindingSystem) void {
-        self.nav_dirty_edits.clearRetainingCapacity();
-        self.nav_dirty_cell_spans.clearRetainingCapacity();
-        self.nav_dirty_levels.clearRetainingCapacity();
+        self.nav_marks.clearRetainingCapacity();
     }
 
-    // Records one changed nav cell for the next incremental update. Grows the buffer rather
-    // than dropping: applyBufferedNavUpdates coalesces cells to a per-chunk remask, and a
-    // dropped cell would leave the nav graph stale against the world.
+    /// Records one changed world tile for the next nav batch. Grows the mark buffer rather
+    /// than dropping.
     pub fn markNavDirty(self: *PathfindingSystem, level: u16, x: u16, y: u16) !void {
-        try self.nav_dirty_edits.append(self.allocator, .{ .level = level, .x = x, .y = y });
+        try self.reserveNavMarks(1);
+        appendMergedMark(&self.nav_marks, tileMark(level, x, y, x, y), self.graph.chunk_tiles);
     }
 
-    // Records one entity-driven static-obstacle world-space rect for the next incremental
-    // update, resolved to a nav-cell span immediately so the buffered batch never re-derives
-    // it from a stale entity. A no-op when `level` has no built grid. Grows the buffer rather
-    // than dropping, matching markNavDirty.
+    /// Records one static body's world-space rect for the next nav batch, resolved to a
+    /// nav-cell span now so the batch never re-derives it from a moved entity. A no-op when
+    /// `level` has no built grid.
     pub fn markNavObstacleRectDirty(self: *PathfindingSystem, level: u16, rect: ObstacleWorldRect) !void {
-        const grid = self.graph.grid(level) orelse return;
-        const span = grid.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
-        try self.nav_dirty_cell_spans.append(self.allocator, .{ .level = level, .span = span });
+        const mark = staticSpanMark(&self.graph, level, rect) orelse return;
+        try self.reserveNavMarks(1);
+        self.nav_marks.appendAssumeCapacity(mark);
     }
 
-    // Records one exclusive world-tile rect (e.g. a `world_obstacle_changed` event) as a
-    // single nav-cell span — O(1) append, not an O(tiles) NavCellEdit expand. A no-op when
-    // the rect is empty, fully out of world bounds, or `level` has no built grid. Partial
-    // overlap clamps to the world (mirrors perception dirty-rect clamping) so an
-    // overshooting max corner still dirties the in-bounds portion. Grows rather than
-    // dropping, matching markNavDirty / markNavObstacleRectDirty.
+    /// Records one exclusive world-tile rect (a `world_obstacle_changed` event) as one mark,
+    /// clamped to the world; a no-op for an empty or fully out-of-world rect.
     pub fn markNavTileRectDirty(
         self: *PathfindingSystem,
         world: *const WorldSystem,
@@ -639,139 +567,182 @@ pub const PathfindingSystem = struct {
         max_x_exclusive: u16,
         max_y_exclusive: u16,
     ) !void {
-        // Clamp both ends to world so a rect that straddles the edge still dirties the
-        // in-bounds slice; a fully OOB or inverted rect becomes empty and no-ops.
-        const clamped_min_x = @min(min_x, world.width);
-        const clamped_min_y = @min(min_y, world.height);
-        const clamped_max_x = @min(max_x_exclusive, world.width);
-        const clamped_max_y = @min(max_y_exclusive, world.height);
-        if (clamped_min_x >= clamped_max_x or clamped_min_y >= clamped_max_y) return;
-        // Corners are in-bounds by construction after the clamp above.
-        const min_rect = world.cellRect(clamped_min_x, clamped_min_y) orelse return;
-        const max_rect = world.cellRect(clamped_max_x - 1, clamped_max_y - 1) orelse return;
-        try self.markNavObstacleRectDirty(level, .{
-            .min_x = min_rect.x,
-            .min_y = min_rect.y,
-            .max_x = max_rect.x + max_rect.w,
-            .max_y = max_rect.y + max_rect.h,
-        });
+        const mark = tileRectMark(world, level, min_x, min_y, max_x_exclusive, max_y_exclusive) orelse return;
+        try self.reserveNavMarks(1);
+        self.nav_marks.appendAssumeCapacity(mark);
     }
 
-    // Marks a whole level for re-derivation next update. Use when a change cannot be reduced to
-    // specific cells (e.g. a destroyed static obstacle whose nav cell is no longer resolvable):
-    // the level's mask/components and abstract layer are rebuilt from the world. Deduped.
-    // Steady-path marks (within the reserve ceiling) use appendAssumeCapacity so they stay
-    // allocation-free after reserve; an unusually multi-level world grows past that ceiling.
+    /// Marks a whole level for re-derivation, its static coverage included, for a change
+    /// no span describes.
     pub fn markNavLevelDirty(self: *PathfindingSystem, level: u16) !void {
-        for (self.nav_dirty_levels.items) |existing| {
-            if (existing == level) return;
-        }
-        if (self.nav_dirty_levels.items.len < self.nav_dirty_levels.capacity) {
-            self.nav_dirty_levels.appendAssumeCapacity(level);
-        } else {
-            try self.nav_dirty_levels.append(self.allocator, level);
-        }
+        try self.reserveNavMarks(1);
+        self.nav_marks.appendAssumeCapacity(levelMark(level));
     }
 
-    // Defensive fallback for reactToPostCommitNavEvents: an entity-driven obstacle event that
-    // invalidates navigation but carries no resolvable world-space rect. Should be unreachable
-    // (isStaticNavigationObstacle requires movement_body + collision_bounds + collision_response,
-    // exactly what staticObstacleWorldRect needs), so this is loud rather than a silent whole-level
-    // rebuild, matching the edge-cap-fallback warn pattern in nav_graph.zig.
-    fn markNavLevelDirtyWithFallbackWarn(self: *PathfindingSystem, level: u16) !void {
-        if (comptime logging.enabled(.warn) and !builtin.is_test)
-            logging.game.warn("nav obstacle invalidation with no resolvable world rect; falling back to whole-level dirty (level {})", .{level});
-        try self.markNavLevelDirty(level);
+    // Grows the mark buffer to hold `count` more marks: the mark seam. Geometric, counted.
+    fn reserveNavMarks(self: *PathfindingSystem, count: usize) !void {
+        const needed = self.nav_marks.items.len + count;
+        if (needed <= self.nav_marks.capacity) return;
+        try self.nav_marks.ensureTotalCapacity(self.allocator, needed);
+        self.nav_mark_grows += 1;
     }
 
-    // Whether any dirty nav cell, obstacle rect, or whole-level request is buffered for this step.
-    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
-        return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_cell_spans.items.len != 0 or self.nav_dirty_levels.items.len != 0;
+    /// Whether the next nav update has work: recorded marks, or (nav built over `world`) a
+    /// level, a link, or a content revision nav has not applied. O(1).
+    pub fn hasPendingNavUpdates(self: *const PathfindingSystem, world: *const WorldSystem) bool {
+        if (self.nav_marks.items.len != 0) return true;
+        if (!self.graph.world_backed) return false;
+        return world.levelCount() != self.graph.levelCount() or
+            world.levelLinks().len != self.graph.links_applied or
+            world.contentRevision() != self.graph.built_world_revision;
     }
 
-    // Applies the buffered dirty nav cells, obstacle rects, and whole-level requests as one
-    // incremental update, then clears the buffers. Returns zero stats when nothing is
-    // buffered. A non-null thread_system lets the chunk patch thread (tuner-gated); null keeps
-    // it serial.
+    /// Applies every pending nav change, each step its own transaction: builds the levels
+    /// the world added, rebuilds the levels whose content revision moved, then applies the
+    /// recorded marks and new links as one batch. A committed step stays on a later error;
+    /// marks and the level, revision, and link gaps stay pending for the next call. The
+    /// world-wide revision is compared once; levels are walked only when it moved. A
+    /// non-null `thread_system` lets each stage thread under its tuner.
     pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, self.nav_dirty_cell_spans.items, self.nav_dirty_levels.items, thread_system);
-        self.nav_dirty_edits.clearRetainingCapacity();
-        self.nav_dirty_cell_spans.clearRetainingCapacity();
-        self.nav_dirty_levels.clearRetainingCapacity();
+        var stats = NavUpdateStats{};
+        const threads = self.navUpdateThreads(thread_system);
+        if (self.graph.world_backed) {
+            while (self.graph.levelCount() < world.levelCount()) {
+                try self.graph.buildLevel(data, world, @intCast(self.graph.levelCount()), threads, &stats);
+            }
+            if (world.contentRevision() != self.graph.built_world_revision) {
+                for (0..self.graph.levelCount()) |level_index| {
+                    const level: u16 = @intCast(level_index);
+                    if (self.graph.level_graphs.items[level].built_revision == world.levelContentRevision(level)) continue;
+                    try self.graph.buildLevel(data, world, level, threads, &stats);
+                    // The level changed without per-cell spans: no cached result is known good.
+                    self.completed.clear();
+                    self.clearRequestStateKeepingCompleted();
+                    self.dropGroupFields();
+                }
+                self.graph.built_world_revision = world.contentRevision();
+            }
+        }
+        if (try self.graph.prepareMarks(data, world, self.nav_marks.items, threads, &stats)) |prepared| {
+            const batch = self.graph.commitMarks(prepared, data, threads, &stats);
+            if (batch.changed) {
+                // Graph node ids never persist, so cached results stay keyed by cells: evict
+                // only those crossing a changed span.
+                self.completed.evictCrossing(&self.graph, batch.spans);
+                self.clearRequestStateKeepingCompleted();
+                self.dropGroupFields();
+            }
+        }
+        self.nav_marks.clearRetainingCapacity();
         return stats;
     }
 
-    // Reacts to committed structural events: interprets nav-invalidating world/obstacle changes
-    // into dirty nav cells, folds them into the existing nav graph incrementally (affected levels
-    // only), and emits one nav_region_invalidated domain-reaction event when the graph actually
-    // changed. Cell-localizable tile/obstacle edits forward one dirty cell each; entity-driven
-    // changes resolve their carried world-space rect to a nav-cell span and patch only the
-    // affected chunks, same as tile edits. Returns the batch stats (zero when nothing was pending).
-    //
-    // Deliberately does NOT clear the dirty buffers at entry: applyBufferedNavUpdates only
-    // clears them after a successful apply (see its doc comment), so an error here (e.g. this
-    // function's own `try` on ensureCanAppend, or a propagated applyNavUpdatesImpl failure)
-    // leaves this step's marks in the buffer for the NEXT call's marking pass to union with and
-    // retry — matching the buffer's own "grows rather than drops" contract across a failed step,
-    // not just within one. Re-applying an already-applied cell is always safe (a nav-cell edit
-    // re-derives its blocked state from current data/world, never from a stale snapshot), so the
-    // union is never wrong, only possibly redundant.
+    /// The post-commit nav reaction: interprets this step's committed nav events into marks
+    /// (the threaded `nav_mark` stage), applies every pending nav change, and emits one
+    /// `nav_region_invalidated` when the graph changed. An out-of-memory mark reserve
+    /// records no mark; a failed apply keeps the marks and gaps for the next step.
     pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        for (frame.events.mergedItems()) |event| {
-            if (event.stage != .structural_commit) continue;
-            if (!eventInvalidatesNavigation(event)) continue;
-            switch (event.payload) {
-                .world_tile_changed => |changed| try self.markNavDirty(changed.level, changed.x, changed.y),
-                // One ChangedSpan covering the exclusive tile rect — not an O(tiles)
-                // NavCellEdit loop (markNavObstacleRectDirty path). Empty rects no-op.
-                .world_obstacle_changed => |changed| try self.markNavTileRectDirty(
-                    world,
-                    changed.level,
-                    changed.min_x,
-                    changed.min_y,
-                    changed.max_x_exclusive,
-                    changed.max_y_exclusive,
-                ),
-                .entity_destroyed => |destroyed| {
-                    // Stamped from world_level at structural commit (default 0 when missing).
-                    // markStaticBodies is still level-0-only for full body rasterize; this
-                    // path only marks dirty on the event's plane so multi-level is ready.
-                    const level = destroyed.level;
-                    if (destroyed.obstacle_world_rect) |rect| {
-                        try self.markNavObstacleRectDirty(level, rect);
-                    } else {
-                        try self.markNavLevelDirtyWithFallbackWarn(level);
-                    }
-                },
-                .component_changed => |changed| {
-                    // Same as destroy: use stamped plane (default 0), not a hardcoded 0.
-                    const level = changed.level;
-                    if (changed.old_obstacle_world_rect) |rect| {
-                        try self.markNavObstacleRectDirty(level, rect);
-                    } else if (changed.was_static_navigation_obstacle) {
-                        try self.markNavLevelDirtyWithFallbackWarn(level);
-                    }
-                    if (changed.new_obstacle_world_rect) |rect| {
-                        try self.markNavObstacleRectDirty(level, rect);
-                    } else if (changed.is_static_navigation_obstacle) {
-                        try self.markNavLevelDirtyWithFallbackWarn(level);
-                    }
-                },
-                else => {},
-            }
-        }
-
-        if (!self.hasPendingNavUpdates()) return .{};
+        const mark_off_main_ns = try self.markNavEvents(frame.events.mergedItems(), world, thread_system);
+        if (!self.hasPendingNavUpdates(world)) return .{ .off_main_stage_ns = mark_off_main_ns };
         try frame.events.ensureCanAppend(1);
-        const stats = try self.applyBufferedNavUpdates(data, world, thread_system);
-        // Only signal invalidation when the batch actually changed the graph: an incremental dig
-        // keeps nav_version stable, so gate on real work too, not just a full-rebuild version bump.
-        if (stats.version_bumps == 0 and stats.incremental_rebuilds == 0) return stats;
+        var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
+        stats.off_main_stage_ns += mark_off_main_ns;
+        if (stats.incremental_rebuilds == 0 and stats.levels_built == 0) return stats;
         try frame.events.appendRequired(.{
             .stage = .domain_reaction,
             .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
         });
         return stats;
+    }
+
+    // `nav_mark`: interprets committed nav events into marks. Inline (no thread system, or
+    // the tuner keeps it inline) one pass appends in event order. Dispatched, each range
+    // writes its events' marks into its staging window, merging consecutive tile boxes of
+    // one (level, chunk), and the main thread appends the windows in range order with the
+    // same merge, so the marks equal the inline pass for any partition. Main work is
+    // O(marks after the merge). Returns the stage's off-main time.
+    fn markNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) !u64 {
+        self.last_mark_batch = .{};
+        if (events.len == 0) return 0;
+        const mark_bound = events.len * max_marks_per_event;
+        // Every reserve precedes the first mark, so an out-of-memory records none.
+        try self.reserveNavMarks(mark_bound);
+        const ts = thread_system orelse {
+            self.appendEventMarks(world, events);
+            self.last_mark_batch = inlineBatch(events.len, nav_mark_range_alignment_items);
+            return 0;
+        };
+        try self.nav_mark_staging.ensureTotalCapacity(self.allocator, mark_bound);
+        try self.nav_mark_tallies.ensureTotalCapacity(self.allocator, maxRangeCount(events.len, nav_mark_range_alignment_items));
+        const selection = ts.selectBatchProfile(&self.nav_mark_tuner, .{
+            .item_count = events.len,
+            .items_per_range = self.nav_thread_items_per_range,
+            .range_alignment_items = nav_mark_range_alignment_items,
+            .adaptive = self.nav_thread_adaptive,
+        });
+        const options = self.navMarkDispatchOptions(selection);
+        if (selection.worker_threads == 0) {
+            // Inline on the main thread in range order; still dispatched so the tuner
+            // records the batch.
+            var direct = DirectNavMarkJob{ .system = self, .world = world, .events = events };
+            self.last_mark_batch = ts.parallelForWithOptions(events.len, &direct, directNavMarkJob, options);
+            return 0;
+        }
+        std.debug.assert(self.nav_mark_tallies.capacity >= selection.range_count);
+        self.nav_mark_staging.items.len = mark_bound;
+        self.nav_mark_tallies.items.len = selection.range_count;
+        @memset(self.nav_mark_tallies.items, .{});
+        var job = NavMarkJob{
+            .graph = &self.graph,
+            .world = world,
+            .events = events,
+            .items_per_range = selection.items_per_range,
+            .staging = self.nav_mark_staging.items,
+            .tallies = self.nav_mark_tallies.items,
+        };
+        const batch = ts.parallelForWithOptions(events.len, &job, navMarkJob, options);
+        self.last_mark_batch = batch;
+        for (self.nav_mark_tallies.items, 0..) |tally, range_index| {
+            const window_start = range_index * selection.items_per_range * max_marks_per_event;
+            for (self.nav_mark_staging.items[window_start .. window_start + tally.count]) |mark| self.appendEventMark(mark);
+        }
+        return if (batch.ran_inline) 0 else batch.batch_duration_ns;
+    }
+
+    fn navMarkDispatchOptions(self: *const PathfindingSystem, selection: BatchSelection) ParallelForOptions {
+        return .{
+            .items_per_range = self.nav_thread_items_per_range,
+            .range_alignment_items = nav_mark_range_alignment_items,
+            .adaptive = self.nav_thread_adaptive,
+            .adaptive_tuner = selection.active_tuner,
+            .selected_profile = selection.profile,
+        };
+    }
+
+    // The inline `nav_mark` pass: appends the events' marks in event order.
+    fn appendEventMarks(self: *PathfindingSystem, world: *const WorldSystem, events: []const SimulationEvent) void {
+        for (events) |event| {
+            var marks: [max_marks_per_event]NavMark = undefined;
+            const count = interpretNavEvent(&self.graph, world, event, &marks);
+            for (marks[0..count]) |mark| self.appendEventMark(mark);
+        }
+    }
+
+    // Appends one event's mark into reserved capacity, merging a tile box into the previous
+    // mark when both lie in one chunk.
+    fn appendEventMark(self: *PathfindingSystem, mark: NavMark) void {
+        if (mark.kind == .level and comptime logging.enabled(.warn) and !builtin.is_test)
+            logging.game.warn("nav obstacle invalidation with no resolvable world rect; re-deriving level {}", .{mark.level});
+        appendMergedMark(&self.nav_marks, mark, self.graph.chunk_tiles);
+    }
+
+    /// Whether the post-commit nav reaction may run and emit its event this step: a pending
+    /// structural command or committed event may change nav, or nav has marks, levels,
+    /// links, or a content revision still to apply. Callers reserve its event slot first.
+    pub fn navReactionMayEmit(self: *const PathfindingSystem, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
+        return structuralCommandsMayInvalidateNavigation(data, frame) or
+            pendingEventsMayInvalidateNavigation(frame) or
+            self.hasPendingNavUpdates(world);
     }
 
     // Whether a committed structural event affects the static navigation graph.
@@ -792,7 +763,7 @@ pub const PathfindingSystem = struct {
     // Whether any queued structural-commit event will drive a post-commit nav invalidation.
     // Mirrors reactToPostCommitNavEvents's stage/payload filter so a caller can reserve the one
     // appended event before mutation.
-    pub fn pendingEventsMayInvalidateNavigation(frame: *const SimulationFrame) bool {
+    fn pendingEventsMayInvalidateNavigation(frame: *const SimulationFrame) bool {
         for (frame.events.mergedItems()) |event| {
             if (event.stage != .structural_commit) continue;
             if (eventInvalidatesNavigation(event)) return true;
@@ -801,7 +772,7 @@ pub const PathfindingSystem = struct {
     }
 
     // Whether any pending structural command may invalidate navigation once applied.
-    pub fn structuralCommandsMayInvalidateNavigation(data: *const DataSystem, frame: *const SimulationFrame) bool {
+    fn structuralCommandsMayInvalidateNavigation(data: *const DataSystem, frame: *const SimulationFrame) bool {
         for (frame.structural_commands.mergedItems()) |command| {
             if (structuralCommandMayInvalidateNavigation(data, command)) return true;
         }
@@ -824,35 +795,6 @@ pub const PathfindingSystem = struct {
         return response.mobility == .static and
             template.movement_body != null and
             template.collision_bounds != null;
-    }
-
-    // Evicts cached paths crossing this batch's changed-cell spans (tile edits plus
-    // entity-driven obstacle-rect edits, already resolved to nav-cell spans).
-    fn evictCachedPathsCrossingEdits(self: *PathfindingSystem, world: *const WorldSystem, edits: []const NavCellEdit, cell_edits: []const types.ChangedSpan) !void {
-        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, edits.len + cell_edits.len);
-        self.nav_changed_spans.clearRetainingCapacity();
-        for (edits) |edit| {
-            const grid = self.graph.grid(edit.level) orelse continue;
-            const span = grid.navSpanForTile(world, edit) orelse continue;
-            self.appendChangedSpanWithHalo(edit.level, span, grid.width, grid.height);
-        }
-        for (cell_edits) |edit| {
-            const grid = self.graph.grid(edit.level) orelse continue;
-            self.appendChangedSpanWithHalo(edit.level, edit.span, grid.width, grid.height);
-        }
-        self.completed.evictCrossing(&self.graph, self.nav_changed_spans.items);
-    }
-
-    // One-cell halo: also evicts paths running ALONGSIDE the change so an agent beside a
-    // newly-opened cell re-solves into the opening. Shared by the tile-edit and entity-driven
-    // cell-edit passes above.
-    fn appendChangedSpanWithHalo(self: *PathfindingSystem, level: u16, span: types.NavSpan, grid_width: usize, grid_height: usize) void {
-        self.nav_changed_spans.appendAssumeCapacity(.{ .level = level, .span = .{
-            .min_x = span.min_x -| 1,
-            .min_y = span.min_y -| 1,
-            .max_x = @min(span.max_x + 1, grid_width - 1),
-            .max_y = @min(span.max_y + 1, grid_height - 1),
-        } });
     }
 
     fn dropGroupFields(self: *PathfindingSystem) void {
@@ -1806,6 +1748,170 @@ pub const PathfindingSystem = struct {
         }
     }
 };
+
+fn tileMark(level: u16, min_x: u32, min_y: u32, max_x: u32, max_y: u32) NavMark {
+    return .{ .level = level, .kind = .tile_box, .min_x = min_x, .min_y = min_y, .max_x = max_x, .max_y = max_y };
+}
+
+fn levelMark(level: u16) NavMark {
+    return .{ .level = level, .kind = .level, .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 };
+}
+
+// An exclusive world-tile rect clamped to the world as an inclusive tile box; null when
+// empty or fully outside.
+fn tileRectMark(world: *const WorldSystem, level: u16, min_x: u16, min_y: u16, max_x_exclusive: u16, max_y_exclusive: u16) ?NavMark {
+    const clamped_max_x = @min(max_x_exclusive, world.width);
+    const clamped_max_y = @min(max_y_exclusive, world.height);
+    if (min_x >= clamped_max_x or min_y >= clamped_max_y) return null;
+    return tileMark(level, min_x, min_y, clamped_max_x - 1, clamped_max_y - 1);
+}
+
+// A static body's world rect as the nav-cell span it covers on `level`; null when the
+// level has no built grid.
+fn staticSpanMark(graph: *const NavGraph, level: u16, rect: ObstacleWorldRect) ?NavMark {
+    const grid = graph.grid(level) orelse return null;
+    const span = grid.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
+    // A validated grid's cell coordinates fit u32.
+    return .{ .level = level, .kind = .static_span, .min_x = @intCast(span.min_x), .min_y = @intCast(span.min_y), .max_x = @intCast(span.max_x), .max_y = @intCast(span.max_y) };
+}
+
+// Whether two tile boxes lie in one `chunk_tiles` chunk of one level, so their bounding
+// box covers exactly that chunk.
+fn tileBoxesShareChunk(a: NavMark, b: NavMark, chunk_tiles: u16) bool {
+    if (a.kind != .tile_box or b.kind != .tile_box or a.level != b.level) return false;
+    const ct: u32 = @max(chunk_tiles, 1);
+    const chunk_x = a.min_x / ct;
+    const chunk_y = a.min_y / ct;
+    return a.max_x / ct == chunk_x and a.max_y / ct == chunk_y and
+        b.min_x / ct == chunk_x and b.max_x / ct == chunk_x and
+        b.min_y / ct == chunk_y and b.max_y / ct == chunk_y;
+}
+
+// Writes `mark` after the first `count` marks of `marks`, merged into the last one when
+// both are tile boxes in one chunk; returns the new count. Merging only with the last mark
+// makes the result independent of how a mark sequence is split and rejoined.
+fn foldMark(marks: []NavMark, count: usize, mark: NavMark, chunk_tiles: u16) usize {
+    if (count != 0) {
+        const last = &marks[count - 1];
+        if (tileBoxesShareChunk(last.*, mark, chunk_tiles)) {
+            last.min_x = @min(last.min_x, mark.min_x);
+            last.min_y = @min(last.min_y, mark.min_y);
+            last.max_x = @max(last.max_x, mark.max_x);
+            last.max_y = @max(last.max_y, mark.max_y);
+            return count;
+        }
+    }
+    std.debug.assert(count < marks.len);
+    marks[count] = mark;
+    return count + 1;
+}
+
+// `foldMark` onto a list with reserved capacity.
+fn appendMergedMark(list: *std.ArrayList(NavMark), mark: NavMark, chunk_tiles: u16) void {
+    std.debug.assert(list.items.len < list.capacity);
+    const count = foldMark(list.items.ptr[0..list.capacity], list.items.len, mark, chunk_tiles);
+    list.items.len = count;
+}
+
+// One committed event's nav marks (at most `max_marks_per_event`): a blocking tile flip
+// becomes its tile, an obstacle rect its clamped tile box, a static body's change its old
+// and new covered spans (the whole level when a rect is missing). Reads only the graph's
+// grid geometry and the world, so ranges interpret in parallel.
+fn interpretNavEvent(graph: *const NavGraph, world: *const WorldSystem, event: SimulationEvent, out: *[max_marks_per_event]NavMark) usize {
+    if (event.stage != .structural_commit) return 0;
+    if (!PathfindingSystem.eventInvalidatesNavigation(event)) return 0;
+    var count: usize = 0;
+    switch (event.payload) {
+        .world_tile_changed => |changed| {
+            out[0] = tileMark(changed.level, changed.x, changed.y, changed.x, changed.y);
+            count = 1;
+        },
+        .world_obstacle_changed => |changed| {
+            if (tileRectMark(world, changed.level, changed.min_x, changed.min_y, changed.max_x_exclusive, changed.max_y_exclusive)) |mark| {
+                out[0] = mark;
+                count = 1;
+            }
+        },
+        // Stamped with the body's plane at structural commit (0 when it had none).
+        .entity_destroyed => |destroyed| {
+            if (destroyed.obstacle_world_rect) |rect| {
+                if (staticSpanMark(graph, destroyed.level, rect)) |mark| {
+                    out[0] = mark;
+                    count = 1;
+                }
+            } else {
+                out[0] = levelMark(destroyed.level);
+                count = 1;
+            }
+        },
+        .component_changed => |changed| {
+            if (changed.old_obstacle_world_rect) |rect| {
+                if (staticSpanMark(graph, changed.level, rect)) |mark| {
+                    out[count] = mark;
+                    count += 1;
+                }
+            } else if (changed.was_static_navigation_obstacle) {
+                out[count] = levelMark(changed.level);
+                count += 1;
+            }
+            if (changed.new_obstacle_world_rect) |rect| {
+                if (staticSpanMark(graph, changed.level, rect)) |mark| {
+                    out[count] = mark;
+                    count += 1;
+                }
+            } else if (changed.is_static_navigation_obstacle) {
+                out[count] = levelMark(changed.level);
+                count += 1;
+            }
+        },
+        else => {},
+    }
+    return count;
+}
+
+// One range of the `nav_mark` stage: its events' marks, folded, in its staging window.
+const NavMarkJob = struct {
+    graph: *const NavGraph,
+    world: *const WorldSystem,
+    events: []const SimulationEvent,
+    items_per_range: usize,
+    staging: []NavMark,
+    tallies: []NavMarkTally,
+};
+
+fn navMarkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *NavMarkJob = @ptrCast(@alignCast(context));
+    // Dual worker asserts: range.index vs the dispatched tallies, and the window the merge
+    // reads, inside the staging buffer.
+    std.debug.assert(range.index < job.tallies.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.events.len);
+    std.debug.assert(range.end * max_marks_per_event <= job.staging.len);
+    const window = job.staging[range.start * max_marks_per_event .. range.end * max_marks_per_event];
+    var count: usize = 0;
+    for (job.events[range.start..range.end]) |event| {
+        var marks: [max_marks_per_event]NavMark = undefined;
+        const produced = interpretNavEvent(job.graph, job.world, event, &marks);
+        for (marks[0..produced]) |mark| count = foldMark(window, count, mark, job.graph.chunk_tiles);
+    }
+    job.tallies[range.index] = .{ .count = count };
+}
+
+// `nav_mark` dispatched inline: each range, in order on the main thread, appends its marks.
+const DirectNavMarkJob = struct {
+    system: *PathfindingSystem,
+    world: *const WorldSystem,
+    events: []const SimulationEvent,
+};
+
+fn directNavMarkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
+    const job: *DirectNavMarkJob = @ptrCast(@alignCast(context));
+    std.debug.assert(worker_id.index == WorkerId.main.index);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.events.len);
+    job.system.appendEventMarks(job.world, job.events[range.start..range.end]);
+}
 
 // One range of the `path_intake` stage.
 const IntakeJob = struct {
@@ -3774,30 +3880,27 @@ test "pathfinding chunk-local portal seeding scans only the start chunk's local 
     try std.testing.expect(right_component != no_component);
     try std.testing.expect(left_component != right_component);
 
-    // levelComponentPortals returns exactly the start CHUNK's local-component portals:
-    // every returned portal shares the queried encoded label (hence the same chunk and
-    // the same chunk-local component), and the two query results are disjoint.
+    // A start chunk's record holds only its own portals; those sharing the start cell's
+    // label (the seeds) all lie in that chunk with that component, and each seed set is a
+    // strict subset of the level's portals.
     const left_chunk = grid.chunkOfCell(left_cell);
     const right_chunk = grid.chunkOfCell(right_cell);
-    const left_portals = system.graph.levelComponentPortals(0, left_component);
-    const right_portals = system.graph.levelComponentPortals(0, right_component);
-    try std.testing.expect(left_portals.len > 0);
-    try std.testing.expect(right_portals.len > 0);
-    const level0_graph = system.graph.levelGraph(0).?;
-    for (left_portals) |node| {
-        const cell = level0_graph.portals.items[node].cell_index;
-        try std.testing.expectEqual(left_component, grid.componentOf(cell));
-        try std.testing.expectEqual(left_chunk, grid.chunkOfCell(cell));
+    for ([_]struct { chunk: u32, cell: usize, component: u32 }{
+        .{ .chunk = left_chunk, .cell = left_cell, .component = left_component },
+        .{ .chunk = right_chunk, .cell = right_cell, .component = right_component },
+    }) |start| {
+        const portals = system.graph.chunkPortals(0, start.chunk);
+        var seeds: usize = 0;
+        for (portals.border) |portal| {
+            if (portal.label != grid.labelAt(start.cell)) continue;
+            const cell = system.graph.cellOfLocal(start.chunk, portal.local);
+            try std.testing.expectEqual(start.component, grid.componentOf(cell));
+            try std.testing.expectEqual(start.chunk, grid.chunkOfCell(cell));
+            seeds += 1;
+        }
+        try std.testing.expect(seeds > 0);
+        try std.testing.expect(seeds < system.graph.levelLivePortalCount(0));
     }
-    for (right_portals) |node| {
-        const cell = level0_graph.portals.items[node].cell_index;
-        try std.testing.expectEqual(right_component, grid.componentOf(cell));
-        try std.testing.expectEqual(right_chunk, grid.chunkOfCell(cell));
-    }
-    // The two slices are disjoint (different labels), and each is a strict subset of the
-    // level's full portal set (chunk-local seeding never scans the whole border).
-    try std.testing.expect(left_portals.len < system.graph.levelLivePortalCount(0));
-    try std.testing.expect(right_portals.len < system.graph.levelLivePortalCount(0));
 
     // Correctness preserved: a cross-component goal (no link) is unavailable, and a
     // same-component goal stays reachable.
@@ -3943,7 +4046,6 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
 
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
     // A pure incremental dig keeps nav_version stable; invalidation is scoped.
-    try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
     try std.testing.expect(system.graph.version == version_before);
     // The cached path crossed the now-blocked gap, so it was evicted: missing.
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
@@ -4043,7 +4145,6 @@ test "pathfinding incremental update retains a still-valid cached path when an o
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
 
     // The path survived: still available and still routing through the far gap (row 9).
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
@@ -4080,7 +4181,6 @@ test "pathfinding incremental update blocking an off-path cell keeps the cached 
     const changed = (try world.setDenseTile(built.wall_layer, 9, 11, tree)) orelse return error.TestExpectedEqual;
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
 
     // The same goal is served from the surviving cache (a hit): nothing re-solved.
     const after = try solveStep(&system, requester, start, goal);
@@ -4121,7 +4221,6 @@ test "pathfinding incremental update leaves an unaffected second level untouched
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), nav_stats.full_relabel);
     // Level 1's mask is byte-for-byte what it was: the incremental update never
     // re-marked it. Its obstacle cell and blocked count are intact.
     try std.testing.expectEqual(level1_blocked_before, system.graph.grid(1).?.blocked_count);
@@ -4148,7 +4247,6 @@ test "pathfinding incremental update with no real change does no work" {
     // An empty edit batch is a no-op: no version bump, no counters.
     const stats = try system.applyNavUpdates(&data, &world, &.{});
     try std.testing.expectEqual(@as(usize, 0), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
     try std.testing.expectEqual(version_before, system.graph.version);
 }
 
@@ -4193,7 +4291,7 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
         marked += 1;
     }
     try std.testing.expect(marked > abstractCapacity().max_frame_requests);
-    try std.testing.expect(system.hasPendingNavUpdates());
+    try std.testing.expect(system.hasPendingNavUpdates(&world));
 
     const stats = try system.applyBufferedNavUpdates(&data, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
@@ -4202,12 +4300,12 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
     fx = 13;
     while (fx < 16) : (fx += 1) try std.testing.expect(nav.isBlockedCell(.{ .x = @intCast(fx), .y = 13 }));
     // applyBuffered clears the buffer, so the next step starts empty.
-    try std.testing.expect(!system.hasPendingNavUpdates());
+    try std.testing.expect(!system.hasPendingNavUpdates(&world));
 
     // clearNavDirty drops a marking pass without applying it.
     try system.markNavDirty(0, 0, 0);
     system.clearNavDirty();
-    try std.testing.expect(!system.hasPendingNavUpdates());
+    try std.testing.expect(!system.hasPendingNavUpdates(&world));
 }
 
 test "nav over a world takes the world's chunk edge and tile size; a world-less build takes its config" {
@@ -4258,14 +4356,12 @@ test "nav build fails loudly when its chunk edge or index widths do not fit" {
     try bad_edge_system.reserve(bad_edge);
     try std.testing.expectError(error.InvalidChunkSize, bad_edge_system.rebuildStaticNavGrid(&data, 256, 256, 32));
 
-    // Chunk edge 1 gives 2 labels per chunk. 65535 x 32768 cells clears the label check and
-    // stops at the memory gate; one more row crosses the label sentinel first.
+    // Chunk edge 1 gives 2 labels per chunk: 65535 x 32769 cells crosses the label sentinel.
     var unit_edge = baselineCapacity();
     unit_edge.nav_chunk_tiles = 1;
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(unit_edge);
-    try std.testing.expectError(error.NavWorldTooLarge, system.rebuildStaticNavGrid(&data, 65535, 32768, 1));
     try std.testing.expectError(error.ChunkLabelOverflow, system.rebuildStaticNavGrid(&data, 65535, 32769, 1));
     try std.testing.expectError(error.LevelCellIndexOverflow, system.rebuildStaticNavGrid(&data, 1.0e6, 1.0e6, 1));
 }
@@ -4301,7 +4397,7 @@ test "reactToPostCommitNavEvents preserves buffered marks across a failed apply 
     try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, &data, &world, null));
     // The mark from this failed call must survive: no entry-clear on the next call may drop a
     // pending edit the world already committed but the nav graph has not yet learned about.
-    try std.testing.expect(system.hasPendingNavUpdates());
+    try std.testing.expect(system.hasPendingNavUpdates(&world));
     try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
 
     // Next step: no new committed events, room to append again. The leftover mark from the
@@ -4310,13 +4406,13 @@ test "reactToPostCommitNavEvents preserves buffered marks across a failed apply 
     frame.beginStep();
     const stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expect(!system.hasPendingNavUpdates());
+    try std.testing.expect(!system.hasPendingNavUpdates(&world));
     try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
 }
 
-test "reactToPostCommitNavEvents maps world_obstacle_changed to one cell-span (not O(tiles) edits)" {
-    // A multi-tile world_obstacle_changed must append a single ChangedSpan via
-    // markNavTileRectDirty, not one NavCellEdit per tile. Multi-chunk fixture
+test "reactToPostCommitNavEvents maps world_obstacle_changed to one mark (not O(tiles) marks)" {
+    // A multi-tile world_obstacle_changed must record one tile-box mark, not one mark per
+    // tile. Multi-chunk fixture
     // (nav_chunk_tiles=4) so the dirty rect spans ≥2 abstract chunks and a control
     // cell in an untouched chunk stays open.
     var data = DataSystem.init(std.testing.allocator);
@@ -4391,17 +4487,17 @@ test "reactToPostCommitNavEvents maps world_obstacle_changed to one cell-span (n
         .max_y_exclusive = max_y_exclusive,
     } } });
 
-    // Mark only (don't apply): inspect the dirty buffers after the event walk by
+    // Mark only (don't apply): inspect the marks after the event walk by
     // forcing ensureCanAppend to fail before applyBufferedNavUpdates, same pattern
     // as the preserve-buffered-marks test above.
     frame.events.setCapacityLimit(frame.events.mergedItems().len);
     try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, &data, &world, null));
 
-    // One span, zero per-tile edits — O(1) dirty expand, not O(tiles).
-    try std.testing.expectEqual(@as(usize, 0), system.nav_dirty_edits.items.len);
-    try std.testing.expectEqual(@as(usize, 1), system.nav_dirty_cell_spans.items.len);
-    try std.testing.expectEqual(@as(u16, 0), system.nav_dirty_cell_spans.items[0].level);
-    try std.testing.expectEqual(expected_span, system.nav_dirty_cell_spans.items[0].span);
+    // One mark covering the rect: O(1) per event, not O(tiles).
+    try std.testing.expectEqual(@as(usize, 1), system.nav_marks.items.len);
+    const mark = system.nav_marks.items[0];
+    try std.testing.expectEqual(@as(u16, 0), mark.level);
+    try std.testing.expectEqual(expected_span, grid.cellSpanForTileBox(&world, mark.min_x, mark.min_y, mark.max_x, mark.max_y).?);
 
     // Apply the leftover mark: dirty tiles block; control cell in the untouched chunk stays open.
     frame.events.setCapacityLimit(null);
@@ -4464,7 +4560,7 @@ test "markNavTileRectDirty clamps partial OOB rects instead of dropping them" {
 
     // min in-bounds, max far past the edge — pre-fix dropped the whole mark.
     try system.markNavTileRectDirty(&world, 0, in_min_x, in_min_y, 1000, 1000);
-    try std.testing.expectEqual(@as(usize, 1), system.nav_dirty_cell_spans.items.len);
+    try std.testing.expectEqual(@as(usize, 1), system.nav_marks.items.len);
 
     const stats = try system.applyBufferedNavUpdates(&data, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
@@ -4485,36 +4581,7 @@ test "markNavTileRectDirty clamps partial OOB rects instead of dropping them" {
 
     // Fully OOB / empty after clamp still no-ops.
     try system.markNavTileRectDirty(&world, 0, world.width, world.height, 1000, 1000);
-    try std.testing.expectEqual(@as(usize, 0), system.nav_dirty_cell_spans.items.len);
-}
-
-test "markNavLevelDirty is allocation-free up to the reserved ceiling (FailingAllocator)" {
-    // R14 / L1: reserve pre-warms nav_dirty_levels; marks up to that ceiling must not
-    // allocate. One past the physical capacity still grows (grows-rather-than-drops).
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(baselineCapacity());
-
-    const reserved_cap = system.nav_dirty_levels.capacity;
-    try std.testing.expect(reserved_cap >= 8);
-
-    const original = system.allocator;
-    system.allocator = std.testing.failing_allocator;
-
-    var level: u16 = 0;
-    while (level < reserved_cap) : (level += 1) {
-        try system.markNavLevelDirty(level);
-    }
-    try std.testing.expectEqual(reserved_cap, system.nav_dirty_levels.items.len);
-    // Dedup within the reserved set must also stay allocation-free.
-    try system.markNavLevelDirty(0);
-    try std.testing.expectEqual(reserved_cap, system.nav_dirty_levels.items.len);
-
-    system.allocator = original;
-
-    // Past the physical capacity: grow path uses the real allocator (still never drops).
-    try system.markNavLevelDirty(@intCast(reserved_cap));
-    try std.testing.expectEqual(reserved_cap + 1, system.nav_dirty_levels.items.len);
+    try std.testing.expectEqual(@as(usize, 0), system.nav_marks.items.len);
 }
 
 test "pathfinding incremental update is allocation-free at steady state (within init high-water mark)" {
@@ -4540,10 +4607,17 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     const high_water = system.graph.totalPortals();
     try std.testing.expect(high_water > 0);
 
+    // Warmup: the same block and reopen, so every batch buffer and record pool reaches
+    // its steady capacity.
+    for ([_]@TypeOf(tree){ tree, grass }) |tile| {
+        const warm = (try world.setDenseTile(built.wall_layer, 5, 3, tile)) orelse return error.TestExpectedEqual;
+        _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = warm.level, .x = warm.x, .y = warm.y }});
+    }
+
     // The failing allocator must cover BOTH the system AND the nav graph (which holds
-    // its own captured allocator copy): every graph-rebuild buffer (portals/edges/
-    // cell_to_portal/build scratch) flows through graph.allocator, so swapping only
-    // system.allocator would let a graph allocation slip through undetected.
+    // its own captured allocator copy): every batch buffer and record pool flows through
+    // graph.allocator, so swapping only system.allocator would let a graph allocation slip
+    // through undetected.
     const original = system.allocator;
     system.allocator = std.testing.failing_allocator;
     system.graph.allocator = std.testing.failing_allocator;
@@ -4565,16 +4639,12 @@ test "pathfinding incremental update is allocation-free at steady state (within 
 }
 
 test "pathfinding threaded incremental nav update is allocation-free at steady state" {
-    // The serial-path allocation-free tests above (and applyNavUpdates itself, which always
-    // passes thread_system=null) only prove the INLINE remask/patch scratch (slot 0) is reused
-    // without allocating. Only applyBufferedNavUpdates/reactToPostCommitNavEvents with a real
-    // ThreadSystem drive patchChunkJob/remaskChunkJob, which index a PER-WORKER
-    // ChunkPatchScratch/ChunkRemaskScratch slot (nav_graph.zig's patch_scratch/remask_scratch,
-    // sized at rebuild). That fan-out path had zero allocation coverage. Mirrors "incremental
-    // nav update forced-parallel remask and patch match a serial full rebuild" in nav_graph.zig
-    // (five edits in five distinct chunks, adaptive=false/items_per_range=1 to force both stages
-    // off the inline path) but under a failing allocator on both system.allocator and
-    // system.graph.allocator, matching the steady-state test above.
+    // The serial allocation-free tests above only cover the inline stages. Only
+    // applyBufferedNavUpdates/reactToPostCommitNavEvents with a real ThreadSystem drive the
+    // plan, remask, and patch jobs, the remask indexing a per-participant scratch slot. Five
+    // edits in five distinct chunks, adaptive=false/items_per_range=1 to force every stage
+    // off the inline path, under a failing allocator on both system.allocator and
+    // system.graph.allocator.
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -4602,28 +4672,34 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     system.nav_thread_adaptive = false;
     system.nav_thread_items_per_range = 1;
 
-    // The failing allocator must cover BOTH the system AND the nav graph (which holds its own
-    // captured allocator copy): every per-worker patch/remask scratch slot, plus every
-    // graph-rebuild buffer, flows through graph.allocator, so swapping only system.allocator
-    // would let a graph allocation slip through undetected.
-    const original = system.allocator;
-    system.allocator = std.testing.failing_allocator;
-    system.graph.allocator = std.testing.failing_allocator;
-
     // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
-    // set and the patch dirty set exceed one chunk and actually fan out across workers.
+    // set and the patch set exceed one chunk and actually fan out across workers.
     const cells = [_]struct { x: u16, y: u16 }{
         .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
         .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
         .{ .x = 7, .y = 7 },
     };
+    // Warmup: block and reopen the cells through the threaded path.
+    for ([_]@TypeOf(tree){ tree, grass }) |tile| {
+        for (cells) |cell| {
+            _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tile)) orelse return error.TestExpectedEqual;
+            try system.markNavDirty(0, cell.x, cell.y);
+        }
+        _ = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    }
+
+    // The failing allocator must cover BOTH the system AND the nav graph (which holds its own
+    // captured allocator copy): every per-participant remask scratch slot, plus every batch
+    // buffer and record pool, flows through graph.allocator.
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
     for (cells) |cell| {
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         try system.markNavDirty(0, cell.x, cell.y);
     }
     const stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
 
     // Both stages must have actually threaded, not fallen back to the inline slot-0 path —
     // otherwise this would silently retest the already-covered serial path.
@@ -4638,7 +4714,7 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     system.allocator = original;
 }
 
-test "pathfinding incremental update expands beyond init high-water mark with bounded growth" {
+test "a fully walled level opened past its prior records grows at the reserve and the next apply allocates nothing" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4646,10 +4722,8 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     const tree = try requireTestTile(&meta, "tree_0");
     const grass = try requireTestTile(&meta, "grass");
 
-    // Start fully walled so the init build has zero portals (minimal high-water).
-    // Opening a block later expands the abstract graph past it. This is the documented
-    // amortized-growth exception (a cold, event-triggered path), NOT the alloc-free
-    // contract: it must SUCCEED and produce the new topology, using the real allocator.
+    // Start fully walled so the init build holds no record. Opening a block grows the
+    // record pools at the batch reserve with the real allocator.
     var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     const wall_layer = try world.addDenseLayer(0, 0, .obstacle, tree);
@@ -4667,8 +4741,7 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
     try std.testing.expectEqual(@as(usize, 0), system.graph.totalPortals());
 
-    // Open a 6x6 block spanning chunk borders, creating new portals past the (zero)
-    // init high-water mark. The growth is allowed and the build completes correctly.
+    // Open a 6x6 block spanning chunk borders, creating records past the (zero) init pool.
     var edits = std.ArrayList(NavCellEdit).empty;
     defer edits.deinit(std.testing.allocator);
     y = 2;
@@ -4679,18 +4752,9 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
             try edits.append(std.testing.allocator, .{ .level = opened.level, .x = opened.x, .y = opened.y });
         }
     }
-    // Border-run consolidation (nav_graph.zig's discoverChunkPortals) means the opened
-    // block no longer produces enough edges on its own to exceed chunk_edge_floor, so this
-    // scenario alone would land within the (still-zero-derived) window rather than forcing
-    // the growth this test exercises. Force it directly instead, the same way
-    // "compactChunkEdges zeroes the chunk's edge counts on overflow..." does — the point
-    // under test is the growth/no-further-allocation CONTRACT, not this specific
-    // geometry's edge count.
-    for (system.graph.chunk_edge_cap.items) |*cap| cap.* = 0;
     const stats = try system.applyNavUpdates(&data, &world, edits.items);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 1), stats.version_bumps);
-    // The expansion produced new portals (the abstract graph grew past init).
+    // The opened block holds portals.
     try std.testing.expect(system.graph.totalPortals() > 0);
 
     // A subsequent edit within the NEW high-water mark is allocation-free again.
@@ -4749,9 +4813,8 @@ test "pathfinding incremental update flips cross-level link liveness when the en
     });
     try std.testing.expectEqual(@as(usize, 1), (try system.updateSerial(&blocked_stream, 8, .{})).unavailable_results);
 
-    // Open the endpoint cell (2,2) on level 1 via the world tile API + incremental
-    // update. buildLinkEdges re-derives link liveness against the current masks, so
-    // the link becomes live and the same cross-level goal is now reachable.
+    // Open the endpoint cell (2,2) on level 1 via the world tile API + incremental update:
+    // the endpoint's record gains the link, so the same cross-level goal is now reachable.
     const changed = (try world.setDenseTile(level1_obstacle, 2, 2, grass)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
@@ -5165,7 +5228,7 @@ test "coversAgentCount compares the live pools and the ceiling" {
     try std.testing.expect(!system.coversAgentCount(17));
 }
 
-test "an agent budget raise past the load-time nav memory limit admits the whole crowd" {
+test "an agent budget raise admits the whole crowd" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var requesters: [12]EntityId = undefined;
@@ -5177,8 +5240,6 @@ test "an agent budget raise past the load-time nav memory limit admits the whole
     defer system.deinit();
     var capacity = baselineCapacity();
     capacity.max_agent_budget = 8;
-    // Exactly the bytes the 8-agent ceiling needs on this 16x16-cell, 1-level grid.
-    capacity.max_nav_memory_bytes = nav_memory.budgetForCapacity(capacity, 1, 0).requiredBytes(16, 16);
     try system.reserve(capacity);
     try system.rebuildStaticNavGrid(&data, 512, 512, 32);
 
@@ -5363,8 +5424,8 @@ test "pathfinding lake detour: reported-bug scale solves, a harder scale degrade
     try std.testing.expectEqual(@as(usize, 0), reported.escalated_dropped);
     try std.testing.expect(reported.budget_exhausted <= 2);
 
-    // Was 512 before nav_graph.zig's discoverChunkPortals consolidated per-cell portals
-    // into one per contiguous open boundary run: the abstract graph is now far sparser
+    // Was 512 before border portals were consolidated to one per contiguous open
+    // boundary run: the abstract graph is now far sparser
     // (each fixed abstract-node budget covers much more physical distance per node
     // explored), so 512 no longer exhausts the tier-1 budget — this scale is retuned to
     // the smallest that still genuinely degrades under the new, sparser graph.
@@ -6138,4 +6199,124 @@ test "pathfinding a publish reserve out of memory publishes nothing and leaves p
     for (goals) |goal| {
         try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
     }
+}
+
+// A dense multi-chunk edit's committed events: runs of tile flips that straddle range
+// boundaries, an obstacle rect, a moved static (two spans), a static with no rect (its
+// level), and events nav ignores.
+fn navMarkTestEvents(allocator: std.mem.Allocator, world: *const WorldSystem) !std.ArrayList(SimulationEvent) {
+    var events: std.ArrayList(SimulationEvent) = .empty;
+    errdefer events.deinit(allocator);
+    for (0..world.height) |y| for (0..world.width) |x| {
+        if ((x + y) % 3 == 0) continue;
+        try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .world_tile_changed = .{
+            .level = @intCast((x / 6) % 2),
+            .x = @intCast(x),
+            .y = @intCast(y),
+            .old_tile_id = 0,
+            .new_tile_id = 1,
+            .old_blocks_movement = false,
+            .new_blocks_movement = (x + y) % 5 != 0,
+        } } });
+        if (x == 5 and y % 4 == 0) {
+            try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{ .level = 0, .min_x = 1, .min_y = @intCast(y), .max_x_exclusive = 9, .max_y_exclusive = @intCast(y + 2) } } });
+            try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .component_changed = .{
+                .entity = try EntityId.init(@intCast(y), 1),
+                .component = .movement_body,
+                .was_static_navigation_obstacle = true,
+                .is_static_navigation_obstacle = true,
+                .old_obstacle_world_rect = .{ .min_x = 10, .min_y = 10, .max_x = 40, .max_y = 40 },
+                .new_obstacle_world_rect = .{ .min_x = 200, .min_y = 100, .max_x = 230, .max_y = 130 },
+            } } });
+            try events.append(allocator, .{ .stage = .domain_reaction, .payload = .{ .world_obstacle_changed = .{ .level = 1, .min_x = 0, .min_y = 0, .max_x_exclusive = 12, .max_y_exclusive = 12 } } });
+        }
+    };
+    try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .component_changed = .{
+        .entity = try EntityId.init(99, 1),
+        .component = .collision_response,
+        .was_static_navigation_obstacle = true,
+        .is_static_navigation_obstacle = false,
+        .level = 1,
+    } } });
+    return events;
+}
+
+test "threaded nav mark interpretation equals serial for a dense multi-chunk edit with runs straddling ranges and mixed tile and obstacle events" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(-16);
+    var events = try navMarkTestEvents(std.testing.allocator, &world);
+    defer events.deinit(std.testing.allocator);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var serial = PathfindingSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    try serial.reserve(abstractCapacity());
+    try serial.rebuildStaticNavGridWithWorld(&data, &world, null);
+    _ = try serial.markNavEvents(events.items, &world, null);
+    // The merge folds same-chunk tile runs, so there are fewer marks than events.
+    try std.testing.expect(serial.nav_marks.items.len < events.items.len);
+    var kinds = std.EnumSet(types.NavMarkKind){};
+    for (serial.nav_marks.items) |mark| kinds.insert(mark.kind);
+    try std.testing.expectEqual(@as(usize, 3), kinds.count());
+
+    for ([_]usize{ 8, 16, 24 }) |items_per_range| {
+        var threaded = PathfindingSystem.init(std.testing.allocator);
+        defer threaded.deinit();
+        try threaded.reserve(abstractCapacity());
+        try threaded.rebuildStaticNavGridWithWorld(&data, &world, null);
+        threaded.nav_thread_adaptive = false;
+        threaded.nav_thread_items_per_range = items_per_range;
+        const off_main = try threaded.markNavEvents(events.items, &world, &threads);
+        try std.testing.expect(off_main != 0);
+        try std.testing.expectEqual(serial.nav_marks.items.len, threaded.nav_marks.items.len);
+        for (serial.nav_marks.items, threaded.nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
+    }
+}
+
+test "nav marking after reserve allocates nothing on a multi-worker ThreadSystem, and an out-of-memory reserve records no mark (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try test_support.abstractTestWorld(&meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(-16);
+    var events = try navMarkTestEvents(std.testing.allocator, &world);
+    defer events.deinit(std.testing.allocator);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 8;
+
+    // A reserve past the steady capacity that runs out of memory records nothing.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, system.markNavEvents(events.items, &world, &threads));
+    try std.testing.expectEqual(@as(usize, 0), system.nav_marks.items.len);
+    system.allocator = std.testing.allocator;
+
+    // Warm, clear, then mark the same step again with every allocation failing.
+    _ = try system.markNavEvents(events.items, &world, &threads);
+    const warm = try std.testing.allocator.dupe(NavMark, system.nav_marks.items);
+    defer std.testing.allocator.free(warm);
+    system.clearNavDirty();
+    var steady = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = steady.allocator();
+    _ = try system.markNavEvents(events.items, &world, &threads);
+    system.allocator = std.testing.allocator;
+    try std.testing.expect(!steady.has_induced_failure);
+    try std.testing.expectEqual(warm.len, system.nav_marks.items.len);
+    for (warm, system.nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
 }
