@@ -17,7 +17,9 @@ harness (`.claude/rules/engine-design.md`).
 
 - **Rules** live only in `.claude/rules/`, one topic per file. Files without
   `paths:` load every session; the rest load when matching files are touched.
-  Docs describe how things work and cite rule files; they never restate them.
+  Docs describe how things work; docs and agent files cite rule files and
+  never restate them. A rule states its mechanism in a few lines, never a
+  slogan; a miss adds the missing mechanism to the owning rule file.
 - `docs/architecture.md`: source layout, ownership, frame flow, Target Model.
 - `docs/development-workflow.md` (DW): commands, build options, diagnostics,
   benches, packaging.
@@ -73,9 +75,10 @@ orchestrates, verifies every agent claim against live code, and reports.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
-  without asking and report them; only scope added or dropped,
-  product/gameplay behavior, rule changes, and a `ThreadSystem`/tuner
-  redesign go to the owner. No model/effort overrides unless the owner asks.
+  without asking, on best practice, scale, performance, and efficiency, never
+  on what today's code happens to produce, and report them; only scope added
+  or dropped, product/gameplay behavior, rule changes, and a
+  `ThreadSystem`/tuner redesign go to the owner. No model/effort overrides unless the owner asks.
 - Implementation agents run sequentially in the main tree; parallelize only
   read-only work, and let read-only agents finish rather than stopping them
   midway. One commit per logical change with review fixes folded in; no
