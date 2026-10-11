@@ -237,6 +237,84 @@ residual only); open work grows beside that loop.
   data in `DataSystem`, structural changes through `SimulationFrame`) are in
   [architecture.md](architecture.md).
 
+## Engine-Core Overhaul
+
+Owner direction 2026-10-11. The cost-model rules added since the 2026-10-07
+branch review (`engine-design.md` § Cost model: results are stored at the unit
+they cover and shared; a population's per-step load is O(1) per requester
+plus the distinct work, summed over worlds) drove the 64G terrain/nav rework.
+The rest of the engine gets the same pass, one area per branch, in this order.
+The owner merges each sealed branch to main before the next starts. Normal
+roadmap flow (Suggested Order) resumes after the AI branch.
+
+1. **Pathfinding (`slice-64g-seal`):** finish [64G](roadmap/slices/slice-64g.md):
+   - maintained reachability (connectivity IDs: O(1) per request, never a
+     failed search);
+   - dense-dig main-thread split;
+   - the cross-level heuristic at scale;
+   - the seal gate (a combined review since the 2026-10-07 branch review).
+2. **Core systems:** spatial index, steering, collision, tile gate, render
+   prep, inert rows, and Slice 75's tier mechanics.
+3. **AI:** cognition, perception, memory, affect, sensory bus and interest
+   markers, built on the core branch's final form.
+
+Each branch opens by measuring first (bench-only landing on today's code), then
+writes the findings below into slice checklists or new slice files.
+
+**Core findings** (derived from code, 2026-10-11; benches to confirm):
+- **High:**
+  - **Spatial index:**
+    - its whole-halo sort runs on main;
+    - rows carry no level, so separation, cohesion and perception cross
+      levels through rock;
+    - perception's check budget counts allies and other levels, so a dense
+      crowd hides hostiles in range; the fix is a per-cell summary built once
+      and shared;
+    - this comes before steering moves onto the index.
+  - **Collision broadphase** (new slice):
+    - the sweep is x-first over every level, so candidates grow with level
+      height and level count;
+    - gather and sort run on main every step.
+  - **Tile gate:** two scalar population walks on main with no threaded path.
+  - **Render collect:** walks every movement row in the world each frame
+    instead of the visible chunks; vertex memory is reserved to the whole
+    world's visuals.
+  - **Inert rows** (static colliders, future world items and resource nodes)
+    pay every per-step pass (movement, tiers, collision, render collect).
+- **Medium:**
+  - **Destructible resolve:** scans only the first 256 rows, so later
+    destructibles can't be hit; Slice 72 D1's planned pass is O(destructibles)
+    on main; the shared static collider query answers it.
+  - **Structural commands:** past the fixed share they fail the whole step, so
+    slices 56, 57, 61, 62, 76 and 77 must budget and defer theirs.
+- **Already owned:**
+  - far-tier freeze: 75;
+  - GPU per-edit sync: 64G B2.
+
+**AI findings** (derived from code, 2026-10-11; benches to confirm):
+- **Critical:** far AI stops advancing (no thinking outside the halo, dormant
+  past 48 chunks or 4 levels; memory and affect freeze), against
+  `engine-design.md` § Target scale. Owned by 75; its tier mechanics land in
+  the core branch.
+- **High:**
+  - **Per-row gathers on main** (perception, decide, memory, affect, stagger
+    filter): five population walks per step, every agent in every world once
+    75 lands. New slice; 68A's gather item moves into it.
+  - **Sensory bus** (new slice):
+    - fixed caps drop stimuli simulation reads;
+    - a dig can in principle be refused when the bus is full;
+    - linger is tied to the stagger, so slower thinkers miss one-shot sounds;
+    - hearing is every observer × every stimulus;
+    - the fix: per-chunk buckets, no caps.
+  - **Decide:** scans every marker per think and ignores level; with no player
+    it steers to a demo constant.
+- **Medium:**
+  - **Interest markers:** a flat 128-slot store that refuses adds and is
+    scanned per think; moves to chunk-owned storage (58).
+  - **Affect decay:** counted per think, not per elapsed step (73).
+- **Open question:** whether crowds converging on one goal share path work
+  through the goal-keyed cache or need the group field (73).
+
 ## Deferred By Owner
 
 Product work the owner explicitly deferred: not slices, no design. When an
@@ -257,6 +335,8 @@ Only the owner adds entries (Ground Rules).
 
 The settled foundation order is in the
 [archive index](framework-implementation-slices-archive.md#historical-order).
+The [Engine-Core Overhaul](#engine-core-overhaul) branches run before this
+order resumes.
 
 ### Open slices — merged order
 
