@@ -27,6 +27,8 @@ const resultBlockWords = @import("../game/systems/pathfinding/types.zig").result
 const registry_shard_count = @import("../game/systems/pathfinding/types.zig").registry_shard_count;
 const RegRecord = @import("../game/systems/pathfinding/types.zig").RegRecord;
 const ResultCache = @import("../game/systems/pathfinding/caches.zig").ResultCache;
+const NegativeCache = @import("../game/systems/pathfinding/caches.zig").NegativeCache;
+const max_negative_keys = @import("../game/systems/pathfinding/solve.zig").max_negative_keys;
 const SolvedPath = @import("../game/systems/pathfinding/system.zig").PathfindingSystem.SolvedPath;
 const ChunkListMap = @import("../game/systems/chunk_list_map.zig").ChunkListMap;
 
@@ -1573,14 +1575,18 @@ pub const NavSizeConfig = struct {
     /// per cached result; the default charges every cached result. A fixture whose paths
     /// all fit inline passes 0 and checks that no long block was taken.
     long_results: usize = std.math.maxInt(usize),
+    /// Proven negatives the fixture caches, clamped to the negative cache's capacity: each
+    /// is charged its most registry keys. A fixture caching none passes 0.
+    negatives: usize = 0,
 };
 
 /// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
 /// ceiling: per-level chunk directories, cell blocks, and records (every chunk mixed and
 /// holding portals), link slots, one level's batch window, per-participant search scratch,
 /// the tier-1 corridor pool, group fields, the result cache with the long-block pages of
-/// `long_results`, and the path registry. Search scratch and group fields are sized by
-/// their node and cell budgets, never by level cells.
+/// `long_results`, the path registry, and the negative cache with the registry keys of
+/// `negatives`. Search scratch and group fields are sized by their node and cell budgets,
+/// never by level cells.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
     // abstract node and stitched cell caps, escalated solves per step, group field cells,
@@ -1641,7 +1647,14 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     const runs_per_result = stored_path_cells / chunk_tiles;
     const registry = cached_results * (registry_shard_count * @sizeOf(u32) + runs_per_result * (ChunkListMap.bytes_per_entry + 2 * ChunkListMap.bytes_per_key_slot)) +
         solves_per_step * runs_per_result * @sizeOf(RegRecord);
-    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results + registry;
+    // Negative cache, per entry: its probe slots, record, free index, owner-log room, and an
+    // owner head per negative-registry shard; each cached negative its keys, each an entry
+    // with, at most, a key of its own in two table slots, and a step's registration windows.
+    const negative_keys: usize = max_negative_keys;
+    const negatives = cached_results * (NegativeCache.bytesPerEntry() + registry_shard_count * @sizeOf(u32)) +
+        @min(config.negatives, cached_results) * negative_keys * (ChunkListMap.bytes_per_entry + 2 * ChunkListMap.bytes_per_key_slot) +
+        @min(config.negatives, solves_per_step) * negative_keys * @sizeOf(RegRecord);
+    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results + registry + negatives;
 }
 
 // Rows the pathfinding tables reserve for `keys` keys; the library defaults sized here
@@ -1650,12 +1663,12 @@ fn tableRows(comptime keys: usize) usize {
     return comptime hashTableSlots(keys) catch @compileError("nav table too wide");
 }
 
-// One corridor scratch: the abstract table, open heap, corridor refs and link flags, and
-// the stitched path (one spare cell).
+// One corridor scratch: the abstract table, open heap, corridor refs and link flags, claim
+// list, and the stitched path (one spare cell).
 fn corridorBytes(comptime abstract_nodes: usize, comptime stitched_cells: usize) usize {
     const heap_entries: usize = @max(16, abstract_nodes * 4);
     return tableRows(abstract_nodes) * @sizeOf(AbstractSlot) + heap_entries * @sizeOf(OpenNode) +
-        abstract_nodes * (@sizeOf(usize) + @sizeOf(bool)) + (stitched_cells + 1) * @sizeOf(StitchedCell);
+        abstract_nodes * (@sizeOf(usize) + @sizeOf(bool) + @sizeOf(u32)) + (stitched_cells + 1) * @sizeOf(StitchedCell);
 }
 
 fn ceilMib(bytes: usize) usize {

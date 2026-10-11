@@ -5,7 +5,8 @@
 //! Per-key lists of owner ids: an open-addressed `u64 key -> {head, tail, count}` table over
 //! a pool of doubly linked entries, each list ordered by its entries' `order`, plus one
 //! chain per owner of the entries it holds. Keys are any u64 whose tier bits (62-63) are not
-//! both set; `chunkKey` builds the (level, chunk) keys. Each present key also holds one u32
+//! both set; `chunkKey` builds the (level, chunk) keys, `superchunkKey`, `levelKey`, and
+//! `world_key` the coarser tiers. Each present key also holds one u32
 //! value for its owner (`no_value` until set); a key holding a value is never dropped.
 //! Lists change in batches: between `beginBatch` and `commitBatch` the owner unlinks and
 //! staged inserts cost O(1) each on the caller's thread, and `commitBatch` places every
@@ -39,6 +40,25 @@ const untouched: u32 = std.math.maxInt(u32);
 pub fn chunkKey(level: u16, chunk: u32) u64 {
     return (@as(u64, level) << 32) | chunk;
 }
+
+/// Chunks along each side of a superchunk.
+pub const superchunk_edge: u32 = 8;
+const tier_one: u64 = 1 << 62;
+const tier_two: u64 = 1 << 63;
+
+/// The key of `superchunk` (a level-local index of `superchunk_edge`-chunk blocks) on
+/// `level`: tier 1, level in bits 32-47, the superchunk index in bits 0-31.
+pub fn superchunkKey(level: u16, superchunk: u32) u64 {
+    return tier_one | (@as(u64, level) << 32) | superchunk;
+}
+
+/// The key of all of `level`: tier 2, level in bits 32-47, low bits 0.
+pub fn levelKey(level: u16) u64 {
+    return tier_two | (@as(u64, level) << 32);
+}
+
+/// The key of every level: tier 2, low bits 1.
+pub const world_key: u64 = tier_two | 1;
 
 const Entry = struct {
     key: u64,
@@ -911,6 +931,34 @@ fn expectSameLists(a: *const ChunkListMap, b: *const ChunkListMap, keys: []const
             entry_a = a.entry_next[entry_a];
             entry_b = b.entry_next[entry_b];
         }
+    }
+}
+
+test "chunk, superchunk, level, and world keys are distinct and never set both tier bits" {
+    var keys: std.ArrayList(u64) = .empty;
+    defer keys.deinit(std.testing.allocator);
+    for ([_]u16{ 0, 1, std.math.maxInt(u16) }) |level| {
+        for ([_]u32{ 0, 1, 7, std.math.maxInt(u31) }) |index| {
+            try keys.append(std.testing.allocator, chunkKey(level, index));
+            try keys.append(std.testing.allocator, superchunkKey(level, index));
+        }
+        try keys.append(std.testing.allocator, levelKey(level));
+    }
+    try keys.append(std.testing.allocator, world_key);
+    for (keys.items, 0..) |key, index| {
+        try std.testing.expect(key >> 62 != 3);
+        try std.testing.expect(key != empty_key);
+        for (keys.items[index + 1 ..]) |other| try std.testing.expect(key != other);
+    }
+    // Every tier lists in one map.
+    var map = ChunkListMap.init(std.testing.allocator, "test tiers");
+    defer map.deinit();
+    try map.reserve(keys.items.len, keys.items.len, keys.items.len);
+    for (keys.items, 0..) |key, owner| map.add(@intCast(owner), key, 0);
+    for (keys.items, 0..) |key, owner| {
+        var owners = map.iterator(key);
+        try std.testing.expectEqual(@as(?u32, @intCast(owner)), owners.next());
+        try std.testing.expectEqual(@as(?u32, null), owners.next());
     }
 }
 

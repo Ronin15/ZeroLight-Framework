@@ -320,9 +320,13 @@ pub const NavUpdateStats = struct {
     evict_count_batch: BatchStats = .{},
     evict_batch: BatchStats = .{},
     evict_flush_batch: BatchStats = .{},
-    // Registry entries the halo walk visited, and the cached results it evicted.
+    // Registry entries the halo walk visited, the cached results it evicted, the negatives
+    // the dirty keys' lists evicted (and a level add's world negatives), and the group fields
+    // a changed cell next to a costed cell dropped.
     evict_entries_visited: usize = 0,
     evicted_results: usize = 0,
+    evicted_negatives: usize = 0,
+    dropped_fields: usize = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -559,6 +563,13 @@ pub const PathfindingStats = struct {
     // Start-side solve failures dropped without negative-caching (see
     // PathSolveResult.start_invalid).
     start_invalid_dropped: usize = 0,
+    // Failed solves answered for their request only, never cached (see
+    // PathSolveResult.start_unreachable); counted in `unavailable_results` too.
+    start_unreachable: usize = 0,
+    // Proven negatives claimed into the negative cache, and those proven after a search
+    // exhausted its budget.
+    negatives_published: usize = 0,
+    negatives_proven_after_exhaustion: usize = 0,
     goal_projected: usize = 0,
     group_fields_built: usize = 0,
     group_field_reuses: usize = 0,
@@ -589,10 +600,12 @@ pub const PathfindingStats = struct {
     publish_copy_batch: BatchStats = .{},
     registry_flush_batch: BatchStats = .{},
     resize_copy_batch: BatchStats = .{},
-    // Path registry entries added and removed by this update's flush, and its shard
-    // storage growths.
+    // Path registry entries added and removed by this update's flush, the negative
+    // registry's, and both registries' shard storage growths.
     registrations_added: usize = 0,
     registrations_removed: usize = 0,
+    negative_registrations_added: usize = 0,
+    negative_registrations_removed: usize = 0,
     registry_grows: usize = 0,
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
@@ -614,9 +627,10 @@ pub const GroupRequestTally = struct {
 };
 
 /// One classified request of the `path_intake` stage, written into its range's window
-/// of the item-capacity record buffer: a candidate (its range's repeats folded in) or an
-/// expired result to remove. Classified against step-start state only; the main-thread
-/// merge resolves expiry, in-step duplicates, and the pending cap in request order.
+/// of the item-capacity record buffer: a candidate (its range's repeats folded in), or an
+/// expired result or negative to remove. Classified against step-start state only; the
+/// main-thread merge resolves expiry, in-step duplicates, and the pending cap in request
+/// order.
 pub const IntakeRecord = struct {
     entity: EntityId,
     key: PathQueryKey,
@@ -626,6 +640,8 @@ pub const IntakeRecord = struct {
     goal_index: usize,
     // The key's cached result was expired at step start: the merge removes it.
     expired: bool,
+    // The key's negative was expired at step start: the merge removes it.
+    expired_negative: bool,
     // Not served by a group field or a cache and not pending at step start.
     candidate: bool,
     // The goal was blocked and projected to an open cell.
@@ -888,16 +904,32 @@ pub const RegRecord = struct {
     order: u32,
 };
 
-/// Per changed key of a path eviction: its hit bound, its hit window's base, its hits and
-/// visited registry entries, and the registered halo keys it owns (bit
-/// `(dy + 1) * 3 + (dx + 1)`).
+/// Per dirty key of an eviction. Its hit window at `base` holds its path hits (`bound`
+/// at most), then its negative hits (`negative_bound` at most), then its group-field hits
+/// (one slot per field for a changed key). `visited` counts the path registry entries
+/// walked. `changed_index` is its index in the batch's changed keys (`no_changed_index`:
+/// a link-only key). `owned` holds the registered halo keys it owns (bit
+/// `(dy + 1) * 3 + (dx + 1)`) and the coarser negative lists it walks
+/// (`evict_owns_superchunk`, `evict_owns_level`, `evict_owns_world`).
 pub const EvictItem = struct {
     bound: u32 = 0,
     base: u32 = 0,
     hits: u32 = 0,
     visited: u32 = 0,
+    negative_bound: u32 = 0,
+    negative_hits: u32 = 0,
+    field_hits: u32 = 0,
+    changed_index: u32 = no_changed_index,
     owned: u16 = 0,
 };
+
+/// `EvictItem.changed_index` of a dirty key that is no changed key.
+pub const no_changed_index: u32 = std.math.maxInt(u32);
+/// `EvictItem.owned` bits of the dirty key that walks its superchunk's, its level's, and
+/// the world's negative lists: the first of the batch's dirty keys in each.
+pub const evict_owns_superchunk: u16 = 1 << 9;
+pub const evict_owns_level: u16 = 1 << 10;
+pub const evict_owns_world: u16 = 1 << 11;
 
 /// Eviction range alignment: every range's items start on a cache line.
 pub const evict_range_alignment_items: usize = 16;
@@ -907,6 +939,7 @@ pub const hit_window_alignment_items: usize = thread_shared_record_alignment / @
 
 comptime {
     std.debug.assert(@sizeOf(RegRecord) == 16);
+    std.debug.assert(@sizeOf(EvictItem) == 36);
     std.debug.assert((@sizeOf(EvictItem) * evict_range_alignment_items) % thread_shared_record_alignment == 0);
 }
 
@@ -934,10 +967,32 @@ pub const PathSolveResult = union(enum) {
     budget_exhausted: PathQueryKey,
     // Start-side failure (blocked/off-grid representative start, unseedable start
     // component): a property of the representative agent, not of the goal. Dropped
-    // from pending WITHOUT negative-caching — the goal-keyed `unavailable` set is
+    // from pending WITHOUT negative-caching — the goal-keyed negative cache is
     // shared by every agent, so caching this would poison the goal for all of them.
     // The next status query falls through to `.missing` (retryable).
     start_invalid: PathQueryKey,
+    // A failed search no proof extends past this start: answered unreachable for this
+    // request only and dropped from pending WITHOUT negative-caching, so the next status
+    // query reads `.missing` and the requester re-requests.
+    start_unreachable: PathQueryKey,
+};
+
+/// The chunk box a cached negative's proof leaves out, on one level, inclusive: the
+/// negative answers every start outside it. The empty box holds for every start.
+pub const Enclosure = struct {
+    level: u16 = 0,
+    min_x: u32 = 1,
+    min_y: u32 = 1,
+    max_x: u32 = 0,
+    max_y: u32 = 0,
+
+    pub const every_start: Enclosure = .{};
+
+    /// Whether a start in chunk (`chunk_x`, `chunk_y`) of `level` lies in the box, so the
+    /// negative does not answer it.
+    pub fn excludes(self: Enclosure, level: u16, chunk_x: u32, chunk_y: u32) bool {
+        return level == self.level and chunk_x >= self.min_x and chunk_x <= self.max_x and chunk_y >= self.min_y and chunk_y <= self.max_y;
+    }
 };
 
 pub const OpenNode = struct {

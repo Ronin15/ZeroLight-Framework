@@ -2511,10 +2511,51 @@ test "steering unavailable paths enter backoff without request spam" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    // A wall on cell column 3, the last column of the first 4-cell chunk: the goal's
+    // region (chunk column 1) leaves the agent's chunk out, so its negative is cached.
+    _ = try addStaticObstacle(&data, .{ .x = 96, .y = 0 }, .{ .x = 32, .y = 160 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4, .nav_chunk_tiles = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+    const grid = pathfinding.graph.grid(0).?;
+    try std.testing.expect(grid.isBlockedCell(.{ .x = 3, .y = 0 }) and !grid.isBlockedCell(.{ .x = 2, .y = 0 }) and !grid.isBlockedCell(.{ .x = 4, .y = 0 }));
+    var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
+    defer colliders.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(4);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 144, .y = 0 }, .direct_direction_x = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const solve = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
+    try std.testing.expectEqual(@as(usize, 1), solve.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 1), solve.negatives_published);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 144, .y = 0 }, .direct_direction_x = 1 });
+    const unavailable = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    try std.testing.expectEqual(@as(usize, 1), unavailable.path_unavailable_count);
+    try std.testing.expectEqual(@as(usize, 0), unavailable.path_request_count);
+}
+
+test "steering re-requests a goal answered unreachable for its start only after its replan cooldown, never every step" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
     _ = try addStaticObstacle(&data, .{ .x = 32, .y = 0 }, .{ .x = 32, .y = 160 });
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
+    // One chunk holds the agent and the goal, so no proof around the goal leaves the agent
+    // out: its failure is answered for that request only.
     try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
@@ -2528,17 +2569,25 @@ test "steering unavailable paths enter backoff without request spam" {
     defer steering.deinit();
     try steering.reserve(4);
 
-    frame.beginStep();
-    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 128, .y = 0 }, .direct_direction_x = 1 });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
-    const solve = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
-    try std.testing.expectEqual(@as(usize, 1), solve.unavailable_results);
-
-    frame.beginStep();
-    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 128, .y = 0 }, .direct_direction_x = 1 });
-    const unavailable = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 1), unavailable.path_unavailable_count);
-    try std.testing.expectEqual(@as(usize, 0), unavailable.path_request_count);
+    // The agent's replan cooldown (`addSteeredEntity`).
+    const cooldown_steps = 4;
+    var requested: [12]bool = undefined;
+    var unreachable_answers: usize = 0;
+    for (&requested) |*step_requested| {
+        frame.beginStep();
+        try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 128, .y = 0 }, .direct_direction_x = 1 });
+        const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        step_requested.* = stats.path_request_count != 0;
+        try std.testing.expectEqual(@as(usize, 0), stats.path_unavailable_count);
+        if (!step_requested.*) try std.testing.expect(stats.replan_cooldown_count != 0);
+        const solve = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
+        unreachable_answers += solve.start_unreachable;
+        try std.testing.expectEqual(@as(usize, 0), solve.negatives_published);
+        try std.testing.expect(pathfinding.statusForWorld(0, .{ .x = 0, .y = 0 }, 0, .{ .x = 128, .y = 0 }, .default, null).status == .missing);
+    }
+    // A request on the first step and then once per cooldown, each answered unreachable.
+    for (requested, 0..) |step_requested, step| try std.testing.expectEqual(step % cooldown_steps == 0, step_requested);
+    try std.testing.expectEqual(requested.len / cooldown_steps, unreachable_answers);
 }
 
 test "steering keeps highest priority navigation intent with stable tie order" {

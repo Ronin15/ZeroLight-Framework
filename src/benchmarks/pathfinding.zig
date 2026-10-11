@@ -298,12 +298,13 @@ pub const cold_unreachable_group = suite.BenchmarkGroup{
     .runCase = runColdUnreachableCase,
 };
 
-// Fresh unreachable goals on a full negative set. Goals lie in a sealed 80² pocket at the
+// Fresh unreachable goals on a full negative cache. Goals lie in a sealed 80² pocket at the
 // origin of a walkable 256² level and are requested from outside it, so every search ends
-// without a path. Untimed, four steps of the item count's requests fill the negative set
-// to its cap (four per agent); each timed step then requests the item count of goals that
-// no step of the last 16 asked for. `outputs` is the step's negatives answered and
-// `evictions` (`victims=`) the negatives lost to the full set.
+// without a path and the goal flood proves the pocket. Untimed, four steps of the item
+// count's requests fill the negative cache to its cap (four per agent); each timed step
+// then requests the item count of goals that no step of the last 16 asked for, and every
+// published negative evicts a round-robin victim. `outputs` is the step's negatives answered
+// and `evictions` (`victims=`) the victims the full cache evicted.
 pub const negative_steady_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-steady",
     .defaultItemCounts = negativeSteadyItemCounts,
@@ -312,16 +313,16 @@ pub const negative_steady_group = suite.BenchmarkGroup{
 
 // The item count's requests (item code level side * 1000 + requests) from outside a
 // sealed 80² pocket at the origin of a walkable level, each to its own goal inside it.
+// An untimed first update publishes every goal's negative: side 256's searches end without
+// a path under the tier-0 cap, and the goal flood proves the pocket within their claims;
+// sides 1024 and 2048 exhaust the tier-0 budget, and the flood proves it within that cap.
 // Each timed step toggles one far cell's blocking, runs the nav reaction, and updates the
-// same requests. Side 256's searches end without a path under the tier-0 cap. Side 2048's
-// exhaust the tier-0 budget in every timed step (the reaction drops their tier-1
-// promotions); an untimed check before timing proves the tier-1 budget exhausts too.
-// Side 1024's exhaust the tier-0 budget the same way; how its tier-1 search ends is not
-// checked. Other sides check only that each request is answered unavailable, exhausted, or still
-// pending. `outputs` is the step's solves, `candidates` its cache hits, `samples` its
+// same requests: the far change evicts no negative, so on the pinned sides every request is
+// a hit. Other sides check only that each request is answered unavailable, exhausted, or
+// still pending. `outputs` is the step's solves, `candidates` its cache hits, `samples` its
 // exhausted attempts, and `deferred` the requests still pending after it. `--details`
 // prints the update's stages, the reaction's remask and eviction stages with its
-// main-thread share, and the reaction/update split.
+// main-thread share, and the reaction/update split with the negatives it evicted.
 pub const negative_dig_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-dig",
     .defaultItemCounts = negativeDigItemCounts,
@@ -932,6 +933,12 @@ const StageReport = struct {
     // Path-registry entries the timed updates added and removed.
     registrations_added: usize = 0,
     registrations_removed: usize = 0,
+    // Negatives the timed updates published, failed solves answered without one, and the
+    // negative-registry entries added and removed.
+    negatives_published: usize = 0,
+    start_unreachable: usize = 0,
+    negative_registrations_added: usize = 0,
+    negative_registrations_removed: usize = 0,
 
     fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
         self.samples += 1;
@@ -943,6 +950,10 @@ const StageReport = struct {
         self.publish_ns += stats.publish_ns -| offMainNs(stats.publish_copy_batch);
         self.registrations_added += stats.registrations_added;
         self.registrations_removed += stats.registrations_removed;
+        self.negatives_published += stats.negatives_published;
+        self.start_unreachable += stats.start_unreachable;
+        self.negative_registrations_added += stats.negative_registrations_added;
+        self.negative_registrations_removed += stats.negative_registrations_removed;
         for (updateBatches(stats), &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
             if (batch.item_count == 0) continue;
             dispatched.* += 1;
@@ -982,6 +993,14 @@ const StageReport = struct {
         });
         if (self.routes) |routes| std.debug.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
         std.debug.print(" registrations +{}/-{} per update", .{ self.registrations_added / self.samples, self.registrations_removed / self.samples });
+        if (self.negatives_published + self.start_unreachable + self.negative_registrations_removed != 0) {
+            std.debug.print(" negatives_published={} start_unreachable={} negative_registrations +{}/-{} per update", .{
+                self.negatives_published / self.samples,
+                self.start_unreachable / self.samples,
+                self.negative_registrations_added / self.samples,
+                self.negative_registrations_removed / self.samples,
+            });
+        }
         std.debug.print("\n", .{});
     }
 };
@@ -2989,9 +3008,11 @@ fn runElasticShrink(
     // The step finished the whole shrink: copies done and pages freed, owner ops flushed,
     // and registry owner heads cut to the new capacity.
     if (system.completed.pendingMoves().len != 0 or system.completed.inline_pages.items.len != system.completed.inline_page_count) return error.ElasticShrinkPagesPending;
-    if (system.completed.core.ownerLog().len != 0) return error.ElasticShrinkOpsPending;
-    for (&system.path_index) |*shard| {
+    if (system.completed.core.ownerLog().len != 0 or system.negatives.core.ownerLog().len != 0) return error.ElasticShrinkOpsPending;
+    if (system.negatives.logicalCapacity() != shrink.cache_capacity_after) return error.ElasticShrinkNegativeCapacityApart;
+    for (&system.path_index, &system.negative_index) |*shard, *negative_shard| {
         if (shard.owner_heads.items.len > shrink.cache_capacity_after) return error.ElasticShrinkOwnerHeadsPending;
+        if (negative_shard.owner_heads.items.len > shrink.cache_capacity_after) return error.ElasticShrinkNegativeOwnerHeadsPending;
     }
 
     // A shrink keeps an entry's key and moves it only to another owner id.
@@ -3205,6 +3226,7 @@ fn pocketSizeConfig(side: u16, participant_count: usize, requester_count: usize)
         .group_fields = 1,
         // No path is published, so no long block is taken.
         .long_results = 0,
+        .negatives = requester_count * cached_results_per_agent,
     };
 }
 
@@ -3232,13 +3254,14 @@ fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture
 }
 
 // One negative-steady step on goals from `first_goal`: every request is a fresh failing
-// solve, and `lost` negatives go to the full set.
-fn runNegativeSteadyStep(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem, first_goal: usize, lost: usize) !PocketStep {
+// solve that publishes its proven negative, evicting `victims` from the full cache.
+fn runNegativeSteadyStep(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem, first_goal: usize, victims: usize) !PocketStep {
     const step = try runPocketUpdate(io, case, fixture, thread_system, first_goal);
     const count = fixture.requests.len;
     if (step.stats.cache_hits != 0) return error.NegativeSteadyCacheHit;
     if (step.stats.solved_requests != count or step.stats.unavailable_results != count) return error.NegativeSteadySolveNotNegative;
-    if (step.stats.cache_evictions != lost) return error.NegativeSteadyLostCount;
+    if (step.stats.negatives_published != count) return error.NegativeSteadyNegativeUnproven;
+    if (step.stats.cache_evictions != victims) return error.NegativeSteadyVictimCount;
     return step;
 }
 
@@ -3261,7 +3284,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     defer fixture.deinit(allocator);
     setPathStageTuners(&fixture.system, case);
 
-    // Untimed prime: the set takes every prime goal's negative and loses none.
+    // Untimed prime: the cache takes every prime goal's negative and evicts none.
     for (0..cached_results_per_agent) |prime_step| {
         _ = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, prime_step * item_count, 0);
     }
@@ -3301,31 +3324,29 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     return stats;
 }
 
-// How a negative-dig side's outside searches end; sides other than 256, 1024, and 2048 are
-// unpinned.
+// How a negative-dig side's first outside searches end, each then proven by the goal flood;
+// sides other than 256, 1024, and 2048 are unpinned.
 const PocketSearchEnd = enum {
     // Without a path, under the tier-0 cap.
     none,
-    // Exhausting the tier-0 and then the tier-1 budget.
+    // Exhausting the tier-0 budget.
     exhausted,
-    // Exhausting the tier-0 budget; how the tier-1 search ends is unpinned.
-    tier0_exhausted,
     // Unpinned: only the step's accounting is checked.
     any,
 
     fn forSide(side: u16) PocketSearchEnd {
         return switch (side) {
             256 => .none,
-            1024 => .tier0_exhausted,
-            2048 => .exhausted,
+            1024, 2048 => .exhausted,
             else => .any,
         };
     }
 };
 
 // The timed negative-dig steps' reaction/update split, the reaction's remask shape, the
-// last step's outcome, and the untimed attempts' abstract nodes, printed under --details.
-// The reaction's eviction stages and main-thread share print through `EvictReport`.
+// negatives the reactions evicted, the last step's outcome, and the untimed first update's
+// abstract nodes, printed under --details. The reaction's eviction stages and main-thread
+// share print through `EvictReport`.
 const NegativeDigReport = struct {
     samples: usize = 0,
     react_ns: u128 = 0,
@@ -3333,16 +3354,16 @@ const NegativeDigReport = struct {
     remask_busiest: BatchStats = .{},
     remask_threaded: usize = 0,
     remask_dispatched: usize = 0,
+    evicted_negatives: usize = 0,
     last: PathfindingStats = .{},
-    // Abstract nodes the untimed first update's tier-0 searches and the second update's
-    // tier-1 search claimed (zero when no tier-1 search ran).
+    // Abstract nodes the untimed first update's last search and goal flood claimed.
     tier0_nodes: usize = 0,
-    tier1_nodes: usize = 0,
 
     fn add(self: *NegativeDigReport, reaction: EvictReaction, step: PocketStep) void {
         self.samples += 1;
         self.react_ns += reaction.elapsed_ns;
         self.update_ns += step.elapsed_ns;
+        self.evicted_negatives += reaction.stats.evicted_negatives;
         self.last = step.stats;
         const remask = reaction.stats.remask_batch;
         if (remask.item_count == 0) return;
@@ -3355,13 +3376,14 @@ const NegativeDigReport = struct {
         if (!options.details or self.samples == 0) return;
         const samples: u128 = self.samples * std.time.ns_per_us;
         var remask_buffer: [48]u8 = undefined;
-        std.debug.print("  {s} {} {s}: react={}us update={}us remask={s} hits={} solves={} exhausted={} escalated={} dropped={} pending={} tier0_nodes={} tier1_nodes={}\n", .{
+        std.debug.print("  {s} {} {s}: react={}us update={}us remask={s} evicted_negatives={} hits={} solves={} exhausted={} escalated={} dropped={} pending={} tier0_nodes={}\n", .{
             negative_dig_group.name,
             item_count,
             case.name,
             @as(u64, @intCast(self.react_ns / samples)),
             @as(u64, @intCast(self.update_ns / samples)),
             stageShape(&remask_buffer, self.remask_busiest, self.remask_threaded, self.remask_dispatched),
+            self.evicted_negatives,
             self.last.cache_hits,
             self.last.solved_requests,
             self.last.budget_exhausted,
@@ -3369,14 +3391,13 @@ const NegativeDigReport = struct {
             self.last.escalated_dropped,
             self.last.deferred_requests,
             self.tier0_nodes,
-            self.tier1_nodes,
         });
     }
 };
 
 // The negative-dig step: toggles the far cell's blocking and runs the nav reaction (its
-// time measured inside `changeAndReact`), then updates the same requests. The pinned sides'
-// timed outcome is checked against the search end.
+// time measured inside `changeAndReact`), then updates the same requests. On the pinned
+// sides the far change evicts no negative and every request is a hit.
 const NegativeDig = struct {
     cell: CellCoord,
     search_end: PocketSearchEnd,
@@ -3389,10 +3410,10 @@ const NegativeDig = struct {
         const update = try runPocketUpdate(io, case, fixture, thread_system, null);
         const count = fixture.requests.len;
         switch (self.search_end) {
-            // Every request is a full failing search.
-            .none => if (update.stats.unavailable_results != count or update.stats.solved_requests != count or update.stats.cache_hits != 0) return error.NegativeDigSearchNotNone,
-            // Every request is a fresh tier-0 attempt that exhausts.
-            .exhausted, .tier0_exhausted => if (update.stats.budget_exhausted != count or update.stats.escalated_solves != 0) return error.NegativeDigTier0NotExhausted,
+            .none, .exhausted => {
+                if (reaction.stats.evicted_negatives != 0) return error.NegativeDigFarChangeEvicted;
+                if (update.stats.cache_hits != count or update.stats.unavailable_results != count or update.stats.solved_requests != 0) return error.NegativeDigNotHit;
+            },
             .any => {},
         }
         return .{ .reaction = reaction, .update = update };
@@ -3422,23 +3443,20 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     setNavReactionTuners(&fixture.system, case);
     configureNavUpdateThreads(&fixture.system, case);
 
-    // Untimed first update: every request is a fresh tier-0 attempt.
+    // Untimed first update: every request is a fresh tier-0 attempt whose goal flood proves
+    // the pocket, after a search without a path (256) or one that exhausted its budget.
     var report = NegativeDigReport{};
     const first = try runPocketUpdate(io, case, &fixture, thread_ptr, null);
     report.tier0_nodes = lastAbstractNodesUsed(&fixture.system);
-    switch (search_end) {
-        .none => if (first.stats.solved_requests != requester_count or first.stats.unavailable_results != requester_count) return error.NegativeDigSearchNotNone,
-        .exhausted => {
-            if (first.stats.budget_exhausted != requester_count or first.stats.escalated_solves != 0) return error.NegativeDigTier0NotExhausted;
-            // Untimed second update of the same requests, all promoted: every admitted
-            // tier-1 attempt exhausts and drops.
-            const second = try runPocketUpdate(io, case, &fixture, thread_ptr, null);
-            for (fixture.system.tier1_scratch.items) |*entry| report.tier1_nodes = @max(report.tier1_nodes, entry.corridor.abstract.nodes_used);
-            const tier1 = second.stats.escalated_solves;
-            if (tier1 == 0 or second.stats.budget_exhausted != tier1 or second.stats.escalated_dropped != tier1) return error.NegativeDigTier1NotExhausted;
-        },
-        .tier0_exhausted => if (first.stats.budget_exhausted != requester_count or first.stats.escalated_solves != 0) return error.NegativeDigTier0NotExhausted,
-        .any => {},
+    const proven_after_exhaustion: usize = switch (search_end) {
+        .none => 0,
+        .exhausted => requester_count,
+        .any => first.stats.negatives_proven_after_exhaustion,
+    };
+    if (search_end != .any) {
+        if (first.stats.solved_requests != requester_count or first.stats.negatives_published != requester_count) return error.NegativeDigNotProven;
+        if (first.stats.negatives_proven_after_exhaustion != proven_after_exhaustion) return error.NegativeDigSearchEnd;
+        if (first.stats.budget_exhausted != 0 or first.stats.escalated_solves != 0) return error.NegativeDigExhausted;
     }
 
     var dig = NegativeDig{ .cell = pocketDigCell(side), .search_end = search_end };

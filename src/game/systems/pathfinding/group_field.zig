@@ -313,6 +313,20 @@ pub const GroupField = struct {
         return .{ .cost = self.columns.cost[block][local], .flow_dir = self.columns.flow[block][local] };
     }
 
+    /// Whether the current build costed a cell of `chunk` set in `cells` (chunk-local
+    /// bits); false for an empty field. One directory probe; read-only, so safe on workers
+    /// while no stage writes the field.
+    pub fn costedNear(self: *const GroupField, chunk: u32, cells: *const ChunkBits) bool {
+        if (self.state == .empty or self.directory.len == 0) return false;
+        const probe = self.findChunk(chunk);
+        if (!probe.found) return false;
+        const costed = &self.columns.costed[self.directory[probe.row].block];
+        for (costed, cells) |costed_word, cell_word| {
+            if (costed_word & cell_word != 0) return true;
+        }
+        return false;
+    }
+
     fn nextGeneration(self: *GroupField) void {
         if (self.generation == max_stamp_generation) {
             @memset(std.mem.sliceAsBytes(self.directory), 0);
@@ -838,6 +852,47 @@ test "a group field equals the flat-array field after every budgeted expand" {
             }
         }
     }
+}
+
+test "costedNear is exact against the current build's costed cells, mid-build and ready" {
+    const allocator = std.testing.allocator;
+    var grid = NavGrid{};
+    defer grid.deinit(allocator);
+    try randomObstacleGrid(allocator, &grid, 24, 24, 4, 0xc057);
+    var field = GroupField{};
+    defer field.deinit(allocator);
+    var single: ChunkBits = @splat(0);
+    // An unbuilt field costs nothing.
+    single[0] = 1;
+    try std.testing.expect(!field.costedNear(0, &single));
+    try std.testing.expect(try beginTestBuild(allocator, &field, &grid, firstOpenCell(&grid, 12 * 24 + 12), 200, 9));
+    for (0..3) |round| {
+        if (round != 0) _ = try stepGrowing(allocator, &field, &grid, 9);
+        // Each cell alone: set exactly when the build costed it.
+        for (0..grid.cellCount()) |cell| {
+            const x = cell % grid.width;
+            const y = cell / grid.width;
+            const local = localAt(&grid, x, y);
+            single = @splat(0);
+            setBit(&single, local);
+            try std.testing.expectEqual(field.lookup(&grid, cell) != null, field.costedNear(chunkAt(&grid, x, y), &single));
+        }
+    }
+    try buildToReady(allocator, &field, &grid, 64);
+    // A whole chunk's bits answer whether any of its cells is costed.
+    var all: ChunkBits = @splat(std.math.maxInt(u64));
+    for (0..grid.dir.items.len) |chunk| {
+        var any = false;
+        for (0..grid.cellCount()) |cell| {
+            if (chunkAt(&grid, cell % grid.width, cell / grid.width) == chunk and field.lookup(&grid, cell) != null) any = true;
+        }
+        try std.testing.expectEqual(any, field.costedNear(@intCast(chunk), &all));
+    }
+    all = @splat(0);
+    try std.testing.expect(!field.costedNear(0, &all));
+    field.state = .empty;
+    single[0] = std.math.maxInt(u64);
+    try std.testing.expect(!field.costedNear(chunkAt(&grid, field.goal_index % grid.width, field.goal_index / grid.width), &single));
 }
 
 test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra field" {

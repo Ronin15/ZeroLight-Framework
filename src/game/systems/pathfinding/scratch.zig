@@ -9,6 +9,7 @@
 //! wraparound.
 
 const std = @import("std");
+const simd = @import("../../../core/simd.zig");
 const types = @import("types.zig");
 const PortalFlags = @import("nav_graph.zig").PortalFlags;
 const OpenNode = types.OpenNode;
@@ -59,6 +60,14 @@ pub const AbstractClaim = struct {
     fresh: bool,
 };
 
+/// An inclusive box of chunk coordinates.
+pub const ChunkBox = struct {
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+};
+
 // Budget-bounded A* over abstract portal nodes keyed by a packed (level << 32) | cell ref,
 // in an open-addressed table of `hashTableSlots(node_limit)` rows, so memory follows the
 // node budget, never the portal count. `corridor` holds the ordered refs of the chosen
@@ -79,6 +88,8 @@ pub const AbstractScratch = struct {
     slot_shift: u6 = 0,
     corridor: std.ArrayList(usize) = .empty,
     corridor_link: std.ArrayList(bool) = .empty,
+    /// This generation's claimed slots in claim order, at most `node_limit`.
+    claimed: std.ArrayList(u32) = .empty,
     /// Logical open-heap cap set by `reserve` (`openHeapLimit(max_abstract_nodes)`); the
     /// search gates compare against this, never `open.capacity`.
     open_limit: usize = 0,
@@ -87,6 +98,7 @@ pub const AbstractScratch = struct {
     corridor_limit: usize = 0,
 
     pub fn deinit(self: *AbstractScratch, allocator: std.mem.Allocator) void {
+        self.claimed.deinit(allocator);
         self.corridor_link.deinit(allocator);
         self.corridor.deinit(allocator);
         allocator.free(self.slots);
@@ -110,6 +122,7 @@ pub const AbstractScratch = struct {
         try self.open.ensureTotalCapacity(allocator, open_limit);
         try self.corridor.ensureTotalCapacity(allocator, max_abstract_nodes);
         try self.corridor_link.ensureTotalCapacity(allocator, max_abstract_nodes);
+        try self.claimed.ensureTotalCapacity(allocator, max_abstract_nodes);
         allocator.free(self.slots);
         self.slots = slots;
         @memset(std.mem.sliceAsBytes(self.slots), 0);
@@ -125,16 +138,19 @@ pub const AbstractScratch = struct {
         std.debug.assert(self.node_limit * 2 <= self.slots.len);
         std.debug.assert(self.open.capacity >= self.open_limit and
             self.corridor.capacity >= self.corridor_limit and
-            self.corridor_link.capacity >= self.corridor_limit);
+            self.corridor_link.capacity >= self.corridor_limit and
+            self.claimed.capacity >= self.node_limit);
         self.open.clearRetainingCapacity();
         self.corridor.clearRetainingCapacity();
         self.corridor_link.clearRetainingCapacity();
+        self.claimed.clearRetainingCapacity();
     }
 
     pub fn reset(self: *AbstractScratch) void {
         self.open.clearRetainingCapacity();
         self.corridor.clearRetainingCapacity();
         self.corridor_link.clearRetainingCapacity();
+        self.claimed.clearRetainingCapacity();
         self.nodes_used = 0;
         if (self.generation == max_stamp_generation) {
             @memset(std.mem.sliceAsBytes(self.slots), 0);
@@ -162,6 +178,9 @@ pub const AbstractScratch = struct {
             }
             if (self.nodes_used >= self.node_budget) return null;
             self.nodes_used += 1;
+            // At most `node_limit` claims a generation, which the reserve covers.
+            std.debug.assert(self.claimed.items.len < self.claimed.capacity);
+            self.claimed.appendAssumeCapacity(@intCast(index));
             slot.* = .{
                 .node = node,
                 .stamp = self.generation << 1,
@@ -175,6 +194,56 @@ pub const AbstractScratch = struct {
             };
             return .{ .slot = @intCast(index), .fresh = true };
         }
+    }
+
+    /// The box of the chunks (cell coordinates shifted right by `chunk_shift`) of this
+    /// generation's claimed nodes; null with none claimed. Chunk coordinates stay below
+    /// 2^31 (a level's chunk count does), so they fit i32 lanes.
+    // SIMD verdict: four lanes over claims gathered into packed coordinate scratch, then a
+    // scalar tail.
+    pub fn chunkBox(self: *const AbstractScratch, chunk_shift: u5) ?ChunkBox {
+        const claimed = self.claimed.items;
+        if (claimed.len == 0) return null;
+        var min_x = simd.splatInt4(std.math.maxInt(i32));
+        var min_y = min_x;
+        var max_x = simd.splatInt4(0);
+        var max_y = max_x;
+        const vector_end = simd.vectorizedEnd(claimed.len);
+        var index: usize = 0;
+        while (index < vector_end) : (index += simd.lane_count) {
+            var xs: [simd.lane_count]i32 = undefined;
+            var ys: [simd.lane_count]i32 = undefined;
+            inline for (0..simd.lane_count) |lane| {
+                const slot = self.slots[claimed[index + lane]];
+                xs[lane] = @intCast(slot.x >> chunk_shift);
+                ys[lane] = @intCast(slot.y >> chunk_shift);
+            }
+            const x = simd.loadInt4(&xs);
+            const y = simd.loadInt4(&ys);
+            min_x = simd.minInt4(min_x, x);
+            min_y = simd.minInt4(min_y, y);
+            max_x = simd.maxInt4(max_x, x);
+            max_y = simd.maxInt4(max_y, y);
+        }
+        var box = ChunkBox{ .min_x = std.math.maxInt(u32), .min_y = std.math.maxInt(u32), .max_x = 0, .max_y = 0 };
+        if (vector_end != 0) {
+            const lanes = .{ simd.toIntArray(min_x), simd.toIntArray(min_y), simd.toIntArray(max_x), simd.toIntArray(max_y) };
+            inline for (0..simd.lane_count) |lane| {
+                // Lanes hold chunk coordinates, never negative.
+                box.min_x = @min(box.min_x, @as(u32, @intCast(lanes[0][lane])));
+                box.min_y = @min(box.min_y, @as(u32, @intCast(lanes[1][lane])));
+                box.max_x = @max(box.max_x, @as(u32, @intCast(lanes[2][lane])));
+                box.max_y = @max(box.max_y, @as(u32, @intCast(lanes[3][lane])));
+            }
+        }
+        for (claimed[vector_end..]) |slot_index| {
+            const slot = self.slots[slot_index];
+            box.min_x = @min(box.min_x, slot.x >> chunk_shift);
+            box.min_y = @min(box.min_y, slot.y >> chunk_shift);
+            box.max_x = @max(box.max_x, slot.x >> chunk_shift);
+            box.max_y = @max(box.max_y, slot.y >> chunk_shift);
+        }
+        return box;
     }
 };
 
@@ -544,4 +613,54 @@ test "tier-1 pool entries never share a cache line" {
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&entries[0]) % thread_shared_record_alignment);
     try std.testing.expectEqual(@as(usize, 0), stride % thread_shared_record_alignment);
     try std.testing.expect(stride >= @sizeOf(CorridorScratch));
+}
+
+test "the claim list holds exactly this generation's claims in claim order and empties on reset" {
+    var scratch = AbstractScratch{};
+    defer scratch.deinit(std.testing.allocator);
+    try scratch.reserve(std.testing.allocator, 8);
+    scratch.node_budget = 3;
+    var claims: [3]u32 = undefined;
+    for (&claims, [_]usize{ 40, 7, 900 }) |*slot, node| slot.* = scratch.slotFor(node).?.slot;
+    // A touched node and a refused claim add nothing.
+    _ = scratch.slotFor(7).?;
+    try std.testing.expect(scratch.slotFor(41) == null);
+    try std.testing.expectEqualSlices(u32, &claims, scratch.claimed.items);
+    scratch.reset();
+    try std.testing.expectEqual(@as(usize, 0), scratch.claimed.items.len);
+    const again = scratch.slotFor(900).?;
+    try std.testing.expect(again.fresh);
+    try std.testing.expectEqualSlices(u32, &.{again.slot}, scratch.claimed.items);
+}
+
+// The chunk box of the claimed nodes, one claim at a time.
+fn referenceChunkBox(scratch: *const AbstractScratch, chunk_shift: u5) ?ChunkBox {
+    var box: ?ChunkBox = null;
+    for (scratch.claimed.items) |slot_index| {
+        const slot = scratch.slots[slot_index];
+        const x = slot.x >> chunk_shift;
+        const y = slot.y >> chunk_shift;
+        if (box) |*current| {
+            current.* = .{ .min_x = @min(current.min_x, x), .min_y = @min(current.min_y, y), .max_x = @max(current.max_x, x), .max_y = @max(current.max_y, y) };
+        } else box = .{ .min_x = x, .min_y = y, .max_x = x, .max_y = y };
+    }
+    return box;
+}
+
+test "the four-lane chunk box equals the scalar reference at 0, 1, 3, 4, 5, and 17 claims" {
+    var prng = std.Random.DefaultPrng.init(0xb0c5);
+    const random = prng.random();
+    var scratch = AbstractScratch{};
+    defer scratch.deinit(std.testing.allocator);
+    try scratch.reserve(std.testing.allocator, 32);
+    for ([_]usize{ 0, 1, 3, 4, 5, 17 }) |claims| {
+        scratch.reset();
+        for (0..claims) |index| {
+            const slot = scratch.slotFor(index * 7919 + 3).?.slot;
+            // Coordinates up to the widest chunk index a level holds.
+            scratch.slots[slot].x = random.uintLessThan(u32, 1 << 20);
+            scratch.slots[slot].y = random.uintLessThan(u32, 1 << 20);
+        }
+        for ([_]u5{ 0, 2, 4 }) |shift| try std.testing.expectEqual(referenceChunkBox(&scratch, shift), scratch.chunkBox(shift));
+    }
 }

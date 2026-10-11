@@ -19,9 +19,9 @@ How it works: `docs/architecture.md` (pathfinding sections).
 - Path results are consumed on later steps and never stall same-step movement.
 - Cache and pending keys are goal-keyed (`nav_version`, `agent_class`,
   `goal_level`, `goal_cell`).
-- Never negative-cache a budget exhaustion; `unavailable` means a definitive
-  negative only. An exhausted budget defers deterministically, never returning
-  a partial path as complete.
+- Never negative-cache a budget exhaustion unless the goal's enclosure is
+  proven; `unavailable` means a definitive negative only. An exhausted budget
+  defers deterministically, never returning a partial path as complete.
 - `PathfindingSystem` owns the post-commit nav reaction end to end.
 - Re-derive touched chunks whole from the world; the dirty buffer grows, never
   drops.
