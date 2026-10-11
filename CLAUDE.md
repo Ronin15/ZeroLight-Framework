@@ -52,9 +52,6 @@ orchestrates, verifies every agent claim against live code, and reports.
 - `zig-design-specialist` opens every slice, right before implementation, and
   runs whenever a design is open or the existing structure fails the cost
   model; local fixes go straight to `zig-specialist`.
-- Before implementation, `zig-debug-specialist` measures each derived
-  assumption the design rests on with throwaway probes; a failed one returns
-  to design.
 - `zig-review-specialist` reviews each slice, or each landing of a
   multi-commit slice, before it is committed; fixes fold into that commit.
   Every real finding is reported and checked against live code and
@@ -71,7 +68,8 @@ orchestrates, verifies every agent claim against live code, and reports.
   measured, is a landing of the current slice and goes straight to
   `zig-specialist`. Code deleted from the branch (for example restored to
   main) takes its fix count with it; the restored code counts from zero.
-- `zig-debug-specialist` for failures.
+- The loop is design → implement → review, each agent in its own role;
+  `zig-debug-specialist` only diagnoses failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
