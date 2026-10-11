@@ -57,10 +57,14 @@ orchestrates, verifies every agent claim against live code, and reports.
   `zig-specialist`. A finding not fixed in its landing becomes a checklist
   item in the owning slice with its `file:line` and failure scenario, never
   only a memory note.
-- A second fix or redesign of the same subsystem on a branch, in one slice
-  or across slices (a follow-up slice counts), or a second review round,
-  stops the work: the next step is a design pass with measured costs, not
-  another patch. Code deleted from the branch (for example restored to
+- The design pass breaks a failing fix loop: a fix that failed (tests,
+  review, or bench) followed by another fix or redesign of the same
+  subsystem on a branch, in one slice or across slices (a follow-up slice
+  counts), or a second review round, stops the work: the next step is a
+  design pass with measured costs, not another patch. A follow-up fix to a
+  landed subsystem that no failed fix preceded, with its cause already
+  measured, is a landing of the current slice and goes straight to
+  `zig-specialist`. Code deleted from the branch (for example restored to
   main) takes its fix count with it; the restored code counts from zero.
 - `zig-debug-specialist` for failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
