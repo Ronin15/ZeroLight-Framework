@@ -47,9 +47,10 @@ orchestrates, verifies every agent claim against live code, and reports.
 - Every non-trivial brief carries the cost model
   (`.claude/rules/engine-design.md`) and names the files in scope, so the agent
   reads the matching rule files.
-- `zig-design-specialist` opens every slice, right before implementation, and
-  runs whenever a design is open or the existing structure fails the cost
-  model; local fixes go straight to `zig-specialist`.
+- `zig-design-specialist` writes the plan for each slice, or each landing of
+  a multi-commit slice, right before its implementation and against the live
+  code, and runs whenever a design is open or the existing structure fails
+  the cost model; local fixes go straight to `zig-specialist`.
 - `zig-review-specialist` reviews each slice, or each landing of a
   multi-commit slice, before it is committed; fixes fold into that commit.
   Every real finding is reported and checked against live code and
