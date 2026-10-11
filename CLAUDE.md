@@ -19,7 +19,8 @@ harness (`.claude/rules/engine-design.md`).
   `paths:` load every session; the rest load when matching files are touched.
   Docs describe how things work; docs and agent files cite rule files and
   never restate them. A rule states its mechanism in a few lines, never a
-  slogan; a miss adds the missing mechanism to the owning rule file.
+  slogan; a miss edits a rule only when its mechanism is missing, never to
+  restate one that exists.
 - `docs/architecture.md`: source layout, ownership, frame flow, Target Model.
 - `docs/development-workflow.md` (DW): commands, build options, diagnostics,
   benches, packaging.
@@ -69,10 +70,7 @@ orchestrates, verifies every agent claim against live code, and reports.
   `zig-specialist`. Code deleted from the branch (for example restored to
   main) takes its fix count with it; the restored code counts from zero.
 - The loop is design → implement → review, each agent in its own role;
-  `zig-debug-specialist` only diagnoses failures. A brief asks only for its
-  agent's work on this landing: no probes, assessments, or extra validation
-  steps beyond the rules' cadence, and nothing another agent already
-  measured.
+  `zig-debug-specialist` only diagnoses failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
