@@ -125,7 +125,13 @@ const PublishBand = struct {
     counts: [registry_shard_count]u32 align(thread_shared_record_alignment) = @splat(0),
 };
 
-// One `registry_flush` shard's entries removed and added, padded to its own cache line.
+// `registry_flush` work pairs (registry index, shard), index-major: pair `p` is shard
+// `p % registry_shard_count` of index `p / registry_shard_count`. The path registry is
+// index 0.
+const registry_index_count: usize = 1;
+const flush_pair_count = registry_index_count * registry_shard_count;
+
+// One `registry_flush` pair's entries removed and added, padded to its own cache line.
 const FlushTally = struct {
     removed: usize align(thread_shared_record_alignment) = 0,
     added: usize = 0,
@@ -145,6 +151,8 @@ comptime {
     std.debug.assert(@sizeOf(NavMarkTally) % thread_shared_record_alignment == 0);
     std.debug.assert(@sizeOf(PublishBand) % thread_shared_record_alignment == 0);
     std.debug.assert(@sizeOf(FlushTally) % thread_shared_record_alignment == 0);
+    // A publish band counts each flush pair's registrations.
+    std.debug.assert(@typeInfo(@FieldType(PublishBand, "counts")).array.len == flush_pair_count);
 }
 
 pub const PathfindingSystem = struct {
@@ -205,7 +213,7 @@ pub const PathfindingSystem = struct {
     reg_buckets: RegRecordList = .empty,
     // Ranges of the last publish copy whose registrations the next flush adds.
     publish_ranges: usize = 0,
-    flush_tallies: [registry_shard_count]FlushTally = @splat(.{}),
+    flush_tallies: [flush_pair_count]FlushTally = @splat(.{}),
     // Owner heads past the cache's capacity wait for the flush that applies its shrink.
     registry_truncate_pending: bool = false,
     // Path eviction scratch: one item per changed key and the hit windows, reserved before
@@ -2252,36 +2260,59 @@ pub const PathfindingSystem = struct {
         return batch;
     }
 
-    // `registry_flush`: shard by shard, removes and renames the owners of the cache's owner
-    // log in log order, then adds the last publish copy's registrations of the shard in
-    // range order, so every list holds its adds in (op, ordinal, run) order for any
-    // partition, and installs a shrink's prepared owner heads. Each item writes only its
-    // shard. Then the log is emptied, the replaced owner heads are freed, and `stats` (when
-    // given) takes the counts. Allocates nothing; every add was reserved by the publish.
-    // A shrink's flush carries ops for most cache entries, a one-off the stage's tuner has
-    // no threaded profile for, so with a dispatch it runs at a fixed shape of one shard per
-    // range, outside the tuner. Returns the stage's batch.
+    // `registry_flush`: pair by pair (registry index, shard), removes and renames the owners
+    // of the cache's owner log in log order, then adds the last publish copy's registrations
+    // of the pair in range order, so every list holds its adds in (op, ordinal, run) order
+    // for any partition, and installs a shrink's prepared owner heads. Each pair writes only
+    // its shard and its tally. Then the log is emptied, the replaced owner heads are freed,
+    // and `stats` (when given) takes the counts. Allocates nothing; every add was reserved
+    // by the publish.
+    // Items are work units: pair p weighs ops + its adds + 1, and a range runs the pairs
+    // whose first unit lies in it, so each pair runs in exactly one range. The main thread
+    // sums the weights, O(publish ranges * pairs). A shrink's flush carries ops for most
+    // cache entries, a one-off the stage's tuner has no threaded profile for, so with a
+    // tuned dispatch it runs at a fixed shape of about one pair per range, outside the
+    // tuner. A dispatch wakes at most one worker fewer than the pair count. Returns the
+    // stage's batch.
     fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*PathfindingStats) BatchStats {
         var batch = BatchStats{};
         const truncate = self.registry_truncate_pending;
-        if (self.completed.core.ownerLog().len != 0 or self.publish_ranges != 0 or truncate) {
-            const flush_dispatch: ?Dispatch = if (dispatch) |stage| shrink: {
-                // Only a tuned dispatch is replaced; a configured range size keeps its shape.
-                // The explicit range size opts the batch out of the tuner: nothing is recorded.
-                if (!truncate or !stage.adaptive or stage.items_per_range != null) break :shrink stage;
-                var fixed = stage;
-                fixed.items_per_range = 1;
-                break :shrink fixed;
+        const ops = self.completed.core.ownerLog();
+        if (ops.len != 0 or self.publish_ranges != 0 or truncate) {
+            var pair_adds: [flush_pair_count]usize = @splat(0);
+            for (self.publish_bands.items[0..self.publish_ranges]) |band| {
+                for (&pair_adds, band.counts) |*adds, count| adds.* += count;
+            }
+            var unit_starts: [flush_pair_count + 1]usize = undefined;
+            var units: usize = 0;
+            for (unit_starts[0..flush_pair_count], pair_adds) |*start, adds| {
+                start.* = units;
+                units += ops.len + adds + 1;
+            }
+            unit_starts[flush_pair_count] = units;
+            const flush_dispatch: ?Dispatch = if (dispatch) |stage| pairs: {
+                var flush_stage = stage;
+                // At most one participant per pair: a worker past that takes only ranges
+                // where no pair starts.
+                flush_stage.max_worker_threads = @min(stage.max_worker_threads orelse flush_pair_count - 1, flush_pair_count - 1);
+                // Only a tuned dispatch's shrink shape is replaced; a configured range size
+                // keeps its shape. The explicit range size opts the batch out of the tuner:
+                // nothing is recorded.
+                if (truncate and stage.adaptive and stage.items_per_range == null) {
+                    flush_stage.items_per_range = (units + flush_pair_count - 1) / flush_pair_count;
+                }
+                break :pairs flush_stage;
             } else null;
-            const shape = stageShape(flush_dispatch, registry_shard_count, 1);
+            const shape = stageShape(flush_dispatch, units, 1);
             var job = RegistryFlushJob{
                 .system = self,
-                .ops = self.completed.core.ownerLog(),
+                .ops = ops,
                 .publish_ranges = self.publish_ranges,
                 .truncate = truncate,
                 .range_count = shape.range_count,
+                .unit_starts = unit_starts,
             };
-            batch = runShaped(flush_dispatch, shape, registry_shard_count, 1, &job, registryFlushJob);
+            batch = runShaped(flush_dispatch, shape, units, 1, &job, registryFlushJob);
             if (stats) |step| {
                 for (self.flush_tallies) |tally| {
                     step.registrations_removed += tally.removed;
@@ -2296,6 +2327,17 @@ pub const PathfindingSystem = struct {
             self.registry_truncate_pending = false;
         }
         return batch;
+    }
+
+    // The shard map of flush pair `pair`; each registry index needs its own arm.
+    fn flushPairMap(self: *PathfindingSystem, pair: usize) *ChunkListMap {
+        comptime std.debug.assert(registry_index_count == 1);
+        std.debug.assert(pair < flush_pair_count);
+        const shard = pair % registry_shard_count;
+        return switch (pair / registry_shard_count) {
+            0 => &self.path_index[shard],
+            else => unreachable,
+        };
     }
 
     // `resize_copy`: copies a shrink's pending path moves, threaded over moves, then frees
@@ -2752,25 +2794,36 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     job.bands[range.index] = .{ .counts = counts };
 }
 
-// One range of `registry_flush`: its shards, each applying the owner log in order and then
-// its segment of every publish range in range order.
+// One range of `registry_flush`: the pairs whose first work unit lies in the range, each
+// applying the owner log in order and then its segment of every publish range in range
+// order.
 const RegistryFlushJob = struct {
     system: *PathfindingSystem,
     ops: []const OwnerOp,
     publish_ranges: usize,
-    // Install each shard's prepared owner heads after its ops and adds.
+    // Install each pair's prepared owner heads after its ops and adds.
     truncate: bool,
     range_count: usize,
+    // Per pair, its first work unit, increasing; the last entry is the unit total.
+    unit_starts: [flush_pair_count + 1]usize,
 };
 
-// SIMD verdict: scalar. Hash probes and list links per op and add.
+fn orderUnit(unit: usize, start: usize) std.math.Order {
+    return std.math.order(unit, start);
+}
+
+// SIMD verdict: scalar. Hash probes and list links per op and add; one binary search over
+// the pair starts per range.
 fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *RegistryFlushJob = @ptrCast(@alignCast(context));
     const system = job.system;
+    const starts = job.unit_starts[0..flush_pair_count];
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end <= registry_shard_count);
-    for (range.start..range.end) |shard| {
-        const map = &system.path_index[shard];
+    std.debug.assert(range.start <= range.end and range.end <= job.unit_starts[flush_pair_count]);
+    var pair = std.sort.lowerBound(usize, starts, range.start, orderUnit);
+    while (pair < flush_pair_count and starts[pair] < range.end) : (pair += 1) {
+        std.debug.assert(pair < system.flush_tallies.len);
+        const map = system.flushPairMap(pair);
         var removed: usize = 0;
         for (job.ops) |op| {
             // Most owners hold runs in few shards.
@@ -2780,12 +2833,12 @@ fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
         var added: usize = 0;
         for (system.publish_bands.items[0..job.publish_ranges], system.publish_range_bases.items[0..job.publish_ranges]) |band, base| {
             var start = base;
-            for (band.counts[0..shard]) |shard_count| start += shard_count;
-            map.addAll(system.reg_buckets.items[start..][0..band.counts[shard]]);
-            added += band.counts[shard];
+            for (band.counts[0..pair]) |pair_count| start += pair_count;
+            map.addAll(system.reg_buckets.items[start..][0..band.counts[pair]]);
+            added += band.counts[pair];
         }
         if (job.truncate) map.installTruncate();
-        system.flush_tallies[shard] = .{ .removed = removed, .added = added };
+        system.flush_tallies[pair] = .{ .removed = removed, .added = added };
     }
 }
 
@@ -8677,6 +8730,30 @@ test "threaded publish equals serial across range sizes and worker counts (cache
     }
 }
 
+// Work units of a registry flush over `ops` logged ops and `adds` pending registrations:
+// every pair weighs the whole log, its adds, and one.
+fn flushUnits(ops: usize, adds: usize) usize {
+    return flush_pair_count * (ops + 1) + adds;
+}
+
+// Fills `system`'s 64-entry cache with routes [0, 64), then publishes routes [64, 80) into
+// the full cache inline without flushing: the flush has victims in the log and adds in
+// every publish band.
+fn prepareMixedFlush(system: *PathfindingSystem, requester: EntityId) !void {
+    for (0..4) |batch| try solveRegistryRoutes(system, requester, 24, batch * 16, 16, 16, null, .{});
+    try std.testing.expectEqual(@as(usize, 64), system.completed.count());
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (64..80) |index| {
+        const route = registryRoute(index, 24);
+        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    var stats = PathfindingStats{};
+    try system.updateInline(&stream, 16, .{}, &stats);
+    try std.testing.expect(stats.cache_evictions != 0);
+    try std.testing.expect(system.completed.core.ownerLog().len != 0 and system.publish_ranges != 0);
+}
+
 // Logs every op kind into `system`'s owner log without flushing: a shrink to the floor's
 // 32 entries (victims and renames), a re-put, and two claims on the full cache (victims);
 // then removes the three claimed entries again, so after a flush the registry matches the
@@ -8724,16 +8801,72 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
     var renames: usize = 0;
     for (ops) |op| renames += @intFromBool(op.new != no_owner);
     try std.testing.expect(renames != 0 and renames < ops.len);
+    try std.testing.expectEqual(@as(usize, 0), systems[1].publish_ranges);
+    // One unit per range: a range per unit, most with no pair starting in it.
+    const units = flushUnits(ops.len, 0);
     var serial_stats = PathfindingStats{};
-    _ = systems[0].flushRegistry(null, &serial_stats);
+    const serial_batch = systems[0].flushRegistry(null, &serial_stats);
+    try std.testing.expectEqual(units, serial_batch.item_count);
     var threaded_stats = PathfindingStats{};
     const stage = (PathfindingSystem.StageThreads{ .thread_system = &threads, .config = fixed_threads_config }).stage(&systems[1].registry_flush_tuner);
     const batch = systems[1].flushRegistry(stage, &threaded_stats);
-    try std.testing.expect(!batch.ran_inline and batch.range_count == registry_shard_count);
+    try std.testing.expect(!batch.ran_inline);
+    try std.testing.expectEqual(units, batch.item_count);
+    try std.testing.expectEqual(units, batch.range_count);
     try std.testing.expectEqual(serial_stats.registrations_removed, threaded_stats.registrations_removed);
     try std.testing.expect(serial_stats.registrations_removed != 0);
     try expectSameRegistry(&systems[0], &systems[1]);
     for (&systems) |*system| try expectRegistryMatchesCache(system);
+}
+
+test "threaded registry flush over unit-weighted pairs equals serial across range sizes and worker counts, on workers" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var serial = try registrySystem(&data, &fixture.world, 16);
+    defer serial.deinit();
+    try prepareMixedFlush(&serial, requester);
+    const ops = serial.completed.core.ownerLog().len;
+    var serial_stats = PathfindingStats{};
+    const serial_batch = serial.flushRegistry(null, &serial_stats);
+    try std.testing.expect(serial_stats.registrations_removed != 0 and serial_stats.registrations_added != 0);
+    const units = flushUnits(ops, serial_stats.registrations_added);
+    try std.testing.expectEqual(units, serial_batch.item_count);
+    try expectRegistryMatchesCache(&serial);
+    // The widest pool has more workers than pairs.
+    for ([_]usize{ 1, 3, flush_pair_count + 4 }) |workers| {
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
+        defer threads.deinit();
+        if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+        var worker_ranges: usize = 0;
+        // Ranges far smaller than a pair (most hold no pair start), ranges that cut pairs,
+        // and two ranges of several pairs each.
+        for ([_]usize{ 1, 3, 7, 40, (units + 1) / 2 }) |items_per_range| {
+            var threaded = try registrySystem(&data, &fixture.world, 16);
+            defer threaded.deinit();
+            try prepareMixedFlush(&threaded, requester);
+            var stats = PathfindingStats{};
+            const config = PathfindingConfig{ .adaptive = false, .items_per_range = items_per_range };
+            const stage = (PathfindingSystem.StageThreads{ .thread_system = &threads, .config = config }).stage(&threaded.registry_flush_tuner);
+            const batch = threaded.flushRegistry(stage, &stats);
+            try std.testing.expect(!batch.ran_inline and batch.active_worker_threads != 0);
+            try std.testing.expect(batch.active_worker_threads <= flush_pair_count - 1);
+            worker_ranges += batch.worker_thread_ranges;
+            try std.testing.expectEqual(units, batch.item_count);
+            try std.testing.expectEqual((units + items_per_range - 1) / items_per_range, batch.range_count);
+            try std.testing.expectEqual(serial_stats.registrations_added, stats.registrations_added);
+            try std.testing.expectEqual(serial_stats.registrations_removed, stats.registrations_removed);
+            try expectSameCache(&serial, &threaded);
+            try expectSameRegistry(&serial, &threaded);
+            try expectRegistryMatchesCache(&threaded);
+        }
+        try std.testing.expect(worker_ranges != 0);
+    }
 }
 
 test "publish after its reserve allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
@@ -8768,6 +8901,9 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 48), published.available_results);
     try std.testing.expect(!published.publish_copy_batch.ran_inline and !published.registry_flush_batch.ran_inline);
+    const units = flushUnits(0, published.registrations_added);
+    try std.testing.expectEqual(units, published.registry_flush_batch.item_count);
+    try std.testing.expectEqual(units, published.registry_flush_batch.range_count);
     try expectRegistryMatchesCache(&system);
 }
 
@@ -9045,6 +9181,8 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     _ = try system.completed.reserve(system.allocator, 32, capacity.max_stored_path_cells, types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells), system.step_counter);
     system.registry_truncate_pending = true;
     try std.testing.expect(system.completed.pendingMoves().len > 1);
+    try std.testing.expectEqual(@as(usize, 0), system.publish_ranges);
+    const units = flushUnits(system.completed.core.ownerLog().len, 0);
     // Every allocation and every in-place resize fails.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
@@ -9055,30 +9193,38 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expect(!batch.ran_inline and batch.range_count > 1);
-    try std.testing.expect(!flush.ran_inline and flush.range_count == registry_shard_count);
+    try std.testing.expect(!flush.ran_inline);
+    try std.testing.expectEqual(units, flush.item_count);
+    try std.testing.expectEqual(units, flush.range_count);
     for (&system.path_index) |*shard| try std.testing.expectEqual(@as(usize, 32), shard.owner_heads.capacity);
     try std.testing.expectEqual(@as(usize, 0), system.completed.pendingMoves().len);
     for (&system.path_index) |*shard| try std.testing.expectEqual(@as(usize, 32), shard.owner_heads.items.len);
     try expectRegistryMatchesCache(&system);
 }
 
+const ShrinkFlushes = struct {
+    serial: BatchStats = .{},
+    threaded: BatchStats = .{},
+};
+
 // Two registry systems over one world, filled alike, then shrunk by sustained low load:
-// one serial, one on `threads` under `config`. Returns the threaded shrink step's flush
-// batch.
-fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem, threads: *ThreadSystem, config: PathfindingConfig) !BatchStats {
+// one serial, one on `threads` under `config`. Returns each shrink step's flush batch.
+fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem, threads: *ThreadSystem, config: PathfindingConfig) !ShrinkFlushes {
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    var flush = BatchStats{};
+    var flushes = ShrinkFlushes{};
     for (0..serial.capacity.capacity_shrink_window) |_| {
-        _ = try serial.updateSerial(&empty, 1, .{});
+        const serial_capacity = serial.completed.logicalCapacity();
+        const serial_stats = try serial.updateSerial(&empty, 1, .{});
+        if (serial.completed.logicalCapacity() < serial_capacity) flushes.serial = serial_stats.registry_flush_batch;
         const capacity = threaded.completed.logicalCapacity();
         const stats = try threaded.update(&empty, 1, threads, config);
-        if (threaded.completed.logicalCapacity() < capacity) flush = stats.registry_flush_batch;
+        if (threaded.completed.logicalCapacity() < capacity) flushes.threaded = stats.registry_flush_batch;
     }
-    return flush;
+    return flushes;
 }
 
-test "a shrink's registry flush runs on workers at one shard per range under the adaptive control, renames included, and equals the serial flush" {
+test "a shrink's registry flush runs on workers at about one pair per range under the adaptive control, renames included, and equals the serial flush" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -9096,14 +9242,20 @@ test "a shrink's registry flush runs on workers at one shard per range under the
     defer threaded.deinit();
     // The shrink's fixed-shape flush leaves the flush tuner untouched.
     const tuner_before = threaded.registry_flush_tuner.report();
-    const flush = try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
+    const flushes = try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
+    const flush = flushes.threaded;
     const tuner_after = threaded.registry_flush_tuner.report();
     try std.testing.expectEqual(tuner_before.sample_count, tuner_after.sample_count);
     try std.testing.expectEqual(tuner_before.phase, tuner_after.phase);
     try std.testing.expectEqual(tuner_before.current_profile, tuner_after.current_profile);
     try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
-    try std.testing.expect(!flush.ran_inline and flush.active_worker_threads != 0);
-    try std.testing.expectEqual(registry_shard_count, flush.range_count);
+    try std.testing.expect(!flush.ran_inline and flush.active_worker_threads != 0 and flush.worker_thread_ranges != 0);
+    // The fixed shape is ceil(units / pairs) units per range; at a pair count's square of
+    // units or more that is exactly one range per pair.
+    try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
+    try std.testing.expect(flush.item_count >= flush_pair_count * flush_pair_count);
+    try std.testing.expectEqual((flush.item_count + flush_pair_count - 1) / flush_pair_count, flush.items_per_range);
+    try std.testing.expectEqual(flush_pair_count, flush.range_count);
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);
@@ -9126,11 +9278,15 @@ test "a shrink's registry flush keeps a configured range size and equals the ser
     defer serial.deinit();
     var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
     defer threaded.deinit();
-    const shards_per_range = 4;
-    const flush = try shrinkThroughUpdates(&serial, &threaded, &threads, .{ .items_per_range = shards_per_range });
+    const units_per_range = 4;
+    const flushes = try shrinkThroughUpdates(&serial, &threaded, &threads, .{ .items_per_range = units_per_range });
+    const flush = flushes.threaded;
     try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
     try std.testing.expect(!flush.ran_inline);
-    try std.testing.expectEqual(registry_shard_count / shards_per_range, flush.range_count);
+    try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
+    try std.testing.expect(flush.item_count > flush_pair_count * units_per_range);
+    try std.testing.expectEqual(units_per_range, flush.items_per_range);
+    try std.testing.expectEqual((flush.item_count + units_per_range - 1) / units_per_range, flush.range_count);
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);
