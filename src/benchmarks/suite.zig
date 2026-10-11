@@ -743,6 +743,8 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) return "uncached unreachable path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-negative-steady")) return "fresh unreachable path requests per step";
+    if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) return "(level side * 1000 + unreachable path requests)";
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) return "agents before the drop";
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (isSteeringAgentGroup(group_name)) return "steering agents";
@@ -937,6 +939,16 @@ fn printValidationSummary(
             std.debug.print(
                 "workload negatives={} deferred={}. ",
                 .{ best.stats.output_count, best.stats.deferred_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-negative-steady")) {
+            std.debug.print(
+                "workload negatives={} victims={} hits={}. ",
+                .{ best.stats.output_count, best.stats.cache_evictions, best.stats.candidate_pairs },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) {
+            std.debug.print(
+                "workload hits={} solves={} exhausted={} pending={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.sample_count, best.stats.deferred_count },
             );
         } else if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
             std.debug.print(
@@ -1260,6 +1272,12 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     }
     if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) {
         return std.fmt.bufPrint(buffer, "negatives={} deferred={}", .{ stats.output_count, stats.deferred_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-negative-steady")) {
+        return std.fmt.bufPrint(buffer, "negatives={} victims={} hits={}", .{ stats.output_count, stats.cache_evictions, stats.candidate_pairs }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) {
+        return std.fmt.bufPrint(buffer, "hits={} solves={} exhausted={} pending={}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
         return std.fmt.bufPrint(buffer, "evicted={} moved={} kept={}", .{ stats.cache_evictions, stats.candidate_pairs, stats.output_count }) catch "workload";

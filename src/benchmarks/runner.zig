@@ -62,6 +62,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.elastic_ramp_group,
     pathfinding.elastic_shrink_group,
     pathfinding.cold_unreachable_group,
+    pathfinding.negative_steady_group,
+    pathfinding.negative_dig_group,
     nav_update.group,
     nav_update.multichunk_group,
     nav_update.entity_obstacle_group,

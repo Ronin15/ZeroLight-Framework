@@ -298,6 +298,36 @@ pub const cold_unreachable_group = suite.BenchmarkGroup{
     .runCase = runColdUnreachableCase,
 };
 
+// Fresh unreachable goals on a full negative set. Goals lie in a sealed 80² pocket at the
+// origin of a walkable 256² level and are requested from outside it, so every search ends
+// without a path. Untimed, four steps of the item count's requests fill the negative set
+// to its cap (four per agent); each timed step then requests the item count of goals that
+// no step of the last 16 asked for. `outputs` is the step's negatives answered and
+// `evictions` (`victims=`) the negatives lost to the full set.
+pub const negative_steady_group = suite.BenchmarkGroup{
+    .name = "pathfinding-negative-steady",
+    .defaultItemCounts = negativeSteadyItemCounts,
+    .runCase = runNegativeSteadyCase,
+};
+
+// The item count's requests (item code level side * 1000 + requests) from outside a
+// sealed 80² pocket at the origin of a walkable level, each to its own goal inside it.
+// Each timed step toggles one far cell's blocking, runs the nav reaction, and updates the
+// same requests. Side 256's searches end without a path under the tier-0 cap. Side 2048's
+// exhaust the tier-0 budget in every timed step (the reaction drops their tier-1
+// promotions); an untimed check before timing proves the tier-1 budget exhausts too.
+// Side 1024's exhaust the tier-0 budget the same way; how its tier-1 search ends is not
+// checked. Other sides check only that each request is answered unavailable, exhausted, or still
+// pending. `outputs` is the step's solves, `candidates` its cache hits, `samples` its
+// exhausted attempts, and `deferred` the requests still pending after it. `--details`
+// prints the update's stages, the reaction's remask and eviction stages with its
+// main-thread share, and the reaction/update split.
+pub const negative_dig_group = suite.BenchmarkGroup{
+    .name = "pathfinding-negative-dig",
+    .defaultItemCounts = negativeDigItemCounts,
+    .runCase = runNegativeDigCase,
+};
+
 const quick_counts = [_]usize{ 128, 512, 1024 };
 const standard_counts = [_]usize{ 512, 1024, 4096 };
 const stress_counts = [_]usize{ 4096, 10000 };
@@ -1716,6 +1746,17 @@ fn elasticRampItemCounts(_: suite.Profile) []const usize {
     return &elastic_ramp_item_counts;
 }
 
+const negative_steady_item_counts = [_]usize{ 64, 128, 256 };
+const negative_dig_item_counts = [_]usize{ 256_064, 256_128, 256_256, 1_024_064, 2_048_064 };
+
+fn negativeSteadyItemCounts(_: suite.Profile) []const usize {
+    return &negative_steady_item_counts;
+}
+
+fn negativeDigItemCounts(_: suite.Profile) []const usize {
+    return &negative_dig_item_counts;
+}
+
 /// The capacity a nav scaling config's nav reserves; library defaults elsewhere.
 /// `suite.navStorageBytes` charges exactly these three fields.
 pub fn navSizeCapacity(config: suite.NavSizeConfig) PathfindingCapacity {
@@ -2311,7 +2352,7 @@ const EvictReport = struct {
         }
     }
 
-    fn print(self: EvictReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
+    fn print(self: EvictReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.timed_ns == 0) return;
         var shapes: [3][48]u8 = undefined;
         var labels: [3][]const u8 = undefined;
@@ -2319,7 +2360,7 @@ const EvictReport = struct {
             label.* = stageShape(buffer, batch, threaded, dispatched);
         }
         std.debug.print("  {s} {} {s}: evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}\n", .{
-            evict_group.name,
+            group_name,
             item_count,
             case.name,
             labels[0],
@@ -2333,24 +2374,20 @@ const EvictReport = struct {
     }
 };
 
-fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
-    var open = try buildOpenWorld(allocator, io, short_route_side, 1);
-    errdefer open.world.deinit();
-    var data = DataSystem.init(allocator);
-    errdefer data.deinit();
-    const requests = try buildShortRouteRequests(allocator, &data, &open, result_count);
-    errdefer allocator.free(requests);
+// Builds the colliders and the world-backed nav over `open` and `data`, then moves them
+// and `requests` into the fixture. On error they stay with the caller.
+fn assembleEvictFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *DataSystem, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&open.world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
+    try colliders.rebuild(data, try extent.colliderGeometry());
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(capacity);
     try system.rebuildNavFromColliders(&colliders, extent, thread_system);
     return .{
-        .open = open,
-        .data = data,
+        .open = open.*,
+        .data = data.*,
         .colliders = colliders,
         .requests = requests,
         .stream = RangeOutputStream(PathRequest).init(allocator),
@@ -2358,6 +2395,16 @@ fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usiz
         .system = system,
         .agent_count = capacity.max_agent_budget,
     };
+}
+
+fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+    var open = try buildOpenWorld(allocator, io, short_route_side, 1);
+    errdefer open.world.deinit();
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try buildShortRouteRequests(allocator, &data, &open, result_count);
+    errdefer allocator.free(requests);
+    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
 // The region config's square: chunk-aligned from chunk (2, 2), `side` chunks a side.
@@ -2398,14 +2445,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer if (region_cells) |cells| allocator.free(cells);
     const cells: []const CellCoord = region_cells orelse &.{evict_dig_cell};
     try fixture.changed.ensureTotalCapacity(allocator, cells.len);
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
-        fixture.system.nav_remask_tuner = tuner;
-        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        fixture.system.nav_evict_count_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
-        fixture.system.nav_evict_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
-        fixture.system.evict_flush_tuner = suite.adaptiveTunerForCase(case, 1).?;
-    }
+    setNavReactionTuners(&fixture.system, case);
     configureNavUpdateThreads(&fixture.system, case);
     try fixture.fillCache(case, thread_ptr);
 
@@ -2427,7 +2467,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
     }
-    report.print(options, item_count, case);
+    report.print(options, evict_group.name, item_count, case);
     // The size config charges no long block.
     if (fixture.system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
     var stats = accumulator.finish();
@@ -2439,6 +2479,18 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
     return stats;
+}
+
+// Gives the nav reaction's stages this case's tuners.
+fn setNavReactionTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
+        system.nav_remask_tuner = tuner;
+        system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_evict_count_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
+        system.nav_evict_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
+        system.evict_flush_tuner = suite.adaptiveTunerForCase(case, 1).?;
+    }
 }
 
 const group_field_pack_agents: usize = 24;
@@ -3059,6 +3111,370 @@ fn runColdUnreachableStep(
     if (stats.solved_requests != admitted or stats.unavailable_results != admitted) return error.ColdUnreachableSolveNotNegative;
     if (stats.cache_evictions != 0) return error.ColdUnreachableNegativeDropped;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
+}
+
+// Goal-pocket fixture: a walkable pocket of `pocket_side`² cells at the level origin, closed
+// by the level border and a blocking column x = `pocket_side` and row y = `pocket_side`.
+// Goals are pocket cells in row-major order; requesters start outside it on rows from
+// `pocket_requester_row`, `pocket_requester_margin` cells clear of the level's sides.
+const pocket_side: u16 = 80;
+const pocket_requester_row: u16 = 96;
+const pocket_requester_margin: u16 = 8;
+// The far dig sits this many cells in from the level's far corner.
+const pocket_dig_inset: u16 = 6;
+const negative_steady_side: u16 = 256;
+// Timed negative-steady steps draw their goals from this many steps' worth, in rotation.
+const negative_steady_pool_steps: usize = 16;
+
+fn pocketGoalCell(index: usize) CellCoord {
+    std.debug.assert(index < @as(usize, pocket_side) * pocket_side);
+    return .{ .x = @intCast(index % pocket_side), .y = @intCast(index / pocket_side) };
+}
+
+fn pocketRequesterCell(side: u16, index: usize) CellCoord {
+    const columns = side - 2 * pocket_requester_margin;
+    // Range checked by `checkPocketLayout`: every requester row lies inside the level.
+    return .{ .x = @intCast(pocket_requester_margin + index % columns), .y = @intCast(pocket_requester_row + index / columns) };
+}
+
+fn pocketDigCell(side: u16) CellCoord {
+    return .{ .x = side - pocket_dig_inset, .y = side - pocket_dig_inset };
+}
+
+fn pocketWallCells() [2 * pocket_side + 1]CellCoord {
+    var walls: [2 * pocket_side + 1]CellCoord = undefined;
+    for (0..pocket_side + 1) |y| walls[y] = .{ .x = pocket_side, .y = @intCast(y) };
+    for (0..pocket_side) |x| walls[pocket_side + 1 + x] = .{ .x = @intCast(x), .y = pocket_side };
+    return walls;
+}
+
+// Fails unless the first `goal_count` goals and `requester_count` starts are distinct cells,
+// every goal inside the pocket and every start outside it, none a wall or the far dig cell.
+fn checkPocketLayout(allocator: std.mem.Allocator, side: u16, goal_count: usize, requester_count: usize) !void {
+    if (goal_count > @as(usize, pocket_side) * pocket_side) return error.PocketGoalCellsTooFew;
+    const columns = side -| 2 * pocket_requester_margin;
+    if (columns == 0 or pocket_requester_row + (requester_count + columns - 1) / columns > side -| pocket_dig_inset) return error.PocketRequesterRowsTooFew;
+    var taken = try std.DynamicBitSetUnmanaged.initEmpty(allocator, @as(usize, side) * side);
+    defer taken.deinit(allocator);
+    const walls = pocketWallCells();
+    for (walls) |cell| taken.set(@as(usize, cell.y) * side + cell.x);
+    const dig = pocketDigCell(side);
+    taken.set(@as(usize, dig.y) * side + dig.x);
+    for (0..goal_count) |index| {
+        const cell = pocketGoalCell(index);
+        const slot = @as(usize, cell.y) * side + cell.x;
+        if (taken.isSet(slot)) return error.PocketLayoutOverlap;
+        taken.set(slot);
+    }
+    for (0..requester_count) |index| {
+        const cell = pocketRequesterCell(side, index);
+        if (cell.x < pocket_side and cell.y < pocket_side) return error.PocketRequesterInside;
+        const slot = @as(usize, cell.y) * side + cell.x;
+        if (taken.isSet(slot)) return error.PocketLayoutOverlap;
+        taken.set(slot);
+    }
+}
+
+// The pocket on a walkable `side`² level with one requester per request; goals are set per
+// step. Nav is world-backed, so the far dig reaches it through `changeAndReact`.
+fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, requester_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+    var open = try buildOpenWorld(allocator, io, side, 1);
+    errdefer open.world.deinit();
+    const walls = pocketWallCells();
+    try writeLevelZeroCells(&open, &walls, open.blocking);
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try allocator.alloc(PathRequest, requester_count);
+    errdefer allocator.free(requests);
+    for (requests, 0..) |*request, index| {
+        request.* = .{
+            .entity = try data.createEntity(),
+            .start = open.cellCenter(pocketRequesterCell(side, index)),
+            .goal = open.cellCenter(pocketGoalCell(index)),
+        };
+    }
+    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+}
+
+fn pocketSizeConfig(side: u16, participant_count: usize, requester_count: usize) suite.NavSizeConfig {
+    return .{
+        .side = side,
+        .levels = 1,
+        .participant_count = participant_count,
+        .agent_budget = requester_count,
+        .group_fields = 1,
+        // No path is published, so no long block is taken.
+        .long_results = 0,
+    };
+}
+
+const PocketStep = struct {
+    elapsed_ns: u64,
+    stats: PathfindingStats,
+};
+
+// Points request `i` at goal `first_goal + i` when `first_goal` is given, then times one
+// update of every request. No requester reaches a goal, and each request is answered
+// unavailable, exhausts its attempt, or still waits.
+fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem, first_goal: ?usize) !PocketStep {
+    if (first_goal) |first| {
+        for (fixture.requests, 0..) |*request, index| request.goal = fixture.open.cellCenter(pocketGoalCell(first + index));
+    }
+    try writeRequests(&fixture.stream, fixture.requests);
+    const count = fixture.requests.len;
+    const start_ns = suite.nowNs(io);
+    const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
+    const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+    if (stats.available_results != 0) return error.PocketGoalReached;
+    if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.PocketRequestDropped;
+    if (stats.unavailable_results + stats.budget_exhausted + stats.escalated_deferred + stats.fallback_deferred_requests != count) return error.PocketRequestUnaccounted;
+    return .{ .elapsed_ns = elapsed_ns, .stats = stats };
+}
+
+// One negative-steady step on goals from `first_goal`: every request is a fresh failing
+// solve, and `lost` negatives go to the full set.
+fn runNegativeSteadyStep(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem, first_goal: usize, lost: usize) !PocketStep {
+    const step = try runPocketUpdate(io, case, fixture, thread_system, first_goal);
+    const count = fixture.requests.len;
+    if (step.stats.cache_hits != 0) return error.NegativeSteadyCacheHit;
+    if (step.stats.solved_requests != count or step.stats.unavailable_results != count) return error.NegativeSteadySolveNotNegative;
+    if (step.stats.cache_evictions != lost) return error.NegativeSteadyLostCount;
+    return step;
+}
+
+fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side = negative_steady_side;
+    // Every request must fit one step's solve window for the step's accounting.
+    if (item_count > default_max_solves_per_frame) return error.PocketRequestsPastSolveCeiling;
+    // The prime pool fills the negative set exactly: its cap is this many per agent.
+    const prime_goals = cached_results_per_agent * item_count;
+    try checkPocketLayout(allocator, side, prime_goals + negative_steady_pool_steps * item_count, item_count);
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = pocketSizeConfig(side, participant_count, item_count);
+    if (suite.navSizeSkip(negative_steady_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var fixture = try initPocketFixture(allocator, io, side, item_count, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    setPathStageTuners(&fixture.system, case);
+
+    // Untimed prime: the set takes every prime goal's negative and loses none.
+    for (0..cached_results_per_agent) |prime_step| {
+        _ = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, prime_step * item_count, 0);
+    }
+    var pool_step: usize = 0;
+    for (0..coldWarmup(options)) |_| {
+        _ = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, prime_goals + pool_step * item_count, item_count);
+        pool_step = (pool_step + 1) % negative_steady_pool_steps;
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = coldSettleLimit(options);
+        while (!fixture.system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, prime_goals + pool_step * item_count, item_count);
+            pool_step = (pool_step + 1) % negative_steady_pool_steps;
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) fixture.system.fallback_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var last_stats = PathfindingStats{};
+    var stage_report = StageReport{};
+    for (0..coldIterations(options)) |_| {
+        const step = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, prime_goals + pool_step * item_count, item_count);
+        pool_step = (pool_step + 1) % negative_steady_pool_steps;
+        last_stats = step.stats;
+        accumulator.record(step.elapsed_ns, last_stats.solveBatch());
+        stage_report.add(step.elapsed_ns, last_stats);
+    }
+    stage_report.print(options, negative_steady_group.name, item_count, case);
+
+    var stats = accumulator.finish();
+    stats.output_count = last_stats.unavailable_results;
+    stats.cache_evictions = last_stats.cache_evictions;
+    stats.candidate_pairs = last_stats.cache_hits;
+    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.fallback_tuner.report(), settled_before_measurement);
+    return stats;
+}
+
+// How a negative-dig side's outside searches end; sides other than 256, 1024, and 2048 are
+// unpinned.
+const PocketSearchEnd = enum {
+    // Without a path, under the tier-0 cap.
+    none,
+    // Exhausting the tier-0 and then the tier-1 budget.
+    exhausted,
+    // Exhausting the tier-0 budget; how the tier-1 search ends is unpinned.
+    tier0_exhausted,
+    // Unpinned: only the step's accounting is checked.
+    any,
+
+    fn forSide(side: u16) PocketSearchEnd {
+        return switch (side) {
+            256 => .none,
+            1024 => .tier0_exhausted,
+            2048 => .exhausted,
+            else => .any,
+        };
+    }
+};
+
+// The timed negative-dig steps' reaction/update split, the reaction's remask shape, the
+// last step's outcome, and the untimed attempts' abstract nodes, printed under --details.
+// The reaction's eviction stages and main-thread share print through `EvictReport`.
+const NegativeDigReport = struct {
+    samples: usize = 0,
+    react_ns: u128 = 0,
+    update_ns: u128 = 0,
+    remask_busiest: BatchStats = .{},
+    remask_threaded: usize = 0,
+    remask_dispatched: usize = 0,
+    last: PathfindingStats = .{},
+    // Abstract nodes the untimed first update's tier-0 searches and the second update's
+    // tier-1 search claimed (zero when no tier-1 search ran).
+    tier0_nodes: usize = 0,
+    tier1_nodes: usize = 0,
+
+    fn add(self: *NegativeDigReport, reaction: EvictReaction, step: PocketStep) void {
+        self.samples += 1;
+        self.react_ns += reaction.elapsed_ns;
+        self.update_ns += step.elapsed_ns;
+        self.last = step.stats;
+        const remask = reaction.stats.remask_batch;
+        if (remask.item_count == 0) return;
+        self.remask_dispatched += 1;
+        if (!remask.ran_inline and remask.active_worker_threads != 0) self.remask_threaded += 1;
+        if (remask.item_count >= self.remask_busiest.item_count) self.remask_busiest = remask;
+    }
+
+    fn print(self: NegativeDigReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
+        if (!options.details or self.samples == 0) return;
+        const samples: u128 = self.samples * std.time.ns_per_us;
+        var remask_buffer: [48]u8 = undefined;
+        std.debug.print("  {s} {} {s}: react={}us update={}us remask={s} hits={} solves={} exhausted={} escalated={} dropped={} pending={} tier0_nodes={} tier1_nodes={}\n", .{
+            negative_dig_group.name,
+            item_count,
+            case.name,
+            @as(u64, @intCast(self.react_ns / samples)),
+            @as(u64, @intCast(self.update_ns / samples)),
+            stageShape(&remask_buffer, self.remask_busiest, self.remask_threaded, self.remask_dispatched),
+            self.last.cache_hits,
+            self.last.solved_requests,
+            self.last.budget_exhausted,
+            self.last.escalated_solves,
+            self.last.escalated_dropped,
+            self.last.deferred_requests,
+            self.tier0_nodes,
+            self.tier1_nodes,
+        });
+    }
+};
+
+// The negative-dig step: toggles the far cell's blocking and runs the nav reaction (its
+// time measured inside `changeAndReact`), then updates the same requests. The pinned sides'
+// timed outcome is checked against the search end.
+const NegativeDig = struct {
+    cell: CellCoord,
+    search_end: PocketSearchEnd,
+    blocked: bool = false,
+
+    fn step(self: *NegativeDig, io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem) !struct { reaction: EvictReaction, update: PocketStep } {
+        self.blocked = !self.blocked;
+        const tile = if (self.blocked) fixture.open.blocking else fixture.open.walkable;
+        const reaction = try fixture.changeAndReact(io, &.{self.cell}, tile, thread_system);
+        const update = try runPocketUpdate(io, case, fixture, thread_system, null);
+        const count = fixture.requests.len;
+        switch (self.search_end) {
+            // Every request is a full failing search.
+            .none => if (update.stats.unavailable_results != count or update.stats.solved_requests != count or update.stats.cache_hits != 0) return error.NegativeDigSearchNotNone,
+            // Every request is a fresh tier-0 attempt that exhausts.
+            .exhausted, .tier0_exhausted => if (update.stats.budget_exhausted != count or update.stats.escalated_solves != 0) return error.NegativeDigTier0NotExhausted,
+            .any => {},
+        }
+        return .{ .reaction = reaction, .update = update };
+    }
+};
+
+fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side: u16 = @intCast(item_count / level_case_encoding);
+    const requester_count = item_count % level_case_encoding;
+    if (requester_count == 0) return error.NegativeDigNoRequests;
+    // Every request must fit one step's solve window for the step's accounting.
+    if (requester_count > default_max_solves_per_frame) return error.PocketRequestsPastSolveCeiling;
+    try checkPocketLayout(allocator, side, requester_count, requester_count);
+    const search_end = PocketSearchEnd.forSide(side);
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = pocketSizeConfig(side, participant_count, requester_count);
+    if (suite.navSizeSkip(negative_dig_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var fixture = try initPocketFixture(allocator, io, side, requester_count, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    try fixture.changed.ensureTotalCapacity(allocator, 1);
+    setPathStageTuners(&fixture.system, case);
+    setNavReactionTuners(&fixture.system, case);
+    configureNavUpdateThreads(&fixture.system, case);
+
+    // Untimed first update: every request is a fresh tier-0 attempt.
+    var report = NegativeDigReport{};
+    const first = try runPocketUpdate(io, case, &fixture, thread_ptr, null);
+    report.tier0_nodes = lastAbstractNodesUsed(&fixture.system);
+    switch (search_end) {
+        .none => if (first.stats.solved_requests != requester_count or first.stats.unavailable_results != requester_count) return error.NegativeDigSearchNotNone,
+        .exhausted => {
+            if (first.stats.budget_exhausted != requester_count or first.stats.escalated_solves != 0) return error.NegativeDigTier0NotExhausted;
+            // Untimed second update of the same requests, all promoted: every admitted
+            // tier-1 attempt exhausts and drops.
+            const second = try runPocketUpdate(io, case, &fixture, thread_ptr, null);
+            for (fixture.system.tier1_scratch.items) |*entry| report.tier1_nodes = @max(report.tier1_nodes, entry.corridor.abstract.nodes_used);
+            const tier1 = second.stats.escalated_solves;
+            if (tier1 == 0 or second.stats.budget_exhausted != tier1 or second.stats.escalated_dropped != tier1) return error.NegativeDigTier1NotExhausted;
+        },
+        .tier0_exhausted => if (first.stats.budget_exhausted != requester_count or first.stats.escalated_solves != 0) return error.NegativeDigTier0NotExhausted,
+        .any => {},
+    }
+
+    var dig = NegativeDig{ .cell = pocketDigCell(side), .search_end = search_end };
+    for (0..coldWarmup(options)) |_| _ = try dig.step(io, case, &fixture, thread_ptr);
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = coldSettleLimit(options);
+        while (!fixture.system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try dig.step(io, case, &fixture, thread_ptr);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) fixture.system.fallback_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    // The update's stages and the reaction's eviction stages, each over its own span.
+    var stage_report = StageReport{};
+    var reaction_report = EvictReport{};
+    for (0..coldIterations(options)) |_| {
+        const timed = try dig.step(io, case, &fixture, thread_ptr);
+        accumulator.record(timed.reaction.elapsed_ns + timed.update.elapsed_ns, timed.update.stats.solveBatch());
+        stage_report.add(timed.update.elapsed_ns, timed.update.stats);
+        reaction_report.add(timed.reaction);
+        report.add(timed.reaction, timed.update);
+    }
+    stage_report.print(options, negative_dig_group.name, item_count, case);
+    reaction_report.print(options, negative_dig_group.name, item_count, case);
+    report.print(options, item_count, case);
+
+    var stats = accumulator.finish();
+    stats.output_count = report.last.solved_requests;
+    stats.candidate_pairs = report.last.cache_hits;
+    stats.sample_count = report.last.budget_exhausted;
+    stats.deferred_count = report.last.deferred_requests;
+    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.fallback_tuner.report(), settled_before_measurement);
+    return stats;
 }
 
 fn appendRequest(stream: *RangeOutputStream(PathRequest), request: PathRequest) !void {
