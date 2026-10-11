@@ -50,7 +50,9 @@ paths:
   interleaved reps and medians (`tools/bench_ab.py`); a regression is a change
   beyond the run-to-run spread. Act on one only when it shows a worse growth
   order or a material total; a nanosecond-per-item constant is reported, not
-  redesigned.
+  redesigned. A constant is material when it moves the stage's total beyond
+  the run-to-run spread at the bench's sizes; a few ns per item on a stage
+  dominated by other work is not.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).

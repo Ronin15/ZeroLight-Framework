@@ -49,6 +49,13 @@ touch. Follow them and cite them by file; never restate them.
 
 ## Report
 
+After folding review fixes, report to the main session for verification; a
+second review round is not the next step (`CLAUDE.md` § Agent Pipeline). An
+explanation of a bench result is a hypothesis unless a measurement tests it;
+say which, and never write an untested explanation into a bench's pass
+condition or comment. Run long jobs in the foreground or poll for a done
+marker; never wait on `tail -f` with a timeout.
+
 Concise: cost model (each order marked measured with its bench group, or
 derived), the rule files your change touches and how it meets them, tests,
 bench numbers, decisions, deviations, and any validation that could not run.

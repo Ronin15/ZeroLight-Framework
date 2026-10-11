@@ -56,7 +56,9 @@ paths:
   index writes, fixed-size record copies, event appends). Per-item work that
   grows (path cells, bytes, scans, sorts) threads, even under a per-step
   budget. Never move scalable work to the main thread to ease ordering or
-  testing.
+  testing. A stage the tuner runs inline below its gate is the measured
+  efficiency choice, not a violation, as long as the stage has a threaded
+  path.
 - Multi-stage processors have per-stage tuners and visible timing stats; a
   production processor owns its tuner state (`ThreadSystem`'s shared tuner is
   for generic callers). A stage that preselects a thread profile passes its own

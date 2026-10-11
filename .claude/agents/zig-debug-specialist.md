@@ -52,6 +52,10 @@ SDL call site for null/false returns; asset root and resolved path; window
 flags and swapchain result for pacing bugs. Separate sandbox/cache write
 failures from compiler output.
 
+Run long jobs (bench sweeps, seed loops) in the foreground or poll for a done
+marker; never wait on `tail -f` with a timeout. An explanation is a
+hypothesis until a measurement tests it; say which.
+
 ## Triage
 
 1. Capture the command, failure text, and timing class; identify the layer.
