@@ -178,8 +178,11 @@ pub const query_group = suite.BenchmarkGroup{
 // Nav scaling groups over a world-backed nav (item counts in the size groups encode
 // `level side * 1000 + levels`). A config whose nav storage exceeds the bench's
 // nav-size limit is skipped, its figure printed (`navSizeSkip`). The route groups time
-// one cold step of 64 distinct-goal requests and fail unless every route solves that
-// step; `candidates` is the abstract nodes the last solve used.
+// one cold step of 64 distinct-goal requests; `candidates` is the abstract nodes the last
+// solve used and `outputs` the routes that solved. The level-size and depth groups fail
+// unless every route solves that step; the teleport and shaft groups count a route whose
+// search exhausted its budget as unsolved (`routes solved= unsolved=` under `--details`).
+// Every group passes only when all routes solve within the step at every config.
 //   - `pathfinding-level-size`: one walkable level of side 256, 1024, or 2048 with a
 //     full-height wall and a two-cell central gap; every request crosses the gap, so
 //     the routes are the same at every size. Passes when flat in side.
@@ -188,7 +191,16 @@ pub const query_group = suite.BenchmarkGroup{
 //     the routes are the same at every depth. Passes when flat in depth.
 //   - `pathfinding-cross-level-teleport`: the depth fixture plus one bidirectional
 //     teleport between opposite corners of level 0 and the deepest level, far from the
-//     routes, whose span far exceeds its traversal cost. Passes when flat in depth.
+//     routes, whose span far exceeds its traversal cost. Passes when flat in depth. A
+//     teleport-count config (item count teleports * 10^7 + side * 1000 + levels) instead
+//     spreads that many such teleports over level-0 cells within 16 of the border, each to
+//     its point mirror on the deepest level; it passes when flat in teleport count, at every
+//     side.
+//   - `pathfinding-cross-level-shaft`: a 256² world of 8, 32, or 128 walkable levels; a ramp
+//     shaft beside the starts joins levels 1 to the deepest, and level 0, which no ramp
+//     reaches, holds a one-way teleport from the shaft's planar cell to beside the goals.
+//     Requests go from level 1 to level 5, 48 cells east, so the routes are the same at
+//     every depth and the teleport is never usable. Passes when flat in depth.
 pub const level_size_group = suite.BenchmarkGroup{
     .name = "pathfinding-level-size",
     .defaultItemCounts = levelSizeItemCounts,
@@ -205,6 +217,12 @@ pub const cross_level_teleport_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-teleport",
     .defaultItemCounts = crossLevelItemCounts,
     .runCase = runCrossLevelTeleportCase,
+};
+
+pub const cross_level_shaft_group = suite.BenchmarkGroup{
+    .name = "pathfinding-cross-level-shaft",
+    .defaultItemCounts = crossLevelItemCounts,
+    .runCase = runCrossLevelShaftCase,
 };
 
 // One timed dig on a 256² walkable level holding 1,000, 10,000, or 50,000 cached results
@@ -839,6 +857,8 @@ const StageReport = struct {
     busiest: [4]BatchStats = @splat(.{}),
     threaded: [4]usize = @splat(0),
     dispatched: [4]usize = @splat(0),
+    // Route groups that count unsolved routes: the last timed step's outcome.
+    routes: ?RouteOutcome = null,
 
     fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
         self.samples += 1;
@@ -868,7 +888,7 @@ const StageReport = struct {
             label.* = stageShape(buffer, batch, threaded, dispatched);
         }
         const samples: u128 = self.samples * std.time.ns_per_us;
-        std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us\n", .{
+        std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
             group_name,
             item_count,
             case.name,
@@ -883,6 +903,8 @@ const StageReport = struct {
             @as(u64, @intCast(self.solve_main_ns / samples)),
             @as(u64, @intCast(self.publish_ns / samples)),
         });
+        if (self.routes) |routes| std.debug.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
+        std.debug.print("\n", .{});
     }
 };
 
@@ -1615,6 +1637,9 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
 const level_case_encoding: usize = 1000;
 const level_size_item_counts = [_]usize{ 256_001, 1_024_001, 2_048_001 };
 const cross_level_item_counts = [_]usize{ 256_008, 256_032, 256_128 };
+const teleport_count_encoding: usize = 10_000_000;
+// Teleport-count configs place their teleports on level-0 cells this close to the border.
+const teleport_border_band: u16 = 16;
 const evict_region_encoding: usize = 10_000_000;
 const evict_item_counts = [_]usize{ 1_000, 10_000, 50_000, 64 * evict_region_encoding + 10_000 };
 // Four packs, then three tunnel field caps: sample points on the coverage curve.
@@ -1839,7 +1864,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    return runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr);
+    return runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr, .fail);
 }
 
 fn runCrossLevelDepthCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -1858,15 +1883,19 @@ fn crossLevelRampCell(center: u16, upper: u16) CellCoord {
 
 fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, teleport: bool) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side: u16 = @intCast(item_count / level_case_encoding);
-    const levels: u16 = @intCast(item_count % level_case_encoding);
+    const world_config = item_count % teleport_count_encoding;
+    const side: u16 = @intCast(world_config / level_case_encoding);
+    const levels: u16 = @intCast(world_config % level_case_encoding);
+    // 0: the one corner-to-corner teleport.
+    const teleport_count = item_count / teleport_count_encoding;
     std.debug.assert(levels > cross_level_goal_level and side >= 256);
+    std.debug.assert(teleport or teleport_count == 0);
 
     var threads = try initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const link_count: usize = levels - 1 + @intFromBool(teleport);
+    const link_count: usize = levels - 1 + if (teleport_count != 0) teleport_count else @intFromBool(teleport);
     const size_config = routeSizeConfig(side, levels, link_count, participant_count);
     const group_name = if (teleport) cross_level_teleport_group.name else cross_level_depth_group.name;
     if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
@@ -1888,7 +1917,9 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
             .bidirectional = true,
         });
     }
-    if (teleport) {
+    if (teleport_count != 0) {
+        try addBorderTeleports(&open.world, side, levels - 1, teleport_count);
+    } else if (teleport) {
         try open.world.addLevelLink(.{
             .kind = .teleport,
             .level_a = 0,
@@ -1917,33 +1948,156 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    return runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr);
+    return runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
 }
 
-// One cold pathfinding step of the fixture's requests; fails unless every route solved
-// to a path that step, so a routing regression can never read as a speedup.
-fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !PathfindingStats {
+// Shaft group levels: requests start on one and end on the other.
+const shaft_start_level: u16 = 1;
+const shaft_goal_level: u16 = 5;
+// Columns east of the starts' block at which the goals' block begins.
+const shaft_goal_offset: u16 = 48;
+
+fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side: u16 = @intCast(item_count / level_case_encoding);
+    const levels: u16 = @intCast(item_count % level_case_encoding);
+    std.debug.assert(levels > shaft_goal_level and side >= 256);
+
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    // Ramps join levels 1..levels-1; one teleport leaves level 0.
+    const link_count: usize = levels - 2 + 1;
+    const size_config = routeSizeConfig(side, levels, link_count, participant_count);
+    if (suite.navSizeSkip(cross_level_shaft_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var open = try buildOpenWorld(allocator, io, side, levels);
+    var open_owned = true;
+    errdefer if (open_owned) open.world.deinit();
+    const center = side / 2;
+    // The shaft sits just west of the starts' 8x8 block.
+    const shaft = CellCoord{ .x = center - 8, .y = center };
+    for (shaft_start_level..levels - 1) |upper_index| {
+        const upper: u16 = @intCast(upper_index);
+        try open.world.addLevelLink(.{
+            .kind = .ramp,
+            .level_a = upper,
+            .cell_a = shaft,
+            .level_b = upper + 1,
+            .cell_b = shaft,
+            .traversal_cost = 1,
+            .bidirectional = true,
+        });
+    }
+    // Level 0 has no ramp, so this teleport's entrance is unreachable; its exit lands just
+    // west of the goals' block on the goal level.
+    try open.world.addLevelLink(.{
+        .kind = .teleport,
+        .level_a = 0,
+        .cell_a = shaft,
+        .level_b = shaft_goal_level,
+        .cell_b = .{ .x = center - 4 + shaft_goal_offset - 2, .y = center },
+        .traversal_cost = 1,
+        .bidirectional = false,
+    });
+
+    var requests: [route_request_count]PathRequest = undefined;
+    for (&requests, 0..) |*request, index| {
+        const column: u16 = @intCast(index % 8);
+        const row: u16 = @intCast(index / 8);
+        request.* = .{
+            .entity = undefined,
+            .start_level = shaft_start_level,
+            .goal_level = shaft_goal_level,
+            .start = open.cellCenter(.{ .x = center - 4 + column, .y = center - 4 + row }),
+            .goal = open.cellCenter(.{ .x = center - 4 + shaft_goal_offset + column, .y = center - 4 + row }),
+        };
+    }
+    open_owned = false;
+    var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit();
+    return runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
+}
+
+// Adds `count` bidirectional teleports from level-0 cells within `teleport_border_band` of
+// the border, spread evenly in row-major order, each to its point mirror on `deepest`. Each
+// span far exceeds its cost, and every endpoint is at least 64 cells from the cross-level
+// routes' starts and goals around the level center.
+fn addBorderTeleports(world: *WorldSystem, side: u16, deepest: u16, count: usize) !void {
+    const inner = side - 2 * teleport_border_band;
+    const band_cells = @as(usize, side) * side - @as(usize, inner) * inner;
+    std.debug.assert(count <= band_cells);
+    const center = side / 2;
+    var band_index: usize = 0;
+    var added: usize = 0;
+    for (0..side) |y| {
+        for (0..side) |x| {
+            const in_band = x < teleport_border_band or y < teleport_border_band or
+                x >= side - teleport_border_band or y >= side - teleport_border_band;
+            if (!in_band) continue;
+            defer band_index += 1;
+            if (added == count or band_index != added * band_cells / count) continue;
+            const cell = CellCoord{ .x = @intCast(x), .y = @intCast(y) };
+            const mirror = CellCoord{ .x = side - 1 - cell.x, .y = side - 1 - cell.y };
+            std.debug.assert(@max(@abs(@as(i32, cell.x) - center), @abs(@as(i32, cell.y) - center)) >= 64 + 16);
+            std.debug.assert(@max(@abs(@as(i32, cell.x) - mirror.x), @abs(@as(i32, cell.y) - mirror.y)) > 64);
+            try world.addLevelLink(.{
+                .kind = .teleport,
+                .level_a = 0,
+                .cell_a = cell,
+                .level_b = deepest,
+                .cell_b = mirror,
+                .traversal_cost = 1,
+                .bidirectional = true,
+            });
+            added += 1;
+        }
+    }
+    std.debug.assert(added == count);
+}
+
+// How a route group treats a route that did not solve within its cold step (its search
+// exhausted the budget, so the request stays pending).
+const UnsolvedRoutes = enum {
+    // The step fails, so a routing regression can never read as a speedup.
+    fail,
+    // The step counts it: budget exhaustion is the measured outcome.
+    count,
+};
+
+const RouteOutcome = struct {
+    solved: usize,
+    unsolved: usize,
+};
+
+// One cold pathfinding step of the fixture's requests. Every fixture route exists and
+// starts on an open cell, so a definitive negative or an invalid start is a fixture fault.
+fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, unsolved_routes: UnsolvedRoutes) !PathfindingStats {
     const count = route_request_count;
     const stats = try runColdOnce(system, &fixture.requests, thread_system, case, count, count, count);
-    if (stats.available_results != count or stats.unavailable_results != 0 or stats.deferred_requests != 0) return error.RouteUnsolved;
+    if (stats.unavailable_results != 0) return error.RouteUnavailable;
+    if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+    std.debug.assert(stats.available_results <= count);
+    if (unsolved_routes == .fail and (stats.available_results != count or stats.deferred_requests != 0)) return error.RouteUnsolved;
     return stats;
 }
 
 // Times one cold pathfinding step of the fixture's requests per iteration (runtime
 // state cleared, untimed, before each).
-fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem) !suite.RunStats {
+fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
     setPathStageTuners(system, case);
     for (0..options.warmup_iterations) |_| {
         system.clearRuntimeState();
-        _ = try runRouteStep(system, fixture, thread_system, case);
+        _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
         while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearRuntimeState();
-            _ = try runRouteStep(system, fixture, thread_system, case);
+            _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         }
     }
     const settled = if (case.adaptive) system.fallback_tuner.isSettled() else false;
@@ -1955,12 +2109,13 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     for (0..options.iterations) |_| {
         system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
-        last_stats = try runRouteStep(system, fixture, thread_system, case);
+        last_stats = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         accumulator.record(elapsed_ns, last_stats.solveBatch());
         stage_report.add(elapsed_ns, last_stats);
         abstract_nodes = lastAbstractNodesUsed(system);
     }
+    if (unsolved_routes == .count) stage_report.routes = .{ .solved = last_stats.available_results, .unsolved = route_request_count - last_stats.available_results };
     stage_report.print(options, group_name, item_count, case);
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results;
