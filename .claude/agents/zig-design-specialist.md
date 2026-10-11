@@ -89,11 +89,16 @@ rules.
   tuner sizes batches by item count, so a stage's items are units whose
   count tracks its work (owner runs, keys, rows), never a fixed partition
   count such as shards whose work varies behind them. State the item unit
-  and why its count tracks the work. Each dispatch carries every ready item
-  (`threading.md`): an iterative stage (rounds, passes, frontier searches)
-  states its per-dispatch item count across the sizes it scales over and
-  shows that the step's work reaches the tuner as batches large enough to
-  thread, with any cost bound coming from termination, never from rationing.
+  and why its count tracks the work.
+- **Dispatch table (mandatory for every threaded stage):** item unit; items
+  per dispatch and dispatches per step at each bench size (per round for an
+  iterative stage); per-item inline cost, measured on today's code or a
+  throwaway probe, or marked derived and listed for the pre-implementation
+  check; per-dispatch inline time against the tuner's gate; the expected
+  adaptive choice. Every dispatch carries every ready item (`threading.md`);
+  a stage whose dispatches fall under the gate while its per-step total
+  exceeds it is redesigned here, before the plan is handed off, never left
+  for review to find.
 - **Main-thread and deferred boundaries**: what stays on the main thread (only
   boundaries, orchestration, ordered merge/commit proportional to what
   changed) and the deterministic merge.
