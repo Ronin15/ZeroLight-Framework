@@ -79,6 +79,7 @@ const IntakeTally = types.IntakeTally;
 const intake_range_alignment_items = types.intake_range_alignment_items;
 const thread_shared_record_alignment = types.thread_shared_record_alignment;
 const resizeList = types.resizeList;
+const resizeUnwritten = types.resizeUnwritten;
 const PathSolveResult = types.PathSolveResult;
 const GroupRequestTally = types.GroupRequestTally;
 const PhaseTimer = types.PhaseTimer;
@@ -2256,12 +2257,22 @@ pub const PathfindingSystem = struct {
     // partition, and installs a shrink's prepared owner heads. Each item writes only its
     // shard. Then the log is emptied, the replaced owner heads are freed, and `stats` (when
     // given) takes the counts. Allocates nothing; every add was reserved by the publish.
-    // Returns the stage's batch.
+    // A shrink's flush carries ops for most cache entries, a one-off the stage's tuner has
+    // no threaded profile for, so with a dispatch it runs at a fixed shape of one shard per
+    // range, outside the tuner. Returns the stage's batch.
     fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*PathfindingStats) BatchStats {
         var batch = BatchStats{};
         const truncate = self.registry_truncate_pending;
         if (self.completed.core.ownerLog().len != 0 or self.publish_ranges != 0 or truncate) {
-            const shape = stageShape(dispatch, registry_shard_count, 1);
+            const flush_dispatch: ?Dispatch = if (dispatch) |stage| shrink: {
+                // Only a tuned dispatch is replaced; a configured range size keeps its shape.
+                // The explicit range size opts the batch out of the tuner: nothing is recorded.
+                if (!truncate or !stage.adaptive or stage.items_per_range != null) break :shrink stage;
+                var fixed = stage;
+                fixed.items_per_range = 1;
+                break :shrink fixed;
+            } else null;
+            const shape = stageShape(flush_dispatch, registry_shard_count, 1);
             var job = RegistryFlushJob{
                 .system = self,
                 .ops = self.completed.core.ownerLog(),
@@ -2269,7 +2280,7 @@ pub const PathfindingSystem = struct {
                 .truncate = truncate,
                 .range_count = shape.range_count,
             };
-            batch = runShaped(dispatch, shape, registry_shard_count, 1, &job, registryFlushJob);
+            batch = runShaped(flush_dispatch, shape, registry_shard_count, 1, &job, registryFlushJob);
             if (stats) |step| {
                 for (self.flush_tallies) |tally| {
                     step.registrations_removed += tally.removed;
@@ -2733,7 +2744,7 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         for (system.worker_run_starts.items[solved.offset..][0..solved.run_count]) |start| {
             const key = if (solved.stitched_len != 0) job.geometry.key(view.levels[start], view.cells[start]) else job.geometry.key(solved.path_level, stripe[start]);
             const shard = registryShard(key);
-            job.buckets[cursors[shard]] = .{ .key = key, .owner = claimed.owner, .start = start };
+            job.buckets[cursors[shard]] = .{ .key = key, .owner = claimed.owner, .order = start };
             cursors[shard] += 1;
         }
     }
@@ -2769,7 +2780,7 @@ fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
         for (system.publish_bands.items[0..job.publish_ranges], system.publish_range_bases.items[0..job.publish_ranges]) |band, base| {
             var start = base;
             for (band.counts[0..shard]) |shard_count| start += shard_count;
-            for (system.reg_buckets.items[start..][0..band.counts[shard]]) |record| map.add(record.owner, record.key, record.start);
+            map.addAll(system.reg_buckets.items[start..][0..band.counts[shard]]);
             added += band.counts[shard];
         }
         if (job.truncate) map.installTruncate();
@@ -2975,17 +2986,6 @@ fn runHits(cache: *const ResultCache, geometry: RunGeometry, owner: u32, start: 
         if (index == cells.len) return false;
         cursor.moveTo(cells[index]);
     }
-}
-
-// Resizes `list` to `len` items without writing any: nothing reads past a written length.
-// On error the list keeps its storage and length.
-fn resizeUnwritten(list: anytype, allocator: std.mem.Allocator, len: usize) !void {
-    const old_len = list.items.len;
-    // An empty list clears without the debug fill of its old items.
-    list.items.len = 0;
-    errdefer list.items.len = old_len;
-    try resizeList(list, allocator, len);
-    list.items.len = len;
 }
 
 // Batch stats of a stage that ran inline on the calling thread.
@@ -9025,6 +9025,80 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     try std.testing.expectEqual(@as(usize, 0), system.completed.pendingMoves().len);
     for (&system.path_index) |*shard| try std.testing.expectEqual(@as(usize, 32), shard.owner_heads.items.len);
     try expectRegistryMatchesCache(&system);
+}
+
+// Two registry systems over one world, filled alike, then shrunk by sustained low load:
+// one serial, one on `threads` under `config`. Returns the threaded shrink step's flush
+// batch.
+fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem, threads: *ThreadSystem, config: PathfindingConfig) !BatchStats {
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    var flush = BatchStats{};
+    for (0..serial.capacity.capacity_shrink_window) |_| {
+        _ = try serial.updateSerial(&empty, 1, .{});
+        const capacity = threaded.completed.logicalCapacity();
+        const stats = try threaded.update(&empty, 1, threads, config);
+        if (threaded.completed.logicalCapacity() < capacity) flush = stats.registry_flush_batch;
+    }
+    return flush;
+}
+
+test "a shrink's registry flush runs on workers at one shard per range under the adaptive control, renames included, and equals the serial flush" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var serial = try shrinkFixture(&data, &fixture, requester, 1);
+    defer serial.deinit();
+    var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
+    defer threaded.deinit();
+    // The shrink's fixed-shape flush leaves the flush tuner untouched.
+    const tuner_before = threaded.registry_flush_tuner.report();
+    const flush = try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
+    const tuner_after = threaded.registry_flush_tuner.report();
+    try std.testing.expectEqual(tuner_before.sample_count, tuner_after.sample_count);
+    try std.testing.expectEqual(tuner_before.phase, tuner_after.phase);
+    try std.testing.expectEqual(tuner_before.current_profile, tuner_after.current_profile);
+    try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
+    try std.testing.expect(!flush.ran_inline and flush.active_worker_threads != 0);
+    try std.testing.expectEqual(registry_shard_count, flush.range_count);
+    try expectSameCache(&serial, &threaded);
+    try expectSameRegistry(&serial, &threaded);
+    try expectRegistryMatchesCache(&threaded);
+    for (&threaded.path_index) |*shard| try std.testing.expectEqual(@as(usize, 32), shard.owner_heads.items.len);
+}
+
+test "a shrink's registry flush keeps a configured range size and equals the serial flush" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var serial = try shrinkFixture(&data, &fixture, requester, 1);
+    defer serial.deinit();
+    var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
+    defer threaded.deinit();
+    const shards_per_range = 4;
+    const flush = try shrinkThroughUpdates(&serial, &threaded, &threads, .{ .items_per_range = shards_per_range });
+    try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
+    try std.testing.expect(!flush.ran_inline);
+    try std.testing.expectEqual(registry_shard_count / shards_per_range, flush.range_count);
+    try expectSameCache(&serial, &threaded);
+    try expectSameRegistry(&serial, &threaded);
+    try expectRegistryMatchesCache(&threaded);
 }
 
 test "reserve() with live entries returns with an empty owner log and no owner past the new capacity" {

@@ -837,7 +837,8 @@ pub const RunGeometry = struct {
 
     /// The key of the chunk holding `cell` on `level`: one division.
     pub fn key(self: RunGeometry, level: u16, cell: u32) u64 {
-        return self.keyAt(level, cell % self.width, cell / self.width);
+        const y = cell / self.width;
+        return self.keyAt(level, cell - y * self.width, y);
     }
 };
 

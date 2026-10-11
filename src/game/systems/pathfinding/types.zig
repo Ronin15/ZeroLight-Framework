@@ -858,11 +858,11 @@ pub const OwnerOp = struct {
 pub const no_owner: u32 = std.math.maxInt(u32);
 
 /// One registration of a published path: its run's chunk key, the owning cache payload,
-/// and the run's first stored cell.
+/// and the run's first stored cell (its registry entry's order).
 pub const RegRecord = struct {
     key: u64,
     owner: u32,
-    start: u32,
+    order: u32,
 };
 
 /// Per changed key of a path eviction: its hit bound, its hit window's base, its hits and
@@ -1121,6 +1121,17 @@ pub fn resizeList(list: anytype, allocator: std.mem.Allocator, capacity: usize) 
     }
     try list.ensureTotalCapacity(allocator, capacity);
     list.clearRetainingCapacity();
+}
+
+/// `resizeList` to exactly `len` items, writing none: for a buffer nothing reads past a
+/// written length. On error the list keeps its storage and length.
+pub fn resizeUnwritten(list: anytype, allocator: std.mem.Allocator, len: usize) !void {
+    const old_len = list.items.len;
+    // An empty list clears without the debug fill of its old items.
+    list.items.len = 0;
+    errdefer list.items.len = old_len;
+    try resizeList(list, allocator, len);
+    list.items.len = len;
 }
 
 /// Two-phase resize of one list inside a multi-list failure-atomic reserve.

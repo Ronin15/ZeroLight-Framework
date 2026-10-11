@@ -461,6 +461,25 @@ pub const ChunkListMap = struct {
         self.linkAfter(slot, entry, self.slot_tails[slot]);
     }
 
+    /// `add` for each of `records` (any slice of values with `owner`, `key`, and `order`
+    /// fields), in order. Records of one key in a row probe the table once: an insert never
+    /// moves another key's slot. Requires a prior `reserve` covering the keys, the entries,
+    /// and the owner ids. Not during a batch.
+    pub fn addAll(self: *ChunkListMap, records: anytype) void {
+        std.debug.assert(!self.in_batch);
+        std.debug.assert(self.entry_free.items.len >= records.len);
+        var slot_key: u64 = empty_key;
+        var slot: usize = 0;
+        for (records) |record| {
+            if (record.key != slot_key) {
+                slot = self.slotFor(record.key);
+                slot_key = record.key;
+            }
+            const entry = self.claimEntry(record.owner, record.key, record.order);
+            self.linkAfter(slot, entry, self.slot_tails[slot]);
+        }
+    }
+
     /// Whether `owner` holds an entry. O(1).
     pub inline fn holdsOwner(self: *const ChunkListMap, owner: u32) bool {
         return owner < self.owner_heads.items.len and self.owner_heads.items[owner] != no_entry;
@@ -1352,6 +1371,56 @@ test "add keeps every run of one owner in insertion order without dedupe" {
     try std.testing.expectEqualSlices(u32, &.{ 40, 7, 3, 3, 90 }, orders.items);
     try std.testing.expectEqual(@as(u32, 5), map.keyCount(key));
     try expectCountsMatchLists(&map);
+}
+
+// Lists, per-key counts, live keys, and owner chains of two maps are equal, entry ids
+// included, over `keys` and owners below `owner_count`.
+fn expectSameMaps(a: *const ChunkListMap, b: *const ChunkListMap, keys: []const u64, owner_count: usize) !void {
+    try expectSameLists(a, b, keys);
+    for (keys) |key| {
+        try std.testing.expectEqual(a.keyCount(key), b.keyCount(key));
+        var entry = a.head(key);
+        while (entry != no_entry) : (entry = a.entry_next[entry]) try std.testing.expectEqual(a.entry_order[entry], b.entry_order[entry]);
+    }
+    for (0..owner_count) |owner| {
+        var entry_a = a.owner_heads.items[owner];
+        var entry_b = b.owner_heads.items[owner];
+        while (entry_a != no_entry or entry_b != no_entry) {
+            try std.testing.expectEqual(entry_a, entry_b);
+            entry_a = a.entry_owner_next[entry_a];
+            entry_b = b.entry_owner_next[entry_b];
+        }
+    }
+}
+
+test "addAll equals one add per record, for runs of one key, a key change back, and a new key" {
+    const Record = struct { owner: u32, key: u64, order: u32 };
+    const a = chunkKey(0, 1);
+    const b = chunkKey(0, 2);
+    const c = chunkKey(3, 9);
+    // A and B are listed already; C is new. Owners repeat and mix across keys.
+    const records = [_]Record{
+        .{ .owner = 2, .key = a, .order = 5 },
+        .{ .owner = 2, .key = a, .order = 1 },
+        .{ .owner = 0, .key = b, .order = 3 },
+        .{ .owner = 1, .key = a, .order = 7 },
+        .{ .owner = 0, .key = c, .order = 0 },
+        .{ .owner = 3, .key = c, .order = 2 },
+    };
+    var maps: [2]ChunkListMap = .{ ChunkListMap.init(std.testing.allocator, "test lists"), ChunkListMap.init(std.testing.allocator, "test lists") };
+    defer for (&maps) |*map| map.deinit();
+    for (&maps) |*map| {
+        try map.reserve(3, 3 + records.len, 4);
+        map.add(1, a, 0);
+        map.add(3, b, 0);
+        map.add(0, a, 4);
+    }
+    for (records) |record| maps[0].add(record.owner, record.key, record.order);
+    maps[1].addAll(&records);
+    try expectSameMaps(&maps[0], &maps[1], &.{ a, b, c }, 4);
+    try std.testing.expectEqual(maps[0].live_keys, maps[1].live_keys);
+    try std.testing.expectEqual(@as(u32, 5), maps[1].keyCount(a));
+    try expectCountsMatchLists(&maps[1]);
 }
 
 test "removeOwner unlinks every entry of the owner and drops the keys it empties" {
