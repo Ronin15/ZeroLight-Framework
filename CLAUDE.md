@@ -50,12 +50,9 @@ orchestrates, verifies every agent claim against live code, and reports.
 - `zig-design-specialist` opens every slice, right before implementation, and
   runs whenever a design is open or the existing structure fails the cost
   model; local fixes go straight to `zig-specialist`.
-- Between design and implementation, the design's load-bearing assumptions
-  are proven on live code, not trusted: the main session checks the plan's
-  dispatch table and cost table against the rules, and `zig-debug-specialist`
-  measures every derived assumption the design depends on (per-item costs
-  that decide threading, exactness of seeds or bounds) with throwaway probes.
-  A failed assumption goes back to design before any code.
+- Before implementation, `zig-debug-specialist` measures each derived
+  assumption the design rests on with throwaway probes; a failed one returns
+  to design.
 - `zig-review-specialist` reviews each slice, or each landing of a
   multi-commit slice, before it is committed; fixes fold into that commit.
   Every real finding is reported and checked against live code and

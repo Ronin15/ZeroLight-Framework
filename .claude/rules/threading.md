@@ -71,19 +71,11 @@ paths:
   and tuner state.
 - Worker participation follows measured timing and structural constraints,
   never static item-count floors.
-- A stage's tuner judges the median time of that stage's recent dispatches
-  against its gate, and dispatches far outside its learned item-count band
-  run unsampled on the current profile (`docs/architecture.md`). It sees the
-  stage's typical dispatch, never its step total: a stage that dispatches
-  several unequal batches per step (rounds of a frontier search) is decided
-  by its small ones and stays inline while its step total is far above the
-  gate. Shape each stage so a step's work reaches its tuner as one dispatch,
-  or as rounds of similar size that each carry enough work to be judged;
-  dispatches of different kinds get their own tuners. A design states, per
-  threaded stage, its dispatches per step and items per dispatch at each
-  bench size, the per-item cost (measured, or probed before implementation),
-  and the dispatch the median lands on against the gate. The adaptive bench
-  case shows the stage on workers where its step total exceeds the gate; a
-  forced-range test proves only that the threaded path exists.
+- A tuner judges its stage's median dispatch against the gate, never the step
+  total, so many small dispatches keep a large step inline. A step's work
+  reaches its tuner as one dispatch or as similar-sized rounds; each design
+  states dispatches per step, items per dispatch, and per-item cost at each
+  bench size. The adaptive bench case shows the stage on workers where its
+  step total exceeds the gate.
 - Bench and diagnostic output reports inline stages as `inline`, never as a
   zero-worker range size.

@@ -89,7 +89,7 @@ rules.
   tuner sizes batches by item count, so a stage's items are units whose
   count tracks its work (owner runs, keys, rows), never a fixed partition
   count such as shards whose work varies behind them. State the item unit
-  and why its count tracks the work. Include the dispatch table
+  and why its count tracks the work, with the dispatch figures
   `threading.md` requires.
 - **Main-thread and deferred boundaries**: what stays on the main thread (only
   boundaries, orchestration, ordered merge/commit proportional to what
