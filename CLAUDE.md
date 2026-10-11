@@ -78,8 +78,9 @@ orchestrates, verifies every agent claim against live code, and reports.
 - Terse reports and docs, never by dropping findings. Make engineering calls
   without asking, on best practice, scale, performance, and efficiency, never
   on what today's code happens to produce, and report them; only scope added
-  or dropped, product/gameplay behavior, rule changes, and a
-  `ThreadSystem`/tuner redesign go to the owner. No model/effort overrides unless the owner asks.
+  or dropped, product/gameplay behavior, rule changes, a `ThreadSystem`/tuner
+  redesign, any departure from the rules (by a plan, brief, or agent), and
+  anything that doesn't make sense go to the owner. No model/effort overrides unless the owner asks.
 - Implementation agents run sequentially in the main tree; parallelize only
   read-only work, and let read-only agents finish rather than stopping them
   midway. One commit per logical change with review fixes folded in; no
