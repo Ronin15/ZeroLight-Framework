@@ -197,6 +197,8 @@ pub const RunStats = struct {
     deferred_count: usize = 0,
     fallback_deferred_count: usize = 0,
     cache_evictions: usize = 0,
+    // Multi-step samples: the mean over timed samples of each sample's longest step.
+    max_step_ns: u64 = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
     min_ns: u64 = 0,
@@ -747,6 +749,9 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) return "uncached unreachable path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-negative-steady")) return "fresh unreachable path requests per step";
     if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) return "(level side * 1000 + unreachable path requests)";
+    if (std.mem.eql(u8, group_name, "pathfinding-negative-burst")) return "unreachable path requests in one burst";
+    if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) return "(variant * 10^10 + edge chunks * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "pathfinding-connectivity-oneway")) return "(variant * 10^10 + terminals per system * 10^5 + one-way systems)";
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) return "agents before the drop";
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (isSteeringAgentGroup(group_name)) return "steering agents";
@@ -951,6 +956,21 @@ fn printValidationSummary(
             std.debug.print(
                 "workload hits={} solves={} exhausted={} pending={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.sample_count, best.stats.deferred_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-negative-burst")) {
+            std.debug.print(
+                "workload searches={} unavailable={} steps={} status_steps={} max_step={f}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.sample_count, best.stats.deferred_count, formatDuration(best.stats.max_step_ns) },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) {
+            std.debug.print(
+                "workload cells={} structure_chunks={}. ",
+                .{ best.stats.output_count, best.stats.candidate_pairs },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-connectivity-oneway")) {
+            std.debug.print(
+                "workload rooms={} oneway_links={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
             );
         } else if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
             std.debug.print(
@@ -1280,6 +1300,17 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     }
     if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) {
         return std.fmt.bufPrint(buffer, "hits={} solves={} exhausted={} pending={}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-negative-burst")) {
+        return std.fmt.bufPrint(buffer, "searches={} unavailable={} steps={} status_steps={} max_step={f}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count, formatDuration(stats.max_step_ns) }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) {
+        var stage_buffer: [128]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "cells={} structure_chunks={} {s}", .{ stats.output_count, stats.candidate_pairs, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-connectivity-oneway")) {
+        var stage_buffer: [128]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "rooms={} oneway_links={} {s}", .{ stats.candidate_pairs, stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
         return std.fmt.bufPrint(buffer, "evicted={} moved={} kept={}", .{ stats.cache_evictions, stats.candidate_pairs, stats.output_count }) catch "workload";

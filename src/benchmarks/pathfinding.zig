@@ -329,6 +329,55 @@ pub const negative_dig_group = suite.BenchmarkGroup{
     .runCase = runNegativeDigCase,
 };
 
+// The item count's unreachable requests in one burst. Four sealed 56² pockets line the top
+// edge of a walkable 256² level; requesters start outside them from row 72, and request `i`
+// goes to its own cell of pocket `i mod 4`. One timed sample, on result state cleared before
+// it (untimed), submits every request on one step and then steps an empty stream until
+// nothing is pending; an untimed status query of every request follows each step. `outputs`
+// is the requests answered unavailable and `candidates` the searches the burst ran; the
+// workload column adds the burst's steps, the step after which every status read
+// unavailable, and the mean longest step. Passes when linear in requests. `--details` prints
+// the update stages over the timed steps.
+pub const negative_burst_group = suite.BenchmarkGroup{
+    .name = "pathfinding-negative-burst",
+    .defaultItemCounts = negativeBurstItemCounts,
+    .runCase = runNegativeBurstCase,
+};
+
+// One walkable level (item code variant * 10^10 + edge chunks * 10^7 + side * 1000 + 1)
+// holding, at its origin corner, solid chunks around one walkable gap chunk. Variant 0: a
+// room of edge² chunks walled off by a one-chunk band whose one open chunk is the gap;
+// blocking the gap seals the room. Variant 1: a one-chunk ring corridor around a solid block
+// of edge² chunks, walled off from the rest of the level, with the gap one chunk of the ring;
+// blocking it cuts the ring without splitting it. One timed sample blocks the gap chunk and
+// runs the nav reaction, then reopens it and runs the reaction again; the tile writes are
+// untimed. `outputs` is the cells each change flips and `candidates` the room or ring chunks.
+// Passes when no config grows faster than its room or ring chunks and every config is flat
+// in side. `--details` prints the block and reopen reactions, the block reaction's plan,
+// remask, and patch shapes, and the reactions' main-thread share.
+pub const connectivity_split_group = suite.BenchmarkGroup{
+    .name = "pathfinding-connectivity-split",
+    .defaultItemCounts = connectivitySplitItemCounts,
+    .runCase = runConnectivitySplitCase,
+};
+
+// A 256² world of 2 levels (item code variant * 10^10 + terminals * 10^5 + systems), each a
+// lattice of one-cell walled rooms, holding `systems` chains of `terminals` rooms, each room
+// joined to the next room of its chain by a one-way teleport. Variants 0 and 1 toggle the
+// first chain's last room (its last link's target), variant 2 its first room (its first
+// link's source), and variant 3 a far room no chain uses; variants 1 to 3 hold one chain.
+// The toggled end's 8 rooms sit in one fixed chunk whose orthogonal neighbours hold no other
+// chain room, so every config's toggle patches the same chunks. One timed sample blocks the
+// cell and runs the nav reaction, then reopens it and runs the reaction again; the tile
+// writes are untimed. `outputs` is the one-way links and `candidates` the rooms. Passes when variants 0 and 3 are flat, variant 2 grows at most
+// linearly in terminals, and variant 1 at most as terminals² / 32. `--details` as for
+// `pathfinding-connectivity-split`.
+pub const connectivity_oneway_group = suite.BenchmarkGroup{
+    .name = "pathfinding-connectivity-oneway",
+    .defaultItemCounts = connectivityOnewayItemCounts,
+    .runCase = runConnectivityOnewayCase,
+};
+
 const quick_counts = [_]usize{ 128, 512, 1024 };
 const standard_counts = [_]usize{ 512, 1024, 4096 };
 const stress_counts = [_]usize{ 4096, 10000 };
@@ -1776,6 +1825,52 @@ fn negativeDigItemCounts(_: suite.Profile) []const usize {
     return &negative_dig_item_counts;
 }
 
+const negative_burst_item_counts = [_]usize{ 1024, 4096, 12288 };
+
+fn negativeBurstItemCounts(_: suite.Profile) []const usize {
+    return &negative_burst_item_counts;
+}
+
+// The connectivity groups' variant digit sits above every other field of their item codes.
+const connectivity_variant_encoding: usize = 10_000_000_000;
+const split_edge_encoding: usize = 10_000_000;
+const oneway_terminals_encoding: usize = 100_000;
+
+// Room edges at one side, then the middle edge at two more sides, then ring edges.
+const connectivity_split_item_counts = [_]usize{
+    splitItemCode(.room, 2, 1024),
+    splitItemCode(.room, 8, 1024),
+    splitItemCode(.room, 32, 1024),
+    splitItemCode(.room, 8, 256),
+    splitItemCode(.room, 8, 2048),
+    splitItemCode(.ring, 2, 1024),
+    splitItemCode(.ring, 8, 1024),
+    splitItemCode(.ring, 32, 1024),
+};
+
+fn connectivitySplitItemCounts(_: suite.Profile) []const usize {
+    return &connectivity_split_item_counts;
+}
+
+const connectivity_oneway_item_counts = [_]usize{
+    onewayItemCode(.locality, 8, 16),
+    onewayItemCode(.locality, 8, 256),
+    onewayItemCode(.locality, 8, 2048),
+    onewayItemCode(.tail, 64, 1),
+    onewayItemCode(.tail, 512, 1),
+    onewayItemCode(.tail, 4096, 1),
+    onewayItemCode(.head, 64, 1),
+    onewayItemCode(.head, 512, 1),
+    onewayItemCode(.head, 4096, 1),
+    onewayItemCode(.far_dig, 64, 1),
+    onewayItemCode(.far_dig, 512, 1),
+    onewayItemCode(.far_dig, 4096, 1),
+};
+
+fn connectivityOnewayItemCounts(_: suite.Profile) []const usize {
+    return &connectivity_oneway_item_counts;
+}
+
 /// The capacity a nav scaling config's nav reserves; library defaults elsewhere.
 /// `suite.navStorageBytes` charges exactly these three fields.
 pub fn navSizeCapacity(config: suite.NavSizeConfig) PathfindingCapacity {
@@ -1833,7 +1928,12 @@ fn buildOpenWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u
 
 // Writes `tile` into `cells` on level 0 in one reserve scope.
 fn writeLevelZeroCells(open: *OpenWorld, cells: []const CellCoord, tile: TileId) !void {
-    const layer = OpenWorld.floor(0);
+    try writeLevelCells(open, 0, cells, tile);
+}
+
+// Writes `tile` into `cells` on `level` in one reserve scope.
+fn writeLevelCells(open: *OpenWorld, level: u16, cells: []const CellCoord, tile: TileId) !void {
+    const layer = OpenWorld.floor(level);
     open.world.beginDenseCellWriteReserve();
     for (cells) |cell| try open.world.reserveDenseCellWrite(layer, cell.x, cell.y, tile);
     for (cells) |cell| _ = try open.world.setDenseTile(layer, cell.x, cell.y, tile);
@@ -3492,6 +3592,766 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     stats.deferred_count = report.last.deferred_requests;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.fallback_tuner.report(), settled_before_measurement);
+    return stats;
+}
+
+// Burst fixture: `burst_pockets` sealed `burst_pocket_side`² pockets along the top edge of a
+// walkable `burst_side`² level, pocket `k` from column `k * burst_pocket_pitch + 1`, each
+// closed by the level border, a blocking column on either side, and a blocking row below
+// it. Requesters start outside on rows from `burst_requester_row`, `pocket_requester_margin`
+// cells clear of the level's sides.
+const burst_side: u16 = 256;
+const burst_pockets: u16 = 4;
+const burst_pocket_side: u16 = 56;
+const burst_pocket_pitch: u16 = 64;
+const burst_requester_row: u16 = 72;
+const burst_requester_columns: usize = burst_side - 2 * pocket_requester_margin;
+// Per pocket: two side columns of `burst_pocket_side + 1` cells and the row between them.
+const burst_wall_cells_per_pocket: usize = 3 * burst_pocket_side + 2;
+
+comptime {
+    // Requesters start below every pocket's bottom wall, and the last pocket's right wall
+    // lies inside the level.
+    std.debug.assert(burst_requester_row > burst_pocket_side);
+    std.debug.assert((burst_pockets - 1) * burst_pocket_pitch + burst_pocket_side + 1 < burst_side);
+}
+
+fn burstGoalCell(index: usize) CellCoord {
+    const pocket: u16 = @intCast(index % burst_pockets);
+    const cell = index / burst_pockets;
+    // In range: the cell lies inside its pocket.
+    std.debug.assert(cell < @as(usize, burst_pocket_side) * burst_pocket_side);
+    return .{
+        .x = pocket * burst_pocket_pitch + 1 + @as(u16, @intCast(cell % burst_pocket_side)),
+        .y = @intCast(cell / burst_pocket_side),
+    };
+}
+
+fn burstRequesterCell(index: usize) CellCoord {
+    // Range checked by `checkBurstLayout`: every requester row lies inside the level.
+    return .{ .x = @intCast(pocket_requester_margin + index % burst_requester_columns), .y = @intCast(burst_requester_row + index / burst_requester_columns) };
+}
+
+fn burstWallCells() [burst_pockets * burst_wall_cells_per_pocket]CellCoord {
+    var walls: [burst_pockets * burst_wall_cells_per_pocket]CellCoord = undefined;
+    var len: usize = 0;
+    for (0..burst_pockets) |pocket_index| {
+        const left: u16 = @as(u16, @intCast(pocket_index)) * burst_pocket_pitch;
+        const right = left + burst_pocket_side + 1;
+        for (0..burst_pocket_side + 1) |y| {
+            walls[len] = .{ .x = left, .y = @intCast(y) };
+            walls[len + 1] = .{ .x = right, .y = @intCast(y) };
+            len += 2;
+        }
+        for (0..burst_pocket_side) |x| {
+            walls[len] = .{ .x = left + 1 + @as(u16, @intCast(x)), .y = burst_pocket_side };
+            len += 1;
+        }
+    }
+    std.debug.assert(len == walls.len);
+    return walls;
+}
+
+// Fails unless every request has its own pocket cell and every requester row lies inside
+// the level.
+fn checkBurstLayout(requester_count: usize) !void {
+    if (requester_count == 0) return error.NegativeBurstNoRequests;
+    if ((requester_count + burst_pockets - 1) / burst_pockets > @as(usize, burst_pocket_side) * burst_pocket_side) return error.NegativeBurstGoalCellsTooFew;
+    const rows = (requester_count + burst_requester_columns - 1) / burst_requester_columns;
+    if (burst_requester_row + rows > burst_side) return error.NegativeBurstRequesterRowsTooFew;
+}
+
+fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, requester_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+    var open = try buildOpenWorld(allocator, io, burst_side, 1);
+    errdefer open.world.deinit();
+    const walls = burstWallCells();
+    try writeLevelZeroCells(&open, &walls, open.blocking);
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try allocator.alloc(PathRequest, requester_count);
+    errdefer allocator.free(requests);
+    for (requests, 0..) |*request, index| {
+        request.* = .{
+            .entity = try data.createEntity(),
+            .start = open.cellCenter(burstRequesterCell(index)),
+            .goal = open.cellCenter(burstGoalCell(index)),
+        };
+    }
+    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+}
+
+fn burstSizeConfig(participant_count: usize, requester_count: usize) suite.NavSizeConfig {
+    return .{
+        .side = burst_side,
+        .levels = 1,
+        .participant_count = participant_count,
+        .agent_budget = requester_count,
+        .group_fields = 1,
+        // No path is published, so no long block is taken.
+        .long_results = 0,
+        // One negative per request.
+        .negatives = requester_count,
+    };
+}
+
+// Requests whose status reads unavailable. Untimed: one status query per request.
+fn unavailableCount(fixture: *const EvictFixture) usize {
+    var unavailable: usize = 0;
+    for (fixture.requests) |request| {
+        const view = fixture.system.statusForWorld(request.start_level, request.start, request.goal_level, request.goal, request.agent_class, null);
+        if (view.status == .unavailable) unavailable += 1;
+    }
+    return unavailable;
+}
+
+const BurstOutcome = struct {
+    // Sum of the burst's step times; status queries excluded.
+    elapsed_ns: u64 = 0,
+    steps: usize = 0,
+    // The step after which every request's status read unavailable.
+    status_steps: usize = 0,
+    max_step_ns: u64 = 0,
+    searches: usize = 0,
+    unavailable: usize = 0,
+    // The submitting step's stats.
+    first: PathfindingStats = .{},
+};
+
+// One burst on cleared result state: every request on the first step, then empty steps
+// until nothing is pending, within the steps the per-step solve ceiling needs plus one.
+// No request reaches its goal, and each is answered unavailable.
+fn runBurst(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem, stage_report: ?*StageReport) !BurstOutcome {
+    const count = fixture.requests.len;
+    fixture.system.clearRuntimeState();
+    try writeRequests(&fixture.stream, fixture.requests);
+    const step_limit = suite.rangeCount(count, default_max_solves_per_frame) + 1;
+    var outcome = BurstOutcome{};
+    var stream = &fixture.stream;
+    while (true) {
+        if (outcome.steps == step_limit) return error.NegativeBurstNotDrained;
+        const start_ns = suite.nowNs(io);
+        const stats = try runColdOnce(&fixture.system, stream, thread_system, case, count, count, count);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        if (stats.available_results != 0) return error.NegativeBurstGoalReached;
+        if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.NegativeBurstRequestDropped;
+        if (outcome.steps == 0) outcome.first = stats;
+        outcome.steps += 1;
+        outcome.elapsed_ns += elapsed_ns;
+        outcome.max_step_ns = @max(outcome.max_step_ns, elapsed_ns);
+        outcome.searches += stats.solved_requests;
+        outcome.unavailable += stats.unavailable_results;
+        if (stage_report) |report| report.add(elapsed_ns, stats);
+        stream = &fixture.empty;
+        if (outcome.status_steps == 0 and unavailableCount(fixture) == count) outcome.status_steps = outcome.steps;
+        if (stats.pending_requests == 0) break;
+    }
+    if (outcome.unavailable != count) return error.NegativeBurstUnanswered;
+    if (outcome.status_steps == 0) return error.NegativeBurstStatusNotUnavailable;
+    return outcome;
+}
+
+fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    try checkBurstLayout(item_count);
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = burstSizeConfig(participant_count, item_count);
+    if (suite.navSizeSkip(negative_burst_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var fixture = try initBurstFixture(allocator, io, item_count, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    setPathStageTuners(&fixture.system, case);
+
+    // At least one untimed burst: the first grows the capacity from the reserve floor.
+    for (0..@max(1, coldWarmup(options))) |_| _ = try runBurst(io, case, &fixture, thread_ptr, null);
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = coldSettleLimit(options);
+        while (!fixture.system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runBurst(io, case, &fixture, thread_ptr, null);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) fixture.system.fallback_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
+    var last = BurstOutcome{};
+    var max_step_total: u128 = 0;
+    for (0..coldIterations(options)) |_| {
+        last = try runBurst(io, case, &fixture, thread_ptr, &stage_report);
+        accumulator.record(last.elapsed_ns, last.first.solveBatch());
+        max_step_total += last.max_step_ns;
+    }
+    stage_report.print(options, negative_burst_group.name, item_count, case);
+
+    var stats = accumulator.finish();
+    stats.output_count = last.unavailable;
+    stats.candidate_pairs = last.searches;
+    stats.sample_count = last.steps;
+    stats.deferred_count = last.status_steps;
+    if (accumulator.iterations != 0) stats.max_step_ns = @intCast(max_step_total / accumulator.iterations);
+    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.fallback_tuner.report(), settled_before_measurement);
+    return stats;
+}
+
+// The agent budget of the toggle groups' fixtures, which request no paths.
+const toggle_agent_budget: usize = 8;
+
+// One timed toggle: a change of `cells` and its nav reaction, then the revert and its
+// reaction, with the change reaction's plan, remask, and patch batches.
+const ToggleSample = struct {
+    change: EvictReaction,
+    change_stages: [3]BatchStats,
+    revert: EvictReaction,
+
+    fn elapsedNs(self: ToggleSample) u64 {
+        return self.change.elapsed_ns + self.revert.elapsed_ns;
+    }
+};
+
+// Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again.
+fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem) !ToggleSample {
+    const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
+    const graph = &fixture.system.graph;
+    const change_stages = [3]BatchStats{ graph.last_plan_batch, change.stats.remask_batch, graph.last_patch_batch };
+    const revert = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+    return .{ .change = change, .change_stages = change_stages, .revert = revert };
+}
+
+// The timed toggles' change and revert reactions, the change reaction's plan, remask, and
+// patch shapes (each stage's busiest batch), and the reactions' main-thread share: each
+// reaction minus its worker-side stage time. Printed under --details.
+const ToggleReport = struct {
+    samples: usize = 0,
+    change_ns: u128 = 0,
+    revert_ns: u128 = 0,
+    main_ns: u128 = 0,
+    busiest: [3]BatchStats = @splat(.{}),
+    threaded: [3]usize = @splat(0),
+    dispatched: [3]usize = @splat(0),
+    chunks_patched: usize = 0,
+    records_patched: usize = 0,
+
+    fn add(self: *ToggleReport, sample: ToggleSample) void {
+        self.samples += 1;
+        self.change_ns += sample.change.elapsed_ns;
+        self.revert_ns += sample.revert.elapsed_ns;
+        self.main_ns += (sample.change.elapsed_ns -| sample.change.stats.off_main_stage_ns) + (sample.revert.elapsed_ns -| sample.revert.stats.off_main_stage_ns);
+        self.chunks_patched = sample.change.stats.chunks_patched;
+        self.records_patched = sample.change.stats.records_patched;
+        for (sample.change_stages, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
+            if (batch.item_count == 0) continue;
+            dispatched.* += 1;
+            const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
+            if (on_workers) threaded.* += 1;
+            if (batch.item_count >= busiest.item_count) busiest.* = batch;
+        }
+    }
+
+    // The busiest plan, remask, and patch batches into `stats`' nav stage summaries.
+    fn summarize(self: ToggleReport, stats: *suite.RunStats) void {
+        stats.nav_plan_batch = suite.batchSummaryFromBatch(self.busiest[0]);
+        stats.batch = suite.batchSummaryFromBatch(self.busiest[1]);
+        stats.secondary_batch = suite.batchSummaryFromBatch(self.busiest[2]);
+    }
+
+    fn print(self: ToggleReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
+        if (!options.details or self.samples == 0) return;
+        var shapes: [3][48]u8 = undefined;
+        var labels: [3][]const u8 = undefined;
+        for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
+            label.* = stageShape(buffer, batch, threaded, dispatched);
+        }
+        const samples: u128 = self.samples * std.time.ns_per_us;
+        const timed_ns = self.change_ns + self.revert_ns;
+        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%) plan={s} remask={s} patch={s} chunks_patched={} records_patched={}\n", .{
+            group_name,
+            item_count,
+            case.name,
+            @as(u64, @intCast(self.change_ns / samples)),
+            @as(u64, @intCast(self.revert_ns / samples)),
+            @as(u64, @intCast(self.main_ns / samples)),
+            @as(u64, @intCast(if (timed_ns == 0) 0 else self.main_ns * 100 / timed_ns)),
+            labels[0],
+            labels[1],
+            labels[2],
+            self.chunks_patched,
+            self.records_patched,
+        });
+    }
+};
+
+// Times `options.iterations` toggles of `cells` after `options.warmup_iterations` untimed
+// ones. Items/s is the cells flipped per second.
+fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem) !suite.RunStats {
+    for (0..options.warmup_iterations) |_| _ = try runToggle(io, fixture, cells, thread_system);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var report = ToggleReport{};
+    for (0..options.iterations) |_| {
+        const sample = try runToggle(io, fixture, cells, thread_system);
+        accumulator.record(sample.elapsedNs(), sample.change.stats.remask_batch);
+        report.add(sample);
+    }
+    report.print(options, group_name, item_count, case);
+    var stats = accumulator.finish();
+    report.summarize(&stats);
+    stats.items_per_second = suite.itemsPerSecond(2 * cells.len, stats.mean_ns);
+    return stats;
+}
+
+const SplitVariant = enum(u8) {
+    // A room sealed by blocking the gap chunk of its wall.
+    room,
+    // A ring corridor cut, not split, by blocking one of its chunks.
+    ring,
+};
+
+fn splitItemCode(variant: SplitVariant, edge_chunks: usize, side: usize) usize {
+    return @as(usize, @backingInt(variant)) * connectivity_variant_encoding + edge_chunks * split_edge_encoding + side * level_case_encoding + 1;
+}
+
+// A chunk of a toggle fixture, in chunk coordinates.
+const ChunkCoord = struct {
+    x: u16,
+    y: u16,
+};
+
+const SplitConfig = struct {
+    variant: SplitVariant,
+    edge_chunks: u16,
+    side: u16,
+
+    fn decode(item_count: usize) !SplitConfig {
+        const variant_index = item_count / connectivity_variant_encoding;
+        const edge_chunks = item_count % connectivity_variant_encoding / split_edge_encoding;
+        const world_config = item_count % split_edge_encoding;
+        if (variant_index > @backingInt(SplitVariant.ring)) return error.ConnectivitySplitUnknownVariant;
+        if (world_config % level_case_encoding != 1) return error.ConnectivitySplitNotOneLevel;
+        if (edge_chunks == 0) return error.ConnectivitySplitNoEdge;
+        const side = world_config / level_case_encoding;
+        if (side > std.math.maxInt(u16) or edge_chunks > std.math.maxInt(u16)) return error.ConnectivitySplitTooLarge;
+        return .{ .variant = @fromBackingInt(@as(u8, @intCast(variant_index))), .edge_chunks = @intCast(edge_chunks), .side = @intCast(side) };
+    }
+
+    // Chunks a side of the structure's square, its outer wall band included.
+    fn spanChunks(self: SplitConfig) usize {
+        return switch (self.variant) {
+            .room => @as(usize, self.edge_chunks) + 1,
+            .ring => @as(usize, self.edge_chunks) + 3,
+        };
+    }
+
+    // The room's chunks, or the ring's.
+    fn structureChunks(self: SplitConfig) usize {
+        const edge: usize = self.edge_chunks;
+        return switch (self.variant) {
+            .room => edge * edge,
+            .ring => 4 * edge + 4,
+        };
+    }
+
+    // Whether `cell` lies in the room, or in the ring (its gap chunk included).
+    fn inStructure(self: SplitConfig, cell: CellCoord, chunk_tiles: usize) bool {
+        const chunk_x = cell.x / chunk_tiles;
+        const chunk_y = cell.y / chunk_tiles;
+        const edge: usize = self.edge_chunks;
+        return switch (self.variant) {
+            .room => chunk_x < edge and chunk_y < edge,
+            .ring => chunk_x < edge + 2 and chunk_y < edge + 2 and
+                (chunk_x == 0 or chunk_y == 0 or chunk_x == edge + 1 or chunk_y == edge + 1),
+        };
+    }
+
+    fn inGapChunk(self: SplitConfig, cell: CellCoord, chunk_tiles: usize) bool {
+        const gap = self.gapChunk();
+        return cell.x / chunk_tiles == gap.x and cell.y / chunk_tiles == gap.y;
+    }
+
+    fn gapChunk(self: SplitConfig) ChunkCoord {
+        return switch (self.variant) {
+            // Mid-height in the room's wall column.
+            .room => .{ .x = self.edge_chunks, .y = self.edge_chunks / 2 },
+            // Mid-height in the ring's west side.
+            .ring => .{ .x = 0, .y = (self.edge_chunks + 2) / 2 },
+        };
+    }
+
+    // The solid chunks: the room's wall band but its gap, or the ring's inner block and its
+    // outer wall band. The level border closes the structure's west and north.
+    fn solidChunks(self: SplitConfig, allocator: std.mem.Allocator) ![]ChunkCoord {
+        var chunks: std.ArrayList(ChunkCoord) = .empty;
+        errdefer chunks.deinit(allocator);
+        // The outer band: the column and the row just past the room or the ring.
+        const band: u16 = switch (self.variant) {
+            .room => self.edge_chunks,
+            .ring => self.edge_chunks + 2,
+        };
+        const gap = self.gapChunk();
+        for (0..band + 1) |y| {
+            const chunk = ChunkCoord{ .x = band, .y = @intCast(y) };
+            if (self.variant == .room and chunk.x == gap.x and chunk.y == gap.y) continue;
+            try chunks.append(allocator, chunk);
+        }
+        for (0..band) |x| try chunks.append(allocator, .{ .x = @intCast(x), .y = band });
+        if (self.variant == .ring) {
+            for (1..band - 1) |y| {
+                for (1..band - 1) |x| try chunks.append(allocator, .{ .x = @intCast(x), .y = @intCast(y) });
+            }
+        }
+        return chunks.toOwnedSlice(allocator);
+    }
+};
+
+// Every cell of `chunks`, chunk by chunk in row-major order.
+// The chunks lie inside the level, so their cells fit `u16`.
+fn chunkCells(allocator: std.mem.Allocator, chunks: []const ChunkCoord, chunk_tiles: u16) ![]CellCoord {
+    const per_chunk = @as(usize, chunk_tiles) * chunk_tiles;
+    const cells = try allocator.alloc(CellCoord, chunks.len * per_chunk);
+    for (chunks, 0..) |chunk, chunk_index| {
+        for (0..per_chunk) |local| {
+            cells[chunk_index * per_chunk + local] = .{
+                .x = @intCast(@as(usize, chunk.x) * chunk_tiles + local % chunk_tiles),
+                .y = @intCast(@as(usize, chunk.y) * chunk_tiles + local / chunk_tiles),
+            };
+        }
+    }
+    return cells;
+}
+
+fn toggleSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize) suite.NavSizeConfig {
+    return .{
+        .side = side,
+        .levels = levels,
+        .links = links,
+        .participant_count = participant_count,
+        .agent_budget = toggle_agent_budget,
+        .group_fields = 1,
+        .long_results = 0,
+    };
+}
+
+// The split fixture on a walkable level: the structure's solid chunks written, no requests.
+fn initSplitFixture(allocator: std.mem.Allocator, io: std.Io, config: SplitConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+    var open = try buildOpenWorld(allocator, io, config.side, 1);
+    errdefer open.world.deinit();
+    if (config.spanChunks() * open.world.chunk_size_tiles > config.side) return error.ConnectivitySplitStructureTooLarge;
+    const solid_chunks = try config.solidChunks(allocator);
+    defer allocator.free(solid_chunks);
+    const solid = try chunkCells(allocator, solid_chunks, open.world.chunk_size_tiles);
+    defer allocator.free(solid);
+    try writeLevelZeroCells(&open, solid, open.blocking);
+    try checkSplitTopology(allocator, &open.world, config);
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try allocator.alloc(PathRequest, 0);
+    errdefer allocator.free(requests);
+    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+}
+
+const SplitFlood = struct {
+    // Open cells of the structure the flood reached.
+    visited: usize,
+    // Whether it reached an open cell outside the structure (and stopped there).
+    escaped: bool,
+};
+
+// Untimed: a 4-connected flood over level 0's open cells from the level origin, which lies
+// in the room or the ring, treating the gap chunk as blocking when `gap_blocked`. Stops at
+// the first open cell outside the structure. The corner rule lets a diagonal step only
+// through two open orthogonal cells, so 4-connected components equal the nav's.
+fn floodSplitStructure(allocator: std.mem.Allocator, world: *const WorldSystem, config: SplitConfig, gap_blocked: bool) !SplitFlood {
+    const chunk_tiles: usize = world.chunk_size_tiles;
+    const region = config.spanChunks() * chunk_tiles;
+    var visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, region * region);
+    defer visited.deinit(allocator);
+    var queue: std.ArrayList(CellCoord) = .empty;
+    defer queue.deinit(allocator);
+    const seed = CellCoord{ .x = 0, .y = 0 };
+    if (world.levelBlocksMovement(0, seed.x, seed.y)) return error.ConnectivitySplitSeedBlocked;
+    visited.set(0);
+    try queue.append(allocator, seed);
+    var read: usize = 0;
+    while (read < queue.items.len) : (read += 1) {
+        const cell = queue.items[read];
+        const x: i32 = cell.x;
+        const y: i32 = cell.y;
+        const steps = [4][2]i32{ .{ x + 1, y }, .{ x - 1, y }, .{ x, y + 1 }, .{ x, y - 1 } };
+        for (steps) |step| {
+            if (step[0] < 0 or step[1] < 0 or step[0] >= world.width or step[1] >= world.height) continue;
+            // In range: inside the level, whose sides fit `u16`.
+            const next = CellCoord{ .x = @intCast(step[0]), .y = @intCast(step[1]) };
+            if (world.levelBlocksMovement(0, next.x, next.y)) continue;
+            if (gap_blocked and config.inGapChunk(next, chunk_tiles)) continue;
+            if (next.x >= region or next.y >= region or !config.inStructure(next, chunk_tiles)) {
+                return .{ .visited = queue.items.len, .escaped = true };
+            }
+            const slot = @as(usize, next.y) * region + next.x;
+            if (visited.isSet(slot)) continue;
+            visited.set(slot);
+            try queue.append(allocator, next);
+        }
+    }
+    return .{ .visited = queue.items.len, .escaped = false };
+}
+
+// Fails unless the layout has the shape its variant claims. Room: with the gap blocked the
+// room's cells reach one another and nothing outside; with it open they reach outside. Ring:
+// with the gap blocked every other ring cell reaches every other and nothing outside.
+fn checkSplitTopology(allocator: std.mem.Allocator, world: *const WorldSystem, config: SplitConfig) !void {
+    const chunk_cells = @as(usize, world.chunk_size_tiles) * world.chunk_size_tiles;
+    const sealed = try floodSplitStructure(allocator, world, config, true);
+    switch (config.variant) {
+        .room => {
+            if (sealed.escaped) return error.ConnectivitySplitRoomNotSealed;
+            if (sealed.visited != config.structureChunks() * chunk_cells) return error.ConnectivitySplitRoomNotOneArea;
+            const opened = try floodSplitStructure(allocator, world, config, false);
+            if (!opened.escaped) return error.ConnectivitySplitRoomGapClosed;
+        },
+        .ring => {
+            if (sealed.escaped) return error.ConnectivitySplitRingNotEnclosed;
+            if (sealed.visited != (config.structureChunks() - 1) * chunk_cells) return error.ConnectivitySplitRingSplit;
+        },
+    }
+}
+
+fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const config = try SplitConfig.decode(item_count);
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = toggleSizeConfig(config.side, 1, 0, participant_count);
+    if (suite.navSizeSkip(connectivity_split_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var fixture = try initSplitFixture(allocator, io, config, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    const gap = try chunkCells(allocator, &.{config.gapChunk()}, fixture.open.world.chunk_size_tiles);
+    defer allocator.free(gap);
+    try fixture.changed.ensureTotalCapacity(allocator, gap.len);
+    setNavReactionTuners(&fixture.system, case);
+    configureNavUpdateThreads(&fixture.system, case);
+
+    var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr);
+    stats.output_count = gap.len;
+    stats.candidate_pairs = config.structureChunks();
+    return stats;
+}
+
+const OnewayVariant = enum(u8) {
+    // Many chains; the first chain's last room toggles.
+    locality,
+    // One chain; its last room toggles.
+    tail,
+    // One chain; its first room toggles.
+    head,
+    // One chain; a far level-0 cell outside every room toggles.
+    far_dig,
+};
+
+fn onewayItemCode(variant: OnewayVariant, terminals: usize, systems: usize) usize {
+    return @as(usize, @backingInt(variant)) * connectivity_variant_encoding + terminals * oneway_terminals_encoding + systems;
+}
+
+// One-way fixture: a `oneway_side`² world of `oneway_levels` levels, each level a 2-cell
+// lattice of blocking cells around one-cell rooms (its even cells). The toggled chain's end
+// group, its `oneway_site_rooms` rooms at the toggled end, takes the first room row of
+// level 0's chunk `oneway_site_chunk`; no other room of that chunk or its orthogonal
+// neighbours holds a link endpoint, so every config's toggle patches the same content. Every
+// other chain room takes the next free room level by level in snaking rows, so consecutive
+// rooms mostly lie 2 cells apart.
+const oneway_side: u16 = 256;
+const oneway_levels: u16 = 2;
+const oneway_rooms_per_row: usize = oneway_side / 2;
+const oneway_site_rooms: usize = 8;
+const oneway_site_chunk: ChunkCoord = .{ .x = 1, .y = 1 };
+
+comptime {
+    // The end group fits the first room row of one chunk.
+    std.debug.assert(2 * oneway_site_rooms <= default_chunk_size_tiles);
+}
+
+const OnewayRoom = struct {
+    level: u16,
+    cell: CellCoord,
+};
+
+// Whether a level-0 chunk is the site chunk or one of its orthogonal neighbours.
+fn inOnewaySite(level: u16, cell: CellCoord) bool {
+    if (level != 0) return false;
+    const chunk_x = cell.x / default_chunk_size_tiles;
+    const chunk_y = cell.y / default_chunk_size_tiles;
+    const dx = @abs(@as(i32, chunk_x) - oneway_site_chunk.x);
+    const dy = @abs(@as(i32, chunk_y) - oneway_site_chunk.y);
+    return dx + dy <= 1;
+}
+
+fn onewaySiteRoom(index: usize) OnewayRoom {
+    std.debug.assert(index < oneway_site_rooms);
+    // In range: the site chunk's first room row lies inside level 0.
+    return .{ .level = 0, .cell = .{
+        .x = @intCast(@as(usize, oneway_site_chunk.x) * default_chunk_size_tiles + 2 * index),
+        .y = oneway_site_chunk.y * default_chunk_size_tiles,
+    } };
+}
+
+// The rooms outside the site in fill order: level by level, snaking rows.
+fn onewayFreeRooms(allocator: std.mem.Allocator) ![]OnewayRoom {
+    var rooms: std.ArrayList(OnewayRoom) = .empty;
+    errdefer rooms.deinit(allocator);
+    for (0..oneway_levels) |level_index| {
+        for (0..oneway_rooms_per_row) |row| {
+            for (0..oneway_rooms_per_row) |step| {
+                const column = if (row % 2 == 0) step else oneway_rooms_per_row - 1 - step;
+                // In range: rows and columns of rooms inside the `oneway_side`² levels.
+                const room = OnewayRoom{ .level = @intCast(level_index), .cell = .{ .x = @intCast(2 * column), .y = @intCast(2 * row) } };
+                if (inOnewaySite(room.level, room.cell)) continue;
+                try rooms.append(allocator, room);
+            }
+        }
+    }
+    return rooms.toOwnedSlice(allocator);
+}
+
+const OnewayConfig = struct {
+    variant: OnewayVariant,
+    terminals: usize,
+    systems: usize,
+
+    fn decode(item_count: usize) !OnewayConfig {
+        const variant_index = item_count / connectivity_variant_encoding;
+        const terminals = item_count % connectivity_variant_encoding / oneway_terminals_encoding;
+        const systems = item_count % oneway_terminals_encoding;
+        if (variant_index > @backingInt(OnewayVariant.far_dig)) return error.ConnectivityOnewayUnknownVariant;
+        const variant: OnewayVariant = @fromBackingInt(@as(u8, @intCast(variant_index)));
+        if (terminals < oneway_site_rooms or systems == 0) return error.ConnectivityOnewayChainTooShort;
+        if (variant != .locality and systems != 1) return error.ConnectivityOnewayOneChainOnly;
+        return .{ .variant = variant, .terminals = terminals, .systems = systems };
+    }
+
+    fn rooms(self: OnewayConfig) usize {
+        return self.terminals * self.systems;
+    }
+
+    fn links(self: OnewayConfig) usize {
+        return (self.terminals - 1) * self.systems;
+    }
+
+    // Chain 0's room `index`: its end group in the site (the first rooms for the head
+    // variant, else the last), its other rooms the next free rooms.
+    fn firstChainSiteIndex(self: OnewayConfig, index: usize) ?usize {
+        const site_start = if (self.variant == .head) 0 else self.terminals - oneway_site_rooms;
+        if (index < site_start or index >= site_start + oneway_site_rooms) return null;
+        return index - site_start;
+    }
+
+    // The toggled level-0 cell: chain 0's first room (head), its last room (locality,
+    // tail), or a far room in a corner chunk no chain room reaches (far dig).
+    fn toggleCell(self: OnewayConfig) CellCoord {
+        return switch (self.variant) {
+            .locality, .tail => onewaySiteRoom(oneway_site_rooms - 1).cell,
+            .head => onewaySiteRoom(0).cell,
+            .far_dig => pocketDigCell(oneway_side),
+        };
+    }
+};
+
+// Every cell of one level with an odd coordinate: the lattice walls.
+fn onewayWallCells(allocator: std.mem.Allocator) ![]CellCoord {
+    var walls: std.ArrayList(CellCoord) = .empty;
+    errdefer walls.deinit(allocator);
+    for (0..oneway_side) |y| {
+        for (0..oneway_side) |x| {
+            if (x % 2 == 0 and y % 2 == 0) continue;
+            // Inside the `oneway_side`² level.
+            try walls.append(allocator, .{ .x = @intCast(x), .y = @intCast(y) });
+        }
+    }
+    return walls.toOwnedSlice(allocator);
+}
+
+// Fails when `room` lies in the far toggle's chunk or an orthogonal neighbour of it.
+fn checkOnewayFarRoom(room: OnewayRoom) !void {
+    if (room.level != 0) return;
+    const far = pocketDigCell(oneway_side);
+    const dx = @abs(@as(i32, room.cell.x / default_chunk_size_tiles) - far.x / default_chunk_size_tiles);
+    const dy = @abs(@as(i32, room.cell.y / default_chunk_size_tiles) - far.y / default_chunk_size_tiles);
+    if (dx + dy <= 1) return error.ConnectivityOnewayChainReachesFarRoom;
+}
+
+fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+    var open = try buildOpenWorld(allocator, io, oneway_side, oneway_levels);
+    errdefer open.world.deinit();
+    std.debug.assert(open.world.chunk_size_tiles == default_chunk_size_tiles);
+    {
+        const walls = try onewayWallCells(allocator);
+        defer allocator.free(walls);
+        for (0..oneway_levels) |level_index| try writeLevelCells(&open, @intCast(level_index), walls, open.blocking);
+    }
+    const free_rooms = try onewayFreeRooms(allocator);
+    defer allocator.free(free_rooms);
+    if (config.rooms() - oneway_site_rooms > free_rooms.len) return error.ConnectivityOnewayRoomsTooFew;
+    var next_free: usize = 0;
+    for (0..config.systems) |system_index| {
+        var previous: ?OnewayRoom = null;
+        // Chain 0's index at the toggled end: its first link's source for head, else its
+        // last link's target.
+        const toggle_index = if (config.variant == .head) 0 else config.terminals - 1;
+        for (0..config.terminals) |index| {
+            const site_index = if (system_index == 0) config.firstChainSiteIndex(index) else null;
+            const room = if (site_index) |site| onewaySiteRoom(site) else free: {
+                defer next_free += 1;
+                break :free free_rooms[next_free];
+            };
+            if (config.variant == .far_dig) try checkOnewayFarRoom(room);
+            if (system_index == 0 and index == toggle_index and config.variant != .far_dig) {
+                const toggle_cell = config.toggleCell();
+                if (room.level != 0 or room.cell.x != toggle_cell.x or room.cell.y != toggle_cell.y) return error.ConnectivityOnewayToggleNotChainEnd;
+            }
+            if (previous) |from| {
+                try open.world.addLevelLink(.{
+                    .kind = .teleport,
+                    .level_a = from.level,
+                    .cell_a = from.cell,
+                    .level_b = room.level,
+                    .cell_b = room.cell,
+                    .traversal_cost = 1,
+                    .bidirectional = false,
+                });
+            }
+            previous = room;
+        }
+    }
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try allocator.alloc(PathRequest, 0);
+    errdefer allocator.free(requests);
+    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+}
+
+fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const config = try OnewayConfig.decode(item_count);
+    const toggle_cell = config.toggleCell();
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = toggleSizeConfig(oneway_side, oneway_levels, config.links(), participant_count);
+    if (suite.navSizeSkip(connectivity_oneway_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var fixture = try initOnewayFixture(allocator, io, config, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    try fixture.changed.ensureTotalCapacity(allocator, 1);
+    setNavReactionTuners(&fixture.system, case);
+    configureNavUpdateThreads(&fixture.system, case);
+
+    var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, &.{toggle_cell}, thread_ptr);
+    stats.output_count = config.links();
+    stats.candidate_pairs = config.rooms();
     return stats;
 }
 
