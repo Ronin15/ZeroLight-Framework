@@ -50,7 +50,7 @@ touch. Follow them and cite them by file; never restate them.
 ## Report
 
 After folding review fixes, report to the main session for verification; a
-second review round is not the next step (`CLAUDE.md` § Agent Pipeline). An
+second review round is not the next step (one review per landing). An
 explanation of a bench result is a hypothesis unless a measurement tests it;
 say which, and never write an untested explanation into a bench's pass
 condition or comment. Run long jobs in the foreground or poll for a done

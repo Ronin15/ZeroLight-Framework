@@ -54,8 +54,7 @@ Every design, and every fix touching storage or per-change work, states:
 - Each order marked measured (bench group) or derived; a derived number is
   never presented as measured. The implementation's scaling benches measure
   each hot-path order at the worst-case shape each bound names (thin, long,
-  deep, dense), not only typical fixtures (`tests-benchmarks.md`); a missed
-  order returns to design.
+  deep, dense), not only typical fixtures (`tests-benchmarks.md`).
 - Start from the engine's proven patterns (the stage pattern, chunk-owned
   work, existing kernels and dispatch shapes), cited by `file:line`; new
   machinery needs a measured reason they cannot serve.

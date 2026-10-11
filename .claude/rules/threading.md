@@ -73,9 +73,8 @@ paths:
   never static item-count floors.
 - A tuner judges its stage's median dispatch against the gate, never the step
   total, so many small dispatches keep a large step inline. A step's work
-  reaches its tuner as one dispatch or as similar-sized rounds; each design
-  states dispatches per step, items per dispatch, and per-item cost at each
-  bench size. The adaptive bench case shows the stage on workers where its
-  step total exceeds the gate.
+  reaches its tuner as one sample: one dispatch, or rounds under one selected
+  profile recorded once; each design states dispatches per step, items per
+  dispatch, and per-item cost at each bench size.
 - Bench and diagnostic output reports inline stages as `inline`, never as a
   zero-worker range size.
