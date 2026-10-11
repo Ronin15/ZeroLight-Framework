@@ -52,7 +52,9 @@ paths:
   order or a material total; a nanosecond-per-item constant is reported, not
   redesigned. A constant is material when it moves the stage's total beyond
   the run-to-run spread at the bench's sizes; a few ns per item on a stage
-  dominated by other work is not.
+  dominated by other work is not. A threaded stage is judged on its
+  adaptive-tuned case, against its base and against the best fixed case in
+  the same tree; the fixed cases are reference shapes only.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
