@@ -24,6 +24,8 @@ const PathQueryKey = @import("../game/systems/pathfinding/types.zig").PathQueryK
 const cached_results_per_agent = @import("../game/systems/pathfinding/types.zig").cached_results_per_agent;
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const intake_range_alignment_items = @import("../game/systems/pathfinding/types.zig").intake_range_alignment_items;
+const evict_range_alignment_items = @import("../game/systems/pathfinding/types.zig").evict_range_alignment_items;
+const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 const AiDir = @import("../game/systems/ai.zig").AiDir;
 const computeRequantizedGoal = @import("../game/systems/ai.zig").computeRequantizedGoal;
 const default_goal_requantization_hysteresis_distance = @import("../game/systems/ai.zig").default_goal_requantization_hysteresis_distance;
@@ -234,6 +236,8 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 // reopens the cell and re-solves the evicted results. A region config (item count
 // region chunks * 10^7 + cached results) instead fills a chunk-aligned square of that
 // many chunks in one step, crossing the routes of its rows: the dense-change reaction.
+// Items/s is the path-registry entries the eviction visited per second. `--details` prints
+// the eviction stages' shapes, the reaction's main-thread time, and the entries visited.
 pub const evict_group = suite.BenchmarkGroup{
     .name = "pathfinding-evict",
     .defaultItemCounts = evictItemCounts,
@@ -273,9 +277,10 @@ pub const elastic_ramp_group = suite.BenchmarkGroup{
 // untimed, then a drop to the last-added eighth, whose results are the youngest and stay
 // cached, held until the shrink window elapses. Times the step whose update shrinks the
 // capacity, result cache included; that step and the hold step before it serve only cache
-// hits. `outputs` is the cached results kept, `candidates` those moved to a lower payload
-// index, `evictions` those evicted. `--details` adds the hold step's time and the
-// difference, the resize, with the cache and agent capacities before and after.
+// hits. `outputs` is the cached results kept, `candidates` those moved to a lower owner id,
+// `evictions` those evicted. `--details` adds the hold step's time and the difference, the
+// resize, split into its worker-side copy and the rest on the main thread, with the cache
+// and agent capacities before and after.
 pub const elastic_shrink_group = suite.BenchmarkGroup{
     .name = "pathfinding-elastic-shrink",
     .defaultItemCounts = elasticRampItemCounts,
@@ -851,14 +856,22 @@ fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) voi
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_tuner = tuner;
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_begin_tuner = tuner;
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_stall_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.publish_copy_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.registry_flush_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.resize_copy_tuner = tuner;
 }
+
+// An update's stage batches, in `StageReport` order.
+fn updateBatches(stats: PathfindingStats) [update_stage_count]BatchStats {
+    return .{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.fallback_batch, stats.publish_copy_batch, stats.registry_flush_batch, stats.resize_copy_batch };
+}
+
+const update_stage_count = 7;
 
 // Worker-side time of an update's threaded stages; stages that ran inline add nothing.
 fn offMainStageNs(stats: PathfindingStats) u64 {
     var total: u64 = 0;
-    for ([_]BatchStats{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.fallback_batch }) |batch| {
-        total += offMainNs(batch);
-    }
+    for (updateBatches(stats)) |batch| total += offMainNs(batch);
     return total;
 }
 
@@ -878,13 +891,17 @@ const StageReport = struct {
     group_main_ns: u128 = 0,
     solve_main_ns: u128 = 0,
     publish_ns: u128 = 0,
-    // Intake, group-field advance, group-field begin, solve: each stage's busiest
-    // batch, and how many of its non-empty batches ran on workers.
-    busiest: [4]BatchStats = @splat(.{}),
-    threaded: [4]usize = @splat(0),
-    dispatched: [4]usize = @splat(0),
+    // Intake, group-field advance, group-field begin, solve, publish copy, registry flush,
+    // resize copy: each stage's busiest batch, and how many of its non-empty batches ran on
+    // workers.
+    busiest: [update_stage_count]BatchStats = @splat(.{}),
+    threaded: [update_stage_count]usize = @splat(0),
+    dispatched: [update_stage_count]usize = @splat(0),
     // Route groups that count unsolved routes: the last timed step's outcome.
     routes: ?RouteOutcome = null,
+    // Path-registry entries the timed updates added and removed.
+    registrations_added: usize = 0,
+    registrations_removed: usize = 0,
 
     fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
         self.samples += 1;
@@ -893,9 +910,10 @@ const StageReport = struct {
         self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
         self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.group_field_batch) + offMainNs(stats.group_field_begin_batch));
         self.solve_main_ns += stats.solve_ns -| offMainNs(stats.fallback_batch);
-        self.publish_ns += stats.publish_ns;
-        const batches = [_]BatchStats{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.fallback_batch };
-        for (batches, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
+        self.publish_ns += stats.publish_ns -| offMainNs(stats.publish_copy_batch);
+        self.registrations_added += stats.registrations_added;
+        self.registrations_removed += stats.registrations_removed;
+        for (updateBatches(stats), &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
             if (batch.item_count == 0) continue;
             dispatched.* += 1;
             const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
@@ -908,13 +926,13 @@ const StageReport = struct {
 
     fn print(self: StageReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.timed_ns == 0) return;
-        var shapes: [4][48]u8 = undefined;
-        var labels: [4][]const u8 = undefined;
+        var shapes: [update_stage_count][48]u8 = undefined;
+        var labels: [update_stage_count][]const u8 = undefined;
         for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
             label.* = stageShape(buffer, batch, threaded, dispatched);
         }
         const samples: u128 = self.samples * std.time.ns_per_us;
-        std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
+        std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
             group_name,
             item_count,
             case.name,
@@ -922,6 +940,9 @@ const StageReport = struct {
             labels[1],
             labels[2],
             labels[3],
+            labels[4],
+            labels[5],
+            labels[6],
             @as(u64, @intCast(self.main_ns / self.samples / std.time.ns_per_us)),
             @as(u64, @intCast(self.main_ns * 100 / self.timed_ns)),
             @as(u64, @intCast(self.accept_main_ns / samples)),
@@ -930,6 +951,7 @@ const StageReport = struct {
             @as(u64, @intCast(self.publish_ns / samples)),
         });
         if (self.routes) |routes| std.debug.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
+        std.debug.print(" registrations +{}/-{} per update", .{ self.registrations_added / self.samples, self.registrations_removed / self.samples });
         std.debug.print("\n", .{});
     }
 };
@@ -1052,7 +1074,7 @@ pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
                 const result = system.completed.resultAt(slot);
                 if (result.stitched_len != 0) {
                     const stitched = system.completed.stitchedSlice(slot, result.stitched_len);
-                    starts[i] = grid.cellCenter(stitched[stitched.len / 2].cell);
+                    starts[i] = grid.cellCenter(stitched.cells[stitched.len() / 2]);
                     warm_paths += 1;
                 } else {
                     const path = system.completed.pathSlice(slot, result.path_len);
@@ -2234,9 +2256,9 @@ const EvictFixture = struct {
     }
 
     // Sets `cells` on level 0 to `tile` in one step (untimed) and runs the nav reaction
-    // over them, marking included; returns the reaction's time. `changed` holds
+    // over them, marking included; returns the reaction's time and stats. `changed` holds
     // `cells.len` entries.
-    fn changeAndReact(self: *EvictFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !u64 {
+    fn changeAndReact(self: *EvictFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
         const layer = OpenWorld.floor(0);
         self.changed.clearRetainingCapacity();
         self.open.world.beginDenseCellWriteReserve();
@@ -2249,10 +2271,65 @@ const EvictFixture = struct {
         const version_before = self.system.graph.version;
         const start_ns = suite.nowNs(io);
         for (self.changed.items) |edit| try self.system.markNavDirty(edit.level, edit.x, edit.y);
-        _ = try self.system.applyBufferedNavUpdates(&self.colliders, &self.open.world, thread_system);
+        const stats = try self.system.applyBufferedNavUpdates(&self.colliders, &self.open.world, thread_system);
         const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (self.system.graph.version != version_before) return error.EvictDigRebuiltNav;
-        return elapsed;
+        return .{ .elapsed_ns = elapsed, .stats = stats };
+    }
+};
+
+const EvictReaction = struct {
+    elapsed_ns: u64,
+    stats: NavUpdateStats,
+};
+
+// The timed reactions' eviction stage shapes and main-thread share, printed under
+// --details: each stage's busiest batch, and the reaction minus its worker-side time.
+const EvictReport = struct {
+    samples: usize = 0,
+    timed_ns: u128 = 0,
+    main_ns: u128 = 0,
+    busiest: [3]BatchStats = @splat(.{}),
+    threaded: [3]usize = @splat(0),
+    dispatched: [3]usize = @splat(0),
+    visited: usize = 0,
+    evicted: usize = 0,
+
+    fn add(self: *EvictReport, reaction: EvictReaction) void {
+        self.samples += 1;
+        self.timed_ns += reaction.elapsed_ns;
+        self.main_ns += reaction.elapsed_ns -| reaction.stats.off_main_stage_ns;
+        self.visited = reaction.stats.evict_entries_visited;
+        self.evicted = reaction.stats.evicted_results;
+        const batches = [_]BatchStats{ reaction.stats.evict_count_batch, reaction.stats.evict_batch, reaction.stats.evict_flush_batch };
+        for (batches, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
+            if (batch.item_count == 0) continue;
+            dispatched.* += 1;
+            const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
+            if (on_workers) threaded.* += 1;
+            if (batch.item_count >= busiest.item_count) busiest.* = batch;
+        }
+    }
+
+    fn print(self: EvictReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
+        if (!options.details or self.timed_ns == 0) return;
+        var shapes: [3][48]u8 = undefined;
+        var labels: [3][]const u8 = undefined;
+        for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
+            label.* = stageShape(buffer, batch, threaded, dispatched);
+        }
+        std.debug.print("  {s} {} {s}: evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}\n", .{
+            evict_group.name,
+            item_count,
+            case.name,
+            labels[0],
+            labels[1],
+            labels[2],
+            @as(u64, @intCast(self.main_ns / self.samples / std.time.ns_per_us)),
+            @as(u64, @intCast(self.main_ns * 100 / self.timed_ns)),
+            self.visited,
+            self.evicted,
+        });
     }
 };
 
@@ -2325,6 +2402,9 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         fixture.system.nav_remask_tuner = tuner;
         fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
         fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        fixture.system.nav_evict_count_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
+        fixture.system.nav_evict_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
+        fixture.system.evict_flush_tuner = suite.adaptiveTunerForCase(case, 1).?;
     }
     configureNavUpdateThreads(&fixture.system, case);
     try fixture.fillCache(case, thread_ptr);
@@ -2335,22 +2415,27 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         try fixture.fillCache(case, thread_ptr);
     }
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var report = EvictReport{};
     var evicted: usize = 0;
     for (0..options.iterations) |_| {
-        const elapsed = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
+        const reaction = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         evicted = result_count - fixture.cachedCount();
-        accumulator.record(elapsed, fixture.system.graph.last_remask_batch);
+        // The reaction evicted exactly the results the cache lost.
+        if (reaction.stats.evicted_results != evicted) return error.EvictCountMismatch;
+        accumulator.record(reaction.elapsed_ns, fixture.system.graph.last_remask_batch);
+        report.add(reaction);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
     }
+    report.print(options, item_count, case);
     // The size config charges no long block.
     if (fixture.system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
     var stats = accumulator.finish();
     stats.output_count = evicted;
     stats.cache_evictions = evicted;
     stats.candidate_pairs = result_count;
-    // Cached results the reaction's eviction scanned per second.
-    stats.items_per_second = suite.itemsPerSecond(result_count, stats.mean_ns);
+    // Registry entries the reaction's eviction visited per second.
+    stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
     return stats;
@@ -2683,17 +2768,19 @@ fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSys
 // The elastic-shrink drop keeps this fraction of the ramped agents.
 const elastic_shrink_divisor: usize = 8;
 
-// A cached result's key and payload index, read before the shrink step to count the
-// results it moved.
+// A cached result's key and owner id, read before the shrink step to count the results it
+// moved.
 const CachedPayload = struct {
     key: PathQueryKey,
-    payload_index: u32,
+    owner: u32,
 };
 
 const ElasticShrink = struct {
     // The shrink step and the hold step before it.
     step_ns: u64 = 0,
     hold_ns: u64 = 0,
+    // The shrink step's resize copy on workers; zero when it ran inline.
+    copy_ns: u64 = 0,
     step_stats: PathfindingStats = .{},
     agent_capacity_before: usize = 0,
     agent_capacity_after: usize = 0,
@@ -2709,20 +2796,23 @@ const ShrinkReport = struct {
     samples: usize = 0,
     step_ns: u128 = 0,
     hold_ns: u128 = 0,
+    copy_ns: u128 = 0,
     last: ElasticShrink = .{},
 
     fn add(self: *ShrinkReport, shrink: ElasticShrink) void {
         self.samples += 1;
         self.step_ns += shrink.step_ns;
         self.hold_ns += shrink.hold_ns;
+        self.copy_ns += shrink.copy_ns;
         self.last = shrink;
     }
 
     fn print(self: ShrinkReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.samples == 0 or self.step_ns == 0) return;
         const resize_ns = self.step_ns -| self.hold_ns;
+        const resize_main_ns = resize_ns -| self.copy_ns;
         const samples: u128 = self.samples * std.time.ns_per_us;
-        std.debug.print("  {s} {} {s}: agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step)\n", .{
+        std.debug.print("  {s} {} {s}: agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step) copy={}us resize_main={}us\n", .{
             group_name,
             item_count,
             case.name,
@@ -2737,6 +2827,8 @@ const ShrinkReport = struct {
             @as(u64, @intCast(self.hold_ns / samples)),
             @as(u64, @intCast(resize_ns / samples)),
             @as(u64, @intCast(resize_ns * 100 / self.step_ns)),
+            @as(u64, @intCast(self.copy_ns / samples)),
+            @as(u64, @intCast(resize_main_ns / samples)),
         });
     }
 };
@@ -2822,7 +2914,7 @@ fn runElasticShrink(
 
     var shrink = ElasticShrink{
         .agent_capacity_before = system.effective_agent_capacity,
-        .cache_capacity_before = system.completed.logical_capacity,
+        .cache_capacity_before = system.completed.logicalCapacity(),
     };
     const hold_start_ns = suite.nowNs(io);
     _ = try runHeldStep(system, stream, thread_system, case, held.len);
@@ -2830,26 +2922,34 @@ fn runElasticShrink(
     if (system.effective_agent_capacity != shrink.agent_capacity_before) return error.ElasticShrinkEarly;
 
     cached.clearRetainingCapacity();
-    try cached.ensureTotalCapacity(allocator, system.completed.len);
-    for (system.completed.slots.items) |slot| {
-        if (slot.occupied) cached.appendAssumeCapacity(.{ .key = slot.key, .payload_index = slot.payload_index });
+    try cached.ensureTotalCapacity(allocator, system.completed.count());
+    for (system.completed.core.records.items, 0..) |record, owner| {
+        if (record.live) cached.appendAssumeCapacity(.{ .key = system.completed.core.keyOf(@intCast(owner)), .owner = @intCast(owner) });
     }
     const step_start_ns = suite.nowNs(io);
     shrink.step_stats = try runHeldStep(system, stream, thread_system, case, held.len);
     shrink.step_ns = suite.elapsedNs(step_start_ns, suite.nowNs(io));
+    shrink.copy_ns = offMainNs(shrink.step_stats.resize_copy_batch);
     shrink.agent_capacity_after = system.effective_agent_capacity;
-    shrink.cache_capacity_after = system.completed.logical_capacity;
+    shrink.cache_capacity_after = system.completed.logicalCapacity();
     if (shrink.agent_capacity_after >= shrink.agent_capacity_before) return error.ElasticShrinkDidNotShrink;
     if (shrink.cache_capacity_after >= shrink.cache_capacity_before) return error.ElasticShrinkCacheDidNotShrink;
+    // The step finished the whole shrink: copies done and pages freed, owner ops flushed,
+    // and registry owner heads cut to the new capacity.
+    if (system.completed.pendingMoves().len != 0 or system.completed.inline_pages.items.len != system.completed.inline_page_count) return error.ElasticShrinkPagesPending;
+    if (system.completed.core.ownerLog().len != 0) return error.ElasticShrinkOpsPending;
+    for (&system.path_index) |*shard| {
+        if (shard.owner_heads.items.len > shrink.cache_capacity_after) return error.ElasticShrinkOwnerHeadsPending;
+    }
 
-    // A shrink keeps an entry's key and moves it only to another payload index.
-    shrink.kept = system.completed.len;
+    // A shrink keeps an entry's key and moves it only to another owner id.
+    shrink.kept = system.completed.count();
     // The shrink evicts only what no longer fits.
     if (shrink.kept != @min(cached.items.len, shrink.cache_capacity_after)) return error.ElasticShrinkEvictedWrongCount;
     shrink.evicted = cached.items.len - shrink.kept;
     for (cached.items) |entry| {
-        const slot = system.completed.slotIndex(entry.key) orelse continue;
-        if (system.completed.slots.items[slot].payload_index != entry.payload_index) shrink.moved += 1;
+        const owner = system.completed.core.ownerOf(entry.key) orelse continue;
+        if (owner != entry.owner) shrink.moved += 1;
     }
     return shrink;
 }

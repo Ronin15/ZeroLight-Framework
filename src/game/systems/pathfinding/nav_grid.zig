@@ -83,6 +83,46 @@ pub const allowed_moves: [512]u8 = blk: {
     break :blk table;
 };
 
+/// The cells of a chunk within one cell (8-neighbour) of a changed cell: `around[(dy + 1) *
+/// 3 + (dx + 1)]` holds the changed bits of the chunk at offset (dx, dy) from it (zero when
+/// absent or out of the level), every chunk `edge` cells a side in chunk-local row-major
+/// bits. Out-of-level bits of the result may be set.
+// SIMD verdict: word-parallel scalar. Each row of at most 16 cells dilates as one padded
+// word (shifts and ORs); no per-cell loop is left to vectorize.
+pub fn dilateChanged3x3(edge: u16, around: *const [9]ChunkBits) ChunkBits {
+    // An edge of at most 16 keeps a padded row within 18 bits and every shift below 64.
+    std.debug.assert(edge >= 1 and edge <= world_terrain.max_chunk_edge and std.math.isPowerOfTwo(edge));
+    const cells: usize = edge;
+    // Padded rows y = -1 .. edge at index y + 1: bit 0 is x = -1, bit edge + 1 is x = edge.
+    var padded: [world_terrain.max_chunk_edge + 2]u32 = @splat(0);
+    for (padded[0 .. cells + 2], 0..) |*row, index| {
+        const band: usize = if (index == 0) 0 else if (index == cells + 1) 2 else 1;
+        const source_row = if (index == 0) cells - 1 else if (index == cells + 1) 0 else index - 1;
+        const west = chunkRow(&around[band * 3], cells, source_row);
+        const center = chunkRow(&around[band * 3 + 1], cells, source_row);
+        const east = chunkRow(&around[band * 3 + 2], cells, source_row);
+        row.* = (center << 1) | ((west >> @intCast(cells - 1)) & 1) | ((east & 1) << @intCast(cells + 1));
+    }
+    const row_mask: u32 = (@as(u32, 1) << @intCast(cells)) - 1;
+    var dilated: ChunkBits = @splat(0);
+    for (0..cells) |y| {
+        const vertical = padded[y] | padded[y + 1] | padded[y + 2];
+        const both = vertical | (vertical << 1) | (vertical >> 1);
+        const local = y * cells;
+        dilated[local / 64] |= @as(u64, (both >> 1) & row_mask) << @intCast(local % 64);
+    }
+    return dilated;
+}
+
+// Row `row` of `edge`-cell chunk bits. A row never straddles a word: 64 is a multiple of
+// every chunk edge.
+fn chunkRow(bits: *const ChunkBits, edge: usize, row: usize) u32 {
+    // At most 16 bits; shifts stay below 64.
+    const local = row * edge;
+    const mask: u64 = (@as(u64, 1) << @intCast(edge)) - 1;
+    return @intCast((bits[local / 64] >> @intCast(local % 64)) & mask);
+}
+
 pub const NavGrid = struct {
     // Nav cells for ONE level (Z-floor). All levels of a graph share the dimensions,
     // cell_size, and chunk_tiles, so chunk ids and cell indices agree across levels.
@@ -209,6 +249,20 @@ pub const NavGrid = struct {
     fn chunkCellCount(self: *const NavGrid, chunk: u32) u32 {
         const b = self.chunkBounds(chunk);
         return @intCast((b.x1 - b.x0) * (b.y1 - b.y0));
+    }
+
+    /// `chunk`'s blocked bits as stored: none for an OPEN chunk, its in-level cells for a
+    /// BLOCKED one, its block's bits for a MIXED one. O(1); never writes.
+    pub fn chunkBlockedBits(self: *const NavGrid, chunk: u32) ChunkBits {
+        return switch (self.dir.items[chunk]) {
+            open_entry => @splat(0),
+            blocked_entry => blocked: {
+                // A chunk's in-level extent is at most its edge of 16 cells.
+                const b = self.chunkBounds(chunk);
+                break :blocked world_terrain.inLevelMask(self.edgeGeometry(), .{ .min_x = 0, .min_y = 0, .cols = @intCast(b.x1 - b.x0), .rows = @intCast(b.y1 - b.y0) });
+            },
+            else => |slot| self.block_bits[slot],
+        };
     }
 
     /// Composes `chunk`'s blocked bits: the world's composed bits for this level (null
@@ -990,6 +1044,54 @@ test "word-parallel projection returns the same cell as the per-cell ring scan" 
                 for ([_]i32{ 0, 1, 3, 16 }) |radius| {
                     try std.testing.expectEqual(projectReference(grid, .{ .x = x, .y = y }, radius), grid.projectToNearestOpen(.{ .x = x, .y = y }, radius));
                 }
+            }
+        }
+    }
+}
+
+// Whether cell (x, y) of the 3x3 chunk neighbourhood, in coordinates -edge .. 2 * edge, is
+// set in its chunk's bits.
+fn aroundBit(around: *const [9]ChunkBits, edge: usize, x: isize, y: isize) bool {
+    const span: isize = @intCast(edge);
+    if (x < -span or y < -span or x >= 2 * span or y >= 2 * span) return false;
+    const chunk_x: usize = @intCast(@divFloor(x, span) + 1);
+    const chunk_y: usize = @intCast(@divFloor(y, span) + 1);
+    const local: usize = @intCast(@mod(y, span) * span + @mod(x, span));
+    return testBit(&around[chunk_y * 3 + chunk_x], local);
+}
+
+test "the dilated changed mask equals the per-cell 3x3 reference across chunk edges and corners at chunk edges 4, 8, 16" {
+    var prng = std.Random.DefaultPrng.init(0xd11a7e);
+    const random = prng.random();
+    for ([_]u16{ 4, 8, 16 }) |edge| {
+        const cells: usize = edge;
+        for (0..40) |round| {
+            var around: [9]ChunkBits = undefined;
+            for (&around) |*bits| {
+                bits.* = @splat(0);
+                // Sparse changes, so cells far from every change stay clear.
+                for (0..cells * cells) |local| {
+                    if (random.uintLessThan(u32, 24) == 0) bits[local / 64] |= @as(u64, 1) << @intCast(local % 64);
+                }
+            }
+            if (round == 0) {
+                // Only the diagonal neighbours' corner cells changed.
+                for (&around) |*bits| bits.* = @splat(0);
+                const last = cells * cells - 1;
+                around[0][last / 64] |= @as(u64, 1) << @intCast(last % 64);
+                around[8][0] |= 1;
+            }
+            const dilated = dilateChanged3x3(edge, &around);
+            for (0..cells) |y| for (0..cells) |x| {
+                var expected = false;
+                for ([_]isize{ -1, 0, 1 }) |dy| for ([_]isize{ -1, 0, 1 }) |dx| {
+                    if (aroundBit(&around, cells, @as(isize, @intCast(x)) + dx, @as(isize, @intCast(y)) + dy)) expected = true;
+                };
+                try std.testing.expectEqual(expected, testBit(&dilated, y * cells + x));
+            };
+            if (round == 0) {
+                // The corners reach exactly the center chunk's two corner cells.
+                try std.testing.expect(testBit(&dilated, 0) and testBit(&dilated, cells * cells - 1));
             }
         }
     }

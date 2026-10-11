@@ -27,6 +27,7 @@ const JobFn = @import("../../../app/thread_system.zig").JobFn;
 const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
+const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
 const no_block = @import("nav_grid.zig").no_block;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
 const ColliderGeometry = @import("../static_colliders.zig").ColliderGeometry;
@@ -44,7 +45,6 @@ const octileU32 = types.octileU32;
 const PathQueryKey = types.PathQueryKey;
 const NavMark = types.NavMark;
 const NavSpan = types.NavSpan;
-const ChangedSpan = types.ChangedSpan;
 const NavUpdateStats = types.NavUpdateStats;
 const setLen = types.setLen;
 
@@ -500,7 +500,8 @@ const BatchLevels = struct {
 
 // One range of the remask stage: each key composes its own chunk's cells from the world and
 // the colliders listed there, writes them (and its labels) into its own directory entry and
-// claimed block, and adds its new blocked count to its item's delta.
+// claimed block, adds its new blocked count to its item's delta, and, for a marks batch,
+// writes the cells that changed (old XOR new bits) into its item's mask.
 const RemaskJob = struct {
     levels: BatchLevels,
     colliders: ColliderView,
@@ -508,18 +509,26 @@ const RemaskJob = struct {
     keys: []const u64,
     slots: []const u32,
     deltas: []i32,
+    masks: ?[]ChunkBits,
     range_count: usize = 0,
 };
 
+// SIMD verdict: word-parallel scalar. The changed mask is four u64 XORs per chunk.
 fn remaskJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *RemaskJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.keys.len and range.end <= job.slots.len and range.end <= job.deltas.len);
+    if (job.masks) |masks| std.debug.assert(range.end <= masks.len);
     for (range.start..range.end) |item| {
         const key = job.keys[item];
         const grid = job.levels.grid(keyLevel(key));
         const bits = grid.composeChunk(keyChunk(key), job.world, job.colliders);
+        // The old bits are read before the write, which may reuse the chunk's block.
+        if (job.masks) |masks| {
+            const old = grid.chunkBlockedBits(keyChunk(key));
+            for (&masks[item], old, bits) |*changed, before, after| changed.* = before ^ after;
+        }
         // A chunk holds at most max_chunk_size_tiles^2 cells.
         job.deltas[item] += @intCast(grid.writeChunk(keyChunk(key), job.slots[item], bits));
     }
@@ -602,8 +611,11 @@ pub const NavBatchResult = struct {
     /// Sorted and deduped: the chunks the marks changed plus both endpoint chunks of each
     /// link the batch applied.
     dirty_keys: []const u64,
-    /// Each mark's changed cell span with a one-cell halo, and each applied link's endpoints.
-    spans: []const ChangedSpan,
+    /// Sorted and deduped: the chunks the marks remasked.
+    changed_keys: []const u64,
+    /// Per changed key, its cells whose blocking the batch flipped (old XOR new bits);
+    /// a link changes no cell.
+    changed_masks: []const ChunkBits,
 };
 
 /// What a nav build covers.
@@ -869,9 +881,10 @@ pub const NavGraph = struct {
     link_bounds: LinkBounds = .{},
     // The world-wide content revision every level was last checked against.
     built_world_revision: u32 = 0,
-    // Batch buffers, reused across batches. `batch_spans` is the last marks batch's changed
-    // cell spans plus a one-cell halo and its new link endpoints, valid until the next batch.
+    // Batch buffers, reused across batches. `changed_masks` holds, per changed key of the
+    // last marks batch, the cells it flipped, valid until the next batch.
     changed_keys: KeyList = .empty,
+    changed_masks: std.ArrayList(ChunkBits) = .empty,
     // Per changed key: the block slot its remask may fill (`no_block` when it can only end
     // uniform) and its blocked-count delta.
     remask_slots: std.ArrayList(u32) = .empty,
@@ -886,7 +899,6 @@ pub const NavGraph = struct {
     plan_tallies: std.ArrayListAligned(PlanTally, .fromByteUnits(thread_shared_record_alignment)) = .empty,
     merge_heap: std.ArrayList(MergeHead) = .empty,
     patch_info: std.ArrayList(PatchInfo) = .empty,
-    batch_spans: std.ArrayList(ChangedSpan) = .empty,
     // Batch shape of the most recent patch / remask stage, for bench and diagnostic
     // reporting. Not part of the graph contract.
     last_plan_batch: BatchStats = .{},
@@ -904,11 +916,11 @@ pub const NavGraph = struct {
         self.plan_windows.deinit(self.allocator);
         for (&self.plan_staging) |*staging| staging.deinit(self.allocator);
         self.dirty_keys.deinit(self.allocator);
-        self.batch_spans.deinit(self.allocator);
         self.patch_info.deinit(self.allocator);
         self.patch_keys.deinit(self.allocator);
         self.remask_deltas.deinit(self.allocator);
         self.remask_slots.deinit(self.allocator);
+        self.changed_masks.deinit(self.allocator);
         self.changed_keys.deinit(self.allocator);
         for (self.level_graphs.items) |*level_graph| level_graph.deinit(self.allocator);
         self.level_graphs.deinit(self.allocator);
@@ -969,7 +981,7 @@ pub const NavGraph = struct {
             self.remask_deltas.capacity * @sizeOf(i32) +
             self.remask_slots.capacity * @sizeOf(u32) +
             self.patch_info.capacity * @sizeOf(PatchInfo) +
-            self.batch_spans.capacity * @sizeOf(ChangedSpan) +
+            self.changed_masks.capacity * @sizeOf(ChunkBits) +
             self.plan_windows.capacity * @sizeOf(PlanWindow) +
             self.plan_tallies.capacity * @sizeOf(PlanTally) +
             self.merge_heap.capacity * @sizeOf(MergeHead);
@@ -1119,7 +1131,7 @@ pub const NavGraph = struct {
         try self.reserveRecords(levels);
 
         // Commit.
-        self.remaskKeys(levels, colliders, world, remaskThreads(threads), stats);
+        self.remaskKeys(levels, colliders, world, null, remaskThreads(threads), stats);
         self.claimRecords(levels);
         self.patchKeys(levels, world, patchThreads(threads), stats);
         _ = self.releaseRecords(levels);
@@ -1172,6 +1184,7 @@ pub const NavGraph = struct {
             .world = if (self.world_backed) world else null,
         };
         try self.planKeys(world, marks, new_links, planThreads(threads), stats);
+        try setLen(&self.changed_masks, self.allocator, self.changed_keys.items.len);
         if (self.patch_keys.items.len != 0) {
             const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
             try self.planPatchInfo(prepared.world);
@@ -1184,8 +1197,8 @@ pub const NavGraph = struct {
 
     /// Commits a prepared batch, the infallible half: folds the batch's new links into
     /// `link_bounds` (O(1) each, a long one O(exit boxes)), remasks the changed chunks from
-    /// the world and `colliders`, re-derives every patch key's record, and advances
-    /// `links_applied`. Remask and patch thread over keys.
+    /// the world and `colliders` (recording each one's flipped cells), re-derives every
+    /// patch key's record, and advances `links_applied`. Remask and patch thread over keys.
     pub fn commitMarks(self: *NavGraph, prepared: PreparedMarks, colliders: ColliderView, threads: ?NavUpdateThreads, stats: *NavUpdateStats) NavBatchResult {
         std.debug.assert(self.batch_prepared);
         self.batch_prepared = false;
@@ -1195,9 +1208,10 @@ pub const NavGraph = struct {
             self.link_bounds.foldLinks(world.levelLinks()[self.links_applied..][0..prepared.new_link_count]);
         }
         self.links_applied += prepared.new_link_count;
-        if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .spans = &.{} };
+        if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .changed_keys = &.{}, .changed_masks = &.{} };
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
-        self.remaskKeys(levels, colliders, prepared.world, remaskThreads(threads), stats);
+        std.debug.assert(self.changed_masks.items.len == self.changed_keys.items.len);
+        self.remaskKeys(levels, colliders, prepared.world, self.changed_masks.items, remaskThreads(threads), stats);
         self.claimRecords(levels);
         self.patchKeys(levels, prepared.world, patchThreads(threads), stats);
         stats.records_patched += self.releaseRecords(levels);
@@ -1205,7 +1219,7 @@ pub const NavGraph = struct {
         stats.chunks_patched += self.patch_keys.items.len;
         stats.incremental_rebuilds = 1;
         self.logPoolGrowth();
-        return .{ .changed = true, .dirty_keys = self.dirty_keys.items, .spans = self.batch_spans.items };
+        return .{ .changed = true, .dirty_keys = self.dirty_keys.items, .changed_keys = self.changed_keys.items, .changed_masks = self.changed_masks.items };
     }
 
     /// Drops a prepared batch without changing the graph; its marks and links stay pending.
@@ -1216,7 +1230,7 @@ pub const NavGraph = struct {
         self.changed_keys.clearRetainingCapacity();
         self.dirty_keys.clearRetainingCapacity();
         self.patch_keys.clearRetainingCapacity();
-        self.batch_spans.clearRetainingCapacity();
+        self.changed_masks.clearRetainingCapacity();
     }
 
     fn logPoolGrowth(self: *NavGraph) void {
@@ -1295,31 +1309,11 @@ pub const NavGraph = struct {
     }
 
     // Plans a marks batch: the changed, dirty, and patch keys (see `PlanStream`), each sorted
-    // and deduped, plus the batch spans. Threaded over marks and new links: each
+    // and deduped. Threaded over marks and new links: each
     // range writes, sorts, and dedupes its own key windows; the main thread sizes the windows
     // (O(1) per item) and merges them in range order, O(keys log ranges). Inline it is one
     // range: one sort and no merge.
     fn planKeys(self: *NavGraph, world: *const WorldSystem, marks: []const NavMark, new_links: []const LevelLink, threads: ?NavStageThreads, stats: *NavUpdateStats) !void {
-        // Batch spans: each mark's span with a one-cell halo, each new link's endpoints.
-        self.batch_spans.clearRetainingCapacity();
-        try self.batch_spans.ensureTotalCapacity(self.allocator, marks.len + 2 * new_links.len);
-        for (marks) |mark| {
-            const span = self.markSpan(world, mark) orelse continue;
-            self.batch_spans.appendAssumeCapacity(.{ .level = mark.level, .span = .{
-                .min_x = span.min_x -| 1,
-                .min_y = span.min_y -| 1,
-                .max_x = @min(span.max_x + 1, self.width - 1),
-                .max_y = @min(span.max_y + 1, self.height - 1),
-            } });
-        }
-        for (new_links) |link| {
-            inline for (.{ .{ link.level_a, link.cell_a }, .{ link.level_b, link.cell_b } }) |end| {
-                if (@as(usize, end[0]) < self.levels.items.len) {
-                    self.batch_spans.appendAssumeCapacity(.{ .level = end[0], .span = .{ .min_x = end[1].x, .min_y = end[1].y, .max_x = end[1].x, .max_y = end[1].y } });
-                }
-            }
-        }
-
         const item_count = marks.len + new_links.len;
         for (std.meta.tags(PlanStream)) |stream| self.keyList(stream).clearRetainingCapacity();
         self.last_plan_batch = .{};
@@ -1554,7 +1548,7 @@ pub const NavGraph = struct {
     // Claims the planned block slots in key order and seeds each key's delta with its
     // chunk's old blocked count; then remasks every changed key (threaded over keys) and,
     // in key order, releases the slots whose chunk ended uniform and applies the deltas.
-    fn remaskKeys(self: *NavGraph, levels: BatchLevels, colliders: ColliderView, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
+    fn remaskKeys(self: *NavGraph, levels: BatchLevels, colliders: ColliderView, world: ?*const WorldSystem, masks: ?[]ChunkBits, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
         const keys = self.changed_keys.items;
         std.debug.assert(self.remask_deltas.items.len == keys.len and self.remask_slots.items.len == keys.len);
         for (keys, self.remask_slots.items, self.remask_deltas.items) |key, *slot, *delta| {
@@ -1570,6 +1564,7 @@ pub const NavGraph = struct {
             .keys = keys,
             .slots = self.remask_slots.items,
             .deltas = self.remask_deltas.items,
+            .masks = masks,
         };
         self.last_remask_batch = runStage(threads, keys.len, &job, &job.range_count, remaskJob);
         stats.off_main_stage_ns += offMainNs(self.last_remask_batch);
@@ -2818,7 +2813,7 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     };
 
     // Warmup: toggle the warm cells on then off through the THREADED path, so every buffer the
-    // threaded stages touch (batch keys and spans, plan windows, cell blocks, record pools)
+    // threaded stages touch (batch keys and masks, plan windows, cell blocks, record pools)
     // reaches steady-state capacity before the failing-allocator proof.
     for ([_]@TypeOf(tree){ tree, grass }) |tile| {
         for (warm_cells) |cell| {
@@ -3472,6 +3467,63 @@ test "an aborted prepared batch leaves the graph and its pending work unchanged,
     var after = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer after.deinit();
     try expectGraphsEquivalent(&system.graph, &after.graph);
+}
+
+// Prepares and commits `system`'s pending marks directly, and checks each changed key's mask
+// against its chunk's bits read before and after the commit. Returns the keys whose mask
+// is not empty.
+fn expectChangedMasksAreFlips(system: *PathfindingSystem, world: *const WorldSystem) !usize {
+    var stats = NavUpdateStats{};
+    const prepared = (try system.graph.prepareMarks(world, no_colliders.view(), system.nav_marks.items, null, &stats)).?;
+    var old: [32]ChunkBits = undefined;
+    const keys = system.graph.changed_keys.items;
+    try std.testing.expect(keys.len <= old.len);
+    for (keys, old[0..keys.len]) |key, *bits| bits.* = system.graph.grid(keyLevel(key)).?.chunkBlockedBits(keyChunk(key));
+    const batch = system.graph.commitMarks(prepared, no_colliders.view(), null, &stats);
+    system.nav_marks.clearRetainingCapacity();
+    try std.testing.expect(batch.changed);
+    try std.testing.expectEqualSlices(u64, keys, batch.changed_keys);
+    var flipped: usize = 0;
+    for (batch.changed_keys, batch.changed_masks, old[0..keys.len]) |key, mask, before| {
+        const after = system.graph.grid(keyLevel(key)).?.chunkBlockedBits(keyChunk(key));
+        for (mask, before, after) |word, old_word, new_word| try std.testing.expectEqual(old_word ^ new_word, word);
+        if (!std.mem.allEqual(u64, &mask, 0)) flipped += 1;
+    }
+    return flipped;
+}
+
+test "the remask changed mask equals old XOR new bits per changed key across open, blocked, and mixed forms" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try twoLevelWorld(&meta);
+    defer fixture.world.deinit();
+    var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
+    defer system.deinit();
+    // Level 0 chunk (0, 0) open -> blocked; level 1 chunk (1, 1) open -> mixed; a mark on
+    // level 1 chunk (2, 2) whose cell keeps its tile changes nothing.
+    for (0..4) |y| for (0..4) |x| {
+        const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], @intCast(x), @intCast(y), fixture.tree)).?;
+        try system.markNavDirty(changed.level, changed.x, changed.y);
+    };
+    const mixed = (try fixture.world.setDenseTile(fixture.obstacle[1], 5, 5, fixture.tree)).?;
+    try system.markNavDirty(mixed.level, mixed.x, mixed.y);
+    try system.markNavDirty(1, 9, 9);
+    try std.testing.expectEqual(@as(usize, 2), try expectChangedMasksAreFlips(&system, &fixture.world));
+    try std.testing.expect(system.graph.grid(0).?.chunkForm(0) == .blocked);
+
+    // Level 0 chunk (0, 0) blocked -> mixed; level 1 chunk (1, 1) mixed -> blocked.
+    const opened = (try fixture.world.setDenseTile(fixture.obstacle[0], 1, 1, fixture.grass)).?;
+    try system.markNavDirty(opened.level, opened.x, opened.y);
+    for (4..8) |y| for (4..8) |x| {
+        if (x == 5 and y == 5) continue;
+        const changed = (try fixture.world.setDenseTile(fixture.obstacle[1], @intCast(x), @intCast(y), fixture.tree)).?;
+        try system.markNavDirty(changed.level, changed.x, changed.y);
+    };
+    try std.testing.expectEqual(@as(usize, 2), try expectChangedMasksAreFlips(&system, &fixture.world));
+    try std.testing.expect(system.graph.grid(0).?.chunkForm(0) == .mixed);
+    try std.testing.expect(system.graph.grid(1).?.chunkForm(4) == .blocked);
 }
 
 fn expectLinkBox(boxes: *const LinkBoxes, index: usize, x: i32, y: i32, level: i32) !void {

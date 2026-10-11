@@ -23,6 +23,12 @@ const field_block_bytes = @import("../game/systems/pathfinding/group_field.zig")
 const OpenNode = @import("../game/systems/pathfinding/types.zig").OpenNode;
 const StitchedCell = @import("../game/systems/pathfinding/types.zig").StitchedCell;
 const hashTableSlots = @import("../game/systems/pathfinding/types.zig").hashTableSlots;
+const resultBlockWords = @import("../game/systems/pathfinding/types.zig").resultBlockWords;
+const registry_shard_count = @import("../game/systems/pathfinding/types.zig").registry_shard_count;
+const RegRecord = @import("../game/systems/pathfinding/types.zig").RegRecord;
+const ResultCache = @import("../game/systems/pathfinding/caches.zig").ResultCache;
+const SolvedPath = @import("../game/systems/pathfinding/system.zig").PathfindingSystem.SolvedPath;
+const ChunkListMap = @import("../game/systems/chunk_list_map.zig").ChunkListMap;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
 
@@ -1545,18 +1551,18 @@ pub const NavSizeConfig = struct {
     agent_budget: usize,
     group_fields: usize,
     /// Cached results whose path can outgrow the inline stripe. The long-block pool grows
-    /// by doubling, so each is charged two blocks, clamped to one per cached result; the
-    /// default charges every cached result. A fixture whose paths all fit inline passes 0
-    /// and checks that no long block was taken.
+    /// in whole pages, so they are charged the pages holding one block each, clamped to one
+    /// per cached result; the default charges every cached result. A fixture whose paths
+    /// all fit inline passes 0 and checks that no long block was taken.
     long_results: usize = std.math.maxInt(usize),
 };
 
 /// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
 /// ceiling: per-level chunk directories, cell blocks, and records (every chunk mixed and
 /// holding portals), link slots, one level's batch window, per-participant search scratch,
-/// the tier-1 corridor pool, group fields, and the result cache with a long block per
-/// `long_results`. Search scratch and group fields are sized by their node and cell
-/// budgets, never by level cells.
+/// the tier-1 corridor pool, group fields, the result cache with the long-block pages of
+/// `long_results`, and the path registry. Search scratch and group fields are sized by
+/// their node and cell budgets, never by level cells.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
     // abstract node and stitched cell caps, escalated solves per step, group field cells,
@@ -1571,7 +1577,9 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     const group_field_cells: usize = 131072;
     const agents: usize = @max(8, config.agent_budget);
     const cached_results: usize = agents * 4;
-    const long_blocks: usize = @min(config.long_results *| 2, cached_results);
+    const block_words = resultBlockWords(explored_nodes, stitched_path_cells);
+    const long_page_blocks = ResultCache.longBlocksPerPage(block_words);
+    const long_blocks: usize = (@min(config.long_results, cached_results) + long_page_blocks - 1) / long_page_blocks * long_page_blocks;
     const solves_per_step: usize = @min(512, agents);
     const chunk_tiles: usize = 16;
     const participants: usize = @max(1, config.participant_count);
@@ -1601,14 +1609,21 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
         explored_nodes * @sizeOf(u32) + corridorBytes(tier0_abstract_nodes, tier0_stitched_cells));
     // Per escalated solve a step admits: one tier-1 corridor scratch.
     const tier1_pool = escalated_solves * corridorBytes(abstract_nodes, stitched_path_cells);
-    // Result cache, per entry: two 24 B probe slots, a 20 B payload, a 4 B free index, a
-    // 16 B eviction-scratch key, and the inline stripe (4 B per stored path cell). A block
-    // holds the longest plain (explored nodes, 4 B) or stitched (8 B) path: one worker
-    // stripe per solve slot, and the long-pool blocks with their free indices.
-    const result_block_bytes = @max(explored_nodes * @sizeOf(u32), stitched_path_cells * @sizeOf(StitchedCell));
-    const results = cached_results * (2 * 24 + 20 + 4 + 16 + stored_path_cells * 4) + solves_per_step * result_block_bytes +
-        long_blocks * (result_block_bytes + @sizeOf(u32));
-    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results;
+    // Result cache, per entry: its probe slots, record, free index, owner-log room, and
+    // inline stripe. A block holds the longest plain or stitched path: per solve slot one
+    // worker stripe, its run-start window (2 B per block word), its solved-path record, and
+    // its claim; and the long-pool blocks with their free indices.
+    const result_block_bytes = block_words * @sizeOf(u32);
+    const results = cached_results * ResultCache.bytesPerEntry(stored_path_cells) +
+        solves_per_step * (result_block_bytes + block_words * @sizeOf(u16) + @sizeOf(SolvedPath) + @sizeOf(?ResultCache.Claimed)) +
+        long_blocks * ResultCache.longBlockBytes(block_words);
+    // Path registry, per cached result: an owner head per shard, and one run per chunk edge
+    // of its stored cells, each an entry with its free id and, at most, a key of its own in
+    // two table slots; a step's registration windows hold every solve's runs.
+    const runs_per_result = stored_path_cells / chunk_tiles;
+    const registry = cached_results * (registry_shard_count * @sizeOf(u32) + runs_per_result * (ChunkListMap.bytes_per_entry + 2 * ChunkListMap.bytes_per_key_slot)) +
+        solves_per_step * runs_per_result * @sizeOf(RegRecord);
+    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results + registry;
 }
 
 // Rows the pathfinding tables reserve for `keys` keys; the library defaults sized here
@@ -1923,20 +1938,23 @@ test "batch modes align to cache-line item boundaries" {
     try std.testing.expectEqual(@as(usize, 256), large);
 }
 
-test "nav storage charges two long blocks per long result, at most one per cached result" {
+test "nav storage charges the long-block pages of the long results, at most the pages of one per cached result" {
     const base = NavSizeConfig{ .side = 256, .levels = 1, .participant_count = 1, .agent_budget = 100, .group_fields = 1 };
     var inline_only = base;
     inline_only.long_results = 0;
+    var one_long = base;
+    one_long.long_results = 1;
     var ten_long = base;
     ten_long.long_results = 10;
-    var past_half = base;
-    past_half.long_results = 300;
-    // A long block holds 4096 words, plus its 4 B free index.
-    const per_block = (navStorageBytes(ten_long) - navStorageBytes(inline_only)) / 20;
-    try std.testing.expectEqual(@as(usize, 4096 * 4 + 4), per_block);
-    try std.testing.expectEqual(@as(usize, 20 * per_block), navStorageBytes(ten_long) - navStorageBytes(inline_only));
-    // 100 agents cache 400 results; the default charges a block for each, and 300 long
-    // results reach that clamp.
+    var past_all = base;
+    past_all.long_results = 1000;
+    // A long block holds 4096 words, plus its 4 B free index; eight fill a 128 KiB page.
+    const per_block: usize = 4096 * 4 + 4;
+    try std.testing.expectEqual(@as(usize, 8), ResultCache.longBlocksPerPage(4096));
+    try std.testing.expectEqual(8 * per_block, navStorageBytes(one_long) - navStorageBytes(inline_only));
+    try std.testing.expectEqual(16 * per_block, navStorageBytes(ten_long) - navStorageBytes(inline_only));
+    // 100 agents cache 400 results, 50 pages; the default charges them, as do more long
+    // results than cached ones.
     try std.testing.expectEqual(400 * per_block, navStorageBytes(base) - navStorageBytes(inline_only));
-    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(past_half));
+    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(past_all));
 }

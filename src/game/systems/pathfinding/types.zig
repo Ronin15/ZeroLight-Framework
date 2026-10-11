@@ -309,9 +309,17 @@ pub const NavUpdateStats = struct {
     levels_built: usize = 0,
     // Records the marks batch left holding portals.
     records_patched: usize = 0,
-    // Remask, patch, and mark dispatch time that ran on workers; inline stages add
-    // nothing. Diagnostic only.
+    // Remask, patch, mark, and eviction dispatch time that ran on workers; inline stages
+    // add nothing. Diagnostic only.
     off_main_stage_ns: u64 = 0,
+    // Path eviction: the pre-commit bound count over the changed keys, the halo walk over
+    // their registrations, and the registry flush of the removals.
+    evict_count_batch: BatchStats = .{},
+    evict_batch: BatchStats = .{},
+    evict_flush_batch: BatchStats = .{},
+    // Registry entries the halo walk visited, and the cached results it evicted.
+    evict_entries_visited: usize = 0,
+    evicted_results: usize = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -338,12 +346,6 @@ pub const NavSpan = struct {
     min_y: usize,
     max_x: usize,
     max_y: usize,
-};
-
-// One edit's changed nav-cell rectangle on a level; scopes path-cache eviction to it.
-pub const ChangedSpan = struct {
-    level: u16,
-    span: NavSpan,
 };
 
 // Single source of the chunk-tiling geometry shared by NavGrid and NavGraph: the chunk_id
@@ -558,6 +560,17 @@ pub const PathfindingStats = struct {
     intake_batch: BatchStats = .{},
     group_field_batch: BatchStats = .{},
     group_field_begin_batch: BatchStats = .{},
+    // The publish byte copy and registration bucketing (`publish_copy`), the path
+    // registry's owner ops and adds (`registry_flush`), and a shrink's byte moves
+    // (`resize_copy`).
+    publish_copy_batch: BatchStats = .{},
+    registry_flush_batch: BatchStats = .{},
+    resize_copy_batch: BatchStats = .{},
+    // Path registry entries added and removed by this update's flush, and its shard
+    // storage growths.
+    registrations_added: usize = 0,
+    registrations_removed: usize = 0,
+    registry_grows: usize = 0,
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
     accept_ns: u64 = 0,
@@ -724,44 +737,154 @@ pub const PendingRing = struct {
 // inter-level link the level changes between consecutive cells (a discrete jump,
 // the only non-adjacent step). The query walks the run matching the agent's current
 // level cell by cell, exactly like a single-level individual A* path.
-// Extern so stored paths can hold it in `u32` words (`stitched_cell_words` each).
-pub const StitchedCell = extern struct {
+pub const StitchedCell = struct {
     level: u16,
     cell: u32,
 };
 
-/// `u32` words one `StitchedCell` occupies in a stored path.
-pub const stitched_cell_words: usize = @sizeOf(StitchedCell) / @sizeOf(u32);
+/// Words a stored stitched path of `len` cells occupies: its cells (one `u32` each), then
+/// its levels packed two `u16` to a word.
+pub fn stitchedWords(len: usize) usize {
+    return len + (len + 1) / 2;
+}
 
 /// Words of one solve-output stripe and of one result-cache long block: the longest plain
 /// path a local solve can return (one cell per explored node) or the longest stitched path.
 pub fn resultBlockWords(max_explored_nodes: usize, max_stitched_path_cells: usize) usize {
-    return @max(@as(usize, 1), @max(max_explored_nodes, max_stitched_path_cells *| stitched_cell_words));
+    return @max(@as(usize, 1), @max(max_explored_nodes, stitchedWords(max_stitched_path_cells)));
 }
 
-/// Words a stored result occupies: one per plain cell, `stitched_cell_words` per stitched cell.
+/// Largest result block a run start can index: run starts are stored as `u16`.
+pub const max_result_block_words: usize = std.math.maxInt(u16);
+
+/// A pathfinding budget whose result block a run start cannot index, or whose field cap
+/// a field's links cannot pack.
+pub const BudgetError = error{PathfindingBudgetTooWide};
+
+/// Words a stored result occupies: one per plain cell, or `stitchedWords` of its cells.
 pub fn storedPathWords(path_len: usize, stitched_len: usize) usize {
-    return if (stitched_len != 0) stitched_len * stitched_cell_words else path_len;
+    return if (stitched_len != 0) stitchedWords(stitched_len) else path_len;
 }
 
-/// `words` viewed as stitched cells (the first `stitched_cell_words * len` words).
-pub fn stitchedCells(words: []u32, len: usize) []StitchedCell {
-    std.debug.assert(len * stitched_cell_words <= words.len);
-    // Extern StitchedCell is u32-aligned and `stitched_cell_words` words long.
-    const cells: [*]StitchedCell = @ptrCast(words.ptr);
-    return cells[0..len];
+/// A stored stitched path: its cells column, then its levels column.
+pub const StitchedView = struct {
+    cells: []const u32,
+    levels: []const u16,
+
+    pub fn len(self: StitchedView) usize {
+        return self.cells.len;
+    }
+
+    pub fn at(self: StitchedView, index: usize) StitchedCell {
+        return .{ .level = self.levels[index], .cell = self.cells[index] };
+    }
+};
+
+/// `words` read as a stored stitched path of `len` cells (its first `stitchedWords(len)`).
+pub fn stitchedView(words: []const u32, len: usize) StitchedView {
+    std.debug.assert(stitchedWords(len) <= words.len);
+    // The levels column starts on a u32 word, so it is u16-aligned and holds `len` levels.
+    const levels: [*]const u16 = @ptrCast(words[len..].ptr);
+    return .{ .cells = words[0..len], .levels = levels[0..len] };
 }
 
-pub fn stitchedCellsConst(words: []const u32, len: usize) []const StitchedCell {
-    std.debug.assert(len * stitched_cell_words <= words.len);
-    // Extern StitchedCell is u32-aligned and `stitched_cell_words` words long.
-    const cells: [*]const StitchedCell = @ptrCast(words.ptr);
-    return cells[0..len];
+/// Stores `cells` into `words` as a stitched path: the cells column, then the levels.
+pub fn writeStitched(words: []u32, cells: []const StitchedCell) void {
+    const len = cells.len;
+    std.debug.assert(stitchedWords(len) <= words.len);
+    // As in `stitchedView`: a u16-aligned levels column of `len` entries.
+    const levels: [*]u16 = @ptrCast(words[len..].ptr);
+    for (cells, words[0..len], levels[0..len]) |stitched, *cell, *level| {
+        cell.* = stitched.cell;
+        level.* = stitched.level;
+    }
+    // The half-word past an odd length is zero, so equal paths store equal words.
+    if (len % 2 == 1) levels[len] = 0;
 }
+
+/// The (x, y) of a walk over a grid's cells: one division to start and after a step that
+/// is not to a neighbouring cell, O(1) per neighbouring step.
+pub const CellCursor = struct {
+    width: usize,
+    cell: usize,
+    x: usize,
+    y: usize,
+
+    pub fn init(width: usize, cell: usize) CellCursor {
+        return .{ .width = width, .cell = cell, .x = cell % width, .y = cell / width };
+    }
+
+    pub fn moveTo(self: *CellCursor, cell: usize) void {
+        // Cell indices and widths are below 2^32.
+        const delta: i64 = @as(i64, @intCast(cell)) - @as(i64, @intCast(self.cell));
+        const width: i64 = @intCast(self.width);
+        inline for (.{ -1, 0, 1 }) |dy| {
+            const dx = delta - dy * width;
+            const x = @as(i64, @intCast(self.x)) + dx;
+            const y = @as(i64, @intCast(self.y)) + dy;
+            // Index and coordinates are a bijection, so at most one (dx, dy) lands in range.
+            if (dx >= -1 and dx <= 1 and x >= 0 and x < width and y >= 0) {
+                self.* = .{ .width = self.width, .cell = cell, .x = @intCast(x), .y = @intCast(y) };
+                return;
+            }
+        }
+        self.* = init(self.width, cell);
+    }
+};
+
+/// Path-registry shards. Each key lives in one shard, so a flush threads over shards.
+pub const registry_shard_count: usize = 16;
+
+/// The shard of registry key `key`: the top bits of an integer hash that is independent of
+/// the shard tables' Fibonacci homes, so one shard's keys spread over its whole table.
+pub fn registryShard(key: u64) usize {
+    return @intCast(std.hash.int(key) >> registry_shard_shift);
+}
+
+const registry_shard_shift: u6 = @intCast(64 - @as(u32, std.math.log2_int(usize, registry_shard_count)));
 
 comptime {
-    std.debug.assert(@alignOf(StitchedCell) == @alignOf(u32));
-    std.debug.assert(@sizeOf(StitchedCell) == stitched_cell_words * @sizeOf(u32));
+    std.debug.assert(std.math.isPowerOfTwo(registry_shard_count));
+}
+
+/// An owner-log entry: owner `old`'s registrations are removed (`new == no_owner`) or
+/// renamed to owner `new`.
+pub const OwnerOp = struct {
+    old: u32,
+    new: u32,
+};
+
+/// `OwnerOp.new` of a retire.
+pub const no_owner: u32 = std.math.maxInt(u32);
+
+/// One registration of a published path: its run's chunk key, the owning cache payload,
+/// and the run's first stored cell.
+pub const RegRecord = struct {
+    key: u64,
+    owner: u32,
+    start: u32,
+};
+
+/// Per changed key of a path eviction: its hit bound, its hit window's base, its hits and
+/// visited registry entries, and the registered halo keys it owns (bit
+/// `(dy + 1) * 3 + (dx + 1)`).
+pub const EvictItem = struct {
+    bound: u32 = 0,
+    base: u32 = 0,
+    hits: u32 = 0,
+    visited: u32 = 0,
+    owned: u16 = 0,
+};
+
+/// Eviction range alignment: every range's items start on a cache line.
+pub const evict_range_alignment_items: usize = 16;
+/// Registration and hit windows start on a cache line: records and owner ids per line.
+pub const reg_window_alignment_items: usize = thread_shared_record_alignment / @sizeOf(RegRecord);
+pub const hit_window_alignment_items: usize = thread_shared_record_alignment / @sizeOf(u32);
+
+comptime {
+    std.debug.assert(@sizeOf(RegRecord) == 16);
+    std.debug.assert((@sizeOf(EvictItem) * evict_range_alignment_items) % thread_shared_record_alignment == 0);
 }
 
 pub const PathResult = struct {
@@ -1052,21 +1175,6 @@ pub fn ListResize(comptime T: type) type {
     };
 }
 
-// Like resizeArrayList but for a pool sized to exactly `capacity` and memset to a
-// fill value (the disjoint worker path/stitched stripes). Shrinking frees memory;
-// failure-atomic the same way.
-pub fn resizeFilledArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize, fill: T) !void {
-    if (shouldShrinkCapacity(list.capacity, capacity)) {
-        var replacement: std.ArrayList(T) = .empty;
-        try replacement.ensureTotalCapacity(allocator, capacity);
-        list.deinit(allocator);
-        list.* = replacement;
-    }
-    try list.ensureTotalCapacity(allocator, capacity);
-    list.items.len = capacity;
-    @memset(list.items, fill);
-}
-
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
@@ -1118,11 +1226,4 @@ test "resize helpers shrink-and-free below capacity and grow-reuse at or above i
     try std.testing.expect(list.capacity < grown_capacity);
     try std.testing.expect(list.capacity >= 2);
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
-
-    // resizeFilledArrayList additionally sets items.len to capacity and fills it.
-    var filled: std.ArrayList(u8) = .empty;
-    defer filled.deinit(std.testing.allocator);
-    try resizeFilledArrayList(u8, &filled, std.testing.allocator, 4, 0xAB);
-    try std.testing.expectEqual(@as(usize, 4), filled.items.len);
-    for (filled.items) |byte| try std.testing.expectEqual(@as(u8, 0xAB), byte);
 }

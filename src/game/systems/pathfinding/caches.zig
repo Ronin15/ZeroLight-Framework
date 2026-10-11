@@ -2,10 +2,10 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Goal-keyed query caches: the linear-probe pending/negative KeySet and the
-//! completed-path ResultCache (exact path storage, entries kept across resizes), plus
-//! the per-agent waypoint derivation that turns a cached plain or stitched path into a
-//! forward heading.
+//! Goal-keyed query caches: the linear-probe pending/negative KeySet, the shared
+//! `CacheCore` slot table with its owner log, and the completed-path ResultCache (exact
+//! path storage in pages, entries kept across resizes), plus the per-agent waypoint
+//! derivation that turns a cached plain or stitched path into a forward heading.
 
 const std = @import("std");
 const math = @import("../../../core/math.zig");
@@ -15,14 +15,15 @@ const NavGraph = @import("nav_graph.zig").NavGraph;
 const types = @import("types.zig");
 const PathQueryKey = types.PathQueryKey;
 const StitchedCell = types.StitchedCell;
+const StitchedView = types.StitchedView;
 const PathResult = types.PathResult;
 const PathfindingStats = types.PathfindingStats;
 const ListResize = types.ListResize;
+const OwnerOp = types.OwnerOp;
+const no_owner = types.no_owner;
 const hashPathKey = types.hashPathKey;
 const keysEqual = types.keysEqual;
 const emptyKey = types.emptyKey;
-const no_cell = types.no_cell;
-const ChangedSpan = types.ChangedSpan;
 
 // Forward window probed around a per-agent waypoint hint before falling back to a full
 // path scan. Agents walk a shared goal-keyed path monotonically (~1 cell/step), so the
@@ -33,10 +34,10 @@ const waypoint_hint_window: usize = 8;
 // Generic fixed-capacity, open-addressed (linear-probe) table keyed by PathQueryKey with
 // back-shift deletion. Full tables drop new inserts instead of allocating during the
 // fixed-step update. Backs both the pending/negative KeySet (Payload = void) and the
-// group-key -> requests-index map (Payload = u16). ResultCache below re-implements this
+// group-key -> requests-index map (Payload = u16). CacheCore below re-implements this
 // same probe-walk/back-shift shape rather than composing over this table, because its
-// slots also carry per-entry path/stitched cell stripes ProbeTable has no notion of; the
-// two copies are kept in sync by hand, not shared code.
+// entries also carry owner ids, claim marks, and owner-log ops ProbeTable has no notion
+// of; the two copies are kept in sync by hand, not shared code.
 //
 // The physical slot array is 2x the LOGICAL capacity (inserts stop at logical), so
 // occupancy never exceeds 50% and every probe chain — hit or miss — terminates at an
@@ -248,60 +249,477 @@ pub const GroupKeyMap = struct {
     }
 };
 
-// Goal-keyed cache. Each entry stores its path exactly so a moving agent can derive a
-// forward waypoint from its current cell against the stored path.
-//
-// SoA layout: the probe-hot {occupied, key, payload_index} slots stay dense so a
-// linear-probe scan (slotIndex/findOrEvictSlot) never drags the cold payload across
-// cache lines. The physical probe table is 2x the logical capacity (occupancy never
-// exceeds 50%, so every probe chain ends at an empty slot), while the cold payloads and
-// the per-entry inline stripes stay at logical capacity, reached through the slot's
-// payload_index. Back-shift deletion and resize rehashing move only the probe slot.
-//
-// Storage: each payload index owns an inline stripe of `inline_words` words, holding a
-// plain path of up to `inline_words` cells or a stitched path of up to
-// `inline_words / stitched_cell_words` cells. A longer result is stored whole in one
-// long block of `long_block_words` words. Long blocks are claimed from a free list
-// that only the publish reserve grows (`reserveLongBlocks`), released on removal, and
-// compacted to the live long entries by a shrink, so a live entry is never evicted for
-// long-pool space.
+// Owner-log ops one entry live at a flush interval's start can take before the next
+// flush: a rename (a shrink moves it) and a retire (it is removed). Entries claimed in the
+// interval log nothing more until the flush.
+const ops_per_entry: usize = 2;
+
+// Page size the result cache's stripes and long blocks are grouped into: a grow appends
+// pages and moves no stored path.
+const page_target_bytes: usize = 128 * 1024;
+
+// log2 of the blocks of `block_words` words one page holds (at least one); below 64.
+fn pageShift(block_words: usize) u6 {
+    const block_bytes = @max(@as(usize, 1), block_words *| @sizeOf(u32));
+    return @intCast(std.math.log2_int(usize, @max(@as(usize, 1), page_target_bytes / block_bytes)));
+}
+
+// Pages of `1 << shift` blocks holding `blocks` blocks.
+fn pageCount(blocks: usize, shift: u6) usize {
+    const per_page = @as(usize, 1) << shift;
+    return (blocks + per_page - 1) / per_page;
+}
+
+/// The slot table and entry records of a goal-keyed cache. An entry's record index is its
+/// owner id in the path registry: it stays below the logical capacity, so registry owner
+/// heads follow the capacity. Every removal logs a retire and every move a rename into the
+/// owner log, which the registry flush applies; the log holds at most `ops_per_entry` ops
+/// per entry live when it was last emptied. Main thread; readers (`slotIndex`, `ownerOf`,
+/// records) are safe on workers while nothing mutates.
+fn CacheCore(comptime Extra: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Record = struct {
+            // step_counter when written, for the TTL and a shrink's age order.
+            stamp: u32 = 0,
+            // The publish that claimed it: never a victim of that publish.
+            claim_epoch: u32 = 0,
+            live: bool = false,
+            extra: Extra = .{},
+        };
+
+        /// A resize's storage, allocated before any entry moves.
+        pub const Resize = struct {
+            capacity: usize,
+            slots: std.ArrayList(ProbeSlot) = .empty,
+            records: ListResize(Record) = .{},
+            keys: ListResize(PathQueryKey) = .{},
+            free: ListResize(u32) = .{},
+            log_replacement: ?std.ArrayList(OwnerOp) = null,
+        };
+
+        // Probe table, 2x the logical capacity so every chain ends at an empty slot.
+        slots: std.ArrayList(ProbeSlot) = .empty,
+        // One per entry of logical capacity, indexed by owner id, and each live one's key,
+        // kept apart so the records a lookup reads stay small.
+        records: std.ArrayList(Record) = .empty,
+        keys: std.ArrayList(PathQueryKey) = .empty,
+        // Unclaimed record indices; a pop takes the lowest after a resize or clear.
+        free: std.ArrayList(u32) = .empty,
+        owner_log: std.ArrayList(OwnerOp) = .empty,
+        owner_log_limit: usize = 0,
+        // A shrink's owner log sized to its new capacity, swapped in after the flush that
+        // applies the shrink's ops.
+        owner_log_replacement: ?std.ArrayList(OwnerOp) = null,
+        logical_capacity: usize = 0,
+        len: usize = 0,
+        next_evict: usize = 0,
+        // The current publish and how many entries it claimed.
+        claim_epoch: u32 = 0,
+        epoch_claims: usize = 0,
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.owner_log_replacement) |*replacement| replacement.deinit(allocator);
+            self.owner_log.deinit(allocator);
+            self.free.deinit(allocator);
+            self.keys.deinit(allocator);
+            self.records.deinit(allocator);
+            self.slots.deinit(allocator);
+            self.* = undefined;
+        }
+
+        pub fn slotIndex(self: *const Self, key: PathQueryKey) ?usize {
+            const capacity = self.slots.items.len;
+            if (capacity == 0) return null;
+            const start = hashPathKey(key) % capacity;
+            for (0..capacity) |probe| {
+                const index = (start + probe) % capacity;
+                const slot = self.slots.items[index];
+                if (slot.occupied and keysEqual(slot.key, key)) return index;
+                // Chains are contiguous (back-shift deletion) and the table is at most half
+                // full, so the first empty slot ends this key's chain.
+                if (!slot.occupied) return null;
+            }
+            return null;
+        }
+
+        /// The owner id of `key`'s entry, or null.
+        pub fn ownerOf(self: *const Self, key: PathQueryKey) ?u32 {
+            const index = self.slotIndex(key) orelse return null;
+            return self.slots.items[index].payload_index;
+        }
+
+        /// The key of live owner `owner`.
+        pub fn keyOf(self: *const Self, owner: u32) PathQueryKey {
+            std.debug.assert(self.records.items[owner].live);
+            return self.keys.items[owner];
+        }
+
+        pub fn ownerLog(self: *const Self) []const OwnerOp {
+            return self.owner_log.items;
+        }
+
+        /// Empties the owner log once a flush applied it, and installs a shrink's smaller log.
+        pub fn finishOwnerLog(self: *Self, allocator: std.mem.Allocator) void {
+            self.owner_log.clearRetainingCapacity();
+            const replacement = self.owner_log_replacement orelse return;
+            self.owner_log.deinit(allocator);
+            self.owner_log = replacement;
+            self.owner_log_replacement = null;
+            self.owner_log_limit = ops_per_entry * self.logical_capacity;
+            std.debug.assert(self.owner_log.capacity >= self.owner_log_limit);
+        }
+
+        fn logOp(self: *Self, op: OwnerOp) void {
+            std.debug.assert(self.owner_log.items.len < self.owner_log_limit);
+            self.owner_log.appendAssumeCapacity(op);
+        }
+
+        /// Opens a publish: its claims are never victims of each other.
+        pub fn beginPublish(self: *Self) void {
+            self.claim_epoch +%= 1;
+            self.epoch_claims = 0;
+            if (self.claim_epoch != 0) return;
+            // Wrapped: forget every mark so no old claim reads as this publish's.
+            for (self.records.items) |*record| record.claim_epoch = 0;
+            self.claim_epoch = 1;
+        }
+
+        /// Claims `key`'s entry for this publish at `stamp`: its own (a re-put, which
+        /// retires its registrations), else the lowest free record, else a round-robin
+        /// victim's (retired) when the cache is full. Never picks an entry this publish
+        /// claimed. Returns the owner id; its `extra` still holds a re-put's or a victim's.
+        /// O(1) expected; allocates nothing. Requires a nonzero capacity.
+        pub fn claim(self: *Self, key: PathQueryKey, stamp: u32, stats: *PathfindingStats) u32 {
+            std.debug.assert(self.logical_capacity != 0);
+            const owner = if (self.slotIndex(key)) |index| reput: {
+                const owner = self.slots.items[index].payload_index;
+                self.logOp(.{ .old = owner, .new = no_owner });
+                break :reput owner;
+            } else fresh: {
+                if (self.len >= self.logical_capacity) self.evictVictim(stats);
+                // Below the capacity, the free list holds a record.
+                const owner = self.free.pop().?;
+                self.insertSlot(key, owner);
+                self.len += 1;
+                break :fresh owner;
+            };
+            const record = &self.records.items[owner];
+            self.keys.items[owner] = key;
+            record.stamp = stamp;
+            record.claim_epoch = self.claim_epoch;
+            record.live = true;
+            self.epoch_claims += 1;
+            return owner;
+        }
+
+        // Removes the next round-robin entry this publish did not claim; its record goes
+        // back to the free list with its `extra` intact.
+        fn evictVictim(self: *Self, stats: *PathfindingStats) void {
+            // A capacity of at least four results per solve keeps an unclaimed entry.
+            std.debug.assert(self.epoch_claims < self.len);
+            const physical = self.slots.items.len;
+            while (true) : (self.next_evict = (self.next_evict + 1) % physical) {
+                const slot = self.slots.items[self.next_evict];
+                if (slot.occupied and self.records.items[slot.payload_index].claim_epoch != self.claim_epoch) break;
+            }
+            const victim = self.next_evict;
+            self.next_evict = (self.next_evict + 1) % physical;
+            stats.cache_evictions += 1;
+            self.removeAt(victim);
+        }
+
+        // Writes `key` at the first empty slot of its chain.
+        fn insertSlot(self: *Self, key: PathQueryKey, owner: u32) void {
+            insertRehashed(ProbeSlot, self.slots.items, .{ .occupied = true, .key = key, .payload_index = owner });
+        }
+
+        /// Removes the entry at probe slot `index`, retiring its owner id. Back-shift
+        /// deletion keeps every probe chain contiguous; only probe slots move. The record's
+        /// `extra` is left for the owner to release.
+        pub fn removeAt(self: *Self, index: usize) void {
+            const capacity = self.slots.items.len;
+            const owner = self.slots.items[index].payload_index;
+            self.records.items[owner].live = false;
+            std.debug.assert(self.free.items.len < self.free.capacity);
+            self.free.appendAssumeCapacity(owner);
+            self.logOp(.{ .old = owner, .new = no_owner });
+            self.slots.items[index].occupied = false;
+            self.len -= 1;
+            var hole = index;
+            var probe = index;
+            while (true) {
+                probe = (probe + 1) % capacity;
+                if (probe == index) break;
+                const slot = self.slots.items[probe];
+                if (!slot.occupied) break;
+                const home = hashPathKey(slot.key) % capacity;
+                // An entry whose home lies cyclically within (hole, probe] stays.
+                if (inCyclicRange(hole, probe, home)) continue;
+                self.slots.items[hole] = slot;
+                self.slots.items[probe].occupied = false;
+                hole = probe;
+            }
+        }
+
+        /// Empties the cache and its owner log, keeping storage. O(capacity).
+        pub fn clear(self: *Self) void {
+            for (self.slots.items) |*slot| slot.occupied = false;
+            for (self.records.items) |*record| record.live = false;
+            self.rebuildFree(self.logical_capacity);
+            self.owner_log.clearRetainingCapacity();
+            self.len = 0;
+            self.next_evict = 0;
+        }
+
+        // Pushes every free record below `capacity` highest first, so pops hand out the
+        // lowest.
+        fn rebuildFree(self: *Self, capacity: usize) void {
+            self.free.clearRetainingCapacity();
+            var index = capacity;
+            while (index > 0) {
+                index -= 1;
+                if (self.records.items[index].live) continue;
+                // Record indices stay below the capacity, a u32 owner width.
+                self.free.appendAssumeCapacity(@intCast(index));
+            }
+        }
+
+        /// Allocates a resize to `capacity` (probe table, records, free list, owner log)
+        /// without moving any entry. Undo with `abortResize`.
+        pub fn prepareResize(self: *Self, allocator: std.mem.Allocator, capacity: usize) !Resize {
+            var resize = Resize{ .capacity = capacity };
+            try resize.slots.ensureTotalCapacityPrecise(allocator, capacity *| 2);
+            errdefer resize.slots.deinit(allocator);
+            try resize.records.prepare(&self.records, allocator, capacity);
+            errdefer resize.records.abort(allocator);
+            try resize.keys.prepare(&self.keys, allocator, capacity);
+            errdefer resize.keys.abort(allocator);
+            try resize.free.prepare(&self.free, allocator, capacity);
+            errdefer resize.free.abort(allocator);
+            // Ops of the entries live now (at most the old capacity) and of the next
+            // interval's, until the next flush.
+            try self.owner_log.ensureTotalCapacity(allocator, ops_per_entry *| @max(self.logical_capacity, capacity));
+            if (capacity < self.logical_capacity) {
+                var replacement: std.ArrayList(OwnerOp) = .empty;
+                try replacement.ensureTotalCapacityPrecise(allocator, ops_per_entry *| capacity);
+                resize.log_replacement = replacement;
+            }
+            return resize;
+        }
+
+        pub fn abortResize(_: *Self, allocator: std.mem.Allocator, resize: *Resize) void {
+            if (resize.log_replacement) |*replacement| replacement.deinit(allocator);
+            resize.free.abort(allocator);
+            resize.keys.abort(allocator);
+            resize.records.abort(allocator);
+            resize.slots.deinit(allocator);
+        }
+
+        /// Commits a prepared resize; infallible. A shrink first evicts the oldest entries
+        /// (age `step -% stamp`, then owner id) until the entries fit, retiring each (calling
+        /// `context.releaseRecord(owner)`), then moves every live record at or past
+        /// `capacity` into the lowest free record below it, renaming the owner (calling
+        /// `context.moveRecord(from, to)`). Then the free list and probe table are rebuilt
+        /// from the records. O(old capacity + new capacity), no sort.
+        pub fn commitResize(self: *Self, allocator: std.mem.Allocator, resize: *Resize, step: u32, context: anytype) void {
+            const old_capacity = self.logical_capacity;
+            const capacity = resize.capacity;
+            if (capacity < old_capacity) {
+                if (self.len > capacity) self.evictOldest(step, self.len - capacity, context);
+                var target: usize = 0;
+                for (capacity..old_capacity) |source| {
+                    if (!self.records.items[source].live) continue;
+                    while (self.records.items[target].live) target += 1;
+                    // The entries fit below the capacity after the evictions.
+                    std.debug.assert(target < capacity);
+                    self.records.items[target] = self.records.items[source];
+                    self.keys.items[target] = self.keys.items[source];
+                    self.records.items[source].live = false;
+                    // Both indices stay below the old capacity, a u32 owner width.
+                    self.logOp(.{ .old = @intCast(source), .new = @intCast(target) });
+                    context.moveRecord(@intCast(source), @intCast(target));
+                    target += 1;
+                }
+            }
+            resize.records.commitResized(&self.records, allocator, capacity);
+            // A key past the old length stays unread until its record is claimed.
+            resize.keys.commitResized(&self.keys, allocator, capacity);
+            for (old_capacity..@max(old_capacity, capacity)) |index| self.records.items[index] = .{};
+            resize.free.commit(&self.free, allocator);
+            self.rebuildFree(capacity);
+            resize.slots.items.len = capacity * 2;
+            @memset(resize.slots.items, .{});
+            for (self.records.items, 0..) |record, index| {
+                // Record indices stay below the capacity.
+                if (record.live) insertRehashed(ProbeSlot, resize.slots.items, .{ .occupied = true, .key = self.keys.items[index], .payload_index = @intCast(index) });
+            }
+            self.slots.deinit(allocator);
+            self.slots = resize.slots;
+            resize.slots = .empty;
+            self.logical_capacity = capacity;
+            self.next_evict = 0;
+            self.owner_log_limit = ops_per_entry * @max(old_capacity, capacity);
+            std.debug.assert(self.owner_log.capacity >= self.owner_log_limit);
+            if (resize.log_replacement) |replacement| {
+                if (self.owner_log_replacement) |*pending| pending.deinit(allocator);
+                self.owner_log_replacement = replacement;
+                resize.log_replacement = null;
+            }
+            std.debug.assert(self.free.items.len == capacity - self.len);
+        }
+
+        // Evicts the `evict_count` oldest entries in age order (greatest `step -% stamp`
+        // first, lowest owner id breaking ties) without sorting: four 8-bit histogram
+        // passes find the age at which the count is reached, then one pass in owner-id
+        // order evicts every older entry and the first entries of that age.
+        // SIMD verdict: scalar. Histogram passes scatter into 256 buckets.
+        fn evictOldest(self: *Self, step: u32, evict_count: usize, context: anytype) void {
+            const threshold = evictionThreshold(self.records.items, step, evict_count);
+            var ties = threshold.ties;
+            for (self.records.items, 0..) |*record, index| {
+                if (!record.live) continue;
+                const age = step -% record.stamp;
+                if (age < threshold.age) continue;
+                if (age == threshold.age) {
+                    if (ties == 0) continue;
+                    ties -= 1;
+                }
+                // Record indices stay below the old capacity.
+                const owner: u32 = @intCast(index);
+                context.releaseRecord(owner);
+                record.live = false;
+                self.len -= 1;
+                self.logOp(.{ .old = owner, .new = no_owner });
+            }
+            std.debug.assert(ties == 0);
+        }
+
+        // The age of the last evicted entry and how many entries of exactly that age are
+        // evicted, for evicting `evict_count` live entries oldest first.
+        fn evictionThreshold(records: []const Record, step: u32, evict_count: usize) EvictThreshold {
+            std.debug.assert(evict_count != 0);
+            var age_prefix: u32 = 0;
+            var remaining = evict_count;
+            inline for (.{ 24, 16, 8, 0 }) |shift| {
+                var histogram: [256]usize = @splat(0);
+                for (records) |record| {
+                    if (!record.live) continue;
+                    const age = step -% record.stamp;
+                    // Count only entries whose higher bytes match the age found so far.
+                    if ((@as(u64, age) >> (shift + 8)) != (@as(u64, age_prefix) >> (shift + 8))) continue;
+                    histogram[(age >> shift) & 0xff] += 1;
+                }
+                var bucket: usize = 256;
+                while (bucket > 0) {
+                    bucket -= 1;
+                    if (histogram[bucket] >= remaining) break;
+                    remaining -= histogram[bucket];
+                }
+                // The live entries outnumber the evictions, so some bucket reached the count.
+                std.debug.assert(histogram[bucket] >= remaining);
+                age_prefix |= @as(u32, @intCast(bucket)) << shift;
+            }
+            return .{ .age = age_prefix, .ties = remaining };
+        }
+    };
+}
+
+const EvictThreshold = struct {
+    age: u32,
+    ties: usize,
+};
+
+/// Whether a resize kept the cache's entries or rebuilt it empty (a stripe width change
+/// or the first reserve).
+pub const ReserveOutcome = enum { kept, rebuilt };
+
+/// One stored path a shrink moves from a record or long block past the new capacity into
+/// one below it. Distinct moves touch distinct sources and destinations.
+pub const ResizeMove = struct {
+    from: u32,
+    to: u32,
+    words: u32,
+    pool: Pool,
+
+    pub const Pool = enum(u8) { inline_stripe, long_block };
+};
+
+// Goal-keyed cache of exact paths: a moving agent derives a forward waypoint from its
+// current cell against the stored path. Every record owns an inline stripe of
+// `inline_words` words, holding a plain path of up to `inline_words` cells or a stitched
+// path of up to about two thirds as many cells (its cells, then its levels); a
+// longer result is stored whole in one long block of `long_block_words` words. Stripes
+// and long blocks live in fixed pages, so a grow appends pages and moves no path. Long
+// blocks are claimed from a free list that only the publish reserve grows, released on
+// removal, and compacted to the live long entries' pages by a shrink, so a live entry is
+// never evicted for long-pool space.
 pub const ResultCache = struct {
-    slots: std.ArrayList(ProbeSlot) = .empty,
-    payloads: std.ArrayList(SlotPayload) = .empty,
-    inline_cells: std.ArrayList(u32) = .empty,
+    const Core = CacheCore(SlotPayload);
+
+    core: Core = .{},
     inline_words: usize = 0,
-    long_cells: std.ArrayList(u32) = .empty,
     long_block_words: usize = 0,
-    // Logical long-block count; long_cells holds exactly this many blocks.
+    inline_page_shift: u6 = 0,
+    long_page_shift: u6 = 0,
+    inline_pages: std.ArrayList([]u32) = .empty,
+    // Pages the logical capacity uses; a shrink frees the pages past it after its copy.
+    inline_page_count: usize = 0,
+    long_pages: std.ArrayList([]u32) = .empty,
+    long_page_count: usize = 0,
+    // Long blocks in the pages the pool uses.
     long_block_count: usize = 0,
     // Unclaimed long blocks (stack); capacity covers every block, so a release never
     // allocates.
     free_long_blocks: std.ArrayList(u32) = .empty,
-    // Unclaimed payload/stripe indices (stack). Every occupied probe slot owns a
-    // distinct payload_index, so this holds exactly logical_capacity - len entries.
-    free_payload_indices: std.ArrayList(u32) = .empty,
-    // Pre-reserved key scratch for evictCrossing's collect-then-remove sweep.
-    evict_scratch: std.ArrayList(PathQueryKey) = .empty,
-    // Insert ceiling; slots.items.len is 2x this for probe headroom.
-    logical_capacity: usize = 0,
-    len: usize = 0,
-    next_evict: usize = 0,
+    // A shrink's stripe and long-block moves, for its resize copy; freed after it.
+    resize_moves: std.ArrayList(ResizeMove) = .empty,
 
     pub fn deinit(self: *ResultCache, allocator: std.mem.Allocator) void {
-        self.evict_scratch.deinit(allocator);
-        self.free_payload_indices.deinit(allocator);
+        self.resize_moves.deinit(allocator);
         self.free_long_blocks.deinit(allocator);
-        self.long_cells.deinit(allocator);
-        self.inline_cells.deinit(allocator);
-        self.payloads.deinit(allocator);
-        self.slots.deinit(allocator);
+        for (self.long_pages.items) |page| allocator.free(page);
+        self.long_pages.deinit(allocator);
+        for (self.inline_pages.items) |page| allocator.free(page);
+        self.inline_pages.deinit(allocator);
+        self.core.deinit(allocator);
         self.* = undefined;
     }
 
-    // Reconstructs the full PathResult for a probe slot from its hot key and cold payload.
+    /// Bytes one entry of logical capacity holds at `inline_words`-word stripes: two probe
+    /// slots, its record and key, free index, and owner-log room, and its stripe.
+    pub fn bytesPerEntry(inline_words: usize) usize {
+        return 2 * @sizeOf(ProbeSlot) + @sizeOf(Core.Record) + @sizeOf(PathQueryKey) + @sizeOf(u32) + ops_per_entry * @sizeOf(OwnerOp) + inline_words * @sizeOf(u32);
+    }
+
+    /// Bytes one long block of `long_block_words` words holds, its free index included.
+    pub fn longBlockBytes(long_block_words: usize) usize {
+        return long_block_words * @sizeOf(u32) + @sizeOf(u32);
+    }
+
+    /// Long blocks one page of `long_block_words`-word blocks holds.
+    pub fn longBlocksPerPage(long_block_words: usize) usize {
+        return @as(usize, 1) << pageShift(long_block_words);
+    }
+
+    pub fn logicalCapacity(self: *const ResultCache) usize {
+        return self.core.logical_capacity;
+    }
+
+    pub fn count(self: *const ResultCache) usize {
+        return self.core.len;
+    }
+
+    /// Whether a result can be claimed: a nonzero capacity and stripe.
+    pub fn canStore(self: *const ResultCache) bool {
+        return self.core.logical_capacity != 0 and self.inline_words != 0;
+    }
+
+    // Reconstructs the full PathResult for a probe slot from its key and record.
     pub fn resultAt(self: *const ResultCache, index: usize) PathResult {
-        const slot = self.slots.items[index];
-        const payload = self.payloads.items[slot.payload_index];
+        const slot = self.core.slots.items[index];
+        const payload = self.core.records.items[slot.payload_index].extra;
         return .{
             .key = slot.key,
             .path_len = payload.path_len,
@@ -312,346 +730,235 @@ pub const ResultCache = struct {
 
     /// Resizes to `capacity` entries with `inline_words`-word stripes and
     /// `long_block_words`-word long blocks. With unchanged widths the live entries are
-    /// kept: a grow rehashes the probe slots, a shrink first evicts oldest first (age
-    /// `step -% stamp`, then payload index) until the entries fit, then moves entries at payload index >=
-    /// `capacity` into free low indices and compacts long blocks to the live long
-    /// entries. A width change (or an empty cache) rebuilds empty. Failure-atomic: every
-    /// allocation happens before any entry moves, so an OOM leaves the cache as it was.
-    /// Main thread, resize seam. O(live entries + old and new capacity), plus a sort of
-    /// the live entries when a shrink evicts.
-    pub fn reserve(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, inline_words: usize, long_block_words: usize, step: u32) !void {
-        if (self.len == 0 or inline_words != self.inline_words or long_block_words != self.long_block_words) {
-            return self.reserveEmpty(allocator, capacity, inline_words, long_block_words);
+    /// kept: a grow appends stripe pages, and a shrink evicts oldest first (age
+    /// `step -% stamp`, then owner id) until the entries fit, moves the records past the
+    /// new capacity into free low records and the long blocks past the live long entries'
+    /// pages into free low blocks, recording each stored path's move in `resize_moves`.
+    /// The caller copies them (`copyMove`) and then calls `finishResize`, which frees the
+    /// pages left behind. A width change, or the first reserve, rebuilds empty (`.rebuilt`).
+    /// Failure-atomic: every allocation precedes any entry move. Main thread, resize seam.
+    /// O(old and new capacity) and O(1) per moved entry, no sort, no stored path copied.
+    pub fn reserve(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, inline_words: usize, long_block_words: usize, step: u32) !ReserveOutcome {
+        std.debug.assert(self.resize_moves.items.len == 0);
+        std.debug.assert(long_block_words != 0);
+        if (inline_words != self.inline_words or long_block_words != self.long_block_words) {
+            try self.reserveEmpty(allocator, capacity, inline_words, long_block_words);
+            return .rebuilt;
         }
-        if (capacity == self.logical_capacity) return;
-        return self.resizeKeepingEntries(allocator, capacity, step);
+        if (capacity != self.core.logical_capacity) try self.resizeKeepingEntries(allocator, capacity, step);
+        return .kept;
     }
 
     fn reserveEmpty(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, inline_words: usize, long_block_words: usize) !void {
-        const physical = capacity *| 2;
-        // A shrink frees the old backing after its replacement exists, so an elastic
-        // down-resize releases memory.
-        var slots_resize: ListResize(ProbeSlot) = .{};
-        try slots_resize.prepare(&self.slots, allocator, physical);
-        errdefer slots_resize.abort(allocator);
-        var payloads_resize: ListResize(SlotPayload) = .{};
-        try payloads_resize.prepare(&self.payloads, allocator, capacity);
-        errdefer payloads_resize.abort(allocator);
-        var inline_resize: ListResize(u32) = .{};
-        try inline_resize.prepare(&self.inline_cells, allocator, capacity *| inline_words);
-        errdefer inline_resize.abort(allocator);
-        var long_resize: ListResize(u32) = .{};
-        try long_resize.prepare(&self.long_cells, allocator, 0);
-        errdefer long_resize.abort(allocator);
-        var free_long_resize: ListResize(u32) = .{};
-        try free_long_resize.prepare(&self.free_long_blocks, allocator, 0);
-        errdefer free_long_resize.abort(allocator);
-        var free_indices_resize: ListResize(u32) = .{};
-        try free_indices_resize.prepare(&self.free_payload_indices, allocator, capacity);
-        errdefer free_indices_resize.abort(allocator);
-        var evict_scratch_resize: ListResize(PathQueryKey) = .{};
-        try evict_scratch_resize.prepare(&self.evict_scratch, allocator, capacity);
+        // A fresh cache at the new shape replaces this one once fully built.
+        var fresh = ResultCache{
+            .inline_words = inline_words,
+            .long_block_words = long_block_words,
+            .inline_page_shift = pageShift(inline_words),
+            .long_page_shift = pageShift(long_block_words),
+        };
+        errdefer fresh.deinit(allocator);
+        var resize = try fresh.core.prepareResize(allocator, capacity);
+        errdefer fresh.core.abortResize(allocator, &resize);
+        try fresh.appendInlinePages(allocator, pageCount(capacity, fresh.inline_page_shift));
+        fresh.core.commitResize(allocator, &resize, 0, NoRecordHooks{});
+        fresh.inline_page_count = fresh.inline_pages.items.len;
+        self.deinit(allocator);
+        self.* = fresh;
+    }
 
-        // Nothing below can fail: commit every list, then rebuild at the new shape.
-        slots_resize.commit(&self.slots, allocator);
-        payloads_resize.commit(&self.payloads, allocator);
-        inline_resize.commit(&self.inline_cells, allocator);
-        long_resize.commit(&self.long_cells, allocator);
-        free_long_resize.commit(&self.free_long_blocks, allocator);
-        free_indices_resize.commit(&self.free_payload_indices, allocator);
-        evict_scratch_resize.commit(&self.evict_scratch, allocator);
-        self.slots.items.len = physical;
-        self.payloads.items.len = capacity;
-        // Stripe contents past a stored length are never read, so they stay unwritten.
-        self.inline_cells.items.len = capacity * inline_words;
-        self.long_cells.clearRetainingCapacity();
-        self.free_long_blocks.clearRetainingCapacity();
-        self.evict_scratch.clearRetainingCapacity();
-        self.long_block_count = 0;
-        self.inline_words = inline_words;
-        self.long_block_words = long_block_words;
-        self.logical_capacity = capacity;
-        self.clear();
+    // Appends pages until `pages` exist; on error the appended pages are freed.
+    fn appendInlinePages(self: *ResultCache, allocator: std.mem.Allocator, pages: usize) !void {
+        const before = self.inline_pages.items.len;
+        if (pages <= before) return;
+        try self.inline_pages.ensureTotalCapacity(allocator, pages);
+        errdefer {
+            for (self.inline_pages.items[before..]) |page| allocator.free(page);
+            self.inline_pages.items.len = before;
+        }
+        const page_words = (@as(usize, 1) << self.inline_page_shift) * self.inline_words;
+        while (self.inline_pages.items.len < pages) self.inline_pages.appendAssumeCapacity(try allocator.alloc(u32, page_words));
     }
 
     fn resizeKeepingEntries(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, step: u32) !void {
-        const old_capacity = self.logical_capacity;
+        const old_capacity = self.core.logical_capacity;
         const shrinking = capacity < old_capacity;
-        const physical = capacity *| 2;
-
-        // Prepare: every allocation, and the eviction order, before any entry moves.
-        var new_slots: std.ArrayList(ProbeSlot) = .empty;
-        try new_slots.ensureTotalCapacityPrecise(allocator, physical);
-        errdefer new_slots.deinit(allocator);
-        var order: std.ArrayList(EntryAge) = .empty;
-        defer order.deinit(allocator);
-        const evict_count = self.len -| capacity;
-        var kept_long = self.long_block_count - self.free_long_blocks.items.len;
-        if (evict_count != 0) {
-            try order.ensureTotalCapacityPrecise(allocator, self.len);
-            for (self.slots.items, 0..) |slot, slot_index| {
-                if (!slot.occupied) continue;
-                order.appendAssumeCapacity(.{
-                    .age = step -% self.payloads.items[slot.payload_index].stamp,
-                    .payload_index = slot.payload_index,
-                    .slot_index = slot_index,
-                });
-            }
-            std.mem.sortUnstable(EntryAge, order.items, {}, EntryAge.olderThan);
-            for (order.items[0..evict_count]) |victim| {
-                if (self.payloads.items[victim.payload_index].long_block != no_block) kept_long -= 1;
-            }
-        }
-        const long_count = if (shrinking) kept_long else self.long_block_count;
-        var payloads_resize: ListResize(SlotPayload) = .{};
-        try payloads_resize.prepare(&self.payloads, allocator, capacity);
-        errdefer payloads_resize.abort(allocator);
-        var inline_resize: ListResize(u32) = .{};
-        try inline_resize.prepare(&self.inline_cells, allocator, capacity *| self.inline_words);
-        errdefer inline_resize.abort(allocator);
-        var long_resize: ListResize(u32) = .{};
-        try long_resize.prepare(&self.long_cells, allocator, long_count *| self.long_block_words);
-        errdefer long_resize.abort(allocator);
-        var free_long_resize: ListResize(u32) = .{};
-        try free_long_resize.prepare(&self.free_long_blocks, allocator, long_count);
-        errdefer free_long_resize.abort(allocator);
-        var free_indices_resize: ListResize(u32) = .{};
-        try free_indices_resize.prepare(&self.free_payload_indices, allocator, capacity);
-        errdefer free_indices_resize.abort(allocator);
-        var evict_scratch_resize: ListResize(PathQueryKey) = .{};
-        try evict_scratch_resize.prepare(&self.evict_scratch, allocator, capacity);
-
-        // Commit: nothing below can fail.
-        for (order.items[0..evict_count]) |victim| {
-            // The old probe table is rebuilt below, so its chains need not stay contiguous.
-            self.slots.items[victim.slot_index].occupied = false;
-            self.releasePayload(victim.payload_index);
-            self.len -= 1;
+        const old_pages = self.inline_pages.items.len;
+        var resize = try self.core.prepareResize(allocator, capacity);
+        errdefer self.core.abortResize(allocator, &resize);
+        try self.appendInlinePages(allocator, pageCount(capacity, self.inline_page_shift));
+        errdefer {
+            for (self.inline_pages.items[old_pages..]) |page| allocator.free(page);
+            self.inline_pages.items.len = old_pages;
         }
         if (shrinking) {
-            self.compactPayloads(capacity);
-            self.compactLongBlocks(long_count);
+            // Inline moves are at most the records past the new capacity; long moves at
+            // most the live long entries.
+            const live_long = self.long_block_count - self.free_long_blocks.items.len;
+            try self.resize_moves.ensureTotalCapacity(allocator, @min(self.core.len, old_capacity - capacity) + live_long);
         }
-        payloads_resize.commitResized(&self.payloads, allocator, capacity);
-        inline_resize.commitResized(&self.inline_cells, allocator, capacity * self.inline_words);
-        long_resize.commitResized(&self.long_cells, allocator, long_count * self.long_block_words);
-        free_long_resize.commitResized(&self.free_long_blocks, allocator, self.free_long_blocks.items.len);
-        free_indices_resize.commitResized(&self.free_payload_indices, allocator, self.free_payload_indices.items.len);
-        evict_scratch_resize.commit(&self.evict_scratch, allocator);
-        self.evict_scratch.clearRetainingCapacity();
-        for (old_capacity..@max(old_capacity, capacity)) |payload_index| {
-            self.payloads.items[payload_index] = .{};
-            self.free_payload_indices.appendAssumeCapacity(@intCast(payload_index));
-        }
-        self.long_block_count = long_count;
 
-        // Rehash every live slot; payload indices are final.
-        new_slots.items.len = physical;
-        @memset(new_slots.items, .{});
-        for (self.slots.items) |slot| {
-            if (slot.occupied) insertRehashed(ProbeSlot, new_slots.items, slot);
-        }
-        self.slots.deinit(allocator);
-        self.slots = new_slots;
-        self.logical_capacity = capacity;
-        self.next_evict = 0;
-        std.debug.assert(self.free_payload_indices.items.len == capacity - self.len);
+        // Commit: nothing below can fail.
+        self.core.commitResize(allocator, &resize, step, self);
+        if (shrinking) self.compactLongBlocks();
+        self.inline_page_count = pageCount(capacity, self.inline_page_shift);
     }
 
-    // Moves every live payload at index >= `capacity` into a free index below it (stripe
-    // and long block reference move with it), leaving only low free indices. Runs after
-    // the shrink's evictions, so the live entries fit below `capacity`.
-    fn compactPayloads(self: *ResultCache, capacity: usize) void {
-        retainBelow(&self.free_payload_indices, capacity);
-        for (self.slots.items) |*slot| {
-            if (!slot.occupied or slot.payload_index < capacity) continue;
-            const target = self.free_payload_indices.pop().?; // live entries fit below capacity
-            const payload = self.payloads.items[slot.payload_index];
-            if (payload.long_block == no_block) {
-                const words = types.storedPathWords(payload.path_len, payload.stitched_len);
-                @memcpy(self.inlineStripe(target)[0..words], self.inlineStripe(slot.payload_index)[0..words]);
-            }
-            self.payloads.items[target] = payload;
-            slot.payload_index = target;
+    // Moves every live long block past the pages the live long entries need into a free
+    // block below them, recording each move.
+    fn compactLongBlocks(self: *ResultCache) void {
+        const live_long = self.long_block_count - self.free_long_blocks.items.len;
+        const pages = pageCount(live_long, self.long_page_shift);
+        const kept_blocks = pages << self.long_page_shift;
+        if (kept_blocks >= self.long_block_count) return;
+        retainBelow(&self.free_long_blocks, kept_blocks);
+        for (self.core.records.items) |*record| {
+            if (!record.live or record.extra.long_block == no_block or record.extra.long_block < kept_blocks) continue;
+            // The live long entries fit below `kept_blocks`.
+            const target = self.free_long_blocks.pop().?;
+            const words = types.storedPathWords(record.extra.path_len, record.extra.stitched_len);
+            // A stored path fits its u32 length fields.
+            self.resize_moves.appendAssumeCapacity(.{ .from = record.extra.long_block, .to = target, .words = @intCast(words), .pool = .long_block });
+            record.extra.long_block = target;
         }
+        self.long_page_count = pages;
+        self.long_block_count = kept_blocks;
     }
 
-    // Moves every live long block at index >= `long_count` (the live long entries) into a
-    // free block below it, leaving no free blocks.
-    fn compactLongBlocks(self: *ResultCache, long_count: usize) void {
-        retainBelow(&self.free_long_blocks, long_count);
-        for (self.slots.items) |slot| {
-            if (!slot.occupied) continue;
-            const payload = &self.payloads.items[slot.payload_index];
-            if (payload.long_block == no_block or payload.long_block < long_count) continue;
-            const target = self.free_long_blocks.pop().?; // live long entries fit below long_count
-            const words = types.storedPathWords(payload.path_len, payload.stitched_len);
-            @memcpy(self.longBlock(target)[0..words], self.longBlock(payload.long_block)[0..words]);
-            payload.long_block = target;
-        }
-        std.debug.assert(self.free_long_blocks.items.len == 0);
+    // `CacheCore` hook: a shrink evicted `owner`, releasing its long block.
+    fn releaseRecord(self: *ResultCache, owner: u32) void {
+        self.releaseLongBlock(&self.core.records.items[owner].extra);
     }
 
-    /// The publish reserve, called with the step's long-result count before any `put`
-    /// stores one: grows the long-block pool so every claim finds a free block, and never
-    /// past `logical_capacity` blocks. Each entry holds at most one block and a `put`
-    /// releases (its own, or an evicted victim's) before it claims, so live blocks never
-    /// exceed the entry limit; min(live + needed, limit) blocks therefore suffice.
-    /// Geometric (at least doubles, clamped to the limit); failure-atomic. Main thread.
-    pub fn reserveLongBlocks(self: *ResultCache, allocator: std.mem.Allocator, needed: usize) !void {
-        const old_count = self.long_block_count;
-        const live = old_count - self.free_long_blocks.items.len;
-        const required = @min(live +| needed, self.logical_capacity);
-        if (old_count >= required) return;
-        const new_count = @min(@max(required, old_count *| 2), self.logical_capacity);
-        try self.long_cells.ensureTotalCapacity(allocator, new_count *| self.long_block_words);
+    // `CacheCore` hook: a shrink moved record `from` to `to`; an inline path moves with it.
+    fn moveRecord(self: *ResultCache, from: u32, to: u32) void {
+        const payload = self.core.records.items[to].extra;
+        if (payload.long_block != no_block) return;
+        const words = types.storedPathWords(payload.path_len, payload.stitched_len);
+        // A stored path fits its u32 length fields.
+        self.resize_moves.appendAssumeCapacity(.{ .from = from, .to = to, .words = @intCast(words), .pool = .inline_stripe });
+    }
+
+    /// The stored path moves of the last shrink, for its resize copy.
+    pub fn pendingMoves(self: *const ResultCache) []const ResizeMove {
+        return self.resize_moves.items;
+    }
+
+    /// Copies one pending move's stored path. Moves touch distinct words, so they copy on
+    /// any thread in any order.
+    pub fn copyMove(self: *const ResultCache, move: ResizeMove) void {
+        const from, const to = switch (move.pool) {
+            .inline_stripe => .{ self.inlineStripe(move.from), self.inlineStripe(move.to) },
+            .long_block => .{ self.longBlock(move.from), self.longBlock(move.to) },
+        };
+        @memcpy(to[0..move.words], from[0..move.words]);
+    }
+
+    /// Ends a resize once its moves are copied: frees the pages past the capacity and the
+    /// move list. Infallible.
+    pub fn finishResize(self: *ResultCache, allocator: std.mem.Allocator) void {
+        for (self.inline_pages.items[self.inline_page_count..]) |page| allocator.free(page);
+        self.inline_pages.items.len = self.inline_page_count;
+        for (self.long_pages.items[self.long_page_count..]) |page| allocator.free(page);
+        self.long_pages.items.len = self.long_page_count;
+        self.resize_moves.clearAndFree(allocator);
+    }
+
+    /// The publish reserve, called with the step's long-result count before any claim
+    /// stores one: appends long-block pages so every claim finds a free block, never past
+    /// the page holding the `logicalCapacity()`th block. Each entry holds at most one block
+    /// and a claim releases (its own, or its victim's) before it takes one, so live blocks
+    /// never exceed the entry limit. Copies no stored path. Failure-atomic. Main thread.
+    /// Returns the pages it allocated.
+    pub fn reserveLongBlocks(self: *ResultCache, allocator: std.mem.Allocator, needed: usize) !usize {
+        const live = self.long_block_count - self.free_long_blocks.items.len;
+        const required = @min(live +| needed, self.core.logical_capacity);
+        if (self.long_block_count >= required) return 0;
+        const pages = pageCount(required, self.long_page_shift);
+        const new_count = pages << self.long_page_shift;
+        try self.long_pages.ensureTotalCapacity(allocator, pages);
         try self.free_long_blocks.ensureTotalCapacity(allocator, new_count);
-        self.long_cells.items.len = new_count * self.long_block_words;
+        const before = self.long_pages.items.len;
+        errdefer {
+            for (self.long_pages.items[before..]) |page| allocator.free(page);
+            self.long_pages.items.len = before;
+        }
+        const page_words = (@as(usize, 1) << self.long_page_shift) * self.long_block_words;
+        while (self.long_pages.items.len < pages) self.long_pages.appendAssumeCapacity(try allocator.alloc(u32, page_words));
         // Pushed high to low so the lowest new block is claimed first.
         var block = new_count;
-        while (block > old_count) {
+        while (block > self.long_block_count) {
             block -= 1;
-            self.free_long_blocks.appendAssumeCapacity(@intCast(block)); // <= logical_capacity, a u32 payload width
+            // Below the page past the logical capacity, a u32 payload width.
+            self.free_long_blocks.appendAssumeCapacity(@intCast(block));
         }
+        self.long_page_count = pages;
         self.long_block_count = new_count;
+        return pages - before;
     }
 
     pub fn clear(self: *ResultCache) void {
-        for (self.slots.items) |*slot| slot.occupied = false;
-        for (self.payloads.items) |*payload| payload.long_block = no_block;
-        self.free_payload_indices.clearRetainingCapacity();
-        for (0..self.logical_capacity) |payload_index| {
-            self.free_payload_indices.appendAssumeCapacity(@intCast(payload_index));
-        }
+        for (self.core.records.items) |*record| record.extra.long_block = no_block;
+        self.core.clear();
         self.free_long_blocks.clearRetainingCapacity();
         var block = self.long_block_count;
         while (block > 0) {
             block -= 1;
+            // Below the page past the logical capacity, a u32 payload width.
             self.free_long_blocks.appendAssumeCapacity(@intCast(block));
         }
-        self.len = 0;
-        self.next_evict = 0;
     }
 
-    // Evicts only cached paths crossing a changed span; paths clear of the edited cells
-    // survive and keep serving hits. Matches on the stored corridor (or plain) cells.
-    // One read-only pass collects the crossing keys into pre-reserved scratch, then
-    // removes them by key: back-shift relocation during removal can therefore never
-    // skip or double-visit an entry, without restarting the scan per eviction.
-    pub fn evictCrossing(self: *ResultCache, graph: *const NavGraph, spans: []const ChangedSpan) void {
-        if (spans.len == 0) return;
-        self.evict_scratch.clearRetainingCapacity();
-        for (self.slots.items) |slot| {
-            if (!slot.occupied) continue;
-            if (self.crossesSpans(graph, slot.payload_index, spans)) {
-                // At most len (<= logical_capacity) occupied slots exist, matching the
-                // scratch reserve.
-                self.evict_scratch.appendAssumeCapacity(slot.key);
-            }
-        }
-        for (self.evict_scratch.items) |key| self.remove(key);
-    }
-
-    fn remove(self: *ResultCache, key: PathQueryKey) void {
-        const index = self.slotIndex(key) orelse return;
-        self.removeAt(index);
-    }
-
-    // Back-shift deletion for the open-addressed slot table. Clearing a slot in the middle
-    // of a probe run would strand later keys behind the gap (lookups early-terminate on the
-    // first truly-empty slot), so we pull up any following entry whose home position lets it
-    // fill the hole. Only the small probe slot moves — its payload_index travels with it,
-    // so the cold payload and cell stripes never move. Keeps every probe chain contiguous,
-    // which is what the empty-slot probe early-out relies on.
-    fn removeAt(self: *ResultCache, index: usize) void {
-        const capacity = self.slots.items.len;
-        self.releasePayload(self.slots.items[index].payload_index);
-        self.slots.items[index].occupied = false;
-        self.len -= 1;
-        var hole = index;
-        var probe = index;
-        while (true) {
-            probe = (probe + 1) % capacity;
-            if (probe == index) break; // wrapped fully (also guards capacity == 1)
-            const slot = self.slots.items[probe];
-            if (!slot.occupied) break;
-            const home = hashPathKey(slot.key) % capacity;
-            // Keep the entry where it is when its home is cyclically within (hole, probe];
-            // otherwise it can move up to fill the hole without becoming unreachable.
-            if (inCyclicRange(hole, probe, home)) continue;
-            self.slots.items[hole] = slot;
-            self.slots.items[probe].occupied = false;
-            hole = probe;
-        }
-    }
-
-    // Returns a payload index (and its long block, if any) to the free lists.
-    fn releasePayload(self: *ResultCache, payload_index: u32) void {
-        self.releaseLongBlock(&self.payloads.items[payload_index]);
-        self.free_payload_indices.appendAssumeCapacity(payload_index);
+    /// Removes the entry at probe slot `index`, retiring its owner and releasing its long
+    /// block. O(1) expected; allocates nothing.
+    pub fn removeAt(self: *ResultCache, index: usize) void {
+        self.releaseLongBlock(&self.core.records.items[self.core.slots.items[index].payload_index].extra);
+        self.core.removeAt(index);
     }
 
     fn releaseLongBlock(self: *ResultCache, payload: *SlotPayload) void {
         if (payload.long_block == no_block) return;
+        std.debug.assert(self.free_long_blocks.items.len < self.free_long_blocks.capacity);
         self.free_long_blocks.appendAssumeCapacity(payload.long_block);
         payload.long_block = no_block;
     }
 
-    fn crossesSpans(self: *const ResultCache, graph: *const NavGraph, payload_index: usize, spans: []const ChangedSpan) bool {
-        const payload = self.payloads.items[payload_index];
-        const words = self.storedWords(payload_index);
-        if (payload.stitched_len != 0) {
-            for (types.stitchedCellsConst(words, payload.stitched_len)) |sc| {
-                if (sc.cell != no_cell and cellInSpans(graph, sc.level, sc.cell, spans)) return true;
-            }
-            return false;
-        }
-        for (words[0..payload.path_len]) |cell| {
-            if (cell != no_cell and cellInSpans(graph, payload.path_level, cell, spans)) return true;
-        }
-        return false;
+    fn inlineStripe(self: *const ResultCache, owner: usize) []u32 {
+        const page = self.inline_pages.items[owner >> self.inline_page_shift];
+        const offset = (owner & ((@as(usize, 1) << self.inline_page_shift) - 1)) * self.inline_words;
+        return page[offset..][0..self.inline_words];
     }
 
-    fn inlineStripe(self: *ResultCache, payload_index: usize) []u32 {
-        return self.inline_cells.items[payload_index * self.inline_words ..][0..self.inline_words];
+    fn longBlock(self: *const ResultCache, block: usize) []u32 {
+        const page = self.long_pages.items[block >> self.long_page_shift];
+        const offset = (block & ((@as(usize, 1) << self.long_page_shift) - 1)) * self.long_block_words;
+        return page[offset..][0..self.long_block_words];
     }
 
-    fn longBlock(self: *ResultCache, block: usize) []u32 {
-        return self.long_cells.items[block * self.long_block_words ..][0..self.long_block_words];
+    /// The words holding `owner`'s stored path: its long block, else its inline stripe.
+    pub fn storedWords(self: *const ResultCache, owner: usize) []const u32 {
+        const block = self.core.records.items[owner].extra.long_block;
+        if (block != no_block) return self.longBlock(block);
+        return self.inlineStripe(owner);
     }
 
-    // The words holding a payload's stored path: its long block, else its inline stripe.
-    fn storedWords(self: *const ResultCache, payload_index: usize) []const u32 {
-        const block = self.payloads.items[payload_index].long_block;
-        if (block != no_block) return self.long_cells.items[@as(usize, block) * self.long_block_words ..][0..self.long_block_words];
-        return self.inline_cells.items[payload_index * self.inline_words ..][0..self.inline_words];
+    /// The words a claim's copy writes. Distinct claims of one publish never share words.
+    pub fn destination(self: *const ResultCache, claimed: Claimed) []u32 {
+        if (claimed.long_block != no_block) return self.longBlock(claimed.long_block);
+        return self.inlineStripe(claimed.owner);
     }
 
-    // `slot_index` is the PROBE slot index (as returned by slotIndex/freshSlotIndex),
-    // not a payload index; both slices translate through the slot's payload_index so
-    // callers never need to know the indirection exists.
+    // `slot_index` is the PROBE slot index (as returned by slotIndex/freshSlotIndex).
     pub fn pathSlice(self: *const ResultCache, slot_index: usize, path_len: usize) []const u32 {
-        return self.storedWords(self.slots.items[slot_index].payload_index)[0..path_len];
+        return self.storedWords(self.core.slots.items[slot_index].payload_index)[0..path_len];
     }
 
-    pub fn stitchedSlice(self: *const ResultCache, slot_index: usize, stitched_len: usize) []const StitchedCell {
-        return types.stitchedCellsConst(self.storedWords(self.slots.items[slot_index].payload_index), stitched_len);
+    pub fn stitchedSlice(self: *const ResultCache, slot_index: usize, stitched_len: usize) StitchedView {
+        return types.stitchedView(self.storedWords(self.core.slots.items[slot_index].payload_index), stitched_len);
     }
 
     pub fn slotIndex(self: *const ResultCache, key: PathQueryKey) ?usize {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return null;
-        const start = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.key, key)) return index;
-            // Physical capacity is 2x logical_capacity, so len never reaches capacity;
-            // chains are contiguous (back-shift deletion), so the first empty slot ends
-            // this key's chain whether present or absent.
-            if (!slot.occupied) return null;
-        }
-        return null;
+        return self.core.slotIndex(key);
     }
 
     pub fn find(self: *const ResultCache, key: PathQueryKey) ?PathResult {
@@ -660,10 +967,9 @@ pub const ResultCache = struct {
     }
 
     // Non-mutating freshness gate for the per-frame read path (statusForWorld): returns the
-    // slot only when it is within `ttl`. A const reader cannot evict, so a stale entry simply
-    // reads as a miss here and the caller re-requests; acceptRequests' findFresh does the
-    // actual eviction. Without this, an agent that only polls statusForWorld (never enqueues)
-    // is served a path older than the TTL forever. ttl 0 disables expiry.
+    // slot only when it is within `ttl`. A const reader cannot evict, so a stale entry
+    // reads as a miss and the caller re-requests; acceptRequests' findFresh evicts. ttl 0
+    // disables expiry.
     pub fn freshSlotIndex(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?usize {
         const found = self.lookup(key, step, ttl) orelse return null;
         return if (found.fresh) found.slot else null;
@@ -678,122 +984,74 @@ pub const ResultCache = struct {
     /// null when absent. ttl 0 disables expiry. Const: never evicts.
     pub fn lookup(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?SlotLookup {
         const index = self.slotIndex(key) orelse return null;
-        const payload_index = self.slots.items[index].payload_index;
-        return .{ .slot = index, .fresh = ttl == 0 or (step -% self.payloads.items[payload_index].stamp) < ttl };
+        const owner = self.core.slots.items[index].payload_index;
+        return .{ .slot = index, .fresh = ttl == 0 or (step -% self.core.records.items[owner].stamp) < ttl };
     }
 
-    // find, but a result older than `ttl` steps is dropped (returns null) so the caller
+    // find, but a result older than `ttl` steps is removed (returns null) so the caller
     // re-solves it against current geometry. ttl 0 disables expiry.
     pub fn findFresh(self: *ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?PathResult {
         const index = self.slotIndex(key) orelse return null;
-        const payload_index = self.slots.items[index].payload_index;
-        if (ttl != 0 and (step -% self.payloads.items[payload_index].stamp) >= ttl) {
+        const owner = self.core.slots.items[index].payload_index;
+        if (ttl != 0 and (step -% self.core.records.items[owner].stamp) >= ttl) {
             self.removeAt(index);
             return null;
         }
         return self.resultAt(index);
     }
 
-    /// Stores a result exactly: a plain local-solve path (start-to-goal cell order) on
-    /// `path_level`, or a full stitched (level,cell) corridor path, never both. A result
-    /// past the inline stripe takes a long block, which `reserveLongBlocks` must have made
-    /// free; re-putting a key releases its previous block. Allocates nothing.
-    pub fn put(self: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, step: u32, stats: *PathfindingStats) void {
-        if (self.logical_capacity == 0 or self.inline_words == 0) return;
-        std.debug.assert(path.len == 0 or stitched.len == 0);
-        const words = types.storedPathWords(path.len, stitched.len);
-        const slot_index = self.findOrEvictSlot(key, stats);
-        const payload_index = self.slots.items[slot_index].payload_index;
-        const payload = &self.payloads.items[payload_index];
+    /// Where a claimed result is stored: its owner's inline stripe, or a long block.
+    pub const Claimed = struct {
+        owner: u32,
+        long_block: u32,
+    };
+
+    /// Claims `key`'s entry for a result of `path_len` plain or `stitched_len` stitched
+    /// cells at `step` (see `CacheCore.claim`) and records its shape; the caller copies the
+    /// path into `destination`. A result past the inline stripe takes a long block, which
+    /// `reserveLongBlocks` made free; a re-put or a victim releases its block first. Opens
+    /// no publish: call `core.beginPublish` first. Main thread; allocates nothing.
+    pub fn claim(self: *ResultCache, key: PathQueryKey, path_len: usize, stitched_len: usize, path_level: u16, step: u32, stats: *PathfindingStats) Claimed {
+        std.debug.assert(self.canStore());
+        std.debug.assert(path_len == 0 or stitched_len == 0);
+        const words = types.storedPathWords(path_len, stitched_len);
+        const owner = self.core.claim(key, step, stats);
+        const payload = &self.core.records.items[owner].extra;
         self.releaseLongBlock(payload);
         var long_block = no_block;
-        const dst = if (words <= self.inline_words) self.inlineStripe(payload_index) else long: {
-            // The solve bounds a result at one long block; the publish reserve freed a block.
+        if (words > self.inline_words) {
+            // The solve bounds a result at one long block; the publish reserve freed one.
             std.debug.assert(words <= self.long_block_words);
-            std.debug.assert(self.free_long_blocks.items.len != 0);
             long_block = self.free_long_blocks.pop().?;
-            break :long self.longBlock(long_block);
-        };
-        if (stitched.len != 0) {
-            @memcpy(types.stitchedCells(dst, stitched.len), stitched);
-        } else {
-            @memcpy(dst[0..path.len], path);
         }
         payload.* = .{
-            .stamp = step,
-            .path_len = @intCast(path.len), // bounded by the solve's node budget
-            .stitched_len = @intCast(stitched.len), // bounded by max_stitched_path_cells
+            .path_len = @intCast(path_len), // bounded by the solve's node budget
+            .stitched_len = @intCast(stitched_len), // bounded by max_stitched_path_cells
             .long_block = long_block,
             .path_level = path_level,
         };
+        return .{ .owner = owner, .long_block = long_block };
     }
+};
 
-    // Finds key's existing probe slot, or claims/evicts one and assigns it a payload_index
-    // (leaving the payload contents for the caller to overwrite). Returns the PROBE slot
-    // index, not the payload index.
-    fn findOrEvictSlot(self: *ResultCache, key: PathQueryKey, stats: *PathfindingStats) usize {
-        const capacity = self.slots.items.len;
-        std.debug.assert(capacity != 0); // callers guard this; assert before `% capacity`
-        const start = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.key, key)) return index;
-            if (!slot.occupied) {
-                if (self.len < self.logical_capacity) {
-                    const payload_index = self.free_payload_indices.pop().?;
-                    self.slots.items[index] = .{ .occupied = true, .key = key, .payload_index = payload_index };
-                    self.len += 1;
-                    return index;
-                }
-                // Logically full (every payload slot owned): evict a round-robin victim —
-                // skipping empty physical slots, since occupancy is sparse — to free a
-                // payload_index, then probe again. The victim may sit in this key's chain,
-                // where back-shift can leave the hole ahead of `index`, so the key goes in
-                // the first empty slot of the re-probed chain, never at the stale `index`.
-                while (!self.slots.items[self.next_evict].occupied) {
-                    self.next_evict = (self.next_evict + 1) % capacity;
-                }
-                const victim = self.next_evict;
-                self.next_evict = (self.next_evict + 1) % capacity;
-                stats.cache_evictions += 1;
-                self.removeAt(victim);
-                std.debug.assert(self.len < self.logical_capacity);
-                return self.findOrEvictSlot(key, stats);
-            }
-        }
-        unreachable; // physical capacity is 2x logical_capacity; an empty slot always exists
-    }
+// Hooks for a resize that holds no stored paths.
+const NoRecordHooks = struct {
+    fn releaseRecord(_: NoRecordHooks, _: u32) void {}
+    fn moveRecord(_: NoRecordHooks, _: u32, _: u32) void {}
 };
 
 const no_block: u32 = std.math.maxInt(u32);
 
-// A live entry's eviction rank for a shrink: greatest age (steps since its stamp, wrapping
-// like the TTL check) first, payload index breaking ties.
-const EntryAge = struct {
-    age: u32,
-    payload_index: u32,
-    slot_index: usize,
-
-    fn olderThan(_: void, lhs: EntryAge, rhs: EntryAge) bool {
-        if (lhs.age != rhs.age) return lhs.age > rhs.age;
-        return lhs.payload_index < rhs.payload_index;
-    }
-};
-
 // Probe-hot slot: the fields a linear-probe scan touches (occupancy + key), plus the
-// indirection to this entry's payload/cell-stripe slot in the logical-capacity arrays.
+// owner id of its record.
 const ProbeSlot = struct {
     occupied: bool = false,
     key: PathQueryKey = emptyKey(0),
     payload_index: u32 = 0,
 };
 
-// Cold per-slot payload, parallel to ProbeSlot. Read only on a hit / TTL check, so it
-// is kept off the probe-scan cache lines. Four u32s, then the u16: 20 bytes.
+// A cached result's shape: four u32s, then the u16: 20 bytes.
 const SlotPayload = struct {
-    // step_counter when the entry was written, for TTL refresh.
-    stamp: u32 = 0,
     path_len: u32 = 0,
     stitched_len: u32 = 0,
     // The long block holding the path, or no_block when it sits in the inline stripe.
@@ -825,18 +1083,6 @@ fn retainBelow(free: *std.ArrayList(u32), limit: usize) void {
 fn inCyclicRange(start: usize, end: usize, x: usize) bool {
     if (start < end) return x > start and x <= end;
     return x > start or x <= end;
-}
-
-// Whether nav cell (level, cell) falls inside any changed span on its level.
-fn cellInSpans(graph: *const NavGraph, level: u16, cell: u32, spans: []const ChangedSpan) bool {
-    const grid = graph.grid(level) orelse return false;
-    const cx: usize = cell % grid.width;
-    const cy: usize = cell / grid.width;
-    for (spans) |s| {
-        if (s.level != level) continue;
-        if (cx >= s.span.min_x and cx <= s.span.max_x and cy >= s.span.min_y and cy <= s.span.max_y) return true;
-    }
-    return false;
 }
 
 // Per-agent waypoint derivation against a cached path. This is the per-step,
@@ -904,73 +1150,74 @@ fn waypointAt(grid: *const NavGrid, path: []const u32, index: usize, hint: ?*u32
 // Per-agent waypoint derivation against a stitched cross-chunk/cross-level corridor
 // path. The stitched path is a single obstacle-aware (level,cell) sequence; within
 // each level its cells are grid-adjacent (the level changes only across a link). The
-// agent's forward waypoint is found by walking the contiguous run of cells on the
-// agent's CURRENT level with the exact same cell-by-cell logic as a plain A* path,
-// so the heading is always to a traversable neighbor — never a straight-line cut
-// across a blocked cell. Returns null when the agent's level has no run in the path
-// (a cross-level agent has not yet reached a level the corridor covers).
-pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCell, start_level: u16, start_index: usize, hint: ?*u32) ?math.Vec2 {
+// agent's forward waypoint is found on the agent's CURRENT level with the same
+// cell-by-cell logic as a plain A* path, so the heading is always to a traversable
+// neighbor — never a straight-line cut across a blocked cell. Returns null when the
+// agent's level has no cell in the path (a cross-level agent has not yet reached a level
+// the corridor covers).
+pub fn waypointFromStitched(graph: *const NavGraph, stitched: StitchedView, start_level: u16, start_index: usize, hint: ?*u32) ?math.Vec2 {
     const start_grid = graph.grid(start_level) orelse return null;
+    // Cell indices are u32.
+    const start_cell: u32 = @intCast(start_index);
     // Hinted fast path: probe a forward window for an exact cell match on the agent's
-    // level before the full run scan. A cell appears at most once per level run, so a hit
+    // level before the full scan. A cell appears at most once per level run, so a hit
     // is unambiguous; a stale hint only misses and falls back to the scan.
     if (hint) |h| {
-        const from = @min(@as(usize, h.*), stitched.len -| 1);
-        const to = @min(from + waypoint_hint_window, stitched.len);
+        const from = @min(@as(usize, h.*), stitched.len() -| 1);
+        const to = @min(from + waypoint_hint_window, stitched.len());
         for (from..to) |j| {
-            if (stitched[j].level == start_level and stitched[j].cell == start_index) {
+            // The cell first: the levels column is read only on a cell match.
+            if (stitched.cells[j] == start_cell and stitched.levels[j] == start_level) {
                 return stitchedWaypointAt(start_grid, stitched, start_level, j, hint);
             }
         }
     }
-    // Scan the path's contiguous runs on the agent's level. An exact match (the agent
-    // is on a path cell) walks to that cell's successor within the run. Otherwise fall
-    // back to the run holding the nearest cell on this level and walk from there.
-    // Single pass: an exact cell match returns immediately; otherwise nearest_index is
-    // tracked alongside best_dist so the off-path branch needs no second scan.
-    var i: usize = 0;
+    // The agent on a path cell walks to that cell's successor within its run.
+    if (stitchedExactIndex(stitched, start_level, start_cell)) |j| return stitchedWaypointAt(start_grid, stitched, start_level, j, hint);
+    // Off path: head from the nearest cell on this level. Scalar: the cell -> (x, y) split
+    // is an integer division per cell, which simd.zig has no vector form of.
     var nearest_index: usize = 0;
     var best_dist: i64 = std.math.maxInt(i64);
     var found_run = false;
     const start_x: i32 = @intCast(start_index % start_grid.width);
     const start_y: i32 = @intCast(start_index / start_grid.width);
-    while (i < stitched.len) {
-        if (stitched[i].level != start_level) {
-            i += 1;
-            continue;
-        }
-        const run_begin = i;
-        while (i < stitched.len and stitched[i].level == start_level) : (i += 1) {}
-        const run_end = i; // exclusive
-        for (run_begin..run_end) |j| {
-            if (stitched[j].cell == start_index) {
-                return stitchedWaypointAt(start_grid, stitched, start_level, j, hint);
-            }
-            const cx: i32 = @intCast(stitched[j].cell % start_grid.width);
-            const cy: i32 = @intCast(stitched[j].cell / start_grid.width);
-            const ddx: i64 = cx - start_x;
-            const ddy: i64 = cy - start_y;
-            const dist = ddx * ddx + ddy * ddy;
-            if (dist < best_dist) {
-                best_dist = dist;
-                nearest_index = j;
-                found_run = true;
-            }
+    for (stitched.cells, stitched.levels, 0..) |cell, level, j| {
+        if (level != start_level) continue;
+        const cx: i32 = @intCast(cell % start_grid.width);
+        const cy: i32 = @intCast(cell / start_grid.width);
+        const ddx: i64 = cx - start_x;
+        const ddy: i64 = cy - start_y;
+        const dist = ddx * ddx + ddy * ddy;
+        if (dist < best_dist) {
+            best_dist = dist;
+            nearest_index = j;
+            found_run = true;
         }
     }
     if (!found_run) return null;
-    // Off-path on this level: head toward the nearest run cell's successor tracked above.
     // The run is grid-adjacent, so the successor is one traversable step from nearest.
     return stitchedWaypointAt(start_grid, stitched, start_level, nearest_index, hint);
+}
+
+// First index holding `cell` on `level`: the four-lane exact scan of the cells column,
+// its level checked on each hit.
+fn stitchedExactIndex(stitched: StitchedView, level: u16, cell: u32) ?usize {
+    var from: usize = 0;
+    while (exactCellIndex(stitched.cells[from..], cell)) |offset| {
+        const index = from + offset;
+        if (stitched.levels[index] == level) return index;
+        from = index + 1;
+    }
+    return null;
 }
 
 // Records the matched/nearest stitched index in the hint and returns the heading to its
 // successor within the same-level run (or the cell itself at the run's end). The run is
 // grid-adjacent, so the successor is always one traversable step.
-fn stitchedWaypointAt(grid: *const NavGrid, stitched: []const StitchedCell, level: u16, j: usize, hint: ?*u32) math.Vec2 {
+fn stitchedWaypointAt(grid: *const NavGrid, stitched: StitchedView, level: u16, j: usize, hint: ?*u32) math.Vec2 {
     if (hint) |h| h.* = @intCast(j);
-    const next = if (j + 1 < stitched.len and stitched[j + 1].level == level) j + 1 else j;
-    return grid.cellCenter(stitched[next].cell);
+    const next = if (j + 1 < stitched.len() and stitched.levels[j + 1] == level) j + 1 else j;
+    return grid.cellCenter(stitched.cells[next]);
 }
 
 // ----------------------------------------------------------------------------
@@ -1070,49 +1317,64 @@ test "pathfinding key set resize keeps its entries" {
     try std.testing.expect(!keys.insert(testGoalKey(1000)));
 }
 
-const no_test_block = std.math.maxInt(u32);
-
-/// Invariants every `ResultCache` state must hold: physical lists cover the logical limit
-/// at the committed widths, every live entry owns a distinct payload below the limit and
-/// at most one long block, and the free lists hold exactly the rest.
+/// Invariants every settled `ResultCache` state holds: the probe table, records, and pages
+/// cover the logical limit, every live record owns a distinct key slot and at most one long
+/// block, the free lists hold exactly the rest, and the owner log fits its limit.
 fn expectResultCacheConsistent(cache: *const ResultCache) !void {
-    const logical = cache.logical_capacity;
-    try std.testing.expectEqual(2 * logical, cache.slots.items.len);
-    try std.testing.expectEqual(logical, cache.payloads.items.len);
-    try std.testing.expectEqual(logical * cache.inline_words, cache.inline_cells.items.len);
-    try std.testing.expectEqual(cache.long_block_count * cache.long_block_words, cache.long_cells.items.len);
-    try std.testing.expect(cache.free_payload_indices.capacity >= logical);
+    const core = &cache.core;
+    const logical = core.logical_capacity;
+    try std.testing.expectEqual(2 * logical, core.slots.items.len);
+    try std.testing.expectEqual(logical, core.records.items.len);
+    try std.testing.expectEqual(pageCount(logical, cache.inline_page_shift), cache.inline_pages.items.len);
+    try std.testing.expectEqual(cache.long_page_count, cache.long_pages.items.len);
+    try std.testing.expectEqual(cache.long_page_count << cache.long_page_shift, cache.long_block_count);
+    try std.testing.expect(core.free.capacity >= logical);
     try std.testing.expect(cache.free_long_blocks.capacity >= cache.long_block_count);
-    try std.testing.expect(cache.evict_scratch.capacity >= logical);
-    try std.testing.expectEqual(logical - cache.len, cache.free_payload_indices.items.len);
+    try std.testing.expectEqual(logical - core.len, core.free.items.len);
+    try std.testing.expect(core.owner_log.capacity >= core.owner_log_limit);
+    try std.testing.expect(core.owner_log.items.len <= core.owner_log_limit);
+    try std.testing.expectEqual(@as(usize, 0), cache.resize_moves.items.len);
+    var occupied: usize = 0;
+    for (core.slots.items) |slot| occupied += @intFromBool(slot.occupied);
+    try std.testing.expectEqual(core.len, occupied);
     var live: usize = 0;
     var live_long: usize = 0;
-    for (cache.slots.items) |slot| {
-        if (!slot.occupied) continue;
+    for (core.records.items, 0..) |record, owner| {
+        if (!record.live) continue;
         live += 1;
-        try std.testing.expect(slot.payload_index < logical);
-        const block = cache.payloads.items[slot.payload_index].long_block;
-        if (block != no_test_block) {
+        try std.testing.expectEqual(@as(?u32, @intCast(owner)), core.ownerOf(core.keyOf(@intCast(owner))));
+        const block = record.extra.long_block;
+        if (block != no_block) {
             live_long += 1;
             try std.testing.expect(block < cache.long_block_count);
         }
     }
-    try std.testing.expectEqual(cache.len, live);
+    try std.testing.expectEqual(core.len, live);
     try std.testing.expectEqual(cache.long_block_count - live_long, cache.free_long_blocks.items.len);
 }
 
 // Test entries for a cache reserved with 4-word stripes and 16-word long blocks. Entry
 // `index` cycles through: a 3-cell plain path (inline), a 10-cell plain path (long), a
-// 2-cell stitched path (4 words, inline), and a 5-cell stitched path (10 words, long).
+// 2-cell stitched path (3 words, inline), and a 5-cell stitched path (8 words, long).
 const test_inline_words = 4;
 const test_long_block_words = 16;
 
-fn testEntryIsLong(index: usize) bool {
-    return index % 2 == 1;
-}
-
 fn testEntryCell(index: usize, offset: usize) u32 {
     return @intCast(index * 100 + offset);
+}
+
+// Claims `key` in a publish of its own and copies its path, as the publish does; the
+// owner log is emptied first, as a flush would.
+fn testPut(cache: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, step: u32, stats: *PathfindingStats) void {
+    cache.core.finishOwnerLog(std.testing.allocator);
+    cache.core.beginPublish();
+    testClaimAndCopy(cache, key, path, stitched, path_level, step, stats);
+}
+
+fn testClaimAndCopy(cache: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, step: u32, stats: *PathfindingStats) void {
+    const claimed = cache.claim(key, path.len, stitched.len, path_level, step, stats);
+    const words = cache.destination(claimed);
+    if (stitched.len != 0) types.writeStitched(words, stitched) else @memcpy(words[0..path.len], path);
 }
 
 fn putTestEntry(cache: *ResultCache, index: usize, step: u32, stats: *PathfindingStats) void {
@@ -1121,10 +1383,10 @@ fn putTestEntry(cache: *ResultCache, index: usize, step: u32, stats: *Pathfindin
     for (&plain, 0..) |*cell, offset| cell.* = testEntryCell(index, offset);
     for (&stitched, 0..) |*cell, offset| cell.* = .{ .level = @intCast(index % 3), .cell = testEntryCell(index, offset) };
     switch (index % 4) {
-        0 => cache.put(testGoalKey(index), plain[0..3], &.{}, 0, step, stats),
-        1 => cache.put(testGoalKey(index), plain[0..10], &.{}, 0, step, stats),
-        2 => cache.put(testGoalKey(index), &.{}, stitched[0..2], 0, step, stats),
-        else => cache.put(testGoalKey(index), &.{}, stitched[0..5], 0, step, stats),
+        0 => testPut(cache, testGoalKey(index), plain[0..3], &.{}, 0, step, stats),
+        1 => testPut(cache, testGoalKey(index), plain[0..10], &.{}, 0, step, stats),
+        2 => testPut(cache, testGoalKey(index), &.{}, stitched[0..2], 0, step, stats),
+        else => testPut(cache, testGoalKey(index), &.{}, stitched[0..5], 0, step, stats),
     }
 }
 
@@ -1143,19 +1405,28 @@ fn expectTestEntry(cache: *const ResultCache, index: usize) !void {
             const len: usize = if (index % 4 == 2) 2 else 5;
             try std.testing.expectEqual(@as(u32, 0), result.path_len);
             const stored = cache.stitchedSlice(slot, result.stitched_len);
-            try std.testing.expectEqual(len, stored.len);
-            for (stored, 0..) |cell, offset| {
-                try std.testing.expectEqual(@as(u16, @intCast(index % 3)), cell.level);
-                try std.testing.expectEqual(testEntryCell(index, offset), cell.cell);
+            try std.testing.expectEqual(len, stored.len());
+            for (0..stored.len()) |offset| {
+                try std.testing.expectEqual(@as(u16, @intCast(index % 3)), stored.levels[offset]);
+                try std.testing.expectEqual(testEntryCell(index, offset), stored.cells[offset]);
             }
         },
     }
 }
 
+// Resizes and finishes as the system does: the pending moves copied, then the pages past
+// the capacity freed and the owner log emptied.
+fn testResize(cache: *ResultCache, allocator: std.mem.Allocator, capacity: usize, inline_words: usize, long_block_words: usize, step: u32) !void {
+    _ = try cache.reserve(allocator, capacity, inline_words, long_block_words, step);
+    for (cache.pendingMoves()) |move| cache.copyMove(move);
+    cache.finishResize(allocator);
+    cache.core.finishOwnerLog(allocator);
+}
+
 // A 16-entry cache holding entries 0..count at steps 0..count, long blocks reserved.
 fn filledTestCache(cache: *ResultCache, count: usize, stats: *PathfindingStats) !void {
-    try cache.reserve(std.testing.allocator, 16, test_inline_words, test_long_block_words, 0);
-    try cache.reserveLongBlocks(std.testing.allocator, count);
+    try testResize(cache, std.testing.allocator, 16, test_inline_words, test_long_block_words, 0);
+    _ = try cache.reserveLongBlocks(std.testing.allocator, count);
     for (0..count) |index| putTestEntry(cache, index, @intCast(index), stats);
 }
 
@@ -1163,47 +1434,45 @@ test "pathfinding result cache stores a long path whole in a long block and neve
     var stats = PathfindingStats{};
     var cache = ResultCache{};
     defer cache.deinit(std.testing.allocator);
-    try cache.reserve(std.testing.allocator, 8, test_inline_words, test_long_block_words, 0);
+    try testResize(&cache, std.testing.allocator, 8, test_inline_words, test_long_block_words, 0);
+    // No long page exists until a publish needs one.
+    try std.testing.expectEqual(@as(usize, 0), cache.long_block_count);
 
-    // One free block: the first long entry takes it; inline entries need none.
-    try cache.reserveLongBlocks(std.testing.allocator, 1);
-    try std.testing.expectEqual(@as(usize, 1), cache.long_block_count);
-    for (0..3) |index| putTestEntry(&cache, index, 0, &stats);
-    try std.testing.expectEqual(@as(usize, 0), cache.free_long_blocks.items.len);
-
-    // The pool is exhausted: the publish reserve grows it instead of evicting a live entry.
-    try cache.reserveLongBlocks(std.testing.allocator, 1);
-    try std.testing.expectEqual(@as(usize, 2), cache.long_block_count);
-    putTestEntry(&cache, 3, 0, &stats);
+    // One page of blocks: the long entries take blocks; inline entries need none.
+    try std.testing.expectEqual(@as(usize, 1), try cache.reserveLongBlocks(std.testing.allocator, 1));
+    try std.testing.expectEqual(ResultCache.longBlocksPerPage(test_long_block_words), cache.long_block_count);
+    for (0..4) |index| putTestEntry(&cache, index, 0, &stats);
     try std.testing.expectEqual(@as(usize, 0), stats.cache_evictions);
     for (0..4) |index| try expectTestEntry(&cache, index);
     try expectResultCacheConsistent(&cache);
+    const free_after_put = cache.free_long_blocks.items.len;
 
     // Re-putting a long key with an inline path releases its block; a TTL removal of
     // the other long entry releases its block too.
-    cache.put(testGoalKey(1), &.{ 7, 8 }, &.{}, 0, 0, &stats);
-    try std.testing.expectEqual(@as(usize, 1), cache.free_long_blocks.items.len);
+    testPut(&cache, testGoalKey(1), &.{ 7, 8 }, &.{}, 0, 0, &stats);
+    try std.testing.expectEqual(free_after_put + 1, cache.free_long_blocks.items.len);
     try std.testing.expect(cache.findFresh(testGoalKey(3), 1000, 10) == null);
-    try std.testing.expectEqual(@as(usize, 2), cache.free_long_blocks.items.len);
-    try std.testing.expectEqual(@as(usize, 2), cache.long_block_count);
+    try std.testing.expectEqual(free_after_put + 2, cache.free_long_blocks.items.len);
     try expectResultCacheConsistent(&cache);
 }
 
-test "pathfinding result cache long pool never exceeds the entry limit, and a full cache of long entries still publishes" {
+test "pathfinding result cache long pool never passes the page of the entry limit, and a full cache of long entries still publishes" {
     var stats = PathfindingStats{};
     var cache = ResultCache{};
     defer cache.deinit(std.testing.allocator);
-    try cache.reserve(std.testing.allocator, 4, test_inline_words, test_long_block_words, 0);
+    // Two 64 KiB blocks per page.
+    const wide_long_words = 16384;
+    try std.testing.expectEqual(@as(usize, 2), ResultCache.longBlocksPerPage(wide_long_words));
+    try testResize(&cache, std.testing.allocator, 4, test_inline_words, wide_long_words, 0);
     // Four live long entries (odd indices are long) fill the cache and the pool.
-    try cache.reserveLongBlocks(std.testing.allocator, 4);
+    try std.testing.expectEqual(@as(usize, 2), try cache.reserveLongBlocks(std.testing.allocator, 4));
     for ([_]usize{ 1, 3, 5, 7 }) |index| putTestEntry(&cache, index, 0, &stats);
     try std.testing.expectEqual(@as(usize, 4), cache.long_block_count);
     try std.testing.expectEqual(@as(usize, 0), cache.free_long_blocks.items.len);
 
-    // Three more long results: the pool stays at the limit; each put evicts a long victim
-    // before it claims, so every claim finds a block.
-    try cache.reserveLongBlocks(std.testing.allocator, 3);
-    try std.testing.expectEqual(@as(usize, 4), cache.long_block_count);
+    // Three more long results: the pool stays at the limit; each claim evicts a long victim
+    // before it takes a block, so every claim finds one.
+    try std.testing.expectEqual(@as(usize, 0), try cache.reserveLongBlocks(std.testing.allocator, 3));
     for ([_]usize{ 9, 11, 13 }) |index| putTestEntry(&cache, index, 1, &stats);
     try std.testing.expectEqual(@as(usize, 3), stats.cache_evictions);
     for ([_]usize{ 9, 11, 13 }) |index| try expectTestEntry(&cache, index);
@@ -1218,31 +1487,31 @@ test "pathfinding result cache grow and shrink keep entries, evicting oldest fir
     try filledTestCache(&cache, 12, &stats);
 
     // A grow keeps every entry and its stored cells.
-    try cache.reserve(std.testing.allocator, 64, test_inline_words, test_long_block_words, 12);
-    try std.testing.expectEqual(@as(usize, 12), cache.len);
+    try testResize(&cache, std.testing.allocator, 64, test_inline_words, test_long_block_words, 12);
+    try std.testing.expectEqual(@as(usize, 12), cache.count());
     for (0..12) |index| try expectTestEntry(&cache, index);
     try expectResultCacheConsistent(&cache);
 
-    // A shrink to 4 evicts the eight oldest (steps 0..7), moves the survivors below the
-    // new limit, and compacts the long pool to their two long entries.
-    try cache.reserve(std.testing.allocator, 4, test_inline_words, test_long_block_words, 12);
-    try std.testing.expectEqual(@as(usize, 4), cache.len);
+    // A shrink to 4 evicts the eight oldest (steps 0..7) and moves the survivors below the
+    // new limit; their two long entries keep one page of blocks.
+    try testResize(&cache, std.testing.allocator, 4, test_inline_words, test_long_block_words, 12);
+    try std.testing.expectEqual(@as(usize, 4), cache.count());
     for (0..8) |index| try std.testing.expect(cache.find(testGoalKey(index)) == null);
     for (8..12) |index| try expectTestEntry(&cache, index);
-    try std.testing.expectEqual(@as(usize, 2), cache.long_block_count);
+    try std.testing.expectEqual(@as(usize, 1), cache.long_page_count);
     try expectResultCacheConsistent(&cache);
 
-    // Equal stamps evict in payload-index order.
+    // Equal stamps evict in owner-id order.
     var tied = ResultCache{};
     defer tied.deinit(std.testing.allocator);
-    try tied.reserve(std.testing.allocator, 4, test_inline_words, test_long_block_words, 0);
+    try testResize(&tied, std.testing.allocator, 4, test_inline_words, test_long_block_words, 0);
+    _ = try tied.reserveLongBlocks(std.testing.allocator, 4);
     for (0..4) |index| putTestEntry(&tied, index * 4, 9, &stats);
     var lowest_index: usize = 0;
     for (0..4) |index| {
-        const payload_index = tied.slots.items[tied.slotIndex(testGoalKey(index * 4)).?].payload_index;
-        if (payload_index == 0) lowest_index = index * 4;
+        if (tied.core.ownerOf(testGoalKey(index * 4)).? == 0) lowest_index = index * 4;
     }
-    try tied.reserve(std.testing.allocator, 3, test_inline_words, test_long_block_words, 9);
+    try testResize(&tied, std.testing.allocator, 3, test_inline_words, test_long_block_words, 9);
     for (0..4) |index| {
         if (index * 4 == lowest_index) {
             try std.testing.expect(tied.find(testGoalKey(index * 4)) == null);
@@ -1255,48 +1524,61 @@ test "pathfinding result cache grow and shrink keep entries, evicting oldest fir
     // Age wraps with the step counter: a stamp just below the wrap is older than one after it.
     var wrapped = ResultCache{};
     defer wrapped.deinit(std.testing.allocator);
-    try wrapped.reserve(std.testing.allocator, 2, test_inline_words, test_long_block_words, 0);
+    try testResize(&wrapped, std.testing.allocator, 2, test_inline_words, test_long_block_words, 0);
     putTestEntry(&wrapped, 0, std.math.maxInt(u32) - 2, &stats);
     putTestEntry(&wrapped, 4, 3, &stats);
-    try wrapped.reserve(std.testing.allocator, 1, test_inline_words, test_long_block_words, 5);
+    try testResize(&wrapped, std.testing.allocator, 1, test_inline_words, test_long_block_words, 5);
     try std.testing.expect(wrapped.find(testGoalKey(0)) == null);
     try expectTestEntry(&wrapped, 4);
 }
 
-test "pathfinding result cache resize runs out of memory at every allocation and leaves entries intact (FailingAllocator)" {
-    // Shrink with eviction (16 -> 2), shrink without (16 -> 8), and grow (16 -> 64): each
-    // allocation the resize makes is failed in turn. A failure leaves the cache whole
-    // (limit, widths, every entry and its cells); success keeps the entries that fit.
+test "pathfinding result cache resize runs out of memory at every allocation and leaves entries and the owner log intact (FailingAllocator)" {
+    // Shrink with eviction, shrink without, and grow, at stripe widths that keep one page
+    // and at widths whose pages a grow appends and a shrink frees: each allocation the
+    // resize makes is failed in turn. A failure leaves the cache whole (limit, widths,
+    // every entry and its cells, the logged ops); success keeps the entries that fit.
     const entry_count = 6;
-    for ([_]usize{ 2, 8, 64 }) |target| {
-        var fail_index: usize = 0;
-        while (true) : (fail_index += 1) {
-            var stats = PathfindingStats{};
-            var cache = ResultCache{};
-            defer cache.deinit(std.testing.allocator);
-            try filledTestCache(&cache, entry_count, &stats);
+    const Shape = struct { inline_words: usize, targets: [3]usize };
+    // 8 stripes of 4096 words per page: 16 entries span 2 pages.
+    for ([_]Shape{ .{ .inline_words = test_inline_words, .targets = .{ 2, 8, 64 } }, .{ .inline_words = 4096, .targets = .{ 2, 8, 64 } } }) |shape| {
+        for (shape.targets) |target| {
+            var fail_index: usize = 0;
+            while (true) : (fail_index += 1) {
+                var stats = PathfindingStats{};
+                var cache = ResultCache{};
+                defer cache.deinit(std.testing.allocator);
+                try testResize(&cache, std.testing.allocator, 16, shape.inline_words, test_long_block_words, 0);
+                _ = try cache.reserveLongBlocks(std.testing.allocator, entry_count);
+                for (0..entry_count) |index| putTestEntry(&cache, index, @intCast(index), &stats);
+                const logged = cache.core.ownerLog().len;
 
-            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
-            cache.reserve(failing.allocator(), target, test_inline_words, test_long_block_words, entry_count) catch |err| {
-                try std.testing.expectEqual(error.OutOfMemory, err);
-                try std.testing.expectEqual(@as(usize, 16), cache.logical_capacity);
-                try std.testing.expectEqual(@as(usize, test_inline_words), cache.inline_words);
-                try std.testing.expectEqual(@as(usize, test_long_block_words), cache.long_block_words);
+                var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
+                const outcome = cache.reserve(failing.allocator(), target, shape.inline_words, test_long_block_words, entry_count) catch |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    try std.testing.expectEqual(@as(usize, 16), cache.logicalCapacity());
+                    try std.testing.expectEqual(shape.inline_words, cache.inline_words);
+                    try std.testing.expectEqual(@as(usize, test_long_block_words), cache.long_block_words);
+                    try std.testing.expectEqual(logged, cache.core.ownerLog().len);
+                    try expectResultCacheConsistent(&cache);
+                    for (0..entry_count) |index| try expectTestEntry(&cache, index);
+                    // Still fully usable at the old limit.
+                    for (0..16) |index| testPut(&cache, testGoalKey(100 + index), &.{1}, &.{}, 0, 0, &stats);
+                    try expectResultCacheConsistent(&cache);
+                    continue;
+                };
+                try std.testing.expectEqual(ReserveOutcome.kept, outcome);
+                for (cache.pendingMoves()) |move| cache.copyMove(move);
+                cache.finishResize(failing.allocator());
+                cache.core.finishOwnerLog(failing.allocator());
+                try std.testing.expectEqual(target, cache.logicalCapacity());
                 try expectResultCacheConsistent(&cache);
-                for (0..entry_count) |index| try expectTestEntry(&cache, index);
-                // Still fully usable at the old limit.
-                for (0..16) |index| cache.put(testGoalKey(100 + index), &.{1}, &.{}, 0, 0, &stats);
-                try expectResultCacheConsistent(&cache);
-                continue;
-            };
-            try std.testing.expectEqual(target, cache.logical_capacity);
-            try expectResultCacheConsistent(&cache);
-            const kept = @min(target, entry_count);
-            try std.testing.expectEqual(kept, cache.len);
-            for (entry_count - kept..entry_count) |index| try expectTestEntry(&cache, index);
-            break;
+                const kept = @min(target, entry_count);
+                try std.testing.expectEqual(kept, cache.count());
+                for (entry_count - kept..entry_count) |index| try expectTestEntry(&cache, index);
+                break;
+            }
+            try std.testing.expect(fail_index >= 1);
         }
-        try std.testing.expect(fail_index >= 1);
     }
 }
 
@@ -1325,40 +1607,59 @@ test "pathfinding waypoint exact-match scan in four lanes equals the scalar scan
     try std.testing.expectEqual(@as(u32, 6), hint);
 }
 
+// The first stitched index holding `cell` on `level`, by a scalar walk.
+fn referenceStitchedIndex(view: StitchedView, level: u16, cell: u32) ?usize {
+    for (view.cells, view.levels, 0..) |stored_cell, stored_level, index| {
+        if (stored_cell == cell and stored_level == level) return index;
+    }
+    return null;
+}
+
+test "pathfinding stitched exact-match scan in four lanes equals scalar (body, tail, absent, wrong-level match)" {
+    // Cells repeat across levels: each cell appears on level 1 before level 0 at a few spots,
+    // so a lane hit on the wrong level must keep scanning.
+    var stitched: [13]StitchedCell = undefined;
+    for (&stitched, 0..) |*cell, index| cell.* = .{ .level = @intCast(index % 2), .cell = @intCast(40 + index / 2) };
+    var words: [types.stitchedWords(stitched.len)]u32 = undefined;
+    for (0..stitched.len + 1) |len| {
+        types.writeStitched(&words, stitched[0..len]);
+        const view = types.stitchedView(&words, len);
+        for (0..2) |level| {
+            for (38..50) |cell| {
+                const expected = referenceStitchedIndex(view, @intCast(level), @intCast(cell));
+                try std.testing.expectEqual(expected, stitchedExactIndex(view, @intCast(level), @intCast(cell)));
+            }
+        }
+    }
+    // Through the waypoint: cell 41 on level 1 sits at index 3, after its level-0 copy at 2.
+    var graph = try makeTestGraph(std.testing.allocator, 100, 1);
+    defer graph.levels.deinit(std.testing.allocator);
+    try graph.levels.append(std.testing.allocator, NavGrid{ .level = 1, .width = 100, .height = 1, .cell_size = 1 });
+    types.writeStitched(&words, &stitched);
+    var hint: u32 = 99;
+    _ = waypointFromStitched(&graph, types.stitchedView(&words, stitched.len), 1, 41, &hint).?;
+    try std.testing.expectEqual(@as(u32, 3), hint);
+}
+
 test "pathfinding result cache keeps probe chains intact after mid-chain removal" {
     var stats = PathfindingStats{};
     var cache = ResultCache{};
     defer cache.deinit(std.testing.allocator);
     const capacity = 8;
-    try cache.reserve(std.testing.allocator, capacity, 4, 8, 0);
+    try testResize(&cache, std.testing.allocator, capacity, 4, 8, 0);
 
     // Fill the cache to capacity with distinct goal-keyed entries (no eviction yet).
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        cache.put(key, &.{ @intCast(i), @intCast(i + 1) }, &.{}, 0, 0, &stats);
-    }
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        try std.testing.expect(cache.find(key) != null);
-    }
+    for (0..capacity) |i| testPut(&cache, testGoalKey(i), &.{ @intCast(i), @intCast(i + 1) }, &.{}, 0, 0, &stats);
+    for (0..capacity) |i| try std.testing.expect(cache.find(testGoalKey(i)) != null);
 
     // Remove two entries that may sit mid-probe-chain. Without back-shift deletion a later
     // key in a cluster would become unreachable; every surviving key must still be found.
-    for ([_]usize{ 2, 5 }) |target| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(target);
-        const index = cache.slotIndex(key).?;
-        cache.removeAt(index);
-    }
+    for ([_]usize{ 2, 5 }) |target| cache.removeAt(cache.slotIndex(testGoalKey(target)).?);
     for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
         if (i == 2 or i == 5) {
-            try std.testing.expect(cache.find(key) == null);
+            try std.testing.expect(cache.find(testGoalKey(i)) == null);
         } else {
-            try std.testing.expect(cache.find(key) != null);
+            try std.testing.expect(cache.find(testGoalKey(i)) != null);
         }
     }
 }
@@ -1377,7 +1678,7 @@ test "pathfinding result cache full-cache put stays reachable when the evicted v
     var stats = PathfindingStats{};
     var cache = ResultCache{};
     defer cache.deinit(std.testing.allocator);
-    try cache.reserve(std.testing.allocator, 4, 4, 8, 0);
+    try testResize(&cache, std.testing.allocator, 4, 4, 8, 0);
     // A at its home slot 0, B at its home slot 1, C and D clear of slots 0-2: the round-robin
     // victim is A, and the new key K (home 0) first finds slot 2 empty.
     var taken: [5]usize = undefined;
@@ -1386,23 +1687,314 @@ test "pathfinding result cache full-cache put stays reachable when the evicted v
     taken[2] = testKeyWithHome(8, 4, taken[0..2]);
     taken[3] = testKeyWithHome(8, 5, taken[0..3]);
     taken[4] = testKeyWithHome(8, 0, taken[0..4]);
-    for (taken[0..4]) |x| cache.put(testGoalKey(x), &.{1}, &.{}, 0, 0, &stats);
+    for (taken[0..4]) |x| testPut(&cache, testGoalKey(x), &.{1}, &.{}, 0, 0, &stats);
     try std.testing.expectEqual(@as(usize, 0), cache.slotIndex(testGoalKey(taken[0])).?);
     try std.testing.expectEqual(@as(usize, 1), cache.slotIndex(testGoalKey(taken[1])).?);
 
     const new_key = testGoalKey(taken[4]);
-    cache.put(new_key, &.{2}, &.{}, 0, 0, &stats);
+    testPut(&cache, new_key, &.{2}, &.{}, 0, 0, &stats);
     try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
     try std.testing.expect(cache.slotIndex(new_key) != null);
 
     // A re-put updates the one slot holding the key, never a duplicate.
-    cache.put(new_key, &.{3}, &.{}, 0, 0, &stats);
+    testPut(&cache, new_key, &.{3}, &.{}, 0, 0, &stats);
     var holders: usize = 0;
-    for (cache.slots.items) |slot| {
+    for (cache.core.slots.items) |slot| {
         if (slot.occupied and keysEqual(slot.key, new_key)) holders += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), holders);
-    try std.testing.expectEqual(@as(usize, 4), cache.len);
+    try std.testing.expectEqual(@as(usize, 4), cache.count());
+    try expectResultCacheConsistent(&cache);
+}
+
+test "pathfinding a payload claimed this publish is never chosen as the victim" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    // Eight entries over 16 probe slots: A and B both home at slot 0 (B lands in slot 1),
+    // the rest at homes 2..7.
+    try testResize(&cache, std.testing.allocator, 8, 4, 8, 0);
+    var taken: [10]usize = undefined;
+    taken[0] = testKeyWithHome(16, 0, taken[0..0]);
+    taken[1] = testKeyWithHome(16, 0, taken[0..1]);
+    for (2..8) |home| taken[home] = testKeyWithHome(16, home, taken[0..home]);
+    for (taken[0..8]) |x| testPut(&cache, testGoalKey(x), &.{1}, &.{}, 0, 0, &stats);
+    // K1 homes at slot 1, which the first victim (A, slot 0) frees by back-shifting B into
+    // slot 0; K2 homes clear of the entries.
+    taken[8] = testKeyWithHome(16, 1, taken[0..8]);
+    taken[9] = testKeyWithHome(16, 12, taken[0..9]);
+
+    // One publish claims K1 then K2. Round-robin reaches K1's slot next, so only the
+    // same-publish skip keeps K2 from evicting K1.
+    cache.core.finishOwnerLog(std.testing.allocator);
+    cache.core.beginPublish();
+    testClaimAndCopy(&cache, testGoalKey(taken[8]), &.{5}, &.{}, 0, 1, &stats);
+    try std.testing.expectEqual(@as(usize, 1), cache.slotIndex(testGoalKey(taken[8])).?);
+    testClaimAndCopy(&cache, testGoalKey(taken[9]), &.{6}, &.{}, 0, 1, &stats);
+    try std.testing.expectEqual(@as(usize, 2), stats.cache_evictions);
+    try std.testing.expect(cache.find(testGoalKey(taken[8])) != null);
+    try std.testing.expect(cache.find(testGoalKey(taken[9])) != null);
+    try std.testing.expect(cache.find(testGoalKey(taken[0])) == null);
+    try std.testing.expectEqual(@as(usize, 8), cache.count());
+    try expectResultCacheConsistent(&cache);
+}
+
+test "pathfinding claim then copy stores plain, stitched, inline, and long results exactly" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try testResize(&cache, std.testing.allocator, 8, test_inline_words, test_long_block_words, 0);
+    _ = try cache.reserveLongBlocks(std.testing.allocator, 4);
+    // Every kind in one publish, then a long one re-put inline and an inline one re-put long.
+    cache.core.beginPublish();
+    var plain: [10]u32 = undefined;
+    var stitched: [5]StitchedCell = undefined;
+    for (0..4) |index| {
+        for (&plain, 0..) |*cell, offset| cell.* = testEntryCell(index, offset);
+        for (&stitched, 0..) |*cell, offset| cell.* = .{ .level = @intCast(index % 3), .cell = testEntryCell(index, offset) };
+        const path: []const u32 = switch (index) {
+            0 => plain[0..3],
+            1 => plain[0..10],
+            else => &.{},
+        };
+        const corridor: []const StitchedCell = switch (index) {
+            2 => stitched[0..2],
+            3 => stitched[0..5],
+            else => &.{},
+        };
+        testClaimAndCopy(&cache, testGoalKey(index), path, corridor, 0, 0, &stats);
+    }
+    for (0..4) |index| try expectTestEntry(&cache, index);
+    // A stitched entry is its cells column, then two levels per word.
+    const stitched_slot = cache.slotIndex(testGoalKey(3)).?;
+    const words = cache.storedWords(cache.core.slots.items[stitched_slot].payload_index);
+    try std.testing.expectEqualSlices(u32, &.{ 300, 301, 302, 303, 304 }, words[0..5]);
+    // Long results hold blocks, inline ones none.
+    try std.testing.expectEqual(cache.long_block_count - 2, cache.free_long_blocks.items.len);
+    putTestEntry(&cache, 5, 1, &stats);
+    testPut(&cache, testGoalKey(1), &.{ 1, 2 }, &.{}, 0, 1, &stats);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, cache.pathSlice(cache.slotIndex(testGoalKey(1)).?, 2));
+    try std.testing.expectEqual(cache.long_block_count - 2, cache.free_long_blocks.items.len);
+    try expectResultCacheConsistent(&cache);
+}
+
+// Records each shrink eviction a core reports.
+const EvictionRecorder = struct {
+    released: std.ArrayList(u32) = .empty,
+
+    fn releaseRecord(self: *EvictionRecorder, owner: u32) void {
+        self.released.append(std.testing.allocator, owner) catch @panic("test allocation");
+    }
+
+    fn moveRecord(_: *EvictionRecorder, _: u32, _: u32) void {}
+};
+
+const OrderedEntry = struct {
+    age: u32,
+    owner: u32,
+
+    fn olderThan(_: void, lhs: OrderedEntry, rhs: OrderedEntry) bool {
+        if (lhs.age != rhs.age) return lhs.age > rhs.age;
+        return lhs.owner < rhs.owner;
+    }
+};
+
+test "pathfinding the shrink's eviction selection equals the age-sorted reference (ties at the threshold, all ages equal, wraparound ages)" {
+    const Core = CacheCore(struct {});
+    const Stamps = enum { random_ties, all_equal, wraparound };
+    var prng = std.Random.DefaultPrng.init(0x5e1ec7);
+    const random = prng.random();
+    for (std.meta.tags(Stamps)) |stamps| {
+        for ([_]usize{ 1, 7, 33, 60 }) |evict_count| {
+            var stats = PathfindingStats{};
+            var core = Core{};
+            defer core.deinit(std.testing.allocator);
+            const capacity = 96;
+            var resize = try core.prepareResize(std.testing.allocator, capacity);
+            core.commitResize(std.testing.allocator, &resize, 0, NoRecordHooks{});
+            const live = 64;
+            const step: u32 = switch (stamps) {
+                .wraparound => 5,
+                else => 1_000_000,
+            };
+            core.beginPublish();
+            for (0..live) |index| {
+                const stamp: u32 = switch (stamps) {
+                    // Few distinct ages, spread across the high and low bytes.
+                    .random_ties => step - (random.uintLessThan(u32, 4) << 16) - random.uintLessThan(u32, 3),
+                    .all_equal => step - 9,
+                    // Half the stamps sit just below the wrap, half just after it.
+                    .wraparound => if (index % 2 == 0) std.math.maxInt(u32) - random.uintLessThan(u32, 8) else random.uintLessThan(u32, 5),
+                };
+                _ = core.claim(testGoalKey(index), stamp, &stats);
+            }
+            // Free a few low records so survivors also move.
+            for ([_]usize{ 3, 10, 40 }) |index| core.removeAt(core.slotIndex(testGoalKey(index)).?);
+            core.finishOwnerLog(std.testing.allocator);
+            var reference: std.ArrayList(OrderedEntry) = .empty;
+            defer reference.deinit(std.testing.allocator);
+            for (core.records.items, 0..) |record, owner| {
+                if (record.live) try reference.append(std.testing.allocator, .{ .age = step -% record.stamp, .owner = @intCast(owner) });
+            }
+            std.mem.sort(OrderedEntry, reference.items, {}, OrderedEntry.olderThan);
+            var expected: std.ArrayList(u32) = .empty;
+            defer expected.deinit(std.testing.allocator);
+            for (reference.items[0..evict_count]) |entry| try expected.append(std.testing.allocator, entry.owner);
+            std.mem.sort(u32, expected.items, {}, std.sort.asc(u32));
+
+            var recorder = EvictionRecorder{};
+            defer recorder.released.deinit(std.testing.allocator);
+            var shrink = try core.prepareResize(std.testing.allocator, core.len - evict_count);
+            core.commitResize(std.testing.allocator, &shrink, step, &recorder);
+            try std.testing.expectEqualSlices(u32, expected.items, recorder.released.items);
+            try std.testing.expectEqual(core.logical_capacity, core.len);
+        }
+    }
+}
+
+test "pathfinding every removal logs one retire and every move one rename, within 2x the larger capacity" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try filledTestCache(&cache, 12, &stats);
+    cache.core.finishOwnerLog(std.testing.allocator);
+    const owner_of = struct {
+        fn at(c: *const ResultCache, index: usize) u32 {
+            return c.core.ownerOf(testGoalKey(index)).?;
+        }
+    }.at;
+    // A TTL removal and a re-put each retire their owner; a fresh claim of a free record
+    // retires nothing.
+    const expired = owner_of(&cache, 0);
+    try std.testing.expect(cache.findFresh(testGoalKey(0), 1000, 10) == null);
+    const reput = owner_of(&cache, 4);
+    cache.core.beginPublish();
+    testClaimAndCopy(&cache, testGoalKey(4), &.{ 1, 2 }, &.{}, 0, 13, &stats);
+    testClaimAndCopy(&cache, testGoalKey(50), &.{3}, &.{}, 0, 13, &stats);
+    try std.testing.expectEqualSlices(OwnerOp, &.{ .{ .old = expired, .new = no_owner }, .{ .old = reput, .new = no_owner } }, cache.core.ownerLog());
+    // A full cache's claim retires its victim.
+    cache.core.finishOwnerLog(std.testing.allocator);
+    for (0..4) |index| putTestEntry(&cache, 60 + index, 14, &stats);
+    cache.core.finishOwnerLog(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 16), cache.count());
+    cache.core.beginPublish();
+    testClaimAndCopy(&cache, testGoalKey(70), &.{9}, &.{}, 0, 15, &stats);
+    try std.testing.expectEqual(@as(usize, 1), cache.core.ownerLog().len);
+    try std.testing.expectEqual(no_owner, cache.core.ownerLog()[0].new);
+    cache.core.finishOwnerLog(std.testing.allocator);
+
+    // A shrink to 4: one retire per victim, then one rename per survivor it moves, from
+    // past the new capacity to below it.
+    _ = try cache.reserve(std.testing.allocator, 4, test_inline_words, test_long_block_words, 16);
+    const log = cache.core.ownerLog();
+    try std.testing.expect(log.len <= cache.core.owner_log_limit);
+    try std.testing.expectEqual(@as(usize, 2 * 16), cache.core.owner_log_limit);
+    var retires: usize = 0;
+    var renames: usize = 0;
+    for (log, 0..) |op, at| {
+        if (op.new == no_owner) {
+            retires += 1;
+            // Every retire precedes every rename.
+            try std.testing.expectEqual(at, retires - 1);
+        } else {
+            renames += 1;
+            try std.testing.expect(op.old >= 4 and op.new < 4);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 12), retires);
+    try std.testing.expect(renames != 0 and renames <= 4);
+    for (cache.pendingMoves()) |move| cache.copyMove(move);
+    cache.finishResize(std.testing.allocator);
+    cache.core.finishOwnerLog(std.testing.allocator);
+    // The flushed shrink's log shrinks to the new capacity.
+    try std.testing.expectEqual(@as(usize, 2 * 4), cache.core.owner_log_limit);
+    try std.testing.expect(cache.core.owner_log.capacity < 2 * 16);
+    try expectResultCacheConsistent(&cache);
+}
+
+// A plain test path of `len` cells starting at `first`.
+fn testLongPath(allocator: std.mem.Allocator, len: usize, first: u32) ![]u32 {
+    const path = try allocator.alloc(u32, len);
+    for (path, 0..) |*cell, offset| cell.* = first + @as(u32, @intCast(offset));
+    return path;
+}
+
+test "pathfinding a grow keeps every stored path at its address" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    // Eight 4096-word stripes per page: a grow from 8 to 64 entries appends seven pages.
+    try testResize(&cache, std.testing.allocator, 8, 4096, test_long_block_words, 0);
+    for (0..8) |index| testPut(&cache, testGoalKey(index), &.{ @intCast(index), 7 }, &.{}, 0, 0, &stats);
+    var addresses: [8][*]const u32 = undefined;
+    for (&addresses, 0..) |*address, index| address.* = cache.storedWords(cache.core.ownerOf(testGoalKey(index)).?).ptr;
+    try std.testing.expectEqual(@as(usize, 1), cache.inline_pages.items.len);
+    try testResize(&cache, std.testing.allocator, 64, 4096, test_long_block_words, 0);
+    try std.testing.expectEqual(@as(usize, 8), cache.inline_pages.items.len);
+    for (addresses, 0..) |address, index| {
+        const owner = cache.core.ownerOf(testGoalKey(index)).?;
+        try std.testing.expectEqual(address, cache.storedWords(owner).ptr);
+        try std.testing.expectEqualSlices(u32, &.{ @intCast(index), 7 }, cache.storedWords(owner)[0..2]);
+    }
+    try expectResultCacheConsistent(&cache);
+}
+
+test "pathfinding a long-pool grow keeps every long path at its address" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    // Two 16384-word blocks per page.
+    try testResize(&cache, std.testing.allocator, 16, test_inline_words, 16384, 0);
+    try std.testing.expectEqual(@as(usize, 1), try cache.reserveLongBlocks(std.testing.allocator, 2));
+    for (0..2) |index| putTestEntry(&cache, index * 4 + 1, 0, &stats);
+    const before = [_][*]const u32{
+        cache.storedWords(cache.core.ownerOf(testGoalKey(1)).?).ptr,
+        cache.storedWords(cache.core.ownerOf(testGoalKey(5)).?).ptr,
+    };
+    try std.testing.expectEqual(@as(usize, 2), try cache.reserveLongBlocks(std.testing.allocator, 3));
+    try std.testing.expectEqual(@as(usize, 6), cache.long_block_count);
+    try std.testing.expectEqual(before[0], cache.storedWords(cache.core.ownerOf(testGoalKey(1)).?).ptr);
+    try std.testing.expectEqual(before[1], cache.storedWords(cache.core.ownerOf(testGoalKey(5)).?).ptr);
+    for ([_]usize{ 1, 5 }) |index| try expectTestEntry(&cache, index);
+    try expectResultCacheConsistent(&cache);
+}
+
+test "pathfinding a shrink frees pages past the new capacity and keeps every surviving path" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    // Eight 4096-word stripes per page and two 16384-word blocks per page.
+    const long_words = 16384;
+    try testResize(&cache, std.testing.allocator, 64, 4096, long_words, 0);
+    try std.testing.expectEqual(@as(usize, 8), cache.inline_pages.items.len);
+    _ = try cache.reserveLongBlocks(std.testing.allocator, 8);
+    const long_path = try testLongPath(std.testing.allocator, 4100, 9000);
+    defer std.testing.allocator.free(long_path);
+    for (0..40) |index| {
+        if (index % 5 == 0) {
+            testPut(&cache, testGoalKey(index), long_path, &.{}, 0, @intCast(index), &stats);
+        } else {
+            testPut(&cache, testGoalKey(index), &.{ @intCast(index), 3, 4 }, &.{}, 0, @intCast(index), &stats);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), cache.long_page_count);
+    // A shrink to 16 keeps the 16 youngest (24..39), three of them long.
+    try testResize(&cache, std.testing.allocator, 16, 4096, long_words, 40);
+    try std.testing.expectEqual(@as(usize, 2), cache.inline_pages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cache.long_page_count);
+    for (0..40) |index| {
+        const slot = cache.slotIndex(testGoalKey(index));
+        if (index < 24) {
+            try std.testing.expect(slot == null);
+            continue;
+        }
+        const result = cache.resultAt(slot.?);
+        if (index % 5 == 0) {
+            try std.testing.expectEqualSlices(u32, long_path, cache.pathSlice(slot.?, result.path_len));
+        } else {
+            try std.testing.expectEqualSlices(u32, &.{ @intCast(index), 3, 4 }, cache.pathSlice(slot.?, result.path_len));
+        }
+    }
     try expectResultCacheConsistent(&cache);
 }
 
@@ -1410,39 +2002,33 @@ test "pathfinding result cache read-path TTL gate is non-mutating and expires st
     var stats = PathfindingStats{};
     var cache = ResultCache{};
     defer cache.deinit(std.testing.allocator);
-    try cache.reserve(std.testing.allocator, 4, 4, 8, 0);
-    var key = emptyKey(1);
-    key.goal.x = 3;
-    cache.put(key, &.{ 0, 1, 2 }, &.{}, 0, 100, &stats); // stamped at step 100
+    try testResize(&cache, std.testing.allocator, 4, 4, 8, 0);
+    testPut(&cache, testGoalKey(3), &.{ 0, 1, 2 }, &.{}, 0, 100, &stats); // stamped at step 100
 
     const ttl: u32 = 50;
     // Within ttl: the read path serves the slot and never evicts (const reader).
-    try std.testing.expect(cache.freshSlotIndex(key, 149, ttl) != null);
-    try std.testing.expect(cache.slotIndex(key) != null); // still resident
+    try std.testing.expect(cache.freshSlotIndex(testGoalKey(3), 149, ttl) != null);
+    try std.testing.expect(cache.slotIndex(testGoalKey(3)) != null); // still resident
     // At/after ttl: the read path reports a miss so the caller re-requests, but the entry
     // is left in place for acceptRequests' mutating findFresh to evict.
-    try std.testing.expect(cache.freshSlotIndex(key, 150, ttl) == null);
-    try std.testing.expect(cache.slotIndex(key) != null);
+    try std.testing.expect(cache.freshSlotIndex(testGoalKey(3), 150, ttl) == null);
+    try std.testing.expect(cache.slotIndex(testGoalKey(3)) != null);
     // ttl 0 disables expiry.
-    try std.testing.expect(cache.freshSlotIndex(key, 100_000, 0) != null);
+    try std.testing.expect(cache.freshSlotIndex(testGoalKey(3), 100_000, 0) != null);
 }
 
 test "pathfinding result cache evicts deterministically and stores paths" {
     var stats = PathfindingStats{};
     var cache = ResultCache{};
     defer cache.deinit(std.testing.allocator);
-    try cache.reserve(std.testing.allocator, 1, 4, 8, 0);
-    var first_key = emptyKey(1);
-    first_key.goal.x = 1;
-    var second_key = emptyKey(1);
-    second_key.goal.x = 2;
+    try testResize(&cache, std.testing.allocator, 1, 4, 8, 0);
 
-    cache.put(first_key, &.{ 0, 1, 2 }, &.{}, 0, 0, &stats);
-    try std.testing.expect(cache.find(first_key) != null);
-    cache.put(second_key, &.{ 3, 4 }, &.{}, 0, 0, &stats);
+    testPut(&cache, testGoalKey(1), &.{ 0, 1, 2 }, &.{}, 0, 0, &stats);
+    try std.testing.expect(cache.find(testGoalKey(1)) != null);
+    testPut(&cache, testGoalKey(2), &.{ 3, 4 }, &.{}, 0, 0, &stats);
     try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
-    try std.testing.expect(cache.find(first_key) == null);
-    const slot = cache.slotIndex(second_key).?;
+    try std.testing.expect(cache.find(testGoalKey(1)) == null);
+    const slot = cache.slotIndex(testGoalKey(2)).?;
     const stored = cache.pathSlice(slot, cache.resultAt(slot).path_len);
     try std.testing.expectEqual(@as(usize, 2), stored.len);
     try std.testing.expectEqual(@as(u32, 3), stored[0]);
@@ -1456,36 +2042,22 @@ test "pathfinding result cache stays correct at full logical occupancy" {
     var cache = ResultCache{};
     defer cache.deinit(std.testing.allocator);
     const capacity = 8;
-    try cache.reserve(std.testing.allocator, capacity, 4, 8, 0);
+    try testResize(&cache, std.testing.allocator, capacity, 4, 8, 0);
 
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        cache.put(key, &.{@intCast(i)}, &.{}, 0, 0, &stats);
-    }
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        try std.testing.expect(cache.find(key) != null);
-    }
+    for (0..capacity) |i| testPut(&cache, testGoalKey(i), &.{@intCast(i)}, &.{}, 0, 0, &stats);
+    for (0..capacity) |i| try std.testing.expect(cache.find(testGoalKey(i)) != null);
     // An absent key (never inserted) must resolve to a miss, not loop or misread a
     // neighboring slot's payload.
-    var absent = emptyKey(1);
-    absent.goal.x = capacity + 100;
-    try std.testing.expect(cache.find(absent) == null);
+    try std.testing.expect(cache.find(testGoalKey(capacity + 100)) == null);
 
     // One more insert past logical capacity evicts exactly one victim; every other key
     // stays resolvable.
-    var overflow_key = emptyKey(1);
-    overflow_key.goal.x = capacity;
-    cache.put(overflow_key, &.{99}, &.{}, 0, 0, &stats);
+    testPut(&cache, testGoalKey(capacity), &.{99}, &.{}, 0, 0, &stats);
     try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
-    try std.testing.expect(cache.find(overflow_key) != null);
+    try std.testing.expect(cache.find(testGoalKey(capacity)) != null);
     var survivors: usize = 0;
     for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        if (cache.find(key) != null) survivors += 1;
+        if (cache.find(testGoalKey(i)) != null) survivors += 1;
     }
     try std.testing.expectEqual(capacity - 1, survivors);
 }
@@ -1496,139 +2068,21 @@ test "pathfinding fixed-capacity key set stays correct at full logical occupancy
     const capacity = 8;
     try keys.reserve(std.testing.allocator, capacity);
 
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        try std.testing.expect(keys.insert(key));
-    }
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        try std.testing.expect(keys.contains(key));
-    }
+    for (0..capacity) |i| try std.testing.expect(keys.insert(testGoalKey(i)));
+    for (0..capacity) |i| try std.testing.expect(keys.contains(testGoalKey(i)));
     // A logically-full set rejects a new key (no eviction: KeySet is fixed-capacity,
     // unlike ResultCache) but every absent-key probe still terminates.
-    var overflow_key = emptyKey(1);
-    overflow_key.goal.x = capacity;
-    try std.testing.expect(!keys.insert(overflow_key));
-    try std.testing.expect(!keys.contains(overflow_key));
+    try std.testing.expect(!keys.insert(testGoalKey(capacity)));
+    try std.testing.expect(!keys.contains(testGoalKey(capacity)));
 }
 
-// Minimal single-level NavGraph for cache-eviction/waypoint tests: only the grid
-// dimensions are read (cellInSpans / waypointFromStitched), so an empty-backed grid
-// of the requested size suffices. Caller must deinit the returned graph's level list.
+// Minimal single-level NavGraph for waypoint tests: only the grid dimensions are read, so
+// an empty-backed grid of the requested size suffices. Caller must deinit the returned
+// graph's level list.
 fn makeTestGraph(allocator: std.mem.Allocator, width: usize, height: usize) !NavGraph {
     var graph = NavGraph{ .allocator = allocator, .width = width, .height = height };
     try graph.levels.append(allocator, NavGrid{ .width = width, .height = height, .cell_size = 1 });
     return graph;
-}
-
-test "pathfinding result cache evicts only paths crossing an edited span" {
-    var stats = PathfindingStats{};
-    var graph = try makeTestGraph(std.testing.allocator, 10, 10);
-    defer graph.levels.deinit(std.testing.allocator);
-    var cache = ResultCache{};
-    defer cache.deinit(std.testing.allocator);
-    try cache.reserve(std.testing.allocator, 4, 8, 8, 0);
-
-    // Crossing path runs along row 0 through cell (2,0); clear path sits on row 5.
-    var crossing = emptyKey(1);
-    crossing.goal.x = 1;
-    cache.put(crossing, &.{ 0, 1, 2, 3 }, &.{}, 0, 0, &stats);
-    var clear = emptyKey(1);
-    clear.goal.x = 2;
-    cache.put(clear, &.{ 50, 51, 52 }, &.{}, 0, 0, &stats);
-
-    const spans = [_]ChangedSpan{.{ .level = 0, .span = .{ .min_x = 2, .max_x = 2, .min_y = 0, .max_y = 0 } }};
-    cache.evictCrossing(&graph, &spans);
-
-    try std.testing.expect(cache.find(crossing) == null); // crossed (2,0) -> evicted
-    try std.testing.expect(cache.find(clear) != null); // clear of the edit -> still served
-}
-
-test "pathfinding result cache evicts every crossing entry in one bulk edit without a restart per eviction" {
-    // A single evictCrossing call with several crossing entries exercises the
-    // collect-then-remove sweep under back-shift relocation: every crossing entry must
-    // be evicted (none skipped/double-visited because an earlier removal shifted a
-    // later entry), and every clear entry must survive.
-    var stats = PathfindingStats{};
-    var graph = try makeTestGraph(std.testing.allocator, 10, 10);
-    defer graph.levels.deinit(std.testing.allocator);
-    var cache = ResultCache{};
-    defer cache.deinit(std.testing.allocator);
-    const capacity = 8;
-    try cache.reserve(std.testing.allocator, capacity, 8, 8, 0);
-
-    // Even-indexed entries cross row 0 (the edited span); odd-indexed sit clear on row 5.
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        if (i % 2 == 0) {
-            cache.put(key, &.{ 0, 1, @as(u32, @intCast(2 + i)) }, &.{}, 0, 0, &stats);
-        } else {
-            cache.put(key, &.{ 50, 51, @as(u32, @intCast(52 + i)) }, &.{}, 0, 0, &stats);
-        }
-    }
-
-    const spans = [_]ChangedSpan{.{ .level = 0, .span = .{ .min_x = 0, .max_x = 1, .min_y = 0, .max_y = 0 } }};
-    cache.evictCrossing(&graph, &spans);
-
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        if (i % 2 == 0) {
-            try std.testing.expect(cache.find(key) == null); // crossing -> evicted
-        } else {
-            try std.testing.expect(cache.find(key) != null); // clear -> survives
-        }
-    }
-}
-
-test "pathfinding result cache evicts a stitched corridor only when a span matches its cell's own level" {
-    // The stitched branch of crossesSpans checks (level, cell) per stored StitchedCell, not
-    // cell alone: an edit on level 0 must evict a corridor whose level-0 run touches it, but
-    // must NOT evict an otherwise-identical corridor that only touches that cell on level 1.
-    var stats = PathfindingStats{};
-    var graph = NavGraph{ .allocator = std.testing.allocator, .width = 10, .height = 10 };
-    defer graph.levels.deinit(std.testing.allocator);
-    try graph.levels.append(std.testing.allocator, NavGrid{ .width = 10, .height = 10, .cell_size = 1 });
-    try graph.levels.append(std.testing.allocator, NavGrid{ .level = 1, .width = 10, .height = 10, .cell_size = 1 });
-
-    var cache = ResultCache{};
-    defer cache.deinit(std.testing.allocator);
-    try cache.reserve(std.testing.allocator, 4, 8, 8, 0);
-
-    // Same cell sequence, different levels: only the level-0 corridor should be considered
-    // crossing an edit scoped to level 0.
-    var on_level0 = emptyKey(1);
-    on_level0.goal.x = 1;
-    cache.put(on_level0, &.{}, &.{
-        .{ .level = 0, .cell = 0 },
-        .{ .level = 0, .cell = 1 },
-        .{ .level = 0, .cell = 2 },
-    }, 0, 0, &stats);
-    var on_level1 = emptyKey(1);
-    on_level1.goal.x = 2;
-    cache.put(on_level1, &.{}, &.{
-        .{ .level = 1, .cell = 0 },
-        .{ .level = 1, .cell = 1 },
-        .{ .level = 1, .cell = 2 },
-    }, 1, 0, &stats);
-    // A cross-level corridor: its level-0 prefix touches the edit, its level-1 tail does not.
-    var mixed = emptyKey(1);
-    mixed.goal.x = 3;
-    cache.put(mixed, &.{}, &.{
-        .{ .level = 0, .cell = 1 },
-        .{ .level = 1, .cell = 5 },
-        .{ .level = 1, .cell = 6 },
-    }, 0, 0, &stats);
-
-    const spans = [_]ChangedSpan{.{ .level = 0, .span = .{ .min_x = 1, .max_x = 1, .min_y = 0, .max_y = 0 } }};
-    cache.evictCrossing(&graph, &spans);
-
-    try std.testing.expect(cache.find(on_level0) == null); // level-0 cell 1 crossed -> evicted
-    try std.testing.expect(cache.find(on_level1) != null); // same cell id, but level 1 -> survives
-    try std.testing.expect(cache.find(mixed) == null); // its level-0 prefix crossed -> evicted
 }
 
 test "pathfinding group key map keeps probe chains intact after mid-chain removal" {
@@ -1637,25 +2091,15 @@ test "pathfinding group key map keeps probe chains intact after mid-chain remova
     const capacity = 8;
     try map.reserve(std.testing.allocator, capacity);
 
-    for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
-        try std.testing.expect(map.insert(key, i));
-    }
+    for (0..capacity) |i| try std.testing.expect(map.insert(testGoalKey(i), i));
     // Remove two entries that may sit mid-probe-chain; every survivor must stay findable and
     // keep its group index (back-shift deletion must not strand a later key behind the gap).
-    for ([_]usize{ 2, 5 }) |target| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(target);
-        map.remove(key);
-    }
+    for ([_]usize{ 2, 5 }) |target| map.remove(testGoalKey(target));
     for (0..capacity) |i| {
-        var key = emptyKey(1);
-        key.goal.x = @intCast(i);
         if (i == 2 or i == 5) {
-            try std.testing.expect(map.find(key) == null);
+            try std.testing.expect(map.find(testGoalKey(i)) == null);
         } else {
-            try std.testing.expectEqual(i, map.find(key).?);
+            try std.testing.expectEqual(i, map.find(testGoalKey(i)).?);
         }
     }
 }
@@ -1664,22 +2108,22 @@ test "pathfinding stitched waypoint matches full scan and recovers from a stale 
     var graph = try makeTestGraph(std.testing.allocator, 100, 1);
     defer graph.levels.deinit(std.testing.allocator);
     const grid = graph.grid(0).?;
-    const stitched = [_]StitchedCell{
-        .{ .level = 0, .cell = 10 }, .{ .level = 0, .cell = 11 },
-        .{ .level = 0, .cell = 12 }, .{ .level = 0, .cell = 13 },
-        .{ .level = 0, .cell = 14 }, .{ .level = 0, .cell = 15 },
-    };
+    var cells: [6]StitchedCell = undefined;
+    for (&cells, 0..) |*cell, index| cell.* = .{ .level = 0, .cell = @intCast(10 + index) };
+    var words: [types.stitchedWords(cells.len)]u32 = undefined;
+    types.writeStitched(&words, &cells);
+    const stitched = types.stitchedView(&words, cells.len);
 
-    const baseline = waypointFromStitched(&graph, &stitched, 0, 12, null).?;
+    const baseline = waypointFromStitched(&graph, stitched, 0, 12, null).?;
     try std.testing.expectEqual(grid.cellCenter(13).x, baseline.x);
 
     var fresh: u32 = 1;
-    const hinted = waypointFromStitched(&graph, &stitched, 0, 12, &fresh).?;
+    const hinted = waypointFromStitched(&graph, stitched, 0, 12, &fresh).?;
     try std.testing.expectEqual(baseline.x, hinted.x);
     try std.testing.expectEqual(@as(u32, 2), fresh);
 
     var stale: u32 = 999;
-    const recovered = waypointFromStitched(&graph, &stitched, 0, 12, &stale).?;
+    const recovered = waypointFromStitched(&graph, stitched, 0, 12, &stale).?;
     try std.testing.expectEqual(baseline.x, recovered.x);
     try std.testing.expectEqual(@as(u32, 2), stale);
 }

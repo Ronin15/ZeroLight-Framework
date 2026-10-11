@@ -2,15 +2,17 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Per-key lists of owner ids: an open-addressed `u64 key -> {head, tail}` table over a
-//! pool of doubly linked entries, each list ordered by its entries' `order`, plus one
+//! Per-key lists of owner ids: an open-addressed `u64 key -> {head, tail, count}` table over
+//! a pool of doubly linked entries, each list ordered by its entries' `order`, plus one
 //! chain per owner of the entries it holds. Keys are any u64 whose tier bits (62-63) are not
 //! both set; `chunkKey` builds the (level, chunk) keys. Each present key also holds one u32
 //! value for its owner (`no_value` until set); a key holding a value is never dropped.
 //! Lists change in batches: between `beginBatch` and `commitBatch` the owner unlinks and
 //! staged inserts cost O(1) each on the caller's thread, and `commitBatch` places every
-//! staged entry in its list's order, the sorted placement threaded per key. Only the
-//! reserves allocate. Reads never mutate, so workers read lists while no batch runs.
+//! staged entry in its list's order, the sorted placement threaded per key. Outside a batch,
+//! `add` appends at a list's tail and `removeOwner`/`renameOwner` touch one owner's entries.
+//! Only the reserves allocate. Reads never mutate, so workers read lists while nothing
+//! writes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -89,6 +91,12 @@ pub const SpliceThreads = struct {
 };
 
 pub const ChunkListMap = struct {
+    /// Bytes one pooled entry takes: its key, owner, order, and three links, and its free
+    /// id.
+    pub const bytes_per_entry: usize = @sizeOf(u64) + 5 * @sizeOf(u32) + @sizeOf(u32);
+    /// Bytes one table slot takes: its key, head, tail, value, count, and batch touch.
+    pub const bytes_per_key_slot: usize = @sizeOf(u64) + 5 * @sizeOf(u32);
+
     allocator: std.mem.Allocator,
     /// What the lists hold, naming this map in its growth log.
     name: []const u8,
@@ -98,6 +106,8 @@ pub const ChunkListMap = struct {
     slot_tails: []u32 = &.{},
     // Per slot, its key's value (`no_value` when unset); moves with the key.
     slot_values: []u32 = &.{},
+    // Per slot, the entries in its key's list; moves with the key.
+    slot_counts: []u32 = &.{},
     // Per slot, its `touched` index while touched in the current batch; valid only when
     // `touched[slot_touch[slot]].slot == slot`, so it is never cleared.
     slot_touch: []u32 = &.{},
@@ -107,6 +117,10 @@ pub const ChunkListMap = struct {
     entry_free: std.ArrayList(u32) = .empty,
     // Per owner id, the newest entry it holds or `no_entry`.
     owner_heads: std.ArrayList(u32) = .empty,
+    // Fewer owner heads, allocated by `prepareTruncate` and installed by `installTruncate`;
+    // the heads they replace wait in `retired_owner_heads` for `releaseTruncated`.
+    owner_heads_replacement: ?std.ArrayList(u32) = null,
+    retired_owner_heads: std.ArrayList(u32) = .empty,
     // Column views refreshed whenever the entry pool grows.
     entry_key: []u64 = &.{},
     entry_owner: []u32 = &.{},
@@ -136,10 +150,13 @@ pub const ChunkListMap = struct {
         self.splice_records.deinit(self.allocator);
         self.touched.deinit(self.allocator);
         self.claims.deinit(self.allocator);
+        self.retired_owner_heads.deinit(self.allocator);
+        if (self.owner_heads_replacement) |*replacement| replacement.deinit(self.allocator);
         self.owner_heads.deinit(self.allocator);
         self.entry_free.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.allocator.free(self.slot_touch);
+        self.allocator.free(self.slot_counts);
         self.allocator.free(self.slot_values);
         self.allocator.free(self.slot_tails);
         self.allocator.free(self.slot_heads);
@@ -210,6 +227,8 @@ pub const ChunkListMap = struct {
         errdefer self.allocator.free(tails);
         const values = try self.allocator.alloc(u32, slot_count);
         errdefer self.allocator.free(values);
+        const counts = try self.allocator.alloc(u32, slot_count);
+        errdefer self.allocator.free(counts);
         const touch = try self.allocator.alloc(u32, slot_count);
         @memset(keys, empty_key);
         @memset(touch, untouched);
@@ -217,21 +236,25 @@ pub const ChunkListMap = struct {
         const old_heads = self.slot_heads;
         const old_tails = self.slot_tails;
         const old_values = self.slot_values;
+        const old_counts = self.slot_counts;
         const old_touch = self.slot_touch;
         self.slot_keys = keys;
         self.slot_heads = heads;
         self.slot_tails = tails;
         self.slot_values = values;
+        self.slot_counts = counts;
         self.slot_touch = touch;
-        for (old_keys, old_heads, old_tails, old_values) |key, old_head, old_tail, old_value| {
+        for (old_keys, old_heads, old_tails, old_values, old_counts) |key, old_head, old_tail, old_value, old_count| {
             if (key == empty_key) continue;
             const slot = self.emptySlotFor(key);
             self.slot_keys[slot] = key;
             self.slot_heads[slot] = old_head;
             self.slot_tails[slot] = old_tail;
             self.slot_values[slot] = old_value;
+            self.slot_counts[slot] = old_count;
         }
         self.allocator.free(old_touch);
+        self.allocator.free(old_counts);
         self.allocator.free(old_values);
         self.allocator.free(old_tails);
         self.allocator.free(old_heads);
@@ -298,6 +321,7 @@ pub const ChunkListMap = struct {
         self.slot_heads[slot] = no_entry;
         self.slot_tails[slot] = no_entry;
         self.slot_values[slot] = no_value;
+        self.slot_counts[slot] = 0;
         self.slot_touch[slot] = untouched;
         self.live_keys += 1;
         return slot;
@@ -314,6 +338,12 @@ pub const ChunkListMap = struct {
     pub fn value(self: *const ChunkListMap, key: u64) u32 {
         const slot = self.findSlot(key) orelse return no_value;
         return self.slot_values[slot];
+    }
+
+    /// The entries in `key`'s list; 0 when absent. O(1) expected; never mutates.
+    pub fn keyCount(self: *const ChunkListMap, key: u64) u32 {
+        const slot = self.findSlot(key) orelse return 0;
+        return self.slot_counts[slot];
     }
 
     /// Sets present `key`'s value; `no_value` clears it. A key whose list a `commitBatch`
@@ -338,7 +368,9 @@ pub const ChunkListMap = struct {
             .keys = self.slot_keys,
             .heads = self.slot_heads,
             .values = self.slot_values,
+            .counts = self.slot_counts,
             .owners = self.entry_owner,
+            .orders = self.entry_order,
             .next_entries = self.entry_next,
             .shift = self.homeShift(),
         };
@@ -348,8 +380,11 @@ pub const ChunkListMap = struct {
         keys: []const u64 = &.{},
         heads: []const u32 = &.{},
         values: []const u32 = &.{},
-        /// Per entry, its owner id and the next entry of its list (`no_entry` at the end).
+        counts: []const u32 = &.{},
+        /// Per entry, its owner id, its order, and the next entry of its list (`no_entry` at
+        /// the end).
         owners: []const u32 = &.{},
+        orders: []const u32 = &.{},
         next_entries: []const u32 = &.{},
         shift: u6 = 0,
 
@@ -358,6 +393,13 @@ pub const ChunkListMap = struct {
             if (self.keys.len == 0) return no_entry;
             const slot = probeSlot(self.keys, self.shift, key) orelse return no_entry;
             return self.heads[slot];
+        }
+
+        /// The entries in `key`'s list; 0 when absent.
+        pub fn keyCount(self: Reader, key: u64) u32 {
+            if (self.keys.len == 0) return 0;
+            const slot = probeSlot(self.keys, self.shift, key) orelse return 0;
+            return self.counts[slot];
         }
 
         /// `key`'s value, or `no_value` when it has none or is absent.
@@ -406,6 +448,115 @@ pub const ChunkListMap = struct {
         const tail = self.slot_tails[slot];
         std.debug.assert(tail == no_entry or self.entry_order[tail] <= order);
         self.linkAfter(slot, entry, tail);
+    }
+
+    /// Appends `owner` at the tail of `key`'s list at `order`, after every entry already
+    /// listed whatever their order: lists hold their adds in call order, an owner's repeats
+    /// included. O(1). Requires a prior `reserve` covering the key, the entry, and the owner
+    /// id. Not during a batch.
+    pub fn add(self: *ChunkListMap, owner: u32, key: u64, order: u32) void {
+        std.debug.assert(!self.in_batch);
+        const entry = self.claimEntry(owner, key, order);
+        const slot = self.slotFor(key);
+        self.linkAfter(slot, entry, self.slot_tails[slot]);
+    }
+
+    /// Whether `owner` holds an entry. O(1).
+    pub inline fn holdsOwner(self: *const ChunkListMap, owner: u32) bool {
+        return owner < self.owner_heads.items.len and self.owner_heads.items[owner] != no_entry;
+    }
+
+    /// Unlinks and frees every entry `owner` holds, dropping each key whose list empties
+    /// (a key holding a value stays). Returns the entries freed. O(the owner's entries);
+    /// allocates nothing. Not during a batch.
+    pub fn removeOwner(self: *ChunkListMap, owner: u32) usize {
+        std.debug.assert(!self.in_batch);
+        if (owner >= self.owner_heads.items.len) return 0;
+        var removed: usize = 0;
+        var entry = self.owner_heads.items[owner];
+        while (entry != no_entry) : (removed += 1) {
+            const owner_next = self.entry_owner_next[entry];
+            // An entry is always in its key's list, so the key has a slot.
+            const slot = self.findSlot(self.entry_key[entry]).?;
+            self.unlinkFromSlot(slot, entry);
+            if (self.slot_heads[slot] == no_entry and self.slot_values[slot] == no_value) self.removeSlot(slot);
+            std.debug.assert(self.entry_free.items.len < self.entry_free.capacity);
+            self.entry_free.appendAssumeCapacity(entry);
+            entry = owner_next;
+        }
+        self.owner_heads.items[owner] = no_entry;
+        return removed;
+    }
+
+    /// Moves every entry of owner `old` to owner `new`, which must hold none; lists keep
+    /// their order. O(the owner's entries); allocates nothing. Not during a batch.
+    pub fn renameOwner(self: *ChunkListMap, old: u32, new: u32) void {
+        std.debug.assert(!self.in_batch);
+        std.debug.assert(new < self.owner_heads.items.len);
+        std.debug.assert(self.owner_heads.items[new] == no_entry);
+        if (old >= self.owner_heads.items.len) return;
+        var entry = self.owner_heads.items[old];
+        while (entry != no_entry) : (entry = self.entry_owner_next[entry]) self.entry_owner[entry] = new;
+        self.owner_heads.items[new] = self.owner_heads.items[old];
+        self.owner_heads.items[old] = no_entry;
+    }
+
+    /// Allocates the storage of `count` owner heads for a later `installTruncate`, replacing
+    /// any earlier unused one. On error nothing changes.
+    pub fn prepareTruncate(self: *ChunkListMap, count: usize) error{OutOfMemory}!void {
+        var replacement: std.ArrayList(u32) = .empty;
+        try replacement.ensureTotalCapacityPrecise(self.allocator, count);
+        self.abortTruncate();
+        self.owner_heads_replacement = replacement;
+    }
+
+    /// Drops a prepared truncation's storage.
+    pub fn abortTruncate(self: *ChunkListMap) void {
+        if (self.owner_heads_replacement) |*replacement| replacement.deinit(self.allocator);
+        self.owner_heads_replacement = null;
+    }
+
+    /// Installs the prepared owner heads: the heads below its count move into it, and every
+    /// head at or past it must hold no entry. The replaced storage waits for
+    /// `releaseTruncated`. Lookups are untouched. O(count) copy; allocates and frees nothing,
+    /// so a flush runs it with the shard's other work. Without a prepared truncation it does
+    /// nothing. Not during a batch.
+    pub fn installTruncate(self: *ChunkListMap) void {
+        std.debug.assert(!self.in_batch);
+        var replacement = self.owner_heads_replacement orelse return;
+        const count = @min(replacement.capacity, self.owner_heads.items.len);
+        if (std.debug.runtime_safety) {
+            for (self.owner_heads.items[count..]) |owner_head| std.debug.assert(owner_head == no_entry);
+        }
+        replacement.appendSliceAssumeCapacity(self.owner_heads.items[0..count]);
+        std.debug.assert(self.retired_owner_heads.capacity == 0);
+        self.retired_owner_heads = self.owner_heads;
+        self.owner_heads = replacement;
+        self.owner_heads_replacement = null;
+    }
+
+    /// Frees the owner heads an `installTruncate` replaced. Main thread.
+    pub fn releaseTruncated(self: *ChunkListMap) void {
+        self.retired_owner_heads.deinit(self.allocator);
+        self.retired_owner_heads = .empty;
+    }
+
+    /// Empties every list and drops every key, keeping storage and owner heads (now empty).
+    /// O(slots + entries + owners). Not during a batch.
+    pub fn clear(self: *ChunkListMap) void {
+        std.debug.assert(!self.in_batch);
+        @memset(self.slot_keys, empty_key);
+        @memset(self.slot_touch, untouched);
+        self.live_keys = 0;
+        @memset(self.owner_heads.items, no_entry);
+        // Every pooled entry is free again, popped in ascending id order; ids stay below
+        // `no_entry` by the entry reserve.
+        self.entry_free.clearRetainingCapacity();
+        var id: u32 = @intCast(self.entries.len);
+        while (id > 0) {
+            id -= 1;
+            self.entry_free.appendAssumeCapacity(id);
+        }
     }
 
     /// Opens a batch; requires `reserveBatch` covering its inserts and removals.
@@ -547,23 +698,28 @@ pub const ChunkListMap = struct {
         self.entry_next[entry] = next;
         if (after == no_entry) self.slot_heads[slot] = entry else self.entry_next[after] = entry;
         if (next == no_entry) self.slot_tails[slot] = entry else self.entry_prev[next] = entry;
+        self.slot_counts[slot] += 1;
     }
 
     // Unlinks `entry` from its list; an emptied list's key waits in `emptied_keys`.
     fn unlink(self: *ChunkListMap, entry: u32) void {
-        const prev = self.entry_prev[entry];
-        const next = self.entry_next[entry];
-        if (prev != no_entry) self.entry_next[prev] = next;
-        if (next != no_entry) self.entry_prev[next] = prev;
-        if (prev != no_entry and next != no_entry) return;
         // An entry is always in its key's list, so the key has a slot.
         const slot = self.findSlot(self.entry_key[entry]).?;
-        if (prev == no_entry) self.slot_heads[slot] = next;
-        if (next == no_entry) self.slot_tails[slot] = prev;
+        self.unlinkFromSlot(slot, entry);
         if (self.slot_heads[slot] == no_entry) {
             std.debug.assert(self.emptied_keys.items.len < self.emptied_keys.capacity);
             self.emptied_keys.appendAssumeCapacity(self.slot_keys[slot]);
         }
+    }
+
+    // Unlinks `entry` from the list of `slot`, its key's slot.
+    fn unlinkFromSlot(self: *ChunkListMap, slot: usize, entry: u32) void {
+        const prev = self.entry_prev[entry];
+        const next = self.entry_next[entry];
+        if (prev == no_entry) self.slot_heads[slot] = next else self.entry_next[prev] = next;
+        if (next == no_entry) self.slot_tails[slot] = prev else self.entry_prev[next] = prev;
+        std.debug.assert(self.slot_counts[slot] != 0);
+        self.slot_counts[slot] -= 1;
     }
 
     // Back-shift deletion: later keys of the probe run move into the hole when their home
@@ -581,6 +737,7 @@ pub const ChunkListMap = struct {
                 self.slot_heads[hole] = self.slot_heads[slot];
                 self.slot_tails[hole] = self.slot_tails[slot];
                 self.slot_values[hole] = self.slot_values[slot];
+                self.slot_counts[hole] = self.slot_counts[slot];
                 hole = slot;
             }
         }
@@ -1146,4 +1303,196 @@ test "a key's value survives a rehash and the back-shift deletion of its probe n
     _ = try applyBatch(&map, &.{key_count + 1}, &.{}, key_count + run.len, null);
     try std.testing.expectEqual(no_entry, map.head(run[1]));
     try std.testing.expectEqual(@as(u32, 202), map.value(run[2]));
+}
+
+// Owners and orders of `key`'s list, in list order.
+fn collectEntries(map: *const ChunkListMap, key: u64, owners: *std.ArrayList(u32), orders: *std.ArrayList(u32)) !void {
+    owners.clearRetainingCapacity();
+    orders.clearRetainingCapacity();
+    var entry = map.head(key);
+    while (entry != no_entry) : (entry = map.entry_next[entry]) {
+        try owners.append(std.testing.allocator, map.entry_owner[entry]);
+        try orders.append(std.testing.allocator, map.entry_order[entry]);
+    }
+}
+
+// Every live key's count equals its list length, and every pooled entry is listed or free.
+fn expectCountsMatchLists(map: *const ChunkListMap) !void {
+    var listed: usize = 0;
+    for (map.slot_keys, 0..) |key, slot| {
+        if (key == empty_key) continue;
+        var length: u32 = 0;
+        var entry = map.slot_heads[slot];
+        while (entry != no_entry) : (entry = map.entry_next[entry]) length += 1;
+        try std.testing.expectEqual(length, map.slot_counts[slot]);
+        try std.testing.expectEqual(length, map.keyCount(key));
+        try std.testing.expectEqual(length, map.reader().keyCount(key));
+        listed += length;
+    }
+    try std.testing.expectEqual(listed, liveEntryCount(map));
+}
+
+test "add keeps every run of one owner in insertion order without dedupe" {
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer map.deinit();
+    const key = chunkKey(3, 5);
+    try map.reserve(1, 6, 4);
+    // Owner 1 enters the key three times; orders are run starts, not sorted.
+    map.add(1, key, 40);
+    map.add(2, key, 7);
+    map.add(1, key, 3);
+    map.add(1, key, 3);
+    map.add(0, key, 90);
+    var owners: std.ArrayList(u32) = .empty;
+    defer owners.deinit(std.testing.allocator);
+    var orders: std.ArrayList(u32) = .empty;
+    defer orders.deinit(std.testing.allocator);
+    try collectEntries(&map, key, &owners, &orders);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 1, 1, 0 }, owners.items);
+    try std.testing.expectEqualSlices(u32, &.{ 40, 7, 3, 3, 90 }, orders.items);
+    try std.testing.expectEqual(@as(u32, 5), map.keyCount(key));
+    try expectCountsMatchLists(&map);
+}
+
+test "removeOwner unlinks every entry of the owner and drops the keys it empties" {
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer map.deinit();
+    try map.reserve(3, 6, 3);
+    // Owner 0 alone in keys A and C; shares key B with owner 1, twice in B.
+    const a = chunkKey(0, 1);
+    const b = chunkKey(0, 2);
+    const c = chunkKey(1, 2);
+    map.add(0, a, 0);
+    map.add(0, b, 1);
+    map.add(1, b, 0);
+    map.add(0, b, 4);
+    map.add(0, c, 6);
+    map.add(2, chunkKey(4, 4), 0);
+    try std.testing.expectEqual(@as(usize, 4), map.removeOwner(0));
+    try std.testing.expectEqual(no_entry, map.head(a));
+    try std.testing.expectEqual(no_entry, map.head(c));
+    try std.testing.expect(map.findSlot(a) == null and map.findSlot(c) == null);
+    try std.testing.expectEqual(@as(usize, 2), map.live_keys);
+    var owners: std.ArrayList(u32) = .empty;
+    defer owners.deinit(std.testing.allocator);
+    try collectOwners(&map, b, &owners);
+    try std.testing.expectEqualSlices(u32, &.{1}, owners.items);
+    try std.testing.expectEqual(no_entry, map.owner_heads.items[0]);
+    try expectCountsMatchLists(&map);
+    // An owner with no entries, or past the heads, removes nothing.
+    try std.testing.expectEqual(@as(usize, 0), map.removeOwner(0));
+    try std.testing.expectEqual(@as(usize, 0), map.removeOwner(99));
+}
+
+test "renameOwner moves every entry and allocates nothing (FailingAllocator)" {
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer map.deinit();
+    try map.reserve(3, 5, 8);
+    const keys = [_]u64{ chunkKey(0, 0), chunkKey(0, 1), chunkKey(2, 9) };
+    map.add(5, keys[0], 0);
+    map.add(1, keys[1], 0);
+    map.add(5, keys[1], 3);
+    map.add(5, keys[2], 7);
+    map.add(1, keys[2], 0);
+    map.allocator = std.testing.failing_allocator;
+    map.renameOwner(5, 2);
+    map.allocator = std.testing.allocator;
+    try std.testing.expectEqual(no_entry, map.owner_heads.items[5]);
+    var owners: std.ArrayList(u32) = .empty;
+    defer owners.deinit(std.testing.allocator);
+    var orders: std.ArrayList(u32) = .empty;
+    defer orders.deinit(std.testing.allocator);
+    try collectEntries(&map, keys[1], &owners, &orders);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, owners.items);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3 }, orders.items);
+    try collectEntries(&map, keys[2], &owners, &orders);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, owners.items);
+    // The renamed owner's chain holds its three entries; removing it frees them all.
+    var chain: usize = 0;
+    var entry = map.owner_heads.items[2];
+    while (entry != no_entry) : (entry = map.entry_owner_next[entry]) {
+        try std.testing.expectEqual(@as(u32, 2), map.entry_owner[entry]);
+        chain += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), chain);
+    try std.testing.expectEqual(@as(usize, 3), map.removeOwner(2));
+    try std.testing.expectEqual(@as(usize, 0), map.removeOwner(5));
+    try expectCountsMatchLists(&map);
+}
+
+test "key count follows add, a batch commit, removeOwner, renameOwner, a rehash, and back-shift deletion" {
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer map.deinit();
+    const owner_count = 200;
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const random = prng.random();
+    var live: [owner_count]bool = @splat(false);
+    // Grows the table from its minimum through several rehashes.
+    for (0..owner_count) |owner| {
+        const runs = random.uintLessThan(u32, 4) + 1;
+        try map.reserve(runs, runs, owner_count);
+        for (0..runs) |run| map.add(@intCast(owner), chunkKey(random.uintLessThan(u16, 2), random.uintLessThan(u32, 60)), @intCast(run));
+        live[owner] = true;
+        try expectCountsMatchLists(&map);
+    }
+    try std.testing.expect(map.slot_keys.len > min_slot_count * 4);
+    // A batch moves some owners: unlinks and staged inserts.
+    try map.reserve(64, 64, owner_count);
+    try map.reserveBatch(64, liveEntryCount(&map));
+    map.beginBatch();
+    for (0..32) |at| {
+        const owner: u32 = @intCast(at * 5);
+        map.unlinkOwnerOutside(owner, keep_nothing);
+        map.stageInsert(owner, chunkKey(0, 100 + @as(u32, @intCast(at % 7))), owner);
+    }
+    _ = map.commitBatch(null);
+    try expectCountsMatchLists(&map);
+    // Removals drop keys and back-shift their probe neighbours; renames move into freed ids.
+    for (0..owner_count) |owner| {
+        if (owner % 3 == 0) {
+            _ = map.removeOwner(@intCast(owner));
+            live[owner] = false;
+        }
+    }
+    try expectCountsMatchLists(&map);
+    for (0..owner_count) |owner| {
+        if (owner % 3 == 1 and !live[owner - 1]) {
+            map.renameOwner(@intCast(owner), @intCast(owner - 1));
+            live[owner - 1] = true;
+            live[owner] = false;
+        }
+    }
+    try expectCountsMatchLists(&map);
+}
+
+test "a prepared owner truncation keeps every lookup, installs without allocating (FailingAllocator), and releases the heads past the count" {
+    var map = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer map.deinit();
+    try map.reserve(4, 4, 64);
+    for (0..4) |owner| map.add(@intCast(owner), chunkKey(0, @intCast(owner)), 0);
+    // Owners 40 and 60 held entries once; renamed below the count before truncating.
+    try map.reserve(2, 2, 64);
+    map.add(40, chunkKey(1, 0), 0);
+    map.add(60, chunkKey(1, 1), 0);
+    try map.prepareTruncate(6);
+    map.renameOwner(40, 4);
+    map.renameOwner(60, 5);
+    map.allocator = std.testing.failing_allocator;
+    map.installTruncate();
+    map.allocator = std.testing.allocator;
+    map.releaseTruncated();
+    try std.testing.expectEqual(@as(usize, 6), map.owner_heads.items.len);
+    try std.testing.expectEqual(@as(usize, 6), map.owner_heads.capacity);
+    for (0..4) |owner| {
+        var owners = map.iterator(chunkKey(0, @intCast(owner)));
+        try std.testing.expectEqual(@as(?u32, @intCast(owner)), owners.next());
+        try std.testing.expectEqual(@as(?u32, null), owners.next());
+    }
+    var moved = map.iterator(chunkKey(1, 1));
+    try std.testing.expectEqual(@as(?u32, 5), moved.next());
+    try expectCountsMatchLists(&map);
+    // A truncated id grows back through the reserve.
+    try map.reserve(1, 1, 64);
+    map.add(63, chunkKey(2, 0), 0);
+    try std.testing.expectEqual(@as(usize, 1), map.removeOwner(63));
 }

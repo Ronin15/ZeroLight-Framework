@@ -23,8 +23,12 @@ const AbstractScratch = @import("scratch.zig").AbstractScratch;
 const AbstractSlot = @import("scratch.zig").AbstractSlot;
 const CorridorScratch = @import("scratch.zig").CorridorScratch;
 const SearchScratch = @import("scratch.zig").SearchScratch;
+const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const types = @import("types.zig");
 const PathSolveResult = types.PathSolveResult;
+const CellCursor = types.CellCursor;
+const registry_shard_count = types.registry_shard_count;
+const registryShard = types.registryShard;
 const PendingRequest = types.PendingRequest;
 const PathQueryKey = types.PathQueryKey;
 const StitchedCell = types.StitchedCell;
@@ -768,38 +772,106 @@ fn reconstructLocalPath(scratch: *SearchScratch, goal_slot: u32) void {
     std.mem.reverse(u32, scratch.path_scratch.items);
 }
 
-// Writes a plain path whole into this request's output stripe at its fallback ordinal.
-// The local solve bounds a path at one cell per explored node, which the stripe holds.
+// Writes a plain path whole into this request's output stripe at its fallback ordinal,
+// with its registry runs. The local solve bounds a path at one cell per explored node,
+// which the stripe holds.
 fn recordPath(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, path: []const u32, path_level: u16) void {
     const stripe_words = types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells);
     const offset = ordinal * stripe_words;
     std.debug.assert(path.len <= stripe_words);
     @memcpy(system.worker_path_pool.items[offset .. offset + path.len], path);
-    system.solved_paths.items[ordinal] = .{
+    var solved = PathfindingSystem.SolvedPath{
         .key = key,
         .offset = offset,
         .len = path.len,
         .path_level = path_level,
     };
+    const starts = system.worker_run_starts.items[offset..][0..stripe_words];
+    solved.run_count = splitRuns(RunGeometry.of(&system.graph), path, null, path_level, starts, &solved.shard_counts);
+    system.solved_paths.items[ordinal] = solved;
 }
 
 // Writes the full stitched (level,cell) corridor path whole into this request's output
-// stripe; `path_level` is the start level. stitchCorridor's cap (at most
-// max_stitched_path_cells) bounds it at the stripe, asserted so a drift fails loud
-// instead of truncating the corridor.
+// stripe as its cells, then its levels, with its registry runs; `path_level` is the start
+// level. stitchCorridor's cap (at most max_stitched_path_cells) bounds it at the stripe,
+// asserted so a drift fails loud instead of truncating the corridor.
 fn recordStitched(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, stitched: []const StitchedCell, start_level: u16) void {
     const stripe_words = types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells);
     const offset = ordinal * stripe_words;
-    std.debug.assert(stitched.len * types.stitched_cell_words <= stripe_words);
+    std.debug.assert(types.stitchedWords(stitched.len) <= stripe_words);
     const stripe = system.worker_path_pool.items[offset .. offset + stripe_words];
-    @memcpy(types.stitchedCells(stripe, stitched.len), stitched);
-    system.solved_paths.items[ordinal] = .{
+    types.writeStitched(stripe, stitched);
+    const view = types.stitchedView(stripe, stitched.len);
+    var solved = PathfindingSystem.SolvedPath{
         .key = key,
         .offset = offset,
         .len = 0,
         .stitched_len = stitched.len,
         .path_level = start_level,
     };
+    const starts = system.worker_run_starts.items[offset..][0..stripe_words];
+    solved.run_count = splitRuns(RunGeometry.of(&system.graph), view.cells, view.levels, start_level, starts, &solved.shard_counts);
+    system.solved_paths.items[ordinal] = solved;
+}
+
+/// How stored cells map to path-registry keys: a run's key is its (level, chunk).
+pub const RunGeometry = struct {
+    width: usize,
+    chunk_shift: u6,
+    chunks_x: usize,
+
+    pub fn of(graph: *const NavGraph) RunGeometry {
+        // Chunk edges are powers of two.
+        return .{
+            .width = graph.width,
+            .chunk_shift = @intCast(@ctz(graph.chunk_tiles)),
+            .chunks_x = (types.ChunkGeometry{ .width = graph.width, .height = graph.height, .chunk_tiles = graph.chunk_tiles }).chunksX(),
+        };
+    }
+
+    /// The key of the chunk holding (x, y) on `level`.
+    pub fn keyAt(self: RunGeometry, level: u16, x: usize, y: usize) u64 {
+        // A level's chunk count stays below 2^31.
+        return chunkKey(level, @intCast((y >> self.chunk_shift) * self.chunks_x + (x >> self.chunk_shift)));
+    }
+
+    /// The key of the chunk holding `cell` on `level`: one division.
+    pub fn key(self: RunGeometry, level: u16, cell: u32) u64 {
+        return self.keyAt(level, cell % self.width, cell / self.width);
+    }
+};
+
+/// Splits a stored path into registry runs, maximal stretches of consecutive cells on one
+/// level in one chunk (a path re-entering a chunk starts a new run each time): writes each
+/// run's first cell index into `starts`, adds each run key's shard to `shard_counts`, and
+/// returns the run count. `levels` is the stitched levels column, or null for a plain path
+/// on `path_level`. O(cells): coordinates follow each step, with a division only to start,
+/// at a level change, or after a step to a cell that is not a neighbour.
+// SIMD verdict: scalar. Run boundaries are data-dependent and each step updates the
+// coordinates of the previous one.
+pub fn splitRuns(geometry: RunGeometry, cells: []const u32, levels: ?[]const u16, path_level: u16, starts: []u16, shard_counts: *[registry_shard_count]u32) u32 {
+    std.debug.assert(cells.len <= starts.len);
+    var run_count: u32 = 0;
+    var cursor: CellCursor = undefined;
+    var run_level: u16 = 0;
+    var run_chunk_x: usize = 0;
+    var run_chunk_y: usize = 0;
+    for (cells, 0..) |cell, index| {
+        const level = if (levels) |column| column[index] else path_level;
+        const level_changed = index == 0 or level != run_level;
+        if (level_changed) cursor = .init(geometry.width, cell) else cursor.moveTo(cell);
+        const chunk_x = cursor.x >> geometry.chunk_shift;
+        const chunk_y = cursor.y >> geometry.chunk_shift;
+        if (!level_changed and chunk_x == run_chunk_x and chunk_y == run_chunk_y) continue;
+        // A run start indexes the stripe, whose width the reserve keeps within u16.
+        starts[run_count] = @intCast(index);
+        run_count += 1;
+        shard_counts[registryShard(geometry.keyAt(level, cursor.x, cursor.y))] += 1;
+        run_level = level;
+        run_chunk_x = chunk_x;
+        run_chunk_y = chunk_y;
+    }
+    return run_count;
 }
 
 // ----------------------------------------------------------------------------
@@ -2065,4 +2137,119 @@ test "same-level abstract searches in worlds without long links equal the goal-l
         }
     }
     try std.testing.expect(found > 20);
+}
+
+// Run starts and keys by one division per cell: a new run wherever the level or chunk
+// differs from the previous cell's.
+fn referenceRuns(geometry: RunGeometry, cells: []const u32, levels: ?[]const u16, path_level: u16, starts: *std.ArrayList(u16), keys: *std.ArrayList(u64)) !void {
+    starts.clearRetainingCapacity();
+    keys.clearRetainingCapacity();
+    for (cells, 0..) |cell, index| {
+        const run_key = geometry.key(if (levels) |column| column[index] else path_level, cell);
+        if (index != 0 and keys.items[keys.items.len - 1] == run_key) continue;
+        try starts.append(std.testing.allocator, @intCast(index));
+        try keys.append(std.testing.allocator, run_key);
+    }
+}
+
+// Splits `stitched` (or a plain path when every level is `path_level`) and checks the
+// starts and shard counts against `referenceRuns`.
+fn expectRunsMatchReference(geometry: RunGeometry, stitched: []const StitchedCell, plain: bool) !void {
+    var words: [64]u32 = undefined;
+    var cells: [32]u32 = undefined;
+    for (stitched, cells[0..stitched.len]) |cell, *plain_cell| plain_cell.* = cell.cell;
+    types.writeStitched(&words, stitched);
+    const view = types.stitchedView(&words, stitched.len);
+    const levels: ?[]const u16 = if (plain) null else view.levels;
+    var starts: [32]u16 = undefined;
+    var counts: [registry_shard_count]u32 = @splat(0);
+    const run_count = splitRuns(geometry, cells[0..stitched.len], levels, stitched[0].level, &starts, &counts);
+    var expected_starts: std.ArrayList(u16) = .empty;
+    defer expected_starts.deinit(std.testing.allocator);
+    var expected_keys: std.ArrayList(u64) = .empty;
+    defer expected_keys.deinit(std.testing.allocator);
+    try referenceRuns(geometry, cells[0..stitched.len], levels, stitched[0].level, &expected_starts, &expected_keys);
+    try std.testing.expectEqualSlices(u16, expected_starts.items, starts[0..run_count]);
+    var expected_counts: [registry_shard_count]u32 = @splat(0);
+    for (expected_keys.items) |key| expected_counts[registryShard(key)] += 1;
+    try std.testing.expectEqualSlices(u32, &expected_counts, &counts);
+}
+
+// 20 x 12 cells in 4-cell chunks: five chunks per row.
+const test_run_geometry = RunGeometry{ .width = 20, .chunk_shift = 2, .chunks_x = 5 };
+
+fn testCell(x: u32, y: u32) u32 {
+    return y * 20 + x;
+}
+
+test "registrations built on the worker equal a reference run split (plain; stitched across a level change; re-entering a chunk; single cell; non-adjacent step)" {
+    var path: [32]StitchedCell = undefined;
+    // Plain: a diagonal then a straight line across chunk corners and edges, ending at the
+    // grid's right edge (an index step of +1 that must not wrap a row).
+    var len: usize = 0;
+    for (0..6) |step| {
+        path[len] = .{ .level = 2, .cell = testCell(@intCast(1 + step), @intCast(1 + step)) };
+        len += 1;
+    }
+    for (7..20) |x| {
+        path[len] = .{ .level = 2, .cell = testCell(@intCast(x), 6) };
+        len += 1;
+    }
+    try expectRunsMatchReference(test_run_geometry, path[0..len], true);
+    try expectRunsMatchReference(test_run_geometry, path[0..len], false);
+    // Stitched across a level change at the same cell, then back.
+    len = 0;
+    for ([_][3]u32{ .{ 0, 2, 2 }, .{ 0, 3, 2 }, .{ 0, 4, 2 }, .{ 1, 4, 2 }, .{ 1, 5, 2 }, .{ 0, 5, 2 }, .{ 0, 6, 3 } }) |step| {
+        path[len] = .{ .level = @intCast(step[0]), .cell = testCell(step[1], step[2]) };
+        len += 1;
+    }
+    try expectRunsMatchReference(test_run_geometry, path[0..len], false);
+    // Leaving chunk (0, 0) and re-entering it: two runs of the same key.
+    len = 0;
+    for ([_][2]u32{ .{ 2, 1 }, .{ 3, 1 }, .{ 4, 1 }, .{ 4, 2 }, .{ 3, 2 }, .{ 2, 2 } }) |step| {
+        path[len] = .{ .level = 0, .cell = testCell(step[0], step[1]) };
+        len += 1;
+    }
+    try expectRunsMatchReference(test_run_geometry, path[0..len], true);
+    var starts: [8]u16 = undefined;
+    var counts: [registry_shard_count]u32 = @splat(0);
+    var cells: [6]u32 = undefined;
+    for (path[0..len], &cells) |cell, *plain_cell| plain_cell.* = cell.cell;
+    try std.testing.expectEqual(@as(u32, 3), splitRuns(test_run_geometry, &cells, null, 0, &starts, &counts));
+    // A single cell.
+    try expectRunsMatchReference(test_run_geometry, &.{.{ .level = 1, .cell = testCell(19, 11) }}, false);
+    // A same-level teleport: a jump to a far cell, then neighbouring steps from it.
+    len = 0;
+    for ([_][2]u32{ .{ 1, 1 }, .{ 2, 1 }, .{ 17, 9 }, .{ 18, 10 }, .{ 19, 11 }, .{ 0, 0 }, .{ 1, 0 } }) |step| {
+        path[len] = .{ .level = 0, .cell = testCell(step[0], step[1]) };
+        len += 1;
+    }
+    try expectRunsMatchReference(test_run_geometry, path[0..len], true);
+}
+
+test "per-ordinal shard counts equal the shard counts of the reference run keys" {
+    // Every chunk of a 4-level grid visited in a snake, so runs spread over the shards.
+    var prng = std.Random.DefaultPrng.init(0x5a4d);
+    const random = prng.random();
+    var path: [32]StitchedCell = undefined;
+    for (0..20) |_| {
+        var x: u32 = random.uintLessThan(u32, 20);
+        var y: u32 = random.uintLessThan(u32, 12);
+        var level: u16 = random.uintLessThan(u16, 4);
+        for (&path) |*cell| {
+            cell.* = .{ .level = level, .cell = testCell(x, y) };
+            switch (random.uintLessThan(u8, 6)) {
+                0 => x = @min(x + 1, 19),
+                1 => x -|= 1,
+                2 => y = @min(y + 1, 11),
+                3 => y -|= 1,
+                4 => level = random.uintLessThan(u16, 4),
+                else => {
+                    x = random.uintLessThan(u32, 20);
+                    y = random.uintLessThan(u32, 12);
+                },
+            }
+        }
+        try expectRunsMatchReference(test_run_geometry, &path, false);
+    }
 }
