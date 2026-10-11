@@ -17,10 +17,7 @@ harness (`.claude/rules/engine-design.md`).
 
 - **Rules** live only in `.claude/rules/`, one topic per file. Files without
   `paths:` load every session; the rest load when matching files are touched.
-  Docs describe how things work; docs and agent files cite rule files and
-  never restate them. A rule states its mechanism in a few lines, never a
-  slogan; a miss edits a rule only when its mechanism is missing, never to
-  restate one that exists.
+  Docs describe how things work and cite rule files; they never restate them.
 - `docs/architecture.md`: source layout, ownership, frame flow, Target Model.
 - `docs/development-workflow.md` (DW): commands, build options, diagnostics,
   benches, packaging.
@@ -69,8 +66,7 @@ orchestrates, verifies every agent claim against live code, and reports.
   measured, is a landing of the current slice and goes straight to
   `zig-specialist`. Code deleted from the branch (for example restored to
   main) takes its fix count with it; the restored code counts from zero.
-- The loop is design → implement → review, each agent in its own role;
-  `zig-debug-specialist` only diagnoses failures.
+- `zig-debug-specialist` for failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
@@ -78,7 +74,8 @@ orchestrates, verifies every agent claim against live code, and reports.
   on what today's code happens to produce, and report them; only scope added
   or dropped, product/gameplay behavior, rule changes, a `ThreadSystem`/tuner
   redesign, any departure from the rules (by a plan, brief, or agent), and
-  anything that doesn't make sense go to the owner. No model/effort overrides unless the owner asks.
+  anything that doesn't make sense go to the owner. No model/effort overrides
+  unless the owner asks.
 - Implementation agents run sequentially in the main tree; parallelize only
   read-only work, and let read-only agents finish rather than stopping them
   midway. One commit per logical change with review fixes folded in; no
