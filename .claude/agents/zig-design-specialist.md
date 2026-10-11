@@ -55,6 +55,10 @@ rules.
   change, and world/level/dungeon create and destroy, each marked measured or
   derived. If the existing structure fails, the design replaces the parts
   that fail (`.claude/rules/engine-design.md`).
+- **Shared results:** every result the design computes (a proof, a region, a
+  path, a summary) is stored at the unit it actually covers and shared by every
+  requester it answers, never recomputed per requester. A result keyed finer
+  than what it proves (per goal cell for a region-wide proof) fails the design.
 - **One chosen design**, justified against the target in a few lines; one line
   per rejected alternative.
 - **Goal, success criteria, scope**, and the owning module of every new piece.
