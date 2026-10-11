@@ -52,8 +52,13 @@ Every design, and every fix touching storage or per-change work, states:
   (`memory-performance.md` § SIMD), reusing the engine's proven SIMD and
   threaded SIMD patterns.
 - Each order marked measured (bench group) or derived; a derived number is
-  never presented as measured. Hot-path orders are measured
-  (`tests-benchmarks.md`).
+  never presented as measured. Hot-path orders are measured before code: an
+  algorithm new to the engine is prototyped and measured at the worst-case
+  shape each bound names (thin, long, deep, dense), not only typical
+  fixtures (`tests-benchmarks.md`).
+- Start from the engine's proven patterns (the stage pattern, chunk-owned
+  work, existing kernels and dispatch shapes), cited by `file:line`; new
+  machinery needs a measured reason they cannot serve.
 - Where code already partitions by a unit (chunk, level, world), the first
   design evaluated has that unit own its storage and work. A shared arena,
   global rebuild, or level-wide shift needs a cost model that beats it.
