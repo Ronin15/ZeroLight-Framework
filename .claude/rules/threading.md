@@ -71,15 +71,19 @@ paths:
   and tuner state.
 - Worker participation follows measured timing and structural constraints,
   never static item-count floors.
-- A stage creates its work and the thread system spreads it: each dispatch
-  carries every item that is ready, never a stage-chosen quota or ration.
-  Work known only in steps (a frontier search) dispatches each step's whole
-  ready set; a cost bound comes from the algorithm's termination, never from
-  holding items back. A fixed scratch bound may split a large ready set only
-  into full batches, never into batches that each fall under the gate while
-  the step's total exceeds it.
-- A threaded stage's adaptive bench case shows it on workers at the sizes
-  where its per-step inline total exceeds the gate. A forced-range test
-  proves the threaded path exists, not that the tuner takes it.
+- A stage's tuner judges the median time of that stage's recent dispatches
+  against its gate, and dispatches far outside its learned item-count band
+  run unsampled on the current profile (`docs/architecture.md`). It sees the
+  stage's typical dispatch, never its step total: a stage that dispatches
+  several unequal batches per step (rounds of a frontier search) is decided
+  by its small ones and stays inline while its step total is far above the
+  gate. Shape each stage so a step's work reaches its tuner as one dispatch,
+  or as rounds of similar size that each carry enough work to be judged;
+  dispatches of different kinds get their own tuners. A design states, per
+  threaded stage, its dispatches per step and items per dispatch at each
+  bench size, the per-item cost (measured, or probed before implementation),
+  and the dispatch the median lands on against the gate. The adaptive bench
+  case shows the stage on workers where its step total exceeds the gate; a
+  forced-range test proves only that the threaded path exists.
 - Bench and diagnostic output reports inline stages as `inline`, never as a
   zero-worker range size.
