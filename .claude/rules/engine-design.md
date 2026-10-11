@@ -51,7 +51,10 @@ Every design, and every fix touching storage or per-change work, states:
   never presented as measured. Hot-path orders are measured
   (`tests-benchmarks.md`).
 - Where code already partitions by a unit (chunk, level, world), the first
-  design evaluated has that unit own its storage and work. A shared arena,
+  design evaluated has that unit own its storage and work.
+- A computed result (a proof, region, path, or summary) is stored at the unit
+  it covers and shared by every requester it answers, never recomputed per
+  requester; a result keyed finer than what it proves fails the cost model. A shared arena,
   global rebuild, or level-wide shift needs a cost model that beats it.
 - If part of the existing structure cannot pass, redesign that part; never
   patch around it. Code, tests, and benches built on a failing part go with
