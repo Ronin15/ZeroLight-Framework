@@ -11,11 +11,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
+const simd = @import("../../../core/simd.zig");
 const logging = @import("../../../core/logging.zig");
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
 const validateChunkGrid = @import("../../world_system.zig").validateChunkGrid;
 const max_chunk_size_tiles = @import("../../world_system.zig").max_chunk_size_tiles;
 const LevelLink = @import("../../world_system.zig").LevelLink;
+const CellCoord = @import("../../world_system.zig").CellCoord;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
@@ -33,6 +35,12 @@ const default_cell_size = types.default_cell_size;
 const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
 const no_cell = types.no_cell;
 const inter_level_penalty = types.inter_level_penalty;
+const unreachable_cost = types.unreachable_cost;
+const long_link_boxes = types.long_link_boxes;
+const crossing_rate_cap = types.crossing_rate_cap;
+const cardinal_cost = types.cardinal_cost;
+const diagonal_cost = types.diagonal_cost;
+const octileU32 = types.octileU32;
 const PathQueryKey = types.PathQueryKey;
 const NavMark = types.NavMark;
 const NavSpan = types.NavSpan;
@@ -640,6 +648,204 @@ pub const NavExtent = union(enum) {
     }
 };
 
+/// Per-level rates the long-link term charges for a level gap: the least excess and the least
+/// cost of a level-crossing short link, per level it spans, capped at `crossing_rate_cap`.
+/// With no such link no level gap is crossable short-only, so both take the cap.
+pub const CrossingRates = struct {
+    excess: i32,
+    cost: i32,
+};
+
+// One box of a `LinkBoxes` summary, for the cold insert.
+const LinkBox = struct {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    l0: i32,
+    l1: i32,
+
+    fn point(x: i32, y: i32, level: i32) LinkBox {
+        return .{ .x0 = x, .y0 = y, .x1 = x, .y1 = y, .l0 = level, .l1 = level };
+    }
+
+    fn unionWith(self: LinkBox, other: LinkBox) LinkBox {
+        return .{
+            .x0 = @min(self.x0, other.x0),
+            .y0 = @min(self.y0, other.y0),
+            .x1 = @max(self.x1, other.x1),
+            .y1 = @max(self.y1, other.y1),
+            .l0 = @min(self.l0, other.l0),
+            .l1 = @max(self.l1, other.l1),
+        };
+    }
+
+    // Cells times levels covered; below 2^48 for u16 coordinates and levels.
+    fn volume(self: LinkBox) i64 {
+        return @as(i64, self.x1 - self.x0 + 1) * (self.y1 - self.y0 + 1) * (self.l1 - self.l0 + 1);
+    }
+};
+
+/// Up to `long_link_boxes` boxes (planar cell rect and level range, inclusive) covering every
+/// point inserted, in SoA i32 columns so a lower bound scans `simd.lane_count` boxes per step.
+/// Exact until the cap; past it the pair (boxes and the new point) whose union adds the least
+/// volume merges, so a far point opens its own box. A covered point changes nothing, so the
+/// summary is a pure function of insert order and re-inserting is idempotent; no point is ever
+/// dropped. Slots past `count` copy box 0, so a scan over every slot equals one over `count`.
+pub const LinkBoxes = struct {
+    x0: [long_link_boxes]i32 = @splat(0),
+    y0: [long_link_boxes]i32 = @splat(0),
+    x1: [long_link_boxes]i32 = @splat(0),
+    y1: [long_link_boxes]i32 = @splat(0),
+    l0: [long_link_boxes]i32 = @splat(0),
+    l1: [long_link_boxes]i32 = @splat(0),
+    count: u32 = 0,
+
+    fn boxAt(self: *const LinkBoxes, index: usize) LinkBox {
+        return .{ .x0 = self.x0[index], .y0 = self.y0[index], .x1 = self.x1[index], .y1 = self.y1[index], .l0 = self.l0[index], .l1 = self.l1[index] };
+    }
+
+    fn setBox(self: *LinkBoxes, index: usize, box: LinkBox) void {
+        self.x0[index] = box.x0;
+        self.y0[index] = box.y0;
+        self.x1[index] = box.x1;
+        self.y1[index] = box.y1;
+        self.l0[index] = box.l0;
+        self.l1[index] = box.l1;
+    }
+
+    fn covers(self: *const LinkBoxes, cell: CellCoord, level: u16) bool {
+        for (0..self.count) |index| {
+            const box = self.boxAt(index);
+            if (cell.x >= box.x0 and cell.x <= box.x1 and cell.y >= box.y0 and cell.y <= box.y1 and level >= box.l0 and level <= box.l1) return true;
+        }
+        return false;
+    }
+
+    // Ties take the lowest pair (i, j), so the boxes follow insert order alone. At most
+    // C(long_link_boxes + 1, 2) pair checks.
+    fn insert(self: *LinkBoxes, cell: CellCoord, level: u16) void {
+        if (self.covers(cell, level)) return;
+        const point = LinkBox.point(cell.x, cell.y, level);
+        if (self.count < long_link_boxes) {
+            self.setBox(self.count, point);
+            self.count += 1;
+        } else {
+            // Candidate `long_link_boxes` is the new point.
+            var best_i: usize = 0;
+            var best_j: usize = 1;
+            var best_added: i64 = std.math.maxInt(i64);
+            for (0..long_link_boxes) |i| {
+                const a = self.boxAt(i);
+                for (i + 1..long_link_boxes + 1) |j| {
+                    const b = if (j == long_link_boxes) point else self.boxAt(j);
+                    const added = a.unionWith(b).volume() - a.volume() - b.volume();
+                    if (added < best_added) {
+                        best_i = i;
+                        best_j = j;
+                        best_added = added;
+                    }
+                }
+            }
+            const merged_with = if (best_j == long_link_boxes) point else self.boxAt(best_j);
+            self.setBox(best_i, self.boxAt(best_i).unionWith(merged_with));
+            if (best_j != long_link_boxes) self.setBox(best_j, point);
+        }
+        const first = self.boxAt(0);
+        for (self.count..long_link_boxes) |index| self.setBox(index, first);
+    }
+
+    /// A lower bound on the short-link cost from (x, y) on `level` to a point in some box: the
+    /// least over boxes of max(octile to the box + gap * `rates.excess`, gap * `rates.cost`),
+    /// gap being the levels between `level` and the box's range. `unreachable_cost` when
+    /// empty. Coordinates at most `max_link_box_coord` (a world-backed grid). Fixed work: one
+    /// `simd.zig` `Int4` step per `simd.lane_count` boxes.
+    pub fn lowerBound(self: *const LinkBoxes, x: u32, y: u32, level: u16, rates: CrossingRates) u32 {
+        if (self.count == 0) return unreachable_cost;
+        std.debug.assert(x <= max_link_box_coord and y <= max_link_box_coord);
+        std.debug.assert(rates.excess >= 0 and rates.excess <= crossing_rate_cap and rates.cost >= 0 and rates.cost <= crossing_rate_cap);
+        // In range per the asserts: x, y < 2^16.
+        const px = simd.splatInt4(@intCast(x));
+        const py = simd.splatInt4(@intCast(y));
+        const pl = simd.splatInt4(level);
+        const zero = simd.splatInt4(0);
+        const cardinal = simd.splatInt4(cardinal_cost);
+        const diagonal_extra = simd.splatInt4(diagonal_cost - cardinal_cost);
+        const excess = simd.splatInt4(rates.excess);
+        const cost = simd.splatInt4(rates.cost);
+        var nearest = simd.splatInt4(std.math.maxInt(i32));
+        var index: usize = 0;
+        while (index < long_link_boxes) : (index += simd.lane_count) {
+            // Distance to a box per axis: max(under-min, over-max, 0).
+            const dx = simd.maxInt4(simd.maxInt4(simd.subInt4(simd.loadInt4(self.x0[index..]), px), simd.subInt4(px, simd.loadInt4(self.x1[index..]))), zero);
+            const dy = simd.maxInt4(simd.maxInt4(simd.subInt4(simd.loadInt4(self.y0[index..]), py), simd.subInt4(py, simd.loadInt4(self.y1[index..]))), zero);
+            const gap = simd.maxInt4(simd.maxInt4(simd.subInt4(simd.loadInt4(self.l0[index..]), pl), simd.subInt4(pl, simd.loadInt4(self.l1[index..]))), zero);
+            const planar = simd.addInt4(simd.mulInt4(simd.maxInt4(dx, dy), cardinal), simd.mulInt4(simd.minInt4(dx, dy), diagonal_extra));
+            const term = simd.maxInt4(simd.addInt4(planar, simd.mulInt4(gap, excess)), simd.mulInt4(gap, cost));
+            nearest = simd.minInt4(nearest, term);
+        }
+        var least = nearest[0];
+        inline for (1..simd.lane_count) |lane| least = @min(least, nearest[lane]);
+        // A min of non-negative lane terms.
+        return @intCast(least);
+    }
+};
+
+/// Largest cell coordinate `LinkBoxes.lowerBound` accepts: a world-backed grid's (`u16` sides).
+pub const max_link_box_coord: u32 = std.math.maxInt(u16);
+
+/// Lower bounds on the abstract cost of the world's links, read by every abstract query and
+/// folded once per link where links enter the graph (world build, marks commit), never per
+/// query. A link is short when its cost (`traversal_cost +| inter_level_penalty`, the edge
+/// cost) covers the planar octile between its endpoints, else long. Same-level short links
+/// never lower a path's cost below its planar octile, so they fold nothing. Every fold is a
+/// min, a max, or a box insert that ignores a covered point: the bounds are a pure function of
+/// link order, and folding a link again changes nothing. Fixed size; never allocates.
+pub const LinkBounds = struct {
+    /// Most levels one level-crossing short link spans; 0 when none exists.
+    short_span: u16 = 0,
+    /// Least cost of a level-crossing short link.
+    short_cost: u32 = unreachable_cost,
+    /// Least excess of a level-crossing short link's cost over its endpoints' planar octile.
+    short_excess: u32 = unreachable_cost,
+    /// Least cost of a long link.
+    long_cost: u32 = unreachable_cost,
+    /// Points a long link leaves from: side a, and side b when bidirectional.
+    entrances: LinkBoxes = .{},
+    /// Points a long link lands on: side b, and side a when bidirectional.
+    exits: LinkBoxes = .{},
+
+    fn foldLinks(self: *LinkBounds, links: []const LevelLink) void {
+        for (links) |link| self.foldLink(link);
+    }
+
+    fn foldLink(self: *LinkBounds, link: LevelLink) void {
+        const cost = link.traversal_cost +| inter_level_penalty;
+        const planar = octileU32(link.cell_a.x, link.cell_a.y, link.cell_b.x, link.cell_b.y);
+        if (planar > cost) {
+            self.long_cost = @min(self.long_cost, cost);
+            self.entrances.insert(link.cell_a, link.level_a);
+            if (link.bidirectional) self.entrances.insert(link.cell_b, link.level_b);
+            self.exits.insert(link.cell_b, link.level_b);
+            if (link.bidirectional) self.exits.insert(link.cell_a, link.level_a);
+            return;
+        }
+        if (link.level_a == link.level_b) return;
+        self.short_span = @max(self.short_span, @max(link.level_a, link.level_b) - @min(link.level_a, link.level_b));
+        self.short_cost = @min(self.short_cost, cost);
+        self.short_excess = @min(self.short_excess, cost - planar);
+    }
+
+    /// The per-level crossing rates of the folded short links.
+    pub fn crossingRates(self: *const LinkBounds) CrossingRates {
+        if (self.short_span == 0) return .{ .excess = crossing_rate_cap, .cost = crossing_rate_cap };
+        return .{
+            .excess = @intCast(@min(self.short_excess / self.short_span, crossing_rate_cap)),
+            .cost = @intCast(@min(self.short_cost / self.short_span, crossing_rate_cap)),
+        };
+    }
+};
+
 // Per-level cell grids and chunk records, built from a world (or bounds) and changed only
 // through `commitMarks` and `buildLevel` on the main thread; read-only to queries between.
 pub const NavGraph = struct {
@@ -655,10 +861,12 @@ pub const NavGraph = struct {
     levels: std.ArrayList(NavGrid) = .empty,
     // One record set per level, paired index-for-index with `levels`.
     level_graphs: std.ArrayList(NavLevelGraph) = .empty,
-    /// Rows of `levelLinks()` already folded into records. Links are append-only, so a marks
-    /// batch re-derives both endpoint chunks of `[links_applied, len)` and advances it; a
-    /// level build leaves it alone.
+    /// Rows of `levelLinks()` already folded into records and `link_bounds`. Links are
+    /// append-only, so a marks batch re-derives both endpoint chunks of `[links_applied, len)`,
+    /// folds them into `link_bounds`, and advances it; a level build leaves it alone.
     links_applied: usize = 0,
+    /// Bounds over every link folded so far; written only by a world build and a marks commit.
+    link_bounds: LinkBounds = .{},
     // The world-wide content revision every level was last checked against.
     built_world_revision: u32 = 0,
     // Batch buffers, reused across batches. `batch_spans` is the last marks batch's changed
@@ -811,8 +1019,9 @@ pub const NavGraph = struct {
         return @intCast(y * self.width + x);
     }
 
-    // Rebuilds every level into a fresh graph and swaps it in. The previous graph stays
-    // intact until every level built, so an error leaves it unchanged. Bumps `version`.
+    // Rebuilds every level into a fresh graph and swaps it in, folding every world link into
+    // fresh link bounds. The previous graph stays intact until every level built, so an error
+    // leaves it unchanged. Bumps `version`.
     // `colliders` must be placed on this extent's cell grid (`NavExtent.colliderGeometry`).
     pub fn rebuild(
         self: *NavGraph,
@@ -856,6 +1065,7 @@ pub const NavGraph = struct {
         var stats = NavUpdateStats{};
         for (0..level_count) |level| try fresh.buildLevel(colliders, world, @intCast(level), threads, &stats);
         if (world) |world_system| {
+            fresh.link_bounds.foldLinks(world_system.levelLinks());
             fresh.links_applied = world_system.levelLinks().len;
             fresh.built_world_revision = world_system.contentRevision();
         }
@@ -972,12 +1182,18 @@ pub const NavGraph = struct {
         return prepared;
     }
 
-    /// Commits a prepared batch, the infallible half: remasks the changed chunks from the
-    /// world and `colliders`, re-derives every patch key's record, and advances
+    /// Commits a prepared batch, the infallible half: folds the batch's new links into
+    /// `link_bounds` (O(1) each, a long one O(exit boxes)), remasks the changed chunks from
+    /// the world and `colliders`, re-derives every patch key's record, and advances
     /// `links_applied`. Remask and patch thread over keys.
     pub fn commitMarks(self: *NavGraph, prepared: PreparedMarks, colliders: ColliderView, threads: ?NavUpdateThreads, stats: *NavUpdateStats) NavBatchResult {
         std.debug.assert(self.batch_prepared);
         self.batch_prepared = false;
+        // Only a world-backed graph has links to apply.
+        std.debug.assert(prepared.new_link_count == 0 or prepared.world != null);
+        if (prepared.world) |world| {
+            self.link_bounds.foldLinks(world.levelLinks()[self.links_applied..][0..prepared.new_link_count]);
+        }
         self.links_applied += prepared.new_link_count;
         if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .spans = &.{} };
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
@@ -1598,6 +1814,7 @@ fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
     try t.expectEqual(a.levels.items.len, b.levels.items.len);
     try t.expectEqual(a.cellCount(), b.cellCount());
     for (0..a.levels.items.len) |level| try t.expect(levelsEquivalent(a, b, @intCast(level)));
+    try t.expect(std.meta.eql(a.link_bounds, b.link_bounds));
 }
 
 // Whether `level` holds the same cells and records in `a` and `b`.
@@ -2972,6 +3189,8 @@ fn expectNavApplyOutOfMemorySafe(edit: OomEdit, thread_system: ?*ThreadSystem) !
             if (!failing.has_induced_failure) return;
         } else |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
+            // Links fold only in the infallible commit.
+            try std.testing.expect(std.meta.eql(system.graph.link_bounds, before.graph.link_bounds));
             for (0..system.graph.levelCount()) |level| {
                 try std.testing.expect(levelsEquivalent(&system.graph, &before.graph, @intCast(level)) or
                     levelsEquivalent(&system.graph, &after.graph, @intCast(level)));
@@ -3253,6 +3472,123 @@ test "an aborted prepared batch leaves the graph and its pending work unchanged,
     var after = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer after.deinit();
     try expectGraphsEquivalent(&system.graph, &after.graph);
+}
+
+fn expectLinkBox(boxes: *const LinkBoxes, index: usize, x: i32, y: i32, level: i32) !void {
+    try std.testing.expectEqual(LinkBox.point(x, y, level), boxes.boxAt(index));
+}
+
+test "a world build folds its authored links into the link bounds" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try twoLevelWorld(&meta);
+    defer fixture.world.deinit();
+    _ = try fixture.world.addLevel(-32);
+    _ = try fixture.world.addDenseLayer(2, 0, .floor, fixture.grass);
+    // A ramp (cost 41, span 0), a two-level stair (cost 43, span 14), a bidirectional long
+    // teleport (cost 41, span 154), a one-way long teleport (cost 42, span 154), and a
+    // same-level short link (cost 40, span 14).
+    try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 5, .y = 5 }, .level_b = 0, .cell_b = .{ .x = 5, .y = 5 }, .traversal_cost = 1, .bidirectional = true });
+    try fixture.world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 2, .y = 2 }, .level_b = 2, .cell_b = .{ .x = 3, .y = 3 }, .traversal_cost = 3, .bidirectional = false });
+    try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 0, .y = 0 }, .level_b = 1, .cell_b = .{ .x = 11, .y = 11 }, .traversal_cost = 1, .bidirectional = true });
+    try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 11, .y = 0 }, .level_b = 2, .cell_b = .{ .x = 0, .y = 11 }, .traversal_cost = 2, .bidirectional = false });
+    try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 8, .y = 8 }, .level_b = 0, .cell_b = .{ .x = 9, .y = 9 }, .traversal_cost = 0, .bidirectional = true });
+    var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
+    defer system.deinit();
+    const bounds = &system.graph.link_bounds;
+    try std.testing.expectEqual(@as(u16, 2), bounds.short_span);
+    try std.testing.expectEqual(@as(u32, 41), bounds.short_cost);
+    try std.testing.expectEqual(@as(u32, 43 - 14), bounds.short_excess);
+    try std.testing.expectEqual(@as(u32, 41), bounds.long_cost);
+    // A link leaves from side a, and from side b only when bidirectional; it lands on the other.
+    try std.testing.expectEqual(@as(u32, 3), bounds.entrances.count);
+    try expectLinkBox(&bounds.entrances, 0, 0, 0, 0);
+    try expectLinkBox(&bounds.entrances, 1, 11, 11, 1);
+    try expectLinkBox(&bounds.entrances, 2, 11, 0, 0);
+    try std.testing.expectEqual(@as(u32, 3), bounds.exits.count);
+    try expectLinkBox(&bounds.exits, 0, 11, 11, 1);
+    try expectLinkBox(&bounds.exits, 1, 0, 0, 0);
+    try expectLinkBox(&bounds.exits, 2, 0, 11, 2);
+    // The folded cost is the edge cost the ramp's record holds.
+    const ramp_cell = 5 * system.graph.width + 5;
+    const ramp_links = system.graph.chunkPortals(1, system.graph.chunkOf(ramp_cell)).linksAt(system.graph.localOf(ramp_cell));
+    try std.testing.expectEqual(bounds.short_cost, ramp_links[0].cost);
+}
+
+test "a link box summary covers every inserted point, is exact up to its cap, ignores a covered point, and opens a box for a far point" {
+    var prng = std.Random.DefaultPrng.init(0x6e67_0000);
+    const random = prng.random();
+    var boxes = LinkBoxes{};
+    var cells: [200]CellCoord = undefined;
+    var levels: [200]u16 = undefined;
+    for (&cells, &levels, 0..) |*cell, *level, index| {
+        cell.* = .{ .x = random.uintLessThan(u16, 512), .y = random.uintLessThan(u16, 512) };
+        level.* = random.uintLessThan(u16, 8);
+        boxes.insert(cell.*, level.*);
+        try std.testing.expectEqual(@min(index + 1, long_link_boxes), boxes.count);
+        for (cells[0 .. index + 1], levels[0 .. index + 1]) |folded, folded_level| try std.testing.expect(boxes.covers(folded, folded_level));
+        for (boxes.count..long_link_boxes) |pad| try std.testing.expectEqual(boxes.boxAt(0), boxes.boxAt(pad));
+        if (index < long_link_boxes) {
+            for (0..index + 1) |box| try expectLinkBox(&boxes, box, cells[box].x, cells[box].y, levels[box]);
+        }
+        const before = boxes;
+        const again = random.uintLessThan(usize, index + 1);
+        boxes.insert(cells[again], levels[again]);
+        try std.testing.expect(std.meta.eql(before, boxes));
+    }
+
+    // A full row of nearby points, then one far away: the far point keeps a box of its own.
+    var row = LinkBoxes{};
+    for (0..long_link_boxes) |column| row.insert(.{ .x = @intCast(column * 4), .y = 0 }, 0);
+    row.insert(.{ .x = 200, .y = 200 }, 0);
+    var own_box = false;
+    for (0..long_link_boxes) |index| own_box = own_box or std.meta.eql(row.boxAt(index), LinkBox.point(200, 200, 0));
+    try std.testing.expect(own_box);
+}
+
+// Scalar reference for `LinkBoxes.lowerBound`.
+fn lowerBoundScalar(boxes: *const LinkBoxes, x: u32, y: u32, level: u16, rates: CrossingRates) u32 {
+    if (boxes.count == 0) return unreachable_cost;
+    var least: i64 = std.math.maxInt(i64);
+    for (0..boxes.count) |index| {
+        const box = boxes.boxAt(index);
+        const dx: i64 = @max(@as(i64, box.x0) - x, @as(i64, x) - box.x1, 0);
+        const dy: i64 = @max(@as(i64, box.y0) - y, @as(i64, y) - box.y1, 0);
+        const gap: i64 = @max(@as(i64, box.l0) - level, @as(i64, level) - box.l1, 0);
+        const planar: i64 = octileU32(0, 0, @intCast(dx), @intCast(dy));
+        least = @min(least, @max(planar + gap * rates.excess, gap * rates.cost));
+    }
+    return @intCast(least);
+}
+
+test "the box lower bound's SIMD scan equals a scalar scan" {
+    var prng = std.Random.DefaultPrng.init(0x6e68_0000);
+    const random = prng.random();
+    const extremes = [_]u16{ 0, std.math.maxInt(u16) };
+    var checked: usize = 0;
+    for (0..64) |round| {
+        var boxes = LinkBoxes{};
+        try std.testing.expectEqual(unreachable_cost, boxes.lowerBound(0, 0, 0, .{ .excess = 0, .cost = 0 }));
+        const points = 1 + round % (long_link_boxes + 8);
+        for (0..points) |_| {
+            const x = if (random.boolean()) extremes[random.uintLessThan(usize, 2)] else random.int(u16);
+            const y = if (random.boolean()) extremes[random.uintLessThan(usize, 2)] else random.int(u16);
+            const level = if (random.boolean()) extremes[random.uintLessThan(usize, 2)] else random.int(u16);
+            boxes.insert(.{ .x = x, .y = y }, level);
+        }
+        for (0..32) |_| {
+            const rate_choices = [_]i32{ 0, crossing_rate_cap, random.intRangeAtMost(i32, 0, crossing_rate_cap) };
+            const rates = CrossingRates{ .excess = rate_choices[random.uintLessThan(usize, 3)], .cost = rate_choices[random.uintLessThan(usize, 3)] };
+            const x: u32 = if (random.boolean()) extremes[random.uintLessThan(usize, 2)] else random.int(u16);
+            const y: u32 = if (random.boolean()) extremes[random.uintLessThan(usize, 2)] else random.int(u16);
+            const level = if (random.boolean()) extremes[random.uintLessThan(usize, 2)] else random.int(u16);
+            try std.testing.expectEqual(lowerBoundScalar(&boxes, x, y, level, rates), boxes.lowerBound(x, y, level, rates));
+            checked += 1;
+        }
+    }
+    try std.testing.expect(checked > 1000);
 }
 
 test "border portals never exceed 4 * ceil(E / 2) and random digs match a full rebuild" {

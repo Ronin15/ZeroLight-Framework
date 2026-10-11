@@ -6982,6 +6982,87 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     }
 }
 
+test "threaded cross-level solves equal serial" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    // Three open 16x16 levels in 4-tile chunks: ramps join consecutive levels, and a long
+    // teleport joins level 0 to level 2.
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
+    defer world.deinit();
+    for (1..3) |level| {
+        _ = try world.addLevel(-16 * @as(i32, @intCast(level)));
+        _ = try world.addDenseLayer(@intCast(level), 0, .floor, grass);
+    }
+    try world.addLevelLink(.{ .kind = .ramp, .level_a = 0, .cell_a = .{ .x = 2, .y = 2 }, .level_b = 1, .cell_b = .{ .x = 2, .y = 2 }, .traversal_cost = 1, .bidirectional = true });
+    try world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 13, .y = 2 }, .level_b = 2, .cell_b = .{ .x = 13, .y = 2 }, .traversal_cost = 1, .bidirectional = true });
+    try world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 1, .y = 14 }, .level_b = 2, .cell_b = .{ .x = 14, .y = 14 }, .traversal_cost = 1, .bidirectional = true });
+    var requesters: [8]EntityId = undefined;
+    for (&requesters) |*requester| requester.* = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var capacity = abstractCapacity();
+    capacity.group_field_max_cells = 16;
+    var serial = PathfindingSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    try serial.reserve(capacity);
+    try serial.rebuildStaticNavGridWithWorld(&data, &world, null);
+    capacity.worker_participant_count = threads.participantSlotCount();
+    var threaded = PathfindingSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    try threaded.reserve(capacity);
+    try threaded.rebuildStaticNavGridWithWorld(&data, &world, null);
+
+    // Level-2 goals on both sides of the level: some route by ramps, some by the teleport.
+    const goals = [_]math.Vec2{
+        tileCenter(14, 12), tileCenter(12, 15), tileCenter(15, 9), tileCenter(10, 13),
+        tileCenter(13, 5),  tileCenter(8, 2),   tileCenter(15, 3), tileCenter(11, 6),
+    };
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(goals.len, goals.len);
+    for (requesters, goals) |requester, goal| {
+        try appendPathRequest(&stream, .{ .entity = requester, .start_level = 0, .goal_level = 2, .start = tileCenter(1, 1), .goal = goal });
+    }
+    const serial_stats = try serial.updateSerial(&stream, 8, .{});
+    const stats = try threaded.update(&stream, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
+
+    try std.testing.expect(!stats.fallback_batch.ran_inline);
+    try std.testing.expect(stats.fallback_batch.range_count > 1);
+    try std.testing.expectEqual(goals.len, serial_stats.available_results);
+    try std.testing.expectEqual(goals.len, stats.available_results);
+    var via_teleport: usize = 0;
+    var via_ramps: usize = 0;
+    for (goals) |goal| {
+        const expected = cachedStitched(&serial, 2, goal);
+        try std.testing.expect(expected.len > 1);
+        try std.testing.expectEqualSlices(types.StitchedCell, expected, cachedStitched(&threaded, 2, goal));
+        var jumps_two_levels = false;
+        for (expected[0 .. expected.len - 1], expected[1..]) |from, to| jumps_two_levels = jumps_two_levels or (from.level == 0 and to.level == 2);
+        if (jumps_two_levels) via_teleport += 1 else via_ramps += 1;
+    }
+    try std.testing.expect(via_teleport > 0 and via_ramps > 0);
+
+    // The warmed threaded re-solve, heuristic and box scans included, allocates nothing.
+    const original = threaded.allocator;
+    threaded.allocator = std.testing.failing_allocator;
+    threaded.graph.allocator = std.testing.failing_allocator;
+    defer {
+        threaded.allocator = original;
+        threaded.graph.allocator = original;
+    }
+    threaded.clearRuntimeState();
+    const warmed = try threaded.update(&stream, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
+    try std.testing.expect(!warmed.fallback_batch.ran_inline);
+    try std.testing.expectEqual(goals.len, warmed.available_results);
+    for (goals) |goal| try std.testing.expectEqualSlices(types.StitchedCell, cachedStitched(&serial, 2, goal), cachedStitched(&threaded, 2, goal));
+}
+
 test "a reserved threaded solve with escalations allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
