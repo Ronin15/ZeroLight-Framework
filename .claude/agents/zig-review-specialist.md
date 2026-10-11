@@ -84,6 +84,9 @@ model; routes to design) or **local**.
    finding. A threaded stage needs a test proving it ran on workers; an
    inline run proves no threaded parity. The bench reports the threaded
    case's main-thread share, and main's time per item stays flat across sizes.
+   A stage that rations items per dispatch, or whose adaptive case stays
+   inline where its per-step total exceeds the gate, is a finding
+   (`threading.md`).
    A change path whose named cost-driver stage has no `runtime_perf_log`
    entry is a finding; so is logging stages beyond the cost drivers
    (`threading.md`).
