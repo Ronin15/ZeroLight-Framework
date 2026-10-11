@@ -219,6 +219,8 @@ pub const RunStats = struct {
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
+    // Nav groups: the reaction's connectivity stages and flood (the removal reaction).
+    nav_conn: ?NavConnSummary = null,
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
@@ -231,6 +233,28 @@ pub const RunStats = struct {
             .skip_reason = reason,
         };
     }
+};
+
+/// One nav reaction's connectivity: the seed, gather, and flood stage shapes (the flood's
+/// rounds folded into one), its families, rounds, the fewest and most searches a round
+/// dispatched, the active sets the round builds walked on the main thread, nodes expanded,
+/// components split off, and roots merged, the flood's summed
+/// dispatch time and its share on workers, and the flood tuner's policy after the case
+/// (null when the case runs no adaptive tuner; zero workers is inline).
+pub const NavConnSummary = struct {
+    seed: BatchSummary = .{},
+    gather: BatchSummary = .{},
+    flood: BatchSummary = .{},
+    families: usize = 0,
+    rounds: usize = 0,
+    round_items_min: usize = 0,
+    round_items_max: usize = 0,
+    build_visits: usize = 0,
+    flood_nodes: usize = 0,
+    splits: usize = 0,
+    merges: usize = 0,
+    flood_off_main_ns: u64 = 0,
+    flood_tuner_workers: ?usize = null,
 };
 
 pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
@@ -763,10 +787,11 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
     if (std.mem.eql(u8, group_name, "chunk-scale-explosion-fill")) return "(sparse props * 10^10 + region chunks * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "chunk-scale-nav-enclose")) return "(variant * 10^10 + pockets, pocket edge, or tunnel chunks * 10^7 + level side * 1000 + levels)";
     if (isChunkScaleBatchGroup(group_name) or isChunkScaleNavBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(resident layers * 10^9 + window edge chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-level-enter")) return "(resident layers * 10^9 + level side * 1000 + levels)";
-    if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(revision case * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(replace case * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "pathfinding-cross-level-teleport")) return "(teleports * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "pathfinding-level-size") or std.mem.startsWith(u8, group_name, "pathfinding-cross-level-")) return "(level side * 1000 + levels)";
     if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
@@ -780,7 +805,8 @@ fn isChunkScaleBatchGroup(group_name: []const u8) bool {
 
 // Chunk-scale groups timing one batched terrain edit plus its nav reaction.
 fn isChunkScaleNavBatchGroup(group_name: []const u8) bool {
-    return std.mem.eql(u8, group_name, "chunk-scale-nav-cave-in") or std.mem.eql(u8, group_name, "chunk-scale-nav-explosion-fill");
+    return std.mem.eql(u8, group_name, "chunk-scale-nav-cave-in") or std.mem.eql(u8, group_name, "chunk-scale-nav-explosion-fill") or
+        std.mem.eql(u8, group_name, "chunk-scale-nav-enclose");
 }
 
 fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
@@ -844,7 +870,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [256]u8 = undefined;
+        var workload_buffer: [768]u8 = undefined;
 
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
@@ -1186,7 +1212,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     // Workload labels translate shared counters into subsystem language so the
     // report remains compact without hiding what was measured.
     if (std.mem.startsWith(u8, group_name, "nav-update-static-dense")) {
-        var stage_buffer: [128]u8 = undefined;
+        var stage_buffer: [512]u8 = undefined;
         var splice_buffer: [32]u8 = undefined;
         var query_splice_buffer: [32]u8 = undefined;
         const splice = stats.splice_batch orelse BatchSummary{};
@@ -1200,7 +1226,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "nav-update-")) {
-        var stage_buffer: [128]u8 = undefined;
+        var stage_buffer: [512]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "movement-apply-intents")) {
@@ -1234,6 +1260,10 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
             .{ stats.item_count, stats.output_count, formatStageShapeInto(&gather_buffer, stats.batch), formatDuration(phases.main_ns), main_percent },
         ) catch "workload";
     }
+    if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) {
+        var stage_buffer: [512]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "levels={} {s}", .{ stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
+    }
     if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
     if (isChunkScaleBatchGroup(group_name)) {
         var plan_buffer: [32]u8 = undefined;
@@ -1249,7 +1279,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (isChunkScaleNavBatchGroup(group_name)) {
-        var stage_buffer: [128]u8 = undefined;
+        var stage_buffer: [512]u8 = undefined;
         const stages = formatNavStagesInto(&stage_buffer, stats);
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
@@ -1260,7 +1290,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-dig") or std.mem.eql(u8, group_name, "chunk-scale-nav-ramp")) {
-        var stage_buffer: [128]u8 = undefined;
+        var stage_buffer: [512]u8 = undefined;
         return std.fmt.bufPrint(buffer, "cells={} {s}", .{ stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "ai")) {
@@ -1305,11 +1335,11 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         return std.fmt.bufPrint(buffer, "searches={} unavailable={} steps={} status_steps={} max_step={f}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count, formatDuration(stats.max_step_ns) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) {
-        var stage_buffer: [128]u8 = undefined;
+        var stage_buffer: [512]u8 = undefined;
         return std.fmt.bufPrint(buffer, "cells={} structure_chunks={} {s}", .{ stats.output_count, stats.candidate_pairs, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-oneway")) {
-        var stage_buffer: [128]u8 = undefined;
+        var stage_buffer: [512]u8 = undefined;
         return std.fmt.bufPrint(buffer, "rooms={} oneway_links={} {s}", .{ stats.candidate_pairs, stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
@@ -1454,19 +1484,51 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
 }
 
 // A nav reaction's stage shapes: `mark=` (when the workload marks events), `plan=`, then
-// `remask=` (the primary batch) and `patch=` (the secondary batch).
+// `remask=` (the primary batch) and `patch=` (the secondary batch), then the connectivity
+// block when the group reports one.
 fn formatNavStagesInto(buffer: []u8, stats: RunStats) []const u8 {
     var mark_buffer: [32]u8 = undefined;
     var plan_buffer: [32]u8 = undefined;
     var remask_buffer: [32]u8 = undefined;
     var patch_buffer: [32]u8 = undefined;
+    var conn_buffer: [320]u8 = undefined;
     const plan = formatStageShapeInto(&plan_buffer, stats.nav_plan_batch orelse .{});
     const remask = formatStageShapeInto(&remask_buffer, stats.batch);
     const patch = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
+    const conn = formatNavConnInto(&conn_buffer, stats.nav_conn);
     if (stats.nav_mark_batch) |mark| {
-        return std.fmt.bufPrint(buffer, "mark={s} plan={s} remask={s} patch={s}", .{ formatStageShapeInto(&mark_buffer, mark), plan, remask, patch }) catch "stages";
+        return std.fmt.bufPrint(buffer, "mark={s} plan={s} remask={s} patch={s}{s}", .{ formatStageShapeInto(&mark_buffer, mark), plan, remask, patch, conn }) catch "stages";
     }
-    return std.fmt.bufPrint(buffer, "plan={s} remask={s} patch={s}", .{ plan, remask, patch }) catch "stages";
+    return std.fmt.bufPrint(buffer, "plan={s} remask={s} patch={s}{s}", .{ plan, remask, patch, conn }) catch "stages";
+}
+
+// The connectivity block of a nav reaction, or nothing.
+fn formatNavConnInto(buffer: []u8, summary: ?NavConnSummary) []const u8 {
+    const conn = summary orelse return "";
+    var seed_buffer: [32]u8 = undefined;
+    var gather_buffer: [32]u8 = undefined;
+    var flood_buffer: [32]u8 = undefined;
+    var tuner_buffer: [24]u8 = undefined;
+    const tuner: []const u8 = if (conn.flood_tuner_workers) |workers|
+        (if (workers == 0) "inline" else std.fmt.bufPrint(&tuner_buffer, "{}w", .{workers}) catch "tuner")
+    else
+        "-";
+    return std.fmt.bufPrint(buffer, " conn_seed={s} conn_gather={s} conn_flood={s} families={} rounds={} round_items={}-{} build_visits={} flood_nodes={} splits={} merges={} flood_dispatch={f} flood_off_main={f} flood_tuner={s}", .{
+        formatRunStageShapeInto(&seed_buffer, conn.seed),
+        formatRunStageShapeInto(&gather_buffer, conn.gather),
+        formatRunStageShapeInto(&flood_buffer, conn.flood),
+        conn.families,
+        conn.rounds,
+        conn.round_items_min,
+        conn.round_items_max,
+        conn.build_visits,
+        conn.flood_nodes,
+        conn.splits,
+        conn.merges,
+        formatDuration(conn.flood.batch_duration_ns),
+        formatDuration(conn.flood_off_main_ns),
+        tuner,
+    }) catch " conn";
 }
 
 // Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the

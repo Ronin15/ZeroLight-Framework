@@ -48,6 +48,11 @@ const NavMark = types.NavMark;
 const NavSpan = types.NavSpan;
 const NavUpdateStats = types.NavUpdateStats;
 const setLen = types.setLen;
+const Connectivity = @import("connectivity.zig").Connectivity;
+const ConnectivityCounters = @import("connectivity.zig").ConnectivityCounters;
+const NodeRow = @import("connectivity.zig").NodeRow;
+const no_node = @import("connectivity.zig").no_node;
+const no_comp = @import("connectivity.zig").no_comp;
 
 /// Most border portals a chunk of edge `chunk_tiles` holds: one per open run on each of its
 /// four sides.
@@ -155,6 +160,10 @@ fn linkLessThan(_: void, a: NavLink, b: NavLink) bool {
 const RecordRow = struct {
     border_count: u8,
     link_slot: u32,
+    // The record's connectivity nodes, linked through `NodeRow.sibling`, and the number of
+    // distinct labels its portals hold.
+    node_head: u32,
+    label_count: u8,
 };
 
 const LinkSlotRow = struct {
@@ -166,8 +175,9 @@ const empty_portal = NavPortal{ .local = 0, .label = 0, .flags = .{} };
 
 /// One level's records. `record_dir` holds each chunk's record id or none; a record's border
 /// portals sit in a fixed `border_stride` window of `border`; a record with link
-/// endpoints holds a link slot. Records and link slots are pools with free lists whose
-/// capacity covers every pooled id, so a release never allocates.
+/// endpoints holds a link slot; a record lists one connectivity node per portal-bearing
+/// label. Records, link slots, and nodes are pools with free lists whose capacity covers
+/// every pooled id, so a release never allocates.
 pub const NavLevelGraph = struct {
     record_dir: std.ArrayList(u32) = .empty,
     records: std.MultiArrayList(RecordRow) = .{},
@@ -175,6 +185,8 @@ pub const NavLevelGraph = struct {
     record_free: std.ArrayList(u32) = .empty,
     link_slots: std.MultiArrayList(LinkSlotRow) = .{},
     link_free: std.ArrayList(u32) = .empty,
+    nodes: std.MultiArrayList(NodeRow) = .{},
+    node_free: std.ArrayList(u32) = .empty,
     // The world's content revision this level was built from.
     built_revision: u32 = 0,
     // Border portal window per record: `borderPortalBound` of the level's chunk edge.
@@ -184,10 +196,19 @@ pub const NavLevelGraph = struct {
     record_link_slot: []u32 = &.{},
     slot_extra: []std.ArrayList(NavPortal) = &.{},
     slot_links: []std.ArrayList(NavLink) = &.{},
+    record_node_head: []u32 = &.{},
+    record_label_count: []u8 = &.{},
+    node_label: []u8 = &.{},
+    node_comp: []u32 = &.{},
+    node_sibling: []u32 = &.{},
+    node_queue: []u64 = &.{},
+    node_queue_row: []u32 = &.{},
 
     pub fn deinit(self: *NavLevelGraph, allocator: std.mem.Allocator) void {
         for (self.slot_extra) |*extra| extra.deinit(allocator);
         for (self.slot_links) |*links| links.deinit(allocator);
+        self.node_free.deinit(allocator);
+        self.nodes.deinit(allocator);
         self.link_free.deinit(allocator);
         self.link_slots.deinit(allocator);
         self.record_free.deinit(allocator);
@@ -201,9 +222,100 @@ pub const NavLevelGraph = struct {
         const records = self.records.slice();
         self.border_count = records.items(.border_count);
         self.record_link_slot = records.items(.link_slot);
+        self.record_node_head = records.items(.node_head);
+        self.record_label_count = records.items(.label_count);
         const slots = self.link_slots.slice();
         self.slot_extra = slots.items(.extra);
         self.slot_links = slots.items(.links);
+        const nodes = self.nodes.slice();
+        self.node_label = nodes.items(.label);
+        self.node_comp = nodes.items(.comp);
+        self.node_sibling = nodes.items(.sibling);
+        self.node_queue = nodes.items(.queue);
+        self.node_queue_row = nodes.items(.queue_row);
+    }
+
+    /// `chunk`'s record id, or null when it holds none.
+    pub fn recordOf(self: *const NavLevelGraph, chunk: u32) ?u32 {
+        const record = self.record_dir.items[chunk];
+        return if (record == no_record) null else record;
+    }
+
+    /// Distinct labels among `chunk`'s portals; 0 with no record.
+    pub fn labelCount(self: *const NavLevelGraph, chunk: u32) usize {
+        const record = self.recordOf(chunk) orelse return 0;
+        return self.record_label_count[record];
+    }
+
+    /// The node row of `chunk`'s label `label`, or `no_node` when the label holds no portal.
+    /// O(portal-bearing labels of the chunk).
+    pub fn nodeOf(self: *const NavLevelGraph, chunk: u32, label: u8) u32 {
+        const record = self.recordOf(chunk) orelse return no_node;
+        var row = self.record_node_head[record];
+        while (row != no_node) : (row = self.node_sibling[row]) {
+            if (self.node_label[row] == label) return row;
+        }
+        return no_node;
+    }
+
+    /// Live node rows.
+    pub fn nodeCount(self: *const NavLevelGraph) usize {
+        return self.nodes.len - self.node_free.items.len;
+    }
+
+    /// Grows the free node list to at least `needed` rows, so that many claims pop without
+    /// allocating. Pool growth is geometric and counted; rows stay below `no_node`.
+    pub fn ensureFreeNodes(self: *NavLevelGraph, allocator: std.mem.Allocator, needed: usize, pool_grows: *u64) !void {
+        if (self.node_free.items.len >= needed) return;
+        const added = needed - self.node_free.items.len;
+        const total = self.nodes.len + added;
+        if (total >= no_node) return error.NavConnectivityOverflow;
+        if (total > self.nodes.capacity) {
+            try self.nodes.ensureTotalCapacity(allocator, @max(total, self.nodes.capacity *| 2));
+            // The pool moved: the column views follow it before anything else can fail.
+            self.refreshColumns();
+            pool_grows.* += 1;
+        }
+        try self.node_free.ensureTotalCapacity(allocator, self.nodes.capacity);
+        self.appendFreeNodes(added);
+    }
+
+    /// Sizes an empty level's node pool to exactly `count` free rows.
+    pub fn ensureNodesExact(self: *NavLevelGraph, allocator: std.mem.Allocator, count: usize) !void {
+        std.debug.assert(self.nodes.len == 0);
+        if (count >= no_node) return error.NavConnectivityOverflow;
+        if (count > self.nodes.capacity) try self.nodes.setCapacity(allocator, count);
+        self.refreshColumns();
+        try self.node_free.ensureTotalCapacityPrecise(allocator, self.nodes.capacity);
+        self.appendFreeNodes(count);
+    }
+
+    // Appends `count` free rows, pushed in descending order so claims hand out ascending rows.
+    fn appendFreeNodes(self: *NavLevelGraph, count: usize) void {
+        const first: u32 = @intCast(self.nodes.len);
+        for (0..count) |_| self.nodes.appendAssumeCapacity(.{ .label = 0, .comp = no_comp, .sibling = no_node, .queue = 0, .queue_row = no_node });
+        var row: u32 = @intCast(self.nodes.len);
+        while (row > first) {
+            row -= 1;
+            self.node_free.appendAssumeCapacity(row);
+        }
+        self.refreshColumns();
+    }
+
+    /// Takes a free node row for `label`, with no comp yet; the batch reserve covered it.
+    pub fn claimNode(self: *NavLevelGraph, label: u8) u32 {
+        const row = self.node_free.pop().?;
+        self.node_label[row] = label;
+        self.node_comp[row] = no_comp;
+        self.node_sibling[row] = no_node;
+        return row;
+    }
+
+    /// Returns `row`, already off its comp and its record's list, to the pool.
+    pub fn releaseNode(self: *NavLevelGraph, row: u32) void {
+        self.node_comp[row] = no_comp;
+        std.debug.assert(self.node_free.items.len < self.node_free.capacity);
+        self.node_free.appendAssumeCapacity(row);
     }
 
     /// `chunk`'s portals and links; empty when the chunk holds no record.
@@ -227,7 +339,9 @@ pub const NavLevelGraph = struct {
 
     fn residentBytes(self: *const NavLevelGraph) usize {
         var bytes = self.record_dir.capacity * @sizeOf(u32) +
-            self.records.capacity * (@sizeOf(u8) + @sizeOf(u32)) +
+            self.records.capacity * (2 * @sizeOf(u8) + 2 * @sizeOf(u32)) +
+            self.nodes.capacity * @sizeOf(NodeRow) +
+            self.node_free.capacity * @sizeOf(u32) +
             self.border.capacity * @sizeOf(NavPortal) +
             self.record_free.capacity * @sizeOf(u32) +
             self.link_slots.capacity * @sizeOf(LinkSlotRow) +
@@ -256,7 +370,7 @@ pub const NavLevelGraph = struct {
         try self.record_free.ensureTotalCapacity(allocator, self.records.capacity);
         for (0..added) |_| {
             const id: u32 = @intCast(self.records.len);
-            self.records.appendAssumeCapacity(.{ .border_count = 0, .link_slot = no_link_slot });
+            self.records.appendAssumeCapacity(.{ .border_count = 0, .link_slot = no_link_slot, .node_head = no_node, .label_count = 0 });
             self.border.appendNTimesAssumeCapacity(empty_portal, self.border_stride);
             self.record_free.appendAssumeCapacity(id);
         }
@@ -290,6 +404,8 @@ pub const NavLevelGraph = struct {
         const record = self.record_free.pop().?;
         self.border_count[record] = 0;
         self.record_link_slot[record] = no_link_slot;
+        self.record_node_head[record] = no_node;
+        self.record_label_count[record] = 0;
         self.record_dir.items[chunk] = record;
         return record;
     }
@@ -315,6 +431,8 @@ pub const NavLevelGraph = struct {
 
     fn releaseRecord(self: *NavLevelGraph, chunk: u32) void {
         const record = self.record_dir.items[chunk];
+        // A record without portals holds no node.
+        std.debug.assert(self.record_node_head[record] == no_node);
         self.releaseLinkSlot(record);
         self.border_count[record] = 0;
         std.debug.assert(self.record_free.items.len < self.record_free.capacity);
@@ -331,9 +449,9 @@ const thread_shared_record_alignment: usize = 64;
 // holds no cell block yet.
 const claim_pending: u32 = no_block - 1;
 
-// Threading for one batch stage (remask or patch): the shared thread system plus that
-// stage's own tuner. `adaptive`/`items_per_range` let a bench pin a fixed partition.
-const NavStageThreads = struct {
+/// Threading for one batch stage: the shared thread system plus that stage's own tuner.
+/// `adaptive`/`items_per_range` let a bench pin a fixed partition.
+pub const NavStageThreads = struct {
     thread_system: *ThreadSystem,
     tuner: *AdaptiveWorkTuner,
     adaptive: bool = true,
@@ -341,14 +459,22 @@ const NavStageThreads = struct {
 };
 
 /// Threading for nav batches: the shared thread system plus one tuner per stage (key
-/// plan, remask and component flood, record patch). Absent: every stage runs inline.
+/// plan, remask and component flood, record patch, connectivity seed, gather, and flood).
+/// Absent: every stage runs inline.
 pub const NavUpdateThreads = struct {
     thread_system: *ThreadSystem,
     plan_tuner: *AdaptiveWorkTuner,
     remask_tuner: *AdaptiveWorkTuner,
     patch_tuner: *AdaptiveWorkTuner,
+    conn_seed_tuner: *AdaptiveWorkTuner,
+    conn_gather_tuner: *AdaptiveWorkTuner,
+    conn_flood_tuner: *AdaptiveWorkTuner,
     adaptive: bool = true,
     items_per_range: ?usize = null,
+
+    fn stage(self: NavUpdateThreads, tuner: *AdaptiveWorkTuner) NavStageThreads {
+        return .{ .thread_system = self.thread_system, .tuner = tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
+    }
 
     fn plan(self: NavUpdateThreads) NavStageThreads {
         return .{ .thread_system = self.thread_system, .tuner = self.plan_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
@@ -373,16 +499,28 @@ fn patchThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
     return if (threads) |t| t.patch() else null;
 }
 
+fn connSeedThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
+    return if (threads) |t| t.stage(t.conn_seed_tuner) else null;
+}
+
+fn connGatherThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
+    return if (threads) |t| t.stage(t.conn_gather_tuner) else null;
+}
+
+fn connFloodThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
+    return if (threads) |t| t.stage(t.conn_flood_tuner) else null;
+}
+
 /// A batch key: the (level, chunk) pair, sorted level-major.
-fn chunkKey(level: u16, chunk: u32) u64 {
+pub fn chunkKey(level: u16, chunk: u32) u64 {
     return (@as(u64, level) << 32) | chunk;
 }
 
-fn keyLevel(key: u64) u16 {
+pub fn keyLevel(key: u64) u16 {
     return @intCast(key >> 32);
 }
 
-fn keyChunk(key: u64) u32 {
+pub fn keyChunk(key: u64) u32 {
     return @truncate(key);
 }
 
@@ -464,34 +602,42 @@ const MergeHead = struct {
     }
 };
 
-// What a patch key needs from the reserve: its endpoint count on the level and whether it
-// may hold portals after the batch.
-const PatchInfo = struct {
+/// What a patch key needs from the reserve: its endpoint count on the level and whether it
+/// may hold portals after the batch.
+pub const PatchInfo = struct {
     endpoints: u32,
     needs_record: bool,
 };
 
-// A level being built into fresh storage: batch stages resolve `index` to it.
-const LevelTarget = struct {
+/// A level being built into fresh storage: batch stages resolve `index` to it.
+pub const LevelTarget = struct {
     index: u16,
     grid: *NavGrid,
     graph: *NavLevelGraph,
 };
 
-// The levels one batch reads and writes.
-const BatchLevels = struct {
+/// The levels one batch reads and writes; a level being built resolves to its fresh storage.
+pub const BatchLevels = struct {
     grids: []NavGrid,
     graphs: []NavLevelGraph,
     fresh: ?LevelTarget = null,
 
-    fn grid(self: BatchLevels, level: u16) *NavGrid {
+    /// Whether `level` is built (or is the level being built).
+    pub fn built(self: BatchLevels, level: u16) bool {
+        if (self.fresh) |fresh| {
+            if (fresh.index == level) return true;
+        }
+        return @as(usize, level) < self.grids.len;
+    }
+
+    pub fn grid(self: BatchLevels, level: u16) *NavGrid {
         if (self.fresh) |fresh| {
             if (fresh.index == level) return fresh.grid;
         }
         return &self.grids[level];
     }
 
-    fn graph(self: BatchLevels, level: u16) *NavLevelGraph {
+    pub fn graph(self: BatchLevels, level: u16) *NavLevelGraph {
         if (self.fresh) |fresh| {
             if (fresh.index == level) return fresh.graph;
         }
@@ -555,15 +701,15 @@ fn patchJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     }
 }
 
-// Dispatch time of a batch that ran on workers; zero when it ran inline.
-fn offMainNs(batch: BatchStats) u64 {
+/// Dispatch time of a batch that ran on workers; zero when it ran inline.
+pub fn offMainNs(batch: BatchStats) u64 {
     return if (batch.ran_inline) 0 else batch.batch_duration_ns;
 }
 
-// Runs one stage over `item_count` keys: through the stage's tuner when threaded, else
-// inline as one range on the main thread. `range_count` is the job's dispatched range
-// count, set before dispatch so each range can assert against it.
-fn runStage(threads: ?NavStageThreads, item_count: usize, context: *anyopaque, range_count: *usize, job: JobFn) BatchStats {
+/// Runs one stage over `item_count` items: through the stage's tuner when threaded, else
+/// inline as one range on the main thread. `range_count` is the job's dispatched range
+/// count, set before dispatch so each range can assert against it.
+pub fn runStage(threads: ?NavStageThreads, item_count: usize, context: *anyopaque, range_count: *usize, job: JobFn) BatchStats {
     if (item_count == 0) return .{};
     if (threads) |stage| {
         const selection = stage.thread_system.selectBatchProfile(stage.tuner, .{
@@ -596,6 +742,119 @@ fn inlineBatch(item_count: usize) BatchStats {
         .main_thread_ranges = 1,
         .ran_inline = true,
     };
+}
+
+// Folds one batch's shape into a running total: summed counts and times, the widest range
+// and worker use, and inline only when every batch ran inline.
+fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
+    if (batch.item_count == 0) return;
+    total.item_count += batch.item_count;
+    total.range_count += batch.range_count;
+    total.items_per_range = @max(total.items_per_range, batch.items_per_range);
+    total.available_worker_threads = @max(total.available_worker_threads, batch.available_worker_threads);
+    total.active_worker_threads = @max(total.active_worker_threads, batch.active_worker_threads);
+    total.main_thread_ranges += batch.main_thread_ranges;
+    total.worker_thread_ranges += batch.worker_thread_ranges;
+    total.batch_duration_ns += batch.batch_duration_ns;
+    total.main_thread_wait_ns += batch.main_thread_wait_ns;
+    total.ran_inline = total.ran_inline and batch.ran_inline;
+}
+
+/// One stage step dispatched as rounds under one thread profile: `begin` selects it once
+/// from the step's item count through the stage's tuner, `run` dispatches every round with it
+/// (no per-round tuner record; a round of one range runs inline), and `finish` records the
+/// summed rounds into the tuner once, at the step's item count and the selected profile, so
+/// the tuner judges one sample per step. With no threads each round runs inline as one range.
+pub const RoundDispatch = struct {
+    threads: ?NavStageThreads,
+    selection: ?BatchSelection = null,
+    // The rounds folded into one.
+    total: BatchStats = .{},
+    /// Dispatch time of the rounds that ran on workers.
+    off_main_ns: u64 = 0,
+    /// The fewest and most items a round dispatched (both zero with no round).
+    round_items_min: usize = 0,
+    round_items_max: usize = 0,
+
+    pub fn begin(threads: ?NavStageThreads, step_items: usize) RoundDispatch {
+        var dispatch = RoundDispatch{ .threads = threads };
+        if (threads) |stage| {
+            dispatch.selection = stage.thread_system.selectBatchProfile(stage.tuner, .{
+                .item_count = @max(step_items, 1),
+                .items_per_range = stage.items_per_range,
+                .range_alignment_items = 1,
+                .adaptive = stage.adaptive,
+            });
+        }
+        return dispatch;
+    }
+
+    /// Runs one round of `item_count` items. `range_count` is the job's dispatched range
+    /// count, set before dispatch so each range can assert against it.
+    pub fn run(self: *RoundDispatch, item_count: usize, context: *anyopaque, range_count: *usize, job: JobFn) void {
+        std.debug.assert(item_count != 0);
+        self.round_items_min = if (self.round_items_max == 0) item_count else @min(self.round_items_min, item_count);
+        self.round_items_max = @max(self.round_items_max, item_count);
+        const batch = if (self.selection) |selection| blk: {
+            const stage = self.threads.?;
+            const per_range = @max(selection.profile.items_per_range, 1);
+            range_count.* = (item_count + per_range - 1) / per_range;
+            break :blk stage.thread_system.parallelForWithOptions(item_count, context, job, .{
+                .adaptive = stage.adaptive,
+                .adaptive_tuner = null,
+                .items_per_range = stage.items_per_range,
+                .range_alignment_items = 1,
+                .selected_profile = selection.profile,
+            });
+        } else blk: {
+            range_count.* = 1;
+            job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
+            break :blk inlineBatch(item_count);
+        };
+        std.debug.assert(batch.range_count == range_count.*);
+        self.off_main_ns += offMainNs(batch);
+        accumulateBatch(&self.total, batch);
+    }
+
+    /// Records the step into the stage's tuner once and returns the rounds folded into one.
+    pub fn finish(self: *RoundDispatch, step_items: usize) BatchStats {
+        const selection = self.selection orelse return self.total;
+        const tuner = selection.active_tuner orelse return self.total;
+        tuner.record(.{
+            .item_count = @max(step_items, 1),
+            .range_count = self.total.range_count,
+            .items_per_range = selection.profile.items_per_range,
+            .range_alignment_items = 1,
+            .available_worker_threads = self.total.available_worker_threads,
+            .active_worker_threads = selection.profile.worker_threads,
+            .main_thread_ranges = self.total.main_thread_ranges,
+            .worker_thread_ranges = self.total.worker_thread_ranges,
+            .batch_duration_ns = self.total.batch_duration_ns,
+            .main_thread_wait_ns = self.total.main_thread_wait_ns,
+            .ran_inline = selection.profile.worker_threads == 0,
+        });
+        return self.total;
+    }
+};
+
+// Folds one batch's connectivity counters and stage shapes into `stats`: level builds and the
+// marks batch sum.
+fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ConnectivityCounters) void {
+    stats.conn_groups += counters.groups;
+    stats.conn_families += counters.families;
+    stats.conn_rounds += counters.rounds;
+    stats.conn_build_visits += counters.build_visits;
+    stats.conn_flood_nodes += counters.flood_nodes;
+    stats.conn_splits += counters.splits;
+    stats.conn_merges += counters.merges;
+    if (counters.rounds != 0) {
+        stats.conn_round_items_min = if (stats.conn_round_items_max == 0) counters.round_items_min else @min(stats.conn_round_items_min, counters.round_items_min);
+        stats.conn_round_items_max = @max(stats.conn_round_items_max, counters.round_items_max);
+    }
+    stats.conn_flood_off_main_ns += counters.flood_off_main_ns;
+    accumulateBatch(&stats.conn_seed_batch, conn.last_seed_batch);
+    accumulateBatch(&stats.conn_gather_batch, conn.last_gather_batch);
+    accumulateBatch(&stats.conn_flood_batch, conn.last_flood_batch);
 }
 
 /// A marks batch between `NavGraph.prepareMarks` and its commit or abort.
@@ -1019,6 +1278,8 @@ pub const NavGraph = struct {
     links_applied: usize = 0,
     /// Bounds over every link folded so far; written only by a world build and a marks commit.
     link_bounds: LinkBounds = .{},
+    /// Connectivity ids over every level's nodes, maintained by every batch.
+    connectivity: Connectivity = .{},
     // The world-wide content revision every level was last checked against.
     built_world_revision: u32 = 0,
     // Batch buffers, reused across batches. `changed_masks` holds, per changed key of the
@@ -1051,6 +1312,7 @@ pub const NavGraph = struct {
     pool_growth_logged: bool = false,
 
     pub fn deinit(self: *NavGraph) void {
+        self.connectivity.deinit(self.allocator);
         self.merge_heap.deinit(self.allocator);
         self.plan_tallies.deinit(self.allocator);
         self.plan_windows.deinit(self.allocator);
@@ -1128,6 +1390,7 @@ pub const NavGraph = struct {
         for (self.plan_staging) |staging| bytes += staging.capacity * @sizeOf(u64);
         for (self.levels.items) |*level_grid| bytes += level_grid.residentBytes();
         for (self.level_graphs.items) |*level_graph| bytes += level_graph.residentBytes();
+        bytes += self.connectivity.residentBytes();
         return bytes;
     }
 
@@ -1231,8 +1494,10 @@ pub const NavGraph = struct {
 
     /// Builds level `level_index` from `world` (or bounds when null) into fresh storage and
     /// swaps it in: appended when `level_index == levelCount()`, else replacing that level and
-    /// freeing the old one. An error leaves the graph unchanged. O(chunks of the level); the
-    /// remask and patch stages thread over its chunks. Never touches `links_applied`.
+    /// freeing the old one, with its connectivity nodes. An error leaves the graph unchanged.
+    /// O(chunks of the level + its nodes and edges); the remask, patch, and connectivity
+    /// stages thread over its chunks (the flood over its searches). Never touches
+    /// `links_applied`.
     pub fn buildLevel(self: *NavGraph, colliders: ColliderView, world: ?*const WorldSystem, level_index: u16, threads: ?NavUpdateThreads, stats: *NavUpdateStats) !void {
         std.debug.assert(@as(usize, level_index) <= self.levels.items.len);
         const chunk_count = self.chunkCount();
@@ -1270,10 +1535,27 @@ pub const NavGraph = struct {
         try self.reserveCellBlocks(levels, world, colliders);
         try self.reserveRecords(levels);
 
-        // Commit.
+        // Commit into the fresh storage.
         self.remaskKeys(levels, colliders, world, null, remaskThreads(threads), stats);
         self.claimRecords(levels);
         self.patchKeys(levels, world, patchThreads(threads), stats);
+        // Connectivity: reserves first, so an error leaves every other level as it was.
+        const old_levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
+        const replaced: ?*NavLevelGraph = if (appending) null else &self.level_graphs.items[level_index];
+        const counters = try self.connectivity.buildLevel(
+            self.allocator,
+            levels,
+            old_levels,
+            world,
+            self.changed_keys.items,
+            replaced,
+            connSeedThreads(threads),
+            connGatherThreads(threads),
+            connFloodThreads(threads),
+            &self.pool_grows,
+            stats,
+        );
+        addConnectivityStats(stats, &self.connectivity, counters);
         _ = self.releaseRecords(levels);
         fresh_graph.built_revision = if (world) |world_system| world_system.levelContentRevision(level_index) else 0;
         if (appending) {
@@ -1330,6 +1612,18 @@ pub const NavGraph = struct {
             try self.planPatchInfo(prepared.world);
             try self.reserveCellBlocks(levels, prepared.world, colliders);
             try self.reserveRecords(levels);
+            try self.connectivity.prepareMarks(
+                self.allocator,
+                levels,
+                prepared.world,
+                self.changed_keys.items,
+                self.patch_keys.items,
+                self.patch_info.items,
+                new_links.len,
+                connSeedThreads(threads),
+                &self.pool_grows,
+                stats,
+            );
         }
         self.batch_prepared = true;
         return prepared;
@@ -1339,15 +1633,17 @@ pub const NavGraph = struct {
     /// `link_bounds` (O(1) each, a long one a fixed pair insert, then one fixed pair chain
     /// closure when the batch changed the pairs or crossing rates), remasks the changed chunks from
     /// the world and `colliders` (recording each one's flipped cells), re-derives every
-    /// patch key's record, and advances `links_applied`. Remask and patch thread over keys.
+    /// patch key's record, updates the connectivity ids, and advances `links_applied`. Remask,
+    /// patch, and the connectivity gather thread over keys; the connectivity flood over its
+    /// searches.
     pub fn commitMarks(self: *NavGraph, prepared: PreparedMarks, colliders: ColliderView, threads: ?NavUpdateThreads, stats: *NavUpdateStats) NavBatchResult {
         std.debug.assert(self.batch_prepared);
         self.batch_prepared = false;
         // Only a world-backed graph has links to apply.
         std.debug.assert(prepared.new_link_count == 0 or prepared.world != null);
-        if (prepared.world) |world| {
-            self.link_bounds.foldLinks(world.levelLinks()[self.links_applied..][0..prepared.new_link_count]);
-        }
+        const first_link = self.links_applied;
+        const new_links: []const LevelLink = if (prepared.world) |world| world.levelLinks()[first_link..][0..prepared.new_link_count] else &.{};
+        self.link_bounds.foldLinks(new_links);
         self.links_applied += prepared.new_link_count;
         if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .changed_keys = &.{}, .changed_masks = &.{} };
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
@@ -1355,6 +1651,8 @@ pub const NavGraph = struct {
         self.remaskKeys(levels, colliders, prepared.world, self.changed_masks.items, remaskThreads(threads), stats);
         self.claimRecords(levels);
         self.patchKeys(levels, prepared.world, patchThreads(threads), stats);
+        const counters = self.connectivity.commitMarks(levels, prepared.world, self.patch_keys.items, new_links, connGatherThreads(threads), connFloodThreads(threads), stats);
+        addConnectivityStats(stats, &self.connectivity, counters);
         stats.records_patched += self.releaseRecords(levels);
         stats.dirty_chunks += self.changed_keys.items.len;
         stats.chunks_patched += self.patch_keys.items.len;
@@ -1850,6 +2148,15 @@ pub const NavGraph = struct {
         @memcpy(level_graph.border.items[base .. base + count], portals[0..count]);
         // At most max_border_portals (32) border portals.
         level_graph.border_count[record] = @intCast(count);
+        var labels: [4]u64 = @splat(0);
+        for (portals[0..count]) |portal| labels[portal.label >> 6] |= @as(u64, 1) << @intCast(portal.label & 63);
+        if (slot != no_link_slot) {
+            for (level_graph.slot_extra[slot].items) |portal| labels[portal.label >> 6] |= @as(u64, 1) << @intCast(portal.label & 63);
+        }
+        var label_count: usize = 0;
+        for (labels) |word| label_count += @popCount(word);
+        // At most 128 labels fit a chunk.
+        level_graph.record_label_count[record] = @intCast(label_count);
     }
 
     pub fn keyForWorld(self: *const NavGraph, level: u16, goal: math.Vec2, agent_class: PathAgentClass) ?PathQueryKey {
@@ -1943,14 +2250,18 @@ const WorldTileChangedEvent = @import("../../simulation.zig").WorldTileChangedEv
 const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 
 // Asserts graph `a` equals graph `b` level by level: every chunk's form, cell bits, and
-// labels, the blocked count, and every chunk's record content (border portals, extra
-// portals, links).
+// labels, the blocked count, every chunk's record content (border portals, extra portals,
+// links), and the connectivity partition, each graph's connectivity consistent with its own
+// records.
 fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
     const t = std.testing;
     try t.expectEqual(a.levels.items.len, b.levels.items.len);
     try t.expectEqual(a.cellCount(), b.cellCount());
     for (0..a.levels.items.len) |level| try t.expect(levelsEquivalent(a, b, @intCast(level)));
     try t.expect(std.meta.eql(a.link_bounds, b.link_bounds));
+    try test_support.expectConnectivityConsistent(a);
+    try test_support.expectConnectivityConsistent(b);
+    try test_support.expectSameConnectivityPartition(a, b);
 }
 
 // Whether `level` holds the same cells and records in `a` and `b`.
@@ -2978,9 +3289,11 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     }
     const stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    // Both stages threaded under the failing allocator and allocated nothing.
+    // The stages threaded under the failing allocator and allocated nothing.
     try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
     try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+    try std.testing.expect(!stats.conn_seed_batch.ran_inline);
+    try std.testing.expect(!stats.conn_gather_batch.ran_inline);
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -3149,7 +3462,7 @@ test "a nav-record reserve OOM before a cave-in or explosion dense write leaves 
     }
 }
 
-test "one chunk's change leaves every other chunk's record untouched" {
+test "one chunk's change leaves every other chunk's record and connectivity nodes untouched" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -3162,19 +3475,32 @@ test "one chunk's change leaves every other chunk's record untouched" {
     defer before.deinit();
     const record_dir_before = try std.testing.allocator.dupe(u32, system.graph.levelGraph(0).?.record_dir.items);
     defer std.testing.allocator.free(record_dir_before);
+    const node_comps_before = try std.testing.allocator.dupe(u32, system.graph.levelGraph(0).?.node_comp);
+    defer std.testing.allocator.free(node_comps_before);
+    const node_heads_before = try std.testing.allocator.dupe(u32, system.graph.levelGraph(0).?.record_node_head);
+    defer std.testing.allocator.free(node_heads_before);
 
     // (5,5) lies in chunk (1,1) of the 3x3 chunk grid.
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)).?;
     const stats = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
+    try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_nodes);
     const patched = [_]u32{ 4, 3, 5, 1, 7 };
+    const level_graph = system.graph.levelGraph(0).?;
     for (0..system.graph.chunkCount()) |chunk_index| {
         const chunk: u32 = @intCast(chunk_index);
         if (std.mem.indexOfScalar(u32, &patched, chunk) != null) continue;
-        try std.testing.expectEqual(record_dir_before[chunk], system.graph.levelGraph(0).?.record_dir.items[chunk]);
+        try std.testing.expectEqual(record_dir_before[chunk], level_graph.record_dir.items[chunk]);
         const now = system.graph.chunkPortals(0, chunk);
         const old = before.graph.chunkPortals(0, chunk);
         try std.testing.expect(portalsEqual(now.border, old.border) and portalsEqual(now.extra, old.extra));
+        // The same node rows on the same comps.
+        const record = level_graph.recordOf(chunk) orelse continue;
+        try std.testing.expectEqual(node_heads_before[record], level_graph.record_node_head[record]);
+        var row = level_graph.record_node_head[record];
+        while (row != no_node) : (row = level_graph.node_sibling[row]) {
+            try std.testing.expectEqual(node_comps_before[row], level_graph.node_comp[row]);
+        }
     }
     try std.testing.expect(levelsEquivalent(&system.graph, &before.graph, 1));
     var after = try fullRebuild(&data, &fixture.world, abstractCapacity());
@@ -3462,6 +3788,7 @@ test "a world build that runs out of memory leaves the previous graph intact; a 
     var reference = try fullRebuild(&data, &first.world, abstractCapacity());
     defer reference.deinit();
 
+    var version = system.graph.version;
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
@@ -3469,11 +3796,18 @@ test "a world build that runs out of memory leaves the previous graph intact; a 
         const result = system.graph.rebuild(no_colliders.view(), .{ .world = &second }, null);
         system.graph.allocator = std.testing.allocator;
         if (result) |_| {
-            try std.testing.expect(!failing.has_induced_failure);
-            break;
+            if (!failing.has_induced_failure) break;
+            // Only a connectivity staging shrink absorbs a failure, keeping its larger buffer:
+            // the build completed. Check it, then restore the first world for the next index.
+            var fresh = try fullRebuild(&data, &second, abstractCapacity());
+            defer fresh.deinit();
+            try expectGraphsEquivalent(&system.graph, &fresh.graph);
+            try system.graph.rebuild(no_colliders.view(), .{ .world = &first.world }, null);
+            try expectGraphsEquivalent(&system.graph, &reference.graph);
+            version = system.graph.version;
         } else |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            try std.testing.expectEqual(reference.graph.version, system.graph.version);
+            try std.testing.expectEqual(version, system.graph.version);
             try expectGraphsEquivalent(&system.graph, &reference.graph);
         }
     }

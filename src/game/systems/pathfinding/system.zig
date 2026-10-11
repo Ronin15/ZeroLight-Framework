@@ -278,6 +278,11 @@ pub const PathfindingSystem = struct {
     // batch's key plan each own a tuner.
     nav_mark_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The connectivity stages of a nav batch (seed over changed keys, gather over patch keys,
+    // the connectivity flood's rounds) each own a tuner.
+    nav_conn_seed_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_conn_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_conn_flood_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // The publish byte copy, the registry flush, and a shrink's resize copy each own a
     // tuner; so do the eviction's bound count, halo walk, and flush.
     publish_copy_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -769,6 +774,9 @@ pub const PathfindingSystem = struct {
         self.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_mark_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_plan_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_seed_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_gather_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_flood_tuner = AdaptiveWorkTuner.init(.{});
         self.publish_copy_tuner = AdaptiveWorkTuner.init(.{});
         self.registry_flush_tuner = AdaptiveWorkTuner.init(.{});
         self.resize_copy_tuner = AdaptiveWorkTuner.init(.{});
@@ -784,6 +792,9 @@ pub const PathfindingSystem = struct {
             .plan_tuner = &self.nav_plan_tuner,
             .remask_tuner = &self.nav_remask_tuner,
             .patch_tuner = &self.nav_patch_tuner,
+            .conn_seed_tuner = &self.nav_conn_seed_tuner,
+            .conn_gather_tuner = &self.nav_conn_gather_tuner,
+            .conn_flood_tuner = &self.nav_conn_flood_tuner,
             .adaptive = self.nav_thread_adaptive,
             .items_per_range = self.nav_thread_items_per_range,
         };

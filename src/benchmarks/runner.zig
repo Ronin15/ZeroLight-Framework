@@ -84,6 +84,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     chunk_scale.nav_ramp_group,
     chunk_scale.nav_cave_in_group,
     chunk_scale.nav_explosion_fill_group,
+    chunk_scale.nav_enclose_group,
     chunk_scale.nav_level_add_group,
     render_prep.group,
     render_game_prep.group,

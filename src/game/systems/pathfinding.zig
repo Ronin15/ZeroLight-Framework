@@ -36,6 +36,7 @@ test {
     _ = @import("pathfinding/scratch.zig");
     _ = @import("pathfinding/group_field.zig");
     _ = @import("pathfinding/nav_graph.zig");
+    _ = @import("pathfinding/connectivity.zig");
     _ = @import("pathfinding/caches.zig");
     _ = @import("pathfinding/solve.zig");
     _ = @import("pathfinding/system.zig");

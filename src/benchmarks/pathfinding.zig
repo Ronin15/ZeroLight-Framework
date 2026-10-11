@@ -349,12 +349,15 @@ pub const negative_burst_group = suite.BenchmarkGroup{
 // room of edge² chunks walled off by a one-chunk band whose one open chunk is the gap;
 // blocking the gap seals the room. Variant 1: a one-chunk ring corridor around a solid block
 // of edge² chunks, walled off from the rest of the level, with the gap one chunk of the ring;
-// blocking it cuts the ring without splitting it. One timed sample blocks the gap chunk and
+// blocking it cuts the ring without splitting it. Variant 2: a one-chunk tunnel of edge
+// chunks along the level's north border, walled below, whose east mouth chunk is the gap;
+// blocking it seals the tunnel off the open level. One timed sample blocks the gap chunk and
 // runs the nav reaction, then reopens it and runs the reaction again; the tile writes are
-// untimed. `outputs` is the cells each change flips and `candidates` the room or ring chunks.
-// Passes when no config grows faster than its room or ring chunks and every config is flat
-// in side. `--details` prints the block and reopen reactions, the block reaction's plan,
-// remask, and patch shapes, and the reactions' main-thread share.
+// untimed. `outputs` is the cells each change flips and `candidates` the room, ring, or tunnel
+// chunks. Passes when no config grows faster than its room, ring, or tunnel chunks and every
+// config is flat in side. `--details` prints the block and reopen reactions, the block
+// reaction's plan, remask, patch, and connectivity shapes (the flood's rounds, searches per
+// round, and its tuner's policy), and the reactions' main-thread share.
 pub const connectivity_split_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-split",
     .defaultItemCounts = connectivitySplitItemCounts,
@@ -1836,7 +1839,8 @@ const connectivity_variant_encoding: usize = 10_000_000_000;
 const split_edge_encoding: usize = 10_000_000;
 const oneway_terminals_encoding: usize = 100_000;
 
-// Room edges at one side, then the middle edge at two more sides, then ring edges.
+// Room edges at one side, then the middle edge at two more sides, then ring edges, then
+// tunnel lengths at one side and the shortest at two more.
 const connectivity_split_item_counts = [_]usize{
     splitItemCode(.room, 2, 1024),
     splitItemCode(.room, 8, 1024),
@@ -1846,6 +1850,11 @@ const connectivity_split_item_counts = [_]usize{
     splitItemCode(.ring, 2, 1024),
     splitItemCode(.ring, 8, 1024),
     splitItemCode(.ring, 32, 1024),
+    splitItemCode(.tunnel, 8, 1024),
+    splitItemCode(.tunnel, 32, 1024),
+    splitItemCode(.tunnel, 62, 1024),
+    splitItemCode(.tunnel, 8, 256),
+    splitItemCode(.tunnel, 8, 2048),
 };
 
 fn connectivitySplitItemCounts(_: suite.Profile) []const usize {
@@ -3804,7 +3813,8 @@ const toggle_agent_budget: usize = 8;
 // reaction, with the change reaction's plan, remask, and patch batches.
 const ToggleSample = struct {
     change: EvictReaction,
-    change_stages: [3]BatchStats,
+    // The change reaction's plan, remask, patch, and connectivity seed, gather, and flood.
+    change_stages: [6]BatchStats,
     revert: EvictReaction,
 
     fn elapsedNs(self: ToggleSample) u64 {
@@ -3816,24 +3826,38 @@ const ToggleSample = struct {
 fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem) !ToggleSample {
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
     const graph = &fixture.system.graph;
-    const change_stages = [3]BatchStats{ graph.last_plan_batch, change.stats.remask_batch, graph.last_patch_batch };
+    const change_stages = [6]BatchStats{ graph.last_plan_batch, change.stats.remask_batch, graph.last_patch_batch, change.stats.conn_seed_batch, change.stats.conn_gather_batch, change.stats.conn_flood_batch };
     const revert = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
     return .{ .change = change, .change_stages = change_stages, .revert = revert };
 }
 
-// The timed toggles' change and revert reactions, the change reaction's plan, remask, and
-// patch shapes (each stage's busiest batch), and the reactions' main-thread share: each
-// reaction minus its worker-side stage time. Printed under --details.
+// The timed toggles' change and revert reactions, the change reaction's plan, remask, patch,
+// and connectivity seed, gather, and flood shapes (each stage's busiest batch), its
+// connectivity flood (nodes expanded, root-groups, families, rounds, the fewest and most
+// searches a round dispatched, components split off, dispatch time on workers) beside the
+// revert's flood nodes, the flood tuner's policy after the samples, and the reactions'
+// main-thread share: each reaction minus its worker-side stage time. Printed under --details.
 const ToggleReport = struct {
     samples: usize = 0,
     change_ns: u128 = 0,
     revert_ns: u128 = 0,
     main_ns: u128 = 0,
-    busiest: [3]BatchStats = @splat(.{}),
-    threaded: [3]usize = @splat(0),
-    dispatched: [3]usize = @splat(0),
+    busiest: [6]BatchStats = @splat(.{}),
+    threaded: [6]usize = @splat(0),
+    dispatched: [6]usize = @splat(0),
     chunks_patched: usize = 0,
     records_patched: usize = 0,
+    flood_nodes: usize = 0,
+    groups: usize = 0,
+    families: usize = 0,
+    rounds: usize = 0,
+    round_items_min: usize = 0,
+    round_items_max: usize = 0,
+    splits: usize = 0,
+    flood_off_main_ns: u64 = 0,
+    revert_flood_nodes: usize = 0,
+    // The flood tuner's workers when the case runs it adaptive (zero: inline).
+    flood_tuner_workers: ?usize = null,
 
     fn add(self: *ToggleReport, sample: ToggleSample) void {
         self.samples += 1;
@@ -3842,6 +3866,15 @@ const ToggleReport = struct {
         self.main_ns += (sample.change.elapsed_ns -| sample.change.stats.off_main_stage_ns) + (sample.revert.elapsed_ns -| sample.revert.stats.off_main_stage_ns);
         self.chunks_patched = sample.change.stats.chunks_patched;
         self.records_patched = sample.change.stats.records_patched;
+        self.flood_nodes = sample.change.stats.conn_flood_nodes;
+        self.groups = sample.change.stats.conn_groups;
+        self.families = sample.change.stats.conn_families;
+        self.rounds = sample.change.stats.conn_rounds;
+        self.round_items_min = sample.change.stats.conn_round_items_min;
+        self.round_items_max = sample.change.stats.conn_round_items_max;
+        self.flood_off_main_ns = sample.change.stats.conn_flood_off_main_ns;
+        self.splits = sample.change.stats.conn_splits;
+        self.revert_flood_nodes = sample.revert.stats.conn_flood_nodes;
         for (sample.change_stages, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
             if (batch.item_count == 0) continue;
             dispatched.* += 1;
@@ -3860,14 +3893,19 @@ const ToggleReport = struct {
 
     fn print(self: ToggleReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.samples == 0) return;
-        var shapes: [3][48]u8 = undefined;
-        var labels: [3][]const u8 = undefined;
+        var shapes: [6][48]u8 = undefined;
+        var labels: [6][]const u8 = undefined;
         for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
             label.* = stageShape(buffer, batch, threaded, dispatched);
         }
         const samples: u128 = self.samples * std.time.ns_per_us;
         const timed_ns = self.change_ns + self.revert_ns;
-        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%) plan={s} remask={s} patch={s} chunks_patched={} records_patched={}\n", .{
+        var tuner_buffer: [24]u8 = undefined;
+        const tuner: []const u8 = if (self.flood_tuner_workers) |workers|
+            (if (workers == 0) "inline" else std.fmt.bufPrint(&tuner_buffer, "{}w", .{workers}) catch "tuner")
+        else
+            "-";
+        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%) plan={s} remask={s} patch={s} conn_seed={s} conn_gather={s} conn_flood={s} flood_nodes={} groups={} families={} rounds={} round_items={}-{} splits={} flood_off_main={}us flood_tuner={s} reopen_flood_nodes={} chunks_patched={} records_patched={}\n", .{
             group_name,
             item_count,
             case.name,
@@ -3878,6 +3916,19 @@ const ToggleReport = struct {
             labels[0],
             labels[1],
             labels[2],
+            labels[3],
+            labels[4],
+            labels[5],
+            self.flood_nodes,
+            self.groups,
+            self.families,
+            self.rounds,
+            self.round_items_min,
+            self.round_items_max,
+            self.splits,
+            self.flood_off_main_ns / std.time.ns_per_us,
+            tuner,
+            self.revert_flood_nodes,
             self.chunks_patched,
             self.records_patched,
         });
@@ -3895,6 +3946,10 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
         accumulator.record(sample.elapsedNs(), sample.change.stats.remask_batch);
         report.add(sample);
     }
+    if (case.adaptive and thread_system != null) {
+        const tuner = fixture.system.nav_conn_flood_tuner.report();
+        report.flood_tuner_workers = if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
+    }
     report.print(options, group_name, item_count, case);
     var stats = accumulator.finish();
     report.summarize(&stats);
@@ -3907,6 +3962,8 @@ const SplitVariant = enum(u8) {
     room,
     // A ring corridor cut, not split, by blocking one of its chunks.
     ring,
+    // A one-chunk tunnel sealed by blocking its mouth chunk.
+    tunnel,
 };
 
 fn splitItemCode(variant: SplitVariant, edge_chunks: usize, side: usize) usize {
@@ -3928,7 +3985,7 @@ const SplitConfig = struct {
         const variant_index = item_count / connectivity_variant_encoding;
         const edge_chunks = item_count % connectivity_variant_encoding / split_edge_encoding;
         const world_config = item_count % split_edge_encoding;
-        if (variant_index > @backingInt(SplitVariant.ring)) return error.ConnectivitySplitUnknownVariant;
+        if (variant_index > @backingInt(SplitVariant.tunnel)) return error.ConnectivitySplitUnknownVariant;
         if (world_config % level_case_encoding != 1) return error.ConnectivitySplitNotOneLevel;
         if (edge_chunks == 0) return error.ConnectivitySplitNoEdge;
         const side = world_config / level_case_encoding;
@@ -3936,24 +3993,28 @@ const SplitConfig = struct {
         return .{ .variant = @fromBackingInt(@as(u8, @intCast(variant_index))), .edge_chunks = @intCast(edge_chunks), .side = @intCast(side) };
     }
 
-    // Chunks a side of the structure's square, its outer wall band included.
+    // Chunks a side of the structure's square, its outer wall band (or the tunnel's mouth
+    // and the open chunk past it) included.
     fn spanChunks(self: SplitConfig) usize {
         return switch (self.variant) {
             .room => @as(usize, self.edge_chunks) + 1,
             .ring => @as(usize, self.edge_chunks) + 3,
+            .tunnel => @as(usize, self.edge_chunks) + 2,
         };
     }
 
-    // The room's chunks, or the ring's.
+    // The room's chunks, the ring's, or the tunnel's.
     fn structureChunks(self: SplitConfig) usize {
         const edge: usize = self.edge_chunks;
         return switch (self.variant) {
             .room => edge * edge,
             .ring => 4 * edge + 4,
+            .tunnel => edge,
         };
     }
 
-    // Whether `cell` lies in the room, or in the ring (its gap chunk included).
+    // Whether `cell` lies in the room, in the ring (its gap chunk included), or in the tunnel
+    // (its mouth excluded).
     fn inStructure(self: SplitConfig, cell: CellCoord, chunk_tiles: usize) bool {
         const chunk_x = cell.x / chunk_tiles;
         const chunk_y = cell.y / chunk_tiles;
@@ -3962,6 +4023,7 @@ const SplitConfig = struct {
             .room => chunk_x < edge and chunk_y < edge,
             .ring => chunk_x < edge + 2 and chunk_y < edge + 2 and
                 (chunk_x == 0 or chunk_y == 0 or chunk_x == edge + 1 or chunk_y == edge + 1),
+            .tunnel => chunk_x < edge and chunk_y == 0,
         };
     }
 
@@ -3976,18 +4038,26 @@ const SplitConfig = struct {
             .room => .{ .x = self.edge_chunks, .y = self.edge_chunks / 2 },
             // Mid-height in the ring's west side.
             .ring => .{ .x = 0, .y = (self.edge_chunks + 2) / 2 },
+            // The tunnel's east mouth.
+            .tunnel => .{ .x = self.edge_chunks, .y = 0 },
         };
     }
 
-    // The solid chunks: the room's wall band but its gap, or the ring's inner block and its
-    // outer wall band. The level border closes the structure's west and north.
+    // The solid chunks: the room's wall band but its gap, the ring's inner block and its
+    // outer wall band, or the row below the tunnel and its mouth. The level border closes the
+    // structure's west and north.
     fn solidChunks(self: SplitConfig, allocator: std.mem.Allocator) ![]ChunkCoord {
         var chunks: std.ArrayList(ChunkCoord) = .empty;
         errdefer chunks.deinit(allocator);
+        if (self.variant == .tunnel) {
+            for (0..self.edge_chunks + 1) |x| try chunks.append(allocator, .{ .x = @intCast(x), .y = 1 });
+            return chunks.toOwnedSlice(allocator);
+        }
         // The outer band: the column and the row just past the room or the ring.
         const band: u16 = switch (self.variant) {
             .room => self.edge_chunks,
             .ring => self.edge_chunks + 2,
+            .tunnel => unreachable,
         };
         const gap = self.gapChunk();
         for (0..band + 1) |y| {
@@ -4104,7 +4174,7 @@ fn checkSplitTopology(allocator: std.mem.Allocator, world: *const WorldSystem, c
     const chunk_cells = @as(usize, world.chunk_size_tiles) * world.chunk_size_tiles;
     const sealed = try floodSplitStructure(allocator, world, config, true);
     switch (config.variant) {
-        .room => {
+        .room, .tunnel => {
             if (sealed.escaped) return error.ConnectivitySplitRoomNotSealed;
             if (sealed.visited != config.structureChunks() * chunk_cells) return error.ConnectivitySplitRoomNotOneArea;
             const opened = try floodSplitStructure(allocator, world, config, false);

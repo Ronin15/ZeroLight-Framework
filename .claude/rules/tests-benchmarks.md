@@ -65,4 +65,7 @@ paths:
   cycle and show nothing more). It passes when the shape matches the cost
   model's order (flat for a local change, linear where linear is right). A
   cost that grows with world size on a local change is a design defect
-  regardless of the absolute number.
+  regardless of the absolute number, except reachability maintenance
+  (`budgets-capacities.md`), whose benches pass when each removal's cost
+  follows its own smaller side or detour reach and never another change or
+  the level around it.

@@ -333,6 +333,28 @@ pub const NavUpdateStats = struct {
     evicted_results: usize = 0,
     evicted_negatives: usize = 0,
     dropped_fields: usize = 0,
+    // The connectivity stages of the level builds and the marks batch, summed: the seed over
+    // changed keys, the gather over patch keys and new links, and the flood over its searches
+    // (every round folded into one).
+    conn_seed_batch: BatchStats = .{},
+    conn_gather_batch: BatchStats = .{},
+    conn_flood_batch: BatchStats = .{},
+    // The fewest and most searches any flood round dispatched (both zero with no round), and
+    // the flood rounds' dispatch time on workers. Diagnostic only.
+    conn_round_items_min: usize = 0,
+    conn_round_items_max: usize = 0,
+    conn_flood_off_main_ns: u64 = 0,
+    // Active sets the flood rounds' builds walked on the main thread. Diagnostic only.
+    conn_build_visits: usize = 0,
+    // Across level builds and the marks batch: connectivity root-groups united, flood families
+    // and rounds, nodes the floods expanded, components a flood split off, and roots merged
+    // into another.
+    conn_groups: usize = 0,
+    conn_families: usize = 0,
+    conn_rounds: usize = 0,
+    conn_flood_nodes: usize = 0,
+    conn_splits: usize = 0,
+    conn_merges: usize = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -341,6 +363,7 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_levels_built, metric(self.levels_built));
         perf.recordMetric(.nav_records_patched, metric(self.records_patched));
         perf.recordBatch(.nav_remask, self.remask_batch);
+        perf.recordBatch(.nav_connect, self.conn_flood_batch);
         perf.recordBatch(.nav_evict, self.evict_batch);
     }
 };
@@ -349,20 +372,26 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-test "nav update stats record the remask and the eviction halo walk under their own perf stages" {
+test "nav update stats record the remask, the connectivity flood, and the eviction halo walk under their own perf stages" {
     if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var perf = runtime_perf_log.RuntimePerfLog.init(0);
     const stats = NavUpdateStats{
         .remask_batch = .{ .item_count = 5 },
+        .conn_seed_batch = .{ .item_count = 7 },
+        .conn_gather_batch = .{ .item_count = 8 },
+        .conn_flood_batch = .{ .item_count = 6 },
         .evict_count_batch = .{ .item_count = 2 },
         .evict_batch = .{ .item_count = 3 },
         .evict_flush_batch = .{ .item_count = 4 },
     };
     stats.recordTo(runtime_perf_log.Context.bind(&perf));
     const remask = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_remask)];
+    const connect = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_connect)];
     const evict = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_evict)];
     try std.testing.expectEqual(@as(u64, 1), remask.calls);
     try std.testing.expectEqual(@as(u64, 5), remask.items);
+    try std.testing.expectEqual(@as(u64, 1), connect.calls);
+    try std.testing.expectEqual(@as(u64, 6), connect.items);
     try std.testing.expectEqual(@as(u64, 1), evict.calls);
     try std.testing.expectEqual(@as(u64, 3), evict.items);
 }

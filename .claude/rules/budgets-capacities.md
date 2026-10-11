@@ -4,7 +4,10 @@
   A level or world holds only a directory of its units; nothing is sized to a
   level's area or a world's extent.
 - A local change (one dig, ramp, or chunk) costs work proportional to what it
-  changed, never to level size, depth, or world count.
+  changed, never to level size, depth, or world count. The one exception is
+  reachability maintenance. After a removed connection it costs the smaller
+  side when the removal splits a component, or the reach until both sides'
+  floods meet when nothing splits (a cut ring costs its ring).
 - Everything lives per world instance; no global or cross-world caps or tables.
   Worlds, levels, and dungeons are created and released in play, and their
   memory goes with them.

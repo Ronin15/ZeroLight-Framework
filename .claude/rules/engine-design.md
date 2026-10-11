@@ -42,11 +42,13 @@ Every design, and every fix touching storage or per-change work, states:
   level, or dungeon, and the per-step load of a population (its requests,
   queries, and updates in every world). Concrete sizes only illustrate an
   order.
-- Pass: local-change cost depends only on what changed; a population's
-  per-step load costs O(1) per requester plus the distinct work requested
-  (goals, regions, chunks), summed over worlds; memory follows what exists
-  and is released with it; nothing is sized from demo constants; nothing
-  stops advancing because the observer is far away.
+- Pass: local-change cost depends only on what changed, except reachability
+  maintenance, which costs the smaller side of a split or, when nothing
+  splits, the reach until both sides meet (`budgets-capacities.md`); a
+  population's per-step load costs O(1) per requester plus the distinct work
+  requested (goals, regions, chunks), summed over worlds; memory follows what
+  exists and is released with it; nothing is sized from demo constants;
+  nothing stops advancing because the observer is far away.
 - The serial and threaded paths (`threading.md`).
 - SIMD via `src/core/simd.zig` or scalar with the reason, per hot loop
   (`memory-performance.md` § SIMD), reusing the engine's proven SIMD and

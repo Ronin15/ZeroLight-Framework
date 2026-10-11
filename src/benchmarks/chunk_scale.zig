@@ -72,8 +72,15 @@
 //!     terrain plan and write stages, the nav record and reaction (event interpretation,
 //!     marking, and apply), and the rest (the main thread's share). Linear in region
 //!     chunks, flat in level size and depth.
+//!   - `chunk-scale-nav-enclose`: pockets walled off one open surface component, each by a
+//!     one-chunk doorway; one batched edit fills every doorway and the next carves them
+//!     back, each followed by the post-commit nav reaction (serial and threaded). Variant 0
+//!     encloses P pockets of 4x4 chunks (linear in P); variant 1 encloses one pocket of edge E
+//!     chunks (linear in its area); variant 2 encloses a one-chunk tunnel of L chunks at its
+//!     mouth (linear in L, flat in level side). The connectivity flood runs in threaded
+//!     rounds.
 //!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav
-//!     updated for it. Its revision case (item prefix `1 * 10^7`) first adds a level with a
+//!     updated for it. Its replace case (item prefix `1 * 10^7`) first adds a level with a
 //!     walkable floor and updates nav (untimed), then times a blocking band added to that
 //!     newest level and nav's update. Depth grows by one per iteration (warmup included),
 //!     so A/B runs use the same `--warmup` and `--iterations`.
@@ -289,23 +296,50 @@ pub const nav_explosion_fill_group = suite.BenchmarkGroup{
     .runCase = runNavExplosionFillCase,
 };
 
+pub const nav_enclose_group = suite.BenchmarkGroup{
+    .name = "chunk-scale-nav-enclose",
+    .defaultItemCounts = encloseItemCounts,
+    .runCase = runNavEncloseCase,
+};
+
 pub const nav_level_add_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-level-add",
     .defaultItemCounts = levelAddItemCounts,
     .runCase = runNavLevelAddCase,
 };
 
-// The level-add group's revision case, encoded above the level side and count.
-const level_add_revision_case: usize = 1;
+// The level-add group's replace case, encoded above the level side and count.
+const level_add_replace_case: usize = 1;
 
 const level_add_item_counts = blk: {
     var counts: [2 * scale_item_counts.len]usize = undefined;
     @memcpy(counts[0..scale_item_counts.len], &scale_item_counts);
     for (scale_item_counts, scale_item_counts.len..) |scale, index| {
-        counts[index] = level_add_revision_case * case_prefix_encoding + scale;
+        counts[index] = level_add_replace_case * case_prefix_encoding + scale;
     }
     break :blk counts;
 };
+
+// The enclose group's variants above their pocket count, pocket edge, or tunnel length, on one
+// level.
+const enclose_variant_encoding: usize = 10_000_000_000;
+const enclose_pocket_edge: u16 = 4;
+const enclose_tunnel_row: u16 = 8;
+const enclose_item_counts = [_]usize{
+    0 * enclose_variant_encoding + 16 * case_prefix_encoding + 1024 * case_encoding + 1,
+    0 * enclose_variant_encoding + 64 * case_prefix_encoding + 1024 * case_encoding + 1,
+    0 * enclose_variant_encoding + 196 * case_prefix_encoding + 2048 * case_encoding + 1,
+    1 * enclose_variant_encoding + 8 * case_prefix_encoding + 1024 * case_encoding + 1,
+    1 * enclose_variant_encoding + 16 * case_prefix_encoding + 1024 * case_encoding + 1,
+    1 * enclose_variant_encoding + 32 * case_prefix_encoding + 1024 * case_encoding + 1,
+    2 * enclose_variant_encoding + 8 * case_prefix_encoding + 1024 * case_encoding + 1,
+    2 * enclose_variant_encoding + 32 * case_prefix_encoding + 1024 * case_encoding + 1,
+    2 * enclose_variant_encoding + 62 * case_prefix_encoding + 1024 * case_encoding + 1,
+};
+
+fn encloseItemCounts(_: suite.Profile) []const usize {
+    return &enclose_item_counts;
+}
 
 fn levelAddItemCounts(_: suite.Profile) []const usize {
     return &level_add_item_counts;
@@ -334,6 +368,8 @@ fn levelEnterItemCounts(_: suite.Profile) []const usize {
 const Workload = enum { dig, ramp, gpu_sync_dig, gpu_sync_level_enter, gpu_sync_pan };
 
 const BatchWorkload = enum { cave_in, explosion_fill };
+
+const NavBatchWorkload = enum { cave_in, explosion_fill, enclose };
 
 fn runDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCase(allocator, io, options, case, item_count, .dig);
@@ -1035,6 +1071,8 @@ const NavFixture = struct {
     changes: ChangeLog,
     // The case's thread system for the dig and ramp reactions; null runs them serial.
     threads: ?*ThreadSystem = null,
+    // The most recent reaction's stats.
+    last_stats: NavUpdateStats = .{},
 
     fn deinit(self: *NavFixture) void {
         self.changes.deinit();
@@ -1068,6 +1106,7 @@ const NavFixture = struct {
     fn react(self: *NavFixture, thread_system: ?*ThreadSystem) !NavUpdateStats {
         const stats = try self.system.applyBufferedNavUpdates(&self.colliders, &self.base.world, thread_system);
         if (stats.incremental_rebuilds != 1) return error.NavReactionUnchanged;
+        self.last_stats = stats;
         return stats;
     }
 
@@ -1090,6 +1129,7 @@ const NavFixture = struct {
         if (stats.incremental_rebuilds != 1) return error.NavReactionUnchanged;
         if (self.system.hasPendingNavUpdates(&self.base.world)) return error.NavMarksPending;
         if (frame.events.stats.nav_region_invalidated != 1) return error.NavInvalidationMissing;
+        self.last_stats = stats;
         return stats;
     }
 };
@@ -1113,8 +1153,37 @@ fn navSizeConfig(side: u16, levels: usize, participant_count: usize) suite.NavSi
     };
 }
 
+// The connectivity block of one nav reaction's stats, with the flood tuner's policy when the
+// case runs it adaptive.
+fn navConnSummary(stats: NavUpdateStats, system: *const PathfindingSystem, case: suite.BenchmarkCase) suite.NavConnSummary {
+    const tuner = system.nav_conn_flood_tuner.report();
+    return .{
+        .seed = suite.batchSummaryFromBatch(stats.conn_seed_batch),
+        .gather = suite.batchSummaryFromBatch(stats.conn_gather_batch),
+        .flood = suite.batchSummaryFromBatch(stats.conn_flood_batch),
+        .families = stats.conn_families,
+        .rounds = stats.conn_rounds,
+        .round_items_min = stats.conn_round_items_min,
+        .round_items_max = stats.conn_round_items_max,
+        .build_visits = stats.conn_build_visits,
+        .flood_nodes = stats.conn_flood_nodes,
+        .splits = stats.conn_splits,
+        .merges = stats.conn_merges,
+        .flood_off_main_ns = stats.conn_flood_off_main_ns,
+        .flood_tuner_workers = if (case.adaptive and case.usesThreadSystem())
+            (if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0)
+        else
+            null,
+    };
+}
+
 fn buildNavFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !NavFixture {
-    var base = try buildFixture(allocator, io, side, levels);
+    return navFixtureOver(allocator, try buildFixture(allocator, io, side, levels), capacity, thread_system);
+}
+
+// Builds nav over `fixture`'s world, taking ownership of it.
+fn navFixtureOver(allocator: std.mem.Allocator, fixture: Fixture, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !NavFixture {
+    var base = fixture;
     errdefer base.deinit();
     var data = DataSystem.init(allocator);
     defer data.deinit();
@@ -1129,13 +1198,17 @@ fn buildNavFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: 
     return .{ .base = base, .colliders = colliders, .system = system, .changes = .{ .allocator = allocator } };
 }
 
-// Gives the nav reaction's mark, plan, remask, and patch stages this case's tuners and
-// control config; nav stage items are independent, one per range for the fixed controls.
+// Gives the nav reaction's mark, plan, remask, patch, and connectivity stages this case's
+// tuners and control config; nav stage items are independent, one per range for the fixed
+// controls.
 fn setNavStageControls(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
     system.nav_mark_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     system.nav_plan_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     system.nav_remask_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     system.nav_patch_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    system.nav_conn_seed_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    system.nav_conn_gather_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    system.nav_conn_flood_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     system.nav_thread_adaptive = case.adaptive;
     system.nav_thread_items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1;
 }
@@ -1143,7 +1216,9 @@ fn setNavStageControls(system: *PathfindingSystem, case: suite.BenchmarkCase) vo
 // `reaction`: the workload runs the post-commit reaction, so its mark stage dispatches too.
 fn navStageTunersSettled(system: *const PathfindingSystem, reaction: bool) bool {
     return (!reaction or system.nav_mark_tuner.isSettled()) and system.nav_plan_tuner.isSettled() and
-        system.nav_remask_tuner.isSettled() and system.nav_patch_tuner.isSettled();
+        system.nav_remask_tuner.isSettled() and system.nav_patch_tuner.isSettled() and
+        system.nav_conn_seed_tuner.isSettled() and system.nav_conn_gather_tuner.isSettled() and
+        (system.nav_conn_flood_tuner.isSettled() or system.graph.connectivity.last_flood_batch.item_count == 0);
 }
 
 fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
@@ -1211,6 +1286,7 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     var stats = accumulator.finish();
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
+    stats.nav_conn = navConnSummary(nav.last_stats, &nav.system, case);
     stats.batch = suite.batchSummaryFromBatch(nav.system.graph.last_remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(nav.system.graph.last_plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(nav.system.graph.last_patch_batch);
@@ -1269,6 +1345,8 @@ const NavBatchTiming = struct {
     nav_ns: u64 = 0,
     // Nav reaction stage time spent on workers.
     nav_off_main_ns: u64 = 0,
+    // The first (forward) edit's reaction.
+    forward: NavUpdateStats = .{},
 };
 
 fn navTunersSettled(nav: *const NavFixture) bool {
@@ -1291,6 +1369,7 @@ fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *
         const nav_start_ns = suite.nowNs(io);
         const nav_stats = try nav.reactToFrame(frame, thread_system);
         const nav_elapsed_ns = suite.elapsedNs(nav_start_ns, suite.nowNs(io));
+        if (chunks.ptr == edit.forward_chunks.items.ptr) timing.forward = nav_stats;
         timing.nav_ns += nav_elapsed_ns;
         timing.elapsed_ns += nav_elapsed_ns;
         timing.nav_off_main_ns += nav_stats.off_main_stage_ns;
@@ -1298,13 +1377,120 @@ fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *
     return edit.forward.items.len + edit.back.items.len;
 }
 
-fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
+fn runNavEncloseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runNavBatchCase(allocator, io, options, case, item_count, .enclose);
+}
+
+// The enclose group's pockets: variant 0 holds `count` pockets of `enclose_pocket_edge` chunks in a
+// square grid, variant 1 one pocket of edge `count`, variant 2 one tunnel of `count` chunks
+// running east from its mouth chunk (1, `enclose_tunnel_row`).
+const EncloseConfig = struct {
+    variant: u8,
+    count: u16,
+
+    fn decode(item_count: usize) !EncloseConfig {
+        const variant = item_count / enclose_variant_encoding;
+        const count = item_count % enclose_variant_encoding / case_prefix_encoding;
+        if (variant > 2) return error.NavEncloseUnknownVariant;
+        if (count == 0 or count > std.math.maxInt(u16)) return error.NavEncloseBadCount;
+        return .{ .variant = @intCast(variant), .count = @intCast(count) };
+    }
+
+    fn pocketEdge(self: EncloseConfig) u16 {
+        return if (self.variant == 0) enclose_pocket_edge else self.count;
+    }
+
+    fn pockets(self: EncloseConfig) u16 {
+        return if (self.variant == 0) self.count else 1;
+    }
+
+    // Pocket `index`'s wall-ring corner chunk: rings in a square grid, one chunk apart.
+    fn corner(self: EncloseConfig, index: u16) [2]u16 {
+        const grid: u16 = std.math.sqrt(self.pockets());
+        const stride = self.pocketEdge() + 3;
+        return .{ 1 + (index % grid) * stride, 1 + (index / grid) * stride };
+    }
+
+    // Pocket `index`'s doorway chunk, on its ring's east side; the tunnel's mouth.
+    fn doorway(self: EncloseConfig, index: u16) [2]u16 {
+        if (self.variant == 2) return .{ 1, enclose_tunnel_row };
+        const ring = self.corner(index);
+        const edge = self.pocketEdge();
+        return .{ ring[0] + edge + 1, ring[1] + 1 + edge / 2 };
+    }
+};
+
+// A walkable surface with every pocket's one-chunk wall ring written solid but its doorway.
+fn buildEncloseFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, config: EncloseConfig) !Fixture {
+    var fixture = try buildFixture(allocator, io, side, 1);
+    errdefer fixture.deinit();
+    const side_chunks = side / default_chunk_size_tiles;
+    if (config.variant == 2) {
+        // The tunnel: wall rows above and below it from its mouth to one past its far end,
+        // which is capped.
+        const length = config.count;
+        if (length + 2 > side_chunks or enclose_tunnel_row + 2 > side_chunks) return error.NavEncloseTunnelTooLong;
+        for (1..length + 2) |chunk_x| {
+            try fillEncloseChunk(&fixture, @intCast(chunk_x), enclose_tunnel_row - 1);
+            try fillEncloseChunk(&fixture, @intCast(chunk_x), enclose_tunnel_row + 1);
+        }
+        try fillEncloseChunk(&fixture, length + 1, enclose_tunnel_row);
+        return fixture;
+    }
+    // Widened first: `std.math.sqrt` of a `u16` is a `u8`.
+    const root: usize = std.math.sqrt(config.pockets());
+    if (config.pockets() != root * root) return error.NavEnclosePocketsNotSquare;
+    const last = config.corner(config.pockets() - 1);
+    if (last[0] + config.pocketEdge() + 2 > side_chunks or last[1] + config.pocketEdge() + 2 > side_chunks) return error.NavEnclosePocketsTooLarge;
+    const edge = config.pocketEdge();
+    for (0..config.pockets()) |index| {
+        const ring = config.corner(@intCast(index));
+        const door = config.doorway(@intCast(index));
+        for (0..edge + 2) |dy| for (0..edge + 2) |dx| {
+            const chunk_x = ring[0] + @as(u16, @intCast(dx));
+            const chunk_y = ring[1] + @as(u16, @intCast(dy));
+            const on_ring = dx == 0 or dy == 0 or dx == edge + 1 or dy == edge + 1;
+            if (!on_ring or (chunk_x == door[0] and chunk_y == door[1])) continue;
+            try fillEncloseChunk(&fixture, chunk_x, chunk_y);
+        };
+    }
+    return fixture;
+}
+
+// Writes chunk (`chunk_x`, `chunk_y`) of the surface solid.
+fn fillEncloseChunk(fixture: *Fixture, chunk_x: u16, chunk_y: u16) !void {
+    const chunk_edge = default_chunk_size_tiles;
+    for (0..chunk_edge) |cy| for (0..chunk_edge) |cx| {
+        _ = try fixture.world.setDenseTile(fixture.floor(0), chunk_x * chunk_edge + @as(u16, @intCast(cx)), chunk_y * chunk_edge + @as(u16, @intCast(cy)), fixture.dirt);
+    };
+}
+
+// Enclose: every doorway filled solid, then carved back to the surface floor.
+fn buildEncloseEdit(allocator: std.mem.Allocator, fixture: *const Fixture, config: EncloseConfig) !BatchEdit {
+    var edit: BatchEdit = .{};
+    errdefer edit.deinit(allocator);
+    const chunk_edge = default_chunk_size_tiles;
+    const layer = fixture.floor(0);
+    for (0..config.pockets()) |index| {
+        const door = config.doorway(@intCast(index));
+        try edit.beginChunk(allocator, 0, door[0], door[1]);
+        for (0..chunk_edge) |dy| for (0..chunk_edge) |dx| {
+            const x = door[0] * chunk_edge + @as(u16, @intCast(dx));
+            const y = door[1] * chunk_edge + @as(u16, @intCast(dy));
+            try edit.add(allocator, layer, x, y, fixture.dirt, fixture.world.denseTile(layer, x, y));
+        };
+    }
+    try edit.finish(allocator);
+    return edit;
+}
+
+fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: NavBatchWorkload) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const region_chunks = item_count / case_prefix_encoding;
     const scale = item_count % case_prefix_encoding;
     const side: u16 = @intCast(scale / case_encoding);
     const levels: u16 = @intCast(scale % case_encoding);
-    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+    std.debug.assert(side >= 256 and (if (workload == .enclose) levels == 1 else levels >= cave_in_levels + 1));
 
     var threads = try initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
@@ -1314,14 +1500,20 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const group_name = switch (workload) {
         .cave_in => nav_cave_in_group.name,
         .explosion_fill => nav_explosion_fill_group.name,
+        .enclose => nav_enclose_group.name,
     };
     if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
 
-    var nav = try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
+    const enclose: ?EncloseConfig = if (workload == .enclose) try EncloseConfig.decode(item_count) else null;
+    var nav = if (enclose) |config|
+        try navFixtureOver(allocator, try buildEncloseFixture(allocator, io, side, config), navSizeCapacity(size_config), thread_ptr)
+    else
+        try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
     var edit = switch (workload) {
         .cave_in => try buildCaveInEdit(allocator, &nav.base, region_chunks),
         .explosion_fill => try buildExplosionEdit(allocator, &nav.base, region_chunks),
+        .enclose => try buildEncloseEdit(allocator, &nav.base, enclose.?),
     };
     defer edit.deinit(allocator);
     var frame = SimulationFrame.init(allocator);
@@ -1367,9 +1559,14 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var nav_total: u128 = 0;
     var main_total: u128 = 0;
     var cells_changed: usize = 0;
+    var forward: NavUpdateStats = .{};
     for (0..options.iterations) |_| {
         var timing: NavBatchTiming = .{};
         cells_changed = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &timing);
+        forward = timing.forward;
+        if (enclose) |config| {
+            if (forward.conn_splits != config.pockets()) return error.NavEnclosePocketsNotSplit;
+        }
         const elapsed_ns = timing.elapsed_ns;
         accumulator.record(elapsed_ns, system.graph.last_remask_batch);
         plan_total += timing.terrain.plan_ns;
@@ -1382,6 +1579,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // The item count is a case code, so report throughput over the cells written.
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
+    stats.nav_conn = navConnSummary(forward, &nav.system, case);
     stats.batch = suite.batchSummaryFromBatch(system.graph.last_remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(system.last_mark_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(system.graph.last_plan_batch);
@@ -1405,8 +1603,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const case_code = item_count / case_prefix_encoding;
-    std.debug.assert(case_code <= level_add_revision_case);
-    const revision = case_code == level_add_revision_case;
+    std.debug.assert(case_code <= level_add_replace_case);
+    const replace = case_code == level_add_replace_case;
     const scale = item_count % case_prefix_encoding;
     const side: u16 = @intCast(scale / case_encoding);
     const levels: u16 = @intCast(scale % case_encoding);
@@ -1426,13 +1624,14 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     setNavStageControls(&nav.system, case);
     var frame = SimulationFrame.init(allocator);
     defer frame.deinit();
-    for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, &frame, revision);
+    for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, &frame, replace);
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
-        accumulator.record(try levelAddIteration(io, &nav, &frame, revision), nav.system.graph.last_remask_batch);
+        accumulator.record(try levelAddIteration(io, &nav, &frame, replace), nav.system.graph.last_remask_batch);
     }
     var stats = accumulator.finish();
     stats.output_count = nav.base.world.levelCount();
+    stats.nav_conn = navConnSummary(nav.last_stats, &nav.system, case);
     // One level (or band) added per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
     return stats;
@@ -1440,13 +1639,13 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 
 // One level-add iteration; returns its timed span. The main case adds a level with a
 // solid floor band, then runs the nav reaction on a step with no events (it builds the
-// added level). The revision case first adds a level with a walkable floor and reacts
+// added level). The replace case first adds a level with a walkable floor and reacts
 // (untimed), then adds a blocking band to that newest level and reacts (it rebuilds that
 // level), so each level gains at most one band.
-fn levelAddIteration(io: std.Io, nav: *NavFixture, frame: *SimulationFrame, revision: bool) !u64 {
+fn levelAddIteration(io: std.Io, nav: *NavFixture, frame: *SimulationFrame, replace: bool) !u64 {
     const world = &nav.base.world;
     const new_level_z = -@as(i32, @intCast(world.levelCount())) * level_z_step;
-    if (revision) {
+    if (replace) {
         const level = try world.addLevel(new_level_z);
         _ = try world.addDenseLayer(level, 0, .floor, nav.base.tunnel);
         try reactToLevelChange(nav, frame);
@@ -1468,4 +1667,5 @@ fn reactToLevelChange(nav: *NavFixture, frame: *SimulationFrame) !void {
     frame.beginStep();
     const stats = try nav.system.reactToPostCommitNavEvents(frame, &nav.colliders, &nav.base.world, nav.threads);
     if (stats.levels_built != 1) return error.NavLevelNotBuilt;
+    nav.last_stats = stats;
 }

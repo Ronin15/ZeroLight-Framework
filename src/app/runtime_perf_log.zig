@@ -236,6 +236,9 @@ pub const BatchStage = enum {
     collision_response_apply,
     static_collider_splice,
     nav_remask,
+    // The nav reaction's connectivity flood, its rounds summed: the removal-shaped share of a
+    // dig, fill, or dense terrain change.
+    nav_connect,
     nav_evict,
     particles,
     sprite_prep,
