@@ -38,11 +38,15 @@ Every design, and every fix touching storage or per-change work, states:
 
 - Work and memory as growth orders in what changed, what exists, and extent
   (level size, depth, world count) for a local change (one dig, ramp, chunk), a
-  dense one-step change (an explosion region), and creating or destroying a
-  world, level, or dungeon. Concrete sizes only illustrate an order.
-- Pass: local-change cost depends only on what changed; memory follows what
-  exists and is released with it; nothing is sized from demo constants;
-  nothing stops advancing because the observer is far away.
+  dense one-step change (an explosion region), creating or destroying a world,
+  level, or dungeon, and the per-step load of a population (its requests,
+  queries, and updates in every world). Concrete sizes only illustrate an
+  order.
+- Pass: local-change cost depends only on what changed; a population's
+  per-step load costs O(1) per requester plus the distinct work requested
+  (goals, regions, chunks), summed over worlds; memory follows what exists
+  and is released with it; nothing is sized from demo constants; nothing
+  stops advancing because the observer is far away.
 - The serial and threaded paths (`threading.md`).
 - SIMD via `src/core/simd.zig` or scalar with the reason, per hot loop
   (`memory-performance.md` § SIMD), reusing the engine's proven SIMD and
@@ -51,11 +55,11 @@ Every design, and every fix touching storage or per-change work, states:
   never presented as measured. Hot-path orders are measured
   (`tests-benchmarks.md`).
 - Where code already partitions by a unit (chunk, level, world), the first
-  design evaluated has that unit own its storage and work.
+  design evaluated has that unit own its storage and work. A shared arena,
+  global rebuild, or level-wide shift needs a cost model that beats it.
 - A computed result (a proof, region, path, or summary) is stored at the unit
   it covers and shared by every requester it answers, never recomputed per
-  requester; a result keyed finer than what it proves fails the cost model. A shared arena,
-  global rebuild, or level-wide shift needs a cost model that beats it.
+  requester; a result keyed finer than what it proves fails the cost model.
 - If part of the existing structure cannot pass, redesign that part; never
   patch around it. Code, tests, and benches built on a failing part go with
   it and are never references or baselines.
