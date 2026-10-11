@@ -177,16 +177,22 @@ pub const default_tier0_stitched_attempt_cap: usize = default_max_stitched_path_
 // `.missing` (retryable later, NOT a false negative) rather than growing the budget.
 pub const default_tier1_abstract_node_cap: usize = default_max_abstract_nodes * 4;
 pub const default_tier1_stitched_cell_cap: usize = default_max_stitched_path_cells * 4;
-/// Boxes in each of a nav graph's long-link entrance and exit summaries. The abstract heuristic
-/// scans the entrance boxes on a push whose short-link estimate exceeds the long-link floor, so
-/// the scan stays a few vector steps beside the heap sift that push already pays.
-pub const long_link_boxes: usize = 16;
+/// Link pairs (entrance box, exit box, least cost) in a nav graph's long-link summary: a
+/// precision width, never a capacity, since past it pairs merge and no link is dropped. The
+/// abstract heuristic scans the entrance boxes on a push whose short-link estimate exceeds the
+/// pair floor, so the scan stays a few vector steps beside the heap sift that push already
+/// pays, and the pair chain closure stays a fixed cold 16^3.
+pub const long_link_pairs: usize = 16;
 /// Largest per-level crossing rate the heuristic charges: keeps a box term (planar octile below
 /// 2^20 plus a level gap below 2^16 times this rate) inside an i32 lane.
 pub const crossing_rate_cap: u32 = 1 << 14;
+/// Clamp on every long-term lane value (box term, pair cost, chain bound, pair floor), so the
+/// sum of two clamped lanes stays inside an i32. Clamping only lowers a lower bound.
+pub const long_lane_cap: i32 = (1 << 30) - 1;
 
 comptime {
-    std.debug.assert(long_link_boxes % simd.lane_count == 0);
+    std.debug.assert(long_link_pairs % simd.lane_count == 0);
+    std.debug.assert(2 * @as(i64, long_lane_cap) <= std.math.maxInt(i32));
 }
 // FIXED cap on the number of per-segment local A* runs one stitchCorridor call may
 // attempt (solve.zig). max_abstract_nodes only loosely bounds this (a corridor can be

@@ -8,6 +8,7 @@
 //! NavGraph's grids and chunk records; they stay free functions to keep that wiring flat.
 
 const std = @import("std");
+const simd = @import("../../../core/simd.zig");
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
@@ -16,7 +17,7 @@ const allowed_moves = @import("nav_grid.zig").allowed_moves;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavPortal = @import("nav_graph.zig").NavPortal;
 const LinkBounds = @import("nav_graph.zig").LinkBounds;
-const LinkBoxes = @import("nav_graph.zig").LinkBoxes;
+const LinkPairs = @import("nav_graph.zig").LinkPairs;
 const CrossingRates = @import("nav_graph.zig").CrossingRates;
 const max_link_box_coord = @import("nav_graph.zig").max_link_box_coord;
 const AbstractScratch = @import("scratch.zig").AbstractScratch;
@@ -41,6 +42,8 @@ const no_parent = types.no_parent;
 const no_slot = types.no_slot;
 const no_component = types.no_component;
 const unreachable_cost = types.unreachable_cost;
+const long_link_pairs = types.long_link_pairs;
+const long_lane_cap = types.long_lane_cap;
 const diagonal_cost = types.diagonal_cost;
 const cardinal_cost = types.cardinal_cost;
 const packRef = types.packRef;
@@ -614,7 +617,7 @@ fn relaxAbstractNode(
     node: AbstractNode,
     cost: u32,
     via_link: bool,
-    heuristic: *const CrossLevelHeuristic,
+    heuristic: *CrossLevelHeuristic,
     terms: ?CrossLevelHeuristic.LevelTerms,
 ) bool {
     const claim = abstract.slotFor(node.ref) orelse return false;
@@ -638,11 +641,15 @@ fn relaxAbstractNode(
 // from the graph's link bounds: the least of a short and a long term. With D the planar
 // octile to the goal and K the fewest level-crossing short links that close the node's level
 // gap, a path using only short links costs at least D + K * short_excess and K * short_cost.
-// A path using a long link costs at least the short-link bound from the node to the nearest
-// long-link entrance box, plus the cheapest long link, plus the short-link bound from the
-// nearest exit box to the goal (`long_floor`, once per query). Box bounds charge a level gap
-// at per-level crossing rates, so an entrance on a far level cuts nothing nearby. On the goal
-// level with no long link the estimate is octile. Every term is saturating.
+// A path whose first long link lies in pair p costs at least the short-link bound from the
+// node to p's entrance box, plus p's cost, plus p's chain bound: the least, over pairs r its
+// exit box chains to, of the chain cost plus the short-link bound from r's exit box to the
+// goal. Box bounds charge a level gap at per-level crossing rates, so an entrance on a far
+// level cuts nothing nearby. The long term is at least `long_floor` (the cheapest link plus
+// the nearest exit box's bound) and `pair_floor` (the least pair offset), so a push scans
+// entrance boxes only past both; the offsets are built on the first push past `long_floor`.
+// On the goal level with no long link the estimate is octile. Short terms saturate; long
+// lanes clamp at `long_lane_cap`.
 const CrossLevelHeuristic = struct {
     goal_x: u32,
     goal_y: u32,
@@ -651,8 +658,14 @@ const CrossLevelHeuristic = struct {
     short_cost: u32,
     short_excess: u32,
     rates: CrossingRates,
-    entrances: *const LinkBoxes,
+    pairs: *const LinkPairs,
+    // Per pair, the box bound from its exit box to the goal.
+    exit_terms: [long_link_pairs]i32,
     long_floor: u32,
+    // Per pair, its cost plus its chain bound; valid once `pair_ready`.
+    offsets: [long_link_pairs]i32,
+    pair_floor: u32,
+    pair_ready: bool,
 
     // The level-dependent part of the short term, shared by every node on one level.
     const LevelTerms = struct {
@@ -664,7 +677,7 @@ const CrossLevelHeuristic = struct {
     fn init(graph: *const NavGraph, goal_level: u16, goal_x: u32, goal_y: u32) CrossLevelHeuristic {
         const bounds = &graph.link_bounds;
         // Links exist only on world-backed graphs, whose u16 sides keep box lanes in i32.
-        if (bounds.entrances.count != 0) {
+        if (bounds.pairs.count != 0) {
             std.debug.assert(graph.world_backed and graph.width <= max_link_box_coord + 1 and graph.height <= max_link_box_coord + 1);
         }
         return fromBounds(bounds, goal_level, goal_x, goal_y);
@@ -672,7 +685,7 @@ const CrossLevelHeuristic = struct {
 
     fn fromBounds(bounds: *const LinkBounds, goal_level: u16, goal_x: u32, goal_y: u32) CrossLevelHeuristic {
         const rates = bounds.crossingRates();
-        return .{
+        var heuristic = CrossLevelHeuristic{
             .goal_x = goal_x,
             .goal_y = goal_y,
             .goal_level = goal_level,
@@ -680,9 +693,50 @@ const CrossLevelHeuristic = struct {
             .short_cost = bounds.short_cost,
             .short_excess = bounds.short_excess,
             .rates = rates,
-            .entrances = &bounds.entrances,
-            .long_floor = bounds.long_cost +| bounds.exits.lowerBound(goal_x, goal_y, goal_level, rates),
+            .pairs = &bounds.pairs,
+            .exit_terms = @splat(0),
+            .long_floor = unreachable_cost,
+            .offsets = @splat(0),
+            .pair_floor = unreachable_cost,
+            .pair_ready = false,
         };
+        // With no long link every short term passes the unreachable floor.
+        if (bounds.pairs.count == 0) return heuristic;
+        heuristic.exit_terms = bounds.pairs.exits.laneTerms(goal_x, goal_y, goal_level, rates);
+        var nearest = heuristic.exit_terms[0];
+        for (heuristic.exit_terms[1..]) |term| nearest = @min(nearest, term);
+        // At most every pair offset: each pair's cost is at least min(long_cost, cap) and its
+        // chain bound at least the nearest exit term.
+        heuristic.long_floor = @min(bounds.long_cost +| @as(u32, @intCast(nearest)), @as(u32, long_lane_cap));
+        return heuristic;
+    }
+
+    // Per pair offset = min(cost + min(chain bound, cap), cap), the chain bound being the least
+    // over pairs r of chain_to[r] + exit_terms[r]: one `Int4` step per r and lane group.
+    fn preparePairs(self: *CrossLevelHeuristic) void {
+        const pairs = self.pairs;
+        const lane_groups = long_link_pairs / simd.lane_count;
+        var chain_bound: [lane_groups]simd.Int4 = @splat(simd.splatInt4(std.math.maxInt(i32)));
+        for (0..pairs.count) |exit_pair| {
+            const exit_term = simd.splatInt4(self.exit_terms[exit_pair]);
+            for (&chain_bound, 0..) |*bound, group| {
+                // At most 2 * long_lane_cap, inside an i32.
+                bound.* = simd.minInt4(bound.*, simd.addInt4(simd.loadInt4(pairs.chain_to[exit_pair][group * simd.lane_count ..]), exit_term));
+            }
+        }
+        const cap = simd.splatInt4(long_lane_cap);
+        var least = cap;
+        for (chain_bound, 0..) |bound, group| {
+            const lanes = group * simd.lane_count;
+            const offset = simd.minInt4(simd.addInt4(simd.loadInt4(pairs.cost[lanes..]), simd.minInt4(bound, cap)), cap);
+            simd.storeInt4(self.offsets[lanes..][0..simd.lane_count], offset);
+            least = simd.minInt4(least, offset);
+        }
+        var floor = least[0];
+        inline for (1..simd.lane_count) |lane| floor = @min(floor, least[lane]);
+        // A min of offsets in [0, long_lane_cap].
+        self.pair_floor = @intCast(floor);
+        self.pair_ready = true;
     }
 
     fn levelTerms(self: *const CrossLevelHeuristic, level: u16) LevelTerms {
@@ -694,13 +748,15 @@ const CrossLevelHeuristic = struct {
         return .{ .add = crossings *| self.short_excess, .floor = crossings *| self.short_cost };
     }
 
-    // `terms` are `level`'s. The long term is at least `long_floor`, so the entrance scan runs
-    // only for a short term above it.
-    fn estimate(self: *const CrossLevelHeuristic, terms: LevelTerms, level: u16, x: u32, y: u32) u32 {
+    // `terms` are `level`'s. Mutable only to build the pair offsets on first use, a pure
+    // function of the graph and goal.
+    fn estimate(self: *CrossLevelHeuristic, terms: LevelTerms, level: u16, x: u32, y: u32) u32 {
         const planar = octileU32(x, y, self.goal_x, self.goal_y);
         const short = @max(planar +| terms.add, terms.floor);
         if (short <= self.long_floor) return short;
-        return @min(short, self.long_floor +| self.entrances.lowerBound(x, y, level, self.rates));
+        if (!self.pair_ready) self.preparePairs();
+        if (short <= self.pair_floor) return short;
+        return @min(short, self.pairs.entrances.offsetLowerBound(&self.offsets, self.pairs.count, x, y, level, self.rates));
     }
 };
 
@@ -743,7 +799,7 @@ fn abstractCorridor(
     const goal: u32 = @intCast(goal_index);
     const goal_y = goal / width;
     const goal_x = goal - goal_y * width;
-    const heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
+    var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
 
     // Seed the open set with the start chunk's portals sharing the start cell's label,
     // costed by octile distance from the start.
@@ -892,7 +948,7 @@ comptime {
 }
 
 // Relaxes the mirror cell `target` at (mx, my) across a border at one cardinal step.
-fn relaxMirror(abstract: *AbstractScratch, parent_slot: u32, parent_g: u32, level: u16, target: u32, mx: u32, my: u32, heuristic: *const CrossLevelHeuristic, terms: CrossLevelHeuristic.LevelTerms) bool {
+fn relaxMirror(abstract: *AbstractScratch, parent_slot: u32, parent_g: u32, level: u16, target: u32, mx: u32, my: u32, heuristic: *CrossLevelHeuristic, terms: CrossLevelHeuristic.LevelTerms) bool {
     const node = AbstractNode{ .ref = packRef(level, target), .x = mx, .y = my, .portal = null };
     return relaxAbstractNode(abstract, parent_slot, parent_g, node, cardinal_cost, false, heuristic, terms);
 }
@@ -1324,7 +1380,7 @@ test "abstract relax saturates at open_limit regardless of physical capacity" {
     }
     try b.open.ensureTotalCapacity(allocator, 256);
 
-    const no_links = CrossLevelHeuristic.fromBounds(&LinkBounds{}, 0, 0, 0);
+    var no_links = CrossLevelHeuristic.fromBounds(&LinkBounds{}, 0, 0, 0);
     inline for (.{ &a, &b }) |abstract| {
         try std.testing.expect(relaxAbstractNode(abstract, no_slot, 0, testAbstractNode(1), 10, false, &no_links, null));
         try std.testing.expect(relaxAbstractNode(abstract, no_slot, 0, testAbstractNode(2), 10, false, &no_links, null));
@@ -1456,7 +1512,7 @@ const ReferenceAbstract = struct {
         return true;
     }
 
-    fn estimateAt(self: *const ReferenceAbstract, heuristic: *const CrossLevelHeuristic, level: u16, x: u32, y: u32) u32 {
+    fn estimateAt(self: *const ReferenceAbstract, heuristic: *CrossLevelHeuristic, level: u16, x: u32, y: u32) u32 {
         return switch (self.estimate) {
             .cross_level => heuristic.estimate(heuristic.levelTerms(level), level, x, y),
             .goal_level_octile => if (level == heuristic.goal_level) octileU32(x, y, heuristic.goal_x, heuristic.goal_y) else 0,
@@ -1471,7 +1527,7 @@ const ReferenceAbstract = struct {
         const goal: u32 = @intCast(goal_index);
         const goal_x = goal % width;
         const goal_y = goal / width;
-        const heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
+        var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
         const start_label = start_grid.labelAt(start_index);
         if (start_label == 0) return .unseedable;
         const start: u32 = @intCast(start_index);
@@ -1768,8 +1824,30 @@ fn heuristicTestLinks(random: std.Random, levels: u16) [9]LevelLink {
     return links;
 }
 
-fn heuristicAt(heuristic: *const CrossLevelHeuristic, level: u16, x: u32, y: u32) u32 {
+// `heuristicTestLinks`, plus with `merged` 24 random long teleports from the west columns to the
+// east ones, so the long links outnumber the pair summary's width.
+fn heuristicTestLinkSet(random: std.Random, levels: u16, merged: bool, buffer: *[9 + 24]LevelLink) []const LevelLink {
+    buffer[0..9].* = heuristicTestLinks(random, levels);
+    if (!merged) return buffer[0..9];
+    for (buffer[9..]) |*link| {
+        link.* = .{ .kind = .teleport, .level_a = random.uintLessThan(u16, levels), .cell_a = randomCell(random, 0, 4), .level_b = random.uintLessThan(u16, levels), .cell_b = randomCell(random, 12, 16), .traversal_cost = random.uintLessThan(u32, 4), .bidirectional = random.boolean() };
+    }
+    return buffer;
+}
+
+fn heuristicAt(heuristic: *CrossLevelHeuristic, level: u16, x: u32, y: u32) u32 {
     return heuristic.estimate(heuristic.levelTerms(level), level, x, y);
+}
+
+// Whether a pair holds a long link: its source in the entrance box and its target in the exit
+// box (box terms 0), at a cost no more than the link's.
+fn pairHoldsLink(pairs: *const LinkPairs, rates: CrossingRates, from: [3]u32, to: [3]u32, cost: u32) bool {
+    const entrance_terms = pairs.entrances.laneTerms(from[1], from[2], @intCast(from[0]), rates);
+    const exit_terms = pairs.exits.laneTerms(to[1], to[2], @intCast(to[0]), rates);
+    for (0..pairs.count) |pair| {
+        if (entrance_terms[pair] == 0 and exit_terms[pair] == 0 and pairs.cost[pair] <= cost) return true;
+    }
+    return false;
 }
 
 fn pushDistance(allocator: std.mem.Allocator, distances: *std.AutoHashMap(usize, u32), open: *std.ArrayList(OpenNode), ref: usize, candidate: u32) !void {
@@ -1874,7 +1952,8 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
     var goal_portals: usize = 0;
     var long_sources: usize = 0;
     var collinear_goals: usize = 0;
-    for (0..6) |seed| {
+    // Seeds 6 and 7 hold more long links than the pair summary's width.
+    for (0..8) |seed| {
         var prng = std.Random.DefaultPrng.init(0x6e61_0000 + seed);
         const random = prng.random();
         const levels: u16 = 3 + @as(u16, @intCast(seed % 2));
@@ -1882,7 +1961,8 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
         defer data.deinit();
         var world = try heuristicTestWorld(&meta, random, levels);
         defer world.deinit();
-        const links = heuristicTestLinks(random, levels);
+        var link_buffer: [9 + 24]LevelLink = undefined;
+        const links = heuristicTestLinkSet(random, levels, seed >= 6, &link_buffer);
         for (links) |link| try world.addLevelLink(link);
         var system = PathfindingSystem.init(allocator);
         defer system.deinit();
@@ -1895,7 +1975,8 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
         // Every bound is live, the wide short teleport spans every level, and the cheapest
         // short link costs less than that teleport's planar span.
         try std.testing.expectEqual(levels - 1, bounds.short_span);
-        try std.testing.expect(bounds.short_cost < 100 and bounds.long_cost <= 43 and bounds.entrances.count > 0 and bounds.exits.count > 0);
+        try std.testing.expect(bounds.short_cost < 100 and bounds.long_cost <= 43 and bounds.pairs.count > 0);
+        if (seed >= 6) try std.testing.expectEqual(@as(u32, long_link_pairs), bounds.pairs.count);
         const width: u32 = @intCast(graph.width);
         // Random goals, then the first open cell on the wide teleport's exit row beyond its
         // exit: there a path through the teleport saves exactly its planar span.
@@ -1919,7 +2000,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
             const goal_y = goal / width;
             const goal_label = goal_grid.labelAt(goal);
             const goal_chunk = graph.chunkOf(goal);
-            const heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
+            var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
             for (0..levels) |level_index| {
                 const level: u16 = @intCast(level_index);
                 for (0..graph.chunkCount()) |chunk_index| {
@@ -1963,9 +2044,10 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
                                 const to_y = link.to_cell / width;
                                 try std.testing.expect(h <= link.cost +| heuristicAt(&heuristic, link.to_level, to_x, to_y));
                                 edges += 1;
-                                // A long link's source lies inside an entrance box.
+                                // A long link lies in a pair: its source in the entrance box, its
+                                // target in the exit box, at no less than the pair's cost.
                                 if (octileU32(x, y, to_x, to_y) > link.cost) {
-                                    try std.testing.expectEqual(@as(u32, 0), bounds.entrances.lowerBound(x, y, level, bounds.crossingRates()));
+                                    try std.testing.expect(pairHoldsLink(&bounds.pairs, bounds.crossingRates(), .{ level, x, y }, .{ link.to_level, to_x, to_y }, link.cost));
                                     long_sources += 1;
                                 }
                             }
@@ -1990,10 +2072,16 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
     var found_cross_level: usize = 0;
     var found_via_long: usize = 0;
     var none: usize = 0;
-    for (0..8) |seed| {
+    // Seeds 8 and 9 hold more long links than the pair summary's width, authored long links
+    // first, so the second nav apply changes only the crossing rates the pair chains use.
+    for (0..10) |seed| {
         const levels: u16 = 3 + @as(u16, @intCast(seed % 2));
         var link_prng = std.Random.DefaultPrng.init(0x6e62_0000 + seed);
-        const links = heuristicTestLinks(link_prng.random(), levels);
+        var link_buffer: [9 + 24]LevelLink = undefined;
+        const merged = seed >= 8;
+        const links = heuristicTestLinkSet(link_prng.random(), levels, merged, &link_buffer);
+        if (merged) std.mem.rotate(LevelLink, link_buffer[0..links.len], 5);
+        const first_apply = if (merged) links.len - 5 else 4;
         var data = DataSystem.init(allocator);
         defer data.deinit();
         var capacity = test_support.abstractCapacity();
@@ -2017,9 +2105,9 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
         defer marked.deinit();
         try marked.reserve(capacity);
         try marked.rebuildStaticNavGridWithWorld(&data, &marked_world, null);
-        for (links[0..4]) |link| try marked_world.addLevelLink(link);
+        for (links[0..first_apply]) |link| try marked_world.addLevelLink(link);
         _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
-        for (links[4..]) |link| try marked_world.addLevelLink(link);
+        for (links[first_apply..]) |link| try marked_world.addLevelLink(link);
         _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
         try std.testing.expect(std.meta.eql(whole.graph.link_bounds, marked.graph.link_bounds));
 
@@ -2161,7 +2249,7 @@ test "a long teleport far from the goal leaves same-level abstract nodes and cor
         try system.reserve(capacity);
         try system.rebuildStaticNavGridWithWorld(&data, &world, null);
         const graph = &system.graph;
-        try std.testing.expectEqual(@as(u32, @intFromBool(teleport)), graph.link_bounds.exits.count);
+        try std.testing.expectEqual(@as(u32, @intFromBool(teleport)), graph.link_bounds.pairs.count);
         var abstract = AbstractScratch{};
         defer abstract.deinit(allocator);
         try abstract.reserve(allocator, 4096);
@@ -2177,7 +2265,7 @@ test "a long teleport far from the goal leaves same-level abstract nodes and cor
 }
 
 test "with no links the heuristic is octile on the goal level and saturates off it, at any level gap" {
-    const none = CrossLevelHeuristic.fromBounds(&LinkBounds{}, 0, 0, 0);
+    var none = CrossLevelHeuristic.fromBounds(&LinkBounds{}, 0, 0, 0);
     try std.testing.expectEqual(octileU32(7, 3, 0, 0), heuristicAt(&none, 0, 7, 3));
     try std.testing.expectEqual(unreachable_cost, heuristicAt(&none, 1, 7, 3));
     try std.testing.expectEqual(unreachable_cost, heuristicAt(&none, std.math.maxInt(u16), 7, 3));
@@ -2188,17 +2276,17 @@ test "with no links the heuristic is octile on the goal level and saturates off 
 
     // Saturating short and long bounds at the widest gap.
     var widest = LinkBounds{ .short_span = 1, .short_cost = max, .short_excess = max };
-    const far = CrossLevelHeuristic.fromBounds(&widest, std.math.maxInt(u16), 0, 0);
+    var far = CrossLevelHeuristic.fromBounds(&widest, std.math.maxInt(u16), 0, 0);
     try std.testing.expectEqual(unreachable_cost, heuristicAt(&far, 0, max, max));
     widest.short_span = std.math.maxInt(u16);
     widest.short_cost = 7;
     widest.short_excess = 5;
-    const one_crossing = CrossLevelHeuristic.fromBounds(&widest, std.math.maxInt(u16), 0, 0);
+    var one_crossing = CrossLevelHeuristic.fromBounds(&widest, std.math.maxInt(u16), 0, 0);
     try std.testing.expectEqual(@as(u32, 7), heuristicAt(&one_crossing, 0, 0, 0));
     try std.testing.expectEqual(unreachable_cost, heuristicAt(&one_crossing, 0, max, max));
 
     // A gap of 3 over two-level links takes two crossings, rounded up.
-    const rounded = CrossLevelHeuristic.fromBounds(&LinkBounds{ .short_span = 2, .short_cost = 7, .short_excess = 5 }, 3, 0, 0);
+    var rounded = CrossLevelHeuristic.fromBounds(&LinkBounds{ .short_span = 2, .short_cost = 7, .short_excess = 5 }, 3, 0, 0);
     try std.testing.expectEqual(@as(u32, 14), heuristicAt(&rounded, 0, 0, 0));
     try std.testing.expectEqual(@as(u32, 10 + 10), heuristicAt(&rounded, 0, 1, 0));
 
@@ -2208,17 +2296,55 @@ test "with no links the heuristic is octile on the goal level and saturates off 
     try std.testing.expectEqual(CrossingRates{ .excess = 2, .cost = 3 }, (LinkBounds{ .short_span = 2, .short_cost = 7, .short_excess = 5 }).crossingRates());
     try std.testing.expectEqual(CrossingRates{ .excess = types.crossing_rate_cap, .cost = types.crossing_rate_cap }, (LinkBounds{ .short_span = 1, .short_cost = max, .short_excess = max }).crossingRates());
 
-    // The long term applies only above the floor: one entrance box at (100, 0) on level 0
-    // behind a floor of 50.
-    var entrance = LinkBoxes{ .count = 1 };
-    entrance.x0 = @splat(100);
-    entrance.x1 = @splat(100);
-    var gated = CrossLevelHeuristic.fromBounds(&LinkBounds{}, 0, 0, 0);
-    gated.entrances = &entrance;
-    gated.long_floor = 50;
+    // Two level-0 pairs toward a goal at (0, 0): pair 0 the cheapest link (10) from (300, 0)
+    // to a far exit (100, 0), pair 1 a costly one (200) from (500, 0) to the nearest exit
+    // (5, 0). The long floor is 10 + 50; the pair offsets are 10 + 1000 and 200 + 50, since
+    // neither chains below its own exit term (4000 + 200 and 2950 + 10).
+    const entrance_x = [2]i32{ 300, 500 };
+    const exit_x = [2]i32{ 100, 5 };
+    const costs = [2]i32{ 10, 200 };
+    const chain = [2][2]i32{ .{ 0, 4000 + 200 }, .{ 2950 + 10, 0 } };
+    var bounds = LinkBounds{ .long_cost = 10, .pairs = .{ .count = 2 } };
+    for (0..long_link_pairs) |slot| {
+        // Slots past the count copy pair 0.
+        const pair: usize = if (slot == 1) 1 else 0;
+        bounds.pairs.entrances.x0[slot] = entrance_x[pair];
+        bounds.pairs.entrances.x1[slot] = entrance_x[pair];
+        bounds.pairs.exits.x0[slot] = exit_x[pair];
+        bounds.pairs.exits.x1[slot] = exit_x[pair];
+        bounds.pairs.cost[slot] = costs[pair];
+        for (0..long_link_pairs) |to| bounds.pairs.chain_to[to][slot] = chain[pair][if (to == 1) 1 else 0];
+    }
+    var gated = CrossLevelHeuristic.fromBounds(&bounds, 0, 0, 0);
+    try std.testing.expectEqual(@as(u32, 60), gated.long_floor);
+    // Gate 1: a short term at most the long floor; the offsets stay unbuilt.
     try std.testing.expectEqual(@as(u32, 30), heuristicAt(&gated, 0, 3, 0));
-    try std.testing.expectEqual(@as(u32, 50 + 100), heuristicAt(&gated, 0, 90, 0));
-    try std.testing.expectEqual(@as(u32, 50), heuristicAt(&gated, 0, 100, 0));
+    try std.testing.expect(!gated.pair_ready);
+    // Gate 2: past the long floor, at most the pair floor.
+    try std.testing.expectEqual(@as(u32, 200), heuristicAt(&gated, 0, 20, 0));
+    try std.testing.expect(gated.pair_ready);
+    try std.testing.expectEqual(@as(u32, 250), gated.pair_floor);
+    // The scan: each pair's offset plus its entrance term, or the short term when less.
+    try std.testing.expectEqual(@as(u32, 300), heuristicAt(&gated, 0, 30, 0));
+    try std.testing.expectEqual(@as(u32, 1010), heuristicAt(&gated, 0, 300, 0));
+    try std.testing.expectEqual(@as(u32, 250 + 100), heuristicAt(&gated, 0, 490, 0));
+
+    // A cheapest link above the lane cap: its pair's cost and offset clamp to the cap, and so
+    // does the long floor, so a short term between the cap and the unclamped floor still
+    // takes the scan. One pair enters at (300, 0) on level 1 and exits at (5, 0) on level 0;
+    // one level-crossing short link costs the cap + 50, so a level-1 node's short term is
+    // that.
+    var above_cap = LinkBounds{ .short_span = 1, .short_cost = long_lane_cap + 50, .short_excess = 0, .long_cost = long_lane_cap + 100, .pairs = .{ .count = 1 } };
+    above_cap.pairs.entrances.x0 = @splat(300);
+    above_cap.pairs.entrances.x1 = @splat(300);
+    above_cap.pairs.entrances.l0 = @splat(1);
+    above_cap.pairs.entrances.l1 = @splat(1);
+    above_cap.pairs.exits.x0 = @splat(5);
+    above_cap.pairs.exits.x1 = @splat(5);
+    above_cap.pairs.cost = @splat(long_lane_cap);
+    var clamped = CrossLevelHeuristic.fromBounds(&above_cap, 0, 0, 0);
+    try std.testing.expectEqual(@as(u32, long_lane_cap), clamped.long_floor);
+    try std.testing.expectEqual(@as(u32, long_lane_cap), heuristicAt(&clamped, 1, 300, 0));
 }
 
 // 32x32 cells in 16-tile chunks. Walls close the goal chunk (16..31, 16..31) except two west
@@ -2272,7 +2398,7 @@ test "a goal portal whose estimate the long floor cut is re-queued before it end
     const start = grid.indexForCell(pocket_start).?;
     const goal = grid.indexForCell(pocket_goal).?;
     // The far gap's estimate is cut to 40 + 30 below its octile 192.
-    const heuristic = CrossLevelHeuristic.init(graph, 0, @intCast(pocket_goal.x), @intCast(pocket_goal.y));
+    var heuristic = CrossLevelHeuristic.init(graph, 0, @intCast(pocket_goal.x), @intCast(pocket_goal.y));
     try std.testing.expectEqual(@as(u32, 70), heuristicAt(&heuristic, 0, 16, 17));
     try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
     // The near gap: g 84 + octile 140, against g 74 + octile 192 through the far one.
@@ -2335,6 +2461,135 @@ test "a long link landing next to the goal from an unreachable level leaves abst
     try std.testing.expectEqual(nodes[0], nodes[2]);
     try std.testing.expectEqualSlices(usize, corridors[0], corridors[1]);
     try std.testing.expectEqualSlices(usize, corridors[0], corridors[2]);
+}
+
+test "a long link's estimate pairs its entrance with its own exit and chains through another link only at their real distance" {
+    const allocator = std.testing.allocator;
+    const DataSystem = @import("../../data_system.zig").DataSystem;
+    var meta = try test_support.loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    const grass = try test_support.requireTestTile(&meta, "grass");
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    // Open 64x64 levels 0-2 in 4-tile chunks; ramps (cost 41, one level) at (62, 62) set the
+    // crossing rates to 41 per level. One-way teleports of cost 41: A from L0 (2, 32) to
+    // L2 (60, 32), B from L2 (60, 2) to L0 (40, 60); the goal is L0 (40, 62).
+    var world = try test_support.abstractTestWorld(&meta, 2048, 2048);
+    defer world.deinit();
+    for (1..3) |level| {
+        _ = try world.addLevel(-16 * @as(i32, @intCast(level)));
+        _ = try world.addDenseLayer(@intCast(level), 0, .floor, grass);
+        try world.addLevelLink(.{ .kind = .ramp, .level_a = @intCast(level - 1), .cell_a = .{ .x = 62, .y = 62 }, .level_b = @intCast(level), .cell_b = .{ .x = 62, .y = 62 }, .traversal_cost = 1, .bidirectional = true });
+    }
+    try world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 2, .y = 32 }, .level_b = 2, .cell_b = .{ .x = 60, .y = 32 }, .traversal_cost = 1, .bidirectional = false });
+    try world.addLevelLink(.{ .kind = .teleport, .level_a = 2, .cell_a = .{ .x = 60, .y = 2 }, .level_b = 0, .cell_b = .{ .x = 40, .y = 60 }, .traversal_cost = 1, .bidirectional = false });
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    var capacity = test_support.abstractCapacity();
+    capacity.group_field_max_cells = 16;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    const graph = &system.graph;
+    // At A's entrance: A (41), L2 (60, 32) -> (60, 2) (300), B (41), L0 (40, 60) -> goal (20).
+    // Short-only it is octile 500; A then the short climb from L2 is 41 + 380 + 2 * 41 + 41 =
+    // 503 against no chain; independent summaries pair A's entrance with B's exit at 41 + 20.
+    var heuristic = CrossLevelHeuristic.init(graph, 0, 40, 62);
+    try std.testing.expectEqual(@as(u32, 402), heuristicAt(&heuristic, 0, 2, 32));
+    const grid = graph.grid(0).?;
+    const start = grid.indexForCell(.{ .x = 2, .y = 32 }).?;
+    const goal = grid.indexForCell(.{ .x = 40, .y = 62 }).?;
+    var abstract = AbstractScratch{};
+    defer abstract.deinit(allocator);
+    try abstract.reserve(allocator, 4096);
+    try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
+    try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal), foundObjective(&abstract, graph.width, goal));
+    try std.testing.expect(std.mem.indexOfScalar(bool, abstract.corridor_link.items, true) != null);
+}
+
+// Band geometry for the mirrored-teleport test: 64x64 levels, a 4-cell border band.
+const band_side: u16 = 64;
+const band_width: u16 = 4;
+
+fn inBand(x: u32, y: u32) bool {
+    return x < band_width or y < band_width or x >= band_side - band_width or y >= band_side - band_width;
+}
+
+// `count` bidirectional teleports from level-0 band cells, spread evenly in row-major order,
+// each to its point mirror on `deepest`.
+fn addBandTeleports(world: *WorldSystem, deepest: u16, count: usize) !void {
+    const inner = band_side - 2 * band_width;
+    const band_cells = @as(usize, band_side) * band_side - @as(usize, inner) * inner;
+    var band_index: usize = 0;
+    var added: usize = 0;
+    for (0..band_side) |y| {
+        for (0..band_side) |x| {
+            if (!inBand(@intCast(x), @intCast(y))) continue;
+            defer band_index += 1;
+            if (added == count or band_index != added * band_cells / count) continue;
+            try world.addLevelLink(.{
+                .kind = .teleport,
+                .level_a = 0,
+                .cell_a = .{ .x = @intCast(x), .y = @intCast(y) },
+                .level_b = deepest,
+                .cell_b = .{ .x = @intCast(band_side - 1 - x), .y = @intCast(band_side - 1 - y) },
+                .traversal_cost = 1,
+                .bidirectional = true,
+            });
+            added += 1;
+        }
+    }
+    std.debug.assert(added == count);
+}
+
+test "mirrored band teleports leave no level-0 band node closed and the objective exact at 1 and band-fill teleports" {
+    const allocator = std.testing.allocator;
+    const DataSystem = @import("../../data_system.zig").DataSystem;
+    var meta = try test_support.loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    const grass = try test_support.requireTestTile(&meta, "grass");
+    const levels: u16 = 8;
+    const inner = band_side - 2 * band_width;
+    const band_cells = @as(usize, band_side) * band_side - @as(usize, inner) * inner;
+    for ([_]usize{ 1, band_cells }) |teleports| {
+        var data = DataSystem.init(allocator);
+        defer data.deinit();
+        // Open levels in 4-tile chunks; ramps alternate 10 cells east and west of the center,
+        // so a route from level 0 to level 2 zig-zags between the band's level-0 nodes.
+        var world = try test_support.abstractTestWorld(&meta, 2048, 2048);
+        defer world.deinit();
+        const center = band_side / 2;
+        for (1..levels) |level| {
+            const upper: u16 = @intCast(level - 1);
+            _ = try world.addLevel(-16 * @as(i32, @intCast(level)));
+            _ = try world.addDenseLayer(@intCast(level), 0, .floor, grass);
+            const cell = @import("../../world_system.zig").CellCoord{ .x = if (upper % 2 == 0) center + 10 else center - 10, .y = center };
+            try world.addLevelLink(.{ .kind = .ramp, .level_a = upper, .cell_a = cell, .level_b = upper + 1, .cell_b = cell, .traversal_cost = 1, .bidirectional = true });
+        }
+        try addBandTeleports(&world, levels - 1, teleports);
+        var system = PathfindingSystem.init(allocator);
+        defer system.deinit();
+        var capacity = test_support.abstractCapacity();
+        capacity.group_field_max_cells = 16;
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+        const graph = &system.graph;
+        var abstract = AbstractScratch{};
+        defer abstract.deinit(allocator);
+        try abstract.reserve(allocator, 4096);
+        const start_grid = graph.grid(0).?;
+        const goal_grid = graph.grid(2).?;
+        const start = start_grid.indexForCell(.{ .x = center, .y = center - 8 }).?;
+        const goal = goal_grid.indexForCell(.{ .x = center, .y = center + 8 }).?;
+        try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 0, 2, start, goal, 4096) == .found);
+        try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, 0, 2, start, goal), foundObjective(&abstract, graph.width, goal));
+        var band_closed: usize = 0;
+        for (abstract.claimed.items) |slot_index| {
+            const slot = abstract.slots[slot_index];
+            if (slot.stamp & 1 == 0 or refLevel(slot.node) != 0) continue;
+            band_closed += @intFromBool(inBand(slot.x, slot.y));
+        }
+        try std.testing.expectEqual(@as(usize, 0), band_closed);
+    }
 }
 
 test "same-level abstract searches in worlds without long links equal the goal-level octile search" {
