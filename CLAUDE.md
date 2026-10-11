@@ -69,7 +69,10 @@ orchestrates, verifies every agent claim against live code, and reports.
   `zig-specialist`. Code deleted from the branch (for example restored to
   main) takes its fix count with it; the restored code counts from zero.
 - The loop is design → implement → review, each agent in its own role;
-  `zig-debug-specialist` only diagnoses failures.
+  `zig-debug-specialist` only diagnoses failures. A brief asks only for its
+  agent's work on this landing: no probes, assessments, or extra validation
+  steps beyond the rules' cadence, and nothing another agent already
+  measured.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
