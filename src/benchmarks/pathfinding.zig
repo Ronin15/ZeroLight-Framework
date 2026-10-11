@@ -20,7 +20,9 @@ const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
+const PathQueryKey = @import("../game/systems/pathfinding/types.zig").PathQueryKey;
 const cached_results_per_agent = @import("../game/systems/pathfinding/types.zig").cached_results_per_agent;
+const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const intake_range_alignment_items = @import("../game/systems/pathfinding/types.zig").intake_range_alignment_items;
 const AiDir = @import("../game/systems/ai.zig").AiDir;
 const computeRequantizedGoal = @import("../game/systems/ai.zig").computeRequantizedGoal;
@@ -265,6 +267,30 @@ pub const elastic_ramp_group = suite.BenchmarkGroup{
     .name = "pathfinding-elastic-ramp",
     .defaultItemCounts = elasticRampItemCounts,
     .runCase = runElasticRampCase,
+};
+
+// The `pathfinding-elastic-ramp` ramp to 1,000, 4,000, or 16,000 agents (the item count),
+// untimed, then a drop to the last-added eighth, whose results are the youngest and stay
+// cached, held until the shrink window elapses. Times the step whose update shrinks the
+// capacity, result cache included; that step and the hold step before it serve only cache
+// hits. `outputs` is the cached results kept, `candidates` those moved to a lower payload
+// index, `evictions` those evicted. `--details` adds the hold step's time and the
+// difference, the resize, with the cache and agent capacities before and after.
+pub const elastic_shrink_group = suite.BenchmarkGroup{
+    .name = "pathfinding-elastic-shrink",
+    .defaultItemCounts = elasticRampItemCounts,
+    .runCase = runElasticShrinkCase,
+};
+
+// The `pathfinding-cache-unreachable` layout (starts and goals on opposite sides of a wall
+// with no gap), but every timed step requests goals the previous step did not, on result
+// state cleared before it (untimed): nothing is answered from the cache, so the step runs
+// every admitted failing solve and publishes its negative. `outputs` is the negatives
+// published, `deferred` the requests past the per-step solve ceiling.
+pub const cold_unreachable_group = suite.BenchmarkGroup{
+    .name = "pathfinding-cold-unreachable",
+    .defaultItemCounts = coldSolveItemCounts,
+    .runCase = runColdUnreachableCase,
 };
 
 const quick_counts = [_]usize{ 128, 512, 1024 };
@@ -2285,6 +2311,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .participant_count = participant_count,
         .agent_budget = evictAgentBudget(result_count),
         .group_fields = 1,
+        .long_results = 0,
     };
     if (suite.navSizeSkip(evict_group.name, item_count, case, size_config)) |skip| return skip;
 
@@ -2316,6 +2343,8 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
     }
+    // The size config charges no long block.
+    if (fixture.system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
     var stats = accumulator.finish();
     stats.output_count = evicted;
     stats.cache_evictions = evicted;
@@ -2591,6 +2620,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         .participant_count = participant_count,
         .agent_budget = item_count,
         .group_fields = 1,
+        .long_results = 0,
     };
     if (suite.navSizeSkip(elastic_ramp_group.name, item_count, case, size_config)) |skip| return skip;
     const capacity = navSizeCapacity(size_config);
@@ -2616,6 +2646,8 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         last = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
         accumulator.record(last.elapsed_ns, last.busiest_solve_batch);
     }
+    // The size config charges no long block.
+    if (system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
     var stats = accumulator.finish();
     stats.output_count = last.solves;
     // A ramp ends with every agent's result cached once, so every solve past one per
@@ -2646,6 +2678,287 @@ fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSys
         if (live == agent_total and step_stats.cache_hits == agent_total) return ramp;
     }
     return error.ElasticRampStalled;
+}
+
+// The elastic-shrink drop keeps this fraction of the ramped agents.
+const elastic_shrink_divisor: usize = 8;
+
+// A cached result's key and payload index, read before the shrink step to count the
+// results it moved.
+const CachedPayload = struct {
+    key: PathQueryKey,
+    payload_index: u32,
+};
+
+const ElasticShrink = struct {
+    // The shrink step and the hold step before it.
+    step_ns: u64 = 0,
+    hold_ns: u64 = 0,
+    step_stats: PathfindingStats = .{},
+    agent_capacity_before: usize = 0,
+    agent_capacity_after: usize = 0,
+    cache_capacity_before: usize = 0,
+    cache_capacity_after: usize = 0,
+    kept: usize = 0,
+    evicted: usize = 0,
+    moved: usize = 0,
+};
+
+// Sums of the timed shrink steps' figures, printed under --details as means.
+const ShrinkReport = struct {
+    samples: usize = 0,
+    step_ns: u128 = 0,
+    hold_ns: u128 = 0,
+    last: ElasticShrink = .{},
+
+    fn add(self: *ShrinkReport, shrink: ElasticShrink) void {
+        self.samples += 1;
+        self.step_ns += shrink.step_ns;
+        self.hold_ns += shrink.hold_ns;
+        self.last = shrink;
+    }
+
+    fn print(self: ShrinkReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
+        if (!options.details or self.samples == 0 or self.step_ns == 0) return;
+        const resize_ns = self.step_ns -| self.hold_ns;
+        const samples: u128 = self.samples * std.time.ns_per_us;
+        std.debug.print("  {s} {} {s}: agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step)\n", .{
+            group_name,
+            item_count,
+            case.name,
+            self.last.agent_capacity_before,
+            self.last.agent_capacity_after,
+            self.last.cache_capacity_before,
+            self.last.cache_capacity_after,
+            self.last.kept,
+            self.last.evicted,
+            self.last.moved,
+            @as(u64, @intCast(self.step_ns / samples)),
+            @as(u64, @intCast(self.hold_ns / samples)),
+            @as(u64, @intCast(resize_ns / samples)),
+            @as(u64, @intCast(resize_ns * 100 / self.step_ns)),
+        });
+    }
+};
+
+fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    if (item_count / elastic_shrink_divisor < min_capacity_floor) return suite.RunStats.skipped("an eighth of the agents is below the capacity floor; nothing shrinks");
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const size_config = suite.NavSizeConfig{
+        .side = short_route_side,
+        .levels = 1,
+        .participant_count = participant_count,
+        .agent_budget = item_count,
+        .group_fields = 1,
+        .long_results = 0,
+    };
+    if (suite.navSizeSkip(elastic_shrink_group.name, item_count, case, size_config)) |skip| return skip;
+    const capacity = navSizeCapacity(size_config);
+
+    var open = try buildOpenWorld(allocator, io, short_route_side, 1);
+    defer open.world.deinit();
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const requests = try buildShortRouteRequests(allocator, &data, &open, item_count);
+    defer allocator.free(requests);
+    var stream = RangeOutputStream(PathRequest).init(allocator);
+    defer stream.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
+    setPathStageTuners(&system, case);
+    var cached: std.ArrayList(CachedPayload) = .empty;
+    defer cached.deinit(allocator);
+
+    // Each iteration re-runs the whole ramp untimed, so the cold measurement budget applies.
+    for (0..coldWarmup(options)) |_| _ = try runElasticShrink(allocator, io, case, &system, capacity, &stream, requests, &cached, thread_ptr);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
+    var shrink_report = ShrinkReport{};
+    for (0..coldIterations(options)) |_| {
+        const shrink = try runElasticShrink(allocator, io, case, &system, capacity, &stream, requests, &cached, thread_ptr);
+        accumulator.record(shrink.step_ns, shrink.step_stats.intake_batch);
+        stage_report.add(shrink.step_ns, shrink.step_stats);
+        shrink_report.add(shrink);
+    }
+    stage_report.print(options, elastic_shrink_group.name, item_count, case);
+    shrink_report.print(options, elastic_shrink_group.name, item_count, case);
+    // The size config charges no long block.
+    if (system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
+
+    var stats = accumulator.finish();
+    stats.output_count = shrink_report.last.kept;
+    stats.candidate_pairs = shrink_report.last.moved;
+    stats.cache_evictions = shrink_report.last.evicted;
+    return stats;
+}
+
+// One ramp to every agent (untimed), then the drop: hold steps until the shrink window has
+// one step left, the last hold step timed as the control, then the timed shrink step. The
+// held agents' results are cached throughout, so every held step serves hits only.
+fn runElasticShrink(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    case: suite.BenchmarkCase,
+    system: *PathfindingSystem,
+    capacity: PathfindingCapacity,
+    stream: *RangeOutputStream(PathRequest),
+    requests: []const PathRequest,
+    cached: *std.ArrayList(CachedPayload),
+    thread_system: ?*ThreadSystem,
+) !ElasticShrink {
+    _ = try runElasticRamp(io, case, system, capacity, stream, requests, thread_system);
+    if (system.low_load_steps != 0) return error.ElasticShrinkRampLeftLowLoad;
+    const held = requests[requests.len - requests.len / elastic_shrink_divisor ..];
+    try writeRequests(stream, held);
+    const window = system.capacity.capacity_shrink_window;
+    if (window < 2) return error.ElasticShrinkWindowTooShort;
+    for (0..window - 2) |_| _ = try runHeldStep(system, stream, thread_system, case, held.len);
+
+    var shrink = ElasticShrink{
+        .agent_capacity_before = system.effective_agent_capacity,
+        .cache_capacity_before = system.completed.logical_capacity,
+    };
+    const hold_start_ns = suite.nowNs(io);
+    _ = try runHeldStep(system, stream, thread_system, case, held.len);
+    shrink.hold_ns = suite.elapsedNs(hold_start_ns, suite.nowNs(io));
+    if (system.effective_agent_capacity != shrink.agent_capacity_before) return error.ElasticShrinkEarly;
+
+    cached.clearRetainingCapacity();
+    try cached.ensureTotalCapacity(allocator, system.completed.len);
+    for (system.completed.slots.items) |slot| {
+        if (slot.occupied) cached.appendAssumeCapacity(.{ .key = slot.key, .payload_index = slot.payload_index });
+    }
+    const step_start_ns = suite.nowNs(io);
+    shrink.step_stats = try runHeldStep(system, stream, thread_system, case, held.len);
+    shrink.step_ns = suite.elapsedNs(step_start_ns, suite.nowNs(io));
+    shrink.agent_capacity_after = system.effective_agent_capacity;
+    shrink.cache_capacity_after = system.completed.logical_capacity;
+    if (shrink.agent_capacity_after >= shrink.agent_capacity_before) return error.ElasticShrinkDidNotShrink;
+    if (shrink.cache_capacity_after >= shrink.cache_capacity_before) return error.ElasticShrinkCacheDidNotShrink;
+
+    // A shrink keeps an entry's key and moves it only to another payload index.
+    shrink.kept = system.completed.len;
+    // The shrink evicts only what no longer fits.
+    if (shrink.kept != @min(cached.items.len, shrink.cache_capacity_after)) return error.ElasticShrinkEvictedWrongCount;
+    shrink.evicted = cached.items.len - shrink.kept;
+    for (cached.items) |entry| {
+        const slot = system.completed.slotIndex(entry.key) orelse continue;
+        if (system.completed.slots.items[slot].payload_index != entry.payload_index) shrink.moved += 1;
+    }
+    return shrink;
+}
+
+// One step of the held agents, which must be served by cache hits alone.
+fn runHeldStep(system: *PathfindingSystem, stream: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !PathfindingStats {
+    const stats = try runColdOnce(system, stream, thread_system, case, agent_count, agent_count, agent_count);
+    if (stats.cache_hits != agent_count or stats.solved_requests != 0) return error.ElasticShrinkHeldResultLost;
+    return stats;
+}
+
+fn runColdUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try createFixture(allocator, item_count, .blocked_unreachable);
+    defer fixture.deinit();
+    const side = fixtureGridSide(item_count, .blocked_unreachable);
+    // Distinct goal cells right of the wall: one step's requests take distinct keys, and the
+    // rotation moves the next step on to other cells where the wall side has room. The
+    // per-step clear keeps any repeated key uncached.
+    const goal_cells = blockedLaneCount(side) * (side - 2);
+    if (goal_cells < item_count) return error.ColdUnreachableGoalCellsTooFew;
+    const requests = try allocator.dupe(PathRequest, fixture.requests.mergedItems());
+    defer allocator.free(requests);
+    var stream = RangeOutputStream(PathRequest).init(allocator);
+    defer stream.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    setPathStageTuners(&system, case);
+
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    try system.reserve(PathfindingCapacity{
+        .max_group_fields = 8,
+        .worker_participant_count = participant_count,
+        .max_agent_budget = @max(item_count, 1),
+    });
+    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
+    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
+
+    var next_goal: usize = 0;
+    // Untimed priming step: the first step grows the capacity from the reserve floor.
+    _ = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
+    for (0..coldWarmup(options)) |_| {
+        _ = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = coldSettleLimit(options);
+        while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var last_stats = PathfindingStats{};
+    var stage_report = StageReport{};
+    for (0..coldIterations(options)) |_| {
+        const step = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
+        last_stats = step.stats;
+        accumulator.record(step.elapsed_ns, last_stats.solveBatch());
+        stage_report.add(step.elapsed_ns, last_stats);
+    }
+    stage_report.print(options, cold_unreachable_group.name, item_count, case);
+
+    var stats = accumulator.finish();
+    stats.output_count = last_stats.unavailable_results;
+    stats.candidate_pairs = last_stats.solved_requests;
+    stats.deferred_count = last_stats.deferred_requests;
+    stats.cache_evictions = last_stats.cache_evictions;
+    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), settled_before_measurement);
+    return stats;
+}
+
+// Points every request at the next goal cells (untimed), clears the result state, and
+// times one step; every admitted request must fail and publish its negative.
+fn runColdUnreachableStep(
+    io: std.Io,
+    case: suite.BenchmarkCase,
+    system: *PathfindingSystem,
+    stream: *RangeOutputStream(PathRequest),
+    requests: []PathRequest,
+    side: usize,
+    goal_cells: usize,
+    next_goal: *usize,
+    thread_system: ?*ThreadSystem,
+) !struct { elapsed_ns: u64, stats: PathfindingStats } {
+    for (requests, 0..) |*request, index| {
+        const goal = requestGoalCell((next_goal.* + index) % goal_cells, side, .blocked_unreachable);
+        request.goal = .{
+            .x = @as(f32, @floatFromInt(goal.x)) * 32.0 + 8.0,
+            .y = @as(f32, @floatFromInt(goal.y)) * 32.0 + 8.0,
+        };
+    }
+    next_goal.* = (next_goal.* + requests.len) % goal_cells;
+    try writeRequests(stream, requests);
+    // A full negative set drops inserts, so each step starts from an empty one.
+    system.clearRuntimeState();
+    const start_ns = suite.nowNs(io);
+    const stats = try runColdOnce(system, stream, thread_system, case, requests.len, requests.len, requests.len);
+    const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+    const admitted = @min(requests.len, default_max_solves_per_frame);
+    if (stats.cache_hits != 0) return error.ColdUnreachableCacheHit;
+    if (stats.solved_requests != admitted or stats.unavailable_results != admitted) return error.ColdUnreachableSolveNotNegative;
+    if (stats.cache_evictions != 0) return error.ColdUnreachableNegativeDropped;
+    return .{ .elapsed_ns = elapsed_ns, .stats = stats };
 }
 
 fn appendRequest(stream: *RangeOutputStream(PathRequest), request: PathRequest) !void {

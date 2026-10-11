@@ -736,6 +736,8 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) return "uncached unreachable path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) return "agents before the drop";
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (isSteeringAgentGroup(group_name)) return "steering agents";
     if (std.mem.eql(u8, group_name, "steering-static-change")) return "static bodies";
@@ -924,6 +926,16 @@ fn printValidationSummary(
             std.debug.print(
                 "workload field_requests={} results={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) {
+            std.debug.print(
+                "workload negatives={} deferred={}. ",
+                .{ best.stats.output_count, best.stats.deferred_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
+            std.debug.print(
+                "workload evicted={} moved={} kept={}. ",
+                .{ best.stats.cache_evictions, best.stats.candidate_pairs, best.stats.output_count },
             );
         } else if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
             std.debug.print(
@@ -1240,6 +1252,12 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.eql(u8, group_name, "pathfinding")) {
         return std.fmt.bufPrint(buffer, "field_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
     }
+    if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) {
+        return std.fmt.bufPrint(buffer, "negatives={} deferred={}", .{ stats.output_count, stats.deferred_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
+        return std.fmt.bufPrint(buffer, "evicted={} moved={} kept={}", .{ stats.cache_evictions, stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
     if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
         return std.fmt.bufPrint(buffer, "cache_hits={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
     }
@@ -1526,13 +1544,19 @@ pub const NavSizeConfig = struct {
     participant_count: usize,
     agent_budget: usize,
     group_fields: usize,
+    /// Cached results whose path can outgrow the inline stripe. The long-block pool grows
+    /// by doubling, so each is charged two blocks, clamped to one per cached result; the
+    /// default charges every cached result. A fixture whose paths all fit inline passes 0
+    /// and checks that no long block was taken.
+    long_results: usize = std.math.maxInt(usize),
 };
 
 /// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
 /// ceiling: per-level chunk directories, cell blocks, and records (every chunk mixed and
 /// holding portals), link slots, one level's batch window, per-participant search scratch,
-/// the tier-1 corridor pool, group fields, and the result cache. Search scratch and group
-/// fields are sized by their node and cell budgets, never by level cells.
+/// the tier-1 corridor pool, group fields, and the result cache with a long block per
+/// `long_results`. Search scratch and group fields are sized by their node and cell
+/// budgets, never by level cells.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
     // abstract node and stitched cell caps, escalated solves per step, group field cells,
@@ -1547,6 +1571,7 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     const group_field_cells: usize = 131072;
     const agents: usize = @max(8, config.agent_budget);
     const cached_results: usize = agents * 4;
+    const long_blocks: usize = @min(config.long_results *| 2, cached_results);
     const solves_per_step: usize = @min(512, agents);
     const chunk_tiles: usize = 16;
     const participants: usize = @max(1, config.participant_count);
@@ -1579,11 +1604,10 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Result cache, per entry: two 24 B probe slots, a 20 B payload, a 4 B free index, a
     // 16 B eviction-scratch key, and the inline stripe (4 B per stored path cell). A block
     // holds the longest plain (explored nodes, 4 B) or stitched (8 B) path: one worker
-    // stripe per solve slot, and the long pool's worst case of one block (plus a 4 B free
-    // index) per cached result.
+    // stripe per solve slot, and the long-pool blocks with their free indices.
     const result_block_bytes = @max(explored_nodes * @sizeOf(u32), stitched_path_cells * @sizeOf(StitchedCell));
     const results = cached_results * (2 * 24 + 20 + 4 + 16 + stored_path_cells * 4) + solves_per_step * result_block_bytes +
-        cached_results * (result_block_bytes + 4);
+        long_blocks * (result_block_bytes + @sizeOf(u32));
     return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results;
 }
 
@@ -1897,4 +1921,22 @@ test "batch modes align to cache-line item boundaries" {
     const large = default_cases[5].itemsPerRange(16).?;
     try std.testing.expectEqual(@as(usize, 32), small);
     try std.testing.expectEqual(@as(usize, 256), large);
+}
+
+test "nav storage charges two long blocks per long result, at most one per cached result" {
+    const base = NavSizeConfig{ .side = 256, .levels = 1, .participant_count = 1, .agent_budget = 100, .group_fields = 1 };
+    var inline_only = base;
+    inline_only.long_results = 0;
+    var ten_long = base;
+    ten_long.long_results = 10;
+    var past_half = base;
+    past_half.long_results = 300;
+    // A long block holds 4096 words, plus its 4 B free index.
+    const per_block = (navStorageBytes(ten_long) - navStorageBytes(inline_only)) / 20;
+    try std.testing.expectEqual(@as(usize, 4096 * 4 + 4), per_block);
+    try std.testing.expectEqual(@as(usize, 20 * per_block), navStorageBytes(ten_long) - navStorageBytes(inline_only));
+    // 100 agents cache 400 results; the default charges a block for each, and 300 long
+    // results reach that clamp.
+    try std.testing.expectEqual(400 * per_block, navStorageBytes(base) - navStorageBytes(inline_only));
+    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(past_half));
 }

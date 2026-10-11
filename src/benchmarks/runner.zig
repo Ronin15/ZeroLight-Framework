@@ -60,6 +60,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.cross_level_shaft_group,
     pathfinding.evict_group,
     pathfinding.elastic_ramp_group,
+    pathfinding.elastic_shrink_group,
+    pathfinding.cold_unreachable_group,
     nav_update.group,
     nav_update.multichunk_group,
     nav_update.entity_obstacle_group,
