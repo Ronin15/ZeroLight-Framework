@@ -312,6 +312,9 @@ pub const NavUpdateStats = struct {
     // Remask, patch, mark, and eviction dispatch time that ran on workers; inline stages
     // add nothing. Diagnostic only.
     off_main_stage_ns: u64 = 0,
+    // The marks batch's chunk remask; empty when no marks batch changed the graph. Level
+    // builds' remasks are not in it.
+    remask_batch: BatchStats = .{},
     // Path eviction: the pre-commit bound count over the changed keys, the halo walk over
     // their registrations, and the registry flush of the removals.
     evict_count_batch: BatchStats = .{},
@@ -327,11 +330,31 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
         perf.recordMetric(.nav_levels_built, metric(self.levels_built));
         perf.recordMetric(.nav_records_patched, metric(self.records_patched));
+        perf.recordBatch(.nav_remask, self.remask_batch);
+        perf.recordBatch(.nav_evict, self.evict_batch);
     }
 };
 
 fn metric(value: usize) u64 {
     return @intCast(value);
+}
+
+test "nav update stats record the remask and the eviction halo walk under their own perf stages" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+    var perf = runtime_perf_log.RuntimePerfLog.init(0);
+    const stats = NavUpdateStats{
+        .remask_batch = .{ .item_count = 5 },
+        .evict_count_batch = .{ .item_count = 2 },
+        .evict_batch = .{ .item_count = 3 },
+        .evict_flush_batch = .{ .item_count = 4 },
+    };
+    stats.recordTo(runtime_perf_log.Context.bind(&perf));
+    const remask = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_remask)];
+    const evict = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_evict)];
+    try std.testing.expectEqual(@as(u64, 1), remask.calls);
+    try std.testing.expectEqual(@as(u64, 5), remask.items);
+    try std.testing.expectEqual(@as(u64, 1), evict.calls);
+    try std.testing.expectEqual(@as(u64, 3), evict.items);
 }
 
 pub const GridCell = struct {

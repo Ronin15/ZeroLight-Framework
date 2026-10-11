@@ -223,6 +223,9 @@ pub const BatchStage = enum {
     ai_intent,
     steering,
     path_fallback,
+    path_intake,
+    // The pathfinding update's registry flush, shrinks included; not the eviction flush.
+    path_registry_flush,
     apply_intents,
     movement,
     chunk_derive,
@@ -231,6 +234,9 @@ pub const BatchStage = enum {
     collision_narrowphase,
     collision_response_gather,
     collision_response_apply,
+    static_collider_splice,
+    nav_remask,
+    nav_evict,
     particles,
     sprite_prep,
 };

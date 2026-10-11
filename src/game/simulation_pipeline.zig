@@ -590,6 +590,8 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
         perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.max_stitch_segments_observed));
         perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
+        perf.recordBatch(.path_intake, pathfinding_stats.intake_batch);
+        perf.recordBatch(.path_registry_flush, pathfinding_stats.registry_flush_batch);
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
         perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
         perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
@@ -1042,6 +1044,13 @@ pub const SimulationPipeline = struct {
     pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: ?*ThreadSystem) !void {
         try self.static_colliders.sync(data, thread_system);
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
+    }
+
+    /// Records the last collider sync's chunk-list splice batch. Every sync resets it, so
+    /// after the commit seam it is this step's, empty (and not recorded) when no static
+    /// changed.
+    pub fn recordStaticColliderSyncTo(self: *const SimulationPipeline, perf: runtime_perf_log.Context) void {
+        perf.recordBatch(.static_collider_splice, self.static_colliders.last_splice_batch);
     }
 
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
@@ -6968,6 +6977,72 @@ test "a static committed at the seam pushes steering agents on the next step" {
     try pipeline.syncStaticColliders(&data, null);
     pipeline.reactToPostCommitSteeringEvents(&frame);
     try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
+}
+
+test "a static move's collider splice reaches the perf log, and a seam with no static change records none" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const parked = math.Vec2{ .x = 96, .y = 600 };
+    const box = try data.createEntity();
+    try data.setMovementBody(box, .{ .position = parked, .previous_position = parked, .velocity = .{}, .speed = 0 });
+    try data.setCollisionBounds(box, .{ .size = .{ .x = 20, .y = 20 } });
+    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 640, 640, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 16,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 4, 4, 4, 4, 4 + 16);
+    var perf = runtime_perf_log.RuntimePerfLog.init(0);
+    const splice_stage = @backingInt(runtime_perf_log.BatchStage.static_collider_splice);
+
+    // The box moves onto a chunk corner: the sync splices more chunk-list keys than
+    // query-list keys, so the two splice batches differ.
+    frame.beginStep();
+    const moved = math.Vec2{ .x = 500, .y = 500 };
+    try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = moved, .previous_position = moved, .velocity = .{}, .speed = 0 } } }});
+    try pipeline.reserveStaticColliders(&frame, &data);
+    _ = try frame.applyStructuralCommands(&data);
+    pipeline.captureStaticColliderChanges(&frame);
+    try pipeline.syncStaticColliders(&data, null);
+    const splice = pipeline.static_colliders.last_splice_batch;
+    try std.testing.expect(splice.item_count > 0);
+    try std.testing.expect(splice.item_count != pipeline.static_colliders.last_query_splice_batch.item_count);
+    pipeline.recordStaticColliderSyncTo(runtime_perf_log.Context.bind(&perf));
+    try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
+    try std.testing.expectEqual(@as(u64, splice.item_count), perf.batches[splice_stage].items);
+
+    // A seam with no static change resets the batch, so nothing more is recorded.
+    frame.beginStep();
+    try pipeline.reserveStaticColliders(&frame, &data);
+    _ = try frame.applyStructuralCommands(&data);
+    pipeline.captureStaticColliderChanges(&frame);
+    try pipeline.syncStaticColliders(&data, null);
+    pipeline.recordStaticColliderSyncTo(runtime_perf_log.Context.bind(&perf));
+    try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
+}
+
+test "pipeline stats record the path intake and registry flush batches under their own perf stages" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+    var perf = runtime_perf_log.RuntimePerfLog.init(0);
+    const stats = SimulationPipelineStats{ .pathfinding = .{
+        .fallback_batch = .{ .item_count = 3 },
+        .intake_batch = .{ .item_count = 5 },
+        .registry_flush_batch = .{ .item_count = 7 },
+    } };
+    stats.recordTo(runtime_perf_log.Context.bind(&perf));
+    const intake = perf.batches[@backingInt(runtime_perf_log.BatchStage.path_intake)];
+    const flush = perf.batches[@backingInt(runtime_perf_log.BatchStage.path_registry_flush)];
+    try std.testing.expectEqual(@as(u64, 1), intake.calls);
+    try std.testing.expectEqual(@as(u64, 5), intake.items);
+    try std.testing.expectEqual(@as(u64, 1), flush.calls);
+    try std.testing.expectEqual(@as(u64, 7), flush.items);
 }
 
 const StructuralBurstOutcome = struct {

@@ -901,6 +901,7 @@ pub const PathfindingSystem = struct {
             }
             const batch = self.graph.commitMarks(prepared, view, threads, &stats);
             if (batch.changed) {
+                stats.remask_batch = self.graph.last_remask_batch;
                 // Graph node ids never persist, so cached results stay keyed by cells: evict
                 // only those with a cell within one cell of a changed cell.
                 self.evictScoped(batch, thread_system, &stats);
@@ -5293,6 +5294,40 @@ test "nav build fails loudly when its chunk edge or index widths do not fit" {
     try system.reserve(unit_edge);
     try std.testing.expectError(error.ChunkLabelOverflow, system.rebuildStaticNavGrid(&data, 65535, 32769, 1));
     try std.testing.expectError(error.LevelCellIndexOverflow, system.rebuildStaticNavGrid(&data, 1.0e6, 1.0e6, 1));
+}
+
+test "a nav update reports its marks batch's remask, and an update without marks reports none" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const grass = try requireTestTile(&meta, "grass");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 128, 128);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+
+    const changed = (try world.setDenseTile(obstacle, 2, 2, tree)) orelse return error.TestExpectedEqual;
+    const stats = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expect(stats.remask_batch.item_count > 0);
+    try std.testing.expectEqual(stats.dirty_chunks, stats.remask_batch.item_count);
+
+    // The graph keeps its last remask; an update with no batch must not report it again.
+    const idle = try system.applyNavUpdates(no_colliders, &world, &.{});
+    try std.testing.expectEqual(@as(usize, 0), idle.incremental_rebuilds);
+    try std.testing.expectEqual(BatchStats{}, idle.remask_batch);
+
+    // A batch whose only mark misses every built level commits without changing the graph.
+    const unbuilt = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = 99, .x = 2, .y = 2 }});
+    try std.testing.expectEqual(@as(usize, 0), unbuilt.incremental_rebuilds);
+    try std.testing.expectEqual(BatchStats{}, unbuilt.remask_batch);
 }
 
 test "reactToPostCommitNavEvents preserves buffered marks across a failed apply instead of dropping them" {

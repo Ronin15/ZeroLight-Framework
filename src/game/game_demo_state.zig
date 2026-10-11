@@ -538,6 +538,7 @@ pub const GameDemoState = struct {
             structural_stats.recordTo(context.perf);
             self.simulation_frame.events.stats.recordTo(context.perf);
             self.last_nav_update_stats.recordTo(context.perf);
+            self.pipeline.recordStaticColliderSyncTo(context.perf);
             self.last_population_sync.recordTo(context.perf);
         }
     }
