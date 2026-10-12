@@ -108,7 +108,8 @@ rules.
   bench reports the threaded case's main-thread share. Name each change
   path's cost-driver stage, the one that gets a `runtime_perf_log` entry
   (`threading.md`).
-- **Files**: every file the implementation touches; the implementer stops on
+- **Files**: every file the implementation touches, with its estimated lines
+  added and removed (production and tests apart); the implementer stops on
   any other.
 - **Doc notes**: the doc changes the work needs, as notes for the slice's
   docs pass; the landing itself edits no docs.
