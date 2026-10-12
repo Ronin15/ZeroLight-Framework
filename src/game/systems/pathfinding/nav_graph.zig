@@ -195,8 +195,11 @@ pub const NavLevelGraph = struct {
     node_sibling: []u32 = &.{},
     node_queue: []u64 = &.{},
     node_queue_row: []u32 = &.{},
+    // This level's plan merge sets, sized to its chunks when it is built.
+    plan: LevelPlanSets = .{},
 
     pub fn deinit(self: *NavLevelGraph, allocator: std.mem.Allocator) void {
+        self.plan.deinit(allocator);
         for (self.slot_extra) |*extra| extra.deinit(allocator);
         for (self.slot_links) |*links| links.deinit(allocator);
         self.node_free.deinit(allocator);
@@ -337,7 +340,8 @@ pub const NavLevelGraph = struct {
             self.border.capacity * @sizeOf(NavPortal) +
             self.record_free.capacity * @sizeOf(u32) +
             self.link_slots.capacity * @sizeOf(LinkSlotRow) +
-            self.link_free.capacity * @sizeOf(u32);
+            self.link_free.capacity * @sizeOf(u32) +
+            self.plan.residentBytes();
         for (self.slot_extra) |extra| bytes += extra.capacity * @sizeOf(NavPortal);
         for (self.slot_links) |links| bytes += links.capacity * @sizeOf(NavLink);
         return bytes;
@@ -557,12 +561,11 @@ fn sortUnique(keys: []u64) usize {
 const PlanStream = enum { changed, dirty, patch };
 const plan_streams = std.meta.tags(PlanStream).len;
 
-// One plan range's key windows in the staging lists, and its merge cursors.
+// One plan range's key windows in the staging lists.
 const PlanWindow = struct {
     start: [plan_streams]usize,
     // Exclusive: the start plus the range's key bounds.
     end: [plan_streams]usize = @splat(0),
-    next: [plan_streams]usize = @splat(0),
 };
 
 // One plan range's unique key counts, padded to its own cache line.
@@ -573,6 +576,142 @@ const PlanTally = struct {
 comptime {
     std.debug.assert(@sizeOf(PlanTally) % thread_shared_record_alignment == 0);
 }
+
+// A set of indices below its capacity, popped in ascending order: one std bit set per tier,
+// each bit of a tier set exactly when its word in the tier below is nonzero, and a top tier
+// of one word. Insert and `popMin` cost O(tiers); `isEmpty` reads the top word. std's
+// `PriorityQueue` costs O(log n) per key and keeps repeats, and a std bit set's first-set
+// and iterator scan from word 0, so a drain would cost a local change O(capacity / 64).
+const OrderedIndexSet = struct {
+    const Word = std.bit_set.Dynamic.MaskInt;
+    const word_bits = @bitSizeOf(Word);
+    const word_shift = std.math.log2(word_bits);
+    // Each tier divides the index width by `word_bits`, so any usize capacity summarizes to
+    // one word within this many tiers.
+    const max_tiers = (@bitSizeOf(usize) + word_shift - 1) / word_shift;
+
+    tiers: [max_tiers]std.bit_set.Dynamic = @splat(.{}),
+    tier_count: usize = 0,
+
+    // Mask words of a std bit set of `bits` bits.
+    fn maskCount(bits: usize) usize {
+        return (bits + word_bits - 1) / word_bits;
+    }
+
+    fn deinit(self: *OrderedIndexSet, allocator: std.mem.Allocator) void {
+        for (self.tiers[0..self.tier_count]) |*tier| tier.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn capacity(self: *const OrderedIndexSet) usize {
+        return self.tiers[0].capacity();
+    }
+
+    fn isEmpty(self: *const OrderedIndexSet) bool {
+        return self.tier_count == 0 or self.tiers[self.tier_count - 1].masks[0] == 0;
+    }
+
+    // Grows an empty set to hold indices below `needed`, geometrically; true when it grew.
+    // Builds every tier fresh and swaps them in: a tier-by-tier `resize` that failed past
+    // the first tier would leave tiers that no longer summarize each other. An error leaves
+    // the set as it was.
+    fn reserve(self: *OrderedIndexSet, allocator: std.mem.Allocator, needed: usize) !bool {
+        if (needed <= self.capacity()) return false;
+        std.debug.assert(self.isEmpty());
+        var fresh: OrderedIndexSet = .{};
+        errdefer fresh.deinit(allocator);
+        var tier_bits = @max(needed, 2 * self.capacity());
+        while (true) {
+            fresh.tiers[fresh.tier_count] = try .initEmpty(allocator, tier_bits);
+            fresh.tier_count += 1;
+            if (tier_bits <= word_bits) break;
+            tier_bits = maskCount(tier_bits);
+        }
+        self.deinit(allocator);
+        self.* = fresh;
+        return true;
+    }
+
+    fn insert(self: *OrderedIndexSet, index: usize) void {
+        std.debug.assert(index < self.capacity());
+        var position = index;
+        for (self.tiers[0..self.tier_count]) |*tier| {
+            const word_was_empty = tier.masks[position >> word_shift] == 0;
+            tier.set(position);
+            // A nonempty word's summary bit is already set in every tier above.
+            if (!word_was_empty) return;
+            position >>= word_shift;
+        }
+    }
+
+    // Removes and returns the smallest index, or null when empty.
+    fn popMin(self: *OrderedIndexSet) ?usize {
+        if (self.isEmpty()) return null;
+        // Descend from the top word along each tier's lowest set bit.
+        var position: usize = 0;
+        var tier_index = self.tier_count;
+        while (tier_index != 0) {
+            tier_index -= 1;
+            const word = self.tiers[tier_index].masks[position];
+            std.debug.assert(word != 0);
+            position = (position << word_shift) | @ctz(word);
+        }
+        const index = position;
+        for (self.tiers[0..self.tier_count]) |*tier| {
+            tier.unset(position);
+            if (tier.masks[position >> word_shift] != 0) break;
+            position >>= word_shift;
+        }
+        return index;
+    }
+
+    fn residentBytes(self: *const OrderedIndexSet) usize {
+        var bytes: usize = 0;
+        for (self.tiers[0..self.tier_count]) |tier| bytes += bitSetBytes(tier);
+        return bytes;
+    }
+};
+
+// Mask bytes of a std bit set.
+fn bitSetBytes(set: std.bit_set.Dynamic) usize {
+    return OrderedIndexSet.maskCount(set.capacity()) * @sizeOf(OrderedIndexSet.Word);
+}
+
+// One level's share of the threaded plan merge (`NavGraph.mergePlanWindows`): its patch
+// chunks in order and flags for its changed and dirty chunks, sized to the level's chunks at
+// build and empty between batches. The counts tally the flags set in the current merge.
+const LevelPlanSets = struct {
+    order: OrderedIndexSet = .{},
+    changed: std.bit_set.Dynamic = .{},
+    dirty: std.bit_set.Dynamic = .{},
+    changed_count: usize = 0,
+    dirty_count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, chunk_count: usize) !LevelPlanSets {
+        var sets: LevelPlanSets = .{};
+        errdefer sets.deinit(allocator);
+        _ = try sets.order.reserve(allocator, chunk_count);
+        sets.changed = try .initEmpty(allocator, chunk_count);
+        sets.dirty = try .initEmpty(allocator, chunk_count);
+        return sets;
+    }
+
+    fn deinit(self: *LevelPlanSets, allocator: std.mem.Allocator) void {
+        self.dirty.deinit(allocator);
+        self.changed.deinit(allocator);
+        self.order.deinit(allocator);
+        self.* = .{};
+    }
+
+    // Empty: no patch chunk queued and no flag set since the last merge drained.
+    fn isClear(self: *const LevelPlanSets) bool {
+        return self.order.isEmpty() and self.changed_count == 0 and self.dirty_count == 0;
+    }
+
+    fn residentBytes(self: *const LevelPlanSets) usize {
+        return self.order.residentBytes() + bitSetBytes(self.changed) + bitSetBytes(self.dirty);
+    }
+};
 
 // One range of the plan stage over marks then new links: each item writes its keys into the
 // range's window of every stream; the range then sorts and dedupes each window.
@@ -602,16 +741,6 @@ fn planJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     for (0..plan_streams) |stream| tally.counts[stream] = sortUnique(job.staging[stream][window.start[stream]..ends[stream]]);
     job.tallies[range.index] = tally;
 }
-
-// A k-way merge head: the smallest unmerged key of one plan range.
-const MergeHead = struct {
-    key: u64,
-    range: u32,
-
-    fn lessThan(a: MergeHead, b: MergeHead) bool {
-        return a.key < b.key or (a.key == b.key and a.range < b.range);
-    }
-};
 
 /// What a patch key needs from the reserve: its endpoint count on the level and whether it
 /// may hold portals after the batch.
@@ -1356,12 +1485,14 @@ pub const NavGraph = struct {
     patch_keys: KeyList = .empty,
     // The batch result's keys: the changed keys plus both endpoint chunks of each new link.
     dirty_keys: KeyList = .empty,
-    // Plan stage staging (per-range key windows, one list per stream), tallies, and the
-    // merge heap.
+    // Plan stage staging (per-range key windows, one list per stream) and tallies.
     plan_staging: [plan_streams]KeyList = @splat(.empty),
     plan_windows: std.ArrayList(PlanWindow) = .empty,
     plan_tallies: std.ArrayListAligned(PlanTally, .fromByteUnits(thread_shared_record_alignment)) = .empty,
-    merge_heap: std.ArrayList(MergeHead) = .empty,
+    // The threaded plan merge's levels holding keys, in order (each level's chunks are in its
+    // `LevelPlanSets`). Covers every level, grows at level append, and is empty between
+    // batches.
+    plan_levels: OrderedIndexSet = .{},
     patch_info: std.ArrayList(PatchInfo) = .empty,
     // Batch shape of the most recent patch / remask stage, for bench and diagnostic
     // reporting. Not part of the graph contract.
@@ -1376,7 +1507,7 @@ pub const NavGraph = struct {
 
     pub fn deinit(self: *NavGraph) void {
         self.connectivity.deinit(self.allocator);
-        self.merge_heap.deinit(self.allocator);
+        self.plan_levels.deinit(self.allocator);
         self.plan_tallies.deinit(self.allocator);
         self.plan_windows.deinit(self.allocator);
         for (&self.plan_staging) |*staging| staging.deinit(self.allocator);
@@ -1449,7 +1580,7 @@ pub const NavGraph = struct {
             self.changed_masks.capacity * @sizeOf(ChunkBits) +
             self.plan_windows.capacity * @sizeOf(PlanWindow) +
             self.plan_tallies.capacity * @sizeOf(PlanTally) +
-            self.merge_heap.capacity * @sizeOf(MergeHead);
+            self.plan_levels.residentBytes();
         for (self.plan_staging) |staging| bytes += staging.capacity * @sizeOf(u64);
         for (self.levels.items) |*level_grid| bytes += level_grid.residentBytes();
         for (self.level_graphs.items) |*level_graph| bytes += level_graph.residentBytes();
@@ -1540,6 +1671,7 @@ pub const NavGraph = struct {
         const level_count: usize = if (world) |world_system| world_system.levelCount() else 1;
         try fresh.levels.ensureTotalCapacity(self.allocator, level_count);
         try fresh.level_graphs.ensureTotalCapacity(self.allocator, level_count);
+        _ = try fresh.plan_levels.reserve(self.allocator, level_count);
         var stats = NavUpdateStats{};
         for (0..level_count) |level| try fresh.buildLevel(colliders, world, @intCast(level), threads, &stats);
         // The one-way closure over every level at once, after the levels and before the swap.
@@ -1576,6 +1708,7 @@ pub const NavGraph = struct {
         errdefer fresh_graph.deinit(self.allocator);
         try fresh_graph.record_dir.resize(self.allocator, chunk_count);
         @memset(fresh_graph.record_dir.items, no_record);
+        fresh_graph.plan = try .init(self.allocator, chunk_count);
         stats.main.reserve_ns += section.lap();
 
         // Plan: every chunk of the level, in order.
@@ -1597,6 +1730,7 @@ pub const NavGraph = struct {
         if (appending) {
             try self.levels.ensureUnusedCapacity(self.allocator, 1);
             try self.level_graphs.ensureUnusedCapacity(self.allocator, 1);
+            if (try self.plan_levels.reserve(self.allocator, self.levels.items.len + 1)) self.pool_grows += 1;
         }
         const levels = BatchLevels{
             .grids = self.levels.items,
@@ -1639,6 +1773,7 @@ pub const NavGraph = struct {
             self.levels.appendAssumeCapacity(fresh_grid);
             self.level_graphs.appendAssumeCapacity(fresh_graph);
         } else {
+            std.debug.assert(self.level_graphs.items[level_index].plan.isClear());
             self.levels.items[level_index].deinit(self.allocator);
             self.level_graphs.items[level_index].deinit(self.allocator);
             self.levels.items[level_index] = fresh_grid;
@@ -1840,10 +1975,10 @@ pub const NavGraph = struct {
     }
 
     // Plans a marks batch: the changed, dirty, and patch keys (see `PlanStream`), each sorted
-    // and deduped. Threaded over marks and new links: each
-    // range writes, sorts, and dedupes its own key windows; the main thread sizes the windows
-    // (O(1) per item) and merges them in range order, O(keys log ranges). Inline it is one
-    // range: one sort and no merge.
+    // and deduped. Threaded over marks and new links: each range writes, sorts, and dedupes
+    // its own key windows; the main thread sizes the windows (O(1) per item) and merges them
+    // through the plan order set (`mergePlanWindows`). Inline it is one range: one sort and
+    // no merge.
     fn planKeys(self: *NavGraph, world: *const WorldSystem, marks: []const NavMark, new_links: []const LevelLink, threads: ?NavStageThreads, stats: *NavUpdateStats) !void {
         const item_count = marks.len + new_links.len;
         for (std.meta.tags(PlanStream)) |stream| self.keyList(stream).clearRetainingCapacity();
@@ -1863,7 +1998,6 @@ pub const NavGraph = struct {
         // Windows: each range's key bounds, starting on a cache line.
         try self.plan_windows.resize(self.allocator, selection.range_count);
         try self.plan_tallies.resize(self.allocator, selection.range_count);
-        try self.merge_heap.ensureTotalCapacity(self.allocator, selection.range_count);
         var totals: [plan_streams]usize = @splat(0);
         for (self.plan_windows.items, 0..) |*window, range_index| {
             for (&totals) |*total| total.* = std.mem.alignForward(usize, total.*, key_window_alignment);
@@ -1911,15 +2045,12 @@ pub const NavGraph = struct {
 
         section = StageTimer.begin();
         defer stats.main.plan_ns += section.lap();
+        if (selection.range_count > 1) return self.mergePlanWindows();
         for (std.meta.tags(PlanStream)) |stream| {
+            // One range: its windows start at 0 and hold the sorted unique keys.
             const out = self.keyList(stream);
-            if (selection.range_count == 1) {
-                // One range: its windows start at 0 and hold the sorted unique keys.
-                std.mem.swap(KeyList, out, &self.plan_staging[@backingInt(stream)]);
-                out.items.len = self.plan_tallies.items[0].counts[@backingInt(stream)];
-            } else {
-                try self.mergeWindows(stream);
-            }
+            std.mem.swap(KeyList, out, &self.plan_staging[@backingInt(stream)]);
+            out.items.len = self.plan_tallies.items[0].counts[@backingInt(stream)];
         }
     }
 
@@ -1937,38 +2068,80 @@ pub const NavGraph = struct {
         selection: ?BatchSelection,
     };
 
-    // Merges the plan ranges' sorted unique windows into one sorted unique key list, in
-    // range order: a heap of one head per range, O(keys log ranges).
-    fn mergeWindows(self: *NavGraph, stream_tag: PlanStream) !void {
-        const stream = @backingInt(stream_tag);
-        const out = self.keyList(stream_tag);
-        const staging = self.plan_staging[stream].items;
-        var total: usize = 0;
-        for (self.plan_tallies.items) |tally| total += tally.counts[stream];
-        try out.ensureTotalCapacity(self.allocator, total);
-        out.clearRetainingCapacity();
-        const heap = &self.merge_heap;
-        heap.clearRetainingCapacity();
-        for (self.plan_windows.items, self.plan_tallies.items, 0..) |*window, tally, range_index| {
-            window.next[stream] = window.start[stream] + 1;
-            if (tally.counts[stream] == 0) continue;
-            heap.appendAssumeCapacity(.{ .key = staging[window.start[stream]], .range = @intCast(range_index) });
-            siftMergeUp(heap.items, heap.items.len - 1);
+    // Merges the plan ranges' sorted unique windows into each stream's sorted unique key list:
+    // each patch key queues its chunk in its level's ordered set (and the level in
+    // `plan_levels`), each changed and dirty key flags its chunk; then ascending pops, level
+    // by level, emit the patch keys and, by flag, the changed and dirty keys among them
+    // (changed and dirty keys are patch keys of the same range by construction). O(1) per
+    // window key, O(tiers) per unique key and per touched level, for any partition. The
+    // output reserve is the last fallible call, so every set is empty again at return.
+    fn mergePlanWindows(self: *NavGraph) !void {
+        std.debug.assert(self.plan_levels.isEmpty());
+        std.debug.assert(self.level_graphs.items.len <= self.plan_levels.capacity());
+        var totals: [plan_streams]usize = @splat(0);
+        for (self.plan_tallies.items) |tally| {
+            for (&totals, tally.counts) |*total, count| total.* += count;
         }
-        while (heap.items.len != 0) {
-            const head = heap.items[0];
-            if (out.items.len == 0 or out.items[out.items.len - 1] != head.key) out.appendAssumeCapacity(head.key);
-            const window = &self.plan_windows.items[head.range];
-            const end = window.start[stream] + self.plan_tallies.items[head.range].counts[stream];
-            if (window.next[stream] < end) {
-                heap.items[0] = .{ .key = staging[window.next[stream]], .range = head.range };
-                window.next[stream] += 1;
-            } else {
-                heap.items[0] = heap.items[heap.items.len - 1];
-                heap.items.len -= 1;
+        for (std.meta.tags(PlanStream), totals) |stream, total| try self.keyList(stream).ensureTotalCapacity(self.allocator, total);
+
+        const level_graphs = self.level_graphs.items;
+        for (self.plan_windows.items, self.plan_tallies.items) |window, tally| {
+            // Patch keys first, so a level's first key this merge finds it clear.
+            for (self.planWindowKeys(.patch, window, tally)) |key| {
+                const sets = &level_graphs[keyLevel(key)].plan;
+                if (sets.order.isEmpty()) {
+                    std.debug.assert(sets.isClear());
+                    self.plan_levels.insert(keyLevel(key));
+                }
+                sets.order.insert(keyChunk(key));
             }
-            if (heap.items.len != 0) siftMergeDown(heap.items, 0);
+            for (self.planWindowKeys(.dirty, window, tally)) |key| {
+                const sets = &level_graphs[keyLevel(key)].plan;
+                if (sets.dirty.isSet(keyChunk(key))) continue;
+                sets.dirty.set(keyChunk(key));
+                sets.dirty_count += 1;
+            }
+            for (self.planWindowKeys(.changed, window, tally)) |key| {
+                const sets = &level_graphs[keyLevel(key)].plan;
+                if (sets.changed.isSet(keyChunk(key))) continue;
+                sets.changed.set(keyChunk(key));
+                sets.changed_count += 1;
+            }
         }
+        while (self.plan_levels.popMin()) |level_index| {
+            // Levels are below `levels.len`, so below 2^16 (`chunkKey`).
+            const level: u16 = @intCast(level_index);
+            const sets = &level_graphs[level_index].plan;
+            const changed_start = self.changed_keys.items.len;
+            const dirty_start = self.dirty_keys.items.len;
+            while (sets.order.popMin()) |chunk_index| {
+                // Chunks are below the level's chunk count, a u32 (`validateChunkGrid`).
+                const chunk: u32 = @intCast(chunk_index);
+                const key = chunkKey(level, chunk);
+                self.patch_keys.appendAssumeCapacity(key);
+                const changed = sets.changed.isSet(chunk);
+                if (!sets.dirty.isSet(chunk)) {
+                    std.debug.assert(!changed);
+                    continue;
+                }
+                sets.dirty.unset(chunk);
+                self.dirty_keys.appendAssumeCapacity(key);
+                if (!changed) continue;
+                sets.changed.unset(chunk);
+                self.changed_keys.appendAssumeCapacity(key);
+            }
+            // Every flag was popped with its patch chunk, so the level's flag sets are empty.
+            std.debug.assert(self.changed_keys.items.len - changed_start == sets.changed_count);
+            std.debug.assert(self.dirty_keys.items.len - dirty_start == sets.dirty_count);
+            sets.changed_count = 0;
+            sets.dirty_count = 0;
+        }
+    }
+
+    // One plan range's sorted unique keys of `stream`.
+    fn planWindowKeys(self: *const NavGraph, stream: PlanStream, window: PlanWindow, tally: PlanTally) []const u64 {
+        const index = @backingInt(stream);
+        return self.plan_staging[index].items[window.start[index]..][0..tally.counts[index]];
     }
 
     // Per patch key: its link endpoints on the level (an O(1) count) and whether it may hold
@@ -2274,29 +2447,6 @@ pub const NavGraph = struct {
         };
     }
 };
-
-fn siftMergeUp(heap: []MergeHead, start: usize) void {
-    var index = start;
-    while (index != 0) {
-        const parent = (index - 1) / 2;
-        if (!heap[index].lessThan(heap[parent])) break;
-        std.mem.swap(MergeHead, &heap[index], &heap[parent]);
-        index = parent;
-    }
-}
-
-fn siftMergeDown(heap: []MergeHead, start: usize) void {
-    var index = start;
-    while (true) {
-        const left = index * 2 + 1;
-        if (left >= heap.len) break;
-        var best = left;
-        if (left + 1 < heap.len and heap[left + 1].lessThan(heap[left])) best = left + 1;
-        if (!heap[best].lessThan(heap[index])) break;
-        std.mem.swap(MergeHead, &heap[index], &heap[best]);
-        index = best;
-    }
-}
 
 fn findLocalLinear(portals: []const NavPortal, local: u8) ?usize {
     for (portals, 0..) |portal, index| {
@@ -4578,10 +4728,268 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
     }
     for (systems[1..]) |*system| {
         _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+        // Merged from several ranges that ran on workers.
         try std.testing.expect(system.graph.plan_tallies.items.len > 1);
+        try std.testing.expect(!system.graph.last_plan_batch.ran_inline);
+        try std.testing.expect(system.graph.plan_levels.isEmpty());
         try std.testing.expectEqualSlices(u64, systems[0].graph.changed_keys.items, system.graph.changed_keys.items);
         try std.testing.expectEqualSlices(u64, systems[0].graph.patch_keys.items, system.graph.patch_keys.items);
         try std.testing.expectEqualSlices(u64, systems[0].graph.dirty_keys.items, system.graph.dirty_keys.items);
         try expectGraphsEquivalent(&systems[0].graph, &system.graph);
     }
+}
+
+// The tier counts the set reserves at each capacity: one word, past one word, a full and past
+// a full second tier, and four tiers.
+const ordered_set_capacities = [_]struct { bits: usize, tiers: usize }{
+    .{ .bits = 1, .tiers = 1 },
+    .{ .bits = 64, .tiers = 1 },
+    .{ .bits = 65, .tiers = 2 },
+    .{ .bits = 4096, .tiers = 2 },
+    .{ .bits = 4097, .tiers = 3 },
+    .{ .bits = 300_000, .tiers = 4 },
+};
+
+test "the ordered index set pops each inserted index once in ascending order across word and tier boundaries, and is reusable once drained" {
+    const allocator = std.testing.allocator;
+    for (ordered_set_capacities) |shape| {
+        var set: OrderedIndexSet = .{};
+        defer set.deinit(allocator);
+        try std.testing.expect(set.isEmpty());
+        try std.testing.expect(try set.reserve(allocator, shape.bits));
+        try std.testing.expectEqual(shape.tiers, set.tier_count);
+        try std.testing.expect(!try set.reserve(allocator, shape.bits));
+        var reference: std.ArrayList(u64) = .empty;
+        defer reference.deinit(allocator);
+        var prng = std.Random.DefaultPrng.init(shape.bits);
+        const random = prng.random();
+        for (0..2) |_| {
+            try std.testing.expect(set.isEmpty());
+            try std.testing.expectEqual(@as(?usize, null), set.popMin());
+            reference.clearRetainingCapacity();
+            // Indices at each word and tier edge, then random ones with repeats.
+            for ([_]usize{ shape.bits - 1, 0, 63, 64, 4095, 4096, 262_143, 262_144 }) |index| {
+                if (index >= shape.bits) continue;
+                set.insert(index);
+                try reference.append(allocator, index);
+            }
+            for (0..@min(2 * shape.bits, 4000)) |_| {
+                const index = random.uintLessThan(usize, shape.bits);
+                set.insert(index);
+                try reference.append(allocator, index);
+            }
+            reference.items.len = sortUnique(reference.items);
+            for (reference.items) |expected| try std.testing.expectEqual(@as(?usize, @intCast(expected)), set.popMin());
+            try std.testing.expect(set.isEmpty());
+        }
+    }
+}
+
+test "an ordered index set reserve grows geometrically onto valid tiers, and one out of memory leaves the set as it was" {
+    const allocator = std.testing.allocator;
+    var set: OrderedIndexSet = .{};
+    defer set.deinit(allocator);
+    try std.testing.expect(try set.reserve(allocator, 64));
+    set.insert(5);
+    try std.testing.expectEqual(@as(?usize, 5), set.popMin());
+
+    // A tier past the first fails: the earlier tiers free and the set keeps its one word.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, set.reserve(failing.allocator(), 4097));
+    try std.testing.expectEqual(@as(usize, 64), set.capacity());
+    try std.testing.expectEqual(@as(usize, 1), set.tier_count);
+    set.insert(63);
+    try std.testing.expectEqual(@as(?usize, 63), set.popMin());
+
+    // Doubling covers the next 64-bit request with room to spare.
+    try std.testing.expect(try set.reserve(allocator, 65));
+    try std.testing.expectEqual(@as(usize, 128), set.capacity());
+    try std.testing.expect(!try set.reserve(allocator, 128));
+    for ([_]usize{ 127, 0, 64, 63 }) |index| set.insert(index);
+    for ([_]usize{ 0, 63, 64, 127 }) |expected| try std.testing.expectEqual(@as(?usize, expected), set.popMin());
+    try std.testing.expect(set.isEmpty());
+}
+
+test "the threaded plan merge equals the sorted unique keys of every stream for any partition of range windows" {
+    const allocator = std.testing.allocator;
+    // 72x72 chunks per level (three tiers) on 65 levels (two tiers): keys at each chunk word
+    // and tier edge, and on both sides of the level set's first word.
+    var graph = NavGraph{ .allocator = allocator, .width = 288, .height = 288, .chunk_tiles = 4 };
+    defer graph.deinit();
+    const level_count = 65;
+    const chunk_count = graph.chunkCount();
+    try std.testing.expectEqual(@as(usize, 5184), chunk_count);
+    _ = try graph.plan_levels.reserve(allocator, level_count);
+    try graph.level_graphs.ensureTotalCapacity(allocator, level_count);
+    for (0..level_count) |_| {
+        var level_graph = NavLevelGraph{};
+        level_graph.plan = try .init(allocator, chunk_count);
+        graph.level_graphs.appendAssumeCapacity(level_graph);
+    }
+    try std.testing.expectEqual(@as(usize, 3), graph.level_graphs.items[0].plan.order.tier_count);
+    const edge_keys = [_]u64{ chunkKey(64, 5183), chunkKey(0, 63), chunkKey(63, 64), chunkKey(64, 4095), chunkKey(1, 4096), chunkKey(63, 0) };
+
+    var range_keys: [plan_streams]std.ArrayList(u64) = @splat(.empty);
+    defer for (&range_keys) |*list| list.deinit(allocator);
+    var expected: [plan_streams]std.ArrayList(u64) = @splat(.empty);
+    defer for (&expected) |*list| list.deinit(allocator);
+    for ([_]usize{ 2, 3, 7, 16 }) |range_count| {
+        var prng = std.Random.DefaultPrng.init(range_count);
+        const random = prng.random();
+        for (&expected) |*list| list.clearRetainingCapacity();
+        for (&graph.plan_staging) |*list| list.clearRetainingCapacity();
+        try graph.plan_windows.resize(allocator, range_count);
+        try graph.plan_tallies.resize(allocator, range_count);
+        for (graph.plan_windows.items, graph.plan_tallies.items, 0..) |*window, *tally, range_index| {
+            // Changed keys, then dirty and patch supersets, with repeats across ranges; the
+            // last range is empty.
+            for (&range_keys) |*list| list.clearRetainingCapacity();
+            const key_count: usize = if (range_index + 1 == range_count) 0 else random.uintLessThan(usize, 40);
+            for (0..key_count) |key_index| {
+                const key = if (key_index < edge_keys.len and range_index % 2 == 0)
+                    edge_keys[key_index]
+                else
+                    chunkKey(random.uintLessThan(u16, level_count), random.uintLessThan(u32, @intCast(chunk_count)));
+                const depth = random.uintLessThan(usize, plan_streams);
+                for (@backingInt(PlanStream.changed) + depth..plan_streams) |stream| try range_keys[stream].append(allocator, key);
+            }
+            for (&range_keys, &expected) |*list, *all| try all.appendSlice(allocator, list.items);
+            window.* = .{ .start = undefined };
+            for (&graph.plan_staging, &range_keys, &window.start, &window.end, &tally.counts) |*staging, *list, *start, *end, *count| {
+                count.* = sortUnique(list.items);
+                start.* = staging.items.len;
+                try staging.appendSlice(allocator, list.items[0..count.*]);
+                end.* = staging.items.len;
+            }
+        }
+        for (std.meta.tags(PlanStream)) |stream| graph.keyList(stream).clearRetainingCapacity();
+        try graph.mergePlanWindows();
+        try std.testing.expect(graph.plan_levels.isEmpty());
+        for (graph.level_graphs.items) |*level_graph| try std.testing.expect(level_graph.plan.isClear());
+        for (std.meta.tags(PlanStream), &expected) |stream, *all| {
+            all.items.len = sortUnique(all.items);
+            try std.testing.expectEqualSlices(u64, all.items, graph.keyList(stream).items);
+        }
+    }
+}
+
+test "the threaded key plan equals the inline plan on 65 levels across the plan level set's word boundary" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var capacity = abstractCapacity();
+    capacity.worker_participant_count = threads.participantSlotCount();
+    const level_count = 65;
+    const Cell = struct { level: u16, x: u16, y: u16 };
+    // Level 64 lies past the level set's first word; a chunk set holds one chunk, or a full
+    // word of 64 with keys at both ends. Marks go in descending key order, so ranges hold
+    // keys out of range order. A new link adds dirty keys that are not changed keys.
+    const shapes = [_]struct { bounds: f32, chunks: usize, link_levels: [2]u16, cells: []const Cell }{
+        .{ .bounds = 128, .chunks = 1, .link_levels = .{ 2, 3 }, .cells = &.{ .{ .level = 64, .x = 2, .y = 2 }, .{ .level = 63, .x = 1, .y = 1 }, .{ .level = 62, .x = 2, .y = 1 }, .{ .level = 1, .x = 1, .y = 2 }, .{ .level = 0, .x = 1, .y = 1 } } },
+        .{ .bounds = 1024, .chunks = 64, .link_levels = .{ 63, 64 }, .cells = &.{ .{ .level = 64, .x = 13, .y = 6 }, .{ .level = 64, .x = 1, .y = 1 }, .{ .level = 63, .x = 29, .y = 29 }, .{ .level = 1, .x = 29, .y = 1 }, .{ .level = 1, .x = 1, .y = 1 }, .{ .level = 0, .x = 29, .y = 29 } } },
+    };
+    for (shapes) |shape| {
+        var world = try test_support.abstractTestWorld(&meta, shape.bounds, shape.bounds);
+        defer world.deinit();
+        var obstacles: [level_count]usize = undefined;
+        obstacles[0] = try world.addDenseLayer(0, 0, .obstacle, grass);
+        for (1..level_count) |level_index| {
+            const level = try world.addLevel(-16 * @as(i32, @intCast(level_index)));
+            _ = try world.addDenseLayer(level, 0, .floor, grass);
+            obstacles[level_index] = try world.addDenseLayer(level, 0, .obstacle, grass);
+        }
+        // The inline plan, then fixed partitions; all built before the edits.
+        const partitions = [_]?usize{ null, 1, 2 };
+        var systems: [partitions.len]PathfindingSystem = undefined;
+        var built: usize = 0;
+        defer for (systems[0..built]) |*system| system.deinit();
+        for (partitions) |items_per_range| {
+            systems[built] = try fullRebuild(&data, &world, capacity);
+            systems[built].nav_thread_adaptive = false;
+            systems[built].nav_thread_items_per_range = items_per_range;
+            built += 1;
+        }
+        try world.addLevelLink(.{ .kind = .ramp, .level_a = shape.link_levels[0], .cell_a = .{ .x = 3, .y = 3 }, .level_b = shape.link_levels[1], .cell_b = .{ .x = 3, .y = 3 }, .traversal_cost = 1, .bidirectional = true });
+        for (shape.cells) |cell| {
+            const changed = (try world.setDenseTile(obstacles[cell.level], cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+            for (&systems) |*system| try system.markNavDirty(changed.level, changed.x, changed.y);
+        }
+        _ = try systems[0].applyBufferedNavUpdates(no_colliders, &world, null);
+        const inline_graph = &systems[0].graph;
+        try std.testing.expectEqual(shape.chunks, inline_graph.chunkCount());
+        try std.testing.expectEqual(@as(usize, level_count), inline_graph.levelCount());
+        try std.testing.expectEqual(@as(usize, 1), inline_graph.plan_tallies.items.len);
+        try std.testing.expect(inline_graph.dirty_keys.items.len > inline_graph.changed_keys.items.len);
+        for (systems[1..]) |*system| {
+            _ = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
+            try std.testing.expect(system.graph.plan_tallies.items.len > 1);
+            try std.testing.expect(!system.graph.last_plan_batch.ran_inline);
+            try std.testing.expect(system.graph.plan_levels.isEmpty());
+            try std.testing.expectEqualSlices(u64, inline_graph.changed_keys.items, system.graph.changed_keys.items);
+            try std.testing.expectEqualSlices(u64, inline_graph.dirty_keys.items, system.graph.dirty_keys.items);
+            try std.testing.expectEqualSlices(u64, inline_graph.patch_keys.items, system.graph.patch_keys.items);
+            try expectGraphsEquivalent(inline_graph, &system.graph);
+        }
+    }
+}
+
+// Every level's plan sets are clear and sized to its chunks, and the level set covers every
+// level and is empty.
+fn expectPlanSetsClear(graph: *const NavGraph) !void {
+    try std.testing.expect(graph.plan_levels.isEmpty());
+    try std.testing.expect(graph.plan_levels.capacity() >= graph.levelCount());
+    for (graph.level_graphs.items) |*level_graph| {
+        try std.testing.expect(level_graph.plan.isClear());
+        try std.testing.expectEqual(graph.chunkCount(), level_graph.plan.order.capacity());
+        try std.testing.expectEqual(graph.chunkCount(), level_graph.plan.changed.capacity());
+        try std.testing.expectEqual(graph.chunkCount(), level_graph.plan.dirty.capacity());
+    }
+}
+
+test "a threaded plan, a level replace, a level append, and a world rebuild each leave every level's plan sets clear and sized to its chunks" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try twoLevelWorld(&meta);
+    defer fixture.world.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var capacity = abstractCapacity();
+    capacity.worker_participant_count = threads.participantSlotCount();
+    var system = try fullRebuild(&data, &fixture.world, capacity);
+    defer system.deinit();
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+    try expectPlanSetsClear(&system.graph);
+
+    // A multi-range plan over both levels.
+    for ([_][3]u16{ .{ 0, 1, 1 }, .{ 1, 10, 10 }, .{ 0, 5, 9 } }) |cell| {
+        const changed = (try fixture.world.setDenseTile(fixture.obstacle[cell[0]], cell[1], cell[2], fixture.tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(changed.level, changed.x, changed.y);
+    }
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expect(system.graph.plan_tallies.items.len > 1);
+    try expectPlanSetsClear(&system.graph);
+
+    // Replace level 1 in place, then append a level through the apply.
+    var stats = NavUpdateStats{};
+    try system.graph.buildLevel(no_colliders.view(), &fixture.world, 1, null, &stats);
+    try expectPlanSetsClear(&system.graph);
+    _ = try fixture.world.addLevel(-32);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(@as(usize, 3), system.graph.levelCount());
+    try expectPlanSetsClear(&system.graph);
+
+    // A world rebuild sizes the level set to the world's levels up front.
+    try system.rebuildStaticNavGridWithWorld(&data, &fixture.world, null);
+    try std.testing.expectEqual(@as(usize, 3), system.graph.plan_levels.capacity());
+    try expectPlanSetsClear(&system.graph);
 }

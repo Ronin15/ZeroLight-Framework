@@ -871,13 +871,6 @@ pub const PathfindingSystem = struct {
     /// main work is O(1) per mark.
     pub fn recordTerrainNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) void {
         if (events.len == 0) return;
-        if (std.debug.runtime_safety) {
-            const check_timer = StageTimer.begin();
-            for (events) |event| {
-                std.debug.assert(event.payload == .world_tile_changed or event.payload == .world_obstacle_changed);
-            }
-            self.pending_mark_main_ns += check_timer.lap();
-        }
         self.pending_mark_off_main_ns += self.markNavEvents(events, world, thread_system);
     }
 
@@ -1217,6 +1210,7 @@ pub const PathfindingSystem = struct {
     // The inline `nav_mark` pass: appends the events' marks in event order.
     fn appendEventMarks(self: *PathfindingSystem, world: *const WorldSystem, events: []const SimulationEvent) void {
         for (events) |event| {
+            assertTerrainNavEvent(event);
             if (interpretNavEvent(world, event)) |mark| self.appendEventMark(mark);
         }
     }
@@ -2771,6 +2765,11 @@ fn interpretNavEvent(world: *const WorldSystem, event: SimulationEvent) ?NavMark
     };
 }
 
+// `nav_mark` takes only what a terrain writer appends.
+fn assertTerrainNavEvent(event: SimulationEvent) void {
+    std.debug.assert(event.payload == .world_tile_changed or event.payload == .world_obstacle_changed);
+}
+
 // One range of the `nav_mark` stage: its events' marks, folded, in its staging window.
 const NavMarkJob = struct {
     chunk_tiles: u16,
@@ -2793,6 +2792,7 @@ fn navMarkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const window = job.staging[range.start..range.end];
     var count: usize = 0;
     for (job.events[range.start..range.end]) |event| {
+        assertTerrainNavEvent(event);
         if (interpretNavEvent(job.world, event)) |mark| count = foldMark(window, count, mark, job.chunk_tiles);
     }
     job.tallies[range.index] = .{ .count = count };
@@ -6051,10 +6051,13 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 
-    // Both stages must have actually threaded, not fallen back to the inline slot-0 path —
-    // otherwise this would silently retest the already-covered serial path.
+    // Every stage must have actually threaded, not fallen back to the inline slot-0 path —
+    // otherwise this would silently retest the already-covered serial path. A plan over
+    // several ranges merges through the plan order set into its reserved key lists.
     try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
     try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+    try std.testing.expect(!system.graph.last_plan_batch.ran_inline);
+    try std.testing.expect(system.graph.plan_tallies.items.len > 1);
 
     for (cells) |cell| {
         try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = cell.x, .y = cell.y }));
@@ -7978,16 +7981,15 @@ test "a terrain nav record reserve counts each growth of the marks, staging, or 
     try std.testing.expect(system.nav_mark_tallies.capacity >= maxRangeCount(all_bound, nav_mark_range_alignment_items));
 }
 
-// The terrain record's reserve, then `nav_mark` over `events`, which may hold events nav
-// ignores (so it bypasses `recordTerrainNavEvents`'s terrain-only check).
+// The terrain record's reserve, then `nav_mark` over `events`, returning its off-main time.
 fn markEventsForTest(system: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) !u64 {
     try system.reserveTerrainNavRecord(events.len);
     return system.markNavEvents(events, world, thread_system);
 }
 
-// A dense multi-chunk edit's committed events: runs of tile flips that straddle range
-// boundaries, obstacle rects, and events nav ignores (entity changes, which reach nav
-// through the collider sync, and a non-commit-stage rect).
+// A dense multi-chunk edit's terrain events: runs of tile flips that straddle range
+// boundaries, obstacle rects, and terrain events nav ignores (tile changes that keep their
+// blocking, and a non-commit-stage rect).
 fn navMarkTestEvents(allocator: std.mem.Allocator, world: *const WorldSystem) !std.ArrayList(SimulationEvent) {
     var events: std.ArrayList(SimulationEvent) = .empty;
     errdefer events.deinit(allocator);
@@ -8004,22 +8006,9 @@ fn navMarkTestEvents(allocator: std.mem.Allocator, world: *const WorldSystem) !s
         } } });
         if (x == 5 and y % 4 == 0) {
             try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{ .level = 0, .min_x = 1, .min_y = @intCast(y), .max_x_exclusive = 9, .max_y_exclusive = @intCast(y + 2) } } });
-            try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .component_changed = .{
-                .entity = try EntityId.init(@intCast(y), 1),
-                .component = .movement_body,
-                .was_static_navigation_obstacle = true,
-                .is_static_navigation_obstacle = true,
-            } } });
             try events.append(allocator, .{ .stage = .domain_reaction, .payload = .{ .world_obstacle_changed = .{ .level = 1, .min_x = 0, .min_y = 0, .max_x_exclusive = 12, .max_y_exclusive = 12 } } });
         }
     };
-    try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .component_changed = .{
-        .entity = try EntityId.init(99, 1),
-        .component = .collision_response,
-        .was_static_navigation_obstacle = true,
-        .is_static_navigation_obstacle = false,
-        .level = 1,
-    } } });
     return events;
 }
 
@@ -8069,15 +8058,8 @@ test "a terrain nav record after its reserve allocates nothing on a multi-worker
     var world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer world.deinit();
     _ = try world.addLevel(-16);
-    var mixed = try navMarkTestEvents(std.testing.allocator, &world);
-    defer mixed.deinit(std.testing.allocator);
-    // A terrain writer appends only tile and obstacle events.
-    var events: std.ArrayList(SimulationEvent) = .empty;
+    var events = try navMarkTestEvents(std.testing.allocator, &world);
     defer events.deinit(std.testing.allocator);
-    for (mixed.items) |event| switch (event.payload) {
-        .world_tile_changed, .world_obstacle_changed => try events.append(std.testing.allocator, event),
-        else => {},
-    };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
 
