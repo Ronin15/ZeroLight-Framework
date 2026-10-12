@@ -310,7 +310,10 @@ const Proposal = struct {
 };
 
 // One participant's search table: the node keys its current item proposed, open-addressed and
-// cleared by a generation bump. Only its own participant writes it.
+// cleared by a generation bump. Only its own participant writes it. Not a std set: it clears
+// once per flood item, where std's clear costs the table's capacity. Not an `ElementMap`: a
+// key set probed through slices by the worker's visitor, with no values or logical limit, on
+// its own cache line.
 const FloodScratch = struct {
     generation: u32 align(thread_shared_record_alignment) = 0,
     keys: []u64 = &.{},
@@ -326,8 +329,8 @@ const FloodScratch = struct {
         self.* = .{};
     }
 
-    // Grows the table to `slots` (a power of two). Never shrinks.
-    fn reserve(self: *FloodScratch, allocator: std.mem.Allocator, slots: usize) !void {
+    // Grows the table to `slots` (a power of two), counting one in `grows`. Never shrinks.
+    fn reserve(self: *FloodScratch, allocator: std.mem.Allocator, slots: usize, grows: *u64) !void {
         if (self.keys.len >= slots) return;
         const keys = try allocator.alloc(u64, slots);
         errdefer allocator.free(keys);
@@ -335,6 +338,7 @@ const FloodScratch = struct {
         @memset(stamps, 0);
         self.deinit(allocator);
         self.* = .{ .keys = keys, .stamps = stamps };
+        grows.* += 1;
     }
 };
 
@@ -349,107 +353,146 @@ pub const default_flood_window: usize = 16384;
 /// participant's search table.
 pub const default_flood_budget_cap: u32 = 512;
 
+/// The most keys per slot an `ElementMapAt` table holds.
+const SlotLoad = enum { half, three_quarters };
+
 // Not std.HashMapUnmanaged: its clear costs the high-water capacity per batch, where the
 // generation bump costs nothing.
 /// Open-addressed u64 -> u32 map, cleared by a generation bump. Its slot count is a power of
-/// two at least twice its logical limit, so probes stay short and an insert always finds
-/// room. Const lookups are safe on workers while nothing writes.
-pub const ElementMap = struct {
-    keys: std.ArrayList(u64) = .empty,
-    values: std.ArrayList(u32) = .empty,
-    stamps: std.ArrayList(u32) = .empty,
-    generation: u32 = 1,
-    limit: usize = 0,
-    used: usize = 0,
+/// two holding its logical limit at a load of at most `load` (`slotCount`), so linear probes
+/// stay short and an insert always finds room. Const lookups are safe on workers while
+/// nothing writes. Expected linear probes at full load: 1.5 per hit and 2.5 per miss at
+/// `.half`, 2.5 and 8.5 at `.three_quarters`, which holds a third fewer slots on average.
+fn ElementMapAt(comptime load: SlotLoad) type {
+    return struct {
+        keys: std.ArrayList(u64) = .empty,
+        values: std.ArrayList(u32) = .empty,
+        stamps: std.ArrayList(u32) = .empty,
+        generation: u32 = 1,
+        limit: usize = 0,
+        used: usize = 0,
 
-    pub fn deinit(self: *ElementMap, allocator: std.mem.Allocator) void {
-        self.stamps.deinit(allocator);
-        self.values.deinit(allocator);
-        self.keys.deinit(allocator);
-        self.* = .{};
-    }
+        const Self = @This();
 
-    pub fn reserve(self: *ElementMap, allocator: std.mem.Allocator, limit: usize) !void {
-        const slots = try std.math.ceilPowerOfTwo(usize, @max(2 * limit, 16));
-        if (slots > self.keys.items.len) {
-            try self.keys.ensureTotalCapacityPrecise(allocator, slots);
-            try self.values.ensureTotalCapacityPrecise(allocator, slots);
-            try self.stamps.ensureTotalCapacityPrecise(allocator, slots);
-            self.keys.items.len = slots;
-            self.values.items.len = slots;
-            self.stamps.items.len = slots;
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.stamps.deinit(allocator);
+            self.values.deinit(allocator);
+            self.keys.deinit(allocator);
+            self.* = .{};
+        }
+
+        // The slots for `limit` keys: a power of two holding them at `load` or less. Lookups are
+        // exact and nothing iterates the slots, so the count never changes a result.
+        fn slotCount(limit: usize) error{NavConnectivityOverflow}!usize {
+            const least = switch (load) {
+                .half => 2 *| limit,
+                .three_quarters => limit +| limit / 3 +| 1,
+            };
+            return std.math.ceilPowerOfTwo(usize, @max(least, 16)) catch error.NavConnectivityOverflow;
+        }
+
+        /// Grows the slots to hold `limit` keys, emptying the map when they grow; never shrinks.
+        pub fn reserve(self: *Self, allocator: std.mem.Allocator, limit: usize) !void {
+            var grows: u64 = 0;
+            try self.reserveSlots(allocator, limit, &grows);
+        }
+
+        // Grows the slots to hold `limit` keys as batch staging at a main-thread prepare seam,
+        // emptying the map when they grow and counting one in `grows`. A release
+        // (`release`) frees them between batches.
+        fn reserveStaging(self: *Self, allocator: std.mem.Allocator, limit: usize, grows: *u64) !void {
+            try self.reserveSlots(allocator, limit, grows);
+        }
+
+        fn reserveSlots(self: *Self, allocator: std.mem.Allocator, limit: usize, grows: *u64) !void {
+            const slots = try slotCount(limit);
+            if (slots > self.keys.items.len) {
+                try self.keys.ensureTotalCapacityPrecise(allocator, slots);
+                try self.values.ensureTotalCapacityPrecise(allocator, slots);
+                try self.stamps.ensureTotalCapacityPrecise(allocator, slots);
+                self.keys.items.len = slots;
+                self.values.items.len = slots;
+                self.stamps.items.len = slots;
+                @memset(self.stamps.items, 0);
+                self.generation = 1;
+                grows.* += 1;
+            }
+            // Assigned only after every reserve succeeded.
+            self.limit = limit;
+            std.debug.assert(self.stamps.items.len >= slots);
+        }
+
+        // Frees the slots down to what `keep` keys need when they hold more than twice that,
+        // emptying the map. Never fails: a failed shrink keeps the larger buffers.
+        fn release(self: *Self, allocator: std.mem.Allocator, keep: usize) void {
+            const slots = slotCount(keep) catch return;
+            if (!types.shouldShrinkCapacity(self.keys.items.len, slots)) return;
+            self.keys.shrinkAndFree(allocator, slots);
+            self.values.shrinkAndFree(allocator, slots);
+            self.stamps.shrinkAndFree(allocator, slots);
             @memset(self.stamps.items, 0);
             self.generation = 1;
+            self.limit = 0;
+            self.used = 0;
         }
-        // Assigned only after every reserve succeeded.
-        self.limit = limit;
-        std.debug.assert(self.stamps.items.len >= 2 * limit);
-    }
 
-    // Shrinks the slots to what `limit` needs when it holds more, emptying the map. Never
-    // fails: a failed shrink keeps the larger buffers.
-    pub fn shrink(self: *ElementMap, allocator: std.mem.Allocator, limit: usize) void {
-        const slots = std.math.ceilPowerOfTwo(usize, @max(2 * limit, 16)) catch return;
-        if (self.keys.items.len <= slots) return;
-        self.keys.shrinkAndFree(allocator, slots);
-        self.values.shrinkAndFree(allocator, slots);
-        self.stamps.shrinkAndFree(allocator, slots);
-        @memset(self.stamps.items, 0);
-        self.generation = 1;
-        self.limit = 0;
-        self.used = 0;
-    }
-
-    pub fn clear(self: *ElementMap) void {
-        self.used = 0;
-        self.generation +%= 1;
-        if (self.generation == 0) {
-            @memset(self.stamps.items, 0);
-            self.generation = 1;
+        pub fn clear(self: *Self) void {
+            self.used = 0;
+            self.generation +%= 1;
+            if (self.generation == 0) {
+                @memset(self.stamps.items, 0);
+                self.generation = 1;
+            }
         }
-    }
 
-    fn slotOf(self: *const ElementMap, key: u64) usize {
-        const mask = self.keys.items.len - 1;
-        var slot: usize = @truncate((key *% 0x9E3779B97F4A7C15) >> 32);
-        slot &= mask;
-        while (self.stamps.items[slot] == self.generation and self.keys.items[slot] != key) slot = (slot + 1) & mask;
-        return slot;
-    }
+        fn slotOf(self: *const Self, key: u64) usize {
+            const mask = self.keys.items.len - 1;
+            var slot: usize = @truncate((key *% 0x9E3779B97F4A7C15) >> 32);
+            slot &= mask;
+            while (self.stamps.items[slot] == self.generation and self.keys.items[slot] != key) slot = (slot + 1) & mask;
+            return slot;
+        }
 
-    pub fn get(self: *const ElementMap, key: u64) ?u32 {
-        const slot = self.slotOf(key);
-        return if (self.stamps.items[slot] == self.generation) self.values.items[slot] else null;
-    }
+        pub fn get(self: *const Self, key: u64) ?u32 {
+            const slot = self.slotOf(key);
+            return if (self.stamps.items[slot] == self.generation) self.values.items[slot] else null;
+        }
 
-    pub fn put(self: *ElementMap, key: u64, value: u32) void {
-        const slot = self.slotOf(key);
-        std.debug.assert(self.stamps.items[slot] != self.generation);
-        self.claimSlot(slot, key);
-        self.values.items[slot] = value;
-    }
+        pub fn put(self: *Self, key: u64, value: u32) void {
+            const slot = self.slotOf(key);
+            std.debug.assert(self.stamps.items[slot] != self.generation);
+            self.claimSlot(slot, key);
+            self.values.items[slot] = value;
+        }
 
-    /// `key`'s value slot from one probe: `found` when the key was present, else the key is
-    /// inserted and the caller writes its value. Within the reserved limit.
-    pub fn getOrPut(self: *ElementMap, key: u64) GetOrPut {
-        const slot = self.slotOf(key);
-        const found = self.stamps.items[slot] == self.generation;
-        if (!found) self.claimSlot(slot, key);
-        return .{ .value = &self.values.items[slot], .found = found };
-    }
+        /// `key`'s value slot from one probe: `found` when the key was present, else the key is
+        /// inserted and the caller writes its value. Within the reserved limit.
+        pub fn getOrPut(self: *Self, key: u64) GetOrPut {
+            const slot = self.slotOf(key);
+            const found = self.stamps.items[slot] == self.generation;
+            if (!found) self.claimSlot(slot, key);
+            return .{ .value = &self.values.items[slot], .found = found };
+        }
 
-    pub const GetOrPut = struct {
-        value: *u32,
-        found: bool,
+        pub const GetOrPut = struct {
+            value: *u32,
+            found: bool,
+        };
+
+        fn claimSlot(self: *Self, slot: usize, key: u64) void {
+            std.debug.assert(self.used < self.limit);
+            self.used += 1;
+            self.stamps.items[slot] = self.generation;
+            self.keys.items[slot] = key;
+        }
     };
+}
 
-    fn claimSlot(self: *ElementMap, slot: usize, key: u64) void {
-        std.debug.assert(self.used < self.limit);
-        self.used += 1;
-        self.stamps.items[slot] = self.generation;
-        self.keys.items[slot] = key;
-    }
-};
+/// A map for lookups on workers, kept to short probes.
+pub const ElementMap = ElementMapAt(.half);
+// Connectivity's merge map: main-thread, one batch long, its limit an over-count of the
+// batch's elements, so it trades probe length for memory.
+const MergeMap = ElementMapAt(.three_quarters);
 
 // Union-find find with full path compression.
 fn findRoot(parents: []u32, index: u32) u32 {
@@ -1239,8 +1282,9 @@ const BatchViews = struct {
     groups: GroupColumns,
 };
 
-// Element counts of the batch staging lists: what a marks batch prepared, or what a level
-// build keeps.
+// Element counts of the batch staging lists that a marks batch changing one chunk needs:
+// the floor no staging list frees below, so a run of small batches never reallocates. The
+// closure's per-key windows keep `patch_keys`; its other lists keep nothing.
 const StagingSizes = struct {
     // Seed windows.
     changed_keys: usize = 0,
@@ -1252,40 +1296,33 @@ const StagingSizes = struct {
     edges: usize = 0,
     // Merge staging: elements, units, sets, families, groups, and their lists.
     elements: usize = 0,
-    // Closure staging: candidate and gather one-way entries, candidate H-components, the
-    // terminals and links a batch can number, S windows, and round items.
-    cand_entries: usize = 0,
-    ow_entries: usize = 0,
-    closure_touched: usize = 0,
-    closure_terms: usize = 0,
-    closure_links: usize = 0,
-    closure_k_cap: usize = 0,
-    closure_s_words: usize = 0,
-    closure_copy_items: usize = 0,
-    closure_round_items: usize = 0,
-
-    fn max(a: StagingSizes, b: StagingSizes) StagingSizes {
-        var result: StagingSizes = undefined;
-        inline for (@typeInfo(StagingSizes).@"struct".field_names) |name| @field(result, name) = @max(@field(a, name), @field(b, name));
-        return result;
-    }
 };
 
-// Shrinks `list` to `keep` slots when it holds more; contents are scratch. A failed shrink
-// keeps the larger buffer, so this never fails.
-fn shrinkList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, keep: usize) void {
-    if (list.capacity <= keep) return;
-    list.items.len = keep;
-    list.shrinkAndFree(allocator, keep);
-    list.clearRetainingCapacity();
-}
-
-fn shrinkRows(comptime Row: type, rows: *std.MultiArrayList(Row), allocator: std.mem.Allocator, keep: usize) void {
-    if (rows.capacity <= keep) return;
-    rows.len = rows.capacity;
-    rows.shrinkAndFree(allocator, keep);
-    rows.len = 0;
-}
+// Need groups of the staging lists for their release window (`types.StagingWindow`): the
+// lists of a group are sized from one need.
+const StagingGroup = enum {
+    changed_keys,
+    patch_keys,
+    items,
+    seeds,
+    rows,
+    edges,
+    elements,
+    ow_entries,
+    cand_entries,
+    closure_terms,
+    candidates,
+    s_words,
+    k_cap_sum,
+    loose,
+    links,
+    slots,
+    pieces,
+    masks,
+    copy_items,
+    round_items,
+    compact,
+};
 
 /// What sizes a world's reachability for `storageBytesBound`.
 pub const StorageShape = struct {
@@ -1337,7 +1374,8 @@ pub fn storageBytesBound(shape: StorageShape) usize {
     const marks_elements = 5 *| marks_nodes +| shape.batch_links;
     const build_elements = build_labels +| 2 *| build_endpoints +| 1;
     const elements = @max(marks_elements, build_elements);
-    const map_slots = std.math.ceilPowerOfTwo(usize, @max(4 *| elements, 16)) catch std.math.maxInt(usize);
+    // Elements plus the roots of kept elements share the map.
+    const map_slots = MergeMap.slotCount(2 *| elements) catch std.math.maxInt(usize);
     const staging = listBytesBound(usize, keys +| 1) +| listBytesBound(u32, keys) +| listBytesBound(EdgeEntry, seeds) +|
         listBytesBound(bool, keys) +|
         2 *| (listBytesBound(usize, items +| 1) +| listBytesBound(u32, items)) +|
@@ -1394,9 +1432,11 @@ fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usize {
 
 /// Per-world comps and roots, plus the batch staging the stages share and the flood's round
 /// buffers. Comps and roots are pools with free lists whose capacity covers every pooled id,
-/// so a release never allocates; every staging bound is reserved before the batch's commit
-/// starts, and a level build shrinks its staging back to what a marks batch needs when it
-/// ends. The round buffers are fixed per world once reserved.
+/// so a release never allocates. Every staging bound is reserved on the main thread before
+/// the batch's stages dispatch: a list grows, counted (`types.growList`), to each batch's or
+/// build's need, a batch noting it in the release window (`staging_window`); `releaseWindow`,
+/// on the window's last step or a level build's step, frees it down to what the window kept,
+/// so staging follows recent batches, never its high-water. The round buffers are fixed per world once reserved.
 pub const Connectivity = struct {
     comps: std.MultiArrayList(CompRow) = .{},
     comp_free: std.ArrayList(u32) = .empty,
@@ -1431,7 +1471,7 @@ pub const Connectivity = struct {
     element_limit: usize = 0,
     element_count: usize = 0,
     elements: std.MultiArrayList(ElementRow) = .{},
-    element_map: ElementMap = .{},
+    element_map: MergeMap = .{},
     units: std.MultiArrayList(UnitRow) = .{},
     sets: std.MultiArrayList(SetRow) = .{},
     families: std.MultiArrayList(FamilyRow) = .{},
@@ -1464,9 +1504,8 @@ pub const Connectivity = struct {
     // The most link endpoints any chunk holds, over the first `endpoint_links_seen` links.
     max_chunk_endpoints: usize = 0,
     endpoint_links_seen: usize = 0,
-    // The largest staging any marks batch prepared, per list: a level build keeps that much,
-    // or what one changed chunk needs, and frees the rest.
-    marks_staging_high: StagingSizes = .{},
+    // The staging's release window over marks batches.
+    staging_window: types.StagingWindow(StagingGroup) = .{},
     // Batch shapes of the most recent batch's seed and gather stages and its flood's rounds
     // folded into one (stats and benches).
     last_seed_batch: BatchStats = .{},
@@ -1508,63 +1547,74 @@ pub const Connectivity = struct {
         self.* = undefined;
     }
 
-    // Shrinks each staging list to its size in `keep` where it holds more; the round buffers
-    // stay. Never fails.
-    fn shrinkStaging(self: *Connectivity, allocator: std.mem.Allocator, keep: StagingSizes) void {
-        shrinkList(usize, &self.seed_starts, allocator, keep.changed_keys + 1);
-        shrinkList(u32, &self.seed_counts, allocator, keep.changed_keys);
-        shrinkList(EdgeEntry, &self.seed_edges, allocator, keep.seeds);
-        shrinkList(bool, &self.patch_changed, allocator, keep.patch_keys);
-        shrinkList(usize, &self.row_starts, allocator, keep.items + 1);
-        shrinkList(usize, &self.edge_starts, allocator, keep.items + 1);
-        shrinkList(u32, &self.row_counts, allocator, keep.items);
-        shrinkList(u32, &self.edge_counts, allocator, keep.items);
-        shrinkList(RowEntry, &self.gather_rows, allocator, keep.rows);
-        shrinkList(EdgeEntry, &self.gather_edges, allocator, keep.edges);
-        shrinkRows(ElementRow, &self.elements, allocator, keep.elements);
-        self.element_map.shrink(allocator, 2 * keep.elements);
-        shrinkRows(UnitRow, &self.units, allocator, keep.elements);
-        shrinkRows(SetRow, &self.sets, allocator, keep.elements);
-        shrinkRows(FamilyRow, &self.families, allocator, keep.elements);
-        shrinkRows(GroupRow, &self.groups, allocator, keep.elements);
-        shrinkList(u32, &self.unit_elements, allocator, keep.elements);
-        shrinkList(u32, &self.group_roots, allocator, keep.elements);
-        shrinkList(u32, &self.group_sets, allocator, keep.elements);
-        shrinkList(u32, &self.root_first, allocator, keep.elements);
-        shrinkList(u32, &self.round_sets, allocator, keep.elements);
-        const closure = &self.closure;
-        shrinkList(usize, &closure.cand_starts, allocator, keep.patch_keys + 1);
-        shrinkList(u32, &closure.cand_counts, allocator, keep.patch_keys);
-        shrinkList(CandTally, &closure.cand_tallies, allocator, keep.patch_keys);
-        shrinkList(u32, &closure.cand_hcomps, allocator, keep.cand_entries);
-        shrinkList(usize, &closure.ow_starts, allocator, keep.patch_keys + 1);
-        shrinkList(u32, &closure.ow_counts, allocator, keep.patch_keys);
-        shrinkList(OneWayEntry, &closure.ow_entries, allocator, keep.ow_entries);
-        shrinkList(u32, &closure.freed_terms, allocator, keep.closure_terms);
-        shrinkRows(TouchRow, &closure.touched, allocator, keep.closure_touched);
-        // The S bitmap stays zero over its length: shrink it as a whole.
-        if (closure.s_words.capacity > keep.closure_s_words) {
-            closure.s_words.items.len = @min(closure.s_words.items.len, keep.closure_s_words);
-            closure.s_words.shrinkAndFree(allocator, keep.closure_s_words);
+    /// At the end of a step that closes the release window or built a level: frees every
+    /// staging list down to what it keeps (`StagingWindow.kept`: the most the window's batches
+    /// needed, the most any batch changing at most one chunk needed, and one changed chunk's
+    /// static bound) when it holds more (`types.releaseStaging`); a closing window starts the
+    /// next. The round buffers stay. Never fails. O(staging lists) plus the bytes it frees.
+    pub fn releaseWindow(self: *Connectivity, allocator: std.mem.Allocator, border_stride: usize) void {
+        const floor = self.oneChunkStaging(border_stride);
+        const window = &self.staging_window;
+        // Window highs of the per-key and starts lists count their closing entry.
+        const changed_keep = window.kept(.changed_keys, floor.changed_keys + 1);
+        types.releaseStaging(&self.seed_starts, allocator, changed_keep);
+        types.releaseStaging(&self.seed_counts, allocator, changed_keep);
+        types.releaseStaging(&self.seed_edges, allocator, window.kept(.seeds, floor.seeds));
+        const key_keep = window.kept(.patch_keys, floor.patch_keys + 1);
+        types.releaseStaging(&self.patch_changed, allocator, key_keep);
+        const item_keep = window.kept(.items, floor.items + 1);
+        inline for (.{ &self.row_starts, &self.edge_starts, &self.row_counts, &self.edge_counts }) |list| {
+            types.releaseStaging(list, allocator, item_keep);
         }
-        shrinkList(u32, &closure.s_list, allocator, keep.closure_k_cap);
-        shrinkList(u32, &closure.loose, allocator, keep.closure_links);
-        shrinkList(u32, &closure.resolve_items, allocator, keep.closure_links);
-        shrinkList(ResolveOut, &closure.resolve_out, allocator, keep.closure_links);
-        shrinkRows(SlotRow, &closure.slots, allocator, keep.closure_terms);
-        shrinkList(u32, &closure.targets, allocator, keep.closure_links);
-        shrinkRows(PieceRow, &closure.pieces, allocator, keep.closure_terms);
-        shrinkList(u32, &closure.leaving, allocator, keep.closure_terms);
-        shrinkList(FreedIndex, &closure.freed_indices, allocator, keep.closure_terms);
-        shrinkList(MaskItem, &closure.mask_items, allocator, keep.closure_terms);
-        shrinkList(u32, &closure.plan_items, allocator, keep.closure_terms);
-        shrinkRows(APosRow, &closure.apos, allocator, keep.closure_terms);
-        shrinkList(CopyItem, &closure.copy_items, allocator, keep.closure_copy_items);
-        shrinkList(RowsItem, &closure.round_items, allocator, keep.closure_round_items);
-        shrinkList(u32, &closure.round_starts, allocator, keep.closure_terms + 2);
-        shrinkList(CompactBlock, &closure.compact_blocks, allocator, 0);
+        types.releaseStaging(&self.gather_rows, allocator, window.kept(.rows, floor.rows));
+        types.releaseStaging(&self.gather_edges, allocator, window.kept(.edges, floor.edges));
+        const element_keep = window.kept(.elements, floor.elements);
+        types.releaseStaging(&self.elements, allocator, element_keep);
+        // Elements plus the roots of kept elements share the map.
+        self.element_map.release(allocator, 2 * element_keep);
+        types.releaseStaging(&self.units, allocator, element_keep);
+        types.releaseStaging(&self.sets, allocator, element_keep);
+        types.releaseStaging(&self.families, allocator, element_keep);
+        types.releaseStaging(&self.groups, allocator, element_keep);
+        inline for (.{ &self.unit_elements, &self.group_roots, &self.group_sets, &self.root_first, &self.round_sets }) |list| {
+            types.releaseStaging(list, allocator, element_keep);
+        }
+        const closure = &self.closure;
+        inline for (.{ &closure.cand_starts, &closure.cand_counts, &closure.cand_tallies, &closure.ow_starts, &closure.ow_counts }) |list| {
+            types.releaseStaging(list, allocator, key_keep);
+        }
+        types.releaseStaging(&closure.ow_entries, allocator, window.kept(.ow_entries, 0));
+        types.releaseStaging(&closure.cand_hcomps, allocator, window.kept(.cand_entries, 0));
+        const terms_keep = window.kept(.closure_terms, 0);
+        inline for (.{ &closure.freed_terms, &closure.leaving, &closure.freed_indices }) |list| {
+            types.releaseStaging(list, allocator, terms_keep);
+        }
+        types.releaseStaging(&closure.touched, allocator, window.kept(.candidates, 0));
+        // A shrink empties the S bitmap, which stays zero over its length.
+        types.releaseStaging(&closure.s_words, allocator, window.kept(.s_words, 0));
+        types.releaseStaging(&closure.s_list, allocator, window.kept(.k_cap_sum, 0));
+        types.releaseStaging(&closure.loose, allocator, window.kept(.loose, 0));
+        const links_keep = window.kept(.links, 0);
+        inline for (.{ &closure.resolve_items, &closure.resolve_out, &closure.targets }) |list| {
+            types.releaseStaging(list, allocator, links_keep);
+        }
+        const slots_keep = window.kept(.slots, 0);
+        inline for (.{ &closure.slots, &closure.apos, &closure.round_starts }) |list| {
+            types.releaseStaging(list, allocator, slots_keep);
+        }
+        const pieces_keep = window.kept(.pieces, 0);
+        types.releaseStaging(&closure.pieces, allocator, pieces_keep);
+        types.releaseStaging(&closure.plan_items, allocator, pieces_keep);
+        types.releaseStaging(&closure.mask_items, allocator, window.kept(.masks, 0));
+        types.releaseStaging(&closure.copy_items, allocator, window.kept(.copy_items, 0));
+        types.releaseStaging(&closure.round_items, allocator, window.kept(.round_items, 0));
+        types.releaseStaging(&closure.compact_blocks, allocator, window.kept(.compact, 0));
+        // The lists may have shrunk below the limits: the next reserve sets them.
         self.element_limit = 0;
         self.element_count = 0;
+        self.element_map.limit = 0;
+        closure.limits = .{};
+        window.released();
     }
 
     /// Live comps.
@@ -1704,18 +1754,17 @@ pub const Connectivity = struct {
     // one pair per set or rootless unit, at most one per unit.
     fn reserveMerge(self: *Connectivity, allocator: std.mem.Allocator, limit: usize, fresh: usize, pool_grows: *u64) !void {
         if (limit >= no_unit) return error.NavConnectivityOverflow;
-        try self.elements.ensureTotalCapacity(allocator, limit);
+        self.staging_window.note(.elements, limit);
+        try types.growList(&self.elements, allocator, limit, pool_grows);
         // Elements plus the roots of kept elements share the map.
-        try self.element_map.reserve(allocator, 2 * limit);
-        try self.units.ensureTotalCapacity(allocator, limit);
-        try self.sets.ensureTotalCapacity(allocator, limit);
-        try self.families.ensureTotalCapacity(allocator, limit);
-        try self.groups.ensureTotalCapacity(allocator, limit);
-        try self.unit_elements.ensureTotalCapacity(allocator, limit);
-        try self.group_roots.ensureTotalCapacity(allocator, limit);
-        try self.group_sets.ensureTotalCapacity(allocator, limit);
-        try self.root_first.ensureTotalCapacity(allocator, limit);
-        try self.round_sets.ensureTotalCapacity(allocator, limit);
+        try self.element_map.reserveStaging(allocator, 2 * limit, pool_grows);
+        try types.growList(&self.units, allocator, limit, pool_grows);
+        try types.growList(&self.sets, allocator, limit, pool_grows);
+        try types.growList(&self.families, allocator, limit, pool_grows);
+        try types.growList(&self.groups, allocator, limit, pool_grows);
+        inline for (.{ &self.unit_elements, &self.group_roots, &self.group_sets, &self.root_first, &self.round_sets }) |list| {
+            try types.growList(list, allocator, limit, pool_grows);
+        }
         try self.ensureFreeIds(allocator, fresh, pool_grows);
         // Assigned only after every reserve succeeded.
         self.element_limit = limit;
@@ -1744,19 +1793,19 @@ pub const Connectivity = struct {
     // fixed per world, never sized from its extent. Every item's window holds its budget plus
     // the slack, so a round holds at most `flood_window_limit / (1 + slack)` items, and a
     // table of twice an item's window keeps probes short. Grows only with the slack, W, K, or
-    // the participant count.
-    fn reserveFlood(self: *Connectivity, allocator: std.mem.Allocator, border_stride: usize, participants: usize) !void {
+    // the participant count; each growth counts one in `pool_grows`.
+    fn reserveFlood(self: *Connectivity, allocator: std.mem.Allocator, border_stride: usize, participants: usize, pool_grows: *u64) !void {
         const slack = border_stride + self.max_chunk_endpoints;
         const budget: u32 = @intCast(@max(@min(@as(usize, self.flood_budget_cap), self.flood_window), 1));
         const window = @max(self.flood_window, budget) + slack;
         const items = window / (1 + slack);
-        const slots = try std.math.ceilPowerOfTwo(usize, 2 * (@as(usize, budget) + slack));
-        try self.flood_items.ensureTotalCapacity(allocator, items);
-        try self.flood_outs.ensureTotalCapacity(allocator, items);
-        try self.proposals.ensureTotalCapacity(allocator, window);
-        try self.flood_scratch.ensureTotalCapacity(allocator, participants);
+        const slots = std.math.ceilPowerOfTwo(usize, 2 * (@as(usize, budget) + slack)) catch return error.NavConnectivityOverflow;
+        try types.growList(&self.flood_items, allocator, items, pool_grows);
+        try types.growList(&self.flood_outs, allocator, items, pool_grows);
+        try types.growList(&self.proposals, allocator, window, pool_grows);
+        try types.growList(&self.flood_scratch, allocator, participants, pool_grows);
         while (self.flood_scratch.items.len < participants) self.flood_scratch.appendAssumeCapacity(.{});
-        for (self.flood_scratch.items) |*scratch| try scratch.reserve(allocator, slots);
+        for (self.flood_scratch.items) |*scratch| try scratch.reserve(allocator, slots, pool_grows);
         // Assigned only after every reserve succeeded.
         self.flood_slack = slack;
         self.flood_budget_limit = budget;
@@ -1790,13 +1839,18 @@ pub const Connectivity = struct {
         pool_grows: *u64,
         stats: *NavUpdateStats,
     ) !void {
-        std.debug.assert(patch_info.len == patch_keys.len);
+        std.debug.assert(patch_info.len == patch_keys.len and patch_keys.len != 0);
         var section = StageTimer.begin();
         const new_link_count = new_links.len;
+        // The batch notes its needs in the release window (`NavGraph.finishStagingStep`).
+        const window = &self.staging_window;
+        window.beginBatch();
         // Flags and seed windows: changed keys are a sorted subset of the sorted patch keys.
-        try self.patch_changed.resize(allocator, patch_keys.len);
-        try self.seed_starts.resize(allocator, changed_keys.len + 1);
-        try self.seed_counts.resize(allocator, changed_keys.len);
+        window.note(.patch_keys, patch_keys.len + 1);
+        try types.resizeStaging(&self.patch_changed, allocator, patch_keys.len, pool_grows);
+        window.note(.changed_keys, changed_keys.len + 1);
+        try types.resizeStaging(&self.seed_starts, allocator, changed_keys.len + 1, pool_grows);
+        try types.resizeStaging(&self.seed_counts, allocator, changed_keys.len, pool_grows);
         var changed_index: usize = 0;
         var seed_total: usize = 0;
         for (patch_keys, patch_info, self.patch_changed.items) |key, info, *changed| {
@@ -1808,15 +1862,17 @@ pub const Connectivity = struct {
         }
         std.debug.assert(changed_index == changed_keys.len);
         self.seed_starts.items[changed_keys.len] = seed_total;
-        try self.seed_edges.resize(allocator, seed_total);
+        window.note(.seeds, seed_total);
+        try types.resizeStaging(&self.seed_edges, allocator, seed_total, pool_grows);
 
         // Gather windows: per patch key its old nodes and new labels as rows and one edge per
         // border flag and link endpoint; per new link one edge.
         const item_count = patch_keys.len + new_link_count;
-        try self.row_starts.resize(allocator, item_count + 1);
-        try self.edge_starts.resize(allocator, item_count + 1);
-        try self.row_counts.resize(allocator, item_count);
-        try self.edge_counts.resize(allocator, item_count);
+        window.note(.items, item_count + 1);
+        try types.resizeStaging(&self.row_starts, allocator, item_count + 1, pool_grows);
+        try types.resizeStaging(&self.edge_starts, allocator, item_count + 1, pool_grows);
+        try types.resizeStaging(&self.row_counts, allocator, item_count, pool_grows);
+        try types.resizeStaging(&self.edge_counts, allocator, item_count, pool_grows);
         var row_total: usize = 0;
         var edge_total: usize = 0;
         for (0..item_count) |item| {
@@ -1833,8 +1889,10 @@ pub const Connectivity = struct {
         }
         self.row_starts.items[item_count] = row_total;
         self.edge_starts.items[item_count] = edge_total;
-        try self.gather_rows.resize(allocator, row_total);
-        try self.gather_edges.resize(allocator, edge_total);
+        window.note(.rows, row_total);
+        try types.resizeStaging(&self.gather_rows, allocator, row_total, pool_grows);
+        window.note(.edges, edge_total);
+        try types.resizeStaging(&self.gather_edges, allocator, edge_total, pool_grows);
 
         // Node rows: each patch key may gain up to its node bound, per level.
         var start: usize = 0;
@@ -1854,7 +1912,7 @@ pub const Connectivity = struct {
         // Only a removal can flood; its sets come from the seeds.
         if (seed_total != 0) {
             self.noteLinks(world);
-            try self.reserveFlood(allocator, levels.graph(keyLevel(changed_keys[0])).border_stride, participantCount(threads));
+            try self.reserveFlood(allocator, levels.graph(keyLevel(changed_keys[0])).border_stride, participantCount(threads), pool_grows);
         }
         var job = SeedJob{
             .levels = levels,
@@ -1875,30 +1933,8 @@ pub const Connectivity = struct {
         const new_oneway = countOneWay(new_links);
         self.closure.active = self.closure.oneway.len != 0 or new_oneway != 0;
         stats.main.reserve_ns += section.lap();
-        const bounds: ClosureBounds = if (self.closure.active)
-            try self.prepareClosure(allocator, levels, world, patch_keys, true, self.patch_changed.items, new_oneway, new_link_count, closure_threads, pool_grows, stats)
-        else
-            .{};
-        section = StageTimer.begin();
-        defer stats.main.reserve_ns += section.lap();
-        self.marks_staging_high = self.marks_staging_high.max(.{
-            .changed_keys = changed_keys.len,
-            .patch_keys = patch_keys.len,
-            .items = item_count,
-            .seeds = seed_total,
-            .rows = row_total,
-            .edges = edge_total,
-            .elements = limit,
-            .cand_entries = self.closure.cand_hcomps.items.len,
-            .ow_entries = self.closure.ow_entries.items.len,
-            .closure_touched = bounds.candidates,
-            .closure_terms = bounds.k_b,
-            .closure_links = bounds.e_t,
-            .closure_k_cap = bounds.k_cap_sum,
-            .closure_s_words = bounds.s_words,
-            .closure_copy_items = bounds.copy_items,
-            .closure_round_items = bounds.round_items,
-        });
+        if (self.closure.active) _ = try self.prepareClosure(allocator, levels, world, patch_keys, true, self.patch_changed.items, new_oneway, new_link_count, closure_threads, pool_grows, stats);
+        window.endBatch(changed_keys.len <= 1);
     }
 
     /// The infallible half, after the patch re-derived every patch key's record: gathers the
@@ -1951,10 +1987,10 @@ pub const Connectivity = struct {
     /// rows leave their comps, and their two-way link partners on other levels seed the
     /// removal (read through `old_levels`). Reserves first (node rows exactly, from each
     /// record's label count; fresh ids geometrically), so an error changes nothing; then
-    /// gathers, merges, settles, floods, and unites as a marks batch does. It then shrinks
-    /// each staging list to the most any marks batch prepared, or one changed chunk's bound if
-    /// larger; the flood's round buffers stay. O(level chunks + nodes + edges), the seed,
-    /// gather, and flood stages threaded.
+    /// gathers, merges, settles, floods, and unites as a marks batch does. Its staging grows
+    /// to the level, so a world build's levels reuse it; its needs stay out of the release
+    /// window (the caller's `beginBuild`), and the build's step frees it.
+    /// O(level chunks + nodes + edges), the seed, gather, and flood stages threaded.
     pub fn buildLevel(
         self: *Connectivity,
         allocator: std.mem.Allocator,
@@ -1974,14 +2010,17 @@ pub const Connectivity = struct {
         const level_graph = fresh.graph;
         const seeding = replaced != null;
         var section = StageTimer.begin();
-        // The staging shrinks back when the build ends, and on an error too.
-        errdefer self.shrinkStaging(allocator, self.marks_staging_high.max(self.oneChunkStaging(level_graph.border_stride)));
-        try self.row_starts.resize(allocator, keys.len + 1);
-        try self.edge_starts.resize(allocator, keys.len + 1);
-        try self.row_counts.resize(allocator, keys.len);
-        try self.edge_counts.resize(allocator, keys.len);
-        try self.seed_starts.resize(allocator, if (seeding) keys.len + 1 else 1);
-        try self.seed_counts.resize(allocator, if (seeding) keys.len else 0);
+        // A build's needs stay out of the window (`beginBuild`); its notes are no-ops.
+        const window = &self.staging_window;
+        window.note(.items, keys.len + 1);
+        try types.resizeStaging(&self.row_starts, allocator, keys.len + 1, pool_grows);
+        try types.resizeStaging(&self.edge_starts, allocator, keys.len + 1, pool_grows);
+        try types.resizeStaging(&self.row_counts, allocator, keys.len, pool_grows);
+        try types.resizeStaging(&self.edge_counts, allocator, keys.len, pool_grows);
+        const seed_keys: usize = if (seeding) keys.len else 0;
+        window.note(.changed_keys, seed_keys + 1);
+        try types.resizeStaging(&self.seed_starts, allocator, seed_keys + 1, pool_grows);
+        try types.resizeStaging(&self.seed_counts, allocator, seed_keys, pool_grows);
         var labels: usize = 0;
         var edge_total: usize = 0;
         var endpoint_total: usize = 0;
@@ -2005,11 +2044,15 @@ pub const Connectivity = struct {
         self.row_starts.items[keys.len] = labels;
         self.edge_starts.items[keys.len] = edge_total;
         self.seed_starts.items[self.seed_starts.items.len - 1] = seed_total;
-        try self.gather_rows.resize(allocator, labels);
-        try self.gather_edges.resize(allocator, edge_total);
-        try self.seed_edges.resize(allocator, seed_total);
+        window.note(.rows, labels);
+        try types.resizeStaging(&self.gather_rows, allocator, labels, pool_grows);
+        window.note(.edges, edge_total);
+        try types.resizeStaging(&self.gather_edges, allocator, edge_total, pool_grows);
+        window.note(.seeds, seed_total);
+        try types.resizeStaging(&self.seed_edges, allocator, seed_total, pool_grows);
         // No fresh row is old, so no key reads as remasked.
-        try self.patch_changed.resize(allocator, keys.len);
+        window.note(.patch_keys, keys.len + 1);
+        try types.resizeStaging(&self.patch_changed, allocator, keys.len, pool_grows);
         @memset(self.patch_changed.items, false);
         try level_graph.ensureNodesExact(allocator, labels);
         // A mirror's far end is an added row of the level; only a link's far end, a seed's far
@@ -2018,7 +2061,7 @@ pub const Connectivity = struct {
         try self.reserveMerge(allocator, labels + endpoint_total + seed_total + 1, labels + seed_total + 1, pool_grows);
         if (seed_total != 0) {
             self.noteLinks(world);
-            try self.reserveFlood(allocator, level_graph.border_stride, participantCount(flood_threads));
+            try self.reserveFlood(allocator, level_graph.border_stride, participantCount(flood_threads), pool_grows);
         }
         stats.main.reserve_ns += section.lap();
 
@@ -2063,9 +2106,6 @@ pub const Connectivity = struct {
         stats.main.conn_merge_ns += section.lap();
         var counters = self.settleAndFlood(levels, world, flood_threads, stats);
         if (self.closure.active) counters.closure = self.updateClosure(levels, world, keys.len, closure_threads, stats);
-        section = StageTimer.begin();
-        self.shrinkStaging(allocator, self.marks_staging_high.max(self.oneChunkStaging(level_graph.border_stride)));
-        stats.main.commit_ns += section.lap();
         return counters;
     }
 
@@ -2919,8 +2959,8 @@ pub const Connectivity = struct {
 
     /// Builds the closure of a freshly built world: registers every world link, resolves the
     /// one-way ones on the built levels, and builds every H-component's matrix in an arena
-    /// reserved exactly, then shrinks the staging as a level build does. Allocates; on error
-    /// the caller discards the graph. Resolution
+    /// reserved exactly; its staging, sized to every link, is freed with the world build's.
+    /// Allocates; on error the caller discards the graph. Resolution
     /// O(links) threaded, Tarjan O(terminals + links) per component, rows
     /// O((terminals + links) * row words) threaded.
     pub fn buildClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: BatchLevels, world: ?*const WorldSystem, threads: ClosureThreads, pool_grows: *u64, stats: *NavUpdateStats) !ClosureCounters {
@@ -2956,9 +2996,6 @@ pub const Connectivity = struct {
         closure.arena_limit = words;
         std.debug.assert(closure.words.capacity >= closure.arena_limit);
         self.finishClosure(threads, &counters, stats);
-        // The staging sized to every link goes back to what a marks batch needs, as after a
-        // level build.
-        self.shrinkStaging(allocator, self.marks_staging_high.max(self.oneChunkStaging(levels.graph(0).border_stride)));
         return counters;
     }
 
@@ -3005,12 +3042,14 @@ pub const Connectivity = struct {
         const closure = &self.closure;
         self.advanceStamp();
         const scan = closure.oneway.len != 0;
-        try closure.ow_starts.resize(allocator, keys.len + 1);
-        try closure.ow_counts.resize(allocator, keys.len);
+        const window = &self.staging_window;
+        window.note(.patch_keys, keys.len + 1);
+        try types.resizeStaging(&closure.ow_starts, allocator, keys.len + 1, pool_grows);
+        try types.resizeStaging(&closure.ow_counts, allocator, keys.len, pool_grows);
         if (scan) {
-            try closure.cand_starts.resize(allocator, keys.len + 1);
-            try closure.cand_counts.resize(allocator, keys.len);
-            try closure.cand_tallies.resize(allocator, keys.len);
+            try types.resizeStaging(&closure.cand_starts, allocator, keys.len + 1, pool_grows);
+            try types.resizeStaging(&closure.cand_counts, allocator, keys.len, pool_grows);
+            try types.resizeStaging(&closure.cand_tallies, allocator, keys.len, pool_grows);
         }
         var ow_total: usize = 0;
         var cand_total: usize = 0;
@@ -3025,7 +3064,8 @@ pub const Connectivity = struct {
             cand_total += old_labels + 2 * endpoints;
         }
         closure.ow_starts.items[keys.len] = ow_total;
-        try closure.ow_entries.resize(allocator, ow_total);
+        window.note(.ow_entries, ow_total);
+        try types.resizeStaging(&closure.ow_entries, allocator, ow_total, pool_grows);
 
         // Every new link is loose, and each end of a new one-way link may pop a terminal.
         var bounds = ClosureBounds{ .loose = new_oneway, .live_prepared = closure.live_words };
@@ -3036,7 +3076,8 @@ pub const Connectivity = struct {
         var distinct: usize = 0;
         if (scan) {
             closure.cand_starts.items[keys.len] = cand_total;
-            try closure.cand_hcomps.resize(allocator, cand_total);
+            window.note(.cand_entries, cand_total);
+            try types.resizeStaging(&closure.cand_hcomps, allocator, cand_total, pool_grows);
             var job = CandidateJob{
                 .levels = levels,
                 .world = world,
@@ -3138,34 +3179,49 @@ pub const Connectivity = struct {
         bounds.copy_items = sums.copies + 2 * bounds.n_net * spanCount(q_max) + bounds.pieces;
     }
 
-    // Reserves every staging list the closure stages use for `bounds`, and the free terminal
-    // and H-component ids the merge pops. The S bitmap stays zero over its length.
+    // Reserves every staging list the closure stages use for `bounds`, noting their needs in
+    // the release window, and the free terminal and H-component ids the merge pops. The S
+    // bitmap stays zero over its length.
     fn reserveClosure(self: *Connectivity, allocator: std.mem.Allocator, bounds: ClosureBounds, pool_grows: *u64) !void {
         const closure = &self.closure;
+        const window = &self.staging_window;
         try closure.ensureFreeIds(allocator, @min(bounds.n_gross, 2 * bounds.e_t), bounds.pieces, pool_grows);
-        try closure.freed_terms.ensureTotalCapacity(allocator, bounds.k_c);
-        try closure.touched.ensureTotalCapacity(allocator, bounds.candidates);
+        window.note(.closure_terms, bounds.k_c);
+        try types.growList(&closure.freed_terms, allocator, bounds.k_c, pool_grows);
+        try types.growList(&closure.leaving, allocator, bounds.k_c, pool_grows);
+        try types.growList(&closure.freed_indices, allocator, bounds.k_c, pool_grows);
+        window.note(.candidates, bounds.candidates);
+        try types.growList(&closure.touched, allocator, bounds.candidates, pool_grows);
+        // A growth zeroes its new words.
+        window.note(.s_words, bounds.s_words);
         const s_before = closure.s_words.items.len;
         if (bounds.s_words > s_before) {
-            try closure.s_words.ensureTotalCapacity(allocator, bounds.s_words);
+            try types.growList(&closure.s_words, allocator, bounds.s_words, pool_grows);
             closure.s_words.items.len = bounds.s_words;
             @memset(closure.s_words.items[s_before..], 0);
         }
-        try closure.s_list.resize(allocator, bounds.k_cap_sum);
-        try closure.loose.ensureTotalCapacity(allocator, bounds.loose);
-        try closure.resolve_items.ensureTotalCapacity(allocator, bounds.e_t);
-        try closure.resolve_out.ensureTotalCapacity(allocator, bounds.e_t);
-        try closure.targets.ensureTotalCapacity(allocator, bounds.e_t);
-        try closure.slots.ensureTotalCapacity(allocator, bounds.k_b);
-        try closure.pieces.ensureTotalCapacity(allocator, bounds.pieces);
-        try closure.leaving.ensureTotalCapacity(allocator, bounds.k_c);
-        try closure.freed_indices.ensureTotalCapacity(allocator, bounds.k_c);
-        try closure.mask_items.ensureTotalCapacity(allocator, @min(bounds.k_b, bounds.k_c));
-        try closure.plan_items.ensureTotalCapacity(allocator, bounds.pieces);
-        try closure.apos.ensureTotalCapacity(allocator, bounds.k_b);
-        try closure.copy_items.ensureTotalCapacity(allocator, bounds.copy_items);
-        try closure.round_items.ensureTotalCapacity(allocator, bounds.round_items);
-        try closure.round_starts.ensureTotalCapacity(allocator, bounds.k_b + 2);
+        window.note(.k_cap_sum, bounds.k_cap_sum);
+        try types.resizeStaging(&closure.s_list, allocator, bounds.k_cap_sum, pool_grows);
+        window.note(.loose, bounds.loose);
+        try types.growList(&closure.loose, allocator, bounds.loose, pool_grows);
+        window.note(.links, bounds.e_t);
+        inline for (.{ &closure.resolve_items, &closure.resolve_out, &closure.targets }) |list| {
+            try types.growList(list, allocator, bounds.e_t, pool_grows);
+        }
+        window.note(.slots, bounds.k_b + 2);
+        try types.growList(&closure.slots, allocator, bounds.k_b, pool_grows);
+        try types.growList(&closure.apos, allocator, bounds.k_b, pool_grows);
+        try types.growList(&closure.round_starts, allocator, bounds.k_b + 2, pool_grows);
+        window.note(.pieces, bounds.pieces);
+        try types.growList(&closure.pieces, allocator, bounds.pieces, pool_grows);
+        try types.growList(&closure.plan_items, allocator, bounds.pieces, pool_grows);
+        const masks = @min(bounds.k_b, bounds.k_c);
+        window.note(.masks, masks);
+        try types.growList(&closure.mask_items, allocator, masks, pool_grows);
+        window.note(.copy_items, bounds.copy_items);
+        try types.growList(&closure.copy_items, allocator, bounds.copy_items, pool_grows);
+        window.note(.round_items, bounds.round_items);
+        try types.growList(&closure.round_items, allocator, bounds.round_items, pool_grows);
         // Assigned only after every reserve succeeded.
         closure.limits = bounds;
         closure.freed_terms.clearRetainingCapacity();
@@ -3189,7 +3245,8 @@ pub const Connectivity = struct {
         var fresh: std.ArrayList(u32) = .empty;
         errdefer fresh.deinit(allocator);
         try fresh.ensureTotalCapacityPrecise(allocator, limit);
-        try closure.compact_blocks.ensureTotalCapacity(allocator, closure.hcompCount());
+        self.staging_window.note(.compact, closure.hcompCount());
+        try types.growList(&closure.compact_blocks, allocator, closure.hcompCount(), pool_grows);
         closure.compact_blocks.clearRetainingCapacity();
         const hcomp = closure.hcomp;
         var offset: usize = 0;
@@ -5994,38 +6051,73 @@ test "threaded floods equal inline ones column for column when families meet and
     }
 }
 
-// Asserts every staging list of `conn` holds at most its size in `keep`.
+// Asserts every staging list of `conn` is held for its size in `keep` (`types.stagingHeld`),
+// as a release to `keep` leaves it.
 fn expectStagingWithin(conn: *const Connectivity, keep: StagingSizes) !void {
     const t = std.testing;
-    try t.expect(conn.seed_starts.capacity <= keep.changed_keys + 1 and conn.seed_counts.capacity <= keep.changed_keys);
-    try t.expect(conn.seed_edges.capacity <= keep.seeds and conn.patch_changed.capacity <= keep.patch_keys);
-    try t.expect(conn.row_starts.capacity <= keep.items + 1 and conn.edge_starts.capacity <= keep.items + 1);
-    try t.expect(conn.row_counts.capacity <= keep.items and conn.edge_counts.capacity <= keep.items);
-    try t.expect(conn.gather_rows.capacity <= keep.rows and conn.gather_edges.capacity <= keep.edges);
-    try t.expect(conn.elements.capacity <= keep.elements and conn.units.capacity <= keep.elements);
-    try t.expect(conn.sets.capacity <= keep.elements and conn.families.capacity <= keep.elements and conn.groups.capacity <= keep.elements);
-    try t.expect(conn.element_map.keys.capacity <= try std.math.ceilPowerOfTwo(usize, @max(4 * keep.elements, 16)));
-    for ([_]usize{ conn.unit_elements.capacity, conn.group_roots.capacity, conn.group_sets.capacity, conn.root_first.capacity, conn.round_sets.capacity }) |capacity| {
-        try t.expect(capacity <= keep.elements);
+    // A starts list and its counts keep the same size.
+    try t.expect(types.stagingHeld(&conn.seed_starts, keep.changed_keys + 1) and types.stagingHeld(&conn.seed_counts, keep.changed_keys + 1));
+    try t.expect(types.stagingHeld(&conn.seed_edges, keep.seeds));
+    try t.expect(types.stagingHeld(&conn.patch_changed, keep.patch_keys + 1));
+    try t.expect(types.stagingHeld(&conn.row_starts, keep.items + 1) and types.stagingHeld(&conn.edge_starts, keep.items + 1));
+    try t.expect(types.stagingHeld(&conn.row_counts, keep.items + 1) and types.stagingHeld(&conn.edge_counts, keep.items + 1));
+    try t.expect(types.stagingHeld(&conn.gather_rows, keep.rows) and types.stagingHeld(&conn.gather_edges, keep.edges));
+    try t.expect(!types.shouldShrinkCapacity(conn.element_map.keys.capacity, try MergeMap.slotCount(2 * keep.elements)));
+    try t.expect(types.stagingHeld(&conn.elements, keep.elements) and types.stagingHeld(&conn.units, keep.elements));
+    try t.expect(types.stagingHeld(&conn.sets, keep.elements) and types.stagingHeld(&conn.families, keep.elements) and types.stagingHeld(&conn.groups, keep.elements));
+    inline for (.{ &conn.unit_elements, &conn.group_roots, &conn.group_sets, &conn.root_first, &conn.round_sets }) |list| {
+        try t.expect(types.stagingHeld(list, keep.elements));
     }
 }
 
-// Asserts every closure staging list of `conn` holds at most its size in `keep`.
+// Asserts the closure staging of `conn` is held for one batch's per-key windows over `keep`'s
+// patch keys, and every other closure list for nothing.
 fn expectClosureStagingWithin(conn: *const Connectivity, keep: StagingSizes) !void {
     const t = std.testing;
     const closure = &conn.closure;
-    try t.expect(closure.cand_starts.capacity <= keep.patch_keys + 1 and closure.ow_starts.capacity <= keep.patch_keys + 1);
-    try t.expect(closure.cand_counts.capacity <= keep.patch_keys and closure.cand_tallies.capacity <= keep.patch_keys and closure.ow_counts.capacity <= keep.patch_keys);
-    try t.expect(closure.cand_hcomps.capacity <= keep.cand_entries and closure.ow_entries.capacity <= keep.ow_entries);
-    try t.expect(closure.touched.capacity <= keep.closure_touched and closure.s_words.capacity <= keep.closure_s_words and closure.s_list.capacity <= keep.closure_k_cap);
-    for ([_]usize{ closure.loose.capacity, closure.resolve_items.capacity, closure.resolve_out.capacity, closure.targets.capacity }) |capacity| {
-        try t.expect(capacity <= keep.closure_links);
+    inline for (.{ &closure.cand_starts, &closure.ow_starts, &closure.cand_counts, &closure.cand_tallies, &closure.ow_counts }) |list| {
+        try t.expect(types.stagingHeld(list, keep.patch_keys + 1));
     }
-    for ([_]usize{ closure.freed_terms.capacity, closure.slots.capacity, closure.pieces.capacity, closure.leaving.capacity, closure.freed_indices.capacity, closure.mask_items.capacity, closure.plan_items.capacity, closure.apos.capacity }) |capacity| {
-        try t.expect(capacity <= keep.closure_terms);
+    inline for (.{
+        &closure.cand_hcomps,    &closure.ow_entries,    &closure.freed_terms, &closure.touched,
+        &closure.s_words,        &closure.s_list,        &closure.loose,       &closure.resolve_items,
+        &closure.resolve_out,    &closure.slots,         &closure.targets,     &closure.pieces,
+        &closure.leaving,        &closure.freed_indices, &closure.mask_items,  &closure.plan_items,
+        &closure.apos,           &closure.copy_items,    &closure.round_items, &closure.round_starts,
+        &closure.compact_blocks,
+    }) |list| try t.expect(types.stagingHeld(list, 0));
+}
+
+// Asserts every batch list of `graph` is held for what its release keeps: its group's window
+// high, the most a one-chunk batch needed, and the graph's static one-chunk floor (1 changed,
+// 1 dirty, 5 patch keys; one plan range).
+fn expectGraphStagingWithin(graph: *const NavGraph) !void {
+    const t = std.testing;
+    const window = &graph.staging_window;
+    const changed = window.kept(.changed, 1);
+    const dirty = window.kept(.dirty, 1);
+    const patch = window.kept(.patch, 5);
+    try t.expect(types.stagingHeld(&graph.changed_keys, changed) and types.stagingHeld(&graph.plan_staging[0], changed));
+    try t.expect(types.stagingHeld(&graph.dirty_keys, dirty) and types.stagingHeld(&graph.plan_staging[1], dirty));
+    try t.expect(types.stagingHeld(&graph.patch_keys, patch) and types.stagingHeld(&graph.plan_staging[2], patch));
+    try t.expect(types.stagingHeld(&graph.changed_masks, changed) and types.stagingHeld(&graph.remask_slots, changed) and types.stagingHeld(&graph.remask_deltas, changed));
+    try t.expect(types.stagingHeld(&graph.patch_info, patch));
+    try t.expect(types.stagingHeld(&graph.plan_windows, window.kept(.ranges, 1)) and types.stagingHeld(&graph.plan_tallies, window.kept(.ranges, 1)));
+}
+
+// `capacity` with a release window of `steps` steps, so a test closes windows quickly.
+fn windowCapacity(steps: u32) types.PathfindingCapacity {
+    var capacity = test_support.abstractCapacity();
+    capacity.capacity_shrink_window = steps;
+    return capacity;
+}
+
+// Runs `steps` steps with no nav change.
+fn quietSteps(fixture: *TestWorld, system: *PathfindingSystem, steps: usize) !void {
+    for (0..steps) |_| {
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        try std.testing.expectEqual(@as(usize, 0), stats.incremental_rebuilds);
     }
-    try t.expect(closure.copy_items.capacity <= keep.closure_copy_items and closure.round_items.capacity <= keep.closure_round_items);
-    try t.expect(closure.round_starts.capacity <= keep.closure_terms + 2 and closure.compact_blocks.capacity == 0);
 }
 
 test "a registry reserve counts each growth of its link map and one-way rows, and a covered reserve none" {
@@ -6043,43 +6135,265 @@ test "a registry reserve counts each growth of its link map and one-way rows, an
     try std.testing.expectEqual(@as(u64, 2), grows);
 }
 
-test "a world build with one-way links leaves its closure staging at what a one-chunk batch needs" {
+test "a world build with one-way links frees its closure staging when it ends" {
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
     try addChain(&fixture, chunks, 0, 0, 32);
-    var system = try fixture.build(test_support.abstractCapacity());
+    const window: u32 = 4;
+    var system = try fixture.build(windowCapacity(window));
     defer system.deinit();
     const conn = &system.graph.connectivity;
     try std.testing.expectEqual(@as(usize, 32), conn.closure.termCount());
     const keep = conn.oneChunkStaging(system.graph.levelGraph(0).?.border_stride);
     try expectStagingWithin(conn, keep);
     try expectClosureStagingWithin(conn, keep);
+    try expectGraphStagingWithin(&system.graph);
     try fixture.expectMatchesRebuild(&system);
 }
 
-test "a level build shrinks its connectivity staging to what a one-chunk batch needs, and that batch then prepares without allocating" {
+// Writes `tile` over the `edge` x `edge` chunks from chunk (`first`, `first`) of level 0.
+fn setChunkBlock(fixture: *TestWorld, system: *PathfindingSystem, first: u16, edge: u16, tile: TileId) !void {
+    for (first..first + edge) |cy| for (first..first + edge) |cx| {
+        try fixture.setChunk(system, 0, @intCast(cx), @intCast(cy), tile);
+    };
+}
+
+test "a dense batch's staging frees down within two release windows of one-chunk batches, which then prepare without allocating" {
+    var fixture = try TestWorld.init(16, 1);
+    defer fixture.deinit();
+    const window: u32 = 6;
+    var system = try fixture.build(windowCapacity(window));
+    defer system.deinit();
+    const conn = &system.graph.connectivity;
+    // A cave-in shape: 64 chunks blocked in one batch.
+    try setChunkBlock(&fixture, &system, 2, 8, fixture.tree);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const dense_staging = conn.stagingBytes();
+    const dense_resident = system.graph.residentBytes();
+    // One-chunk digs and fills over two release windows.
+    for (0..2 * window - 1) |batch| {
+        try fixture.setChunk(&system, 0, 13, 13, if (batch % 2 == 0) fixture.tree else fixture.grass);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    }
+    try std.testing.expect(2 * conn.stagingBytes() < dense_staging);
+    try std.testing.expect(system.graph.residentBytes() < dense_resident);
+    try expectStagingWithin(conn, conn.oneChunkStaging(system.graph.levelGraph(0).?.border_stride));
+    try expectGraphStagingWithin(&system.graph);
+    // The next one-chunk batch neither shrinks nor grows anything.
+    try fixture.setChunk(&system, 0, 13, 13, fixture.grass);
+    var stats = NavUpdateStats{};
+    const original = system.graph.allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    const prepared = system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats);
+    system.graph.allocator = original;
+    const batch = system.graph.commitMarks((try prepared).?, no_colliders.view(), null, &stats);
+    system.nav_marks.clearRetainingCapacity();
+    try std.testing.expect(batch.changed);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "a step that frees a dense batch's staging commits its batch on a multi-worker ThreadSystem without allocating, then releases" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture = try TestWorld.init(16, 1);
+    defer fixture.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
+    defer threads.deinit();
+    const window: u32 = 6;
+    var capacity = windowCapacity(window);
+    capacity.worker_participant_count = threads.participantSlotCount();
+    var system = try fixture.build(capacity);
+    defer system.deinit();
+    const conn = &system.graph.connectivity;
+    const nav_threads = forcedNavThreads(&system, &threads);
+    try setChunkBlock(&fixture, &system, 2, 8, fixture.tree);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    // One-chunk batches up to the last step of the second release window.
+    for (0..2 * window - 2) |batch| {
+        try fixture.setChunk(&system, 0, 13, 13, if (batch % 2 == 0) fixture.tree else fixture.grass);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    }
+    const held = conn.stagingBytes();
+    try fixture.setChunk(&system, 0, 13, 13, fixture.tree);
+    var stats = NavUpdateStats{};
+    system.graph.tickStagingStep(window);
+    try std.testing.expect(conn.staging_window.closing and system.graph.staging_window.closing);
+    const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, nav_threads, &stats)).?;
+    const original = system.graph.allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    const batch = system.graph.commitMarks(prepared, no_colliders.view(), nav_threads, &stats);
+    system.graph.allocator = original;
+    system.nav_marks.clearRetainingCapacity();
+    try std.testing.expect(batch.changed);
+    try std.testing.expect(!stats.conn_gather_batch.ran_inline);
+    // The release runs at the step's end, after the commit.
+    try std.testing.expectEqual(held, conn.stagingBytes());
+    system.graph.finishStagingStep();
+    try std.testing.expect(2 * conn.stagingBytes() < held);
+    try expectGraphStagingWithin(&system.graph);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "quiet steps through the nav reaction keep a dense batch's staging for its window and free it at the next window's end" {
+    var fixture = try TestWorld.init(16, 1);
+    defer fixture.deinit();
+    const window: u32 = 6;
+    var system = try fixture.build(windowCapacity(window));
+    defer system.deinit();
+    const conn = &system.graph.connectivity;
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const step = struct {
+        fn run(world: *TestWorld, nav: *PathfindingSystem, sim: *SimulationFrame) !NavUpdateStats {
+            sim.beginStep();
+            return nav.reactToPostCommitNavEvents(sim, no_colliders, &world.world, null);
+        }
+    }.run;
+    const built_staging = conn.stagingBytes();
+    try setChunkBlock(&fixture, &system, 2, 8, fixture.tree);
+    try std.testing.expectEqual(@as(usize, 1), (try step(&fixture, &system, &frame)).incremental_rebuilds);
+    const dense_staging = conn.stagingBytes();
+    const dense_graph = system.graph.residentBytes();
+    try std.testing.expect(dense_staging > 2 * built_staging);
+    // Quiet steps to the window's next-to-last: one tick each, nothing freed.
+    for (0..window - 2) |_| try std.testing.expectEqual(@as(usize, 0), (try step(&fixture, &system, &frame)).incremental_rebuilds);
+    try std.testing.expectEqual(window - 1, system.graph.staging_window.steps);
+    try std.testing.expectEqual(window - 1, conn.staging_window.steps);
+    try std.testing.expectEqual(dense_staging, conn.stagingBytes());
+    // The window's last step releases, keeping its dense batch's high.
+    _ = try step(&fixture, &system, &frame);
+    try std.testing.expectEqual(@as(u32, 0), system.graph.staging_window.steps);
+    try std.testing.expectEqual(dense_staging, conn.stagingBytes());
+    try std.testing.expectEqual(dense_graph, system.graph.residentBytes());
+    // A window of quiet steps: its release frees everything down to the floors.
+    for (0..window) |_| _ = try step(&fixture, &system, &frame);
+    try std.testing.expect(2 * conn.stagingBytes() < dense_staging);
+    try std.testing.expect(system.graph.residentBytes() < dense_graph);
+    try expectStagingWithin(conn, conn.oneChunkStaging(system.graph.levelGraph(0).?.border_stride));
+    try expectGraphStagingWithin(&system.graph);
+    // The freed staging serves the next dig.
+    try fixture.setChunk(&system, 0, 2, 2, fixture.grass);
+    _ = try step(&fixture, &system, &frame);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "dense batches in a row keep their staging across release windows, never shrinking it to regrow" {
+    var fixture = try TestWorld.init(16, 1);
+    defer fixture.deinit();
+    const window: u32 = 8;
+    var system = try fixture.build(windowCapacity(window));
+    defer system.deinit();
+    const conn = &system.graph.connectivity;
+    // Dense blocks and reopenings of one region: two of each warm every list and pool. The
+    // world build's level-sized lists are noted in the first window and trimmed by the
+    // second's release; later releases free nothing, and nothing ever regrows.
+    var warm_grows: u64 = 0;
+    var released_staging: usize = 0;
+    var released_resident: usize = 0;
+    for (0..3 * window + 2) |batch| {
+        try setChunkBlock(&fixture, &system, 2, 8, if (batch % 2 == 0) fixture.tree else fixture.grass);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        if (batch == 3) warm_grows = system.graph.pool_grows;
+        if (batch == 2 * window) {
+            released_staging = conn.stagingBytes();
+            released_resident = system.graph.residentBytes();
+        }
+    }
+    try std.testing.expect(warm_grows > 0);
+    try std.testing.expectEqual(warm_grows, system.graph.pool_grows);
+    try std.testing.expectEqual(released_staging, conn.stagingBytes());
+    try std.testing.expectEqual(released_resident, system.graph.residentBytes());
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "a one-way world's single dig stays allocation-free after its closure staging is released" {
+    const chunks: u16 = 4;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    try addChain(&fixture, chunks, 0, 0, 16);
+    const window: u32 = 4;
+    var system = try fixture.build(windowCapacity(window));
+    defer system.deinit();
+    const conn = &system.graph.connectivity;
+    // The dig and its refill, each one chunk, set the closure floor.
+    try setRoom(&fixture, &system, chunks, 0, 5, fixture.tree);
+    const dug = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expect(dug.closure_links != 0);
+    try setRoom(&fixture, &system, chunks, 0, 5, fixture.grass);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    // A dense change through the chain grows the closure staging; two quiet windows free it.
+    for (0..8) |index| try setRoom(&fixture, &system, chunks, 0, index, fixture.tree);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    for (0..8) |index| try setRoom(&fixture, &system, chunks, 0, index, fixture.grass);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const dense_staging = conn.stagingBytes();
+    try quietSteps(&fixture, &system, 2 * window);
+    try std.testing.expect(conn.stagingBytes() < dense_staging);
+    // The same dig again: its prepare neither shrinks nor grows anything.
+    try setRoom(&fixture, &system, chunks, 0, 5, fixture.tree);
+    var stats = NavUpdateStats{};
+    const original = system.graph.allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    const prepared = system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats);
+    system.graph.allocator = original;
+    const batch = system.graph.commitMarks((try prepared).?, no_colliders.view(), null, &stats);
+    system.nav_marks.clearRetainingCapacity();
+    try std.testing.expect(batch.changed);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "element maps hold their limit at their load, find every key, and a merge map's release frees its slots" {
+    const allocator = std.testing.allocator;
+    var grows: u64 = 0;
+    inline for (.{ ElementMap, MergeMap }, .{ 2, 4 }, .{ 1, 3 }) |Map, load_den, load_num| {
+        var map: Map = .{};
+        defer map.deinit(allocator);
+        // 700 separates the loads: 2048 slots at one half, 1024 at three quarters.
+        for ([_]usize{ 1, 12, 48, 700, 1000 }) |limit| {
+            try map.reserve(allocator, limit);
+            const slots = map.keys.items.len;
+            try std.testing.expect(std.math.isPowerOfTwo(slots));
+            try std.testing.expect(load_den * limit <= load_num * slots or limit == 0);
+            if (limit == 700) try std.testing.expectEqual(@as(usize, if (Map == ElementMap) 2048 else 1024), slots);
+            map.clear();
+            for (0..limit) |index| map.put(@as(u64, index) *% 0x2545F4914F6CDD1D, @intCast(index));
+            for (0..limit) |index| try std.testing.expectEqual(@as(?u32, @intCast(index)), map.get(@as(u64, index) *% 0x2545F4914F6CDD1D));
+            try std.testing.expectEqual(@as(?u32, null), map.get(0xFFFF_FFFF_FFFF));
+        }
+    }
+    var map: MergeMap = .{};
+    defer map.deinit(allocator);
+    try map.reserveStaging(allocator, 1000, &grows);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+    // A release keeping a small batch frees the slots down to it, uncounted.
+    map.release(allocator, 10);
+    try std.testing.expectEqual(@as(usize, 16), map.keys.items.len);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+}
+
+test "a level build's staging frees at the end of its step, and a one-chunk batch then prepares without allocating" {
     var fixture = try TestWorld.init(16, 2);
     defer fixture.deinit();
     try buildRoom(&fixture, 3);
-    var system = try fixture.build(test_support.abstractCapacity());
+    const window: u32 = 4;
+    var system = try fixture.build(windowCapacity(window));
     defer system.deinit();
     const conn = &system.graph.connectivity;
     const stride = system.graph.levelGraph(0).?.border_stride;
-    // The world build's levels keep no more staging than one changed chunk needs.
-    try expectStagingWithin(conn, conn.oneChunkStaging(stride));
-    // An enclosure and its reopening warm the node pool, the free ids, and the round buffers.
+    // An enclosure and its reopening warm the node pool, the free ids, and the round buffers,
+    // and set the one-chunk floor.
     try fixture.setChunk(&system, 0, 3, 1, fixture.tree);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try fixture.setChunk(&system, 0, 3, 1, fixture.grass);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    const high = conn.marks_staging_high;
-    // A level added in play shrinks back the same way.
+    // A level added in play grows the staging to a level; its step's end frees it.
     const level = try fixture.world.addLevel(-32);
     _ = try fixture.world.addDenseLayer(level, 0, .floor, fixture.grass);
     const added = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), added.levels_built);
-    try expectStagingWithin(conn, high.max(conn.oneChunkStaging(stride)));
+    try std.testing.expect(system.graph.staging_window.steps < window);
+    try expectStagingWithin(conn, conn.oneChunkStaging(stride));
+    try expectGraphStagingWithin(&system.graph);
     // The same enclosure again: its prepare allocates nothing.
     try fixture.setChunk(&system, 0, 3, 1, fixture.tree);
     var stats = NavUpdateStats{};
@@ -6091,6 +6405,37 @@ test "a level build shrinks its connectivity staging to what a one-chunk batch n
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
     try std.testing.expectEqual(@as(usize, 1), stats.conn_splits);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "levels added together in one step build on one shared staging, freed once at the step's end" {
+    var fixture = try TestWorld.init(16, 1);
+    defer fixture.deinit();
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const conn = &system.graph.connectivity;
+    const stride = system.graph.levelGraph(0).?.border_stride;
+    const addLevels = struct {
+        fn run(world: *TestWorld, count: usize, first_depth: i32) !void {
+            for (0..count) |index| {
+                const level = try world.world.addLevel(first_depth - 32 * @as(i32, @intCast(index)));
+                _ = try world.world.addDenseLayer(level, 0, .floor, world.grass);
+            }
+        }
+    }.run;
+    // One level per step: each step grows the level-sized staging from the floors.
+    try addLevels(&fixture, 1, -32);
+    const single_before = system.graph.pool_grows;
+    try std.testing.expectEqual(@as(usize, 1), (try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null)).levels_built);
+    const single_grows = system.graph.pool_grows - single_before;
+    try expectStagingWithin(conn, conn.oneChunkStaging(stride));
+    // Three in one step: each level's own pools grow from empty, the shared staging once.
+    try addLevels(&fixture, 3, -64);
+    const step_before = system.graph.pool_grows;
+    try std.testing.expectEqual(@as(usize, 3), (try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null)).levels_built);
+    try std.testing.expect(system.graph.pool_grows - step_before < 3 * single_grows);
+    try expectStagingWithin(conn, conn.oneChunkStaging(stride));
+    try expectGraphStagingWithin(&system.graph);
     try fixture.expectMatchesRebuild(&system);
 }
 

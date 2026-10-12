@@ -1207,15 +1207,145 @@ pub fn resizeArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std
 
 /// `resizeArrayList` for any unmanaged list type (cache-line-aligned staging included).
 pub fn resizeList(list: anytype, allocator: std.mem.Allocator, capacity: usize) !void {
-    if (shouldShrinkCapacity(list.capacity, capacity)) {
-        var replacement: @TypeOf(list.*) = .empty;
-        try replacement.ensureTotalCapacity(allocator, capacity);
-        list.deinit(allocator);
-        list.* = replacement;
-        return;
-    }
+    if (shouldShrinkCapacity(list.capacity, capacity)) return replaceEmpty(list, allocator, capacity);
     try list.ensureTotalCapacity(allocator, capacity);
     list.clearRetainingCapacity();
+}
+
+// Replaces `list` with an empty one holding `capacity`, allocated before the old buffer is
+// freed: on error the list keeps its storage and contents.
+fn replaceEmpty(list: anytype, allocator: std.mem.Allocator, capacity: usize) !void {
+    var replacement: @TypeOf(list.*) = .empty;
+    try replacement.ensureTotalCapacity(allocator, capacity);
+    list.deinit(allocator);
+    list.* = replacement;
+}
+
+/// Grows `list` (an `std.ArrayList` or `std.MultiArrayList` shape) to hold `need` items,
+/// geometrically (std's growth), counting one in `grows` when it grew. On error the list keeps
+/// its storage and contents.
+pub fn growList(list: anytype, allocator: std.mem.Allocator, need: usize, grows: *u64) !void {
+    if (need <= list.capacity) return;
+    try list.ensureTotalCapacity(allocator, need);
+    grows.* += 1;
+}
+
+/// Whether a batch staging list (`std.ArrayList` or `std.MultiArrayList` shaped) keeping
+/// `keep` items holds at most twice what a fresh reserve of `keep` gets: the
+/// `shouldShrinkCapacity` hysteresis, measured against std's growth so a list released to
+/// `keep` stays held at the next release.
+pub fn stagingHeld(list: anytype, keep: usize) bool {
+    return !shouldShrinkCapacity(list.capacity, @TypeOf(list.*).growCapacity(keep));
+}
+
+/// Frees a batch staging list down to `keep` items when it holds more (`stagingHeld`), into
+/// an empty list (`resizeList`'s shrink). Never fails: when the smaller buffer cannot be
+/// allocated the list keeps the larger one, which still serves every batch.
+pub fn releaseStaging(list: anytype, allocator: std.mem.Allocator, keep: usize) void {
+    if (stagingHeld(list, keep)) return;
+    replaceEmpty(list, allocator, keep) catch return;
+}
+
+/// Grows a batch staging list to `len` items (`growList`, counted) at a main-thread prepare
+/// seam, before any stage dispatches; the list then holds `len` unwritten items.
+pub fn resizeStaging(list: anytype, allocator: std.mem.Allocator, len: usize, grows: *u64) !void {
+    try growList(list, allocator, len, grows);
+    list.items.len = len;
+}
+
+/// The release window of one owner's batch staging: the population pools' grow-fast,
+/// shrink-slow hysteresis, over the configured `capacity_shrink_window` fixed steps. A list
+/// grows to each batch's need at once, and the batch notes the need in its `Group`. On the
+/// window's last step the owner frees each list down to the most any batch of the window
+/// needed (`kept`), at least its floor, when it holds more (`releaseStaging`). The floor is
+/// the owner's static bound for a batch changing one chunk and the most any batch changing
+/// at most one chunk ever needed, so a single dig never reallocates. Batches whose needs
+/// vary within a window never reallocate, and a dense batch's staging is freed within two
+/// windows of steps, batches or not. A level build's needs never enter the window: the
+/// owner releases at the end of the build's step, down to what the window keeps. Main thread
+/// only; the window never feeds a result.
+pub fn StagingWindow(comptime Group: type) type {
+    return struct {
+        const Self = @This();
+        const Needs = std.EnumArray(Group, usize);
+        // The most each group needed this window, this batch, and in any batch changing at
+        // most one chunk.
+        high: Needs = .initFill(0),
+        batch: Needs = .initFill(0),
+        one_chunk: Needs = .initFill(0),
+        steps: u32 = 0,
+        // This step is the window's last: the owner releases at the step's end.
+        closing: bool = false,
+        // A level build runs: its needs are not noted.
+        building: bool = false,
+        // A level build ran since the last release: the owner releases at the step's end.
+        built: bool = false,
+
+        /// Counts one fixed step of a `length`-step window. O(1).
+        pub fn tick(self: *Self, length: u32) void {
+            self.steps +|= 1;
+            self.closing = self.steps >= @max(length, 1);
+        }
+
+        /// Opens a marks batch's reserve.
+        pub fn beginBatch(self: *Self) void {
+            self.batch = .initFill(0);
+        }
+
+        /// Opens a level build: until `endBuild`, needs are not noted, and the owner releases at
+        /// the end of the step.
+        pub fn beginBuild(self: *Self) void {
+            self.building = true;
+            self.built = true;
+        }
+
+        pub fn endBuild(self: *Self) void {
+            self.building = false;
+        }
+
+        /// Whether the owner releases at this step's end: the window's last step, or a step
+        /// that built a level.
+        pub fn releases(self: *const Self) bool {
+            return self.closing or self.built;
+        }
+
+        /// After the owner's release: a closing window starts the next one; a build's release
+        /// keeps the window running.
+        pub fn released(self: *Self) void {
+            if (self.closing) self.reset();
+            self.built = false;
+        }
+
+        /// Notes a list's `need` in its group, for this window and this batch; a level build's
+        /// needs are not noted.
+        pub fn note(self: *Self, group: Group, need: usize) void {
+            if (self.building) return;
+            const high = self.high.getPtr(group);
+            high.* = @max(high.*, need);
+            const batch = self.batch.getPtr(group);
+            batch.* = @max(batch.*, need);
+        }
+
+        /// Closes a marks batch whose reserve succeeded; `one_chunk` when it changed at most
+        /// one chunk, so its needs join the floor.
+        pub fn endBatch(self: *Self, one_chunk: bool) void {
+            if (!one_chunk) return;
+            for (&self.one_chunk.values, self.batch.values) |*floor, need| floor.* = @max(floor.*, need);
+        }
+
+        /// The size `group`'s lists keep in a release: the window's high, the one-chunk floor,
+        /// and `floor` (the owner's static bound).
+        pub fn kept(self: *const Self, group: Group, floor: usize) usize {
+            return @max(self.high.get(group), self.one_chunk.get(group), floor);
+        }
+
+        /// Starts the next window, after the owner released its staging.
+        pub fn reset(self: *Self) void {
+            self.high = .initFill(0);
+            self.steps = 0;
+            self.closing = false;
+        }
+    };
 }
 
 /// `resizeList` to exactly `len` items, writing none: for a buffer nothing reads past a
@@ -1332,4 +1462,89 @@ test "resize helpers shrink-and-free below capacity and grow-reuse at or above i
     try std.testing.expect(list.capacity < grown_capacity);
     try std.testing.expect(list.capacity >= 2);
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
+test "staging grows counted, and a release frees only a list holding more than twice what keeping its size gets" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayList(u64) = .empty;
+    defer list.deinit(allocator);
+    var grows: u64 = 0;
+
+    try resizeStaging(&list, allocator, 1000, &grows);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+    try std.testing.expectEqual(@as(usize, 1000), list.items.len);
+    try resizeStaging(&list, allocator, 10, &grows);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+    const dense_capacity = list.capacity;
+    // Keeping at least half of what the capacity serves frees nothing.
+    releaseStaging(&list, allocator, 1000 / 2);
+    try std.testing.expectEqual(dense_capacity, list.capacity);
+    // Keeping less frees down to it, uncounted, and empties the list; a second release
+    // keeping the same size frees nothing more.
+    releaseStaging(&list, allocator, 64);
+    const kept_capacity = std.ArrayList(u64).growCapacity(64);
+    try std.testing.expectEqual(kept_capacity, list.capacity);
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
+    try std.testing.expect(stagingHeld(&list, 64));
+    releaseStaging(&list, allocator, 64);
+    try std.testing.expectEqual(kept_capacity, list.capacity);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+    releaseStaging(&list, allocator, 0);
+    try std.testing.expect(list.capacity <= std.ArrayList(u64).growCapacity(0));
+
+    var rows: std.MultiArrayList(struct { a: u32, b: u64 }) = .empty;
+    defer rows.deinit(allocator);
+    try growList(&rows, allocator, 500, &grows);
+    try std.testing.expectEqual(@as(u64, 2), grows);
+    releaseStaging(&rows, allocator, 20);
+    try std.testing.expect(stagingHeld(&rows, 20) and rows.capacity < 500);
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+}
+
+test "a staging release that cannot allocate keeps the larger buffer, and a failed growth keeps the list's storage" {
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(std.testing.allocator);
+    var grows: u64 = 0;
+    try growList(&list, std.testing.allocator, 4096, &grows);
+    const dense_capacity = list.capacity;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    releaseStaging(&list, failing.allocator(), 8);
+    try std.testing.expectEqual(dense_capacity, list.capacity);
+    try resizeStaging(&list, failing.allocator(), 8, &grows);
+    try std.testing.expectEqual(@as(usize, 8), list.items.len);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+
+    try std.testing.expectError(error.OutOfMemory, growList(&list, failing.allocator(), dense_capacity + 1, &grows));
+    try std.testing.expectEqual(dense_capacity, list.capacity);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+}
+
+test "a staging window closes on its configured last step, keeping its own batches' high and the one-chunk floor" {
+    const Group = enum { keys, rows };
+    var window: StagingWindow(Group) = .{};
+    const length: u32 = 6;
+    for (0..length - 1) |step| {
+        window.tick(length);
+        try std.testing.expect(!window.closing);
+        // A batch on some steps only; step 3's is dense, step 0's changes one chunk.
+        if (step % 3 == 0) {
+            window.beginBatch();
+            window.note(.keys, if (step == 3) 900 else 10);
+            window.note(.rows, 2);
+            window.endBatch(step == 0);
+        }
+    }
+    window.tick(length);
+    try std.testing.expect(window.closing);
+    try std.testing.expectEqual(@as(usize, 900), window.kept(.keys, 4));
+    try std.testing.expectEqual(@as(usize, 4), window.kept(.rows, 4));
+    window.reset();
+    // A quiet window keeps the one-chunk floor and the static floor.
+    for (0..length - 1) |_| window.tick(length);
+    try std.testing.expect(!window.closing and window.steps == length - 1);
+    window.tick(length);
+    try std.testing.expect(window.closing);
+    try std.testing.expectEqual(@as(usize, 10), window.kept(.keys, 4));
+    try std.testing.expectEqual(@as(usize, 2), window.kept(.rows, 1));
 }

@@ -607,6 +607,18 @@ fn sortUnique(keys: []u64) usize {
 const PlanStream = enum { changed, dirty, patch };
 const plan_streams = std.meta.tags(PlanStream).len;
 
+// Need groups of the batch lists for their release window (`types.StagingWindow`): each plan
+// stream's staging and key list (they swap buffers), and the plan ranges.
+const StagingGroup = enum { changed, dirty, patch, ranges };
+
+fn streamGroup(stream: PlanStream) StagingGroup {
+    return switch (stream) {
+        .changed => .changed,
+        .dirty => .dirty,
+        .patch => .patch,
+    };
+}
+
 // One plan range's key windows in the staging lists.
 const PlanWindow = struct {
     start: [plan_streams]usize,
@@ -1544,7 +1556,8 @@ pub const NavGraph = struct {
     // The world-wide content revision every level was last checked against.
     built_world_revision: u32 = 0,
     // Batch buffers, reused across batches. `changed_masks` holds, per changed key of the
-    // last marks batch, the cells it flipped, valid until the next batch.
+    // marks batch, the cells it flipped; it and the key lists are valid only within the
+    // batch result (`NavBatchResult`), as the step's staging release may free them.
     changed_keys: KeyList = .empty,
     changed_masks: std.ArrayList(ChunkBits) = .empty,
     // Per changed key: the block slot its remask may fill (`no_block` when it can only end
@@ -1568,9 +1581,11 @@ pub const NavGraph = struct {
     last_plan_batch: BatchStats = .{},
     last_patch_batch: BatchStats = .{},
     last_remask_batch: BatchStats = .{},
+    // The batch lists' release window over marks batches.
+    staging_window: types.StagingWindow(StagingGroup) = .{},
     // Set between a prepared marks batch and its commit or abort.
     batch_prepared: bool = false,
-    /// Telemetry: record and link-slot pool growths. The first logs once.
+    /// Telemetry: growths of the nav pools and of the batch staging. The first logs once.
     pool_grows: u64 = 0,
     pool_growth_logged: bool = false,
 
@@ -1874,13 +1889,19 @@ pub const NavGraph = struct {
         const level_count: usize = if (world) |world_system| world_system.levelCount() else 1;
         try fresh.levels.ensureTotalCapacity(self.allocator, level_count);
         try fresh.level_graphs.ensureTotalCapacity(self.allocator, level_count);
-        _ = try fresh.plan_levels.reserve(self.allocator, level_count);
+        if (try fresh.plan_levels.reserve(self.allocator, level_count)) fresh.pool_grows += 1;
         var stats = NavUpdateStats{};
+        // Every level has the same chunks, so the levels share one level-sized staging, freed
+        // once after the closure.
         for (0..level_count) |level| try fresh.buildLevel(colliders, world, @intCast(level), threads, &stats);
         // The one-way closure over every level at once, after the levels and before the swap.
         const fresh_levels = BatchLevels{ .grids = fresh.levels.items, .graphs = fresh.level_graphs.items };
+        fresh.beginBuild();
         const closure_counters = try fresh.connectivity.buildClosure(self.allocator, fresh_levels, world, closureThreads(threads), &fresh.pool_grows, &stats);
+        fresh.endBuild();
         addClosureStats(&stats, &fresh.connectivity, closure_counters);
+        // The world build's staging frees now, down to the floors.
+        fresh.finishStagingStep();
         if (world) |world_system| {
             fresh.link_bounds.foldLinks(world_system.levelLinks());
             fresh.links_applied = world_system.levelLinks().len;
@@ -1899,8 +1920,11 @@ pub const NavGraph = struct {
     /// freeing the old one, with its connectivity nodes. An error leaves the graph unchanged.
     /// O(chunks of the level + its nodes and edges); the remask, patch, and connectivity
     /// stages thread over its chunks (the flood over its searches). Never touches
-    /// `links_applied`.
+    /// `links_applied`. The batch staging grows to the level, its needs kept out of the release
+    /// window; the step's `finishStagingStep` frees it.
     pub fn buildLevel(self: *NavGraph, colliders: ColliderView, world: ?*const WorldSystem, level_index: u16, threads: ?NavUpdateThreads, stats: *NavUpdateStats) !void {
+        self.beginBuild();
+        defer self.endBuild();
         std.debug.assert(@as(usize, level_index) <= self.levels.items.len);
         const chunk_count = self.chunkCount();
         var section = StageTimer.begin();
@@ -1914,12 +1938,14 @@ pub const NavGraph = struct {
         fresh_graph.plan = try .init(self.allocator, chunk_count);
         stats.main.reserve_ns += section.lap();
 
-        // Plan: every chunk of the level, in order.
+        // Plan: every chunk of the level, in order. A build has no dirty keys; their list
+        // holds one changed chunk's, as every key list does once the build releases them.
         section = StageTimer.begin();
-        try self.changed_keys.resize(self.allocator, chunk_count);
-        try self.patch_keys.resize(self.allocator, chunk_count);
-        // The marks batch's key lists share the build's one-level window high-water.
-        try self.dirty_keys.ensureTotalCapacity(self.allocator, chunk_count);
+        try types.growList(&self.dirty_keys, self.allocator, one_chunk_keys[@backingInt(PlanStream.dirty)], &self.pool_grows);
+        self.staging_window.note(.changed, chunk_count);
+        self.staging_window.note(.patch, chunk_count);
+        try types.resizeStaging(&self.changed_keys, self.allocator, chunk_count, &self.pool_grows);
+        try types.resizeStaging(&self.patch_keys, self.allocator, chunk_count, &self.pool_grows);
         self.dirty_keys.clearRetainingCapacity();
         for (0..chunk_count) |chunk| {
             const key = chunkKey(level_index, @intCast(chunk));
@@ -1987,6 +2013,58 @@ pub const NavGraph = struct {
         self.logPoolGrowth();
     }
 
+    // What a marks batch changing one chunk keeps in each batch list, per plan stream: the
+    // static floor no list frees below.
+    const one_chunk_keys: [plan_streams]usize = .{ 1, 1, 5 };
+
+    /// Counts one fixed step of the batch staging's release windows (`length` steps, the
+    /// configured `capacity_shrink_window`), on the main thread before the step's nav work.
+    /// O(1). Follow with `finishStagingStep` once the step's nav work ends.
+    pub fn tickStagingStep(self: *NavGraph, length: u32) void {
+        self.staging_window.tick(length);
+        self.connectivity.staging_window.tick(length);
+    }
+
+    /// Ends a step's nav work, after every batch and level build of the step: on a release
+    /// window's last step, or a step that built levels, frees every batch staging list (the
+    /// graph's and connectivity's) down to what it keeps (`types.StagingWindow.kept`: the
+    /// window's batches and the floors, never a build's level-sized needs) when it holds more;
+    /// a closing window starts the next. The only place staging frees, once however many
+    /// levels the step built. Never fails, never inside a stage. O(1), or O(lists) plus the
+    /// bytes freed once per window or build step.
+    pub fn finishStagingStep(self: *NavGraph) void {
+        if (self.staging_window.releases()) self.releaseLists();
+        if (self.connectivity.staging_window.releases()) self.connectivity.releaseWindow(self.allocator, borderPortalBound(self.chunk_tiles));
+    }
+
+    fn beginBuild(self: *NavGraph) void {
+        self.staging_window.beginBuild();
+        self.connectivity.staging_window.beginBuild();
+    }
+
+    fn endBuild(self: *NavGraph) void {
+        self.staging_window.endBuild();
+        self.connectivity.staging_window.endBuild();
+    }
+
+    fn releaseLists(self: *NavGraph) void {
+        const allocator = self.allocator;
+        const window = &self.staging_window;
+        for (std.meta.tags(PlanStream), one_chunk_keys, &self.plan_staging) |stream, floor, *staging| {
+            const keep = window.kept(streamGroup(stream), floor);
+            types.releaseStaging(self.keyList(stream), allocator, keep);
+            types.releaseStaging(staging, allocator, keep);
+        }
+        const changed_keep = window.kept(.changed, one_chunk_keys[@backingInt(PlanStream.changed)]);
+        types.releaseStaging(&self.changed_masks, allocator, changed_keep);
+        types.releaseStaging(&self.remask_slots, allocator, changed_keep);
+        types.releaseStaging(&self.remask_deltas, allocator, changed_keep);
+        types.releaseStaging(&self.patch_info, allocator, window.kept(.patch, one_chunk_keys[@backingInt(PlanStream.patch)]));
+        types.releaseStaging(&self.plan_windows, allocator, window.kept(.ranges, 1));
+        types.releaseStaging(&self.plan_tallies, allocator, window.kept(.ranges, 1));
+        window.released();
+    }
+
     /// The links of `world` not yet folded into records.
     pub fn newLinks(self: *const NavGraph, world: *const WorldSystem) []const LevelLink {
         if (!self.world_backed) return &.{};
@@ -2021,9 +2099,11 @@ pub const NavGraph = struct {
             .new_link_count = new_links.len,
             .world = if (self.world_backed) world else null,
         };
+        // The batch notes its needs in the release window (`finishStagingStep`).
+        self.staging_window.beginBatch();
         try self.planKeys(world, marks, new_links, planThreads(threads), stats);
         var section = StageTimer.begin();
-        try self.changed_masks.resize(self.allocator, self.changed_keys.items.len);
+        try types.resizeStaging(&self.changed_masks, self.allocator, self.changed_keys.items.len, &self.pool_grows);
         if (self.patch_keys.items.len != 0) {
             const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
             try self.planPatchInfo(prepared.world);
@@ -2048,6 +2128,7 @@ pub const NavGraph = struct {
         // The one-way registry rows the commit appends for the new links.
         try self.connectivity.reserveRegistry(self.allocator, new_links, &self.pool_grows);
         stats.main.reserve_ns += section.lap();
+        self.staging_window.endBatch(self.changed_keys.items.len <= 1);
         self.batch_prepared = true;
         return prepared;
     }
@@ -2106,7 +2187,7 @@ pub const NavGraph = struct {
         if (self.pool_grows == 0 or self.pool_growth_logged) return;
         self.pool_growth_logged = true;
         if (comptime logging.enabled(.info) and !builtin.is_test)
-            logging.game.info("nav record pools grew ({} growths so far)", .{self.pool_grows});
+            logging.game.info("nav pools or batch staging grew ({} growths so far)", .{self.pool_grows});
     }
 
     // A mark's inclusive nav-cell span, or null when it misses every built level.
@@ -2199,8 +2280,9 @@ pub const NavGraph = struct {
         } else .{ .range_count = 1, .items_per_range = item_count, .selection = null };
 
         // Windows: each range's key bounds, starting on a cache line.
-        try self.plan_windows.resize(self.allocator, selection.range_count);
-        try self.plan_tallies.resize(self.allocator, selection.range_count);
+        self.staging_window.note(.ranges, selection.range_count);
+        try types.resizeStaging(&self.plan_windows, self.allocator, selection.range_count, &self.pool_grows);
+        try types.resizeStaging(&self.plan_tallies, self.allocator, selection.range_count, &self.pool_grows);
         var totals: [plan_streams]usize = @splat(0);
         for (self.plan_windows.items, 0..) |*window, range_index| {
             for (&totals) |*total| total.* = std.mem.alignForward(usize, total.*, key_window_alignment);
@@ -2213,8 +2295,9 @@ pub const NavGraph = struct {
             window.end = totals;
         }
         var staging: [plan_streams][]u64 = undefined;
-        for (&self.plan_staging, totals, &staging) |*list, total, *slice| {
-            try list.resize(self.allocator, total);
+        for (std.meta.tags(PlanStream), &self.plan_staging, totals, &staging) |stream, *list, total, *slice| {
+            self.staging_window.note(streamGroup(stream), total);
+            try types.resizeStaging(list, self.allocator, total, &self.pool_grows);
             slice.* = list.items;
         }
         @memset(self.plan_tallies.items, .{});
@@ -2285,7 +2368,10 @@ pub const NavGraph = struct {
         for (self.plan_tallies.items) |tally| {
             for (&totals, tally.counts) |*total, count| total.* += count;
         }
-        for (std.meta.tags(PlanStream), totals) |stream, total| try self.keyList(stream).ensureTotalCapacity(self.allocator, total);
+        for (std.meta.tags(PlanStream), totals) |stream, total| {
+            self.staging_window.note(streamGroup(stream), total);
+            try types.growList(self.keyList(stream), self.allocator, total, &self.pool_grows);
+        }
 
         const level_graphs = self.level_graphs.items;
         for (self.plan_windows.items, self.plan_tallies.items) |window, tally| {
@@ -2352,7 +2438,8 @@ pub const NavGraph = struct {
     // (statics only add blocked cells), and one whose orthogonal neighbours are all BLOCKED
     // has no border run, so it needs a record only for an endpoint. O(keys + endpoints).
     fn planPatchInfo(self: *NavGraph, world: ?*const WorldSystem) !void {
-        try self.patch_info.resize(self.allocator, self.patch_keys.items.len);
+        const patch_count = self.patch_keys.items.len;
+        try types.resizeStaging(&self.patch_info, self.allocator, patch_count, &self.pool_grows);
         const cx_count = self.chunksX();
         const cy_count = self.chunksY();
         for (self.patch_keys.items, self.patch_info.items) |key, *info| {
@@ -2433,8 +2520,8 @@ pub const NavGraph = struct {
     // to cover the claims (worst case: every such key ends mixed). O(keys).
     fn reserveCellBlocks(self: *NavGraph, levels: BatchLevels, world: ?*const WorldSystem, colliders: ColliderView) !void {
         const keys = self.changed_keys.items;
-        try self.remask_slots.resize(self.allocator, keys.len);
-        try self.remask_deltas.resize(self.allocator, keys.len);
+        try types.resizeStaging(&self.remask_slots, self.allocator, keys.len, &self.pool_grows);
+        try types.resizeStaging(&self.remask_deltas, self.allocator, keys.len, &self.pool_grows);
         var start: usize = 0;
         while (start < keys.len) {
             const level = keyLevel(keys[start]);

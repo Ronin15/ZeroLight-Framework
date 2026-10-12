@@ -930,13 +930,20 @@ pub const PathfindingSystem = struct {
     /// step's goal table. A committed step stays on a later error; marks and the
     /// level, revision, and link gaps stay pending for the next call. The world-wide revision
     /// is compared once; levels are walked only when it moved. A non-null `thread_system`
-    /// lets each stage thread under its tuner.
+    /// lets each stage thread under its tuner. Counts one step of the batch staging's release
+    /// windows (`NavGraph.tickStagingStep`).
     pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
         var stats = NavUpdateStats{};
         self.goals.invalidate();
+        // The step's tick of the batch staging's release windows, before any batch; the
+        // release, if the window closes, after every batch and level build of the step.
+        self.graph.tickStagingStep(self.capacity.capacity_shrink_window);
+        defer self.graph.finishStagingStep();
         const threads = self.navUpdateThreads(thread_system);
         const view = colliders.view();
         if (self.graph.world_backed) {
+            // Every level build of the step shares one level-sized staging, freed once at the
+            // step's end (`finishStagingStep`), after the marks batch.
             while (self.graph.levelCount() < world.levelCount()) {
                 try self.graph.buildLevel(view, world, @intCast(self.graph.levelCount()), threads, &stats);
             }
@@ -987,7 +994,12 @@ pub const PathfindingSystem = struct {
         self.pending_mark_off_main_ns = 0;
         self.pending_mark_inline_ns = 0;
         self.pending_mark_main_ns = 0;
-        if (!self.hasPendingNavUpdates(world)) return .{ .off_main_stage_ns = mark_off_main_ns, .inline_stage_ns = mark_inline_ns, .main = .{ .mark_ns = mark_main_ns } };
+        if (!self.hasPendingNavUpdates(world)) {
+            // A quiet step still counts toward the batch staging's release windows.
+            self.graph.tickStagingStep(self.capacity.capacity_shrink_window);
+            self.graph.finishStagingStep();
+            return .{ .off_main_stage_ns = mark_off_main_ns, .inline_stage_ns = mark_inline_ns, .main = .{ .mark_ns = mark_main_ns } };
+        }
         try frame.events.ensureCanAppend(1);
         var stats = try self.applyBufferedNavUpdates(colliders, world, thread_system);
         stats.off_main_stage_ns += mark_off_main_ns;
