@@ -227,6 +227,15 @@ pub const GroupField = struct {
         return self.blocks.capacity * field_block_bytes + self.directory.len * @sizeOf(DirEntry);
     }
 
+    /// An over-estimate of `residentBytes` for a field capped at `max_cells` cells on a level
+    /// of `level_chunks` chunks: the pool never grows past what a build can claim, and its
+    /// directory is sized to the pool. A directory too wide to build saturates.
+    pub fn storageBytesBound(max_cells: usize, level_chunks: usize) usize {
+        const blocks = @min(@max(1, max_cells), level_chunks);
+        const rows = hashTableSlots(blocks) catch return std.math.maxInt(usize);
+        return blocks *| field_block_bytes +| rows *| @sizeOf(DirEntry);
+    }
+
     /// Grows the pool to at least `min_blocks` blocks (at least doubling, never past what
     /// a build toward `max_cells` on `grid` can claim). Allocation-free when the pool
     /// already holds them. Failure-atomic: the directory and pool are allocated before
@@ -1076,6 +1085,24 @@ test "GroupField build cost is bounded by max_cells independent of world size" {
     try std.testing.expectEqual(max_cells, covered);
     // A cell far outside the capped radius reads as uncovered, not a default direction.
     try std.testing.expect(field.sample(&grid, grid.cellCount() - 1) == null);
+}
+
+test "a field built to its cap, then past it with a wider cap, stays within its storage bound" {
+    const allocator = std.testing.allocator;
+    var grid = NavGrid{};
+    defer grid.deinit(allocator);
+    try grid.prepare(allocator, 0, 64, 64, default_cell_size, default_nav_chunk_tiles);
+    const chunks = grid.dir.items.len;
+    var field = GroupField{};
+    defer field.deinit(allocator);
+    for ([_]usize{ 40, grid.cellCount() }) |max_cells| {
+        try std.testing.expect(try beginTestBuild(allocator, &field, &grid, 0, max_cells, 1000));
+        try buildToReady(allocator, &field, &grid, 1000);
+        try std.testing.expect(field.residentBytes() <= GroupField.storageBytesBound(max_cells, chunks));
+    }
+    // A cap past the level's cells claims every chunk: the bound is the whole level's.
+    try std.testing.expectEqual(GroupField.storageBytesBound(chunks, chunks), GroupField.storageBytesBound(grid.cellCount(), chunks));
+    try std.testing.expect(field.residentBytes() > GroupField.storageBytesBound(chunks / 2, chunks));
 }
 
 test "an unbuilt field holds no memory and never builds" {

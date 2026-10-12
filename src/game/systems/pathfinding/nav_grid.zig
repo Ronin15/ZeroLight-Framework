@@ -17,6 +17,9 @@ const ChunkForm = world_terrain.ChunkForm;
 const max_chunk_cells = world_terrain.max_chunk_cells;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
 const types = @import("types.zig");
+const pooledRows = @import("nav_graph.zig").pooledRows;
+const pooledList = @import("nav_graph.zig").pooledList;
+const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const default_cell_size = types.default_cell_size;
 const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
 const no_component = types.no_component;
@@ -45,6 +48,9 @@ const NavCellBlock = struct {
     blocked_count: u16,
     label_count: u8,
 };
+
+// One pooled block's columns.
+const cell_block_bytes = @sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8);
 
 inline fn testBit(words: *const ChunkBits, local: usize) bool {
     return (words[local >> 6] >> @intCast(local & 63)) & 1 != 0;
@@ -660,8 +666,18 @@ pub const NavGrid = struct {
     /// Bytes held by the directory and the block pool (allocated capacity).
     pub fn residentBytes(self: *const NavGrid) usize {
         return self.dir.capacity * @sizeOf(u32) +
-            self.blocks.capacity * (@sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8)) +
+            self.blocks.capacity * cell_block_bytes +
             self.block_free.capacity * @sizeOf(u32);
+    }
+
+    /// An over-estimate of `residentBytes` summed over `levels` levels of `chunks` chunks
+    /// each, whose block needs (mixed chunks, plus the fresh blocks a batch takes before it
+    /// frees the old) sum to `block_need`: the directories, and each level's block pool and
+    /// free list at their worst growth (the pool doubles past its need, std then grows each
+    /// list by half again plus its first slots).
+    pub fn storageBytesBound(levels: usize, chunks: usize, block_need: usize) usize {
+        const blocks = pooledRows(NavCellBlock, levels, block_need);
+        return levels *| listBytesBound(u32, chunks) +| blocks *| cell_block_bytes +| pooledList(u32, levels, blocks);
     }
 
     /// Mixed chunks holding a cell block.
@@ -767,6 +783,23 @@ test "a block pool grow that fails after the pool moved keeps the column views o
     // The retry grows the pool; the claimed block kept its count.
     try grid.ensureFreeBlocks(std.testing.allocator, needed, &pool_grows);
     try std.testing.expectEqual(@as(u16, 7), grid.block_counts[slot]);
+}
+
+test "a level whose every chunk turns mixed one block at a time stays within its storage bound" {
+    var grid = NavGrid{};
+    defer grid.deinit(std.testing.allocator);
+    try grid.prepare(std.testing.allocator, 0, 64, 64, 1, 4);
+    const chunks = grid.chunkGeometry().chunkCount();
+    var pool_grows: u64 = 0;
+    // One claim per chunk, each grown for just the next one: the pool doubles at its worst.
+    for (0..chunks) |_| {
+        try grid.ensureFreeBlocks(std.testing.allocator, 1, &pool_grows);
+        _ = grid.claimBlock();
+    }
+    try std.testing.expect(pool_grows > 1);
+    try std.testing.expect(grid.residentBytes() <= NavGrid.storageBytesBound(1, chunks, chunks));
+    // The pool's doubling past its need is charged: half the blocks' bound is short of it.
+    try std.testing.expect(grid.residentBytes() > NavGrid.storageBytesBound(1, chunks, chunks / 2));
 }
 
 test "pathfinding nav grid blocked set matches per-level composed mask" {

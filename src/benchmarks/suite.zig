@@ -18,8 +18,6 @@ const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfi
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const AbstractSlot = @import("../game/systems/pathfinding/scratch.zig").AbstractSlot;
 const SearchSlot = @import("../game/systems/pathfinding/scratch.zig").SearchSlot;
-const DirEntry = @import("../game/systems/pathfinding/group_field.zig").DirEntry;
-const field_block_bytes = @import("../game/systems/pathfinding/group_field.zig").field_block_bytes;
 const OpenNode = @import("../game/systems/pathfinding/types.zig").OpenNode;
 const StitchedCell = @import("../game/systems/pathfinding/types.zig").StitchedCell;
 const hashTableSlots = @import("../game/systems/pathfinding/types.zig").hashTableSlots;
@@ -29,8 +27,9 @@ const RegRecord = @import("../game/systems/pathfinding/types.zig").RegRecord;
 const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 const ResultCache = @import("../game/systems/pathfinding/caches.zig").ResultCache;
-const reachabilityBytesBound = @import("../game/systems/pathfinding/connectivity.zig").storageBytesBound;
-const max_border_portals = @import("../game/systems/pathfinding/nav_graph.zig").max_border_portals;
+const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
+const GroupField = @import("../game/systems/pathfinding/group_field.zig").GroupField;
+const PathfindingSystem = @import("../game/systems/pathfinding/system.zig").PathfindingSystem;
 const SolvedPath = @import("../game/systems/pathfinding/system.zig").PathfindingSystem.SolvedPath;
 const ChunkListMap = @import("../game/systems/chunk_list_map.zig").ChunkListMap;
 
@@ -826,7 +825,7 @@ fn isSteeringAgentGroup(group_name: []const u8) bool {
 
 fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
-    if (std.mem.eql(u8, group_name, "movement-apply-intents")) return "moving agents";
+    if (std.mem.startsWith(u8, group_name, "movement-apply-intents")) return "moving agents";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
     if (std.mem.eql(u8, group_name, "ai-memory")) return "AI agents";
@@ -856,6 +855,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "chunk-scale-explosion-fill")) return "(sparse props * 10^10 + region chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-enclose")) return "(variant * 10^10 + pockets, pocket edge, or tunnel chunks * 10^7 + level side * 1000 + levels)";
     if (isChunkScaleBatchGroup(group_name) or isChunkScaleNavBatchGroup(group_name)) return "(region chunks * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-dig")) return "(variant * 10^11 + resident layers * 10^9 + window edge chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(resident layers * 10^9 + window edge chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-level-enter")) return "(resident layers * 10^9 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(replace case * 10^7 + level side * 1000 + levels)";
@@ -1297,7 +1297,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         var stage_buffer: [2048]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
     }
-    if (std.mem.eql(u8, group_name, "movement-apply-intents")) {
+    if (std.mem.startsWith(u8, group_name, "movement-apply-intents")) {
         var apply_buffer: [32]u8 = undefined;
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
@@ -1830,18 +1830,56 @@ pub const NavSizeConfig = struct {
     /// row; every link keeps its one-way registry entry. The default charges every link as
     /// one-way.
     oneway_links: usize = std.math.maxInt(usize),
+    /// The most terminals one one-way system holds. The default charges one system holding
+    /// every terminal.
+    oneway_system_terminals: usize = std.math.maxInt(usize),
+    /// The largest marks batch the workload runs; the default charges the worst.
+    batch: NavBatch = .{},
+    /// The built world's chunk forms and link endpoints (`NavGraph.storageContentOf`), plus
+    /// what the workload adds; null charges every chunk mixed.
+    content: ?NavGraph.StorageContent = null,
+};
+
+/// The largest marks batch of a nav scaling workload: the chunks its marks span (each mark
+/// counted, at most one per changed cell or obstacle rect), its new links, and its distinct
+/// chunk keys (its changed chunks with their four neighbours and both endpoint chunks of
+/// each new link, over every level it touches). A batch reserves the graph's and
+/// connectivity's staging per key, and the staging keeps the largest batch's size. The
+/// defaults charge a mark per cell, every link, and every chunk.
+pub const NavBatch = struct {
+    mark_chunks: usize = std.math.maxInt(usize),
+    links: usize = std.math.maxInt(usize),
+    keys: usize = std.math.maxInt(usize),
+
+    /// A nav that runs no marks batch after its build.
+    pub const none: NavBatch = .{ .mark_chunks = 0, .links = 0, .keys = 0 };
+};
+
+// `navStorageBytes` by what reports it at run time: the graph (`NavGraph.residentBytes`),
+// the group fields (`GroupField.residentBytes`), and the rest of the nav, which reports no
+// bytes.
+const NavStorageParts = struct {
+    graph: usize,
+    group_fields: usize,
+    rest: usize,
+
+    fn total(self: NavStorageParts) usize {
+        return self.graph +| self.group_fields +| self.rest;
+    }
 };
 
 /// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
-/// ceiling: per-level chunk directories, cell blocks, and records (every chunk mixed and
-/// holding portals), link slots, one level's batch window, per-participant search scratch,
-/// the tier-1 corridor pool, group fields, the result cache with the long-block pages of
-/// `long_results`, the path registry, the goal table, and reachability (connectivity node,
-/// comp, and root pools with the flood's buffers, and the one-way closure's links,
-/// terminals, H-components, and arena for `oneway_links`, and a one-way registry entry per
-/// link). Search scratch and
-/// group fields are sized by their node and cell budgets, never by level cells.
+/// ceiling: the graph (`NavGraph.storageBytesBound`), group fields
+/// (`GroupField.storageBytesBound`), per-participant search scratch, the tier-1 corridor
+/// pool, the result cache with the long-block pages of `long_results`, the path registry,
+/// and the goal table. Search scratch and group fields are sized by their node and cell
+/// budgets, never by level cells.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
+    return navStorageParts(config).total();
+}
+
+// `navStorageBytes` split by what reports it at run time.
+fn navStorageParts(config: NavSizeConfig) NavStorageParts {
     // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
     // abstract node and stitched cell caps, escalated solves per step, group field cells,
     // results cached per agent, and the per-step solve ceiling.
@@ -1864,22 +1902,6 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     const levels: usize = @max(1, config.levels);
     const chunks_per_side = (config.side + chunk_tiles - 1) / chunk_tiles;
     const chunks = chunks_per_side * chunks_per_side;
-
-    // Per level and chunk: the cell and record directories (4 + 4), a cell block with its
-    // free-list entry (296), and a record with its 32-portal border window and free-list
-    // entry (104 + 4).
-    const level_chunks = levels * chunks * (8 + 296 + 104 + 4);
-    // Per link: two endpoint portals (3 B) and links (16 B), in two link slots (48 B of list
-    // headers and a 4 B free-list entry each).
-    const link_slots = config.links * 2 * (3 + 16 + 48 + 4);
-    // One level's batch window: changed, patch, and dirty keys and three plan staging lists
-    // (8 B each), patch info (8), and remask slots and deltas (4 + 4).
-    const batch = chunks * (6 * 8 + 8 + 4 + 4);
-    // Per group field: one block per goal-level chunk it can cover (at most its cell cap)
-    // and the chunk directory. A directory too wide to build saturates past any limit.
-    const field_blocks = @min(group_field_cells, chunks);
-    const directory_rows = hashTableSlots(field_blocks) catch std.math.maxInt(usize);
-    const group_fields = config.group_fields *| (field_blocks * field_block_bytes +| directory_rows *| @sizeOf(DirEntry));
     // Per participant: the search table, the open heap (four entries per node), the path
     // buffer, and the tier-0 corridor scratch.
     const explored_heap_entries: usize = @max(16, explored_nodes * 4);
@@ -1904,18 +1926,38 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Goal table, per intent (one per agent): four map slots of key, value, and stamp, an
     // entry's ref and live cell, its scan slot, and a scan tally per aligned range.
     const goal_table = agents * (4 * (@sizeOf(u64) + 2 * @sizeOf(u32)) + @sizeOf(u64) + @sizeOf(u32) + @sizeOf(u64) + 2 * @sizeOf(usize));
-    // Reachability: a node row per portal a chunk record holds (its border window and every
-    // link endpoint), a flood participant per threaded participant, and one node's slack of
-    // its border flags and the endpoints one chunk's cells can hold.
-    const nodes = levels * chunks * max_border_portals + 2 * config.links;
-    const chunk_endpoints = @min(2 * config.links, chunk_tiles * chunk_tiles);
-    // The bound charges the one-way registry entry for its one-way links only; every link holds one.
-    const oneway_links = @min(config.oneway_links, config.links);
-    const oneway_registry = (config.links - oneway_links) * @sizeOf(u32);
-    const reachability = reachabilityBytesBound(nodes, oneway_links, participants, max_border_portals + chunk_endpoints) + oneway_registry;
-    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results + registry + goal_table + reachability;
+    const graph = NavGraph.storageBytesBound(.{
+        .chunks = chunks,
+        .levels = levels,
+        .links = config.links,
+        .oneway_links = config.oneway_links,
+        .oneway_system_terminals = config.oneway_system_terminals,
+        .participants = participants,
+        .batch_mark_chunks = config.batch.mark_chunks,
+        .batch_links = config.batch.links,
+        .batch_keys = config.batch.keys,
+        .content = config.content,
+    });
+    return .{
+        .graph = graph,
+        .group_fields = config.group_fields *| GroupField.storageBytesBound(group_field_cells, chunks),
+        .rest = search + tier1_pool + results + registry + goal_table,
+    };
 }
 
+/// Fails when a built nav's measured graph or group-field bytes exceed what
+/// `navStorageParts(config)` charges for them, printing both.
+pub fn checkNavBytes(group_name: []const u8, item_count: usize, config: NavSizeConfig, system: *const PathfindingSystem) !void {
+    const parts = navStorageParts(config);
+    const graph_bytes = system.graph.residentBytes();
+    var field_bytes: usize = 0;
+    for (system.group_fields.items) |*field| field_bytes += field.residentBytes();
+    if (graph_bytes <= parts.graph and field_bytes <= parts.group_fields) return;
+    std.debug.print("  {s} {}: nav graph holds {} B against {} B charged, group fields {} B against {} B\n", .{
+        group_name, item_count, graph_bytes, parts.graph, field_bytes, parts.group_fields,
+    });
+    return error.NavBytesPastEstimate;
+}
 // Rows the pathfinding tables reserve for `keys` keys; the library defaults sized here
 // always fit, so an unbuildable table fails the build.
 fn tableRows(comptime keys: usize) usize {
@@ -2261,7 +2303,7 @@ test "batch modes align to cache-line item boundaries" {
 }
 
 test "nav storage charges the one-way closure for one-way links only, every link by default" {
-    const base = NavSizeConfig{ .side = 256, .levels = 2, .links = 4096, .participant_count = 1, .agent_budget = 8, .group_fields = 1 };
+    const base = NavSizeConfig{ .side = 256, .levels = 2, .links = 4096, .participant_count = 1, .agent_budget = 8, .group_fields = 1, .batch = .{ .mark_chunks = 1, .links = 0, .keys = 5 } };
     var two_way = base;
     two_way.oneway_links = 0;
     var all_oneway = base;
@@ -2270,11 +2312,34 @@ test "nav storage charges the one-way closure for one-way links only, every link
     past_all.oneway_links = 2 * base.links;
     try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(all_oneway));
     try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(past_all));
-    try std.testing.expectEqual(
-        navStorageBytes(base) - navStorageBytes(two_way),
-        // The two-way links keep their one-way registry entries.
-        reachabilityBytesBound(0, base.links, 1, 0) - reachabilityBytesBound(0, 0, 1, 0) - base.links * @sizeOf(u32),
-    );
+    try std.testing.expect(navStorageBytes(two_way) < navStorageBytes(base));
+    // Systems of a few terminals each hold narrower blocks than one holding every terminal.
+    var small_systems = base;
+    small_systems.oneway_system_terminals = 8;
+    try std.testing.expect(navStorageBytes(small_systems) < navStorageBytes(base));
+    try std.testing.expect(navStorageBytes(two_way) < navStorageBytes(small_systems));
+}
+
+test "nav storage parts pass the config's shape to the graph and field bounds, and a batch moves only the graph" {
+    const base = NavSizeConfig{ .side = 256, .levels = 2, .links = 64, .oneway_links = 0, .participant_count = 3, .agent_budget = 8, .group_fields = 2, .batch = NavBatch.none };
+    var batch = base;
+    batch.batch = .{ .mark_chunks = 300, .links = 10, .keys = 400 };
+    for ([_]NavSizeConfig{ base, batch }) |config| {
+        try std.testing.expectEqual(NavGraph.storageBytesBound(.{
+            .chunks = 256,
+            .levels = 2,
+            .links = 64,
+            .oneway_links = 0,
+            .participants = 3,
+            .batch_mark_chunks = config.batch.mark_chunks,
+            .batch_links = config.batch.links,
+            .batch_keys = config.batch.keys,
+        }), navStorageParts(config).graph);
+        try std.testing.expectEqual(2 * GroupField.storageBytesBound(131072, 256), navStorageParts(config).group_fields);
+    }
+    try std.testing.expect(navStorageParts(batch).graph > navStorageParts(base).graph);
+    try std.testing.expectEqual(navStorageParts(base).rest, navStorageParts(batch).rest);
+    try std.testing.expectEqual(navStorageBytes(batch) - navStorageBytes(base), navStorageParts(batch).graph - navStorageParts(base).graph);
 }
 
 test "nav storage charges the long-block pages of the long results, at most the pages of one per cached result" {

@@ -23,7 +23,16 @@
 //!     places 32 blocking sparse props in every chunk of the square, so each changed
 //!     cell's composed blocked bit also reads its chunk's sparse tiles.
 //!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the
-//!     digs and after the refills (64 blocks taken, then freed). Flat.
+//!     digs and after the refills (64 blocks taken, then freed). Flat. An edit sync scans
+//!     the window once per pass for each flagged resident layer, so two axes vary those
+//!     terms at 256² (item code `variant * 10^11 + resident layers * 10^9 + window edge
+//!     chunks * 10^7 + level side * 1000 + levels`): the window-edge axis (variant 0) digs
+//!     and refills the 4 cells of the center 2x2 chunks under a 2-, 6-, or 14-chunk window
+//!     at 8 levels, the same edits at every edge (linear in window chunks); the batched
+//!     axis (variant 1) times the syncs after an explosion disk inscribed in the fixed
+//!     window is blown open on every one of 2, 8, or 32 resident layers in one batched
+//!     edit and filled back in another, at 128 levels (linear in resident layers). The
+//!     batched edits are untimed.
 //!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
 //!     and back, each step one level entering (its window directory and 64 mixed
 //!     blocks) and one leaving. Flat across level size and depth.
@@ -89,9 +98,6 @@
 //! build the case's thread system (the single-cell world writes stay on the main thread).
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -123,6 +129,9 @@ const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const default_max_group_fields = @import("../game/systems/pathfinding/types.zig").default_max_group_fields;
 const navSizeCapacity = @import("pathfinding.zig").navSizeCapacity;
+const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
+const buildBandedWorld = @import("pathfinding.zig").buildBandedWorld;
+const squareBatchKeys = @import("pathfinding.zig").squareBatchKeys;
 const suite = @import("suite.zig");
 
 const level_sides = [_]u16{ 256, 1024, 2048 };
@@ -256,7 +265,7 @@ pub const explosion_fill_group = suite.BenchmarkGroup{
 
 pub const gpu_sync_dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-dig",
-    .defaultItemCounts = scaleItemCounts,
+    .defaultItemCounts = gpuSyncDigItemCounts,
     .runCase = runGpuSyncDigCase,
 };
 
@@ -372,11 +381,11 @@ const BatchWorkload = enum { cave_in, explosion_fill };
 const NavBatchWorkload = enum { cave_in, explosion_fill, enclose };
 
 fn runDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .dig);
+    return runCase(allocator, io, options, case, item_count, .dig, CaseShape.decode(item_count, .dig));
 }
 
 fn runRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .ramp);
+    return runCase(allocator, io, options, case, item_count, .ramp, CaseShape.decode(item_count, .ramp));
 }
 
 fn runCaveInCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -388,15 +397,138 @@ fn runExplosionFillCase(allocator: std.mem.Allocator, io: std.Io, options: suite
 }
 
 fn runGpuSyncDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .gpu_sync_dig);
+    const config = try GpuSyncDigConfig.decode(item_count);
+    return switch (config.variant) {
+        .digs => runCase(allocator, io, options, case, item_count, .gpu_sync_dig, .{
+            .side = config.side,
+            .levels = config.levels,
+            .window_edge = config.window_edge,
+        }),
+        .batched => runGpuSyncBatchCase(allocator, io, options, case, item_count, config),
+    };
 }
 
 fn runGpuSyncLevelEnterCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .gpu_sync_level_enter);
+    return runCase(allocator, io, options, case, item_count, .gpu_sync_level_enter, CaseShape.decode(item_count, .gpu_sync_level_enter));
 }
 
 fn runGpuSyncPanCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .gpu_sync_pan);
+    return runCase(allocator, io, options, case, item_count, .gpu_sync_pan, CaseShape.decode(item_count, .gpu_sync_pan));
+}
+
+// A single-cell or GPU sync case's world and render window.
+const CaseShape = struct {
+    side: u16,
+    levels: u16,
+    resident_layers: u16 = default_resident_layers,
+    // The pan group's window edge; for the gpu-sync-dig group, its window edge, or 0 for
+    // the fixed dig window.
+    window_edge: u16 = 0,
+
+    // The dig, ramp, level-enter, and pan groups' item codes.
+    fn decode(item_count: usize, workload: Workload) CaseShape {
+        std.debug.assert(workload != .gpu_sync_dig);
+        const encoded_layers = item_count / resident_layer_encoding;
+        const window_edge: u16 = @intCast(item_count % resident_layer_encoding / case_prefix_encoding);
+        const scale = item_count % case_prefix_encoding;
+        std.debug.assert((workload == .gpu_sync_pan) == (window_edge > 0));
+        std.debug.assert(encoded_layers == 0 or workload == .gpu_sync_pan or workload == .gpu_sync_level_enter);
+        return .{
+            .side = @intCast(scale / case_encoding),
+            .levels = @intCast(scale % case_encoding),
+            .resident_layers = if (encoded_layers == 0) default_resident_layers else @intCast(encoded_layers),
+            .window_edge = window_edge,
+        };
+    }
+};
+
+// The gpu-sync-dig group's variants, encoded above the resident layers: the dig workload
+// with a sync after the digs and after the refills, or one batched change over every
+// resident layer with a sync after it and after its reversal.
+const GpuSyncDigVariant = enum { digs, batched };
+const gpu_sync_variant_encoding: usize = 100_000_000_000;
+// The dig variant's window-edge axis: the window edges of the pan group over the digs of
+// the fixed dig square's center 2x2 chunks, the same edits at every edge, at one level size
+// and depth.
+const gpu_sync_edge_dig_square: u16 = 2;
+const gpu_sync_edge_axis_scale: usize = @as(usize, level_sides[0]) * case_encoding + level_counts[0];
+// The batched variant's written resident layers, at one level size and depth deep enough to
+// hold them.
+const gpu_sync_batch_layers = [_]u16{ 2, 8, 32 };
+
+const GpuSyncDigConfig = struct {
+    variant: GpuSyncDigVariant,
+    side: u16,
+    levels: u16,
+    resident_layers: u16,
+    // The dig variant's window edge; 0 is the fixed dig window over the 64-cell dig square.
+    window_edge: u16,
+
+    fn itemCode(variant: GpuSyncDigVariant, resident_layers: u16, window_edge: u16, scale: usize) usize {
+        const variant_code: usize = switch (variant) {
+            .digs => 0,
+            .batched => 1,
+        };
+        return variant_code * gpu_sync_variant_encoding + @as(usize, resident_layers) * resident_layer_encoding +
+            @as(usize, window_edge) * case_prefix_encoding + scale;
+    }
+
+    // Each config has one code: the dig variant leaves the layers field 0 (it renders the
+    // default two) and the batched variant the edge field 0 (it renders the fixed dig window).
+    fn decode(item_count: usize) !GpuSyncDigConfig {
+        const variant: GpuSyncDigVariant = switch (item_count / gpu_sync_variant_encoding) {
+            0 => .digs,
+            1 => .batched,
+            else => return error.GpuSyncDigUnknownVariant,
+        };
+        const layers_field = item_count % gpu_sync_variant_encoding / resident_layer_encoding;
+        const edge_field = item_count % resident_layer_encoding / case_prefix_encoding;
+        const scale = item_count % case_prefix_encoding;
+        const side = scale / case_encoding;
+        const levels = scale % case_encoding;
+        if (std.mem.indexOfScalar(u16, &level_sides, std.math.cast(u16, side) orelse 0) == null) return error.GpuSyncDigBadLevelSide;
+        if (std.mem.indexOfScalar(u16, &level_counts, std.math.cast(u16, levels) orelse 0) == null) return error.GpuSyncDigBadLevelCount;
+        var config = GpuSyncDigConfig{
+            .variant = variant,
+            .side = @intCast(side),
+            .levels = @intCast(levels),
+            .resident_layers = default_resident_layers,
+            .window_edge = 0,
+        };
+        switch (variant) {
+            .digs => {
+                if (layers_field != 0) return error.GpuSyncDigLayersOnDigs;
+                if (edge_field != 0) {
+                    if (std.mem.indexOfScalar(u16, &pan_window_edges, @intCast(edge_field)) == null) return error.GpuSyncDigBadWindowEdge;
+                    if (scale != gpu_sync_edge_axis_scale) return error.GpuSyncDigBadEdgeAxisScale;
+                    config.window_edge = @intCast(edge_field);
+                }
+            },
+            .batched => {
+                if (edge_field != 0) return error.GpuSyncDigEdgeOnBatched;
+                if (std.mem.indexOfScalar(u16, &gpu_sync_batch_layers, std.math.cast(u16, layers_field) orelse 0) == null) return error.GpuSyncDigBadBatchLayers;
+                if (scale != resident_layer_axis_scale) return error.GpuSyncDigBadBatchScale;
+                config.resident_layers = @intCast(layers_field);
+            },
+        }
+        return config;
+    }
+};
+
+const gpu_sync_dig_item_counts = blk: {
+    var counts: [scale_item_counts.len + pan_window_edges.len + gpu_sync_batch_layers.len]usize = undefined;
+    @memcpy(counts[0..scale_item_counts.len], &scale_item_counts);
+    for (pan_window_edges, scale_item_counts.len..) |edge, index| {
+        counts[index] = GpuSyncDigConfig.itemCode(.digs, 0, edge, gpu_sync_edge_axis_scale);
+    }
+    for (gpu_sync_batch_layers, scale_item_counts.len + pan_window_edges.len..) |layers, index| {
+        counts[index] = GpuSyncDigConfig.itemCode(.batched, layers, 0, resident_layer_axis_scale);
+    }
+    break :blk counts;
+};
+
+fn gpuSyncDigItemCounts(_: suite.Profile) []const usize {
+    return &gpu_sync_dig_item_counts;
 }
 
 const Fixture = struct {
@@ -416,6 +548,8 @@ const Fixture = struct {
     gpu_levels_below: u16 = default_resident_layers - 1,
     pan_origin_chunk_x: u16 = 0,
     pan_origin_chunk_y: u16 = 0,
+    // GPU sync dig group: the dig square's edge in chunks, one dug cell per chunk.
+    gpu_dig_square: u16 = dig_window_chunks,
 
     fn deinit(self: *Fixture) void {
         if (self.renderer) |*renderer| {
@@ -481,12 +615,18 @@ const Fixture = struct {
         try self.setChunkWindow(self.pan_origin_chunk_x + step_chunks, self.pan_origin_chunk_y, self.pan_window_edge);
     }
 
-    // Sets the fixed render window over the dig cells' chunk square, with the two
-    // deepest levels in the level window.
+    // Sets the fixed render window over the dig cells' chunk square, with the resident
+    // levels in the level window.
     fn setDigWindow(self: *Fixture) !void {
+        try self.setCenteredWindow(dig_window_chunks);
+    }
+
+    // Sets an `edge` x `edge` chunk render window at the level center, with the resident
+    // levels in the level window.
+    fn setCenteredWindow(self: *Fixture, edge: u16) !void {
         self.world.render_window = .{ .levels_below = self.gpu_levels_below };
-        const origin_chunk = self.side / default_chunk_size_tiles / 2 - dig_window_chunks / 2;
-        try self.setChunkWindow(origin_chunk, origin_chunk, dig_window_chunks);
+        const origin_chunk = self.side / default_chunk_size_tiles / 2 - edge / 2;
+        try self.setChunkWindow(origin_chunk, origin_chunk, edge);
     }
 
     // A rect exactly covering `edge` x `edge` chunks from (min_chunk_x, min_chunk_y).
@@ -511,55 +651,37 @@ const Fixture = struct {
     }
 };
 
-// A grass surface over `levels - 1` solid dirt levels, each one uniform dense band.
+// A walkable surface over `levels - 1` solid levels, each one uniform dense band.
 fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16) !Fixture {
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var meta_owned = true;
-    defer if (meta_owned) meta.deinit();
-    var world = WorldSystem{
-        .allocator = allocator,
-        .width = side,
-        .height = side,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = default_chunk_size_tiles,
-    };
+    var world = try buildBandedWorld(allocator, io, side, levels, "grass", "dirt");
     errdefer world.deinit();
-    try world.buildCatalog(&meta);
-    const grass = try world.requireTileByName(&meta, "grass");
-    const dirt = try world.requireTileByName(&meta, "dirt");
-    const tunnel = try world.requireTileByName(&meta, "cave_0");
-    const ramp = (try DigConfig.fromMeta(&meta)).ramp_tile;
-    const prop = try world.requireTileByName(&meta, "deco_0");
-    for (0..levels) |level_index| {
-        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
-        const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) grass else dirt);
-        std.debug.assert(layer == level);
-    }
-    world.adoptTilesetMeta(meta);
-    meta_owned = false;
+    const meta = world.tilesetMeta().?;
+    const dirt = try world.requireTileByName(meta, "dirt");
+    const tunnel = try world.requireTileByName(meta, "cave_0");
+    const ramp = (try DigConfig.fromMeta(meta)).ramp_tile;
+    const prop = try world.requireTileByName(meta, "deco_0");
     return .{ .world = world, .dirt = dirt, .tunnel = tunnel, .ramp = ramp, .prop = prop, .side = side, .levels = levels };
 }
 
-fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, shape: CaseShape) !suite.RunStats {
     if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs, ramps, and GPU syncs run on the main thread");
-    const encoded_layers = item_count / resident_layer_encoding;
-    const resident_layers: u16 = if (encoded_layers == 0) default_resident_layers else @intCast(encoded_layers);
-    const window_edge: u16 = @intCast(item_count % resident_layer_encoding / case_prefix_encoding);
-    const scale = item_count % case_prefix_encoding;
-    const side: u16 = @intCast(scale / case_encoding);
-    const levels: u16 = @intCast(scale % case_encoding);
+    const resident_layers = shape.resident_layers;
+    const window_edge = shape.window_edge;
+    const side = shape.side;
+    const levels = shape.levels;
     std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
-    std.debug.assert((workload == .gpu_sync_pan) == (window_edge > 0));
-
-    std.debug.assert(resident_layers == default_resident_layers or workload == .gpu_sync_pan or workload == .gpu_sync_level_enter);
     std.debug.assert(resident_layers + 1 <= levels);
     var fixture = try buildFixture(allocator, io, side, levels);
     defer fixture.deinit();
     fixture.gpu_levels_below = resident_layers - 1;
     switch (workload) {
         .gpu_sync_dig => {
-            try fixture.setDigWindow();
+            if (window_edge == 0) {
+                try fixture.setDigWindow();
+            } else {
+                fixture.gpu_dig_square = gpu_sync_edge_dig_square;
+                try fixture.setCenteredWindow(window_edge);
+            }
             try fixture.attachHeadlessTileStore(allocator);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         },
@@ -567,7 +689,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             try fixture.setDigWindow();
             try fixture.attachHeadlessTileStore(allocator);
             // 64 mixed chunks on each level the window crosses.
-            for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel, null);
+            for (fixture.gpuActiveLevel() - 1..fixture.levels) |level| _ = try digCells(&fixture, @intCast(level), fixture.tunnel, null, dig_window_chunks);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
         },
         .gpu_sync_pan => {
@@ -616,10 +738,15 @@ fn runIteration(fixture: *Fixture, workload: Workload) !usize {
         .ramp => digRamps(fixture, null),
         .gpu_sync_dig => blk: {
             const level = fixture.levels - 1;
-            _ = try digCells(fixture, level, fixture.tunnel, null);
+            const square = fixture.gpu_dig_square;
+            _ = try digCells(fixture, level, fixture.tunnel, null, square);
             const split = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-            _ = try digCells(fixture, level, fixture.dirt, null);
-            break :blk split + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            _ = try digCells(fixture, level, fixture.dirt, null, square);
+            const uploaded = split + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            // Each dug cell splits its uniform chunk (its word and a whole block) and the
+            // refill merges it back (its word).
+            if (uploaded != @as(usize, square) * square * (2 + tileStoreBlockElements(default_chunk_size_tiles))) return error.GpuSyncDigUploadCountMismatch;
+            break :blk uploaded;
         },
         .gpu_sync_level_enter => blk: {
             const entered = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
@@ -747,18 +874,20 @@ fn undoRamps(fixture: *Fixture, changes: ?*ChangeLog) !void {
     }
 }
 
-// Writes `tile` into the dig workload's 64 cells on `level`, one per chunk, in one step.
-fn digCells(fixture: *Fixture, level: u16, tile: TileId, changes: ?*ChangeLog) !usize {
+// Writes `tile` into the dig workload's cells on `level` in one step: one per chunk of the
+// `square` x `square` chunk square at the level center (the 64 cells at `dig_window_chunks`).
+fn digCells(fixture: *Fixture, level: u16, tile: TileId, changes: ?*ChangeLog, square: u16) !usize {
     const world = &fixture.world;
     const layer = fixture.floor(level);
     const chunk = default_chunk_size_tiles;
-    const origin = fixture.side / 2 - 4 * chunk;
+    const origin = fixture.side / 2 - square / 2 * chunk;
+    const cell_count = square * square;
     world.beginDenseCellWriteReserve();
     for (0..2) |pass| {
         var cell_index: u16 = 0;
-        while (cell_index < dig_cell_count) : (cell_index += 1) {
-            const x = origin + (cell_index % 8) * chunk + 5;
-            const y = origin + (cell_index / 8) * chunk + 7;
+        while (cell_index < cell_count) : (cell_index += 1) {
+            const x = origin + (cell_index % square) * chunk + 5;
+            const y = origin + (cell_index / square) * chunk + 7;
             if (pass == 0) {
                 try world.reserveDenseCellWrite(layer, x, y, tile);
             } else if (try world.setDenseTile(layer, x, y, tile)) |changed| {
@@ -766,7 +895,7 @@ fn digCells(fixture: *Fixture, level: u16, tile: TileId, changes: ?*ChangeLog) !
             }
         }
     }
-    return dig_cell_count;
+    return cell_count;
 }
 
 // Makes every chunk of the pan region on `level` mixed: one tunnel cell per chunk
@@ -866,20 +995,31 @@ fn buildCaveInEdit(allocator: std.mem.Allocator, fixture: *const Fixture, region
     return edit;
 }
 
-// Explosion: the cells of the deepest level whose centers lie in the disk inscribed
-// in a chunk-aligned `sqrt(region_chunks)` square at the level center, blown open
-// to empty and filled back with dirt. The square's corner chunks the disk misses
+// Explosion: the cells of the `deep_levels` deepest levels whose centers lie in the disk
+// inscribed in a chunk-aligned `sqrt(region_chunks)` square at the level center, blown
+// open to empty and filled back with dirt. The square's corner chunks the disk misses
 // are not part of the edit.
-fn buildExplosionEdit(allocator: std.mem.Allocator, fixture: *const Fixture, region_chunks: usize) !BatchEdit {
+fn buildExplosionEdit(allocator: std.mem.Allocator, fixture: *const Fixture, region_chunks: usize, deep_levels: u16) !BatchEdit {
     var edit: BatchEdit = .{};
     errdefer edit.deinit(allocator);
     const square_chunks = std.math.sqrt(region_chunks);
     std.debug.assert(square_chunks * square_chunks == region_chunks);
+    std.debug.assert(deep_levels >= 1 and deep_levels <= fixture.levels);
     const chunk_edge = default_chunk_size_tiles;
     const radius: i32 = @intCast(square_chunks * chunk_edge / 2);
     const center: i32 = fixture.side / 2;
     const origin_chunk: u16 = fixture.side / 2 / chunk_edge - @as(u16, @intCast(square_chunks / 2));
-    const level = fixture.levels - 1;
+    for (fixture.levels - deep_levels..fixture.levels) |level_index| {
+        const level: u16 = @intCast(level_index);
+        try addExplosionLevel(allocator, &edit, fixture, level, square_chunks, origin_chunk, center, radius);
+    }
+    try edit.finish(allocator);
+    return edit;
+}
+
+// One level's share of an explosion edit, in chunk-major order.
+fn addExplosionLevel(allocator: std.mem.Allocator, edit: *BatchEdit, fixture: *const Fixture, level: u16, square_chunks: usize, origin_chunk: u16, center: i32, radius: i32) !void {
+    const chunk_edge = default_chunk_size_tiles;
     const layer = fixture.floor(level);
     for (0..square_chunks) |row| for (0..square_chunks) |col| {
         const chunk_x = origin_chunk + @as(u16, @intCast(col));
@@ -894,8 +1034,6 @@ fn buildExplosionEdit(allocator: std.mem.Allocator, fixture: *const Fixture, reg
             try edit.add(allocator, layer, x, y, invalid_tile_id, fixture.dirt);
         };
     };
-    try edit.finish(allocator);
-    return edit;
 }
 
 // Places blocking sparse props on the explosion level over its whole region square,
@@ -978,7 +1116,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
     var edit = switch (workload) {
         .cave_in => try buildCaveInEdit(allocator, &fixture, region_chunks),
-        .explosion_fill => try buildExplosionEdit(allocator, &fixture, region_chunks),
+        .explosion_fill => try buildExplosionEdit(allocator, &fixture, region_chunks, 1),
     };
     defer edit.deinit(allocator);
     // The cave-in region starts carved, so each iteration collapses then re-carves it.
@@ -1051,6 +1189,63 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         stats.secondary_work_tuning = suite.workTuningSummary(world.terrain_edit_plan_tuner.report(), plan_settled);
     }
     return stats;
+}
+
+// Elements the two syncs of one batched-sync iteration upload: per edited chunk, a chunk
+// the edit covers whole changes its uniform word there and back; a chunk it covers in part
+// splits (its word and a whole block) and merges back (its word).
+fn expectedBatchSyncUploads(edit: *const BatchEdit) usize {
+    const chunk_cells = @as(usize, default_chunk_size_tiles) * default_chunk_size_tiles;
+    var uploads: usize = 0;
+    for (edit.forward_chunks.items) |chunk| {
+        uploads += if (chunk.writes.len == chunk_cells) 2 else 2 + tileStoreBlockElements(default_chunk_size_tiles);
+    }
+    return uploads;
+}
+
+// gpu-sync-dig's batched variant: an explosion disk inscribed in the fixed dig window on
+// every resident layer, blown open as one batched edit and filled back as another (both
+// untimed), each followed by the timed GPU sync. Every resident layer is flagged.
+fn runGpuSyncBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: GpuSyncDigConfig) !suite.RunStats {
+    std.debug.assert(config.variant == .batched);
+    if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs, ramps, and GPU syncs run on the main thread");
+    std.debug.assert(config.resident_layers + 1 <= config.levels);
+    var fixture = try buildFixture(allocator, io, config.side, config.levels);
+    defer fixture.deinit();
+    fixture.gpu_levels_below = config.resident_layers - 1;
+    try fixture.setDigWindow();
+    try fixture.attachHeadlessTileStore(allocator);
+    _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+    var edit = try buildExplosionEdit(allocator, &fixture, @as(usize, dig_window_chunks) * dig_window_chunks, config.resident_layers);
+    defer edit.deinit(allocator);
+    const expected_uploads = expectedBatchSyncUploads(&edit);
+
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try runGpuSyncBatchIteration(io, &fixture, &edit, expected_uploads);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    for (0..options.iterations) |_| {
+        const sync_ns = try runGpuSyncBatchIteration(io, &fixture, &edit, expected_uploads);
+        accumulator.record(sync_ns, suite.serialBatch(expected_uploads, 1));
+    }
+    var stats = accumulator.finish();
+    // The item count is a case code, so report throughput over the elements uploaded.
+    stats.output_count = expected_uploads;
+    stats.items_per_second = suite.itemsPerSecond(expected_uploads, stats.mean_ns);
+    return stats;
+}
+
+// One batched change and its reversal, each followed by a GPU sync; returns the two syncs'
+// time and fails unless they uploaded `expected_uploads` elements.
+fn runGpuSyncBatchIteration(io: std.Io, fixture: *Fixture, edit: *BatchEdit, expected_uploads: usize) !u64 {
+    var sync_ns: u64 = 0;
+    var uploaded: usize = 0;
+    for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }) |chunks| {
+        try applyBatch(&fixture.world, chunks, &edit.events, null);
+        const start_ns = suite.nowNs(io);
+        uploaded += try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+        sync_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+    }
+    if (uploaded != expected_uploads) return error.GpuSyncBatchUploadCountMismatch;
+    return sync_ns;
 }
 
 // The nav groups' fixture: the chunk-scale world with nav built over every level and no
@@ -1145,14 +1340,16 @@ fn publishBatchEvents(frame: *SimulationFrame, events: []const WorldTileChangedE
     if (frame.events.stats.world_tile_changed != events.len) return error.BatchEventsUnpublished;
 }
 
-// No path requests: the agent budget stays at its floor.
-fn navSizeConfig(side: u16, levels: usize, participant_count: usize) suite.NavSizeConfig {
+// No path requests: the agent budget stays at its floor. `batch`: the workload's largest
+// marks batch.
+fn navSizeConfig(side: u16, levels: usize, participant_count: usize, batch: suite.NavBatch) suite.NavSizeConfig {
     return .{
         .side = side,
         .levels = levels,
         .participant_count = participant_count,
         .agent_budget = min_capacity_floor,
         .group_fields = default_max_group_fields,
+        .batch = batch,
     };
 }
 
@@ -1180,10 +1377,6 @@ fn navConnSummary(stats: NavUpdateStats, system: *const PathfindingSystem, case:
     };
     suite.fillClosureSummary(&summary, stats);
     return summary;
-}
-
-fn buildNavFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !NavFixture {
-    return navFixtureOver(allocator, io, try buildFixture(allocator, io, side, levels), capacity, thread_system);
 }
 
 // Builds nav over `fixture`'s world, taking ownership of it.
@@ -1254,15 +1447,28 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const size_config = navSizeConfig(side, levels, participant_count);
+    // The dig square's cells on the deepest level; the ramps' too, with their exits' obstacle
+    // rects on the level above and their links.
+    const batch: suite.NavBatch = switch (workload) {
+        .dig => .{ .mark_chunks = dig_cell_count, .links = 0, .keys = squareBatchKeys(dig_window_chunks) },
+        .ramp => .{ .mark_chunks = 2 * dig_cell_count, .links = dig_cell_count, .keys = 2 * squareBatchKeys(dig_window_chunks) },
+    };
+    // The world first: its content sizes the nav.
+    var world_fixture = try buildFixture(allocator, io, side, levels);
+    var world_owned = true;
+    defer if (world_owned) world_fixture.deinit();
+    var size_config = navSizeConfig(side, levels, participant_count, batch);
+    size_config.content = NavGraph.storageContentOf(&world_fixture.world);
     const group_name = switch (workload) {
         .dig => nav_dig_group.name,
         .ramp => nav_ramp_group.name,
     };
     if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
 
-    var nav = try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
+    world_owned = false;
+    var nav = try navFixtureOver(allocator, io, world_fixture, navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
+    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
     setNavStageControls(&nav.system, case);
 
@@ -1293,6 +1499,7 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         timed_main = nav.lastNavMain();
         if (workload == .ramp) try resetNavRamps(&nav);
     }
+    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
@@ -1316,9 +1523,9 @@ fn runNavIteration(nav: *NavFixture, workload: NavWorkload) !usize {
     const level = nav.base.levels - 1;
     switch (workload) {
         .dig => {
-            _ = try digCells(&nav.base, level, nav.base.tunnel, &nav.changes);
+            _ = try digCells(&nav.base, level, nav.base.tunnel, &nav.changes, dig_window_chunks);
             try nav.reactToChanges(dig_cell_count);
-            _ = try digCells(&nav.base, level, nav.base.dirt, &nav.changes);
+            _ = try digCells(&nav.base, level, nav.base.dirt, &nav.changes, dig_window_chunks);
             try nav.reactToChanges(dig_cell_count);
             return @as(usize, dig_cell_count) * 2;
         },
@@ -1508,7 +1715,22 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const size_config = navSizeConfig(side, levels, participant_count);
+    const enclose: ?EncloseConfig = if (workload == .enclose) try EncloseConfig.decode(item_count) else null;
+    // Every cell of the edit's chunks as a mark; its keys: a cave-in's square on each of its
+    // levels, an explosion disk's bounding square, or each doorway chunk with its neighbours.
+    const edit_chunks: usize = if (enclose) |config| config.pockets() else region_chunks;
+    const batch_keys: usize = switch (workload) {
+        .cave_in => cave_in_levels * squareBatchKeys(std.math.sqrt(region_chunks / cave_in_levels)),
+        .explosion_fill => squareBatchKeys(std.math.sqrt(region_chunks)),
+        .enclose => edit_chunks * squareBatchKeys(1),
+    };
+    const chunk_cells = @as(usize, default_chunk_size_tiles) * default_chunk_size_tiles;
+    // The world first: its content sizes the nav.
+    var world_fixture = if (enclose) |config| try buildEncloseFixture(allocator, io, side, config) else try buildFixture(allocator, io, side, levels);
+    var world_owned = true;
+    defer if (world_owned) world_fixture.deinit();
+    var size_config = navSizeConfig(side, levels, participant_count, .{ .mark_chunks = edit_chunks * chunk_cells, .links = 0, .keys = batch_keys });
+    size_config.content = NavGraph.storageContentOf(&world_fixture.world);
     const group_name = switch (workload) {
         .cave_in => nav_cave_in_group.name,
         .explosion_fill => nav_explosion_fill_group.name,
@@ -1516,15 +1738,13 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     };
     if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
 
-    const enclose: ?EncloseConfig = if (workload == .enclose) try EncloseConfig.decode(item_count) else null;
-    var nav = if (enclose) |config|
-        try navFixtureOver(allocator, io, try buildEncloseFixture(allocator, io, side, config), navSizeCapacity(size_config), thread_ptr)
-    else
-        try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
+    world_owned = false;
+    var nav = try navFixtureOver(allocator, io, world_fixture, navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
+    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var edit = switch (workload) {
         .cave_in => try buildCaveInEdit(allocator, &nav.base, region_chunks),
-        .explosion_fill => try buildExplosionEdit(allocator, &nav.base, region_chunks),
+        .explosion_fill => try buildExplosionEdit(allocator, &nav.base, region_chunks, 1),
         .enclose => try buildEncloseEdit(allocator, &nav.base, enclose.?),
     };
     defer edit.deinit(allocator);
@@ -1590,6 +1810,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         // Main is everything but the terrain and nav reaction stages that ran on workers.
         main_total += elapsed_ns -| (timing.terrain.off_main_ns + timing.nav_off_main_ns);
     }
+    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the cells written.
     stats.output_count = cells_changed;
@@ -1631,11 +1852,26 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const size_config = navSizeConfig(side, levels + options.warmup_iterations + options.iterations, participant_count);
+    // Level builds only: no marks batch. The world first: its content, and the levels the run
+    // adds (solid, or walkable for the replace case), size the nav.
+    var world_fixture = try buildFixture(allocator, io, side, levels);
+    var world_owned = true;
+    defer if (world_owned) world_fixture.deinit();
+    const added_levels = options.warmup_iterations + options.iterations;
+    var size_config = navSizeConfig(side, levels + added_levels, participant_count, suite.NavBatch.none);
+    var content = NavGraph.storageContentOf(&world_fixture.world);
+    if (replace) {
+        const chunks = world_fixture.world.chunkCountPerLevel();
+        content.open_chunks += added_levels * chunks;
+        content.max_level_open = chunks;
+    }
+    size_config.content = content;
     if (suite.navSizeSkip(nav_level_add_group.name, item_count, case, size_config)) |skip| return skip;
 
-    var nav = try buildNavFixture(allocator, io, side, levels, navSizeCapacity(size_config), thread_ptr);
+    world_owned = false;
+    var nav = try navFixtureOver(allocator, io, world_fixture, navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
+    try suite.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
     setNavStageControls(&nav.system, case);
     var frame = SimulationFrame.init(allocator);
@@ -1645,6 +1881,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     for (0..options.iterations) |_| {
         accumulator.record(try levelAddIteration(io, &nav, &frame, replace), nav.system.graph.last_remask_batch);
     }
+    try suite.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     stats.output_count = nav.base.world.levelCount();
     stats.nav_conn = navConnSummary(nav.last_stats, &nav.system, case);

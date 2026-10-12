@@ -29,6 +29,7 @@ pub const std_options = logging.std_options;
 const benchmark_groups = [_]suite.BenchmarkGroup{
     movement.group,
     movement.apply_intents_group,
+    movement.apply_intents_sorted_group,
     particles.group,
     ai.group,
     ai_memory.group,

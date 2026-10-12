@@ -48,6 +48,7 @@ const NavMark = types.NavMark;
 const NavSpan = types.NavSpan;
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
+const connectivity = @import("connectivity.zig");
 const Connectivity = @import("connectivity.zig").Connectivity;
 const ConnectivityCounters = @import("connectivity.zig").ConnectivityCounters;
 const ClosureCounters = @import("connectivity.zig").ClosureCounters;
@@ -64,6 +65,31 @@ pub fn borderPortalBound(chunk_tiles: u16) usize {
 
 /// Most border portals any chunk holds.
 pub const max_border_portals: usize = borderPortalBound(max_chunk_size_tiles);
+
+/// Bytes of a std list of `T` that `ensureTotalCapacity` grew to hold `need`: std's growth
+/// past it, first slots included. Storage bounds charge each list with it.
+pub fn listBytesBound(comptime T: type, need: usize) usize {
+    return std.ArrayList(T).growCapacity(need) *| @sizeOf(T);
+}
+
+/// `listBytesBound` for a `std.MultiArrayList(Row)`, at the padded row size the resident
+/// counts charge.
+pub fn rowsBytesBound(comptime Row: type, need: usize) usize {
+    return std.MultiArrayList(Row).growCapacity(need) *| @sizeOf(Row);
+}
+
+/// Rows of `pools` `std.MultiArrayList(Row)` pools, each grown to twice its own need and then
+/// by std, whose needs sum to `need`: std's growth of a doubled need is linear past its first
+/// slots.
+pub fn pooledRows(comptime Row: type, pools: usize, need: usize) usize {
+    return 3 *| need +| pools *| std.MultiArrayList(Row).growCapacity(0);
+}
+
+/// Bytes of `pools` std lists of `T`, each grown by std to its own need, whose needs sum to
+/// `need`.
+pub fn pooledList(comptime T: type, pools: usize, need: usize) usize {
+    return (need +| need / 2 +| pools *| std.ArrayList(T).growCapacity(0)) *| @sizeOf(T);
+}
 const no_record: u32 = std.math.maxInt(u32);
 const no_link_slot: u32 = std.math.maxInt(u32);
 
@@ -157,6 +183,9 @@ const RecordRow = struct {
     node_head: u32,
     label_count: u8,
 };
+
+// One pooled record's columns.
+const record_row_bytes = 2 * @sizeOf(u8) + 2 * @sizeOf(u32);
 
 const LinkSlotRow = struct {
     extra: std.ArrayList(NavPortal),
@@ -334,7 +363,7 @@ pub const NavLevelGraph = struct {
 
     fn residentBytes(self: *const NavLevelGraph) usize {
         var bytes = self.record_dir.capacity * @sizeOf(u32) +
-            self.records.capacity * (2 * @sizeOf(u8) + 2 * @sizeOf(u32)) +
+            self.records.capacity * record_row_bytes +
             self.nodes.capacity * @sizeOf(NodeRow) +
             self.node_free.capacity * @sizeOf(u32) +
             self.border.capacity * @sizeOf(NavPortal) +
@@ -345,6 +374,23 @@ pub const NavLevelGraph = struct {
         for (self.slot_extra) |extra| bytes += extra.capacity * @sizeOf(NavPortal);
         for (self.slot_links) |links| bytes += links.capacity * @sizeOf(NavLink);
         return bytes;
+    }
+
+    // An over-estimate of `residentBytes` summed over `levels` levels of `chunks` chunks each,
+    // whose record, node row, and link slot needs (live plus what a batch claims before it
+    // frees the old) sum to `record_need`, `node_need`, and `slot_need` over the levels, each
+    // slot's lists at most `chunk_endpoints` long. Each pool is charged at its doubling past
+    // its need, each list at std's growth; both are linear past their first slots, so the
+    // needs sum across levels.
+    fn storageBytesBound(levels: usize, chunks: usize, border_stride: usize, record_need: usize, node_need: usize, slot_need: usize, chunk_endpoints: usize) usize {
+        const records = pooledRows(RecordRow, levels, record_need);
+        const nodes = pooledRows(NodeRow, levels, node_need);
+        const slots = pooledRows(LinkSlotRow, levels, slot_need);
+        const slot_lists = listBytesBound(NavPortal, chunk_endpoints) +| listBytesBound(NavLink, chunk_endpoints);
+        return levels *| (listBytesBound(u32, chunks) +| LevelPlanSets.storageBytesBound(chunks)) +|
+            records *| record_row_bytes +| pooledList(NavPortal, levels, records *| border_stride) +| pooledList(u32, levels, records) +|
+            nodes *| @sizeOf(NodeRow) +| pooledList(u32, levels, nodes) +|
+            slots *| (@sizeOf(LinkSlotRow) +| slot_lists) +| pooledList(u32, levels, slots);
     }
 
     // Grows the free record list to at least `needed` ids, so the next `needed` claims pop
@@ -670,11 +716,29 @@ const OrderedIndexSet = struct {
         for (self.tiers[0..self.tier_count]) |tier| bytes += bitSetBytes(tier);
         return bytes;
     }
+
+    // `residentBytes` of a set reserved for indices below `bits`: its tiers as `reserve`
+    // builds them.
+    fn storageBytesBound(bits: usize) usize {
+        var bytes: usize = 0;
+        var tier_bits = bits;
+        while (true) {
+            bytes +|= bitSetBytesFor(tier_bits);
+            if (tier_bits <= word_bits) break;
+            tier_bits = maskCount(tier_bits);
+        }
+        return bytes;
+    }
 };
 
-// Mask bytes of a std bit set.
+// Bytes of a std bit set: its masks and the length word before them, none when empty.
 fn bitSetBytes(set: std.bit_set.Dynamic) usize {
-    return OrderedIndexSet.maskCount(set.capacity()) * @sizeOf(OrderedIndexSet.Word);
+    return bitSetBytesFor(set.capacity());
+}
+
+fn bitSetBytesFor(bits: usize) usize {
+    if (bits == 0) return 0;
+    return (OrderedIndexSet.maskCount(bits) + 1) * @sizeOf(OrderedIndexSet.Word);
 }
 
 // One level's share of the threaded plan merge (`NavGraph.mergePlanWindows`): its patch
@@ -710,6 +774,11 @@ const LevelPlanSets = struct {
 
     fn residentBytes(self: *const LevelPlanSets) usize {
         return self.order.residentBytes() + bitSetBytes(self.changed) + bitSetBytes(self.dirty);
+    }
+
+    // `residentBytes` of a level's sets built over `chunks` chunks.
+    fn storageBytesBound(chunks: usize) usize {
+        return OrderedIndexSet.storageBytesBound(chunks) +| 2 *| bitSetBytesFor(chunks);
     }
 };
 
@@ -1586,6 +1655,140 @@ pub const NavGraph = struct {
         for (self.level_graphs.items) |*level_graph| bytes += level_graph.residentBytes();
         bytes += self.connectivity.residentBytes();
         return bytes;
+    }
+
+    /// What sizes a nav for `storageBytesBound`. Counts past what the nav can hold clamp.
+    pub const StorageShape = struct {
+        /// Chunks per level.
+        chunks: usize,
+        levels: usize,
+        chunk_tiles: u16 = default_nav_chunk_tiles,
+        links: usize = 0,
+        /// One-way links among `links`.
+        oneway_links: usize = std.math.maxInt(usize),
+        /// The most terminals one one-way system (H-component) holds.
+        oneway_system_terminals: usize = std.math.maxInt(usize),
+        participants: usize = 1,
+        /// The largest marks batch: the chunks its marks span (each mark counted, at most one
+        /// per changed cell or obstacle rect), its new links, and its distinct patch keys.
+        batch_mark_chunks: usize = std.math.maxInt(usize),
+        batch_links: usize = std.math.maxInt(usize),
+        batch_keys: usize = std.math.maxInt(usize),
+        /// The world's chunk forms and link endpoints before the build (`storageContentOf`);
+        /// null charges every chunk mixed and `2 * links` endpoints wherever they fit.
+        content: ?StorageContent = null,
+    };
+
+    /// What a world holds that sizes its nav, counted before a build: its open and mixed
+    /// chunks over every level and on the level holding the most, and the chunks holding
+    /// link endpoints and the most one holds. A batch may turn its own chunks mixed; the
+    /// bound adds them.
+    pub const StorageContent = struct {
+        open_chunks: usize = 0,
+        mixed_chunks: usize = 0,
+        max_level_open: usize = 0,
+        max_level_mixed: usize = 0,
+        endpoint_chunks: usize = 0,
+        max_chunk_endpoints: usize = 0,
+    };
+
+    /// `StorageContent` of `world` from its composed chunk forms and link endpoint counts,
+    /// for a nav whose chunks are the world's: O(levels x chunks). Static colliders are not
+    /// counted; a nav over static bodies needs their chunks counted mixed.
+    pub fn storageContentOf(world: *const WorldSystem) StorageContent {
+        var content = StorageContent{};
+        const chunks = world.chunkCountPerLevel();
+        for (0..world.levelCount()) |level_index| {
+            const level: u16 = @intCast(level_index);
+            var open: usize = 0;
+            var mixed: usize = 0;
+            for (0..chunks) |chunk_index| {
+                const chunk: u32 = @intCast(chunk_index);
+                switch (world.levelChunkBlockedForm(level, chunk)) {
+                    .open => open += 1,
+                    .mixed => mixed += 1,
+                    .blocked => {},
+                }
+                const endpoints = world.levelChunkLinkEndpointCount(level, chunk);
+                content.endpoint_chunks += @intFromBool(endpoints != 0);
+                content.max_chunk_endpoints = @max(content.max_chunk_endpoints, endpoints);
+            }
+            content.open_chunks += open;
+            content.mixed_chunks += mixed;
+            content.max_level_open = @max(content.max_level_open, open);
+            content.max_level_mixed = @max(content.max_level_mixed, mixed);
+        }
+        return content;
+    }
+
+    /// An over-estimate of `residentBytes` for `shape`, for storage size limits: the grids'
+    /// blocks for the mixed chunks; a record per open or mixed chunk and per chunk holding a
+    /// link endpoint, each with a full border window; a node per open chunk, a border
+    /// window's worth per mixed chunk, and one per link endpoint; the batch buffers of one
+    /// level build or the largest marks batch, whose chunks may turn mixed (the same ones
+    /// every batch); the plan sets; and reachability (`Connectivity.storageBytesBound`).
+    /// Pools are charged at their doubling and lists at std's growth past their need.
+    pub fn storageBytesBound(shape: StorageShape) usize {
+        const levels = @max(1, shape.levels);
+        const chunks = shape.chunks;
+        const all_chunks = levels *| chunks;
+        const chunk_cells = @as(usize, shape.chunk_tiles) * shape.chunk_tiles;
+        const border_stride = borderPortalBound(shape.chunk_tiles);
+        const endpoints = 2 *| shape.links;
+        const mark_chunks = @min(shape.batch_mark_chunks, all_chunks *| chunk_cells);
+        const batch_links = @min(shape.batch_links, shape.links);
+        const batch_keys = @min(shape.batch_keys, @min(all_chunks, 5 *| mark_chunks +| 2 *| batch_links));
+        const content: StorageContent = shape.content orelse .{
+            .mixed_chunks = all_chunks,
+            .max_level_mixed = chunks,
+            .endpoint_chunks = @min(all_chunks, endpoints),
+            .max_chunk_endpoints = @min(endpoints, chunk_cells),
+        };
+        const chunk_endpoints = content.max_chunk_endpoints;
+        // Chunks a batch changes may turn mixed; its keys bound them.
+        const mixed = @min(all_chunks, content.mixed_chunks +| batch_keys);
+        const level_mixed = @min(chunks, content.max_level_mixed +| batch_keys);
+        const nonblocked = @min(all_chunks, content.open_chunks +| mixed);
+        const live_nodes = content.open_chunks +| mixed *| border_stride +| endpoints;
+        const batch_nodes = batch_keys *| border_stride +| @min(batch_keys *| chunk_endpoints, endpoints);
+        const records = nonblocked +| content.endpoint_chunks +| batch_keys;
+        const slot_need = content.endpoint_chunks +| @min(batch_keys, content.endpoint_chunks);
+        const graphs = NavLevelGraph.storageBytesBound(levels, chunks, border_stride, records, live_nodes +| batch_nodes, slot_need, chunk_endpoints);
+        const grids = NavGrid.storageBytesBound(levels, chunks, mixed +| @min(mark_chunks, batch_keys));
+        const level_nodes = @min(chunks, content.max_level_open +| level_mixed) +| level_mixed *| border_stride +|
+            @min(chunks *| chunk_endpoints, endpoints);
+        return grids +| graphs +|
+            batchBytesBound(chunks, mark_chunks, batch_links, batch_keys) +|
+            OrderedIndexSet.storageBytesBound(2 *| levels) +|
+            connectivity.storageBytesBound(.{
+                .nodes = live_nodes,
+                .level_chunks = chunks,
+                .level_nodes = level_nodes,
+                .batch_keys = batch_keys,
+                .batch_links = batch_links,
+                .border_stride = border_stride,
+                .chunk_endpoints = chunk_endpoints,
+                .links = shape.links,
+                .oneway_links = @min(shape.oneway_links, shape.links),
+                .system_terminals = shape.oneway_system_terminals,
+                .participants = @max(1, shape.participants),
+            });
+    }
+
+    // The batch buffers' share of `storageBytesBound`: a level build over `chunks` keys, or a
+    // marks batch whose `mark_chunks` and `batch_links` stage seven and two keys each before
+    // dedupe, at most one plan range per item, each range's windows padded to a cache line.
+    // A key list may swap with a staging list, so every one is charged the larger.
+    fn batchBytesBound(chunks: usize, mark_chunks: usize, batch_links: usize, batch_keys: usize) usize {
+        const ranges = @max(1, mark_chunks +| batch_links);
+        const staged = 5 *| mark_chunks +| 2 *| batch_links +| ranges *| (key_window_alignment - 1);
+        const keys = @max(chunks, staged);
+        const changed = @max(chunks, mark_chunks);
+        return 2 *| plan_streams *| KeyList.growCapacity(keys) *| @sizeOf(u64) +|
+            listBytesBound(ChunkBits, changed) +| listBytesBound(u32, changed) +| listBytesBound(i32, changed) +|
+            listBytesBound(PatchInfo, @max(chunks, batch_keys)) +|
+            listBytesBound(PlanWindow, ranges) +|
+            std.ArrayListAligned(PlanTally, .fromByteUnits(thread_shared_record_alignment)).growCapacity(ranges) *| @sizeOf(PlanTally);
     }
 
     // Chunk-tiling geometry for this graph; agrees with every level's NavGrid.
@@ -3556,6 +3759,128 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
 
     system.graph.allocator = original;
     system.allocator = original;
+}
+
+test "a nav whose every chunk is mixed, with links in separate chunks, stays within its storage bound after its build and a dense batch" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+    var world = try test_support.abstractTestWorld(&meta, 1024, 1024);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+    // Blocking diagonals every third cell: every chunk mixed, with many border runs.
+    for (0..world.height) |y| for (0..world.width) |x| {
+        if ((x + y) % 3 == 0) _ = try world.setDenseTile(obstacle, @intCast(x), @intCast(y), tree);
+    };
+    // One same-level link per pair of far chunks, each end alone in its chunk.
+    const ct: u16 = world.chunk_size_tiles;
+    const links: u16 = 4;
+    const spacing = world.width / links;
+    try std.testing.expect(spacing >= 2 * ct);
+    for (0..links) |index| {
+        const offset: u16 = @intCast(index * spacing + 1);
+        try world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = offset, .y = 1 }, .level_b = 0, .cell_b = .{ .x = offset, .y = @intCast(world.height - 2) }, .traversal_cost = 1, .bidirectional = true });
+    }
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    var colliders = try test_support.worldColliders(&data, &world);
+    defer colliders.deinit();
+    try system.rebuildNavFromColliders(&colliders, PathfindingSystem.worldNavExtent(&world), null);
+    const graph = &system.graph;
+    // The world's content: every chunk mixed, each link end alone in its chunk.
+    const content = NavGraph.storageContentOf(&world);
+    try std.testing.expectEqual(graph.chunkCount(), content.mixed_chunks);
+    try std.testing.expectEqual(@as(usize, 0), content.open_chunks);
+    try std.testing.expectEqual(@as(usize, 2 * links), content.endpoint_chunks);
+    try std.testing.expectEqual(@as(usize, 1), content.max_chunk_endpoints);
+    var shape = NavGraph.StorageShape{
+        .chunks = graph.chunkCount(),
+        .levels = graph.levelCount(),
+        .chunk_tiles = graph.chunk_tiles,
+        .links = links,
+        .oneway_links = 0,
+        .batch_mark_chunks = 0,
+        .batch_links = 0,
+        .batch_keys = 0,
+        .content = content,
+    };
+    try std.testing.expect(graph.residentBytes() <= NavGraph.storageBytesBound(shape));
+    // Every cell of a 2x2-chunk corner flips, one mark each.
+    var flipped: usize = 0;
+    for (0..2 * ct) |y| for (0..2 * ct) |x| {
+        const tile = if (world.denseTile(obstacle, @intCast(x), @intCast(y)) == tree) grass else tree;
+        _ = try world.setDenseTile(obstacle, @intCast(x), @intCast(y), tile);
+        try system.markNavDirty(0, @intCast(x), @intCast(y));
+        flipped += 1;
+    };
+    const stats = try system.applyBufferedNavUpdates(&colliders, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    shape.batch_mark_chunks = flipped;
+    shape.batch_keys = 2 * 2 + 4 * 2;
+    try std.testing.expect(graph.residentBytes() <= NavGraph.storageBytesBound(shape));
+    // The batch's staging is charged: a bound with no batch is short of it.
+    var no_batch = shape;
+    no_batch.batch_mark_chunks = 0;
+    no_batch.batch_keys = 0;
+    try std.testing.expect(NavGraph.storageBytesBound(shape) > NavGraph.storageBytesBound(no_batch));
+    // Without the content every chunk is charged mixed and holding endpoints: never less.
+    var structural = shape;
+    structural.content = null;
+    try std.testing.expect(NavGraph.storageBytesBound(structural) >= NavGraph.storageBytesBound(shape));
+}
+
+test "a nav over open and blocked levels is charged by the world's content and stays within its bound" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+    const dirt = try requireTestTile(&meta, "dirt");
+    var world = try test_support.abstractTestWorld(&meta, 1024, 1024);
+    defer world.deinit();
+    // Level 0 holds at least one mixed chunk; level 1 is blocked whole.
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+    _ = try world.setDenseTile(obstacle, 1, 1, tree);
+    const lower = try world.addLevel(-32);
+    const lower_floor = try world.addDenseLayer(lower, 0, .floor, dirt);
+    const content = NavGraph.storageContentOf(&world);
+    const chunks = world.chunkCountPerLevel();
+    try std.testing.expect(content.mixed_chunks >= 1);
+    // Only level 0 holds open or mixed chunks.
+    try std.testing.expect(content.open_chunks + content.mixed_chunks <= chunks);
+    try std.testing.expectEqual(content.open_chunks, content.max_level_open);
+    try std.testing.expectEqual(content.mixed_chunks, content.max_level_mixed);
+    try std.testing.expectEqual(@as(usize, 0), content.endpoint_chunks);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    var colliders = try test_support.worldColliders(&data, &world);
+    defer colliders.deinit();
+    try system.rebuildNavFromColliders(&colliders, PathfindingSystem.worldNavExtent(&world), null);
+    var shape = NavGraph.StorageShape{
+        .chunks = system.graph.chunkCount(),
+        .levels = system.graph.levelCount(),
+        .chunk_tiles = system.graph.chunk_tiles,
+        .batch_mark_chunks = 1,
+        .batch_links = 0,
+        .batch_keys = 5,
+        .content = content,
+    };
+    try std.testing.expectEqual(chunks, shape.chunks);
+    try std.testing.expect(system.graph.residentBytes() <= NavGraph.storageBytesBound(shape));
+    // A dig on the blocked level: its chunk turns mixed, within the batch's charge.
+    const dug = try world.setDenseTile(lower_floor, 5, 5, grass);
+    try std.testing.expect(dug != null);
+    try system.markNavDirty(lower, 5, 5);
+    _ = try system.applyBufferedNavUpdates(&colliders, &world, null);
+    try std.testing.expect(system.graph.residentBytes() <= NavGraph.storageBytesBound(shape));
+    shape.content = null;
+    try std.testing.expect(NavGraph.storageBytesBound(shape) > NavGraph.storageBytesBound(.{ .chunks = chunks, .levels = 2, .chunk_tiles = shape.chunk_tiles, .batch_mark_chunks = 1, .batch_links = 0, .batch_keys = 5, .content = content }));
 }
 
 // A path request on the next step from `start` on `start_level` to `goal` on `goal_level`

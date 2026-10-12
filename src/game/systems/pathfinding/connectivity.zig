@@ -44,6 +44,8 @@ const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
 const accumulateBatch = @import("nav_graph.zig").accumulateBatch;
+const listBytesBound = @import("nav_graph.zig").listBytesBound;
+const rowsBytesBound = @import("nav_graph.zig").rowsBytesBound;
 const simd = @import("../../../core/simd.zig");
 
 pub const no_node: u32 = std.math.maxInt(u32);
@@ -1285,28 +1287,109 @@ fn shrinkRows(comptime Row: type, rows: *std.MultiArrayList(Row), allocator: std
     rows.len = 0;
 }
 
-/// An over-estimate of the bytes reachability keeps, for storage size limits: per node row
-/// its row, and a comp and a root of its own with their free-list entries; per one-way link
-/// its row and link index, two terminals and two H-components with their free-list entries,
-/// and the closure arena at twice the live words of one H-component holding every terminal;
-/// the flood's round buffers at the default window; and per flood participant a search
-/// table at the default budget cap, with `slack` the most proposals one node adds.
-pub fn storageBytesBound(nodes: usize, oneway_links: usize, participants: usize, slack: usize) usize {
-    const free_entry = @sizeOf(u32);
-    const node_rows = nodes * (@sizeOf(NodeRow) + free_entry + @sizeOf(CompRow) + free_entry + @sizeOf(RootRow) + free_entry);
-    const terminals = 2 * oneway_links;
-    // Terminal ids stay below 2^31, so a cap past u32 saturates.
-    const k_cap: usize = if (terminals == 0) 0 else std.math.ceilPowerOfTwo(usize, terminals) catch std.math.maxInt(usize);
-    const block_words: usize = if (k_cap == 0) 0 else blockWords(std.math.cast(u32, k_cap) orelse std.math.maxInt(u32));
-    const closure = oneway_links * (@sizeOf(OneWayRow) + @sizeOf(u32)) +
-        terminals * (@sizeOf(TermRow) + free_entry + @sizeOf(HCompRow) + free_entry) +
-        2 *| block_words *| @sizeOf(u32);
-    const window = @max(default_flood_window, default_flood_budget_cap) + slack;
-    const items = window / (1 + slack);
-    const rounds = window * @sizeOf(Proposal) + items * (@sizeOf(FloodItem) + @sizeOf(FloodOut));
-    const table_slots = std.math.ceilPowerOfTwo(usize, 2 * (default_flood_budget_cap + slack)) catch std.math.maxInt(usize);
-    const tables = participants *| (@sizeOf(FloodScratch) + table_slots *| (@sizeOf(u64) + @sizeOf(u32)));
-    return node_rows +| closure +| rounds +| tables;
+/// What sizes a world's reachability for `storageBytesBound`.
+pub const StorageShape = struct {
+    /// The most live node rows over every level.
+    nodes: usize,
+    /// The chunks one level build patches and the most nodes it gathers.
+    level_chunks: usize,
+    level_nodes: usize,
+    /// The patch keys and new links of the largest marks batch.
+    batch_keys: usize,
+    batch_links: usize,
+    border_stride: usize,
+    /// The most link endpoints one chunk holds.
+    chunk_endpoints: usize,
+    links: usize,
+    oneway_links: usize,
+    /// The most terminals one H-component holds, clamped to every terminal.
+    system_terminals: usize = std.math.maxInt(usize),
+    participants: usize,
+};
+
+/// An over-estimate of `Connectivity.residentBytes` for `shape`, for storage size limits.
+/// Every list is charged at std's growth past the most it is reserved for, every pool at its
+/// doubling past its need. Staging is the larger of one level build and the largest marks
+/// batch, per list: a key holds at most `border_stride + chunk_endpoints` nodes. Comps and
+/// roots cover the live nodes plus a batch's fresh ids; the closure covers two terminals per
+/// one-way link, H-components of at most `system_terminals` each, its arena at three times
+/// its live blocks plus a span per piece, and a batch's closure staging at its worst.
+pub fn storageBytesBound(shape: StorageShape) usize {
+    const node_bound = shape.border_stride + shape.chunk_endpoints;
+    const marks_keys = shape.batch_keys;
+    const build_keys = shape.level_chunks;
+    const keys = @max(marks_keys, build_keys);
+    const items = @max(marks_keys +| shape.batch_links, build_keys);
+    // Every key's border window, and the link endpoints its chunks hold: at most
+    // `chunk_endpoints` each and every endpoint of the world in all.
+    const endpoints = 2 *| shape.links;
+    const marks_nodes = marks_keys *| shape.border_stride +| @min(marks_keys *| shape.chunk_endpoints, endpoints);
+    const build_endpoints = @min(build_keys *| shape.chunk_endpoints, endpoints);
+    // A build gathers a row per label (at most its nodes) and an edge per border run and
+    // endpoint of every chunk.
+    const build_labels = @min(shape.level_nodes, build_keys *| shape.border_stride +| build_endpoints);
+    const build_edges = build_keys *| shape.border_stride +| build_endpoints;
+    // A marks key gathers its old labels and new nodes as rows, an edge per node, and seeds
+    // each node.
+    const seeds = @max(marks_nodes, build_endpoints);
+    const rows = @max(2 *| marks_nodes, build_labels);
+    const edges = @max(marks_nodes +| shape.batch_links, build_edges);
+    const marks_elements = 5 *| marks_nodes +| shape.batch_links;
+    const build_elements = build_labels +| 2 *| build_endpoints +| 1;
+    const elements = @max(marks_elements, build_elements);
+    const map_slots = std.math.ceilPowerOfTwo(usize, @max(4 *| elements, 16)) catch std.math.maxInt(usize);
+    const staging = listBytesBound(usize, keys +| 1) +| listBytesBound(u32, keys) +| listBytesBound(EdgeEntry, seeds) +|
+        listBytesBound(bool, keys) +|
+        2 *| (listBytesBound(usize, items +| 1) +| listBytesBound(u32, items)) +|
+        listBytesBound(RowEntry, rows) +| listBytesBound(EdgeEntry, edges) +|
+        rowsBytesBound(ElementRow, elements) +| rowsBytesBound(UnitRow, elements) +| rowsBytesBound(SetRow, elements) +|
+        rowsBytesBound(FamilyRow, elements) +| rowsBytesBound(GroupRow, elements) +|
+        5 *| listBytesBound(u32, elements) +|
+        map_slots *| (@sizeOf(u64) + 2 * @sizeOf(u32));
+    // A pool doubles past its need and its free list covers it exactly.
+    const ids = 2 *| (shape.nodes +| elements);
+    const pools = ids *| (@sizeOf(CompRow) + @sizeOf(u32) + @sizeOf(RootRow) + @sizeOf(u32));
+    const flood_window = @max(default_flood_window, default_flood_budget_cap) + node_bound;
+    // A round's items shrink as a node's slack grows: charged at the least slack.
+    const flood_items = flood_window / (1 + shape.border_stride);
+    const table_slots = std.math.ceilPowerOfTwo(usize, 2 * (default_flood_budget_cap + node_bound)) catch std.math.maxInt(usize);
+    const flood = listBytesBound(FloodItem, flood_items) +| listBytesBound(FloodOut, flood_items) +|
+        listBytesBound(Proposal, flood_window) +| listBytesBound(FloodScratch, shape.participants) +|
+        shape.participants *| table_slots *| (@sizeOf(u64) + @sizeOf(u32));
+    // Every world link holds a registry entry, one-way or not.
+    const registry = listBytesBound(u32, shape.links);
+    const key_nodes = keys *| shape.border_stride +| @min(keys *| shape.chunk_endpoints, endpoints);
+    return staging +| pools +| flood +| registry +| closureBytesBound(shape, keys, key_nodes);
+}
+
+// The closure's share of `storageBytesBound`: its one-way rows, terminal and H-component pools,
+// arena, and a batch's staging over `keys` keys holding at most `key_nodes` nodes. A batch holds at most every terminal as an old or popped
+// one, every one-way link live or loose, and blocks whose caps sum to twice the terminals.
+fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usize {
+    if (shape.oneway_links == 0) return 0;
+    const terminals = 2 *| shape.oneway_links;
+    const system = @max(1, @min(shape.system_terminals, terminals));
+    // A block's cap is a power of two below twice its component's terminals.
+    const cap_max = std.math.ceilPowerOfTwo(usize, 2 *| system) catch std.math.maxInt(usize);
+    const row_words = @max(1, cap_max / 32);
+    const spans = (row_words + span_words - 1) / span_words;
+    const live_words = 2 *| terminals *| (row_words +| 2) +| span_words *| terminals;
+    const arena = (3 *| live_words +| span_words *| terminals) *| @sizeOf(u32);
+    const registry = rowsBytesBound(OneWayRow, shape.oneway_links);
+    // Terminals pop up to twice the live ones; H-components split into a piece per link.
+    const pools = 2 *| 3 *| terminals *| (@sizeOf(TermRow) + @sizeOf(u32)) +| 2 *| 2 *| terminals *| (@sizeOf(HCompRow) + @sizeOf(u32));
+    const staging = 2 *| listBytesBound(usize, keys +| 1) +| 2 *| listBytesBound(u32, keys) +| listBytesBound(CandTally, keys) +|
+        listBytesBound(u32, 3 *| key_nodes) +|
+        listBytesBound(OneWayEntry, @min(keys *| shape.chunk_endpoints, 2 *| shape.links)) +|
+        listBytesBound(u32, terminals) +| rowsBytesBound(TouchRow, terminals) +|
+        listBytesBound(u32, terminals / 16 +| terminals) +| listBytesBound(u32, 2 *| terminals) +|
+        3 *| listBytesBound(u32, terminals) +| listBytesBound(ResolveOut, terminals) +|
+        rowsBytesBound(SlotRow, 2 *| terminals) +| rowsBytesBound(PieceRow, terminals) +|
+        2 *| listBytesBound(u32, terminals) +| listBytesBound(FreedIndex, terminals) +| listBytesBound(MaskItem, terminals) +|
+        rowsBytesBound(APosRow, 2 *| terminals) +|
+        listBytesBound(CopyItem, 6 *| terminals *| spans) +| listBytesBound(RowsItem, 3 *| terminals *| spans) +|
+        listBytesBound(u32, 2 *| terminals +| 2) +| listBytesBound(CompactBlock, terminals);
+    return registry +| pools +| arena +| staging;
 }
 
 /// Per-world comps and roots, plus the batch staging the stages share and the flood's round
@@ -7087,6 +7170,64 @@ test "a tail toggle at a full block bounds its slots by the block and its pops, 
     try std.testing.expectEqual(@as(usize, 1), limits.n_net);
     try std.testing.expectEqual(@as(usize, 32), limits.q_max);
     try fixture.expectMatchesRebuild(&system);
+}
+
+test "a one-way chain cut to a few rooms, reopened, and toggled stays within the reachability and nav storage bounds" {
+    const chunks: u16 = 8;
+    const rooms: usize = 64;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    try addChain(&fixture, chunks, 0, 0, rooms);
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const graph = &system.graph;
+    const links = rooms - 1;
+    const stride = graph.levelGraph(0).?.border_stride;
+    const chunk_cells = @as(usize, test_chunk) * test_chunk;
+    const chunk_endpoints = @min(2 * links, chunk_cells);
+    const shape = StorageShape{
+        .nodes = graph.chunkCount() * stride + 2 * links,
+        .level_chunks = graph.chunkCount(),
+        .level_nodes = graph.chunkCount() * stride + 2 * links,
+        .batch_keys = graph.chunkCount(),
+        .batch_links = 0,
+        .border_stride = stride,
+        .chunk_endpoints = chunk_endpoints,
+        .links = links,
+        .oneway_links = links,
+        .system_terminals = rooms,
+        .participants = 1,
+    };
+    const graph_shape = NavGraph.StorageShape{
+        .chunks = graph.chunkCount(),
+        .levels = 1,
+        .chunk_tiles = test_chunk,
+        .links = links,
+        .oneway_links = links,
+        .oneway_system_terminals = rooms,
+        .batch_mark_chunks = rooms,
+        .batch_links = 0,
+        .batch_keys = graph.chunkCount(),
+    };
+    const cut = rooms - 8;
+    for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
+        for (0..cut) |index| try setRoom(&fixture, &system, chunks, 0, index, tile);
+        _ = try applyWithinBounds(&fixture, &system);
+        try std.testing.expect(graph.connectivity.residentBytes() <= storageBytesBound(shape));
+        try std.testing.expect(graph.residentBytes() <= NavGraph.storageBytesBound(graph_shape));
+    }
+    for (0..4) |_| {
+        for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
+            try setRoom(&fixture, &system, chunks, 0, rooms - 1, tile);
+            _ = try applyWithinBounds(&fixture, &system);
+            try std.testing.expect(graph.connectivity.residentBytes() <= storageBytesBound(shape));
+        }
+    }
+    try fixture.expectMatchesRebuild(&system);
+    // The closure is charged only for one-way links.
+    var two_way = shape;
+    two_way.oneway_links = 0;
+    try std.testing.expect(storageBytesBound(two_way) < storageBytesBound(shape));
 }
 
 test "a fill splitting a one-chunk room holding two endpoint cells yields two terminals within the bound" {

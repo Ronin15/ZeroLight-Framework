@@ -2003,6 +2003,19 @@ const OpenWorld = struct {
 };
 
 fn buildOpenWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16) !OpenWorld {
+    var world = try buildBandedWorld(allocator, io, side, levels, "grass", "grass");
+    errdefer world.deinit();
+    const meta = world.tilesetMeta().?;
+    const walkable = try world.requireTileByName(meta, "grass");
+    const blocking = try world.requireTileByName(meta, "dirt");
+    return .{ .world = world, .walkable = walkable, .blocking = blocking };
+}
+
+/// The bench world fixture: `levels` square levels of `side`² tiles in default chunks,
+/// each one uniform dense floor band (level `i` owns layer `i`), the tile named `surface`
+/// on level 0 and `below` under it. The world owns its tileset metadata
+/// (`tilesetMeta()`) for further tile lookups.
+pub fn buildBandedWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16, surface: []const u8, below: []const u8) !WorldSystem {
     const asset_store = AssetStore.init(allocator, io, "assets");
     var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     var meta_owned = true;
@@ -2016,16 +2029,16 @@ fn buildOpenWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u
     };
     errdefer world.deinit();
     try world.buildCatalog(&meta);
-    const walkable = try world.requireTileByName(&meta, "grass");
-    const blocking = try world.requireTileByName(&meta, "dirt");
+    const surface_tile = try world.requireTileByName(&meta, surface);
+    const below_tile = try world.requireTileByName(&meta, below);
     for (0..levels) |level_index| {
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
-        const layer = try world.addDenseLayer(level, 0, .floor, walkable);
-        std.debug.assert(layer == OpenWorld.floor(level));
+        const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) surface_tile else below_tile);
+        std.debug.assert(layer == level);
     }
     world.adoptTilesetMeta(meta);
     meta_owned = false;
-    return .{ .world = world, .walkable = walkable, .blocking = blocking };
+    return world;
 }
 
 // Writes `tile` into `cells` on level 0 in one reserve scope.
@@ -2087,6 +2100,17 @@ const route_request_count: usize = 64;
 // Requests run from level 0 to this level in the cross-level groups.
 const cross_level_goal_level: u16 = 4;
 
+// The chunk keys a marks batch toggling one cell patches: its chunk and four neighbours.
+const toggle_batch_keys: usize = squareBatchKeys(1);
+const toggle_batch: suite.NavBatch = .{ .mark_chunks = 1, .links = 0, .keys = toggle_batch_keys };
+
+/// The chunk keys a marks batch changing an `edge` x `edge` chunk square patches: the square
+/// and the ring of neighbours around it (`suite.NavSizeConfig.batch_keys`).
+pub fn squareBatchKeys(edge: usize) usize {
+    return edge * edge + 4 * edge;
+}
+
+// The route fixtures never change nav after the build: no marks batch.
 fn routeSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize) suite.NavSizeConfig {
     return .{
         .side = side,
@@ -2095,6 +2119,7 @@ fn routeSizeConfig(side: usize, levels: usize, links: usize, participant_count: 
         .participant_count = participant_count,
         .agent_budget = route_request_count,
         .group_fields = 1,
+        .batch = suite.NavBatch.none,
     };
 }
 
@@ -2174,7 +2199,10 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    return runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr, .fail);
+    try suite.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
+    const stats = try runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr, .fail);
+    try suite.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
+    return stats;
 }
 
 fn runCrossLevelDepthCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -2308,7 +2336,10 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    return runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
+    try suite.checkNavBytes(group_name, item_count, size_config, &fixture.system);
+    const stats = try runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
+    try suite.checkNavBytes(group_name, item_count, size_config, &fixture.system);
+    return stats;
 }
 
 // Shaft group levels: requests start on one and end on the other.
@@ -2377,7 +2408,10 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    return runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
+    try suite.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
+    const stats = try runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
+    try suite.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
+    return stats;
 }
 
 // Adds `count` bidirectional teleports from level-0 cells within `teleport_border_band` of
@@ -2840,11 +2874,19 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .agent_budget = evictAgentBudget(result_count),
         .group_fields = 1,
         .long_results = 0,
+        // The dig's cell, or every cell of the region square; their chunks with their
+        // neighbours.
+        .batch = if (region_chunks == 0) toggle_batch else .{
+            .mark_chunks = region_chunks * default_chunk_size_tiles * default_chunk_size_tiles,
+            .links = 0,
+            .keys = squareBatchKeys(std.math.sqrt(region_chunks)),
+        },
     };
     if (suite.navSizeSkip(evict_group.name, item_count, case, size_config)) |skip| return skip;
 
     var fixture = try initEvictFixture(allocator, io, result_count, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    try suite.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
     const region_cells: ?[]CellCoord = if (region_chunks == 0) null else try evictRegionCells(allocator, region_chunks, fixture.open.world.chunk_size_tiles);
     defer if (region_cells) |cells| allocator.free(cells);
     const cells: []const CellCoord = region_cells orelse &.{evict_dig_cell};
@@ -2874,6 +2916,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     report.print(options, evict_group.name, item_count, case);
     // The size config charges no long block.
     if (fixture.system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
+    try suite.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = evicted;
     stats.cache_evictions = evicted;
@@ -3172,6 +3215,8 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         .agent_budget = item_count,
         .group_fields = 1,
         .long_results = 0,
+        // Requests only: no marks batch.
+        .batch = suite.NavBatch.none,
     };
     if (suite.navSizeSkip(elastic_ramp_group.name, item_count, case, size_config)) |skip| return skip;
     const capacity = navSizeCapacity(size_config);
@@ -3188,6 +3233,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer system.deinit();
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
+    try suite.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
     setPathStageTuners(&system, case);
 
     for (0..options.warmup_iterations) |_| _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
@@ -3199,6 +3245,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     }
     // The size config charges no long block.
     if (system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
+    try suite.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
     stats.output_count = last.solves;
     // A ramp ends with every agent's result cached once, so every solve past one per
@@ -3313,6 +3360,8 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         .agent_budget = item_count,
         .group_fields = 1,
         .long_results = 0,
+        // Requests only: no marks batch.
+        .batch = suite.NavBatch.none,
     };
     if (suite.navSizeSkip(elastic_shrink_group.name, item_count, case, size_config)) |skip| return skip;
     const capacity = navSizeCapacity(size_config);
@@ -3329,6 +3378,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     defer system.deinit();
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
+    try suite.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
     setPathStageTuners(&system, case);
     var cached: std.ArrayList(CachedPayload) = .empty;
     defer cached.deinit(allocator);
@@ -3349,6 +3399,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     // The size config charges no long block.
     if (system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
 
+    try suite.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
     stats.output_count = shrink_report.last.kept;
     stats.candidate_pairs = shrink_report.last.moved;
@@ -3617,6 +3668,8 @@ fn pocketSizeConfig(side: u16, participant_count: usize, requester_count: usize)
         .group_fields = 1,
         // No path is published, so no long block is taken.
         .long_results = 0,
+        // At most one toggled cell per step.
+        .batch = toggle_batch,
     };
 }
 
@@ -3668,6 +3721,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
 
     var fixture = try initPocketFixture(allocator, io, side, item_count, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    try suite.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     setPathStageTuners(&fixture.system, case);
 
     var pool_step: usize = 0;
@@ -3697,6 +3751,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     }
     stage_report.print(options, negative_steady_group.name, item_count, case);
 
+    try suite.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = last_stats.unavailable_results;
     stats.cache_evictions = last_stats.cache_evictions;
@@ -3786,6 +3841,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 
     var fixture = try initPocketFixture(allocator, io, side, requester_count, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    try suite.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     try fixture.changed.ensureTotalCapacity(allocator, 1);
     setPathStageTuners(&fixture.system, case);
     setNavReactionTuners(&fixture.system, case);
@@ -3821,6 +3877,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     reaction_report.print(options, negative_dig_group.name, item_count, case);
     report.print(options, item_count, case);
 
+    try suite.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = report.last.solved_requests;
     stats.candidate_pairs = report.last.reach_unavailable;
@@ -3978,6 +4035,8 @@ fn burstSizeConfig(participant_count: usize, requester_count: usize) suite.NavSi
         .group_fields = 1,
         // No path is published, so no long block is taken.
         .long_results = 0,
+        // Requests only: no marks batch.
+        .batch = suite.NavBatch.none,
     };
 }
 
@@ -4098,6 +4157,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
 
     var fixture = try initBurstFixture(allocator, io, config, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    try suite.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     setPathStageTuners(&fixture.system, case);
 
     // At least one untimed burst: the first grows the capacity from the reserve floor.
@@ -4124,6 +4184,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     }
     stage_report.print(options, negative_burst_group.name, item_count, case);
 
+    try suite.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = last.unavailable;
     stats.candidate_pairs = last.searches;
@@ -4532,7 +4593,8 @@ fn chunkCells(allocator: std.mem.Allocator, chunks: []const ChunkCoord, chunk_ti
     return cells;
 }
 
-fn toggleSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize) suite.NavSizeConfig {
+// `batch`: the workload's largest marks batch.
+fn toggleSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize, batch: suite.NavBatch) suite.NavSizeConfig {
     return .{
         .side = side,
         .levels = levels,
@@ -4541,6 +4603,7 @@ fn toggleSizeConfig(side: usize, levels: usize, links: usize, participant_count:
         .agent_budget = toggle_agent_budget,
         .group_fields = 1,
         .long_results = 0,
+        .batch = batch,
     };
 }
 
@@ -4635,11 +4698,13 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const size_config = toggleSizeConfig(config.side, 1, 0, participant_count);
+    // The gap chunk's cells.
+    const size_config = toggleSizeConfig(config.side, 1, 0, participant_count, .{ .mark_chunks = default_chunk_size_tiles * default_chunk_size_tiles, .links = 0, .keys = toggle_batch_keys });
     if (suite.navSizeSkip(connectivity_split_group.name, item_count, case, size_config)) |skip| return skip;
 
     var fixture = try initSplitFixture(allocator, io, config, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    try suite.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     const gap = try chunkCells(allocator, &.{config.gapChunk()}, fixture.open.world.chunk_size_tiles);
     defer allocator.free(gap);
     try fixture.changed.ensureTotalCapacity(allocator, gap.len);
@@ -4647,6 +4712,7 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     configureNavUpdateThreads(&fixture.system, case);
 
     var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr, .{});
+    try suite.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     stats.output_count = gap.len;
     stats.candidate_pairs = config.structureChunks();
     return stats;
@@ -4704,6 +4770,23 @@ const OnewayRoom = struct {
     level: u16,
     cell: CellCoord,
 };
+
+// The chunk keys a marks batch changing `rooms` patches at most: each distinct chunk they
+// sit in with its four neighbours.
+fn roomBatchKeys(allocator: std.mem.Allocator, rooms: []const OnewayRoom) !usize {
+    const chunks = try allocator.alloc(u64, rooms.len);
+    defer allocator.free(chunks);
+    const chunk_edge = default_chunk_size_tiles;
+    for (rooms, chunks) |room, *chunk| {
+        chunk.* = (@as(u64, room.level) << 32) | (@as(u64, room.cell.y / chunk_edge) << 16) | (room.cell.x / chunk_edge);
+    }
+    std.mem.sort(u64, chunks, {}, std.sort.asc(u64));
+    var distinct: usize = 0;
+    for (chunks, 0..) |chunk, index| {
+        if (index == 0 or chunk != chunks[index - 1]) distinct += 1;
+    }
+    return distinct * toggle_batch_keys;
+}
 
 // Whether a level-0 chunk is the site chunk or one of its orthogonal neighbours.
 fn inOnewaySite(level: u16, cell: CellCoord) bool {
@@ -4925,13 +5008,29 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const size_config = toggleSizeConfig(oneway_side, oneway_levels, config.links(), participant_count);
-    if (suite.navSizeSkip(connectivity_oneway_group.name, item_count, case, size_config)) |skip| return skip;
-
     const rooms = try onewayRooms(allocator, config);
     defer allocator.free(rooms);
+    // The toggle, the dense variant's walls, or the shrunk variant's cut, whichever writes the
+    // most cells and patches the most chunks.
+    const cut_rooms = if (config.variant == .shrunk) config.terminals - oneway_shrunk_live else 0;
+    const batch = suite.NavBatch{
+        .mark_chunks = @max(1, @max(config.systems, cut_rooms)),
+        .links = 0,
+        .keys = @max(toggle_batch_keys, if (config.variant == .dense)
+            config.systems * toggle_batch_keys
+        else if (config.variant == .shrunk)
+            try roomBatchKeys(allocator, rooms[0..cut_rooms])
+        else
+            toggle_batch_keys),
+    };
+    var size_config = toggleSizeConfig(oneway_side, oneway_levels, config.links(), participant_count, batch);
+    // A system is one chain or fan of rooms; the dense variant's opening merges every one.
+    size_config.oneway_system_terminals = if (config.variant == .dense) config.rooms() else config.terminals;
+    if (suite.navSizeSkip(connectivity_oneway_group.name, item_count, case, size_config)) |skip| return skip;
+
     var fixture = try initOnewayFixture(allocator, io, config, rooms, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     // One toggled cell, or the dense variant's walls.
     const dense_walls: []CellCoord = if (config.variant == .dense) try denseWalls(allocator, config.systems) else &.{};
     defer allocator.free(dense_walls);
@@ -4946,6 +5045,7 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     // opening can create: its ratio is what the variant measures.
     const checks: ToggleChecks = if (config.variant == .dense) .{ .fixed_blocks = false, .reserve_ratio = false } else .{};
     var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks);
+    try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     stats.output_count = config.links();
     stats.candidate_pairs = config.rooms();
     return stats;
@@ -5005,7 +5105,8 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // Every sample adds a batch, so the size check holds at the most pads the run holds.
     const samples = options.warmup_iterations + options.iterations;
     const peak_pads = config.padsAfter(samples);
-    var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count);
+    // A timed batch's pads and their endpoint chunks; the probe preload is in the build.
+    var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count, .{ .mark_chunks = 0, .links = link_fold_batch, .keys = 2 * link_fold_batch });
     // Every pad is bidirectional.
     size_config.oneway_links = 0;
     if (suite.navSizeSkip(link_fold_group.name, item_count, case, size_config)) |skip| return skip;
@@ -5015,6 +5116,7 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const probe_pairs = config.probePairs(samples);
     var fixture = try initLinkFoldFixture(allocator, io, random, config, probe_pairs, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
+    try suite.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     setNavReactionTuners(&fixture.system, case);
     configureNavUpdateThreads(&fixture.system, case);
     var batch: usize = 0;
@@ -5033,6 +5135,7 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const pads_held = fixture.open.world.levelLinks().len;
     if (pads_held != peak_pads) return error.LinkFoldDrift;
     report.print(options, link_fold_group.name, item_count, case);
+    try suite.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = pads_held;
     stats.candidate_pairs = report.chunks_patched;

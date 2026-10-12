@@ -128,12 +128,23 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
 // scattered row order. Timed: one apply of the merged intents into velocity; apply is
 // idempotent, so no reset runs between iterations. `--details` reports the applied
 // intents, the apply shape, and the main-thread time (everything but a dispatched
-// apply) and share.
+// apply) and share. `movement-apply-intents-sorted` is the same stream in row order, so
+// each range writes one contiguous row window: the scattered group's control for worker
+// ranges writing rows scattered across the velocity columns.
 pub const apply_intents_group = suite.BenchmarkGroup{
     .name = "movement-apply-intents",
     .defaultItemCounts = applyIntentsItemCounts,
-    .runCase = runApplyIntentsCase,
+    .runCase = runApplyIntentsScatteredCase,
 };
+
+pub const apply_intents_sorted_group = suite.BenchmarkGroup{
+    .name = "movement-apply-intents-sorted",
+    .defaultItemCounts = applyIntentsItemCounts,
+    .runCase = runApplyIntentsSortedCase,
+};
+
+// The intent stream's row order.
+const IntentOrder = enum { scattered, sorted };
 
 const apply_intents_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
 // Every this-many agents has speed 0, so the apply takes its default-speed path.
@@ -177,8 +188,9 @@ fn scatterStride(count: usize) usize {
 }
 
 // `count` agents with a movement body (zero velocity) and an AI agent, entity `index`
-// on movement row `index`; one movement intent each, in `index * stride mod count` order.
-fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize) !ApplyIntentsFixture {
+// on movement row `index`; one movement intent each, in `index * stride mod count` order
+// when scattered, else in row order.
+fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize, order_kind: IntentOrder) !ApplyIntentsFixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     for (0..count) |index| {
@@ -195,7 +207,10 @@ fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize) !ApplyIn
     frame.intents.addCount(0, count);
     try frame.intents.prefix();
     var writer = frame.intents.rangeWriter(0);
-    const stride = scatterStride(count);
+    const stride: usize = switch (order_kind) {
+        .scattered => scatterStride(count),
+        .sorted => 1,
+    };
     for (0..count) |order| {
         const row = order * stride % count;
         const direction = agentDirection(row);
@@ -238,7 +253,15 @@ fn applyIntentsOnce(
     return stats.batch;
 }
 
-fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runApplyIntentsScatteredCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runApplyIntentsCase(allocator, io, options, case, item_count, .scattered);
+}
+
+fn runApplyIntentsSortedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runApplyIntentsCase(allocator, io, options, case, item_count, .sorted);
+}
+
+fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, order_kind: IntentOrder) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var threads: ?ThreadSystem = null;
@@ -251,7 +274,7 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
-    var fixture = try buildApplyIntentsFixture(allocator, item_count);
+    var fixture = try buildApplyIntentsFixture(allocator, item_count, order_kind);
     defer fixture.deinit();
     var system = MovementSystem.init();
     if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
