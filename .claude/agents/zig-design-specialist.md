@@ -74,7 +74,8 @@ section with nothing new is omitted.
   reordered stage names its `PipelineResource` tags and `stage_order` position.
 - **Budgets, capacities, thresholds**: class, sizing, growth point, degradation
   path, and proofs, checked against destruction-scale workloads.
-- **Hot-loop table (mandatory; a design without it is incomplete):** one row
+- **Hot-loop table** (mandatory whenever the change adds a loop or changes a
+  loop's cost or thread placement; otherwise one line saying none): one row
   for every per-step, per-frame, per-request, and per-change loop the change
   adds or changes, plus inherited loops in the area whose cost or thread
   placement it changes. Columns:
