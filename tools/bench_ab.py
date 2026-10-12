@@ -16,7 +16,15 @@ only what differs). Raw outputs and the summary go to
 (`--all-cases` runs every case). A run must name its config with
 `-- --items N` (or pass `--grid` for every config): one config answers a
 regression question; a full grid is rarely the right signal. Runs use `--warmup 2 --iterations 10`
-unless the forwarded bench args set them. `--optimize ReleaseFast` is only for a
+unless the forwarded bench args set them.
+
+Each side's raw outputs are cached under `benchmark_outputs/ab-cache/`, keyed
+by the side's build inputs (`src/`, `build.zig*`, `assets/` as git trees, the
+working tree's content included, so a landing's measured tree is the next
+landing's cached base), the build mode, the case, and the
+forwarded args. A side with enough cached reps younger than
+`CACHE_MAX_AGE_S` is not rerun; that side is then not interleaved with the
+other, so `--fresh` reruns both when a verdict sits at the edge of spread. `--optimize ReleaseFast` is only for a
 question Debug cannot answer (`.claude/rules/build-validation.md`).
 
 Usage:
@@ -32,17 +40,25 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
+import json
+import os
 import re
 import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 OUTPUT_DIRNAME = "benchmark_outputs"
 BASE_DIRNAME = "ab-base"
 KEEP_BASES = 2
 READY_MARKER = ".bench-ab-ready"
+CACHE_DIRNAME = "ab-cache"
+# Cached reps older than this are rerun: machine state drifts across a day.
+CACHE_MAX_AGE_S = 6 * 3600
 
 GROUP_HEADER = re.compile(r"^(\S+)\s+(\d+)\s+\S")
 CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s")
@@ -79,6 +95,39 @@ def export_base(root: Path, ref: str) -> Path:
     for old in others[: max(0, len(others) - (KEEP_BASES - 1))]:
         shutil.rmtree(old)
     return target
+
+
+# Only these paths change what a bench measures; docs, rules, and tools do not.
+BUILD_INPUTS = ("src", "build.zig", "build.zig.zon", "assets")
+
+
+def tree_of(root: Path, ref: str | None) -> str:
+    """Id of the bench's build inputs at a ref, or in the working tree (untracked included)."""
+    if ref is not None:
+        tree = git(root, "rev-parse", f"{ref}^{{tree}}")
+    else:
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            subprocess.run(["git", "read-tree", "HEAD"], cwd=root, env=env, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=root, env=env, check=True)
+            tree = subprocess.run(["git", "write-tree"], cwd=root, env=env, capture_output=True, text=True, check=True).stdout.strip()
+    parts = [subprocess.run(["git", "rev-parse", f"{tree}:{path}"], cwd=root, capture_output=True, text=True).stdout.strip() for path in BUILD_INPUTS]
+    return hashlib.sha256(" ".join(parts).encode()).hexdigest()
+
+
+def cache_path(root: Path, tree: str, optimize: str, bench_args: list[str]) -> Path:
+    digest = hashlib.sha256(json.dumps([optimize, bench_args]).encode()).hexdigest()[:16]
+    return root / OUTPUT_DIRNAME / CACHE_DIRNAME / tree[:16] / f"{digest}.json"
+
+
+def cached_texts(path: Path, reps: int) -> list[str] | None:
+    try:
+        entry = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if time.time() - entry.get("created", 0) > CACHE_MAX_AGE_S or len(entry.get("texts", [])) < reps:
+        return None
+    return entry["texts"][:reps]
 
 
 def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str) -> tuple[int, str]:
@@ -141,6 +190,7 @@ def main() -> int:
         default="Debug",
         help="build mode for both sides (default: Debug; ReleaseFast only for what Debug cannot show)",
     )
+    parser.add_argument("--fresh", action="store_true", help="ignore cached reps and rerun both sides")
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
     args = parser.parse_args()
 
@@ -153,10 +203,10 @@ def main() -> int:
         parser.error("--reps must be >= 1")
 
     root = repo_root()
-    sides: list[tuple[str, Path]] = []
+    sides: list[tuple[str, Path, str]] = []
     if args.base != "none":
-        sides.append((f"base:{args.base}", export_base(root, args.base)))
-    sides.append(("tree", root))
+        sides.append((f"base:{args.base}", export_base(root, args.base), tree_of(root, args.base)))
+    sides.append(("tree", root, tree_of(root, None)))
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = root / OUTPUT_DIRNAME / f"ab-{stamp}"
@@ -172,13 +222,26 @@ def main() -> int:
         parser.error("--all-cases and --case are exclusive")
     cases: list[str | None] = [None] if args.all_cases else (list(args.case) or list(DEFAULT_CASES))
     samples: dict[tuple[str, str, str, str], list[float]] = {}
+    texts: dict[tuple[int, int, int], list[str]] = {}
+    cached_sides: set[str] = set()
+    for t, target in enumerate(targets):
+        for c, case in enumerate(cases):
+            for s, (name, _, tree) in enumerate(sides):
+                bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
+                hit = None if args.fresh else cached_texts(cache_path(root, tree, args.optimize, bench_args), args.reps)
+                if hit is not None:
+                    texts[(t, c, s)] = hit
+                    cached_sides.add(name)
 
-    total = args.reps * len(targets) * len(cases) * len(sides)
+    total = sum(args.reps for t in range(len(targets)) for c in range(len(cases)) for s in range(len(sides)) if (t, c, s) not in texts)
     done = 0
+    fresh: dict[tuple[int, int, int], list[str]] = {}
     for rep in range(1, args.reps + 1):
-        for target in targets:
-            for case in cases:
-                for name, cwd in sides:
+        for t, target in enumerate(targets):
+            for c, case in enumerate(cases):
+                for s, (name, cwd, _) in enumerate(sides):
+                    if (t, c, s) in texts:
+                        continue
                     bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
                     code, text = run_bench(cwd, bench_args, root / ".zig-cache", args.optimize)
                     tag = "_".join([name.replace(":", "-").replace("/", "-"), target[1], case or "all", str(rep)])
@@ -189,15 +252,25 @@ def main() -> int:
                         print(text[-4000:], file=sys.stderr)
                         print(f"bench failed on {name} (exit {code}); raw output in {out_dir}", file=sys.stderr)
                         return code
-                    for (group, item, case_name), us in parse(text, case).items():
-                        samples.setdefault((group, item, case_name, name), []).append(us)
+                    fresh.setdefault((t, c, s), []).append(text)
+
+    for (t, c, s), runs in fresh.items():
+        bench_args = targets[t] + (["--case", cases[c]] if cases[c] else []) + timing + args.bench_args
+        path = cache_path(root, sides[s][2], args.optimize, bench_args)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"created": time.time(), "args": bench_args, "texts": runs}))
+    for (t, c, s), runs in {**texts, **fresh}.items():
+        for text in runs:
+            for (group, item, case_name), us in parse(text, cases[c]).items():
+                samples.setdefault((group, item, case_name, sides[s][0]), []).append(us)
 
     keys = sorted({k[:3] for k in samples})
-    names = [n for n, _ in sides]
+    names = [n for n, _, _ in sides]
     lines = [
         f"# bench_ab  {stamp}  head={git(root, 'rev-parse', '--short', 'HEAD')}"
         f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  {args.optimize}",
         f"# args  {' '.join(sum(targets, []))}  cases={'all' if args.all_cases else ','.join(c for c in cases)}  extra={' '.join(args.bench_args) or '-'}",
+        f"# cached (not interleaved): {', '.join(sorted(cached_sides)) or 'none'}",
         "",
     ]
     header = f"{'group':30} {'item':>12} {'case':28}"
