@@ -2,7 +2,8 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** Prerequisite for 51 (the lane thread relies on the
+**Status: not started.** Owner 2026-10-12: near-term; opens the core-systems
+branch, right after 64G. Prerequisite for 51 (the lane thread relies on the
 foreign-thread rule, naming, and TSan workflow). Rebases with 49 on
 `thread_system.zig` and with 52A on `build.zig`; once landed, 52C adds a TSan
 job.

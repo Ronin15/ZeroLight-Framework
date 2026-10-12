@@ -256,7 +256,9 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - dense-dig main-thread split;
    - the cross-level heuristic at scale;
    - the seal gate (a combined review since the 2026-10-07 branch review).
-2. **Core systems:** spatial index, steering, collision, tile gate, render
+2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
+   2026-10-12), so the branch's threaded rework runs under the race
+   detector; then spatial index, steering, collision, tile gate, render
    prep, inert rows, and Slice 75's tier mechanics.
 3. **AI:** cognition, perception, memory, affect, sensory bus and interest
    markers, built on the core branch's final form.
@@ -355,12 +357,12 @@ order.
   name in the same change.
 
 1. **64G** Chunk-Owned Terrain And Nav.
-2. **76** Cave-Ins — after 64G.
-3. **77** Explosions — after 64G, 76.
-4. **49** Session Seed And Determinism Checksum Harness — after 64G.
-5. **73** Data-Driven Cognition — after 49.
-6. **75** Far Simulation — after 64G, 73.
-7. **50** Thread System Hardening.
+2. **50** Thread System Hardening (opens the core-systems branch).
+3. **76** Cave-Ins — after 64G.
+4. **77** Explosions — after 64G, 76.
+5. **49** Session Seed And Determinism Checksum Harness — after 64G.
+6. **73** Data-Driven Cognition — after 49.
+7. **75** Far Simulation — after 64G, 73.
 8. **74** World Instances — after 64G, 49, 50, 75.
 9. **52A** Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders.
 10. **52B** Platform Packaging Layouts — after 52A.
