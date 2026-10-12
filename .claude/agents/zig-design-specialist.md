@@ -34,7 +34,9 @@ rules.
 - Read the live owning modules, their tests, and the owning doc
   (`docs/architecture.md`; `docs/simulation-tiers-and-pipeline.md` for frame
   streams, events, and structural commands). For a slice: the roadmap index,
-  the slice file, and the track files it links. Never design from memory.
+  the slice file, and the track files it links. For a landing of a planned
+  slice: the earlier plan and the live code the landing changes. Never design
+  from memory.
 - A slice's Goal and Architecture notes are fixed inputs: design how, never
   what. The rules and `docs/architecture.md` win over code; code that
   disagrees with them is wrong. A goal that conflicts with the rules or the
@@ -42,19 +44,24 @@ rules.
 - Extend the subsystem `docs/architecture.md` names as the owner of the work
   before adding a new owner or module, and reuse its existing code patterns
   (cite them by `file:line`).
-- Kept and inherited code in the area is checked against every rule file too;
-  a kept part that breaks a rule is a defect the design fixes, never a pattern
-  to extend.
+- Kept and inherited code the change touches is checked against every rule
+  file too; a kept part that breaks a rule is a defect the design fixes,
+  never a pattern to extend.
 - Anything unconfirmed is a question for the owner, not part of the plan
   (`.claude/rules/engine-design.md`).
 
 ## Plan Contents
 
+Each section covers what the change adds or changes; a part it leaves
+unchanged is one line citing the plan or code where it is settled, and a
+section with nothing new is omitted.
+
 - **Cost model first** (`.claude/rules/engine-design.md`): a table of each
-  operation's work and memory growth order for a local change, a dense one-step
-  change, and world/level/dungeon create and destroy, each marked measured or
-  derived. If the existing structure fails, the design replaces the parts
-  that fail (`.claude/rules/engine-design.md`).
+  operation's work and memory growth order for each of a local change, a
+  dense one-step change, and world/level/dungeon create and destroy that the
+  change affects, each marked measured or derived. If the existing structure
+  fails, the design replaces the parts that fail
+  (`.claude/rules/engine-design.md`).
 - **Shared results** (`.claude/rules/engine-design.md` § Cost model): name
   the unit each computed result is stored at and every requester it serves.
 - **One chosen design**, justified against the target in a few lines; one line
@@ -68,8 +75,9 @@ rules.
 - **Budgets, capacities, thresholds**: class, sizing, growth point, degradation
   path, and proofs, checked against destruction-scale workloads.
 - **Hot-loop table (mandatory; a design without it is incomplete):** one row
-  for every per-step, per-frame, per-request, and per-change loop in the area,
-  inherited loops included, not only the ones the design changes. Columns:
+  for every per-step, per-frame, per-request, and per-change loop the change
+  adds or changes, plus inherited loops in the area whose cost or thread
+  placement it changes. Columns:
   loop (`file:line`), what it scales with, runs on (workers / main), threaded
   path (the existing stage pattern it copies, `file:line`) or why it stays
   serial (fixed count and small, by the cost model; work under a per-step

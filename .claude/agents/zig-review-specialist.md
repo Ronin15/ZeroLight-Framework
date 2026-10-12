@@ -62,8 +62,9 @@ model; routes to design) or **local**.
    float/compare loop with no SIMD verdict is a finding; so is main-thread
    per-item work that grows (path cells, bytes, scans, sorts), even under a
    per-step budget: main keeps O(1) work per item in its ordered merge. When reviewing a
-   design, check its hot-loop table covers every loop in the area, inherited
-   loops included. A serial/inline path that does more work than the code it
+   design, check its hot-loop table covers every loop the change adds or
+   changes and every inherited loop whose cost or thread placement it
+   changes. A serial/inline path that does more work than the code it
    replaces is a finding.
    Is each claimed order measured by a scaling bench at three or more sizes
    (`.claude/rules/tests-benchmarks.md`), or marked derived? A flat-cost claim
