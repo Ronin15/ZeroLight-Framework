@@ -94,7 +94,7 @@ options: DW. Validation cadence: `.claude/rules/build-validation.md`.
 - Design and review agents write their plans and reports to
   `.claude/reports/` (gitignored); briefs cite the file instead of pasting it.
 - `tools/bench_ab.py` is the before/after bench (targeted groups, base ref vs
-  tree, Debug reps, medians and spread; each side's reps cached by its build
-  inputs).
+  tree, one Debug run per side, 3 reps only to confirm a slower case; each
+  side's runs cached by its build inputs).
 - `hooks/zig-fmt.sh` runs `zig fmt` on each edited `.zig`/`.zon` file (needs
   `jq`); it does not replace validation.

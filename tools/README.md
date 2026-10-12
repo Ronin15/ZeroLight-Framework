@@ -21,7 +21,7 @@ they are **not** part of the game binary.
 
 | Script | What it does |
 | --- | --- |
-| `bench_ab.py` | Targeted Debug before/after: named bench groups only, a base ref vs the working tree, reps cached by build inputs, medians and spread. |
+| `bench_ab.py` | Targeted Debug before/after: named bench groups only, a base ref vs the working tree, one run per side (`--reps 3` confirms a slower case), runs cached by build inputs. |
 | `bench_run.py` | Run `zig build bench` (full suite unless args narrow it), save a timestamped copy to `benchmark_outputs/`, and rotate to the newest N runs. |
 | `gen_atlas_orders.py` | Generate atlas **order manifests** (`atlas_orders/*.json`) from the procedural sprite registries. |
 | `generate_grim_sprites.py` | Generate the grim-dark fantasy character and item sprite atlases. |
@@ -55,9 +55,11 @@ tree per group and case, except a side whose reps are cached: each side's raw
 outputs are cached under `benchmark_outputs/ab-cache/`, keyed by its build
 inputs (`src/`, `build.zig*`, `assets/`), mode, case, and args, and reused for
 six hours, so a landing's measured tree is the next landing's base. `--fresh`
-reruns both sides interleaved. The summary prints each side's median and min-max
-spread and a verdict: `slower`/`faster` only when the two ranges do not
-overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
+reruns both sides interleaved. With one run per side (the default) the verdict
+is `slower`/`faster` past 10%, otherwise `within noise`; a `slower` case is
+confirmed with `--reps 3` on that case alone, where the summary prints each
+side's median and min-max spread and calls `slower`/`faster` only when the two
+ranges do not overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
 `benchmark_outputs/ab-<stamp>/`. Always Debug. Cases default to
 `serial-direct` and `thread-adaptive-tuned-range` (`--all-cases` for every
 scheduler case) and to `--warmup 2 --iterations 10` per run (forward

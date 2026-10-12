@@ -46,10 +46,11 @@ paths:
 - Run benches targeted to the code being tested or changed
   (`--group <name> --items N`), never the full suite; full sweeps only when
   the owner or a slice asks.
-- Bench only changes that can move a hot path. Compare before/after on adjacent
-  commits in Debug (ReleaseFast only per `build-validation.md`) with 3
-  reps and medians (`tools/bench_ab.py`); a regression is a change
-  beyond the run-to-run spread. Act on one only when it shows a worse growth
+- Bench only changes that can move a hot path, once, at the right-sized
+  scales. Compare before/after on adjacent commits in Debug (ReleaseFast only
+  per `build-validation.md`) with one run per side (`tools/bench_ab.py`); a
+  case more than 10% slower is rerun alone with 3 reps, and a regression is a
+  change beyond their run-to-run spread. Act on one only when it shows a worse growth
   order or a material total; a nanosecond-per-item constant is reported, not
   redesigned. A constant is material when it moves the stage's total beyond
   the run-to-run spread at the bench's sizes; a few ns per item on a stage

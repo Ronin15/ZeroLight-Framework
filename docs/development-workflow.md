@@ -436,7 +436,8 @@ zig build bench -- --details
 ```
 
 Before/after comparisons use `tools/bench_ab.py`: targeted groups only, a base
-ref vs the working tree, Debug reps, medians and spread. Each side's reps are
+ref vs the working tree, one Debug run per side (`--reps 3` confirms a slower
+case with medians and spread). Each side's runs are
 cached by its build inputs (`src/`, `build.zig*`, `assets/`) for six hours, so
 a landing's measured tree is reused as the next landing's base; `--fresh`
 reruns both sides interleaved. Full-suite

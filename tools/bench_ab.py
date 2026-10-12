@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Targeted before/after benchmark comparison, in Debug by default.
 
-Runs only the named bench groups (never the full suite), interleaving a base
-git ref against the working tree for N reps, and prints per-(group, item,
-case) medians, each side's min-max spread, and a verdict: a change counts only
-when the two sides' min-max ranges do not overlap
-(`.claude/rules/tests-benchmarks.md`).
+Runs only the named bench groups (never the full suite), a base git ref
+against the working tree, one run per side by default, and prints per-(group,
+item, case) times and a verdict (`.claude/rules/tests-benchmarks.md`). One run
+per side: a change beyond NOISE_PCT counts, and a `slower` case is confirmed by
+rerunning only that group, size, and case with `--reps 3`. With reps, it prints
+medians and min-max spread, and a change counts only when the two sides' ranges
+do not overlap.
 
 The base ref is exported once with `git archive` under
 `benchmark_outputs/ab-base/<sha>/` and reused while it exists (its build cache
@@ -64,6 +66,8 @@ GROUP_HEADER = re.compile(r"^(\S+)\s+(\d+)\s+\S")
 CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s")
 UNIT_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
 DEFAULT_CASES = ("serial-direct", "thread-adaptive-tuned-range")
+# Single-run verdict band; a regression past it is confirmed with --reps 3.
+NOISE_PCT = 10.0
 # A regression check needs medians and spread over reps, not long runs per config.
 DEFAULT_TIMING = ("--warmup", "2", "--iterations", "10")
 
@@ -164,7 +168,7 @@ def fmt_us(v: float) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Targeted A/B bench (Debug by default): base ref vs working tree, interleaved reps, medians.",
+        description="Targeted A/B bench (Debug by default): base ref vs working tree, one run per side or medians over reps.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -183,7 +187,7 @@ def main() -> int:
         help="run every config of each group (default: refuse unless the forwarded args name --items)",
     )
     parser.add_argument("--base", default="HEAD", help="git ref for the before side, or 'none' (default: HEAD)")
-    parser.add_argument("--reps", type=int, default=3, help="interleaved reps per side (default: 3)")
+    parser.add_argument("--reps", type=int, default=1, help="interleaved reps per side (default: 1; 3 to confirm a slower case)")
     parser.add_argument(
         "--optimize",
         choices=("Debug", "ReleaseFast"),
@@ -295,7 +299,10 @@ def main() -> int:
         if len(names) == 2 and all(stats):
             (bm, blo, bhi), (tm, tlo, thi) = stats
             delta = (tm - bm) / bm * 100 if bm else 0.0
-            verdict = "slower" if tlo > bhi else "faster" if thi < blo else "within spread"
+            if args.reps == 1:
+                verdict = "slower (confirm: --reps 3)" if delta > NOISE_PCT else "faster" if delta < -NOISE_PCT else "within noise"
+            else:
+                verdict = "slower" if tlo > bhi else "faster" if thi < blo else "within spread"
             row += f" {delta:+7.1f}%  {verdict}"
         lines.append(row)
     summary = "\n".join(lines) + "\n"
