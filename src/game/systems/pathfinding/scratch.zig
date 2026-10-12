@@ -11,6 +11,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const PortalFlags = @import("nav_graph.zig").PortalFlags;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const OpenNode = types.OpenNode;
 const StitchedCell = types.StitchedCell;
 const unreachable_cost = types.unreachable_cost;
@@ -20,10 +21,6 @@ const openHeapLimit = types.openHeapLimit;
 const fibonacciSlot = types.fibonacciSlot;
 const hashTableSlots = types.hashTableSlots;
 const hashTableShift = types.hashTableShift;
-
-// Cache-line separation for per-worker scratch slots, same policy as nav_graph.zig,
-// collision.zig, simulation_scope.zig and spatial_index.zig.
-const thread_shared_record_alignment: usize = 64;
 
 pub const AbstractSlotFlags = packed struct(u8) {
     // The slot's best parent edge is a cross-level or teleport link.

@@ -6,6 +6,7 @@ const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const CollisionResponse = @import("../game/data_system.zig").CollisionResponse;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -106,7 +107,7 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         const start_ns = suite.nowNs(io);
         last_stats = try system.updateSerial(&fixture.data, &fixture.frame, EntityId.invalid);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), suite.serialBatch(item_count, movement_range_alignment_items));
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), inlineBatch(item_count, movement_range_alignment_items));
     }
 
     var stats = accumulator.finish();

@@ -19,6 +19,7 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 
 pub const hot_particle_column_alignment: usize = 64;
@@ -422,14 +423,7 @@ pub const ParticleSystem = struct {
             .active_before = active_before,
             .active_after = self.activeCount(),
             .removed_count = removed,
-            .batch = .{
-                .item_count = active_before,
-                .range_count = if (active_before > 0) 1 else 0,
-                .items_per_range = active_before,
-                .range_alignment_items = particle_range_alignment_items,
-                .main_thread_ranges = if (active_before > 0) 1 else 0,
-                .ran_inline = true,
-            },
+            .batch = inlineBatch(active_before, particle_range_alignment_items),
         };
     }
 
@@ -593,14 +587,7 @@ fn updateSerialScalarForTest(system: *ParticleSystem, delta_seconds: f32) Partic
         .active_before = active_before,
         .active_after = system.activeCount(),
         .removed_count = removed,
-        .batch = .{
-            .item_count = active_before,
-            .range_count = if (active_before > 0) 1 else 0,
-            .items_per_range = active_before,
-            .range_alignment_items = particle_range_alignment_items,
-            .main_thread_ranges = if (active_before > 0) 1 else 0,
-            .ran_inline = true,
-        },
+        .batch = inlineBatch(active_before, particle_range_alignment_items),
     };
 }
 

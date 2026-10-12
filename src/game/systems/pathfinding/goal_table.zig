@@ -13,6 +13,7 @@ const simd = @import("../../../core/simd.zig");
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ElementMap = @import("connectivity.zig").ElementMap;
@@ -22,7 +23,6 @@ const TraversalClass = types.TraversalClass;
 const traversalOf = types.traversalOf;
 const no_cell = types.no_cell;
 const default_goal_projection_radius = types.default_goal_projection_radius;
-const thread_shared_record_alignment = types.thread_shared_record_alignment;
 
 /// `goal_scan` range alignment: every range's window of u64 goal refs starts on a cache
 /// line.

@@ -41,12 +41,13 @@ const builtin = @import("builtin");
 const simd = @import("../../core/simd.zig");
 const math = @import("../../core/math.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
@@ -66,8 +67,6 @@ const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 /// Cache-line range alignment for the scope passes, matching the other hot stages
 /// so worker ranges land on aligned SoA boundaries.
 pub const scope_range_alignment_items: usize = movement_range_alignment_items;
-
-const thread_shared_record_alignment: usize = 64;
 
 /// Per-step threading knobs for the scope passes. Mirrors the other systems:
 /// null `items_per_range` + `adaptive` lets each pass train its own tuner; an
@@ -269,7 +268,13 @@ pub const SimulationScopeSystem = struct {
         if (data.tierCount(.dormant) + data.tierCount(.kinematic) == 0) return .{ .indices = null };
 
         const scope = data.scopeColumnsSliceConst();
-        const selection = selectGatherWork(thread_system, n, config, &self.collision_gather_tuner);
+        const selection = thread_system.selectBatchProfile(&self.collision_gather_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = scope_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
         try self.prepareRangeWindows(u32, &self.collision_indices, n, selection.range_count);
         var context = CollisionGatherContext{
             .data = data,
@@ -339,7 +344,13 @@ pub const SimulationScopeSystem = struct {
         }
 
         const scope = data.scopeColumnsSliceConst();
-        const selection = selectGatherWork(thread_system, n, config, &self.ai_gather_tuner);
+        const selection = thread_system.selectBatchProfile(&self.ai_gather_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = scope_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
         try self.prepareRangeWindows(u32, &self.ai_halo_indices, n, selection.range_count);
         var context = AiGatherContext{
             .data = data,
@@ -456,7 +467,13 @@ pub const SimulationScopeSystem = struct {
         const n = scope.entities.len;
         if (n == 0) return .{};
 
-        const selection = selectGatherWork(thread_system, n, config, &self.tier_policy_tuner);
+        const selection = thread_system.selectBatchProfile(&self.tier_policy_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = scope_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
         try self.prepareRangeWindows(StructuralCommand, &self.scope_tier_commands, n, selection.range_count);
         var context = TierPolicyContext{
             .scope = scope,
@@ -827,31 +844,6 @@ fn tierPolicyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     assertRangeWindow(range, job.items_per_range, job.tallies.len, job.out.len);
     const count = scanTierPolicy(job.scope, job.region, range.start, range.end, job.out[range.start..range.end]);
     job.tallies[range.index].tally = .{ .count = count };
-}
-
-// ---- Work selection ---------------------------------------------------------
-
-/// Resolves the pass's owned tuner and selects the batch shape through the single
-/// tuner-owned entry point (`ThreadSystem.selectBatchProfile`), so every scope pass
-/// shapes work identically to the downstream systems and `parallelForWithOptions`.
-fn selectGatherWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    config: ScopeConfig,
-    owned_tuner: *AdaptiveWorkTuner,
-) BatchSelection {
-    return thread_system.selectBatchProfile(owned_tuner, .{
-        .item_count = item_count,
-        .items_per_range = config.items_per_range,
-        .max_worker_threads = config.max_worker_threads,
-        .range_alignment_items = scope_range_alignment_items,
-        .adaptive = config.adaptive,
-    });
-}
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
 }
 
 // ---- Tests ------------------------------------------------------------------

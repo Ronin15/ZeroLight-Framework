@@ -53,6 +53,7 @@ const CollisionResponseMobility = @import("../game/data_system.zig").CollisionRe
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
@@ -456,7 +457,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         // two halves (block vs unblock) are asymmetric, so this mean blends them by design — see
         // runToggle.
         const elapsed = try runToggle(fixture, io, thread_ptr);
-        accumulator.record(elapsed / 2, suite.serialBatch(edited_cells, 1));
+        accumulator.record(elapsed / 2, inlineBatch(edited_cells, 1));
     }
     var stats = accumulator.finish();
     // Report the worker profile each stage actually used so threaded rows are not mistaken for

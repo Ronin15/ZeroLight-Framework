@@ -28,6 +28,8 @@ const LevelLink = @import("../../world_system.zig").LevelLink;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
+const accumulateBatch = @import("../../../app/thread_system.zig").accumulateBatch;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavLevelGraph = @import("nav_graph.zig").NavLevelGraph;
@@ -43,7 +45,6 @@ const keyChunk = @import("nav_graph.zig").keyChunk;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
-const accumulateBatch = @import("nav_graph.zig").accumulateBatch;
 const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const rowsBytesBound = @import("nav_graph.zig").rowsBytesBound;
 const simd = @import("../../../core/simd.zig");
@@ -341,9 +342,6 @@ const FloodScratch = struct {
         grows.* += 1;
     }
 };
-
-// Per-participant scratch sits on whole cache lines: each worker bumps its own generation.
-const thread_shared_record_alignment: usize = 64;
 
 /// Default proposal slots per flood round (W): rounds pack served sets' windows up to it.
 /// A round width, not a budget: every round of a batch completes in that batch.

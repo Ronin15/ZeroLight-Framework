@@ -15,14 +15,22 @@
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
+const BandPartition = @import("../../app/thread_system.zig").BandPartition;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const JobFn = @import("../../app/thread_system.zig").JobFn;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const band_tuner_config = @import("../../app/thread_system.zig").band_tuner_config;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const setRowCount = @import("../../app/thread_system.zig").setRowCount;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
@@ -49,12 +57,6 @@ pub const steering_range_alignment_items: usize = @import("../data_system.zig").
 const steering_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .initial_range_items = steering_range_alignment_items,
     .smallest_range_items = steering_range_alignment_items,
-};
-
-// `select_claim` and `grid_sort` dispatch one item per band.
-const band_tuner_config = AdaptiveWorkTunerConfig{
-    .initial_range_items = 1,
-    .smallest_range_items = 1,
 };
 
 pub const HotF32Slice = []f32;
@@ -88,7 +90,6 @@ const max_obstacle_hits: u16 = 64;
 const max_obstacle_work: u16 = 512;
 const direction_epsilon: f32 = 0.0001;
 
-const thread_shared_record_alignment: usize = 64;
 // Partition width of the band stages, not a capacity: results are independent of the band
 // count, and a range's band histogram stays on the worker stack.
 const max_bands: usize = 64;
@@ -558,7 +559,7 @@ pub const SteeringSystem = struct {
             return;
         };
         const selection = stage.select(&self.select_resolve_tuner, intent_count, steering_range_alignment_items, null);
-        const bands = BandPartition.init(agent_count);
+        const bands = AgentBands.init(agent_count);
         setSlotCount(BandRow, &self.band_rows, selection.range_count);
         std.debug.assert(self.intent_buckets.capacity >= intent_count);
         self.intent_buckets.items.len = intent_count;
@@ -962,23 +963,6 @@ const SelectedWindow = struct {
 const SelectedList = std.ArrayListAligned(SelectedIntent, .fromByteUnits(thread_shared_record_alignment));
 const RowList = std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment));
 
-// One range's record, padded so concurrently written slots never share a cache line.
-fn PaddedSlot(comptime T: type) type {
-    return struct {
-        value: T = .{},
-        padding: [paddingForCacheLine(T)]u8 = @splat(0),
-    };
-}
-
-fn SlotList(comptime T: type) type {
-    return std.ArrayListAligned(PaddedSlot(T), .fromByteUnits(thread_shared_record_alignment));
-}
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
 const AgentsTally = struct {
     mismatches: usize = 0,
     // Largest avoidance plus agent radius in the range.
@@ -1019,44 +1003,8 @@ comptime {
     }
 }
 
-// Sets a MAL's row count within reserved capacity; rows past the old count are undefined.
-fn setRowCount(comptime Row: type, rows: *std.MultiArrayList(Row), count: usize) void {
-    std.debug.assert(rows.capacity >= count);
-    rows.len = count;
-}
-
-fn setSlotCount(comptime T: type, slots: *SlotList(T), count: usize) void {
-    std.debug.assert(slots.capacity >= count);
-    slots.items.len = count;
-    @memset(slots.items, .{});
-}
-
-// The partition of steering rows into `band_count` bands of whole `band_block_rows`
-// blocks: band `b` owns blocks `[ceil(b * blocks / bands), ceil((b + 1) * blocks / bands))`.
-const BandPartition = struct {
-    band_count: usize,
-    block_count: usize,
-    agent_count: usize,
-
-    // `max_bands`, or one band per block when fewer; independent of any stage's partition.
-    fn init(agent_count: usize) BandPartition {
-        const block_count = @max((agent_count + band_block_rows - 1) / band_block_rows, 1);
-        return .{
-            .band_count = @min(max_bands, block_count),
-            .block_count = block_count,
-            .agent_count = agent_count,
-        };
-    }
-
-    fn bandOfRow(self: BandPartition, row: usize) usize {
-        return (row / band_block_rows) * self.band_count / self.block_count;
-    }
-
-    fn firstRow(self: BandPartition, band: usize) usize {
-        const block = (band * self.block_count + self.band_count - 1) / self.band_count;
-        return @min(block * band_block_rows, self.agent_count);
-    }
-};
+// The partition of steering rows into bands of whole `band_block_rows` blocks.
+const AgentBands = BandPartition(band_block_rows, max_bands);
 
 // A spatial cell, ordered by (cell_y, cell_x).
 const CellKey = struct {
@@ -1334,7 +1282,7 @@ const ResolveJob = struct {
     intent_movement: []u32,
     // Range r's window starts at `r * items_per_range`.
     buckets: []u32,
-    bands: BandPartition,
+    bands: AgentBands,
     items_per_range: usize,
     band_rows: []PaddedSlot(BandRow),
 };
@@ -1376,7 +1324,7 @@ const ClaimJob = struct {
     buckets: []const u32,
     band_rows: []const PaddedSlot(BandRow),
     resolve_items_per_range: usize,
-    bands: BandPartition,
+    bands: AgentBands,
     claims: ClaimColumns,
     stamp: u32,
     range_count: usize,
@@ -2241,17 +2189,6 @@ fn changeInvalidatesSteeringMovementIndexCache(change: StructuralChange) bool {
 
 fn distance(a: math.Vec2, b: math.Vec2) f32 {
     return math.length(.{ .x = a.x - b.x, .y = a.y - b.y });
-}
-
-fn inlineBatch(count: usize, range_alignment_items: usize) BatchStats {
-    return .{
-        .item_count = count,
-        .range_count = if (count == 0) 0 else 1,
-        .items_per_range = if (count == 0) 1 else count,
-        .range_alignment_items = range_alignment_items,
-        .main_thread_ranges = if (count == 0) 0 else 1,
-        .ran_inline = true,
-    };
 }
 
 fn expectAgentSnapshotColumnsAligned(rows: *const std.MultiArrayList(AgentSnapshotRow)) !void {
@@ -4126,7 +4063,7 @@ fn expectTunedStagesInline(stats: SteeringStats, agent_count: usize) !void {
     for ([_]BatchStats{ stats.agents_batch, stats.select_resolve_batch, stats.select_claim_batch, stats.directions_batch, stats.grid_bucket_batch, stats.grid_sort_batch }) |batch| {
         try std.testing.expect(batch.ran_inline);
     }
-    try std.testing.expectEqual(BandPartition.init(agent_count).band_count, stats.select_claim_batch.item_count);
+    try std.testing.expectEqual(AgentBands.init(agent_count).band_count, stats.select_claim_batch.item_count);
     try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
 }
 

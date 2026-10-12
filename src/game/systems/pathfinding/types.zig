@@ -16,12 +16,11 @@ const simd = @import("../../../core/simd.zig");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const EntityId = @import("../../data_system.zig").EntityId;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 
 pub const pathfinding_range_alignment_items: usize = simd.lane_count;
-/// Cache-line size records written by concurrent ranges are padded or aligned to.
-pub const thread_shared_record_alignment: usize = 64;
 
 pub const default_cell_size: f32 = 32.0;
 pub const default_max_frame_requests: usize = 1024;

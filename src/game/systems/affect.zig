@@ -68,12 +68,12 @@ const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
@@ -190,10 +190,6 @@ fn appendAffectGatherRow(
     row_slice.set(rows.len - 1, row);
 }
 
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = if (count > 0) 1 else 0, .items_per_range = count };
-}
-
 pub const AffectSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in
@@ -240,14 +236,13 @@ pub const AffectSystem = struct {
 
         const active_tuner: ?*AdaptiveWorkTuner = config.adaptive_tuner orelse
             if (config.adaptive and config.items_per_range == null) &self.compute_tuner else null;
-        const selection = selectStageWork(
-            thread_system,
-            count,
-            config.items_per_range,
-            config.max_worker_threads,
-            config.adaptive,
-            active_tuner,
-        );
+        const selection = thread_system.selectBatchProfile(active_tuner, .{
+            .item_count = count,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = affect_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
         var job = self.buildJobContext(data, selection.range_count);
         const batch = thread_system.parallelForWithOptions(count, &job, affectRangeJob, .{
             .max_worker_threads = selection.worker_threads,
@@ -283,7 +278,7 @@ pub const AffectSystem = struct {
         return .{
             .processed_count = count,
             .threshold_crossed_count = merge.crossed,
-            .batch = serialBatch(count),
+            .batch = inlineBatch(count, affect_range_alignment_items),
         };
     }
 
@@ -728,30 +723,6 @@ fn markCrossings(
             crossing_bits[k + lane] |= crossingBits(drive, rising);
         }
     }
-}
-
-const StageWorkSelection = BatchSelection;
-
-// Mirrors ai.zig/perception.zig/collision.zig's selectStageWork verbatim
-// (module-local adaptive-profile resolution), keyed by
-// affect_range_alignment_items.
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = affect_range_alignment_items,
-        .adaptive = adaptive,
-    });
 }
 
 // ---- Tests --------------------------------------------------------------------

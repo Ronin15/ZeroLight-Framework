@@ -704,17 +704,6 @@ pub fn skipIfWorkersUnavailable(case: BenchmarkCase) ?RunStats {
     return RunStats.skipped("not enough worker threads available");
 }
 
-pub fn serialBatch(item_count: usize, range_alignment_items: usize) BatchStats {
-    return .{
-        .item_count = item_count,
-        .range_count = if (item_count > 0) 1 else 0,
-        .items_per_range = item_count,
-        .range_alignment_items = range_alignment_items,
-        .main_thread_ranges = if (item_count > 0) 1 else 0,
-        .ran_inline = true,
-    };
-}
-
 pub fn nowNs(io: std.Io) i96 {
     return std.Io.Timestamp.now(io, .awake).toNanoseconds();
 }

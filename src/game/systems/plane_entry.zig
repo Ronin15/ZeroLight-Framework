@@ -20,7 +20,9 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
@@ -30,8 +32,6 @@ const CellCoord = @import("../world_system.zig").CellCoord;
 
 /// Range alignment of the gather: every range's window starts on a cache line.
 pub const plane_entry_range_alignment_items: usize = movement_range_alignment_items;
-
-const cache_line_bytes: usize = 64;
 
 /// One AI agent that entered `cell` this step on `level` (its `world_level`, or its
 /// scope level when it has none) where plane traversal may act.
@@ -44,7 +44,7 @@ pub const PlaneEntry = struct {
 
 comptime {
     std.debug.assert(@sizeOf(PlaneEntry) == 16);
-    std.debug.assert((plane_entry_range_alignment_items * @sizeOf(PlaneEntry)) % cache_line_bytes == 0);
+    std.debug.assert((plane_entry_range_alignment_items * @sizeOf(PlaneEntry)) % thread_shared_record_alignment == 0);
     std.debug.assert(plane_entry_range_alignment_items % simd.lane_count == 0);
 }
 
@@ -58,15 +58,15 @@ pub const PlaneEntryConfig = struct {
 
 // One range's entry count, written once by its job. Padded to a cache line.
 const PlaneEntryTally = struct {
-    count: usize align(cache_line_bytes) = 0,
+    count: usize align(thread_shared_record_alignment) = 0,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(PlaneEntryTally) % cache_line_bytes == 0);
+    std.debug.assert(@sizeOf(PlaneEntryTally) % thread_shared_record_alignment == 0);
 }
 
-const EntryList = std.ArrayListAligned(PlaneEntry, .fromByteUnits(cache_line_bytes));
-const TallyList = std.ArrayListAligned(PlaneEntryTally, .fromByteUnits(cache_line_bytes));
+const EntryList = std.array_list.Aligned(PlaneEntry, .fromByteUnits(thread_shared_record_alignment));
+const TallyList = std.array_list.Aligned(PlaneEntryTally, .fromByteUnits(thread_shared_record_alignment));
 
 pub const PlaneEntrySystem = struct {
     allocator: std.mem.Allocator,
@@ -150,7 +150,7 @@ pub const PlaneEntrySystem = struct {
         const ts = thread_system orelse {
             self.entries.items.len = item_count;
             self.entries.items.len = gatherRange(&job.input, 0, item_count, self.entries.items);
-            self.last_batch = inlineBatch(item_count);
+            self.last_batch = inlineBatch(item_count, plane_entry_range_alignment_items);
             return self.entries.items;
         };
         const selection = ts.selectBatchProfile(&self.tuner, .{
@@ -197,18 +197,6 @@ pub const PlaneEntrySystem = struct {
         }
     }
 };
-
-// Batch stats of a gather that ran on the calling thread with no thread system.
-fn inlineBatch(item_count: usize) BatchStats {
-    return .{
-        .item_count = item_count,
-        .range_count = 1,
-        .items_per_range = item_count,
-        .range_alignment_items = plane_entry_range_alignment_items,
-        .main_thread_ranges = 1,
-        .ran_inline = true,
-    };
-}
 
 // Compacts range r's `count` entries at `r * items_per_range` into one prefix in range
 // order. Each window starts at or after the running total, so a forward copy is safe.

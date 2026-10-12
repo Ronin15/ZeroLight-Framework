@@ -17,16 +17,23 @@
 const std = @import("std");
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
+const BandPartition = @import("../../app/thread_system.zig").BandPartition;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const JobFn = @import("../../app/thread_system.zig").JobFn;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const band_tuner_config = @import("../../app/thread_system.zig").band_tuner_config;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const setRowCount = @import("../../app/thread_system.zig").setRowCount;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const contact_query = @import("../contact_query.zig");
 const CollisionResponse = @import("../data_system.zig").CollisionResponse;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -40,7 +47,6 @@ const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 
 const collision_response_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(f32);
-const thread_shared_record_alignment: usize = 64;
 
 // An intent whose entity has no movement body; the apply skips it.
 const no_row: u32 = std.math.maxInt(u32);
@@ -52,12 +58,6 @@ const max_step_intents: usize = std.math.maxInt(u32);
 const max_bands: usize = 64;
 // Movement rows per band block; a band owns whole blocks.
 const band_block_rows: usize = collision_response_range_alignment_items;
-
-// The apply dispatches one item per band.
-const band_tuner_config = AdaptiveWorkTunerConfig{
-    .initial_range_items = 1,
-    .smallest_range_items = 1,
-};
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, collision_response_range_alignment_items);
@@ -167,23 +167,6 @@ pub fn estimateTriggerCapacity(contact_capacity: usize) usize {
 const IndexList = std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment));
 const TriggerList = std.ArrayListAligned(CollisionTriggerEvent, .fromByteUnits(thread_shared_record_alignment));
 
-// One range's record, padded so concurrently written slots never share a cache line.
-fn PaddedSlot(comptime T: type) type {
-    return struct {
-        value: T = .{},
-        padding: [paddingForCacheLine(T)]u8 = @splat(0),
-    };
-}
-
-fn SlotList(comptime T: type) type {
-    return std.ArrayListAligned(PaddedSlot(T), .fromByteUnits(thread_shared_record_alignment));
-}
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
 // One gather range's counts, and, when the gather ran on workers, the per-band start
 // offsets of its placed intents within its order window; entry `band_count` is the
 // range's placed count.
@@ -198,49 +181,13 @@ comptime {
     std.debug.assert(@sizeOf(PaddedSlot(GatherRow)) % thread_shared_record_alignment == 0);
 }
 
-// Sets a MAL's row count within reserved capacity; rows past the old count are undefined.
-fn setRowCount(comptime Row: type, rows: *std.MultiArrayList(Row), count: usize) void {
-    std.debug.assert(rows.capacity >= count);
-    rows.len = count;
-}
-
 fn setListCount(list: anytype, count: usize) void {
     std.debug.assert(list.capacity >= count);
     list.items.len = count;
 }
 
-fn setSlotCount(comptime T: type, slots: *SlotList(T), count: usize) void {
-    std.debug.assert(slots.capacity >= count);
-    slots.items.len = count;
-    @memset(slots.items, .{});
-}
-
-// The partition of movement rows into `band_count` bands of whole `band_block_rows`
-// blocks: band `b` owns blocks `[ceil(b * blocks / bands), ceil((b + 1) * blocks / bands))`.
-const RowBands = struct {
-    band_count: usize,
-    block_count: usize,
-    row_count: usize,
-
-    // `max_bands`, or one band per block when fewer; independent of any stage's partition.
-    fn init(row_count: usize) RowBands {
-        const block_count = @max((row_count + band_block_rows - 1) / band_block_rows, 1);
-        return .{
-            .band_count = @min(max_bands, block_count),
-            .block_count = block_count,
-            .row_count = row_count,
-        };
-    }
-
-    fn bandOfRow(self: RowBands, row: usize) usize {
-        return (row / band_block_rows) * self.band_count / self.block_count;
-    }
-
-    fn firstRow(self: RowBands, band: usize) usize {
-        const block = (band * self.block_count + self.band_count - 1) / self.band_count;
-        return @min(block * band_block_rows, self.row_count);
-    }
-};
+// The partition of movement rows into bands of whole `band_block_rows` blocks.
+const RowBands = BandPartition(band_block_rows, max_bands);
 
 // Threading for one update's stages: the thread system and the caller's control config.
 // Absent in `updateSerial`, where both stages run inline.
@@ -503,19 +450,6 @@ fn placedIntentCount(gather_rows: []const PaddedSlot(GatherRow), bands: RowBands
     var placed: usize = 0;
     for (gather_rows) |slot| placed += slot.value.offsets[bands.band_count];
     return placed;
-}
-
-// Batch stats of a stage that ran on the calling thread with no thread system, or whose
-// work the inline path absorbed.
-fn inlineBatch(count: usize, range_alignment_items: usize) BatchStats {
-    return .{
-        .item_count = count,
-        .range_count = if (count == 0) 0 else 1,
-        .items_per_range = if (count == 0) 1 else count,
-        .range_alignment_items = range_alignment_items,
-        .main_thread_ranges = if (count == 0) 0 else 1,
-        .ran_inline = true,
-    };
 }
 
 // One nonempty step's gather inputs and the movement columns its apply writes.

@@ -25,6 +25,9 @@ const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const JobFn = @import("../../../app/thread_system.zig").JobFn;
 const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
+const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
+const accumulateBatch = @import("../../../app/thread_system.zig").accumulateBatch;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
@@ -482,10 +485,6 @@ pub const NavLevelGraph = struct {
         self.record_dir.items[chunk] = no_record;
     }
 };
-
-// Cache-line separation for per-participant scratch slots, same policy as collision.zig,
-// simulation_scope.zig and spatial_index.zig.
-const thread_shared_record_alignment: usize = 64;
 
 // A changed key's remask slot before the commit claims it: the chunk may end mixed and
 // holds no cell block yet.
@@ -963,37 +962,9 @@ pub fn runStage(threads: ?NavStageThreads, item_count: usize, context: *anyopaqu
     // No thread system times the batch, so it is timed here.
     const stage_timer = StageTimer.begin();
     job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-    var batch = inlineBatch(item_count);
+    var batch = inlineBatch(item_count, 1);
     batch.batch_duration_ns = stage_timer.lap();
     return batch;
-}
-
-// The batch shape of a stage run inline as one range on the main thread.
-fn inlineBatch(item_count: usize) BatchStats {
-    return .{
-        .item_count = item_count,
-        .range_count = 1,
-        .items_per_range = item_count,
-        .range_alignment_items = 1,
-        .main_thread_ranges = 1,
-        .ran_inline = true,
-    };
-}
-
-/// Folds one batch's shape into a running total: summed counts and times, the widest range
-/// and worker use, and inline only when every batch ran inline.
-pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
-    if (batch.item_count == 0) return;
-    total.item_count += batch.item_count;
-    total.range_count += batch.range_count;
-    total.items_per_range = @max(total.items_per_range, batch.items_per_range);
-    total.available_worker_threads = @max(total.available_worker_threads, batch.available_worker_threads);
-    total.active_worker_threads = @max(total.active_worker_threads, batch.active_worker_threads);
-    total.main_thread_ranges += batch.main_thread_ranges;
-    total.worker_thread_ranges += batch.worker_thread_ranges;
-    total.batch_duration_ns += batch.batch_duration_ns;
-    total.main_thread_wait_ns += batch.main_thread_wait_ns;
-    total.ran_inline = total.ran_inline and batch.ran_inline;
 }
 
 /// One stage step dispatched as rounds under one thread profile: `begin` selects it once
@@ -1048,7 +1019,7 @@ pub const RoundDispatch = struct {
             // No thread system times the round, so it is timed here.
             const round_timer = StageTimer.begin();
             job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-            var round = inlineBatch(item_count);
+            var round = inlineBatch(item_count, 1);
             round.batch_duration_ns = round_timer.lap();
             break :blk round;
         };
@@ -2324,7 +2295,7 @@ pub const NavGraph = struct {
         } else {
             const stage_timer = StageTimer.begin();
             planJob(&job, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-            self.last_plan_batch = inlineBatch(item_count);
+            self.last_plan_batch = inlineBatch(item_count, 1);
             self.last_plan_batch.batch_duration_ns = stage_timer.lap();
         }
         stats.addStageTime(self.last_plan_batch);

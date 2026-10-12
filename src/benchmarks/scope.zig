@@ -33,6 +33,7 @@
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
@@ -344,7 +345,7 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         ctx.scope.deriveChunksSerial(&fixture.data, chunk_grid);
         // Tier policy reads the chunk just derived; serial path emits one range.
         try ctx.scope.queueTierChangesSerial(&fixture.data, visibleRegion(), &fixture.frame.structural_commands);
-        return .{ .batch = suite.serialBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_cognition_indices.len, .excluded_ns = excluded_ns };
+        return .{ .batch = inlineBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_cognition_indices.len, .excluded_ns = excluded_ns };
     }
 
     _ = try ctx.ai.update(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{

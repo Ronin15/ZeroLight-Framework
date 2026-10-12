@@ -5,6 +5,7 @@
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
 const movement = @import("../game/systems/movement.zig");
@@ -107,7 +108,7 @@ fn runOnce(
     var slice = data.movementBodySlice();
     if (!case.usesThreadSystem()) {
         movement.updateSerial(&slice, delta_seconds);
-        return suite.serialBatch(data.movementBodySliceConst().entities.len, movement_range_alignment_items);
+        return inlineBatch(data.movementBodySliceConst().entities.len, movement_range_alignment_items);
     }
 
     const stats = system.update(&slice, thread_system.?, delta_seconds, .{
@@ -243,7 +244,7 @@ fn applyIntentsOnce(
 ) BatchStats {
     if (!case.usesThreadSystem()) {
         movement.applyIntentsSerial(&fixture.data, &fixture.frame);
-        return suite.serialBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
+        return inlineBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
     }
     const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system.?, .{
         .items_per_range = benchmarkItemsPerRange(case),

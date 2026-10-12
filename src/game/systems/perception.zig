@@ -82,14 +82,16 @@ const simd = @import("../../core/simd.zig");
 const stance = @import("../faction.zig").stance;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -300,8 +302,6 @@ const ConstCandidateSlice = struct {
     level: []const u16,
 };
 
-const thread_shared_record_alignment: usize = 64;
-
 const PerceptionRangeStatsSlot = struct {
     // Each worker writes only its assigned slot, once, at the end of its
     // range (see `PerceptionRangeStats`'s doc comment). Padding keeps that
@@ -311,15 +311,6 @@ const PerceptionRangeStatsSlot = struct {
 };
 
 const PerceptionRangeStatsSlotList = std.ArrayListAligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = if (count > 0) 1 else 0, .items_per_range = count };
-}
 
 pub const PerceptionSystem = struct {
     allocator: std.mem.Allocator,
@@ -387,14 +378,13 @@ pub const PerceptionSystem = struct {
 
         const active_tuner: ?*AdaptiveWorkTuner = config.adaptive_tuner orelse
             if (config.adaptive and config.items_per_range == null) &self.compute_tuner else null;
-        const selection = selectStageWork(
-            thread_system,
-            observer_count,
-            config.items_per_range,
-            config.max_worker_threads,
-            config.adaptive,
-            active_tuner,
-        );
+        const selection = thread_system.selectBatchProfile(active_tuner, .{
+            .item_count = observer_count,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = perception_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
         // Grow-only safety net for unreserved standalone use; after `reserve`
         // it never allocates (`selection.range_count <= maxRangeCount(cap, 16)`).
         try self.prepareRangeStats(selection.range_count);
@@ -462,7 +452,7 @@ pub const PerceptionSystem = struct {
             .perceived_events = merge.perceived,
             .lost_events = merge.lost,
             .dropped_events = merge.dropped,
-            .batch = serialBatch(observer_count),
+            .batch = inlineBatch(observer_count, perception_range_alignment_items),
         };
     }
 
@@ -1223,30 +1213,6 @@ const TransitionSink = struct {
         }
     }
 };
-
-const StageWorkSelection = BatchSelection;
-
-// Mirrors ai.zig/spatial_index.zig/collision.zig's selectStageWork verbatim
-// (module-local adaptive-profile resolution), keyed by
-// perception_range_alignment_items.
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = perception_range_alignment_items,
-        .adaptive = adaptive,
-    });
-}
 
 // ---- Tests --------------------------------------------------------------------
 

@@ -21,6 +21,8 @@ const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const JobFn = @import("../../../app/thread_system.zig").JobFn;
 const ParallelForOptions = @import("../../../app/thread_system.zig").ParallelForOptions;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
@@ -82,7 +84,6 @@ const IntakeRecord = types.IntakeRecord;
 const GroupKeyCount = types.GroupKeyCount;
 const IntakeTally = types.IntakeTally;
 const intake_range_alignment_items = types.intake_range_alignment_items;
-const thread_shared_record_alignment = types.thread_shared_record_alignment;
 const resizeList = types.resizeList;
 const resizeUnwritten = types.resizeUnwritten;
 const PathSolveResult = types.PathSolveResult;
@@ -3366,19 +3367,6 @@ fn runHits(cache: *const ResultCache, geometry: RunGeometry, owner: u32, start: 
         if (index == cells.len) return false;
         cursor.moveTo(cells[index]);
     }
-}
-
-// Batch stats of a stage that ran inline on the calling thread.
-fn inlineBatch(item_count: usize, range_alignment_items: usize) BatchStats {
-    const ranges: usize = if (item_count == 0) 0 else 1;
-    return .{
-        .item_count = item_count,
-        .range_count = ranges,
-        .items_per_range = item_count,
-        .range_alignment_items = range_alignment_items,
-        .main_thread_ranges = ranges,
-        .ran_inline = true,
-    };
 }
 
 // ----------------------------------------------------------------------------

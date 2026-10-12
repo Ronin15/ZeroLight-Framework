@@ -1245,6 +1245,113 @@ pub fn maxRangeCount(item_count: usize, range_alignment_items: usize) usize {
     return rangeCount(item_count, @max(range_alignment_items, @as(usize, 1)));
 }
 
+/// Alignment and padding unit of records that concurrent ranges write, so no two
+/// participants share a writable cache line. Fixed at 64 rather than
+/// `std.atomic.cache_line` (128 on x86_64 and aarch64): the padded record layouts and
+/// their comptime window asserts are built on 64.
+pub const thread_shared_record_alignment: usize = 64;
+
+/// Bytes that pad `T` to a whole number of `thread_shared_record_alignment` lines.
+pub fn paddingForCacheLine(comptime T: type) usize {
+    const rem = @sizeOf(T) % thread_shared_record_alignment;
+    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
+}
+
+/// One range's record, padded so concurrently written slots never share a cache line.
+pub fn PaddedSlot(comptime T: type) type {
+    return struct {
+        value: T = .{},
+        padding: [paddingForCacheLine(T)]u8 = @splat(0),
+    };
+}
+
+/// Per-range padded slots on a `thread_shared_record_alignment` base.
+pub fn SlotList(comptime T: type) type {
+    return std.array_list.Aligned(PaddedSlot(T), .fromByteUnits(thread_shared_record_alignment));
+}
+
+/// Resets `slots` to `count` default slots within reserved capacity; never allocates.
+pub fn setSlotCount(comptime T: type, slots: *SlotList(T), count: usize) void {
+    slots.clearRetainingCapacity();
+    slots.appendNTimesAssumeCapacity(.{}, count);
+}
+
+/// Sets a MAL's row count within reserved capacity, never allocating; rows past the old
+/// count are undefined. Hand-written: `std.MultiArrayList` has no assume-capacity length
+/// set (`resize` takes an allocator).
+pub fn setRowCount(comptime Row: type, rows: *std.MultiArrayList(Row), count: usize) void {
+    std.debug.assert(rows.capacity >= count);
+    rows.len = count;
+}
+
+/// The partition of `row_count` rows into `band_count` bands of whole `block_rows` blocks:
+/// band `b` owns blocks `[ceil(b * blocks / bands), ceil((b + 1) * blocks / bands))`. The
+/// band count is `max_bands`, or one band per block when fewer, independent of any stage's
+/// range partition.
+pub fn BandPartition(comptime block_rows: usize, comptime max_bands: usize) type {
+    comptime std.debug.assert(block_rows > 0 and max_bands > 0);
+    return struct {
+        const Self = @This();
+
+        band_count: usize,
+        block_count: usize,
+        row_count: usize,
+
+        pub fn init(row_count: usize) Self {
+            const block_count = @max((row_count + block_rows - 1) / block_rows, 1);
+            return .{
+                .band_count = @min(max_bands, block_count),
+                .block_count = block_count,
+                .row_count = row_count,
+            };
+        }
+
+        pub fn bandOfRow(self: Self, row: usize) usize {
+            return (row / block_rows) * self.band_count / self.block_count;
+        }
+
+        pub fn firstRow(self: Self, band: usize) usize {
+            const block = (band * self.block_count + self.band_count - 1) / self.band_count;
+            return @min(block * block_rows, self.row_count);
+        }
+    };
+}
+
+/// Tuner config of a stage that dispatches one item per band.
+pub const band_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = 1,
+    .smallest_range_items = 1,
+};
+
+/// Batch stats of a stage that ran on the calling thread as one range, with no thread
+/// system or with work the inline path absorbed. An empty batch reports no range.
+pub fn inlineBatch(item_count: usize, range_alignment_items: usize) BatchStats {
+    return .{
+        .item_count = item_count,
+        .range_count = if (item_count == 0) 0 else 1,
+        .items_per_range = if (item_count == 0) 1 else item_count,
+        .range_alignment_items = range_alignment_items,
+        .main_thread_ranges = if (item_count == 0) 0 else 1,
+        .ran_inline = true,
+    };
+}
+
+/// Folds one batch's shape into a running total: summed counts and times, the widest range
+/// and worker use, and inline only when every batch ran inline. Empty batches are skipped.
+pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
+    if (batch.item_count == 0) return;
+    total.item_count += batch.item_count;
+    total.range_count += batch.range_count;
+    total.items_per_range = @max(total.items_per_range, batch.items_per_range);
+    total.available_worker_threads = @max(total.available_worker_threads, batch.available_worker_threads);
+    total.active_worker_threads = @max(total.active_worker_threads, batch.active_worker_threads);
+    total.main_thread_ranges += batch.main_thread_ranges;
+    total.worker_thread_ranges += batch.worker_thread_ranges;
+    total.batch_duration_ns += batch.batch_duration_ns;
+    total.main_thread_wait_ns += batch.main_thread_wait_ns;
+    total.ran_inline = total.ran_inline and batch.ran_inline;
+}
+
 const BatchShape = struct {
     items_per_range: usize,
     worker_threads: usize,
@@ -1807,6 +1914,139 @@ test "every selectable batch shape stays within maxRangeCount" {
             try std.testing.expect(selection.range_count <= bound);
         }
     }
+}
+
+test "inline batch reports one main-thread range, and none when empty" {
+    const empty = inlineBatch(0, 16);
+    try std.testing.expectEqual(@as(usize, 0), empty.item_count);
+    try std.testing.expectEqual(@as(usize, 0), empty.range_count);
+    try std.testing.expectEqual(@as(usize, 1), empty.items_per_range);
+    try std.testing.expectEqual(@as(usize, 16), empty.range_alignment_items);
+    try std.testing.expectEqual(@as(usize, 0), empty.main_thread_ranges);
+    try std.testing.expect(empty.ran_inline);
+
+    const batch = inlineBatch(37, 16);
+    try std.testing.expectEqual(@as(usize, 37), batch.item_count);
+    try std.testing.expectEqual(@as(usize, 1), batch.range_count);
+    try std.testing.expectEqual(@as(usize, 37), batch.items_per_range);
+    try std.testing.expectEqual(@as(usize, 16), batch.range_alignment_items);
+    try std.testing.expectEqual(@as(usize, 1), batch.main_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 0), batch.worker_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 0), batch.active_worker_threads);
+    try std.testing.expectEqual(@as(u64, 0), batch.batch_duration_ns);
+    try std.testing.expect(batch.ran_inline);
+}
+
+test "accumulate batch sums counts, keeps widest shape, and skips empty batches" {
+    var total = BatchStats{};
+    accumulateBatch(&total, inlineBatch(10, 1));
+    try std.testing.expect(total.ran_inline);
+    accumulateBatch(&total, .{
+        .item_count = 40,
+        .range_count = 4,
+        .items_per_range = 12,
+        .available_worker_threads = 3,
+        .active_worker_threads = 2,
+        .main_thread_ranges = 1,
+        .worker_thread_ranges = 3,
+        .batch_duration_ns = 500,
+        .main_thread_wait_ns = 70,
+        .ran_inline = false,
+    });
+    // A second threaded batch with a narrower shape but nonzero times: sums and maxes
+    // diverge on every field.
+    accumulateBatch(&total, .{
+        .item_count = 20,
+        .range_count = 2,
+        .items_per_range = 10,
+        .available_worker_threads = 1,
+        .active_worker_threads = 1,
+        .main_thread_ranges = 1,
+        .worker_thread_ranges = 1,
+        .batch_duration_ns = 300,
+        .main_thread_wait_ns = 40,
+        .ran_inline = false,
+    });
+    const before_empty = total;
+    accumulateBatch(&total, .{ .item_count = 0, .range_count = 9, .items_per_range = 99, .batch_duration_ns = 1_000, .ran_inline = false });
+    try std.testing.expectEqual(before_empty, total);
+
+    try std.testing.expectEqual(@as(usize, 70), total.item_count);
+    try std.testing.expectEqual(@as(usize, 7), total.range_count);
+    try std.testing.expectEqual(@as(usize, 12), total.items_per_range);
+    try std.testing.expectEqual(@as(usize, 3), total.available_worker_threads);
+    try std.testing.expectEqual(@as(usize, 2), total.active_worker_threads);
+    try std.testing.expectEqual(@as(usize, 3), total.main_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 4), total.worker_thread_ranges);
+    try std.testing.expectEqual(@as(u64, 800), total.batch_duration_ns);
+    try std.testing.expectEqual(@as(u64, 110), total.main_thread_wait_ns);
+    try std.testing.expect(!total.ran_inline);
+}
+
+test "padded slots fill whole cache lines on an aligned base and reset within capacity" {
+    const Odd = struct { a: u32 = 0, b: u8 = 0 };
+    const Line = struct { words: [8]u64 = @splat(0) };
+    try std.testing.expectEqual(@as(usize, 0), paddingForCacheLine(Line));
+    try std.testing.expectEqual(thread_shared_record_alignment - @sizeOf(Odd), paddingForCacheLine(Odd));
+    try std.testing.expectEqual(thread_shared_record_alignment, @sizeOf(PaddedSlot(Odd)));
+    try std.testing.expectEqual(thread_shared_record_alignment, @sizeOf(PaddedSlot(Line)));
+
+    var slots: SlotList(Odd) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, 5);
+    try std.testing.expectEqual(thread_shared_record_alignment, std.meta.alignment(@TypeOf(slots.items)));
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(slots.items.ptr) % thread_shared_record_alignment);
+    setSlotCount(Odd, &slots, 5);
+    for (slots.items) |*slot| slot.value = .{ .a = 7, .b = 3 };
+    const base = slots.items.ptr;
+    setSlotCount(Odd, &slots, 3);
+    try std.testing.expectEqual(@as(usize, 3), slots.items.len);
+    try std.testing.expectEqual(base, slots.items.ptr);
+    for (slots.items) |slot| try std.testing.expectEqual(Odd{}, slot.value);
+    setSlotCount(Odd, &slots, 0);
+    try std.testing.expectEqual(@as(usize, 0), slots.items.len);
+}
+
+test "set row count moves a multi array list's length within capacity" {
+    const Row = struct { x: u32, y: f32 };
+    var rows: std.MultiArrayList(Row) = .{};
+    defer rows.deinit(std.testing.allocator);
+    try rows.ensureTotalCapacity(std.testing.allocator, 8);
+    const capacity = rows.capacity;
+    setRowCount(Row, &rows, 8);
+    try std.testing.expectEqual(@as(usize, 8), rows.len);
+    try std.testing.expectEqual(@as(usize, 8), rows.items(.x).len);
+    try std.testing.expectEqual(@as(usize, 8), rows.items(.y).len);
+    setRowCount(Row, &rows, 2);
+    try std.testing.expectEqual(@as(usize, 2), rows.items(.x).len);
+    try std.testing.expectEqual(capacity, rows.capacity);
+}
+
+test "band partition covers every row with whole blocks in band order" {
+    const block_rows = 16;
+    const max_bands = 4;
+    const Bands = BandPartition(block_rows, max_bands);
+    for ([_]usize{ 0, 1, 15, 16, 17, 47, 64, 65, 200, 1000 }) |row_count| {
+        const bands = Bands.init(row_count);
+        const block_count = @max((row_count + block_rows - 1) / block_rows, 1);
+        try std.testing.expectEqual(block_count, bands.block_count);
+        try std.testing.expectEqual(@min(max_bands, block_count), bands.band_count);
+        try std.testing.expectEqual(@as(usize, 0), bands.firstRow(0));
+        try std.testing.expectEqual(row_count, bands.firstRow(bands.band_count));
+        for (0..bands.band_count) |band| {
+            const first = bands.firstRow(band);
+            const end = bands.firstRow(band + 1);
+            try std.testing.expect(first <= end);
+            try std.testing.expectEqual(@as(usize, 0), first % block_rows);
+            for (first..end) |row| try std.testing.expectEqual(band, bands.bandOfRow(row));
+        }
+    }
+}
+
+test "band tuner config starts at, and never shrinks below, one band per range" {
+    const tuner = AdaptiveWorkTuner.init(band_tuner_config);
+    try std.testing.expectEqual(@as(usize, 1), tuner.initial_profile.items_per_range);
+    try std.testing.expectEqual(@as(usize, 1), tuner.config.smallest_range_items);
 }
 
 test "adaptive work tuner aligns and clamps selected items_per_range" {

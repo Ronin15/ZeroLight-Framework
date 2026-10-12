@@ -42,6 +42,7 @@ const JobFn = @import("../app/thread_system.zig").JobFn;
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
+const thread_shared_record_alignment = @import("../app/thread_system.zig").thread_shared_record_alignment;
 const WorldObstacleChangedEvent = @import("simulation.zig").WorldObstacleChangedEvent;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -347,11 +348,10 @@ const DenseEditGroup = struct {
 };
 
 // Per-participant scratch strides are whole cache lines: no shared writable line.
-const edit_scratch_alignment: usize = 64;
-const EditFinalsList = std.ArrayListAligned(TileId, .fromByteUnits(edit_scratch_alignment));
-const EditTouchedList = std.ArrayListAligned(ChunkBits, .fromByteUnits(edit_scratch_alignment));
-const EditOwnedList = std.ArrayListAligned(?OwnedBlock, .fromByteUnits(edit_scratch_alignment));
-const EditBandList = std.ArrayListAligned(u32, .fromByteUnits(edit_scratch_alignment));
+const EditFinalsList = std.array_list.Aligned(TileId, .fromByteUnits(thread_shared_record_alignment));
+const EditTouchedList = std.array_list.Aligned(ChunkBits, .fromByteUnits(thread_shared_record_alignment));
+const EditOwnedList = std.array_list.Aligned(?OwnedBlock, .fromByteUnits(thread_shared_record_alignment));
+const EditBandList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
 
 // Scratch of `applyDenseCellWrites`, kept at its high water.
 const DenseEditScratch = struct {
@@ -1665,10 +1665,10 @@ pub const WorldSystem = struct {
         const participant_count = if (stage_threads) |stage| stage.thread_system.participantSlotCount() else 1;
         const mask_words = @max(1, (band_stride + 63) / 64);
         const finals_stride = band_stride * max_chunk_cells;
-        const touched_stride = std.mem.alignForward(usize, band_stride * @sizeOf(ChunkBits), edit_scratch_alignment) / @sizeOf(ChunkBits);
-        const owned_stride = std.mem.alignForward(usize, band_stride, edit_scratch_alignment / std.math.gcd(@sizeOf(?OwnedBlock), edit_scratch_alignment));
-        const written_bands_stride = std.mem.alignForward(usize, band_stride, edit_scratch_alignment / @sizeOf(u32));
-        comptime std.debug.assert(max_chunk_cells * @sizeOf(TileId) % edit_scratch_alignment == 0);
+        const touched_stride = std.mem.alignForward(usize, band_stride * @sizeOf(ChunkBits), thread_shared_record_alignment) / @sizeOf(ChunkBits);
+        const owned_stride = std.mem.alignForward(usize, band_stride, thread_shared_record_alignment / std.math.gcd(@sizeOf(?OwnedBlock), thread_shared_record_alignment));
+        const written_bands_stride = std.mem.alignForward(usize, band_stride, thread_shared_record_alignment / @sizeOf(u32));
+        comptime std.debug.assert(max_chunk_cells * @sizeOf(TileId) % thread_shared_record_alignment == 0);
         try scratch.masks.ensureTotalCapacity(self.allocator, groups.len * 2 * mask_words);
         try scratch.finals.ensureTotalCapacity(self.allocator, participant_count * finals_stride);
         try scratch.touched.ensureTotalCapacity(self.allocator, participant_count * touched_stride);

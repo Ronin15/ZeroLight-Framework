@@ -41,12 +41,12 @@ const math = @import("../../core/math.zig");
 const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiAgentSlice = @import("../data_system.zig").AiAgentSlice;
@@ -464,14 +464,13 @@ pub const AiSystem = struct {
         const system_config = normalizedConfig(config, self);
         self.resetSeparationScratch();
         const gathered = self.rows.slice();
-        const separation_selection = selectStageWork(
-            thread_system,
-            entity_count,
-            system_config.separation_items_per_range orelse system_config.items_per_range,
-            system_config.max_worker_threads,
-            system_config.adaptive,
-            system_config.separation_adaptive_tuner,
-        );
+        const separation_selection = thread_system.selectBatchProfile(system_config.separation_adaptive_tuner, .{
+            .item_count = entity_count,
+            .items_per_range = system_config.separation_items_per_range orelse system_config.items_per_range,
+            .max_worker_threads = system_config.max_worker_threads,
+            .range_alignment_items = ai_range_alignment_items,
+            .adaptive = system_config.adaptive,
+        });
         var separation_context = buildAiSeparationContext(self, gathered, spatial, separation_selection.range_count, config.interest_markers);
         const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
             .max_worker_threads = separation_selection.worker_threads,
@@ -480,14 +479,13 @@ pub const AiSystem = struct {
             .selected_profile = separation_selection.profile,
         });
 
-        const intent_selection = selectStageWork(
-            thread_system,
-            entity_count,
-            system_config.intent_items_per_range orelse system_config.items_per_range,
-            system_config.max_worker_threads,
-            system_config.adaptive,
-            system_config.intent_adaptive_tuner,
-        );
+        const intent_selection = thread_system.selectBatchProfile(system_config.intent_adaptive_tuner, .{
+            .item_count = entity_count,
+            .items_per_range = system_config.intent_items_per_range orelse system_config.items_per_range,
+            .max_worker_threads = system_config.max_worker_threads,
+            .range_alignment_items = ai_range_alignment_items,
+            .adaptive = system_config.adaptive,
+        });
         const rcount = intent_selection.range_count;
 
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
@@ -563,8 +561,8 @@ pub const AiSystem = struct {
         writeAiIntentsJob(&context, .{ .index = 0, .start = 0, .end = entity_count }, WorkerId.main);
 
         navigation_stream.finishWrite();
-        const separation_batch = serialBatch(entity_count);
-        const intent_batch = serialBatch(entity_count);
+        const separation_batch = inlineBatch(entity_count, ai_range_alignment_items);
+        const intent_batch = inlineBatch(entity_count, ai_range_alignment_items);
         return .{
             .entity_count = entity_count,
             .intent_count = entity_count,
@@ -921,27 +919,6 @@ fn buildAiJobContext(
         .range_base = range_base,
         .range_count = range_count,
     };
-}
-
-const StageWorkSelection = BatchSelection;
-
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = ai_range_alignment_items,
-        .adaptive = adaptive,
-    });
 }
 
 fn sumU8(values: []const u8) usize {
@@ -1412,10 +1389,6 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
         });
     }
     writer.finish();
-}
-
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = 1, .items_per_range = count };
 }
 
 const SpatialIndexSystem = spatial_index.SpatialIndexSystem;

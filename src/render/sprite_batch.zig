@@ -28,6 +28,7 @@ const perf_diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const simd = @import("../core/simd.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 
 pub const TextureId = resources.TextureId;
 
@@ -553,13 +554,7 @@ pub const SpriteBatch = struct {
                     .start = 0,
                     .end = valid_count,
                 });
-                batch = .{
-                    .item_count = valid_count,
-                    .range_count = 1,
-                    .items_per_range = valid_count,
-                    .main_thread_ranges = 1,
-                    .ran_inline = true,
-                };
+                batch = inlineBatch(valid_count, 1);
             }
         }
         return batch;

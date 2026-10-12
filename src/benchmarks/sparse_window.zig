@@ -30,6 +30,7 @@ const default_chunk_size_tiles = @import("../game/world_system.zig").default_chu
 const Rect = @import("../render/renderer.zig").Rect;
 const TextureId = @import("../render/resources.zig").TextureId;
 const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const suite = @import("suite.zig");
 
 const world_side: u16 = 2048;
@@ -240,7 +241,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         submitted = try runIteration(&fixture, workload);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), suite.serialBatch(submitted, 1));
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), inlineBatch(submitted, 1));
         if (workload == .add) try fixture.dropAddedTile();
     }
     var stats = accumulator.finish();

@@ -7,6 +7,7 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -1153,7 +1154,7 @@ fn runQueries(ctx: *QueryContext, thread_system: ?*ThreadSystem, case: suite.Ben
         });
     }
     queryJob(@ptrCast(ctx), .{ .start = 0, .end = item_count }, WorkerId.main);
-    return suite.serialBatch(item_count, pathfinding_range_alignment_items);
+    return inlineBatch(item_count, pathfinding_range_alignment_items);
 }
 
 // Per-agent statusForWorld against a warm cache: isolates the result-cache probe and the

@@ -57,14 +57,16 @@ const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const cognition_halo_chunks = @import("../simulation_scope.zig").cognition_halo_chunks;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
+const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -72,8 +74,6 @@ const EntityId = @import("../data_system.zig").EntityId;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 
 pub const spatial_index_range_alignment_items: usize = movement_range_alignment_items;
-
-const thread_shared_record_alignment: usize = 64;
 
 pub const SpatialCell = struct {
     x: i32,
@@ -572,7 +572,13 @@ pub const SpatialIndexSystem = struct {
         if (n == 0) return .{};
 
         const owned_tuner = if (config.adaptive and config.items_per_range == null) &self.build_tuner else null;
-        const selection = selectStageWork(thread_system, n, config.items_per_range, config.max_worker_threads, config.adaptive, owned_tuner);
+        const selection = thread_system.selectBatchProfile(owned_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = spatial_index_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
         try self.prepareGatherStaging(n, selection.range_count);
         var context = SpatialGatherContext{
             .ai_entities = ai_agents.entities,
@@ -636,7 +642,7 @@ pub const SpatialIndexSystem = struct {
         if (gathered == 0) return .{};
         self.assignCellsDense();
         try self.buildEntriesAndRanges();
-        return .{ .entity_count = gathered, .batch = serialBatch(gathered) };
+        return .{ .entity_count = gathered, .batch = inlineBatch(gathered, spatial_index_range_alignment_items) };
     }
 
     fn clearWork(self: *SpatialIndexSystem) void {
@@ -890,38 +896,6 @@ fn spatialGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
         count += 1;
     }
     job.tallies[range.index].count = count;
-}
-
-// ---- Work selection (mirrors ai.zig/simulation_scope.zig's selectStageWork) ---
-
-const StageWorkSelection = BatchSelection;
-
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = spatial_index_range_alignment_items,
-        .adaptive = adaptive,
-    });
-}
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = 1, .items_per_range = count };
 }
 
 // ---- Tests --------------------------------------------------------------------

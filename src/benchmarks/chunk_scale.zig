@@ -101,6 +101,7 @@ const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const CellCoord = @import("../game/world_system.zig").CellCoord;
@@ -719,7 +720,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         cells_changed = try runIteration(&fixture, workload);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), suite.serialBatch(cells_changed, 1));
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), inlineBatch(cells_changed, 1));
         if (workload == .ramp) try undoRamps(&fixture, null);
     }
     var stats = accumulator.finish();
@@ -1224,7 +1225,7 @@ fn runGpuSyncBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const sync_ns = try runGpuSyncBatchIteration(io, &fixture, &edit, expected_uploads);
-        accumulator.record(sync_ns, suite.serialBatch(expected_uploads, 1));
+        accumulator.record(sync_ns, inlineBatch(expected_uploads, 1));
     }
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the elements uploaded.

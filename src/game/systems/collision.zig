@@ -16,8 +16,11 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
+const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const StageTimer = runtime_perf_log.StageTimer;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -100,8 +103,6 @@ fn appendProxyRow(
     row_slice.len = rows.len;
     row_slice.set(rows.len - 1, row);
 }
-
-const thread_shared_record_alignment: usize = 64;
 
 pub const CollisionConfig = struct {
     items_per_range: ?usize = null,
@@ -346,14 +347,13 @@ pub const CollisionSystem = struct {
             }
         }
 
-        const broadphase_selection = selectStageWork(
-            thread_system,
-            body_count,
-            system_config.broadphase_items_per_range orelse system_config.items_per_range,
-            system_config.max_worker_threads,
-            system_config.adaptive,
-            system_config.broadphase_adaptive_tuner,
-        );
+        const broadphase_selection = thread_system.selectBatchProfile(system_config.broadphase_adaptive_tuner, .{
+            .item_count = body_count,
+            .items_per_range = system_config.broadphase_items_per_range orelse system_config.items_per_range,
+            .max_worker_threads = system_config.max_worker_threads,
+            .range_alignment_items = collision_range_alignment_items,
+            .adaptive = system_config.adaptive,
+        });
         const broadphase = try self.buildBroadphaseCandidatesThreaded(
             thread_system,
             broadphase_selection,
@@ -376,14 +376,13 @@ pub const CollisionSystem = struct {
         }
         const pair_bound_exceeded = self.countPairBoundOverflow(candidate_pair_count, broadphase.grew);
 
-        const narrowphase_selection = selectStageWork(
-            thread_system,
-            candidate_pair_count,
-            system_config.narrowphase_items_per_range orelse system_config.items_per_range,
-            system_config.max_worker_threads,
-            system_config.adaptive,
-            system_config.narrowphase_adaptive_tuner,
-        );
+        const narrowphase_selection = thread_system.selectBatchProfile(system_config.narrowphase_adaptive_tuner, .{
+            .item_count = candidate_pair_count,
+            .items_per_range = system_config.narrowphase_items_per_range orelse system_config.items_per_range,
+            .max_worker_threads = system_config.max_worker_threads,
+            .range_alignment_items = collision_range_alignment_items,
+            .adaptive = system_config.adaptive,
+        });
 
         try self.prepareNarrowphaseStaging(candidate_pair_count, narrowphase_selection.range_count);
         var context = NarrowphaseJobContext{
@@ -446,7 +445,7 @@ pub const CollisionSystem = struct {
                 .body_count = body_count,
                 .candidate_pair_count = 0,
                 .broadphase_simd_groups = broadphase.simd_groups,
-                .broadphase_batch = serialBatch(body_count),
+                .broadphase_batch = inlineBatch(body_count, collision_range_alignment_items),
                 .used_full_sort = used_full_sort,
             };
         }
@@ -462,8 +461,8 @@ pub const CollisionSystem = struct {
             .contact_count = contact_count,
             .candidate_pair_count = candidate_pair_count,
             .broadphase_simd_groups = broadphase.simd_groups,
-            .broadphase_batch = serialBatch(body_count),
-            .narrowphase_batch = serialBatch(candidate_pair_count),
+            .broadphase_batch = inlineBatch(body_count, collision_range_alignment_items),
+            .narrowphase_batch = inlineBatch(candidate_pair_count, collision_range_alignment_items),
             .used_full_sort = used_full_sort,
             .pair_bound_exceeded = pair_bound_exceeded,
         };
@@ -578,7 +577,7 @@ pub const CollisionSystem = struct {
 
     /// Warms any slot `reserve` did not size (an unreserved system, or more bodies than
     /// the reserved capacity). Returns whether any slot allocated.
-    fn reserveInitialBroadphaseRangeCapacity(self: *CollisionSystem, selection: StageWorkSelection) !bool {
+    fn reserveInitialBroadphaseRangeCapacity(self: *CollisionSystem, selection: BatchSelection) !bool {
         const sorted_count = self.order.items.len;
         var grew = false;
         for (self.broadphase_ranges.items[0..selection.range_count], 0..) |*slot, range_index| {
@@ -809,7 +808,7 @@ pub const CollisionSystem = struct {
     fn buildBroadphaseCandidatesThreaded(
         self: *CollisionSystem,
         thread_system: *ThreadSystem,
-        selection: StageWorkSelection,
+        selection: BatchSelection,
     ) !BroadphaseBuildResult {
         try self.prepareBroadphaseRangeBuffers(selection.range_count);
         var result = BroadphaseBuildResult{
@@ -1090,47 +1089,10 @@ fn proxyIndexLessThan(proxies: ConstProxySlice, lhs: usize, rhs: usize) bool {
     return lhs_entity.generation < rhs_entity.generation;
 }
 
-const StageWorkSelection = BatchSelection;
-
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = collision_range_alignment_items,
-        .adaptive = adaptive,
-    });
-}
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
 fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usize) usize {
     const start = range_index * items_per_range;
     if (start >= item_count) return 0;
     return @min(start + items_per_range, item_count) - start;
-}
-
-fn serialBatch(item_count: usize) BatchStats {
-    return .{
-        .item_count = item_count,
-        .range_count = if (item_count > 0) 1 else 0,
-        .items_per_range = item_count,
-        .range_alignment_items = collision_range_alignment_items,
-        .main_thread_ranges = if (item_count > 0) 1 else 0,
-        .ran_inline = true,
-    };
 }
 
 fn addBody(data: *DataSystem, position_x: f32, position_y: f32, size: f32) !EntityId {

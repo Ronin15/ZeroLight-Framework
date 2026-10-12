@@ -23,6 +23,7 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// End of a list or owner chain, and "no entry" from a lookup.
 pub const no_entry: u32 = std.math.maxInt(u32);
@@ -74,7 +75,6 @@ const SpliceRecord = struct {
 /// window padding), and each range's record window starts on a cache line, so no two
 /// ranges write one line.
 pub const splice_range_alignment_items: usize = 8;
-const thread_shared_record_alignment: usize = 64;
 const SpliceRecordList = std.ArrayListAligned(SpliceRecord, .fromByteUnits(thread_shared_record_alignment));
 
 comptime {
