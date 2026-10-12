@@ -7,7 +7,7 @@ zig build           # build and install the app, runtime assets, and shaders
 zig build run       # build, install assets/shaders, and run the app
 zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
-zig build test      # run Zig unit tests
+zig build test      # run Zig unit tests (-Dtest-filter=<text> runs only matching tests)
 zig build bench     # run CPU gameplay and render-prep benchmarks
 zig build verify    # run check, test, shader compilation, atlas + idiom lint, fmt check
 zig build package   # install selected-mode binaries and runtime assets
@@ -275,7 +275,10 @@ intent); dig and move keep their existing keyboard / stick bindings — see
 ## Testing
 
 Unit tests live beside the code they cover as `test` blocks. Run them with
-`zig build test`. Test rules: `.claude/rules/tests-benchmarks.md`.
+`zig build test`. `-Dtest-filter=<text>` (repeatable) compiles and runs only
+tests whose names contain the text; names carry their module path, so
+`-Dtest-filter=systems.pathfinding` selects the pathfinding modules. Test
+rules: `.claude/rules/tests-benchmarks.md`.
 
 ## Validation Cadence
 
@@ -433,7 +436,10 @@ zig build bench -- --details
 ```
 
 Before/after comparisons use `tools/bench_ab.py`: targeted groups only, a base
-ref vs the working tree, interleaved Debug reps, medians and spread. Full-suite
+ref vs the working tree, Debug reps, medians and spread. Each side's reps are
+cached by its build inputs (`src/`, `build.zig*`, `assets/`) for six hours, so
+a landing's measured tree is reused as the next landing's base; `--fresh`
+reruns both sides interleaved. Full-suite
 capture with timestamped output under `benchmark_outputs/` uses
 `tools/bench_run.py`. Both: [tools/README.md](../tools/README.md).
 

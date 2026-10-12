@@ -21,7 +21,7 @@ they are **not** part of the game binary.
 
 | Script | What it does |
 | --- | --- |
-| `bench_ab.py` | Targeted Debug before/after: named bench groups only, a base ref vs the working tree, interleaved reps, medians and spread. |
+| `bench_ab.py` | Targeted Debug before/after: named bench groups only, a base ref vs the working tree, reps cached by build inputs, medians and spread. |
 | `bench_run.py` | Run `zig build bench` (full suite unless args narrow it), save a timestamped copy to `benchmark_outputs/`, and rotate to the newest N runs. |
 | `gen_atlas_orders.py` | Generate atlas **order manifests** (`atlas_orders/*.json`) from the procedural sprite registries. |
 | `generate_grim_sprites.py` | Generate the grim-dark fantasy character and item sprite atlases. |
@@ -51,7 +51,11 @@ The tool for agent and day-to-day perf checks. It refuses to run without
 (default `HEAD`) is exported once with `git archive` to
 `benchmark_outputs/ab-base/<sha>/` and reused while it exists (the newest two
 exports are kept); the working tree is the after side. Reps interleave base and
-tree per group and case. The summary prints each side's median and min-max
+tree per group and case, except a side whose reps are cached: each side's raw
+outputs are cached under `benchmark_outputs/ab-cache/`, keyed by its build
+inputs (`src/`, `build.zig*`, `assets/`), mode, case, and args, and reused for
+six hours, so a landing's measured tree is the next landing's base. `--fresh`
+reruns both sides interleaved. The summary prints each side's median and min-max
 spread and a verdict: `slower`/`faster` only when the two ranges do not
 overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
 `benchmark_outputs/ab-<stamp>/`. Always Debug. Cases default to
