@@ -118,6 +118,11 @@ section with nothing new is omitted.
   bench's sizes. Name each change
   path's cost-driver stage, the one that gets a `runtime_perf_log` entry
   (`threading.md`).
+- **Std usage** (`zig-style.md` std-first): every container, heap, bitset,
+  sort, search, hash, or parse the plan adds or changes names the `std` API it
+  uses (checked against the installed 0.17 `lib/std`), or the reason std can't
+  serve, which goes in the comment at the site. List any hand-rolled
+  duplicates of std in the touched files and their replacements.
 - **Files**: every file the implementation touches, with its estimated lines
   added and removed (production and tests apart); the implementer stops on
   any other.

@@ -72,6 +72,12 @@ model; routes to design) or **local**.
    (`.claude/rules/tests-benchmarks.md`), or marked derived? A flat-cost claim
    for a local change with no such bench is a finding.
 2. **Rule pass**: check the change against each loaded rule file.
+   **Std usage** (`zig-style.md` std-first), every review: list each
+   container, heap, bitset, sort, search, hash, or parse that the change adds
+   or that sits in a touched file. Check it against the installed 0.17
+   `lib/std`. A hand-rolled duplicate of a std API with no reason stated at
+   the site is a finding. So is a plan that never checked std for what it
+   adds.
 3. **Contract pass**: the contracts described by the doc that owns the
    touched area (`CLAUDE.md` § Rules And Docs).
    The rules and `docs/architecture.md` win over code: never recommend moving
