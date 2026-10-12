@@ -28,17 +28,17 @@ const LevelLink = @import("../../world_system.zig").LevelLink;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
+const RoundDispatch = @import("../../../app/thread_system.zig").RoundDispatch;
 const accumulateBatch = @import("../../../app/thread_system.zig").accumulateBatch;
+const runStage = @import("../../../app/thread_system.zig").runStage;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavLevelGraph = @import("nav_graph.zig").NavLevelGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const BatchLevels = @import("nav_graph.zig").BatchLevels;
-const NavStageThreads = @import("nav_graph.zig").NavStageThreads;
 const PatchInfo = @import("nav_graph.zig").PatchInfo;
-const RoundDispatch = @import("nav_graph.zig").RoundDispatch;
-const runStage = @import("nav_graph.zig").runStage;
 const chunkKey = @import("nav_graph.zig").chunkKey;
 const keyLevel = @import("nav_graph.zig").keyLevel;
 const keyChunk = @import("nav_graph.zig").keyChunk;
@@ -1832,7 +1832,7 @@ pub const Connectivity = struct {
         patch_keys: []const u64,
         patch_info: []const PatchInfo,
         new_links: []const LevelLink,
-        threads: ?NavStageThreads,
+        threads: ?Dispatch,
         closure_threads: ClosureThreads,
         pool_grows: *u64,
         stats: *NavUpdateStats,
@@ -1923,7 +1923,7 @@ pub const Connectivity = struct {
             .edges = self.seed_edges.items,
         };
         stats.main.reserve_ns += section.lap();
-        self.last_seed_batch = runStage(threads, changed_keys.len, &job, &job.range_count, seedJob);
+        self.last_seed_batch = runStage(threads, changed_keys.len, 1, &job, &job.range_count, seedJob);
         stats.addStageTime(self.last_seed_batch);
 
         // The closure reads the seed windows' counts and the graph before the change.
@@ -1947,8 +1947,8 @@ pub const Connectivity = struct {
         world: ?*const WorldSystem,
         patch_keys: []const u64,
         new_links: []const LevelLink,
-        gather_threads: ?NavStageThreads,
-        flood_threads: ?NavStageThreads,
+        gather_threads: ?Dispatch,
+        flood_threads: ?Dispatch,
         closure_threads: ClosureThreads,
         stats: *NavUpdateStats,
     ) ConnectivityCounters {
@@ -1966,7 +1966,7 @@ pub const Connectivity = struct {
             .edges = self.gather_edges.items,
         };
         self.bindOneWayWindows(&gather);
-        self.last_gather_batch = runStage(gather_threads, patch_keys.len + new_links.len, &gather, &gather.range_count, gatherJob);
+        self.last_gather_batch = runStage(gather_threads, patch_keys.len + new_links.len, 1, &gather, &gather.range_count, gatherJob);
         stats.addStageTime(self.last_gather_batch);
         const merge_timer = StageTimer.begin();
         self.mergeBatch(levels, patch_keys, true, patch_keys.len + new_links.len, null);
@@ -1997,9 +1997,9 @@ pub const Connectivity = struct {
         world: ?*const WorldSystem,
         keys: []const u64,
         replaced: ?*NavLevelGraph,
-        seed_threads: ?NavStageThreads,
-        gather_threads: ?NavStageThreads,
-        flood_threads: ?NavStageThreads,
+        seed_threads: ?Dispatch,
+        gather_threads: ?Dispatch,
+        flood_threads: ?Dispatch,
         closure_threads: ClosureThreads,
         pool_grows: *u64,
         stats: *NavUpdateStats,
@@ -2074,7 +2074,7 @@ pub const Connectivity = struct {
                 .counts = self.seed_counts.items,
                 .edges = self.seed_edges.items,
             };
-            self.last_seed_batch = runStage(seed_threads, keys.len, &seed, &seed.range_count, seedJob);
+            self.last_seed_batch = runStage(seed_threads, keys.len, 1, &seed, &seed.range_count, seedJob);
             stats.addStageTime(self.last_seed_batch);
         } else {
             self.last_seed_batch = .{};
@@ -2097,7 +2097,7 @@ pub const Connectivity = struct {
             .edges = self.gather_edges.items,
         };
         self.bindOneWayWindows(&gather);
-        self.last_gather_batch = runStage(gather_threads, keys.len, &gather, &gather.range_count, gatherJob);
+        self.last_gather_batch = runStage(gather_threads, keys.len, 1, &gather, &gather.range_count, gatherJob);
         stats.addStageTime(self.last_gather_batch);
         section = StageTimer.begin();
         self.mergeBatch(levels, keys, false, keys.len, replaced);
@@ -2300,7 +2300,7 @@ pub const Connectivity = struct {
     // threaded)
     // ------------------------------------------------------------------------------------
 
-    fn settleAndFlood(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) ConnectivityCounters {
+    fn settleAndFlood(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, threads: ?Dispatch, stats: *NavUpdateStats) ConnectivityCounters {
         var section = StageTimer.begin();
         self.units.len = self.element_limit;
         self.sets.len = self.element_limit;
@@ -2661,7 +2661,7 @@ pub const Connectivity = struct {
     // unexpanded queue spliced back, then claims and joins) and closes every served set left
     // with an empty queue (a whole component) while its family keeps another active set. One
     // thread profile serves every round of the batch, recorded once.
-    fn runFlood(self: *Connectivity, views: BatchViews, threads: ?NavStageThreads, counters: *ConnectivityCounters, stats: *NavUpdateStats) void {
+    fn runFlood(self: *Connectivity, views: BatchViews, threads: ?Dispatch, counters: *ConnectivityCounters, stats: *NavUpdateStats) void {
         // Builds, merges, and closes: every span between the rounds' searches.
         var section = StageTimer.begin();
         const families = views.families;
@@ -3095,7 +3095,7 @@ pub const Connectivity = struct {
                 .tallies = closure.cand_tallies.items,
             };
             stats.main.reserve_ns += section.lap();
-            const batch = runStage(threads.candidates, keys.len, &job, &job.range_count, candidateJob);
+            const batch = runStage(threads.candidates, keys.len, 1, &job, &job.range_count, candidateJob);
             section = StageTimer.begin();
             accumulateBatch(&stats.conn_candidates_batch, batch);
             stats.addStageTime(batch);
@@ -3231,7 +3231,7 @@ pub const Connectivity = struct {
     // words plus the tail (`conn_closure_compact`: a threaded copy per line, the main thread
     // O(1) per H-component), and the old arena is freed; a larger arena counts as a pool
     // growth.
-    fn reserveArena(self: *Connectivity, allocator: std.mem.Allocator, tail: usize, threads: ?NavStageThreads, pool_grows: *u64, stats: *NavUpdateStats) !void {
+    fn reserveArena(self: *Connectivity, allocator: std.mem.Allocator, tail: usize, threads: ?Dispatch, pool_grows: *u64, stats: *NavUpdateStats) !void {
         var section = StageTimer.begin();
         defer stats.main.reserve_ns += section.lap();
         const closure = &self.closure;
@@ -3262,7 +3262,7 @@ pub const Connectivity = struct {
         fresh.items.len = offset;
         var job = CompactJob{ .blocks = closure.compact_blocks.items, .src = closure.words.items, .dst = fresh.items };
         stats.main.reserve_ns += section.lap();
-        const batch = runStage(threads, offset / span_words, &job, &job.range_count, compactJob);
+        const batch = runStage(threads, offset / span_words, 1, &job, &job.range_count, compactJob);
         section = StageTimer.begin();
         accumulateBatch(&stats.conn_closure_compact_batch, batch);
         stats.addStageTime(batch);
@@ -3402,7 +3402,7 @@ pub const Connectivity = struct {
     }
 
     // Each link's ends on the final graph (`conn_closure_resolve`, item = link).
-    fn resolveLinks(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
+    fn resolveLinks(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, threads: ?Dispatch, stats: *NavUpdateStats) void {
         const closure = &self.closure;
         const count = closure.resolve_items.items.len;
         closure.resolve_out.items.len = count;
@@ -3414,7 +3414,7 @@ pub const Connectivity = struct {
             .outs = closure.resolve_out.items,
             .comp_root = self.comp_root,
         };
-        closure.last_resolve_batch = runStage(threads, count, &job, &job.range_count, resolveJob);
+        closure.last_resolve_batch = runStage(threads, count, 1, &job, &job.range_count, resolveJob);
         stats.addStageTime(closure.last_resolve_batch);
     }
 
@@ -3754,7 +3754,7 @@ pub const Connectivity = struct {
             .s_count = touched.s_count,
             .a_flag = slots.a_flag,
         };
-        closure.last_mask_batch = runStage(threads.mask, closure.mask_items.items.len, &mask, &mask.range_count, maskJob);
+        closure.last_mask_batch = runStage(threads.mask, closure.mask_items.items.len, 1, &mask, &mask.range_count, maskJob);
         stats.addStageTime(closure.last_mask_batch);
         var section = StageTimer.begin();
 
@@ -3791,7 +3791,7 @@ pub const Connectivity = struct {
             .apos = apos,
         };
         stats.main.closure_ns += section.lap();
-        closure.last_plan_batch = runStage(threads.plan, closure.plan_items.items.len, &plan, &plan.range_count, planJob);
+        closure.last_plan_batch = runStage(threads.plan, closure.plan_items.items.len, 1, &plan, &plan.range_count, planJob);
         stats.addStageTime(closure.last_plan_batch);
         section = StageTimer.begin();
 
@@ -4363,7 +4363,7 @@ fn gatherLink(levels: BatchLevels, link: LevelLink, window: []EdgeEntry) u32 {
 // ----------------------------------------------------------------------------------------
 
 // The thread system's participants (workers plus the main thread), or the main thread alone.
-fn participantCount(threads: ?NavStageThreads) usize {
+fn participantCount(threads: ?Dispatch) usize {
     return if (threads) |stage| stage.thread_system.participantSlotCount() else 1;
 }
 
@@ -4487,12 +4487,12 @@ fn floodJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
 
 /// Threading for the closure stages, each with its own tuner; a null stage runs inline.
 pub const ClosureThreads = struct {
-    candidates: ?NavStageThreads = null,
-    resolve: ?NavStageThreads = null,
-    mask: ?NavStageThreads = null,
-    plan: ?NavStageThreads = null,
-    rows: ?NavStageThreads = null,
-    compact: ?NavStageThreads = null,
+    candidates: ?Dispatch = null,
+    resolve: ?Dispatch = null,
+    mask: ?Dispatch = null,
+    plan: ?Dispatch = null,
+    rows: ?Dispatch = null,
+    compact: ?Dispatch = null,
 };
 
 const TouchColumns = struct {
@@ -5743,8 +5743,7 @@ test "threaded connectivity stages equal the inline ones column for column acros
             var threaded = PathfindingSystem.init(std.testing.allocator);
             defer threaded.deinit();
             try threaded.reserve(capacity);
-            threaded.nav_thread_adaptive = false;
-            threaded.nav_thread_items_per_range = items_per_range;
+            threaded.nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
             // The world build runs the stages threaded over every chunk of each level.
             try threaded.rebuildStaticNavGridWithWorld(&run.data, &run.world, &threads);
             try std.testing.expect(!threaded.graph.connectivity.last_gather_batch.ran_inline);
@@ -5805,8 +5804,7 @@ test "the post-commit nav reaction runs the connectivity stages on workers and r
     capacity.worker_participant_count = threads.participantSlotCount();
     var system = try fixture.build(capacity);
     defer system.deinit();
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try toggleRooms(&fixture, &system, fixture.tree);
@@ -5843,8 +5841,7 @@ fn forcedNavThreads(system: *PathfindingSystem, threads: *ThreadSystem) NavUpdat
         .conn_closure_plan_tuner = &system.nav_conn_closure_plan_tuner,
         .conn_closure_rows_tuner = &system.nav_conn_closure_rows_tuner,
         .conn_closure_compact_tuner = &system.nav_conn_closure_compact_tuner,
-        .adaptive = false,
-        .items_per_range = 1,
+        .controls = .{ .adaptive = false, .items_per_range = 1 },
     };
 }
 
@@ -5983,8 +5980,7 @@ test "enclosing eight pockets of one component in one batch floods on workers, s
         capacity.worker_participant_count = threads.participantSlotCount();
         var threaded = try fixture.build(capacity);
         defer threaded.deinit();
-        threaded.nav_thread_adaptive = false;
-        threaded.nav_thread_items_per_range = 1;
+        threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
         try enclosePockets(&fixture, &.{ &inline_system, &threaded }, gaps[0..count]);
         const serial = try inline_system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
         const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
@@ -6021,8 +6017,7 @@ test "threaded floods equal inline ones column for column when families meet and
                 capacity.worker_participant_count = threads.participantSlotCount();
                 var threaded = try fixture.build(capacity);
                 defer threaded.deinit();
-                threaded.nav_thread_adaptive = false;
-                threaded.nav_thread_items_per_range = items_per_range;
+                threaded.nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
                 if (narrow) {
                     // A window of one node's slack plus four: a few searches per round, so
                     // families wait for the window and resume at the cursor.
@@ -6587,7 +6582,7 @@ test "a flooding reaction reaches its adaptive tuner as one sample at the batch'
         capacity.worker_participant_count = threads.participantSlotCount();
         var system = try fixture.build(capacity);
         defer system.deinit();
-        try std.testing.expect(system.nav_thread_adaptive and system.nav_thread_items_per_range == null);
+        try std.testing.expect(system.nav_controls.adaptive and system.nav_controls.items_per_range == null);
         narrowFloodWindow(&system);
         const tuner = &system.nav_conn_flood_tuner;
         if (settled) {
@@ -7021,8 +7016,7 @@ test "threaded closure stages equal the inline ones word for word across worker 
             var threaded = PathfindingSystem.init(std.testing.allocator);
             defer threaded.deinit();
             try threaded.reserve(capacity);
-            threaded.nav_thread_adaptive = false;
-            threaded.nav_thread_items_per_range = items_per_range;
+            threaded.nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
             // The world build's closure runs threaded.
             try threaded.rebuildStaticNavGridWithWorld(&fixture.data, &fixture.world, &threads);
             try expectSameColumns(&inline_system.graph, &threaded.graph);
@@ -7376,8 +7370,7 @@ test "the post-commit nav reaction runs the closure resolve and rows on workers 
     capacity.worker_participant_count = threads.participantSlotCount();
     var system = try fixture.build(capacity);
     defer system.deinit();
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try setRoom(&fixture, &system, chunks, 0, 31, fixture.tree);
@@ -7394,6 +7387,106 @@ test "the post-commit nav reaction runs the closure resolve and rows on workers 
         try std.testing.expectEqual(@as(u64, stats.conn_closure_rows_batch.item_count), closure.items);
     }
     try fixture.expectMatchesRebuild(&system);
+}
+
+// A post-commit nav reaction for the cap test: a lattice with two one-way chains whose rooms
+// close (graph, connectivity, and closure stages), or two rooms whose doors close (the flood).
+const CappedNavScenario = enum { closure, flood };
+
+const CappedNavRun = struct {
+    stats: NavUpdateStats,
+    plan_batch: BatchStats,
+    patch_batch: BatchStats,
+    mark_batch: BatchStats,
+
+    // The run's batch of stage `name`.
+    fn batch(self: *const CappedNavRun, comptime name: []const u8) BatchStats {
+        if (comptime std.mem.eql(u8, name, "plan")) return self.plan_batch;
+        if (comptime std.mem.eql(u8, name, "patch")) return self.patch_batch;
+        if (comptime std.mem.eql(u8, name, "mark")) return self.mark_batch;
+        return @field(self.stats, name);
+    }
+};
+
+// The stage names of `CappedNavRun.batch`: every `BatchStats` of `NavUpdateStats`, the key
+// plan and record patch, and `nav_mark`.
+const capped_nav_stages = blk: {
+    var names: []const []const u8 = &.{ "plan", "patch", "mark" };
+    for (@typeInfo(NavUpdateStats).@"struct".field_names, @typeInfo(NavUpdateStats).@"struct".field_types) |name, field_type| {
+        if (field_type == BatchStats) names = names ++ .{name};
+    }
+    break :blk names;
+};
+
+fn runCappedNavScenario(scenario: CappedNavScenario, threads: *ThreadSystem, cap: ?usize) !CappedNavRun {
+    const chunks: u16 = 8;
+    var fixture = switch (scenario) {
+        .closure => try latticeWorld(chunks, 1),
+        .flood => try TestWorld.init(10, 1),
+    };
+    defer fixture.deinit();
+    switch (scenario) {
+        .closure => {
+            try addChain(&fixture, chunks, 0, 16, 16);
+            try addChain(&fixture, chunks, 0, 64, 16);
+        },
+        .flood => try twoRooms(&fixture),
+    }
+    var capacity = test_support.abstractCapacity();
+    capacity.worker_participant_count = threads.participantSlotCount();
+    var system = try fixture.build(capacity);
+    defer system.deinit();
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1, .max_worker_threads = cap };
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    switch (scenario) {
+        .closure => {
+            try setRoom(&fixture, &system, chunks, 0, 31, fixture.tree);
+            try setRoom(&fixture, &system, chunks, 0, 79, fixture.tree);
+        },
+        .flood => try toggleRooms(&fixture, &system, fixture.tree),
+    }
+    frame.beginStep();
+    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, threads);
+    try fixture.expectMatchesRebuild(&system);
+    return .{
+        .stats = stats,
+        .plan_batch = system.graph.last_plan_batch,
+        .patch_batch = system.graph.last_patch_batch,
+        .mark_batch = system.last_mark_batch,
+    };
+}
+
+test "a nav worker cap of zero keeps every graph, connectivity, and closure stage inline on a multi-worker ThreadSystem and changes no result" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    for (std.meta.tags(CappedNavScenario)) |scenario| {
+        const uncapped = try runCappedNavScenario(scenario, &threads, null);
+        const capped = try runCappedNavScenario(scenario, &threads, 0);
+        // The fixed partition runs these stages on workers unless the cap holds them inline.
+        const on_workers: []const []const u8 = switch (scenario) {
+            .closure => &.{ "plan", "patch", "remask_batch", "conn_seed_batch", "conn_gather_batch", "conn_candidates_batch", "conn_closure_compact_batch", "conn_closure_resolve_batch", "conn_closure_mask_batch", "conn_closure_plan_batch", "conn_closure_rows_batch" },
+            .flood => &.{ "conn_seed_batch", "conn_gather_batch", "conn_flood_batch" },
+        };
+        var matched: usize = 0;
+        inline for (capped_nav_stages) |name| {
+            const free = uncapped.batch(name);
+            const held = capped.batch(name);
+            try std.testing.expectEqual(free.item_count, held.item_count);
+            try std.testing.expect(held.ran_inline and held.active_worker_threads == 0);
+            for (on_workers) |wanted| {
+                if (!std.mem.eql(u8, wanted, name)) continue;
+                try std.testing.expect(!free.ran_inline and free.worker_thread_ranges != 0);
+                matched += 1;
+            }
+        }
+        try std.testing.expectEqual(on_workers.len, matched);
+        inline for (.{ "conn_splits", "conn_merges", "conn_flood_nodes", "closure_links", "closure_a_rows", "records_patched" }) |name| {
+            try std.testing.expectEqual(@field(uncapped.stats, name), @field(capped.stats, name));
+        }
+    }
 }
 
 test "a merge and a split of terminal roots far from every endpoint join and part their one-way systems" {

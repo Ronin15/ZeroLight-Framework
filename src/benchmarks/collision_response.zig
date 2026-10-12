@@ -4,9 +4,9 @@
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const CollisionResponse = @import("../game/data_system.zig").CollisionResponse;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -423,11 +423,6 @@ fn stageBandTunerForCase(case: suite.BenchmarkCase) ?AdaptiveWorkTuner {
 fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
     const gather = &system.gather_tuner;
     return gather.isSettled() and (!gather.report().has_threaded_profile or system.apply_tuner.isSettled());
-}
-
-// Off-main time of a stage batch: none when it ran inline.
-fn offMainNs(batch: BatchStats) u64 {
-    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
 }
 
 fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {

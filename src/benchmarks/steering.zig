@@ -17,6 +17,7 @@ const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -218,11 +219,6 @@ const MeasuredCase = struct {
     stats: suite.RunStats,
     last: SteeringStats,
 };
-
-// Off-main time of a stage batch: none when it ran inline.
-fn offMainNs(batch: BatchStats) u64 {
-    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
-}
 
 // Off-main time of one steering step's stages.
 fn stagesOffMainNs(stats: SteeringStats) u64 {
@@ -593,9 +589,8 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
         colliders.splice_tuner = tuner;
         colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
-    colliders.splice_adaptive = case.adaptive;
-    colliders.splice_items_per_range = if (case.adaptive) null else case.itemsPerRange(splice_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, splice_range_alignment_items);
+    colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(splice_range_alignment_items) orelse
+        suite.alignItemCount(suite.default_items_per_range, splice_range_alignment_items) };
     const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticChange, staticChangeOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;

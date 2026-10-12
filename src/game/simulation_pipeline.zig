@@ -6674,8 +6674,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
     });
     defer fixture.deinit();
     const pathfinding = &fixture.pipeline.pathfinding;
-    pathfinding.nav_thread_adaptive = false;
-    pathfinding.nav_thread_items_per_range = 1;
+    pathfinding.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     fixture.pipeline.plane_entry.config = .{ .items_per_range = plane_entry_range_alignment_items, .adaptive = false };
     const spare_marks = pathfinding.nav_marks.capacity - pathfinding.nav_marks.items.len;
     // Past the spare marks and staging, and across at least two `nav_mark` ranges.

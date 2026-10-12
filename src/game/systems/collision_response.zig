@@ -18,9 +18,7 @@ const std = @import("std");
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BandPartition = @import("../../app/thread_system.zig").BandPartition;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
-const JobFn = @import("../../app/thread_system.zig").JobFn;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
@@ -146,6 +144,10 @@ pub const CollisionResponseConfig = struct {
     adaptive: bool = true,
 };
 
+// Threading for one update's stages: the thread system and the caller's control config.
+// Absent in `updateSerial`, where both stages run inline.
+const ResponseThreads = @import("../../app/thread_system.zig").StageThreads(CollisionResponseConfig);
+
 pub const CollisionResponseStats = struct {
     contact_count: usize = 0,
     intent_count: usize = 0,
@@ -188,51 +190,6 @@ fn setListCount(list: anytype, count: usize) void {
 
 // The partition of movement rows into bands of whole `band_block_rows` blocks.
 const RowBands = BandPartition(band_block_rows, max_bands);
-
-// Threading for one update's stages: the thread system and the caller's control config.
-// Absent in `updateSerial`, where both stages run inline.
-const ResponseThreads = struct {
-    thread_system: *ThreadSystem,
-    config: CollisionResponseConfig,
-
-    // Pre-selects the batch shape so a job can assert its range against the dispatched
-    // range count. The stage's own tuner drives an adaptive config with no fixed range size;
-    // `fixed_items_per_range` replaces the config's range size for the band stage.
-    fn select(self: ResponseThreads, owned_tuner: *AdaptiveWorkTuner, item_count: usize, range_alignment_items: usize, fixed_items_per_range: ?usize) BatchSelection {
-        const items_per_range = fixed_items_per_range orelse self.config.items_per_range;
-        const tuner: ?*AdaptiveWorkTuner = if (self.config.adaptive and items_per_range == null) owned_tuner else null;
-        return self.thread_system.selectBatchProfile(tuner, .{
-            .item_count = item_count,
-            .items_per_range = items_per_range,
-            .max_worker_threads = self.config.max_worker_threads,
-            .range_alignment_items = range_alignment_items,
-            .adaptive = self.config.adaptive,
-        });
-    }
-
-    // False when the thread system has no workers or the config allows none.
-    fn mayUseWorkers(self: ResponseThreads) bool {
-        const workers = self.thread_system.workerThreadCount();
-        return @min(self.config.max_worker_threads orelse workers, workers) > 0;
-    }
-
-    fn dispatch(self: ResponseThreads, item_count: usize, context: *anyopaque, job: JobFn, selection: BatchSelection, range_alignment_items: usize) BatchStats {
-        return self.thread_system.parallelForWithOptions(item_count, context, job, .{
-            .items_per_range = selection.items_per_range,
-            .max_worker_threads = self.config.max_worker_threads,
-            .range_alignment_items = range_alignment_items,
-            .adaptive = self.config.adaptive,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
-    }
-};
-
-// `threads` when a stage there can get a worker, else null.
-fn stageWithWorkers(threads: ?ResponseThreads) ?ResponseThreads {
-    const stage = threads orelse return null;
-    return if (stage.mayUseWorkers()) stage else null;
-}
 
 pub const CollisionResponseSystem = struct {
     allocator: std.mem.Allocator,
@@ -311,8 +268,9 @@ pub const CollisionResponseSystem = struct {
         var gather_items_per_range = contact_count;
         // With no bands, the gather ranges apply their own windows.
         var bands_used = false;
-        if (stageWithWorkers(threads)) |stage| {
-            const selection = stage.select(&self.gather_tuner, contact_count, collision_response_range_alignment_items, null);
+        if (ResponseThreads.withWorkers(threads)) |stage| {
+            const gather_stage = stage.stage(&self.gather_tuner);
+            const selection = gather_stage.select(contact_count, collision_response_range_alignment_items);
             setSlotCount(GatherRow, &self.gather_rows, selection.range_count);
             // Placement and the band apply only pay off with workers; an inline gather
             // applies each window inside its timed range instead.
@@ -325,7 +283,7 @@ pub const CollisionResponseSystem = struct {
                 .items_per_range = selection.items_per_range,
                 .gather_rows = self.gather_rows.items,
             };
-            stats.gather_batch = stage.dispatch(contact_count, &gather, gatherJob, selection, collision_response_range_alignment_items);
+            stats.gather_batch = gather_stage.run(selection, contact_count, collision_response_range_alignment_items, &gather, gatherJob);
             gather_items_per_range = selection.items_per_range;
 
             if (bands) |row_bands| {
@@ -333,7 +291,9 @@ pub const CollisionResponseSystem = struct {
                 // No placed intent leaves nothing to apply.
                 if (placedIntentCount(self.gather_rows.items, row_bands) > 0) {
                     // A fixed shape (an explicit range size) applies one band per range.
-                    const apply_selection = stage.select(&self.apply_tuner, row_bands.band_count, 1, if (stage.config.items_per_range != null) 1 else null);
+                    var apply_stage = stage.stage(&self.apply_tuner);
+                    if (stage.config.items_per_range != null) apply_stage.items_per_range = 1;
+                    const apply_selection = apply_stage.select(row_bands.band_count, 1);
                     var apply = ApplyBandJob{
                         .intents = input.intents,
                         .columns = columns,
@@ -344,7 +304,7 @@ pub const CollisionResponseSystem = struct {
                         .bands = row_bands,
                         .range_count = apply_selection.range_count,
                     };
-                    stats.apply_batch = stage.dispatch(row_bands.band_count, &apply, applyBandJob, apply_selection, 1);
+                    stats.apply_batch = apply_stage.run(apply_selection, row_bands.band_count, 1, &apply, applyBandJob);
                 }
             }
         } else {

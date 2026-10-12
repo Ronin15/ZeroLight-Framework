@@ -8,6 +8,7 @@ const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -1014,10 +1015,6 @@ fn offMainStageNs(stats: PathfindingStats) u64 {
     var total: u64 = 0;
     for (updateBatches(stats)) |batch| total += offMainNs(batch);
     return total;
-}
-
-fn offMainNs(batch: BatchStats) u64 {
-    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
 }
 
 // Stage shapes and the main-thread share of the timed pathfinding updates, printed
@@ -2085,8 +2082,7 @@ fn navUpdateItemsPerRange(case: suite.BenchmarkCase) ?usize {
 
 // Gives the nav update stages this case's control config.
 fn configureNavUpdateThreads(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
-    system.nav_thread_adaptive = case.adaptive;
-    system.nav_thread_items_per_range = navUpdateItemsPerRange(case);
+    system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = navUpdateItemsPerRange(case) };
 }
 
 // Most abstract nodes any participant's or tier-1 pool entry's last search claimed this step.

@@ -18,6 +18,7 @@ const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
@@ -153,13 +154,8 @@ pub const PlaneEntrySystem = struct {
             self.last_batch = inlineBatch(item_count, plane_entry_range_alignment_items);
             return self.entries.items;
         };
-        const selection = ts.selectBatchProfile(&self.tuner, .{
-            .item_count = item_count,
-            .items_per_range = self.config.items_per_range,
-            .max_worker_threads = self.config.max_worker_threads,
-            .range_alignment_items = plane_entry_range_alignment_items,
-            .adaptive = self.config.adaptive,
-        });
+        const stage = (StageThreads(PlaneEntryConfig){ .thread_system = ts, .config = self.config }).stage(&self.tuner);
+        const selection = stage.select(item_count, plane_entry_range_alignment_items);
         std.debug.assert(self.tallies.capacity >= selection.range_count);
         self.entries.items.len = item_count;
         self.tallies.items.len = selection.range_count;
@@ -167,12 +163,7 @@ pub const PlaneEntrySystem = struct {
         job.entries = self.entries.items;
         job.tallies = self.tallies.items;
         job.items_per_range = selection.items_per_range;
-        self.last_batch = ts.parallelForWithOptions(item_count, &job, planeEntryJob, .{
-            .max_worker_threads = selection.worker_threads,
-            .range_alignment_items = plane_entry_range_alignment_items,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
+        self.last_batch = stage.run(selection, item_count, plane_entry_range_alignment_items, &job, planeEntryJob);
         compactWindows(&self.entries, self.tallies.items, selection.items_per_range);
         return self.entries.items;
     }

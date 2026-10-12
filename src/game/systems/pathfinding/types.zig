@@ -15,7 +15,6 @@ const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
-const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const EntityId = @import("../../data_system.zig").EntityId;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
@@ -651,7 +650,6 @@ pub const PathfindingConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    fallback_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     max_solved_requests_per_step: ?usize = null,
     max_fallback_requests_per_step: ?usize = null,
 };

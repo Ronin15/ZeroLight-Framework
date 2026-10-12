@@ -18,7 +18,7 @@ const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveW
 const BandPartition = @import("../../app/thread_system.zig").BandPartition;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
-const JobFn = @import("../../app/thread_system.zig").JobFn;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
@@ -111,8 +111,11 @@ pub const SteeringConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
+
+// Threading for one update's stages: the thread system and the caller's control config.
+// Absent in `updateSerial`, where every stage runs inline.
+const StageThreads = @import("../../app/thread_system.zig").StageThreads(SteeringConfig);
 
 pub const SteeringStats = struct {
     navigation_intent_count: usize = 0,
@@ -457,11 +460,12 @@ pub const SteeringSystem = struct {
         var range_count: usize = 0;
         if (agent_count != 0) {
             if (threads) |stage| {
-                const selection = stage.select(&self.agents_tuner, agent_count, steering_range_alignment_items, null);
+                const agents = stage.stage(&self.agents_tuner);
+                const selection = agents.select(agent_count, steering_range_alignment_items);
                 setSlotCount(AgentsTally, &self.agents_tallies, selection.range_count);
                 job.items_per_range = selection.items_per_range;
                 job.tallies = self.agents_tallies.items;
-                stats.agents_batch = stage.dispatch(agent_count, &job, agentsJob, selection, steering_range_alignment_items);
+                stats.agents_batch = agents.run(selection, agent_count, steering_range_alignment_items, &job, agentsJob);
                 range_count = selection.range_count;
             } else {
                 setSlotCount(AgentsTally, &self.agents_tallies, 1);
@@ -553,12 +557,13 @@ pub const SteeringSystem = struct {
         setRowCount(IntentRow, &self.intent_rows, intent_count);
         const intent_rows = self.intent_rows.slice();
         const claims = claimColumns(self.claims.slice());
-        const stage = stageWithWorkers(threads) orelse {
+        const stage = StageThreads.withWorkers(threads) orelse {
             resolveAndClaim(data, intents, 0, intent_count, intent_rows.items(.steering), intent_rows.items(.movement), claims, self.claim_stamp);
             stats.select_resolve_batch = inlineBatch(intent_count, steering_range_alignment_items);
             return;
         };
-        const selection = stage.select(&self.select_resolve_tuner, intent_count, steering_range_alignment_items, null);
+        const resolve_stage = stage.stage(&self.select_resolve_tuner);
+        const selection = resolve_stage.select(intent_count, steering_range_alignment_items);
         const bands = AgentBands.init(agent_count);
         setSlotCount(BandRow, &self.band_rows, selection.range_count);
         std.debug.assert(self.intent_buckets.capacity >= intent_count);
@@ -573,10 +578,12 @@ pub const SteeringSystem = struct {
             .items_per_range = selection.items_per_range,
             .band_rows = self.band_rows.items,
         };
-        stats.select_resolve_batch = stage.dispatch(intent_count, &resolve, resolveJob, selection, steering_range_alignment_items);
+        stats.select_resolve_batch = resolve_stage.run(selection, intent_count, steering_range_alignment_items, &resolve, resolveJob);
 
         // A fixed shape (an explicit range size) claims one band per range.
-        const claim_selection = stage.select(&self.select_claim_tuner, bands.band_count, 1, if (stage.config.items_per_range != null) 1 else null);
+        var claim_stage = stage.stage(&self.select_claim_tuner);
+        if (stage.config.items_per_range != null) claim_stage.items_per_range = 1;
+        const claim_selection = claim_stage.select(bands.band_count, 1);
         var claim = ClaimJob{
             .intents = intents,
             .intent_steering = intent_rows.items(.steering),
@@ -588,7 +595,7 @@ pub const SteeringSystem = struct {
             .stamp = self.claim_stamp,
             .range_count = claim_selection.range_count,
         };
-        stats.select_claim_batch = stage.dispatch(bands.band_count, &claim, claimJob, claim_selection, 1);
+        stats.select_claim_batch = claim_stage.run(claim_selection, bands.band_count, 1, &claim, claimJob);
     }
 
     // `directions` over the intents: each intent that is its steering row's first this step
@@ -631,11 +638,12 @@ pub const SteeringSystem = struct {
         };
         var range_count: usize = 1;
         if (threads) |stage| {
-            const selection = stage.select(&self.directions_tuner, intent_count, steering_range_alignment_items, null);
+            const directions = stage.stage(&self.directions_tuner);
+            const selection = directions.select(intent_count, steering_range_alignment_items);
             setSlotCount(DirectionsTally, &self.directions_tallies, selection.range_count);
             job.items_per_range = selection.items_per_range;
             job.tallies = self.directions_tallies.items;
-            stats.directions_batch = stage.dispatch(intent_count, &job, directionsJob, selection, steering_range_alignment_items);
+            stats.directions_batch = directions.run(selection, intent_count, steering_range_alignment_items, &job, directionsJob);
             range_count = selection.range_count;
         } else {
             setSlotCount(DirectionsTally, &self.directions_tallies, 1);
@@ -677,13 +685,13 @@ pub const SteeringSystem = struct {
     // one band and the bands follow cell order, so every cell holds the same entries in the
     // same order for any splitters and partition.
     fn buildAgentGrid(self: *SteeringSystem, threads: ?StageThreads, stats: *SteeringStats) void {
-        const stage = stageWithWorkers(threads) orelse {
+        const stage = StageThreads.withWorkers(threads) orelse {
             self.buildAgentGridDirect();
             stats.grid_bucket_batch = inlineBatch(self.agent_snapshot_rows.len, steering_range_alignment_items);
             return;
         };
         const splitters = chooseGridSplitters(self.agentSnapshotSliceConst(), self.spatial_cell_size);
-        const selection = stage.select(&self.grid_bucket_tuner, self.agent_snapshot_rows.len, steering_range_alignment_items, null);
+        const selection = stage.stage(&self.grid_bucket_tuner).select(self.agent_snapshot_rows.len, steering_range_alignment_items);
         self.buildAgentGridBanded(stage, selection, splitters, stats);
     }
 
@@ -722,7 +730,7 @@ pub const SteeringSystem = struct {
             .items_per_range = selection.items_per_range,
             .band_rows = self.band_rows.items,
         };
-        stats.grid_bucket_batch = stage.dispatch(agent_count, &bucket, bucketJob, selection, steering_range_alignment_items);
+        stats.grid_bucket_batch = stage.stage(&self.grid_bucket_tuner).run(selection, agent_count, steering_range_alignment_items, &bucket, bucketJob);
 
         // Each band's slice starts after every range's entries of the earlier bands.
         var band_start: [max_bands + 1]usize = @splat(0);
@@ -731,7 +739,9 @@ pub const SteeringSystem = struct {
         }
 
         // A fixed shape (an explicit range size) sorts one band per range.
-        const sort_selection = stage.select(&self.grid_sort_tuner, max_bands, 1, if (stage.config.items_per_range != null) 1 else null);
+        var sort_stage = stage.stage(&self.grid_sort_tuner);
+        if (stage.config.items_per_range != null) sort_stage.items_per_range = 1;
+        const sort_selection = sort_stage.select(max_bands, 1);
         setSlotCount(GridSortTally, &self.grid_sort_tallies, max_bands);
         var sort = SortJob{
             .staging = self.agent_cell_staging.items,
@@ -743,7 +753,7 @@ pub const SteeringSystem = struct {
             .tallies = self.grid_sort_tallies.items,
             .range_count = sort_selection.range_count,
         };
-        stats.grid_sort_batch = stage.dispatch(max_bands, &sort, sortJob, sort_selection, 1);
+        stats.grid_sort_batch = sort_stage.run(sort_selection, max_bands, 1, &sort, sortJob);
 
         self.agent_cell_entries.items.len = band_start[max_bands];
         for (&self.agent_grid.bands, self.grid_sort_tallies.items, band_start[0..max_bands]) |*band, slot, band_entry_start| {
@@ -764,8 +774,9 @@ pub const SteeringSystem = struct {
         stats: *SteeringStats,
     ) !void {
         const count = stats.selected_intent_count;
-        const selection: BatchSelection = if (threads) |stage|
-            selectSteeringWork(stage.thread_system, count, stage.config, self)
+        const movement: ?Dispatch = if (threads) |stage| stage.stage(&self.adaptive_tuner) else null;
+        const selection: BatchSelection = if (movement) |stage|
+            stage.select(count, steering_range_alignment_items)
         else
             .{ .profile = .{ .worker_threads = 0, .items_per_range = count }, .items_per_range = count, .worker_threads = 0, .range_count = 1 };
         const range_count = selection.range_count;
@@ -803,14 +814,8 @@ pub const SteeringSystem = struct {
             .tallies = self.movement_tallies.items,
             .range_count = range_count,
         };
-        if (threads) |stage| {
-            stats.batch = stage.thread_system.parallelForWithOptions(count, &context, writeSteeringMovementJob, .{
-                .items_per_range = selection.items_per_range,
-                .max_worker_threads = selection.worker_threads,
-                .range_alignment_items = steering_range_alignment_items,
-                .adaptive_tuner = selection.active_tuner,
-                .selected_profile = selection.profile,
-            });
+        if (movement) |stage| {
+            stats.batch = stage.run(selection, count, steering_range_alignment_items, &context, writeSteeringMovementJob);
         } else {
             writeSteeringMovementJob(&context, .{ .index = 0, .start = 0, .end = count }, WorkerId.main);
             stats.batch = inlineBatch(count, steering_range_alignment_items);
@@ -827,54 +832,6 @@ pub const SteeringSystem = struct {
         stats.movement_intent_count = count;
     }
 };
-
-// Threading for one update's stages: the thread system and the caller's control config.
-// Absent in `updateSerial`, where every stage runs inline.
-const StageThreads = struct {
-    thread_system: *ThreadSystem,
-    config: SteeringConfig,
-
-    // Pre-selects the batch shape so a job can assert its range against the dispatched
-    // range count. The stage's own tuner drives an adaptive config with no fixed range size;
-    // `fixed_items_per_range` replaces the config's range size for a stage whose items are
-    // not agents or intents.
-    fn select(self: StageThreads, owned_tuner: *AdaptiveWorkTuner, item_count: usize, range_alignment_items: usize, fixed_items_per_range: ?usize) BatchSelection {
-        const items_per_range = fixed_items_per_range orelse self.config.items_per_range;
-        const tuner: ?*AdaptiveWorkTuner = if (self.config.adaptive and items_per_range == null) owned_tuner else null;
-        return self.thread_system.selectBatchProfile(tuner, .{
-            .item_count = item_count,
-            .items_per_range = items_per_range,
-            .max_worker_threads = self.config.max_worker_threads,
-            .range_alignment_items = range_alignment_items,
-            .adaptive = self.config.adaptive,
-        });
-    }
-
-    // False when the thread system has no workers or the config allows none, so every stage
-    // runs inline whatever its tuner learns.
-    fn mayUseWorkers(self: StageThreads) bool {
-        const workers = self.thread_system.workerThreadCount();
-        return @min(self.config.max_worker_threads orelse workers, workers) > 0;
-    }
-
-    fn dispatch(self: StageThreads, item_count: usize, context: *anyopaque, job: JobFn, selection: BatchSelection, range_alignment_items: usize) BatchStats {
-        return self.thread_system.parallelForWithOptions(item_count, context, job, .{
-            .items_per_range = selection.items_per_range,
-            .max_worker_threads = self.config.max_worker_threads,
-            .range_alignment_items = range_alignment_items,
-            .adaptive = self.config.adaptive,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
-    }
-};
-
-// `threads` when a stage there can get a worker, else null: the two-stage selection and
-// grid would only add main-thread passes over the serial ones.
-fn stageWithWorkers(threads: ?StageThreads) ?StageThreads {
-    const stage = threads orelse return null;
-    return if (stage.mayUseWorkers()) stage else null;
-}
 
 const SelectedWorkRow = struct {
     start_x: f32,
@@ -1140,8 +1097,6 @@ const PathDirection = struct {
     // agent correctly walking a detour around an obstacle is not flagged stuck.
     progress_distance: f32 = 0,
 };
-
-const SteeringWorkSelection = BatchSelection;
 
 // `agents`: one range of steering rows.
 const AgentsJob = struct {
@@ -2029,25 +1984,6 @@ fn accumulateAgentSample(
     ax.* += push.direction.x * strength;
     ay.* += push.direction.y * strength;
     sample_count.* += 1;
-}
-
-fn selectSteeringWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    config: SteeringConfig,
-    system: *SteeringSystem,
-) SteeringWorkSelection {
-    // Steering owns its tuner because avoidance cost differs from movement,
-    // pathfinding, and render-prep work even when item counts are similar. Shape is
-    // resolved through the single tuner-owned entry point so pre-sizing and dispatch
-    // agree exactly.
-    return thread_system.selectBatchProfile(config.adaptive_tuner orelse &system.adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = config.items_per_range,
-        .max_worker_threads = config.max_worker_threads,
-        .range_alignment_items = steering_range_alignment_items,
-        .adaptive = config.adaptive,
-    });
 }
 
 fn steeringAgentAt(slice: ConstSteeringAgentSlice, index: usize) SteeringAgentView {
@@ -3744,7 +3680,7 @@ test "steering banded agent grid gives every cell the same entries as one band" 
         try std.testing.expectEqual(layout == .one_cell, reference.ranges.items.len == 1);
 
         // Both stages inline in their ranges on the main thread.
-        const inline_selection = inline_ranges.select(&system.grid_bucket_tuner, system.agent_snapshot_rows.len, steering_range_alignment_items, null);
+        const inline_selection = inline_ranges.stage(&system.grid_bucket_tuner).select(system.agent_snapshot_rows.len, steering_range_alignment_items);
         system.buildAgentGridBanded(inline_ranges, inline_selection, chooseGridSplitters(system.agentSnapshotSliceConst(), system.spatial_cell_size), &stats);
         try std.testing.expect(stats.grid_bucket_batch.ran_inline and stats.grid_bucket_batch.range_count > 1);
         try std.testing.expect(stats.grid_sort_batch.ran_inline);
@@ -3759,7 +3695,7 @@ test "steering banded agent grid gives every cell the same entries as one band" 
         try expectGridMatches(&system, &reference);
 
         // Explicit splitter sets over the same bucket ranges.
-        const selection = threaded.select(&system.grid_bucket_tuner, system.agent_snapshot_rows.len, steering_range_alignment_items, null);
+        const selection = threaded.stage(&system.grid_bucket_tuner).select(system.agent_snapshot_rows.len, steering_range_alignment_items);
         for (std.meta.tags(GridTestSplitters)) |set| {
             system.buildAgentGridBanded(threaded, selection, gridTestSplitters(set, reference.ranges.items), &stats);
             try std.testing.expect(!stats.grid_bucket_batch.ran_inline);

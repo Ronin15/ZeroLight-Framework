@@ -22,7 +22,10 @@ const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTun
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const runShaped = @import("../../app/thread_system.zig").runShaped;
+const stageShape = @import("../../app/thread_system.zig").stageShape;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// End of a list or owner chain, and "no entry" from a lookup.
@@ -80,15 +83,6 @@ const SpliceRecordList = std.ArrayListAligned(SpliceRecord, .fromByteUnits(threa
 comptime {
     std.debug.assert(@sizeOf(SpliceRecord) * splice_range_alignment_items == thread_shared_record_alignment);
 }
-
-/// The splice stage's threading: a thread system and the stage's own tuner and range
-/// controls.
-pub const SpliceThreads = struct {
-    thread_system: *ThreadSystem,
-    tuner: *AdaptiveWorkTuner,
-    adaptive: bool,
-    items_per_range: ?usize,
-};
 
 pub const ChunkListMap = struct {
     /// Bytes one pooled entry takes: its key, owner, order, and three links, and its free
@@ -644,19 +638,14 @@ pub const ChunkListMap = struct {
     /// runs in the splice stage, threaded under `threads`; the main thread sizes
     /// the record windows and links, O(1) per key and per entry. Lists come out the same
     /// for any partition. Allocates nothing. Returns the splice stage's batch shape.
-    pub fn commitBatch(self: *ChunkListMap, threads: ?SpliceThreads) BatchStats {
+    pub fn commitBatch(self: *ChunkListMap, threads: ?Dispatch) BatchStats {
         std.debug.assert(self.in_batch);
         var batch = BatchStats{};
         const key_count = self.touched.items.len;
         if (key_count != 0) {
-            const selection = if (threads) |stage| stage.thread_system.selectBatchProfile(stage.tuner, .{
-                .item_count = key_count,
-                .items_per_range = stage.items_per_range,
-                .range_alignment_items = splice_range_alignment_items,
-                .adaptive = stage.adaptive,
-            }) else null;
             // Inline is one range over every key.
-            const range_size = if (selection) |selected| selected.items_per_range else key_count;
+            const shape = stageShape(threads, key_count, splice_range_alignment_items);
+            const range_size = shape.items_per_range;
             // Each range's window starts on a cache line.
             var record_count: usize = 0;
             for (self.touched.items, 0..) |*touched, index| {
@@ -669,29 +658,10 @@ pub const ChunkListMap = struct {
             var job = SpliceJob{
                 .map = self,
                 .items_per_range = range_size,
-                .range_count = (key_count + range_size - 1) / range_size,
+                .range_count = shape.range_count,
                 .records = self.splice_records.items,
             };
-            if (threads) |stage| {
-                const selected = selection.?;
-                batch = stage.thread_system.parallelForWithOptions(key_count, &job, spliceJob, .{
-                    .items_per_range = stage.items_per_range,
-                    .range_alignment_items = splice_range_alignment_items,
-                    .adaptive = stage.adaptive,
-                    .adaptive_tuner = selected.active_tuner,
-                    .selected_profile = selected.profile,
-                });
-            } else {
-                spliceJob(&job, .{ .start = 0, .end = key_count, .index = 0 }, WorkerId.main);
-                batch = .{
-                    .item_count = key_count,
-                    .range_count = 1,
-                    .items_per_range = key_count,
-                    .range_alignment_items = splice_range_alignment_items,
-                    .main_thread_ranges = 1,
-                    .ran_inline = true,
-                };
-            }
+            batch = runShaped(threads, shape, key_count, splice_range_alignment_items, &job, spliceJob);
             // Link in touched-key order, each key's records in order: each links after a
             // list entry or the record before it, already linked.
             for (self.touched.items) |touched| {
@@ -889,7 +859,7 @@ const keep_nothing = KeepKeys{ .keys = &.{} };
 
 // One batch: `removed` owners leave every list, then each (owner, key) of `inserts` joins
 // at order = owner. Reserves first.
-fn applyBatch(map: *ChunkListMap, removed: []const u32, inserts: []const [2]u64, owner_count: usize, threads: ?SpliceThreads) !BatchStats {
+fn applyBatch(map: *ChunkListMap, removed: []const u32, inserts: []const [2]u64, owner_count: usize, threads: ?Dispatch) !BatchStats {
     try map.reserve(inserts.len, inserts.len, owner_count);
     try map.reserveBatch(inserts.len, liveEntryCount(map));
     map.beginBatch();
@@ -1070,7 +1040,7 @@ test "a key emptied and refilled in one batch keeps one key; a key a batch empti
 }
 
 // Random batches over 64 keys: owners leave and join several keys each, out of order.
-fn randomBatches(map: *ChunkListMap, seed: u64, threads: ?SpliceThreads) !usize {
+fn randomBatches(map: *ChunkListMap, seed: u64, threads: ?Dispatch) !usize {
     const owner_count = 600;
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
@@ -1124,7 +1094,7 @@ test "reserve and reserveBatch, then a threaded batch, allocate nothing on a mul
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var tuner = AdaptiveWorkTuner.init(.{});
-    const splice: SpliceThreads = .{ .thread_system = &threads, .tuner = &tuner, .adaptive = false, .items_per_range = 8 };
+    const splice: Dispatch = .{ .thread_system = &threads, .tuner = &tuner, .adaptive = false, .items_per_range = 8 };
     var map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer map.deinit();
     // Owners 0..255 over 32 keys, listed in descending order so each staged insert lands
@@ -1182,7 +1152,7 @@ fn arrivalOwner(key_index: usize, order: u32) u32 {
 
 // Lists the listed orders in every arrival key, then stages each key's staged orders in its
 // claim order, as one batch.
-fn stageArrivalOrders(map: *ChunkListMap, threads: ?SpliceThreads) !BatchStats {
+fn stageArrivalOrders(map: *ChunkListMap, threads: ?Dispatch) !BatchStats {
     const owner_count = arrival_key_count * 128;
     try map.reserve(arrival_key_count, arrival_key_count * arrival_owners_per_key, owner_count);
     for (0..arrival_key_count) |key_index| {

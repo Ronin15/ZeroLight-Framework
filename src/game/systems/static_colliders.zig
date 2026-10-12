@@ -22,6 +22,8 @@ const logging = @import("../../core/logging.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
+const StageControls = @import("../../app/thread_system.zig").StageControls;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
@@ -30,7 +32,6 @@ const chunkKey = @import("chunk_list_map.zig").chunkKey;
 const no_entry = @import("chunk_list_map.zig").no_entry;
 const no_value = @import("chunk_list_map.zig").no_value;
 const max_chunk_size_tiles = @import("../world_system.zig").max_chunk_size_tiles;
-const SpliceThreads = @import("chunk_list_map.zig").SpliceThreads;
 
 const no_row: u32 = std.math.maxInt(u32);
 
@@ -511,8 +512,7 @@ pub const StaticColliderSystem = struct {
     // batch shapes.
     splice_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     query_splice_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    splice_adaptive: bool = true,
-    splice_items_per_range: ?usize = null,
+    splice_controls: StageControls = .{},
     last_splice_batch: BatchStats = .{},
     last_query_splice_batch: BatchStats = .{},
     // Column views refreshed whenever the row pool grows.
@@ -689,8 +689,7 @@ pub const StaticColliderSystem = struct {
         fresh.refreshQueryClassMask();
         fresh.splice_tuner = self.splice_tuner;
         fresh.query_splice_tuner = self.query_splice_tuner;
-        fresh.splice_adaptive = self.splice_adaptive;
-        fresh.splice_items_per_range = self.splice_items_per_range;
+        fresh.splice_controls = self.splice_controls;
         fresh.row_grows += self.row_grows;
         fresh.chunk_lists.grows += self.chunk_lists.grows;
         fresh.query_lists.grows += self.query_lists.grows;
@@ -1039,14 +1038,9 @@ pub const StaticColliderSystem = struct {
     }
 
     // A splice stage's threading under `thread_system`, with its own `tuner`.
-    fn spliceThreads(self: *const StaticColliderSystem, thread_system: ?*ThreadSystem, tuner: *AdaptiveWorkTuner) ?SpliceThreads {
+    fn spliceThreads(self: *const StaticColliderSystem, thread_system: ?*ThreadSystem, tuner: *AdaptiveWorkTuner) ?Dispatch {
         const threads = thread_system orelse return null;
-        return .{
-            .thread_system = threads,
-            .tuner = tuner,
-            .adaptive = self.splice_adaptive,
-            .items_per_range = self.splice_items_per_range,
-        };
+        return Dispatch.init(threads, tuner, self.splice_controls);
     }
 
     // `entity`'s placement when it is a live static navigation obstacle.
@@ -1509,8 +1503,7 @@ fn expectSyncOutOfMemorySafe(thread_system: ?*ThreadSystem) !void {
     while (true) : (fail_index += 1) {
         var fixture = try SeamFixture.init();
         defer fixture.deinit();
-        fixture.colliders.splice_adaptive = false;
-        fixture.colliders.splice_items_per_range = 8;
+        fixture.colliders.splice_controls = .{ .adaptive = false, .items_per_range = 8 };
         try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 40, .y = 40 }, .{ .x = 8, .y = 8 }) }});
         const moved = fixture.colliders.changesThisStep()[0].entity;
         var before = try fixture.rebuilt();
@@ -1668,8 +1661,7 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
     defer serial.deinit();
     var threaded = try SeamFixture.init();
     defer threaded.deinit();
-    threaded.colliders.splice_adaptive = false;
-    threaded.colliders.splice_items_per_range = 8;
+    threaded.colliders.splice_controls = .{ .adaptive = false, .items_per_range = 8 };
     var prng = std.Random.DefaultPrng.init(0xd5e5);
     const random = prng.random();
     var commands: std.ArrayList(StructuralCommand) = .empty;
@@ -1695,6 +1687,52 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
         if (!batch.ran_inline and batch.range_count > 1) threaded_ranges += 1;
         const query_batch = threaded.colliders.last_query_splice_batch;
         if (!query_batch.ran_inline and query_batch.range_count > 1) threaded_query_ranges += 1;
+    }
+    try std.testing.expect(threaded_ranges != 0);
+    try std.testing.expect(threaded_query_ranges != 0);
+}
+
+test "a splice worker cap of zero keeps both splice stages inline on a multi-worker ThreadSystem and lists the same chunks" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var uncapped = try SeamFixture.init();
+    defer uncapped.deinit();
+    var capped = try SeamFixture.init();
+    defer capped.deinit();
+    // A fixed partition that runs both splices on workers unless the cap holds them inline.
+    uncapped.colliders.splice_controls = .{ .adaptive = false, .items_per_range = 8 };
+    capped.colliders.splice_controls = .{ .adaptive = false, .items_per_range = 8, .max_worker_threads = 0 };
+    var prng = std.Random.DefaultPrng.init(0xd5e5);
+    const random = prng.random();
+    var commands: std.ArrayList(StructuralCommand) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    for (0..120) |_| try commands.append(std.testing.allocator, randomStatic(random));
+    try commitForTestWith(&uncapped.frame, &uncapped.data, &uncapped.colliders, commands.items, &threads);
+    try commitForTestWith(&capped.frame, &capped.data, &capped.colliders, commands.items, &threads);
+    var live: std.ArrayList(EntityId) = .empty;
+    defer live.deinit(std.testing.allocator);
+    var threaded_ranges: usize = 0;
+    var threaded_query_ranges: usize = 0;
+    for (0..10) |_| {
+        live.clearRetainingCapacity();
+        for (uncapped.data.movementBodySliceConst().entities) |entity| try live.append(std.testing.allocator, entity);
+        try denseMixedCommands(random, &uncapped.data, live.items, &commands);
+        try commitForTestWith(&uncapped.frame, &uncapped.data, &uncapped.colliders, commands.items, &threads);
+        try commitForTestWith(&capped.frame, &capped.data, &capped.colliders, commands.items, &threads);
+        try expectIdenticalLayout(&uncapped.colliders, &capped.colliders, 3);
+        for ([_][2]BatchStats{
+            .{ uncapped.colliders.last_splice_batch, capped.colliders.last_splice_batch },
+            .{ uncapped.colliders.last_query_splice_batch, capped.colliders.last_query_splice_batch },
+        }) |pair| {
+            try std.testing.expectEqual(pair[0].item_count, pair[1].item_count);
+            try std.testing.expect(pair[1].ran_inline and pair[1].active_worker_threads == 0);
+        }
+        const batch = uncapped.colliders.last_splice_batch;
+        if (!batch.ran_inline and batch.worker_thread_ranges != 0) threaded_ranges += 1;
+        const query_batch = uncapped.colliders.last_query_splice_batch;
+        if (!query_batch.ran_inline and query_batch.worker_thread_ranges != 0) threaded_query_ranges += 1;
     }
     try std.testing.expect(threaded_ranges != 0);
     try std.testing.expect(threaded_query_ranges != 0);
@@ -1799,8 +1837,7 @@ test "a threaded sync after its reserves allocates nothing on a multi-worker Thr
     defer threads.deinit();
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
-    fixture.colliders.splice_adaptive = false;
-    fixture.colliders.splice_items_per_range = 8;
+    fixture.colliders.splice_controls = .{ .adaptive = false, .items_per_range = 8 };
     // 48 one-cell statics over 48 chunks, each then moved one chunk over and back.
     var creates: [48]StructuralCommand = undefined;
     for (&creates, 0..) |*command, at| command.* = .{ .create_entity = staticTemplate(.{ .x = @floatFromInt((at % 12) * 128 + 4), .y = @floatFromInt((at / 12) * 128 + 4) }, .{ .x = 8, .y = 8 }) };
@@ -2326,8 +2363,7 @@ test "anchor blocks equal a rebuild after random incremental syncs, serial and t
     defer serial.deinit();
     var threaded = try SeamFixture.init();
     defer threaded.deinit();
-    threaded.colliders.splice_adaptive = false;
-    threaded.colliders.splice_items_per_range = 8;
+    threaded.colliders.splice_controls = .{ .adaptive = false, .items_per_range = 8 };
     const Step = struct {
         fn run(a: *SeamFixture, b: *SeamFixture, thread_system: *ThreadSystem, commands: []const StructuralCommand) !void {
             try commitForTest(&a.frame, &a.data, &a.colliders, commands);

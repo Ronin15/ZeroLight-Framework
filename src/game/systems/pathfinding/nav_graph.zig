@@ -23,10 +23,12 @@ const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWork
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
-const JobFn = @import("../../../app/thread_system.zig").JobFn;
-const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
-const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
+const StageControls = @import("../../../app/thread_system.zig").StageControls;
 const accumulateBatch = @import("../../../app/thread_system.zig").accumulateBatch;
+const runShaped = @import("../../../app/thread_system.zig").runShaped;
+const stageShape = @import("../../../app/thread_system.zig").stageShape;
+const runStage = @import("../../../app/thread_system.zig").runStage;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
@@ -490,19 +492,10 @@ pub const NavLevelGraph = struct {
 // holds no cell block yet.
 const claim_pending: u32 = no_block - 1;
 
-/// Threading for one batch stage: the shared thread system plus that stage's own tuner.
-/// `adaptive`/`items_per_range` let a bench pin a fixed partition.
-pub const NavStageThreads = struct {
-    thread_system: *ThreadSystem,
-    tuner: *AdaptiveWorkTuner,
-    adaptive: bool = true,
-    items_per_range: ?usize = null,
-};
-
 /// Threading for nav batches: the shared thread system plus one tuner per stage (key
 /// plan, remask and component flood, record patch, connectivity seed, gather, and flood, and
-/// the one-way closure's candidates, resolve, mask, plan, rows, and compaction).
-/// Absent: every stage runs inline.
+/// the one-way closure's candidates, resolve, mask, plan, rows, and compaction), all under
+/// one set of range controls. Absent: every stage runs inline.
 pub const NavUpdateThreads = struct {
     thread_system: *ThreadSystem,
     plan_tuner: *AdaptiveWorkTuner,
@@ -517,45 +510,34 @@ pub const NavUpdateThreads = struct {
     conn_closure_plan_tuner: *AdaptiveWorkTuner,
     conn_closure_rows_tuner: *AdaptiveWorkTuner,
     conn_closure_compact_tuner: *AdaptiveWorkTuner,
-    adaptive: bool = true,
-    items_per_range: ?usize = null,
+    controls: StageControls = .{},
 
-    fn stage(self: NavUpdateThreads, tuner: *AdaptiveWorkTuner) NavStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
-    }
-
-    fn plan(self: NavUpdateThreads) NavStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = self.plan_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
-    }
-    fn remask(self: NavUpdateThreads) NavStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = self.remask_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
-    }
-    fn patch(self: NavUpdateThreads) NavStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = self.patch_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
+    fn stage(self: NavUpdateThreads, tuner: *AdaptiveWorkTuner) Dispatch {
+        return Dispatch.init(self.thread_system, tuner, self.controls);
     }
 };
 
-fn planThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
-    return if (threads) |t| t.plan() else null;
+fn planThreads(threads: ?NavUpdateThreads) ?Dispatch {
+    return if (threads) |t| t.stage(t.plan_tuner) else null;
 }
 
-fn remaskThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
-    return if (threads) |t| t.remask() else null;
+fn remaskThreads(threads: ?NavUpdateThreads) ?Dispatch {
+    return if (threads) |t| t.stage(t.remask_tuner) else null;
 }
 
-fn patchThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
-    return if (threads) |t| t.patch() else null;
+fn patchThreads(threads: ?NavUpdateThreads) ?Dispatch {
+    return if (threads) |t| t.stage(t.patch_tuner) else null;
 }
 
-fn connSeedThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
+fn connSeedThreads(threads: ?NavUpdateThreads) ?Dispatch {
     return if (threads) |t| t.stage(t.conn_seed_tuner) else null;
 }
 
-fn connGatherThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
+fn connGatherThreads(threads: ?NavUpdateThreads) ?Dispatch {
     return if (threads) |t| t.stage(t.conn_gather_tuner) else null;
 }
 
-fn connFloodThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
+fn connFloodThreads(threads: ?NavUpdateThreads) ?Dispatch {
     return if (threads) |t| t.stage(t.conn_flood_tuner) else null;
 }
 
@@ -931,124 +913,6 @@ fn patchJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         job.graph.patchRecord(job.levels.grid(level), job.levels.graph(level), job.world, level, keyChunk(key), info.endpoints);
     }
 }
-
-// Dispatch time of a batch that ran on workers; zero when it ran inline.
-fn offMainNs(batch: BatchStats) u64 {
-    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
-}
-
-/// Runs one stage over `item_count` items: through the stage's tuner when threaded, else
-/// inline as one range on the main thread. `range_count` is the job's dispatched range
-/// count, set before dispatch so each range can assert against it.
-pub fn runStage(threads: ?NavStageThreads, item_count: usize, context: *anyopaque, range_count: *usize, job: JobFn) BatchStats {
-    if (item_count == 0) return .{};
-    if (threads) |stage| {
-        const selection = stage.thread_system.selectBatchProfile(stage.tuner, .{
-            .item_count = item_count,
-            .items_per_range = stage.items_per_range,
-            .range_alignment_items = 1,
-            .adaptive = stage.adaptive,
-        });
-        range_count.* = selection.range_count;
-        return stage.thread_system.parallelForWithOptions(item_count, context, job, .{
-            .adaptive = stage.adaptive,
-            .adaptive_tuner = selection.active_tuner,
-            .items_per_range = stage.items_per_range,
-            .range_alignment_items = 1,
-            .selected_profile = selection.profile,
-        });
-    }
-    range_count.* = 1;
-    // No thread system times the batch, so it is timed here.
-    const stage_timer = StageTimer.begin();
-    job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-    var batch = inlineBatch(item_count, 1);
-    batch.batch_duration_ns = stage_timer.lap();
-    return batch;
-}
-
-/// One stage step dispatched as rounds under one thread profile: `begin` selects it once
-/// from the step's item count through the stage's tuner, `run` dispatches every round with it
-/// (no per-round tuner record; a round of one range runs inline), and `finish` records the
-/// summed rounds into the tuner once, at the step's item count and the selected profile, so
-/// the tuner judges one sample per step. With no threads each round runs inline as one range.
-pub const RoundDispatch = struct {
-    threads: ?NavStageThreads,
-    selection: ?BatchSelection = null,
-    // The rounds folded into one.
-    total: BatchStats = .{},
-    /// Dispatch time of the rounds that ran on workers, and of those that ran inline.
-    off_main_ns: u64 = 0,
-    inline_ns: u64 = 0,
-    /// The fewest and most items a round dispatched (both zero with no round).
-    round_items_min: usize = 0,
-    round_items_max: usize = 0,
-
-    pub fn begin(threads: ?NavStageThreads, step_items: usize) RoundDispatch {
-        var dispatch = RoundDispatch{ .threads = threads };
-        if (threads) |stage| {
-            dispatch.selection = stage.thread_system.selectBatchProfile(stage.tuner, .{
-                .item_count = @max(step_items, 1),
-                .items_per_range = stage.items_per_range,
-                .range_alignment_items = 1,
-                .adaptive = stage.adaptive,
-            });
-        }
-        return dispatch;
-    }
-
-    /// Runs one round of `item_count` items. `range_count` is the job's dispatched range
-    /// count, set before dispatch so each range can assert against it.
-    pub fn run(self: *RoundDispatch, item_count: usize, context: *anyopaque, range_count: *usize, job: JobFn) void {
-        std.debug.assert(item_count != 0);
-        self.round_items_min = if (self.round_items_max == 0) item_count else @min(self.round_items_min, item_count);
-        self.round_items_max = @max(self.round_items_max, item_count);
-        const batch = if (self.selection) |selection| blk: {
-            const stage = self.threads.?;
-            const per_range = @max(selection.profile.items_per_range, 1);
-            range_count.* = (item_count + per_range - 1) / per_range;
-            break :blk stage.thread_system.parallelForWithOptions(item_count, context, job, .{
-                .adaptive = stage.adaptive,
-                .adaptive_tuner = null,
-                .items_per_range = stage.items_per_range,
-                .range_alignment_items = 1,
-                .selected_profile = selection.profile,
-            });
-        } else blk: {
-            range_count.* = 1;
-            // No thread system times the round, so it is timed here.
-            const round_timer = StageTimer.begin();
-            job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-            var round = inlineBatch(item_count, 1);
-            round.batch_duration_ns = round_timer.lap();
-            break :blk round;
-        };
-        std.debug.assert(batch.range_count == range_count.*);
-        self.off_main_ns += offMainNs(batch);
-        if (batch.ran_inline) self.inline_ns += batch.batch_duration_ns;
-        accumulateBatch(&self.total, batch);
-    }
-
-    /// Records the step into the stage's tuner once and returns the rounds folded into one.
-    pub fn finish(self: *RoundDispatch, step_items: usize) BatchStats {
-        const selection = self.selection orelse return self.total;
-        const tuner = selection.active_tuner orelse return self.total;
-        tuner.record(.{
-            .item_count = @max(step_items, 1),
-            .range_count = self.total.range_count,
-            .items_per_range = selection.profile.items_per_range,
-            .range_alignment_items = 1,
-            .available_worker_threads = self.total.available_worker_threads,
-            .active_worker_threads = selection.profile.worker_threads,
-            .main_thread_ranges = self.total.main_thread_ranges,
-            .worker_thread_ranges = self.total.worker_thread_ranges,
-            .batch_duration_ns = self.total.batch_duration_ns,
-            .main_thread_wait_ns = self.total.main_thread_wait_ns,
-            .ran_inline = selection.profile.worker_threads == 0,
-        });
-        return self.total;
-    }
-};
 
 // Folds one batch's connectivity counters and stage shapes into `stats`: level builds and the
 // marks batch sum.
@@ -2234,21 +2098,13 @@ pub const NavGraph = struct {
     // its own key windows; the main thread sizes the windows (O(1) per item) and merges them
     // through the plan order set (`mergePlanWindows`). Inline it is one range: one sort and
     // no merge.
-    fn planKeys(self: *NavGraph, world: *const WorldSystem, marks: []const NavMark, new_links: []const LevelLink, threads: ?NavStageThreads, stats: *NavUpdateStats) !void {
+    fn planKeys(self: *NavGraph, world: *const WorldSystem, marks: []const NavMark, new_links: []const LevelLink, threads: ?Dispatch, stats: *NavUpdateStats) !void {
         const item_count = marks.len + new_links.len;
         for (std.meta.tags(PlanStream)) |stream| self.keyList(stream).clearRetainingCapacity();
         self.last_plan_batch = .{};
         if (item_count == 0) return;
         var section = StageTimer.begin();
-        const selection: BatchSelectionShape = if (threads) |stage| blk: {
-            const selected = stage.thread_system.selectBatchProfile(stage.tuner, .{
-                .item_count = item_count,
-                .items_per_range = stage.items_per_range,
-                .range_alignment_items = 1,
-                .adaptive = stage.adaptive,
-            });
-            break :blk .{ .range_count = selected.range_count, .items_per_range = selected.items_per_range, .selection = selected };
-        } else .{ .range_count = 1, .items_per_range = item_count, .selection = null };
+        const selection = stageShape(threads, item_count, 1);
 
         // Windows: each range's key bounds, starting on a cache line.
         self.staging_window.note(.ranges, selection.range_count);
@@ -2283,21 +2139,7 @@ pub const NavGraph = struct {
             .tallies = self.plan_tallies.items,
         };
         stats.main.plan_ns += section.lap();
-        if (threads) |stage| {
-            const selected = selection.selection.?;
-            self.last_plan_batch = stage.thread_system.parallelForWithOptions(item_count, &job, planJob, .{
-                .adaptive = stage.adaptive,
-                .adaptive_tuner = selected.active_tuner,
-                .items_per_range = stage.items_per_range,
-                .range_alignment_items = 1,
-                .selected_profile = selected.profile,
-            });
-        } else {
-            const stage_timer = StageTimer.begin();
-            planJob(&job, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-            self.last_plan_batch = inlineBatch(item_count, 1);
-            self.last_plan_batch.batch_duration_ns = stage_timer.lap();
-        }
+        self.last_plan_batch = runShaped(threads, selection, item_count, 1, &job, planJob);
         stats.addStageTime(self.last_plan_batch);
 
         section = StageTimer.begin();
@@ -2318,12 +2160,6 @@ pub const NavGraph = struct {
             .patch => &self.patch_keys,
         };
     }
-
-    const BatchSelectionShape = struct {
-        range_count: usize,
-        items_per_range: usize,
-        selection: ?BatchSelection,
-    };
 
     // Merges the plan ranges' sorted unique windows into each stream's sorted unique key list:
     // each patch key queues its chunk in its level's ordered set (and the level in
@@ -2519,7 +2355,7 @@ pub const NavGraph = struct {
     // Claims the planned block slots in key order and seeds each key's delta with its
     // chunk's old blocked count; then remasks every changed key (threaded over keys) and,
     // in key order, releases the slots whose chunk ended uniform and applies the deltas.
-    fn remaskKeys(self: *NavGraph, levels: BatchLevels, colliders: ColliderView, world: ?*const WorldSystem, masks: ?[]ChunkBits, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
+    fn remaskKeys(self: *NavGraph, levels: BatchLevels, colliders: ColliderView, world: ?*const WorldSystem, masks: ?[]ChunkBits, threads: ?Dispatch, stats: *NavUpdateStats) void {
         const keys = self.changed_keys.items;
         std.debug.assert(self.remask_deltas.items.len == keys.len and self.remask_slots.items.len == keys.len);
         var section = StageTimer.begin();
@@ -2539,7 +2375,7 @@ pub const NavGraph = struct {
             .masks = masks,
         };
         stats.main.commit_ns += section.lap();
-        self.last_remask_batch = runStage(threads, keys.len, &job, &job.range_count, remaskJob);
+        self.last_remask_batch = runStage(threads, keys.len, 1, &job, &job.range_count, remaskJob);
         stats.addStageTime(self.last_remask_batch);
         section = StageTimer.begin();
         for (keys, self.remask_slots.items, self.remask_deltas.items) |key, slot, delta| {
@@ -2567,9 +2403,9 @@ pub const NavGraph = struct {
         }
     }
 
-    fn patchKeys(self: *NavGraph, levels: BatchLevels, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
+    fn patchKeys(self: *NavGraph, levels: BatchLevels, world: ?*const WorldSystem, threads: ?Dispatch, stats: *NavUpdateStats) void {
         var job = PatchJob{ .graph = self, .levels = levels, .world = world, .keys = self.patch_keys.items, .infos = self.patch_info.items };
-        self.last_patch_batch = runStage(threads, self.patch_keys.items.len, &job, &job.range_count, patchJob);
+        self.last_patch_batch = runStage(threads, self.patch_keys.items.len, 1, &job, &job.range_count, patchJob);
         stats.addStageTime(self.last_patch_batch);
     }
 
@@ -2938,8 +2774,7 @@ test "threaded initial nav build matches a serial build across levels" {
     var threaded = PathfindingSystem.init(std.testing.allocator);
     defer threaded.deinit();
     try threaded.reserve(cap);
-    threaded.nav_thread_adaptive = false;
-    threaded.nav_thread_items_per_range = 1;
+    threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try threaded.rebuildStaticNavGridWithWorld(&data, &world, &threads);
     try std.testing.expect(!threaded.graph.last_remask_batch.ran_inline);
     try std.testing.expect(!threaded.graph.last_patch_batch.ran_inline);
@@ -3334,8 +3169,7 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
     try system.reserve(cap);
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
     // Force the parallel schedule rather than letting the tuner keep the small batch inline.
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
 
     // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk set
     // and the patch dirty set exceed one chunk and actually fan out.
@@ -3689,8 +3523,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild 
     const obstacle = try nav.world.addDenseLayer(0, 0, .obstacle, grass);
     // The layer add moved level 0's content revision: settle it before the batch.
     _ = try nav.system.applyBufferedNavUpdates(&nav.colliders, &nav.world, null);
-    nav.system.nav_thread_adaptive = false;
-    nav.system.nav_thread_items_per_range = 1;
+    nav.system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
 
     const entity = nav.data.movementBodySliceConst().entities[0];
     try test_support.commitWithColliders(&nav.frame, &nav.data, &nav.colliders, &nav.system, &.{.{ .destroy_entity = entity }});
@@ -3766,8 +3599,7 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     try system.rebuildNavFromColliders(&colliders, PathfindingSystem.worldNavExtent(&world), null);
     // Force the parallel schedule rather than letting the tuner keep the small batch inline,
     // so the proof exercises the workers.
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
 
     // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
     // set and the patch dirty set exceed one chunk and actually fan out to workers.
@@ -4296,8 +4128,7 @@ fn expectNavApplyOutOfMemorySafe(edit: OomEdit, thread_system: ?*ThreadSystem) !
         defer world.deinit();
         var system = try fullRebuild(&data, &world, capacity);
         defer system.deinit();
-        system.nav_thread_adaptive = false;
-        system.nav_thread_items_per_range = 1;
+        system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
         var colliders = try test_support.worldColliders(&data, &world);
         defer colliders.deinit();
         var before = try fullRebuild(&data, &world, capacity);
@@ -5087,8 +4918,7 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
     defer for (systems[0..built]) |*system| system.deinit();
     for (partitions) |items_per_range| {
         systems[built] = try fullRebuild(&data, &fixture.world, capacity);
-        systems[built].nav_thread_adaptive = false;
-        systems[built].nav_thread_items_per_range = items_per_range;
+        systems[built].nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
         built += 1;
     }
 
@@ -5302,8 +5132,7 @@ test "the threaded key plan equals the inline plan on 65 levels across the plan 
         defer for (systems[0..built]) |*system| system.deinit();
         for (partitions) |items_per_range| {
             systems[built] = try fullRebuild(&data, &world, capacity);
-            systems[built].nav_thread_adaptive = false;
-            systems[built].nav_thread_items_per_range = items_per_range;
+            systems[built].nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
             built += 1;
         }
         try world.addLevelLink(.{ .kind = .ramp, .level_a = shape.link_levels[0], .cell_a = .{ .x = 3, .y = 3 }, .level_b = shape.link_levels[1], .cell_b = .{ .x = 3, .y = 3 }, .traversal_cost = 1, .bidirectional = true });
@@ -5357,8 +5186,7 @@ test "a threaded plan, a level replace, a level append, and a world rebuild each
     capacity.worker_participant_count = threads.participantSlotCount();
     var system = try fullRebuild(&data, &fixture.world, capacity);
     defer system.deinit();
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try expectPlanSetsClear(&system.graph);
 
     // A multi-range plan over both levels.

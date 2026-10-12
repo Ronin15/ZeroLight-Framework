@@ -10,6 +10,7 @@
 const std = @import("std");
 const logging = @import("../core/logging.zig");
 const diagnostics_enabled = @import("runtime_perf_log.zig").enabled;
+const StageTimer = @import("runtime_perf_log.zig").StageTimer;
 const log = logging.app;
 
 pub const WorkerId = struct {
@@ -1352,6 +1353,215 @@ pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
     total.ran_inline = total.ran_inline and batch.ran_inline;
 }
 
+/// A stage's range controls. A fixed `items_per_range` opts the stage out of its tuner;
+/// `max_worker_threads` caps participation; `adaptive = false` pins the fixed shape.
+pub const StageControls = struct {
+    items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    adaptive: bool = true,
+};
+
+/// One stage's threading: the thread system, the stage's own tuner, and its range
+/// controls. `select` pre-sizes the batch; `run` dispatches that selection, so the tuner
+/// records exactly the profile it chose.
+pub const Dispatch = struct {
+    thread_system: *ThreadSystem,
+    tuner: *AdaptiveWorkTuner,
+    items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    adaptive: bool = true,
+
+    pub fn init(thread_system: *ThreadSystem, tuner: *AdaptiveWorkTuner, controls: StageControls) Dispatch {
+        return .{
+            .thread_system = thread_system,
+            .tuner = tuner,
+            .items_per_range = controls.items_per_range,
+            .max_worker_threads = controls.max_worker_threads,
+            .adaptive = controls.adaptive,
+        };
+    }
+
+    /// The batch shape of `item_count` items; the tuner drives an adaptive dispatch with
+    /// no fixed range size.
+    pub fn select(self: Dispatch, item_count: usize, range_alignment_items: usize) BatchSelection {
+        const tuner: ?*AdaptiveWorkTuner = if (self.adaptive and self.items_per_range == null) self.tuner else null;
+        return self.thread_system.selectBatchProfile(tuner, .{
+            .item_count = item_count,
+            .items_per_range = self.items_per_range,
+            .max_worker_threads = self.max_worker_threads,
+            .range_alignment_items = range_alignment_items,
+            .adaptive = self.adaptive,
+        });
+    }
+
+    /// Dispatches `item_count` items at `selection`, recording into its active tuner.
+    pub fn run(self: Dispatch, selection: BatchSelection, item_count: usize, range_alignment_items: usize, context: *anyopaque, job: JobFn) BatchStats {
+        return self.thread_system.parallelForWithOptions(item_count, context, job, .{
+            .items_per_range = self.items_per_range,
+            .max_worker_threads = self.max_worker_threads,
+            .range_alignment_items = range_alignment_items,
+            .adaptive = self.adaptive,
+            .adaptive_tuner = selection.active_tuner,
+            .selected_profile = selection.profile,
+        });
+    }
+};
+
+/// Threading for one update's stages: the thread system and the caller's control config,
+/// whose `items_per_range`, `max_worker_threads`, and `adaptive` every stage shares.
+pub fn StageThreads(comptime Config: type) type {
+    return struct {
+        const Self = @This();
+
+        thread_system: *ThreadSystem,
+        config: Config,
+
+        /// One stage under its own tuner and the config's controls.
+        pub fn stage(self: Self, tuner: *AdaptiveWorkTuner) Dispatch {
+            return Dispatch.init(self.thread_system, tuner, .{
+                .items_per_range = self.config.items_per_range,
+                .max_worker_threads = self.config.max_worker_threads,
+                .adaptive = self.config.adaptive,
+            });
+        }
+
+        // False when the thread system has no workers or the config allows none, so every
+        // stage runs inline whatever its tuner learns.
+        fn mayUseWorkers(self: Self) bool {
+            const workers = self.thread_system.workerThreadCount();
+            return @min(self.config.max_worker_threads orelse workers, workers) > 0;
+        }
+
+        /// `threads` when a stage there can get a worker, else null.
+        pub fn withWorkers(threads: ?Self) ?Self {
+            const held = threads orelse return null;
+            return if (held.mayUseWorkers()) held else null;
+        }
+    };
+}
+
+/// The shape a stage runs at: a dispatch's pre-selected profile, or one inline range.
+pub const StageShape = struct {
+    selection: ?BatchSelection = null,
+    items_per_range: usize = 1,
+    range_count: usize = 0,
+};
+
+/// Selects `item_count` items' shape under `dispatch`, or one inline range without one.
+pub fn stageShape(dispatch: ?Dispatch, item_count: usize, range_alignment_items: usize) StageShape {
+    const stage = dispatch orelse return .{ .items_per_range = @max(item_count, 1), .range_count = @intFromBool(item_count != 0) };
+    const selection = stage.select(item_count, range_alignment_items);
+    return .{ .selection = selection, .items_per_range = selection.items_per_range, .range_count = selection.range_count };
+}
+
+/// Runs `job` over `item_count` items at `shape`: dispatched with its selection, or inline
+/// as one timed range on the calling thread.
+pub fn runShaped(dispatch: ?Dispatch, shape: StageShape, item_count: usize, range_alignment_items: usize, context: *anyopaque, job: JobFn) BatchStats {
+    if (item_count == 0) return .{};
+    const stage = dispatch orelse {
+        // No thread system times the batch, so it is timed here.
+        const stage_timer = StageTimer.begin();
+        job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
+        var batch = inlineBatch(item_count, range_alignment_items);
+        batch.batch_duration_ns = stage_timer.lap();
+        return batch;
+    };
+    // A shape selected under a dispatch holds its selection.
+    return stage.run(shape.selection.?, item_count, range_alignment_items, context, job);
+}
+
+/// Runs one stage over `item_count` items under `dispatch`, or inline as one range.
+/// `range_count` receives the job's dispatched range count before dispatch, so each range
+/// can assert against it; an empty batch selects nothing and leaves it untouched.
+pub fn runStage(dispatch: ?Dispatch, item_count: usize, range_alignment_items: usize, context: *anyopaque, range_count: *usize, job: JobFn) BatchStats {
+    if (item_count == 0) return .{};
+    const shape = stageShape(dispatch, item_count, range_alignment_items);
+    range_count.* = shape.range_count;
+    return runShaped(dispatch, shape, item_count, range_alignment_items, context, job);
+}
+
+/// Dispatch time of a batch that ran on workers; zero when it ran inline.
+pub fn offMainNs(batch: BatchStats) u64 {
+    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
+}
+
+/// One stage step dispatched as rounds under one thread profile: `begin` selects it once
+/// from the step's item count through the stage's tuner, `run` dispatches every round with it
+/// (no per-round tuner record; a round of one range runs inline), and `finish` records the
+/// summed rounds into the tuner once, at the step's item count and the selected profile, so
+/// the tuner judges one sample per step. With no dispatch each round runs inline as one range.
+/// Rounds use range alignment 1.
+pub const RoundDispatch = struct {
+    dispatch: ?Dispatch,
+    selection: ?BatchSelection = null,
+    // The rounds folded into one.
+    total: BatchStats = .{},
+    /// Dispatch time of the rounds that ran on workers, and of those that ran inline.
+    off_main_ns: u64 = 0,
+    inline_ns: u64 = 0,
+    /// The fewest and most items a round dispatched (both zero with no round).
+    round_items_min: usize = 0,
+    round_items_max: usize = 0,
+
+    pub fn begin(dispatch: ?Dispatch, step_items: usize) RoundDispatch {
+        var rounds = RoundDispatch{ .dispatch = dispatch };
+        if (dispatch) |stage| rounds.selection = stage.select(@max(step_items, 1), 1);
+        return rounds;
+    }
+
+    /// Runs one round of `item_count` items. `range_count` is the job's dispatched range
+    /// count, set before dispatch so each range can assert against it.
+    pub fn run(self: *RoundDispatch, item_count: usize, context: *anyopaque, range_count: *usize, job: JobFn) void {
+        std.debug.assert(item_count != 0);
+        self.round_items_min = if (self.round_items_max == 0) item_count else @min(self.round_items_min, item_count);
+        self.round_items_max = @max(self.round_items_max, item_count);
+        const batch = if (self.selection) |selection| blk: {
+            const stage = self.dispatch.?;
+            range_count.* = rangeCount(item_count, @max(selection.profile.items_per_range, 1));
+            break :blk stage.thread_system.parallelForWithOptions(item_count, context, job, .{
+                .adaptive = stage.adaptive,
+                .adaptive_tuner = null,
+                .items_per_range = stage.items_per_range,
+                .max_worker_threads = stage.max_worker_threads,
+                .range_alignment_items = 1,
+                .selected_profile = selection.profile,
+            });
+        } else blk: {
+            range_count.* = 1;
+            // No thread system times the round, so it is timed here.
+            const round_timer = StageTimer.begin();
+            job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
+            var round = inlineBatch(item_count, 1);
+            round.batch_duration_ns = round_timer.lap();
+            break :blk round;
+        };
+        std.debug.assert(batch.range_count == range_count.*);
+        self.off_main_ns += offMainNs(batch);
+        if (batch.ran_inline) self.inline_ns += batch.batch_duration_ns;
+        accumulateBatch(&self.total, batch);
+    }
+
+    /// Records the step into the stage's tuner once and returns the rounds folded into one.
+    pub fn finish(self: *RoundDispatch, step_items: usize) BatchStats {
+        const selection = self.selection orelse return self.total;
+        const tuner = selection.active_tuner orelse return self.total;
+        tuner.record(.{
+            .item_count = @max(step_items, 1),
+            .range_count = self.total.range_count,
+            .items_per_range = selection.profile.items_per_range,
+            .range_alignment_items = 1,
+            .available_worker_threads = self.total.available_worker_threads,
+            .active_worker_threads = selection.profile.worker_threads,
+            .main_thread_ranges = self.total.main_thread_ranges,
+            .worker_thread_ranges = self.total.worker_thread_ranges,
+            .batch_duration_ns = self.total.batch_duration_ns,
+            .main_thread_wait_ns = self.total.main_thread_wait_ns,
+            .ran_inline = selection.profile.worker_threads == 0,
+        });
+        return self.total;
+    }
+};
+
 const BatchShape = struct {
     items_per_range: usize,
     worker_threads: usize,
@@ -2047,6 +2257,127 @@ test "band tuner config starts at, and never shrinks below, one band per range" 
     const tuner = AdaptiveWorkTuner.init(band_tuner_config);
     try std.testing.expectEqual(@as(usize, 1), tuner.initial_profile.items_per_range);
     try std.testing.expectEqual(@as(usize, 1), tuner.config.smallest_range_items);
+}
+
+// A stage job that counts its items and ranges and checks its range index against the
+// range count written before dispatch.
+const StageTestContext = struct {
+    range_count: usize = 0,
+    items: std.atomic.Value(usize) = .init(0),
+    ranges: std.atomic.Value(usize) = .init(0),
+};
+
+fn stageTestJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const stage: *StageTestContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < stage.range_count);
+    _ = stage.items.fetchAdd(range.len(), .monotonic);
+    _ = stage.ranges.fetchAdd(1, .monotonic);
+}
+
+test "run stage with no items selects nothing and leaves the range count untouched" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var tuner = AdaptiveWorkTuner.init(.{});
+    var context = StageTestContext{ .range_count = 77 };
+    const batch = runStage(Dispatch.init(&threads, &tuner, .{}), 0, 1, &context, &context.range_count, stageTestJob);
+    try std.testing.expectEqual(BatchStats{}, batch);
+    try std.testing.expectEqual(@as(usize, 77), context.range_count);
+    try std.testing.expect(tuner.last_request == null);
+    try std.testing.expectEqual(@as(usize, 0), context.ranges.load(.monotonic));
+}
+
+test "run stage with no dispatch runs one inline range on the calling thread" {
+    var context = StageTestContext{};
+    const batch = runStage(null, 10, 4, &context, &context.range_count, stageTestJob);
+    try std.testing.expectEqual(@as(usize, 1), context.range_count);
+    try std.testing.expectEqual(@as(usize, 1), context.ranges.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 10), context.items.load(.monotonic));
+    try std.testing.expect(batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 10), batch.item_count);
+    try std.testing.expectEqual(@as(usize, 1), batch.range_count);
+    try std.testing.expectEqual(@as(usize, 1), batch.main_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 4), batch.range_alignment_items);
+}
+
+test "run stage on workers writes the dispatched range count before dispatch" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var tuner = AdaptiveWorkTuner.init(.{});
+    var context = StageTestContext{};
+    const batch = runStage(Dispatch.init(&threads, &tuner, .{ .items_per_range = 4, .adaptive = false }), 64, 1, &context, &context.range_count, stageTestJob);
+    try std.testing.expectEqual(@as(usize, 16), context.range_count);
+    try std.testing.expectEqual(context.range_count, batch.range_count);
+    try std.testing.expectEqual(context.range_count, context.ranges.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 64), context.items.load(.monotonic));
+    try std.testing.expect(!batch.ran_inline);
+    try std.testing.expect(batch.worker_thread_ranges > 0);
+}
+
+test "a dispatch worker cap of zero runs inline with workers present, and a cap of one uses one worker" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var tuner = AdaptiveWorkTuner.init(.{});
+    for ([_]usize{ 0, 1 }) |cap| {
+        const dispatch = Dispatch.init(&threads, &tuner, .{ .items_per_range = 4, .max_worker_threads = cap, .adaptive = false });
+        var context = StageTestContext{};
+        const batch = runStage(dispatch, 64, 1, &context, &context.range_count, stageTestJob);
+        try std.testing.expectEqual(@as(usize, 64), context.items.load(.monotonic));
+        try std.testing.expectEqual(cap, batch.active_worker_threads);
+        try std.testing.expectEqual(cap == 0, batch.ran_inline);
+
+        var rounds = RoundDispatch.begin(dispatch, 64);
+        var round_context = StageTestContext{};
+        rounds.run(64, &round_context, &round_context.range_count, stageTestJob);
+        const total = rounds.finish(64);
+        try std.testing.expectEqual(cap, total.active_worker_threads);
+        try std.testing.expectEqual(cap == 0, total.ran_inline);
+    }
+}
+
+test "round dispatch records one tuner sample per step, and folds inline rounds with no dispatch" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    const round_items = [_]usize{ 10, 12, 8 };
+    for ([_]bool{ true, false }) |dispatched| {
+        var tuner = AdaptiveWorkTuner.init(.{});
+        var rounds = RoundDispatch.begin(if (dispatched) Dispatch.init(&threads, &tuner, .{}) else null, 30);
+        var context = StageTestContext{};
+        for (round_items) |item_count| rounds.run(item_count, &context, &context.range_count, stageTestJob);
+        try std.testing.expectEqual(@as(usize, 0), tuner.sample_count);
+        const total = rounds.finish(30);
+        try std.testing.expectEqual(@as(usize, 30), context.items.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 30), total.item_count);
+        try std.testing.expectEqual(@as(usize, 3), total.range_count);
+        try std.testing.expectEqual(@as(usize, 3), total.main_thread_ranges);
+        try std.testing.expect(total.ran_inline);
+        try std.testing.expectEqual(@as(usize, 8), rounds.round_items_min);
+        try std.testing.expectEqual(@as(usize, 12), rounds.round_items_max);
+        const expected_samples: usize = if (dispatched) @intFromBool(total.batch_duration_ns != 0) else 0;
+        try std.testing.expectEqual(expected_samples, tuner.sample_count);
+    }
+}
+
+test "stage threads with workers is null with no worker or a zero worker cap" {
+    const Config = struct { items_per_range: ?usize = null, max_worker_threads: ?usize = null, adaptive: bool = true };
+    const Threads = StageThreads(Config);
+    try std.testing.expect(Threads.withWorkers(null) == null);
+    var serial = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial.deinit();
+    try std.testing.expect(Threads.withWorkers(.{ .thread_system = &serial, .config = .{} }) == null);
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    try std.testing.expect(Threads.withWorkers(.{ .thread_system = &threads, .config = .{ .max_worker_threads = 0 } }) == null);
+    const held = Threads.withWorkers(.{ .thread_system = &threads, .config = .{ .items_per_range = 8, .max_worker_threads = 1, .adaptive = false } }).?;
+    var tuner = AdaptiveWorkTuner.init(.{});
+    const stage = held.stage(&tuner);
+    try std.testing.expectEqual(@as(?usize, 8), stage.items_per_range);
+    try std.testing.expectEqual(@as(?usize, 1), stage.max_worker_threads);
+    try std.testing.expect(!stage.adaptive and stage.tuner == &tuner);
 }
 
 test "adaptive work tuner aligns and clamps selected items_per_range" {

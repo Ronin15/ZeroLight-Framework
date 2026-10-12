@@ -54,6 +54,7 @@ const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
@@ -426,8 +427,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     }
     // Drive the threaded stages with this case's control config: adaptive cases let the tuner
     // size ranges; fixed control cases pin a fixed partition so the tuner is measured against them.
-    fixture.system.nav_thread_adaptive = case.adaptive;
-    fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
+    fixture.system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = benchmarkItemsPerRange(case) };
 
     // Warm so the abstract buffers are at high-water capacity (the steady path is
     // allocation-free) and the tuners have trained an inline baseline before timing.
@@ -670,10 +670,8 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         fixture.colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
         fixture.colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
-    fixture.system.nav_thread_adaptive = case.adaptive;
-    fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
-    fixture.colliders.splice_adaptive = case.adaptive;
-    fixture.colliders.splice_items_per_range = spliceItemsPerRange(case);
+    fixture.system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = benchmarkItemsPerRange(case) };
+    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = spliceItemsPerRange(case) };
 
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.moveAndReact(io, thread_ptr);
     if (case.adaptive) {
@@ -850,7 +848,7 @@ const StaticDenseFixture = struct {
         self.shifted = !self.shifted;
         const splice = self.colliders.last_splice_batch;
         const query_splice = self.colliders.last_query_splice_batch;
-        const splice_off_main_ns = (if (splice.ran_inline) 0 else splice.batch_duration_ns) + (if (query_splice.ran_inline) 0 else query_splice.batch_duration_ns);
+        const splice_off_main_ns = offMainNs(splice) + offMainNs(query_splice);
         return .{
             .ns = suite.elapsedNs(start_ns, end_ns),
             .commit_ns = suite.elapsedNs(start_ns, sync_start_ns),
@@ -998,10 +996,8 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         fixture.colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
         fixture.colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
-    fixture.system.nav_thread_adaptive = case.adaptive;
-    fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
-    fixture.colliders.splice_adaptive = case.adaptive;
-    fixture.colliders.splice_items_per_range = spliceItemsPerRange(case);
+    fixture.system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = benchmarkItemsPerRange(case) };
+    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = spliceItemsPerRange(case) };
 
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.changeAndReact(io, thread_ptr);
     if (case.adaptive) {

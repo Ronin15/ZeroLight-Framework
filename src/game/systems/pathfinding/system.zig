@@ -15,13 +15,15 @@ const logging = @import("../../../core/logging.zig");
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
-const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
-const JobFn = @import("../../../app/thread_system.zig").JobFn;
-const ParallelForOptions = @import("../../../app/thread_system.zig").ParallelForOptions;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
+const StageControls = @import("../../../app/thread_system.zig").StageControls;
+const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
+const runShaped = @import("../../../app/thread_system.zig").runShaped;
+const stageShape = @import("../../../app/thread_system.zig").stageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -72,6 +74,9 @@ const goalRef = goal_table.goalRef;
 const types = @import("types.zig");
 const PathfindingCapacity = types.PathfindingCapacity;
 const PathfindingConfig = types.PathfindingConfig;
+// Threading for the request-side stages of one update: the thread system and the caller's
+// control config. Absent in `updateSerial`, where every stage runs inline.
+const StageThreads = @import("../../../app/thread_system.zig").StageThreads(PathfindingConfig);
 const PathfindingStats = types.PathfindingStats;
 const PathView = types.PathView;
 const PathQueryKey = types.PathQueryKey;
@@ -298,11 +303,9 @@ pub const PathfindingSystem = struct {
     nav_evict_count_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_evict_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     evict_flush_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // Threaded nav-update control config. Production runs adaptive (the tuners decide range
-    // sizing); the nav-update benchmark pins these to a FIXED partition so the adaptive tuner
-    // can be measured against fixed controls (the shared cross-bench theme).
-    nav_thread_adaptive: bool = true,
-    nav_thread_items_per_range: ?usize = null,
+    // Range controls of every nav-reaction stage. Production runs adaptive with no cap (the
+    // tuners decide range sizing); benches and tests pin a FIXED partition or a worker cap.
+    nav_controls: StageControls = .{},
     // Live agent count the per-step/memory caps are currently sized for. Elastic
     // resize keeps this tracking the steering-agent crowd: grows fast for battles,
     // shrinks slowly after sustained low load. Zero until the first reserve.
@@ -800,8 +803,7 @@ pub const PathfindingSystem = struct {
             .conn_closure_plan_tuner = &self.nav_conn_closure_plan_tuner,
             .conn_closure_rows_tuner = &self.nav_conn_closure_rows_tuner,
             .conn_closure_compact_tuner = &self.nav_conn_closure_compact_tuner,
-            .adaptive = self.nav_thread_adaptive,
-            .items_per_range = self.nav_thread_items_per_range,
+            .controls = self.nav_controls,
         };
     }
 
@@ -1166,19 +1168,14 @@ pub const PathfindingSystem = struct {
         std.debug.assert(self.nav_mark_staging.capacity >= mark_bound);
         std.debug.assert(self.nav_mark_tallies.capacity >= maxRangeCount(events.len, nav_mark_range_alignment_items));
         var section = StageTimer.begin();
-        const selection = ts.selectBatchProfile(&self.nav_mark_tuner, .{
-            .item_count = events.len,
-            .items_per_range = self.nav_thread_items_per_range,
-            .range_alignment_items = nav_mark_range_alignment_items,
-            .adaptive = self.nav_thread_adaptive,
-        });
-        const options = self.navMarkDispatchOptions(selection);
+        const dispatch = Dispatch.init(ts, &self.nav_mark_tuner, self.nav_controls);
+        const selection = dispatch.select(events.len, nav_mark_range_alignment_items);
         if (selection.worker_threads == 0) {
             // Inline on the main thread in range order; still dispatched so the tuner
             // records the batch.
             var direct = DirectNavMarkJob{ .system = self, .world = world, .events = events };
             self.pending_mark_main_ns += section.lap();
-            self.last_mark_batch = ts.parallelForWithOptions(events.len, &direct, directNavMarkJob, options);
+            self.last_mark_batch = dispatch.run(selection, events.len, nav_mark_range_alignment_items, &direct, directNavMarkJob);
             self.pending_mark_inline_ns += self.last_mark_batch.batch_duration_ns;
             return 0;
         }
@@ -1195,7 +1192,7 @@ pub const PathfindingSystem = struct {
             .tallies = self.nav_mark_tallies.items,
         };
         self.pending_mark_main_ns += section.lap();
-        const batch = ts.parallelForWithOptions(events.len, &job, navMarkJob, options);
+        const batch = dispatch.run(selection, events.len, nav_mark_range_alignment_items, &job, navMarkJob);
         section = StageTimer.begin();
         self.last_mark_batch = batch;
         for (self.nav_mark_tallies.items, 0..) |tally, range_index| {
@@ -1208,16 +1205,6 @@ pub const PathfindingSystem = struct {
             return 0;
         }
         return batch.batch_duration_ns;
-    }
-
-    fn navMarkDispatchOptions(self: *const PathfindingSystem, selection: BatchSelection) ParallelForOptions {
-        return .{
-            .items_per_range = self.nav_thread_items_per_range,
-            .range_alignment_items = nav_mark_range_alignment_items,
-            .adaptive = self.nav_thread_adaptive,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        };
     }
 
     // The inline `nav_mark` pass: appends the events' marks in event order.
@@ -1578,13 +1565,9 @@ pub const PathfindingSystem = struct {
         const config = threads.config;
         const solve_count = (try self.beginSolve(requests, agent_count, config, threads, stats)) orelse return;
         var solve_timer = StageTimer.begin();
-        var system_config = config;
-        self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(system_config), stats);
+        self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(config), stats);
 
         if (self.fallback_indices.items.len != 0) {
-            if (system_config.adaptive and system_config.fallback_adaptive_tuner == null and system_config.items_per_range == null) {
-                system_config.fallback_adaptive_tuner = &self.fallback_tuner;
-            }
             // The configured participant count sized the search scratch at the capacity
             // seam. In a correct configuration scratch is sized to participantSlotCount
             // (the app/bench reserve with it), so the clamp below is a no-op. A Debug-gated
@@ -1598,30 +1581,17 @@ pub const PathfindingSystem = struct {
             // the memory-budgeted count, and the solve loop stays allocation-free.
             if (builtin.mode == .debug) std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
             const max_workers_for_scratch = self.scratch_slots.items.len -| 1;
-            const scratch_clamped_workers = if (system_config.max_worker_threads) |requested|
+            var fallback = threads.stage(&self.fallback_tuner);
+            fallback.max_worker_threads = if (config.max_worker_threads) |requested|
                 @min(requested, max_workers_for_scratch)
             else
                 max_workers_for_scratch;
             self.resetSolvedPaths();
-            // Pre-select so the job context can dual-assert range.index against
-            // the dispatched range count (mirror affect.zig / collision.zig). Mirrors
-            // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
-            const selection = thread_system.selectBatchProfile(system_config.fallback_adaptive_tuner orelse &thread_system.adaptive_tuner, .{
-                .item_count = self.fallback_indices.items.len,
-                .items_per_range = system_config.items_per_range,
-                .max_worker_threads = scratch_clamped_workers,
-                .range_alignment_items = pathfinding_range_alignment_items,
-                .adaptive = system_config.adaptive,
-            });
+            // Pre-select so the job context can dual-assert range.index against the
+            // dispatched range count.
+            const selection = fallback.select(self.fallback_indices.items.len, pathfinding_range_alignment_items);
             var context = SolveJobContext{ .system = self, .range_count = selection.range_count };
-            stats.fallback_batch = thread_system.parallelForWithOptions(self.fallback_indices.items.len, &context, solveFallbackJob, .{
-                .items_per_range = system_config.items_per_range,
-                .max_worker_threads = scratch_clamped_workers,
-                .range_alignment_items = pathfinding_range_alignment_items,
-                .adaptive = system_config.adaptive,
-                .adaptive_tuner = selection.active_tuner,
-                .selected_profile = selection.profile,
-            });
+            stats.fallback_batch = fallback.run(selection, self.fallback_indices.items.len, pathfinding_range_alignment_items, &context, solveFallbackJob);
         }
         stats.solve_ns = solve_timer.lap();
         try self.finishUpdate(solve_count, threads, stats);
@@ -1670,59 +1640,10 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    // Threading for the request-side stages of one update: the thread system and the
-    // caller's control config. Absent in `updateSerial`, where every stage runs inline.
-    const StageThreads = struct {
-        thread_system: *ThreadSystem,
-        config: PathfindingConfig,
-
-        // Pre-selects the batch shape so a job can assert its range against the
-        // dispatched range count. The stage's own tuner drives an adaptive config with
-        // no fixed range size.
-        fn select(self: StageThreads, owned_tuner: *AdaptiveWorkTuner, item_count: usize, range_alignment_items: usize) BatchSelection {
-            const tuner: ?*AdaptiveWorkTuner = if (self.config.adaptive and self.config.items_per_range == null) owned_tuner else null;
-            return self.thread_system.selectBatchProfile(tuner, .{
-                .item_count = item_count,
-                .items_per_range = self.config.items_per_range,
-                .max_worker_threads = self.config.max_worker_threads,
-                .range_alignment_items = range_alignment_items,
-                .adaptive = self.config.adaptive,
-            });
-        }
-
-        fn dispatch(self: StageThreads, item_count: usize, context: *anyopaque, job: JobFn, selection: BatchSelection, range_alignment_items: usize) BatchStats {
-            return self.thread_system.parallelForWithOptions(item_count, context, job, .{
-                .items_per_range = self.config.items_per_range,
-                .max_worker_threads = self.config.max_worker_threads,
-                .range_alignment_items = range_alignment_items,
-                .adaptive = self.config.adaptive,
-                .adaptive_tuner = selection.active_tuner,
-                .selected_profile = selection.profile,
-            });
-        }
-
-        // One stage of the update under its own tuner and the caller's controls.
-        fn stage(self: StageThreads, tuner: *AdaptiveWorkTuner) Dispatch {
-            return .{
-                .thread_system = self.thread_system,
-                .tuner = tuner,
-                .items_per_range = self.config.items_per_range,
-                .max_worker_threads = self.config.max_worker_threads,
-                .adaptive = self.config.adaptive,
-            };
-        }
-    };
-
-    // One stage of the nav reaction under its own tuner and the nav thread controls.
+    // One stage of the nav reaction under its own tuner and the nav controls.
     fn navDispatch(self: *const PathfindingSystem, thread_system: ?*ThreadSystem, tuner: *AdaptiveWorkTuner) ?Dispatch {
         const threads = thread_system orelse return null;
-        return .{
-            .thread_system = threads,
-            .tuner = tuner,
-            .items_per_range = self.nav_thread_items_per_range,
-            .max_worker_threads = null,
-            .adaptive = self.nav_thread_adaptive,
-        };
+        return Dispatch.init(threads, tuner, self.nav_controls);
     }
 
     // `path_intake`. On the main thread (no thread system, or the tuner keeps the pass
@@ -1757,12 +1678,13 @@ pub const PathfindingSystem = struct {
             stats.pending_requests = self.pending.len;
             return stats;
         };
-        const selection = stage.select(&self.intake_tuner, item_count, intake_range_alignment_items);
+        const intake = stage.stage(&self.intake_tuner);
+        const selection = intake.select(item_count, intake_range_alignment_items);
         if (selection.worker_threads == 0) {
             // Inline on the main thread in range order: one direct pass, no records. Still
             // dispatched so the tuner records the batch.
             var direct = DirectIntakeJob{ .system = self, .requests = admitted, .stats = &stats };
-            stats.intake_batch = stage.dispatch(item_count, &direct, directIntakeJob, selection, intake_range_alignment_items);
+            stats.intake_batch = intake.run(selection, item_count, intake_range_alignment_items, &direct, directIntakeJob);
             stats.pending_requests = self.pending.len;
             return stats;
         }
@@ -1781,7 +1703,7 @@ pub const PathfindingSystem = struct {
             .group_counts = self.intake_group_counts.items,
             .tallies = self.intake_tallies.items,
         };
-        stats.intake_batch = stage.dispatch(item_count, &job, intakeJob, selection, intake_range_alignment_items);
+        stats.intake_batch = intake.run(selection, item_count, intake_range_alignment_items, &job, intakeJob);
         self.mergeIntake(selection.items_per_range, &stats);
         stats.pending_requests = self.pending.len;
         return stats;
@@ -2140,9 +2062,10 @@ pub const PathfindingSystem = struct {
             const slots = self.group_field_slots.items;
             const round_tuner = if (first == null) tuner else &self.group_field_stall_tuner;
             const batch = if (threads) |stage| dispatched: {
-                const selection = stage.select(round_tuner, slots.len, 1);
+                const round = stage.stage(round_tuner);
+                const selection = round.select(slots.len, 1);
                 var job = GroupFieldJob{ .system = self, .slots = slots, .range_count = selection.range_count };
-                break :dispatched stage.dispatch(slots.len, &job, groupFieldExpandJob, selection, 1);
+                break :dispatched round.run(selection, slots.len, 1, &job, groupFieldExpandJob);
             } else serial: {
                 for (slots) |slot| self.expandGroupField(slot);
                 break :serial inlineBatch(slots.len, 1);
@@ -2968,61 +2891,6 @@ fn prepareTruncate(shards: *[registry_shard_count]ChunkListMap, capacity: usize)
 
 fn abortTruncate(shards: *[registry_shard_count]ChunkListMap) void {
     for (shards) |*shard| shard.abortTruncate();
-}
-
-// One stage's threading: the thread system, the stage's own tuner, and range controls.
-const Dispatch = struct {
-    thread_system: *ThreadSystem,
-    tuner: *AdaptiveWorkTuner,
-    items_per_range: ?usize,
-    max_worker_threads: ?usize,
-    adaptive: bool,
-};
-
-// The shape a stage runs at: a dispatch's pre-selected profile, or one inline range.
-const StageShape = struct {
-    selection: ?BatchSelection = null,
-    items_per_range: usize = 1,
-    range_count: usize = 0,
-};
-
-// Selects `item_count` items' shape under `dispatch` (its tuner drives an adaptive control
-// with no fixed range size), or one inline range without one.
-fn stageShape(dispatch: ?Dispatch, item_count: usize, range_alignment_items: usize) StageShape {
-    const stage = dispatch orelse return .{ .items_per_range = @max(item_count, 1), .range_count = @intFromBool(item_count != 0) };
-    const tuner: ?*AdaptiveWorkTuner = if (stage.adaptive and stage.items_per_range == null) stage.tuner else null;
-    const selection = stage.thread_system.selectBatchProfile(tuner, .{
-        .item_count = item_count,
-        .items_per_range = stage.items_per_range,
-        .max_worker_threads = stage.max_worker_threads,
-        .range_alignment_items = range_alignment_items,
-        .adaptive = stage.adaptive,
-    });
-    return .{ .selection = selection, .items_per_range = selection.items_per_range, .range_count = selection.range_count };
-}
-
-// Runs `job` over `item_count` items at `shape`: dispatched with its selection, or inline
-// as one range on the calling thread.
-fn runShaped(dispatch: ?Dispatch, shape: StageShape, item_count: usize, range_alignment_items: usize, context: *anyopaque, job: JobFn) BatchStats {
-    if (item_count == 0) return .{};
-    const stage = dispatch orelse {
-        // No thread system times the batch, so it is timed here.
-        const stage_timer = StageTimer.begin();
-        job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-        var batch = inlineBatch(item_count, range_alignment_items);
-        batch.batch_duration_ns = stage_timer.lap();
-        return batch;
-    };
-    // A shape selected under a dispatch holds its selection.
-    const selection = shape.selection.?;
-    return stage.thread_system.parallelForWithOptions(item_count, context, job, .{
-        .items_per_range = stage.items_per_range,
-        .max_worker_threads = stage.max_worker_threads,
-        .range_alignment_items = range_alignment_items,
-        .adaptive = stage.adaptive,
-        .adaptive_tuner = selection.active_tuner,
-        .selected_profile = selection.profile,
-    });
 }
 
 // One range of `publish_copy`: its ordinals' paths into their claimed stripes or blocks,
@@ -6019,8 +5887,7 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     try system.reserve(cap);
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
     // Force the parallel schedule rather than letting the tuner keep the small batch inline.
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
 
     // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
     // set and the patch set exceed one chunk and actually fan out across workers.
@@ -8040,8 +7907,7 @@ test "threaded nav mark interpretation equals serial for a dense multi-chunk edi
         defer threaded.deinit();
         try threaded.reserve(abstractCapacity());
         try threaded.rebuildStaticNavGridWithWorld(&data, &world, null);
-        threaded.nav_thread_adaptive = false;
-        threaded.nav_thread_items_per_range = items_per_range;
+        threaded.nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
         const off_main = try markEventsForTest(&threaded, events.items, &world, &threads);
         try std.testing.expect(off_main != 0);
         try std.testing.expectEqual(serial.nav_marks.items.len, threaded.nav_marks.items.len);
@@ -8073,8 +7939,7 @@ test "a terrain nav record after its reserve allocates nothing on a multi-worker
     defer system.deinit();
     try system.reserve(abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 8;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 8 };
 
     // A reserve past the steady capacity that runs out of memory records nothing.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -9173,7 +9038,7 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
     const serial_batch = systems[0].flushRegistry(null, &serial_stats);
     try std.testing.expectEqual(units, serial_batch.item_count);
     var threaded_stats = PathfindingStats{};
-    const stage = (PathfindingSystem.StageThreads{ .thread_system = &threads, .config = fixed_threads_config }).stage(&systems[1].registry_flush_tuner);
+    const stage = (StageThreads{ .thread_system = &threads, .config = fixed_threads_config }).stage(&systems[1].registry_flush_tuner);
     const batch = systems[1].flushRegistry(stage, &threaded_stats);
     try std.testing.expect(!batch.ran_inline);
     try std.testing.expectEqual(units, batch.item_count);
@@ -9217,7 +9082,7 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
             try prepareMixedFlush(&threaded, requester);
             var stats = PathfindingStats{};
             const config = PathfindingConfig{ .adaptive = false, .items_per_range = items_per_range };
-            const stage = (PathfindingSystem.StageThreads{ .thread_system = &threads, .config = config }).stage(&threaded.registry_flush_tuner);
+            const stage = (StageThreads{ .thread_system = &threads, .config = config }).stage(&threaded.registry_flush_tuner);
             const batch = threaded.flushRegistry(stage, &stats);
             try std.testing.expect(!batch.ran_inline and batch.active_worker_threads != 0);
             try std.testing.expect(batch.active_worker_threads <= flush_pair_count - 1);
@@ -9293,8 +9158,7 @@ test "eviction allocates nothing after its pre-commit reserve on a multi-worker 
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try registrySystem(&data, &fixture.world, 64);
     defer system.deinit();
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     // A warm cycle sizes the eviction scratch and the nav batch buffers.
     try solveRegistryRoutes(&system, requester, 24, 0, 60, 64, null, .{});
     try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
@@ -9377,8 +9241,7 @@ test "threaded eviction equals serial over a dense region (bounds, flags, hits, 
     defer serial.deinit();
     var threaded = try registrySystem(&data, &fixture.world, 64);
     defer threaded.deinit();
-    threaded.nav_thread_adaptive = false;
-    threaded.nav_thread_items_per_range = 1;
+    threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try solveRegistryRoutes(&serial, requester, 24, 0, 60, 64, null, .{});
     try solveRegistryRoutes(&threaded, requester, 24, 0, 60, 64, null, .{});
     try setRegistryCells(&serial, &fixture, &dense_change_cells, fixture.tree);
@@ -9514,7 +9377,7 @@ test "threaded resize copy equals serial for inline and long moves, and runs on 
     }
     try std.testing.expect(inline_moves != 0 and long_moves != 0);
     try serial.resizePreservingLiveState(1, null);
-    try threaded.resizePreservingLiveState(1, PathfindingSystem.StageThreads{ .thread_system = &threads, .config = fixed_threads_config });
+    try threaded.resizePreservingLiveState(1, StageThreads{ .thread_system = &threads, .config = fixed_threads_config });
     try std.testing.expect(serial.last_resize_copy_batch.ran_inline);
     try std.testing.expect(!threaded.last_resize_copy_batch.ran_inline and threaded.last_resize_copy_batch.range_count > 1);
     try std.testing.expectEqual(serial.last_resize_copy_batch.item_count, threaded.last_resize_copy_batch.item_count);
@@ -9552,7 +9415,7 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     // Every allocation and every in-place resize fails.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
-    const stage = (PathfindingSystem.StageThreads{ .thread_system = &threads, .config = fixed_threads_config });
+    const stage = (StageThreads{ .thread_system = &threads, .config = fixed_threads_config });
     const batch = system.runResizeCopy(stage.stage(&system.resize_copy_tuner));
     const flush = system.flushRegistry(stage.stage(&system.registry_flush_tuner), null);
     setSystemAllocators(&system, std.testing.allocator);
@@ -9987,8 +9850,7 @@ test "threaded eviction with paths and fields equals serial over a dense change 
         try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
         _ = try system.updateSerial(&group, 16, .{ .max_fallback_requests_per_step = 0 });
     }
-    systems[1].nav_thread_adaptive = false;
-    systems[1].nav_thread_items_per_range = 1;
+    systems[1].nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
     for (pocket_change_cells) |cell| try systems[1].markNavDirty(0, cell[0], cell[1]);
     const serial_stats = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, null);
@@ -10011,6 +9873,78 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     for (&systems) |*system| try expectRegistryMatchesCache(system);
 }
 
+test "a nav worker cap of zero keeps the mark and eviction stages inline on a multi-worker ThreadSystem and changes no result" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    // Uncapped first, then capped: a fixed partition that runs every stage on workers
+    // unless the cap holds it inline.
+    const caps = [_]?usize{ null, 0 };
+
+    // `nav_mark` over terrain events.
+    {
+        var world = try test_support.abstractTestWorld(&meta, 384, 384);
+        defer world.deinit();
+        _ = try world.addLevel(-16);
+        var events = try navMarkTestEvents(std.testing.allocator, &world);
+        defer events.deinit(std.testing.allocator);
+        var systems = [_]PathfindingSystem{ PathfindingSystem.init(std.testing.allocator), PathfindingSystem.init(std.testing.allocator) };
+        defer for (&systems) |*system| system.deinit();
+        for (&systems, caps) |*system, cap| {
+            try system.reserve(abstractCapacity());
+            try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+            system.nav_controls = .{ .adaptive = false, .items_per_range = 8, .max_worker_threads = cap };
+            try system.reserveTerrainNavRecord(events.items.len);
+            system.recordTerrainNavEvents(events.items, &world, &threads);
+        }
+        try std.testing.expect(!systems[0].last_mark_batch.ran_inline and systems[0].last_mark_batch.range_count > 1);
+        try std.testing.expect(systems[1].last_mark_batch.ran_inline);
+        try std.testing.expectEqual(systems[0].last_mark_batch.item_count, systems[1].last_mark_batch.item_count);
+        try std.testing.expectEqual(systems[0].nav_marks.items.len, systems[1].nav_marks.items.len);
+        for (systems[0].nav_marks.items, systems[1].nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
+    }
+
+    // `nav_evict_count`, `nav_evict`, and `evict_flush` over a dense change.
+    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var systems: [2]PathfindingSystem = undefined;
+    var built: usize = 0;
+    defer for (systems[0..built]) |*system| system.deinit();
+    var stats: [2]NavUpdateStats = undefined;
+    for (&systems, caps) |*system, cap| {
+        system.* = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
+        built += 1;
+        var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
+        defer group.deinit();
+        try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
+        _ = try system.updateSerial(&group, 16, .{ .max_fallback_requests_per_step = 0 });
+        system.nav_controls = .{ .adaptive = false, .items_per_range = 1, .max_worker_threads = cap };
+    }
+    try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
+    for (pocket_change_cells) |cell| try systems[1].markNavDirty(0, cell[0], cell[1]);
+    for (&systems, &stats) |*system, *step| step.* = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    for ([_][2]BatchStats{
+        .{ stats[0].evict_count_batch, stats[1].evict_count_batch },
+        .{ stats[0].evict_batch, stats[1].evict_batch },
+        .{ stats[0].evict_flush_batch, stats[1].evict_flush_batch },
+    }) |pair| {
+        try std.testing.expect(!pair[0].ran_inline and pair[0].range_count > 1);
+        try std.testing.expect(pair[1].ran_inline);
+        try std.testing.expectEqual(pair[0].item_count, pair[1].item_count);
+    }
+    try std.testing.expect(stats[0].evicted_results > 1);
+    try std.testing.expectEqual(stats[0].evicted_results, stats[1].evicted_results);
+    try std.testing.expectEqual(stats[0].dropped_fields, stats[1].dropped_fields);
+    try expectSameCache(&systems[0], &systems[1]);
+    try expectSameRegistry(&systems[0], &systems[1]);
+}
+
 test "eviction with paths and fields allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
@@ -10025,8 +9959,7 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
     defer system.deinit();
-    system.nav_thread_adaptive = false;
-    system.nav_thread_items_per_range = 1;
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer group.deinit();
     try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });

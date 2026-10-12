@@ -38,11 +38,13 @@ const TextureId = @import("../render/resources.zig").TextureId;
 const TextureDesc = @import("../render/resources.zig").TextureDesc;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
-const JobFn = @import("../app/thread_system.zig").JobFn;
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
 const thread_shared_record_alignment = @import("../app/thread_system.zig").thread_shared_record_alignment;
+const Dispatch = @import("../app/thread_system.zig").Dispatch;
+const StageControls = @import("../app/thread_system.zig").StageControls;
+const runStage = @import("../app/thread_system.zig").runStage;
 const WorldObstacleChangedEvent = @import("simulation.zig").WorldObstacleChangedEvent;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -271,30 +273,21 @@ pub const DenseChunkWrites = struct {
     writes: []const DenseCellWrite,
 };
 
-/// Threading for a batched dense edit, with one tuner per stage. `adaptive` and
-/// `items_per_range` pin a fixed partition for benchmark controls.
+/// Threading for a batched dense edit, with one tuner per stage. `controls` pin a fixed
+/// partition or a worker cap for benchmark controls.
 pub const TerrainEditThreads = struct {
     thread_system: *ThreadSystem,
     plan_tuner: *AdaptiveWorkTuner,
     write_tuner: *AdaptiveWorkTuner,
-    adaptive: bool = true,
-    items_per_range: ?usize = null,
+    controls: StageControls = .{},
 
-    fn plan(self: TerrainEditThreads) TerrainEditStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = self.plan_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
+    fn plan(self: TerrainEditThreads) Dispatch {
+        return Dispatch.init(self.thread_system, self.plan_tuner, self.controls);
     }
 
-    fn write(self: TerrainEditThreads) TerrainEditStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = self.write_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
+    fn write(self: TerrainEditThreads) Dispatch {
+        return Dispatch.init(self.thread_system, self.write_tuner, self.controls);
     }
-};
-
-// One stage of a batched dense edit: the shared thread system and that stage's tuner.
-const TerrainEditStageThreads = struct {
-    thread_system: *ThreadSystem,
-    tuner: *AdaptiveWorkTuner,
-    adaptive: bool,
-    items_per_range: ?usize,
 };
 
 const DenseEditStatus = enum { ok, invalid_layer, invalid_cell, invalid_tile };
@@ -1691,12 +1684,7 @@ pub const WorldSystem = struct {
             .catalog_valid = self.catalog_valid.items,
             .range_count = 1,
         };
-        if (stage_threads) |stage| {
-            self.last_terrain_edit_plan_batch = dispatchTerrainEditStage(stage.plan(), groups.len, &plan_job, denseEditPlanJob);
-        } else {
-            self.last_terrain_edit_plan_batch = .{ .item_count = groups.len, .ran_inline = true };
-            for (0..groups.len) |group_index| planDenseEditGroup(&plan_job, group_index);
-        }
+        self.last_terrain_edit_plan_batch = runStage(if (stage_threads) |stage| stage.plan() else null, groups.len, 1, &plan_job, &plan_job.range_count, denseEditPlanJob);
 
         // The first invalid write in group order fails the batch before any growth.
         for (groups) |group| switch (group.plan.status) {
@@ -1785,12 +1773,7 @@ pub const WorldSystem = struct {
             .sparse_level_chunk_tiles = self.sparse_level_chunk_tiles.items,
             .range_count = 1,
         };
-        if (stage_threads) |stage| {
-            self.last_terrain_edit_write_batch = dispatchTerrainEditStage(stage.write(), groups.len, &write_job, denseEditWriteJob);
-        } else {
-            self.last_terrain_edit_write_batch = .{ .item_count = groups.len, .ran_inline = true };
-            for (0..groups.len) |group_index| writeDenseEditGroup(&write_job, group_index, 0);
-        }
+        self.last_terrain_edit_write_batch = runStage(if (stage_threads) |stage| stage.write() else null, groups.len, 1, &write_job, &write_job.range_count, denseEditWriteJob);
 
         // Ordered merge: compact the event windows in group order (each window starts
         // at or after the merged length), flag the resident written layers of each
@@ -2871,24 +2854,6 @@ fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) 
         build.blocked_bits[chunk_index] = bits;
         build.blocked_counts[chunk_index] = blocked_count;
     }
-}
-
-// Pre-selects the batch shape so the job can assert range.index against it.
-fn dispatchTerrainEditStage(stage: TerrainEditStageThreads, item_count: usize, job: anytype, job_fn: JobFn) BatchStats {
-    const selection = stage.thread_system.selectBatchProfile(stage.tuner, .{
-        .item_count = item_count,
-        .items_per_range = stage.items_per_range,
-        .range_alignment_items = 1,
-        .adaptive = stage.adaptive,
-    });
-    job.range_count = selection.range_count;
-    return stage.thread_system.parallelForWithOptions(item_count, job, job_fn, .{
-        .adaptive = stage.adaptive,
-        .adaptive_tuner = selection.active_tuner,
-        .items_per_range = stage.items_per_range,
-        .range_alignment_items = 1,
-        .selected_profile = selection.profile,
-    });
 }
 
 fn denseEditPlanJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -7250,8 +7215,7 @@ fn testEditThreads(world: *WorldSystem, threads: *ThreadSystem) TerrainEditThrea
         .thread_system = threads,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
-        .adaptive = false,
-        .items_per_range = 1,
+        .controls = .{ .adaptive = false, .items_per_range = 1 },
     };
 }
 
@@ -7328,6 +7292,55 @@ test "a batched dense edit is identical inline and threaded and matches its cano
         // Upload both worlds' changes as a frame's sync would.
         _ = try testSyncGpuTiles(&threaded, 0);
         _ = try testSyncGpuTiles(&serial, 0);
+    }
+    try std.testing.expect(threaded_batches > 0);
+}
+
+test "a terrain edit worker cap of zero keeps the plan and write stages inline on a multi-worker ThreadSystem and writes the same terrain and events" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var uncapped = try testBatchEditWorld(&meta);
+    defer uncapped.deinit();
+    var capped = try testBatchEditWorld(&meta);
+    defer capped.deinit();
+    const tiles = try TerrainTestTiles.resolve(&uncapped, &meta);
+
+    var uncapped_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer uncapped_events.deinit(std.testing.allocator);
+    var capped_events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer capped_events.deinit(std.testing.allocator);
+    var write_buffer: [160]DenseCellWrite = undefined;
+    var prng = std.Random.DefaultPrng.init(0x53b_7e44);
+    var threaded_batches: usize = 0;
+    for (0..40) |_| {
+        const writes = randomBatchWrites(prng.random(), tiles, &write_buffer);
+        var batch = try ChunkMajorWrites.init(&uncapped, writes);
+        defer batch.deinit();
+        uncapped_events.clearRetainingCapacity();
+        capped_events.clearRetainingCapacity();
+        try uncapped_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try capped_events.ensureTotalCapacity(std.testing.allocator, writes.len);
+        try uncapped.applyDenseCellWrites(batch.chunks.items, testEditThreads(&uncapped, &threads), &uncapped_events);
+        var capped_threads = testEditThreads(&capped, &threads);
+        capped_threads.controls.max_worker_threads = 0;
+        try capped.applyDenseCellWrites(batch.chunks.items, capped_threads, &capped_events);
+        for ([_][2]BatchStats{
+            .{ uncapped.last_terrain_edit_plan_batch, capped.last_terrain_edit_plan_batch },
+            .{ uncapped.last_terrain_edit_write_batch, capped.last_terrain_edit_write_batch },
+        }) |pair| {
+            try std.testing.expectEqual(pair[0].item_count, pair[1].item_count);
+            try std.testing.expect(pair[1].ran_inline and pair[1].active_worker_threads == 0);
+        }
+        if (uncapped.last_terrain_edit_plan_batch.worker_thread_ranges != 0 and uncapped.last_terrain_edit_write_batch.worker_thread_ranges != 0) {
+            try std.testing.expect(editRanThreaded(&uncapped));
+            threaded_batches += 1;
+        }
+        try std.testing.expectEqualSlices(WorldTileChangedEvent, uncapped_events.items, capped_events.items);
+        try expectTerrainBytesEqual(&uncapped, &capped);
     }
     try std.testing.expect(threaded_batches > 0);
 }

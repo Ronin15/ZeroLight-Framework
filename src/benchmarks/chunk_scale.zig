@@ -102,6 +102,7 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const CellCoord = @import("../game/world_system.zig").CellCoord;
@@ -1062,9 +1063,7 @@ const BatchTiming = struct {
     off_main_ns: u64 = 0,
 
     fn add(self: *BatchTiming, world: *const WorldSystem) void {
-        for ([_]BatchStats{ world.last_terrain_edit_plan_batch, world.last_terrain_edit_write_batch }) |batch| {
-            if (!batch.ran_inline) self.off_main_ns += batch.batch_duration_ns;
-        }
+        for ([_]BatchStats{ world.last_terrain_edit_plan_batch, world.last_terrain_edit_write_batch }) |batch| self.off_main_ns += offMainNs(batch);
         self.plan_ns += world.last_terrain_edit_plan_batch.batch_duration_ns;
         self.write_ns += world.last_terrain_edit_write_batch.batch_duration_ns;
     }
@@ -1133,8 +1132,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
-        .adaptive = case.adaptive,
-        .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1,
+        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1 },
     } else null;
 
     var unused_timing: BatchTiming = .{};
@@ -1408,8 +1406,7 @@ fn setNavStageControls(system: *PathfindingSystem, case: suite.BenchmarkCase) vo
     system.nav_conn_seed_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     system.nav_conn_gather_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     system.nav_conn_flood_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    system.nav_thread_adaptive = case.adaptive;
-    system.nav_thread_items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1;
+    system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1 };
 }
 
 // `reaction`: the workload runs the post-commit reaction, so its mark stage dispatches too.
@@ -1768,8 +1765,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
-        .adaptive = case.adaptive,
-        .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1,
+        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1 },
     } else null;
 
     var unused_timing: NavBatchTiming = .{};
