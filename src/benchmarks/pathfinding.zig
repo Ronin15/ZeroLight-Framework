@@ -38,6 +38,7 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const CellCoord = @import("../game/world_system.zig").CellCoord;
+const LevelLink = @import("../game/world_system.zig").LevelLink;
 const TileId = @import("../game/world_system.zig").TileId;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
@@ -202,10 +203,16 @@ pub const query_group = suite.BenchmarkGroup{
 //   - `pathfinding-cross-level-teleport`: the depth fixture plus one bidirectional
 //     teleport between opposite corners of level 0 and the deepest level, far from the
 //     routes, whose span far exceeds its traversal cost. Passes when flat in depth. A
-//     teleport-count config (item count teleports * 10^7 + side * 1000 + levels) instead
-//     spreads that many such teleports over level-0 cells within 16 of the border, each to
-//     its point mirror on the deepest level; it passes when flat in teleport count, at every
-//     side.
+//     teleport-count config (item count layout * 10^12 + teleports * 10^7 + side * 1000 +
+//     levels) instead adds that many such teleports from level 0 to the deepest level in
+//     one layout. Layout 0 spreads them evenly over level-0 cells within 16 of the border,
+//     each to its point mirror. Layout 1 spreads them evenly over level-0 rows
+//     [center - 112, center - 97) across the side, each to its point mirror. Layout 2 places
+//     random pads on a fixed seed: level-0 cells at least 24 cells from the routes' starts
+//     and goals, each to an independent random cell at least 64 cells away. Layout 0 passes
+//     when flat in teleport count at every side; layouts 1 and 2 pass when flat in side at a
+//     fixed teleport density. Layout 2 at side 256 and 16, 64, or 256 teleports passes when
+//     every route solves at 16 and 64; the 256 point is reported, not judged.
 //   - `pathfinding-cross-level-shaft`: a 256² world of 8, 32, or 128 walkable levels; a ramp
 //     shaft beside the starts joins levels 1 to the deepest, and level 0, which no ramp
 //     reaches, holds a one-way teleport from the shaft's planar cell to beside the goals.
@@ -233,6 +240,32 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-shaft",
     .defaultItemCounts = crossLevelItemCounts,
     .runCase = runCrossLevelShaftCase,
+};
+
+// A 512² world of 8 walkable levels holding random pads: bidirectional teleports from level 0
+// to the deepest level placed as the teleport group's layout 2 (item code axis * 10^9 + probe
+// preload * 10^6 + background pads before the run). One timed sample runs the post-commit nav
+// reaction that applies a batch of 64 more pads, added to the world untimed. Links are
+// append-only, so every sample (warmup included) leaves its batch in the world.
+//   - Axis 0 (uniform): 1,024, 8,192, or 32,768 background pads; every batch is uniform
+//     random pads too, so endpoints per touched chunk rise with pads held.
+//   - Axis 1 (probe): background pads keep off a probe region of chunk pairs (a level-0 chunk
+//     and its point mirror on the deepest level), one set of 8 pairs per sample, each pair
+//     joined by `preload` pads first; each batch lands 8 pads in each pair of its own set, so
+//     endpoints per touched chunk stay at preload + 8 at any background. Preload 16 over
+//     1,024, 8,192, or 32,768 background pads, then preload 4 and 64 over 8,192.
+// `outputs` is the pads the world holds after the run and `candidates` the chunks the last
+// reaction patched; items/s is pads applied per second. Passes when the reaction's `commit`
+// section (the link fold) is flat per pad in pads held on both axes, the whole reaction is flat
+// in background pads at a fixed preload, and it grows at most linearly in endpoints per
+// touched chunk at a fixed background. `--details` prints the reaction's plan, patch, and
+// connectivity gather shapes, the per-pad and per-pad `commit` cost, the mean endpoints per
+// touched chunk, the mean pads held over the timed samples, the main-thread share, and its
+// split by section.
+pub const link_fold_group = suite.BenchmarkGroup{
+    .name = "pathfinding-link-fold",
+    .defaultItemCounts = linkFoldItemCounts,
+    .runCase = runLinkFoldCase,
 };
 
 // One timed dig on a 256² walkable level holding 1,000, 10,000, or 50,000 cached results
@@ -1803,8 +1836,39 @@ const level_case_encoding: usize = 1000;
 const level_size_item_counts = [_]usize{ 256_001, 1_024_001, 2_048_001 };
 const cross_level_item_counts = [_]usize{ 256_008, 256_032, 256_128 };
 const teleport_count_encoding: usize = 10_000_000;
+// Teleport-count configs' layout digit sits above their teleport count.
+const teleport_layout_encoding: usize = 1_000_000_000_000;
 // Teleport-count configs place their teleports on level-0 cells this close to the border.
 const teleport_border_band: u16 = 16;
+// The strip layout's rows: this many, from this far north of the level center.
+const teleport_strip_north: u16 = 112;
+const teleport_strip_rows: u16 = 15;
+// Random pads: the fixed seed, the least distance of an entrance from the routes' block, and
+// the least planar span of a pad.
+const random_pad_seed: u64 = 0x0064_9ad5;
+const random_pad_route_clearance: u32 = 24;
+const random_pad_min_span: u32 = 64;
+const link_fold_side: u16 = 512;
+const link_fold_levels: u16 = 8;
+// Pads each timed link-fold reaction applies.
+const link_fold_batch: usize = 64;
+// Link-fold item codes' axis and probe preload digits.
+const link_fold_axis_encoding: usize = 1_000_000_000;
+const link_fold_preload_encoding: usize = 1_000_000;
+// Probe chunk pairs each probe-axis batch lands in, an equal share of its pads each.
+const link_fold_probe_pairs: usize = 8;
+// The uniform axis, then the probe axis in background pads at a fixed preload, then in
+// preload at a fixed background.
+const link_fold_item_counts = [_]usize{
+    linkFoldItemCode(.uniform, 0, 1024),
+    linkFoldItemCode(.uniform, 0, 8192),
+    linkFoldItemCode(.uniform, 0, 32768),
+    linkFoldItemCode(.probe, 16, 1024),
+    linkFoldItemCode(.probe, 16, 8192),
+    linkFoldItemCode(.probe, 16, 32768),
+    linkFoldItemCode(.probe, 4, 8192),
+    linkFoldItemCode(.probe, 64, 8192),
+};
 const evict_region_encoding: usize = 10_000_000;
 const evict_item_counts = [_]usize{ 1_000, 10_000, 50_000, 64 * evict_region_encoding + 10_000 };
 // Four packs, then three tunnel field caps: sample points on the coverage curve.
@@ -1819,6 +1883,10 @@ fn levelSizeItemCounts(_: suite.Profile) []const usize {
 
 fn crossLevelItemCounts(_: suite.Profile) []const usize {
     return &cross_level_item_counts;
+}
+
+fn linkFoldItemCounts(_: suite.Profile) []const usize {
+    return &link_fold_item_counts;
 }
 
 fn evictItemCounts(_: suite.Profile) []const usize {
@@ -2123,22 +2191,64 @@ fn crossLevelRampCell(center: u16, upper: u16) CellCoord {
     return .{ .x = if (upper % 2 == 0) center + 24 else center - 24, .y = center };
 }
 
+// Where a teleport-count config's teleports sit; each joins level 0 to the deepest level.
+const TeleportLayout = enum(u8) {
+    // Level-0 cells within `teleport_border_band` of the border, each to its point mirror.
+    border_band,
+    // `teleport_strip_rows` level-0 rows across the side, the first `teleport_strip_north`
+    // north of the center, each to its point mirror.
+    strip,
+    // Random level-0 cells clear of the routes, each to an independent random cell.
+    random_pads,
+};
+
+// A cross-level item count: layout * 10^12 + teleports * 10^7 + side * 1000 + levels.
+const CrossLevelConfig = struct {
+    layout: TeleportLayout,
+    // 0: the teleport group's one corner-to-corner teleport, or none in the depth group.
+    teleports: usize,
+    side: u16,
+    levels: u16,
+
+    // Each field reads only its own digits. An unknown layout, teleports in the depth group,
+    // or a config the fixture cannot build is an error.
+    fn decode(item_count: usize, teleport: bool) !CrossLevelConfig {
+        const layout_index = item_count / teleport_layout_encoding;
+        const teleports = item_count % teleport_layout_encoding / teleport_count_encoding;
+        const world_config = item_count % teleport_count_encoding;
+        if (layout_index > @backingInt(TeleportLayout.random_pads)) return error.CrossLevelUnknownLayout;
+        if (!teleport and item_count >= teleport_count_encoding) return error.CrossLevelDepthHoldsTeleports;
+        const layout: TeleportLayout = @fromBackingInt(@as(u8, @intCast(layout_index)));
+        if (layout != .border_band and teleports == 0) return error.CrossLevelLayoutNoTeleports;
+        // In range: below 10^4 by the encoding.
+        const side: u16 = @intCast(world_config / level_case_encoding);
+        const levels: u16 = @intCast(world_config % level_case_encoding);
+        if (levels <= cross_level_goal_level or side < 256) return error.CrossLevelWorldTooSmall;
+        const layout_cells: usize = switch (layout) {
+            .border_band => borderBandCells(side),
+            .strip => @as(usize, teleport_strip_rows) * side,
+            .random_pads => std.math.maxInt(usize),
+        };
+        if (teleports > layout_cells) return error.CrossLevelTeleportsExceedLayout;
+        return .{ .layout = layout, .teleports = teleports, .side = side, .levels = levels };
+    }
+};
+
 fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, teleport: bool) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const world_config = item_count % teleport_count_encoding;
-    const side: u16 = @intCast(world_config / level_case_encoding);
-    const levels: u16 = @intCast(world_config % level_case_encoding);
-    // 0: the one corner-to-corner teleport.
-    const teleport_count = item_count / teleport_count_encoding;
-    std.debug.assert(levels > cross_level_goal_level and side >= 256);
-    std.debug.assert(teleport or teleport_count == 0);
+    const config = try CrossLevelConfig.decode(item_count, teleport);
+    const side = config.side;
+    const levels = config.levels;
+    const teleport_count = config.teleports;
 
     var threads = try initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
     const link_count: usize = levels - 1 + if (teleport_count != 0) teleport_count else @intFromBool(teleport);
-    const size_config = routeSizeConfig(side, levels, link_count, participant_count);
+    var size_config = routeSizeConfig(side, levels, link_count, participant_count);
+    // Every ramp and teleport here is bidirectional.
+    size_config.oneway_links = 0;
     const group_name = if (teleport) cross_level_teleport_group.name else cross_level_depth_group.name;
     if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
 
@@ -2160,7 +2270,15 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         });
     }
     if (teleport_count != 0) {
-        try addBorderTeleports(&open.world, side, levels - 1, teleport_count);
+        const deepest = levels - 1;
+        switch (config.layout) {
+            .border_band => try addBorderTeleports(&open.world, side, deepest, teleport_count),
+            .strip => try addStripTeleports(&open.world, side, deepest, teleport_count),
+            .random_pads => {
+                var prng = std.Random.DefaultPrng.init(random_pad_seed);
+                try addRandomPads(&open.world, prng.random(), side, deepest, teleport_count, 0);
+            },
+        }
     } else if (teleport) {
         try open.world.addLevelLink(.{
             .kind = .teleport,
@@ -2267,8 +2385,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 // span far exceeds its cost, and every endpoint is at least 64 cells from the cross-level
 // routes' starts and goals around the level center.
 fn addBorderTeleports(world: *WorldSystem, side: u16, deepest: u16, count: usize) !void {
-    const inner = side - 2 * teleport_border_band;
-    const band_cells = @as(usize, side) * side - @as(usize, inner) * inner;
+    const band_cells = borderBandCells(side);
     std.debug.assert(count <= band_cells);
     const center = side / 2;
     var band_index: usize = 0;
@@ -2297,6 +2414,95 @@ fn addBorderTeleports(world: *WorldSystem, side: u16, deepest: u16, count: usize
         }
     }
     std.debug.assert(added == count);
+}
+
+// The level-local chunk index (row-major) of `cell`.
+fn levelChunkIndex(world: *const WorldSystem, cell: CellCoord) usize {
+    const chunk = world.chunkCoordForCell(cell.x, cell.y);
+    // In range: chunk coordinates of an in-world cell are non-negative.
+    return @as(usize, @intCast(chunk.y)) * world.chunksX() + @as(usize, @intCast(chunk.x));
+}
+
+// Level cells within `teleport_border_band` of the border.
+fn borderBandCells(side: u16) usize {
+    const inner = side - 2 * teleport_border_band;
+    return @as(usize, side) * side - @as(usize, inner) * inner;
+}
+
+// Chebyshev distance from `cell` to the cross-level routes' planar block: the starts' 8x8
+// block at the level center and the goals' 8x8 block below it.
+fn routeBlockDistance(cell: CellCoord, center: u16) u32 {
+    return @max(gapOutside(cell.x, center - 4, center + 3), gapOutside(cell.y, center - 4, center + 15));
+}
+
+// Distance from `value` to the closed range [low, high]; 0 inside it.
+fn gapOutside(value: u16, low: u16, high: u16) u32 {
+    if (value < low) return low - value;
+    if (value > high) return value - high;
+    return 0;
+}
+
+// Adds `count` bidirectional teleports from the strip's level-0 cells, spread evenly in
+// row-major order, each to its point mirror on `deepest`. Both ends of every teleport lie at
+// least 64 cells from the routes' block and its span far exceeds its cost.
+fn addStripTeleports(world: *WorldSystem, side: u16, deepest: u16, count: usize) !void {
+    const strip_cells = @as(usize, teleport_strip_rows) * side;
+    std.debug.assert(count != 0 and count <= strip_cells);
+    const center = side / 2;
+    const first_row = center - teleport_strip_north;
+    const links_before = world.levelLinks().len;
+    for (0..count) |added| {
+        const strip_index = added * strip_cells / count;
+        const cell = CellCoord{ .x = @intCast(strip_index % side), .y = @intCast(first_row + strip_index / side) };
+        const mirror = CellCoord{ .x = side - 1 - cell.x, .y = side - 1 - cell.y };
+        std.debug.assert(routeBlockDistance(cell, center) >= 64 and routeBlockDistance(mirror, center) >= 64);
+        std.debug.assert(@max(@abs(@as(i32, cell.x) - mirror.x), @abs(@as(i32, cell.y) - mirror.y)) > 64);
+        try world.addLevelLink(.{
+            .kind = .teleport,
+            .level_a = 0,
+            .cell_a = cell,
+            .level_b = deepest,
+            .cell_b = mirror,
+            .traversal_cost = 1,
+            .bidirectional = true,
+        });
+    }
+    std.debug.assert(world.levelLinks().len == links_before + count);
+}
+
+// Adds `count` bidirectional random pads drawn from `random`: each from a level-0 cell at
+// least `random_pad_route_clearance` from the routes' block to an independent cell on
+// `deepest` at least `random_pad_min_span` away, so its span far exceeds its cost. Pads keep
+// off the first `avoid_chunks` level-0 chunks in row-major order and their point-mirror chunks
+// on `deepest` (the link-fold probe chunks).
+fn addRandomPads(world: *WorldSystem, random: std.Random, side: u16, deepest: u16, count: usize, avoid_chunks: usize) !void {
+    const center = side / 2;
+    const links_before = world.levelLinks().len;
+    const chunk_count = world.chunkCountPerLevel();
+    std.debug.assert(avoid_chunks <= chunk_count);
+    for (0..count) |_| {
+        var entrance: CellCoord = undefined;
+        while (true) {
+            entrance = .{ .x = random.uintLessThan(u16, side), .y = random.uintLessThan(u16, side) };
+            if (routeBlockDistance(entrance, center) >= random_pad_route_clearance and levelChunkIndex(world, entrance) >= avoid_chunks) break;
+        }
+        var exit: CellCoord = undefined;
+        while (true) {
+            exit = .{ .x = random.uintLessThan(u16, side), .y = random.uintLessThan(u16, side) };
+            if (@max(@abs(@as(i32, entrance.x) - exit.x), @abs(@as(i32, entrance.y) - exit.y)) >= random_pad_min_span and
+                levelChunkIndex(world, exit) < chunk_count - avoid_chunks) break;
+        }
+        try world.addLevelLink(.{
+            .kind = .teleport,
+            .level_a = 0,
+            .cell_a = entrance,
+            .level_b = deepest,
+            .cell_b = exit,
+            .traversal_cost = 1,
+            .bidirectional = true,
+        });
+    }
+    std.debug.assert(world.levelLinks().len == links_before + count);
 }
 
 // How a route group treats a route that did not solve within its cold step (its search
@@ -2484,28 +2690,25 @@ const EvictReaction = struct {
     stats: NavUpdateStats,
 };
 
-// The timed reactions' eviction stage shapes and main-thread share, printed under
-// --details: each stage's busiest batch, and the reaction minus its worker-side time.
-const EvictReport = struct {
+// Three stages' shapes in the timed nav reactions (each stage's busiest batch, then its
+// threaded and non-empty batch counts) and the reactions' main-thread share and split: each
+// reaction minus its worker-side stage time.
+const ReactionStages = struct {
     samples: usize = 0,
     timed_ns: u128 = 0,
     main_ns: u128 = 0,
     busiest: [3]BatchStats = @splat(.{}),
     threaded: [3]usize = @splat(0),
     dispatched: [3]usize = @splat(0),
-    visited: usize = 0,
-    evicted: usize = 0,
     nav_main: suite.NavMainSummary = .{},
 
-    fn add(self: *EvictReport, reaction: EvictReaction) void {
+    fn add(self: *ReactionStages, reaction: EvictReaction, batches: [3]BatchStats) void {
         self.samples += 1;
         self.timed_ns += reaction.elapsed_ns;
-        self.main_ns += reaction.elapsed_ns -| reaction.stats.off_main_stage_ns;
-        self.nav_main.add(reaction.elapsed_ns -| reaction.stats.off_main_stage_ns, reaction.stats);
+        const main_ns = reaction.elapsed_ns -| reaction.stats.off_main_stage_ns;
+        self.main_ns += main_ns;
+        self.nav_main.add(main_ns, reaction.stats);
         self.nav_main.endSample();
-        self.visited = reaction.stats.evict_entries_visited;
-        self.evicted = reaction.stats.evicted_results;
-        const batches = [_]BatchStats{ reaction.stats.evict_count_batch, reaction.stats.evict_batch, reaction.stats.evict_flush_batch };
         for (batches, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
             if (batch.item_count == 0) continue;
             dispatched.* += 1;
@@ -2515,13 +2718,41 @@ const EvictReport = struct {
         }
     }
 
-    fn print(self: EvictReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.timed_ns == 0) return;
-        var shapes: [3][48]u8 = undefined;
-        var labels: [3][]const u8 = undefined;
-        for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
+    // The stages' shapes, written into `shapes`.
+    fn labels(self: *const ReactionStages, shapes: *[3][48]u8) [3][]const u8 {
+        var stage_labels: [3][]const u8 = undefined;
+        for (self.busiest, self.threaded, self.dispatched, shapes, &stage_labels) |batch, threaded, dispatched, *buffer, *label| {
             label.* = stageShape(buffer, batch, threaded, dispatched);
         }
+        return stage_labels;
+    }
+
+    fn mainUsPerSample(self: ReactionStages) u64 {
+        return @intCast(self.main_ns / self.samples / std.time.ns_per_us);
+    }
+
+    fn mainPercent(self: ReactionStages) u64 {
+        return @intCast(self.main_ns * 100 / self.timed_ns);
+    }
+};
+
+// The timed reactions' eviction stage shapes and main-thread share, printed under
+// --details.
+const EvictReport = struct {
+    stages: ReactionStages = .{},
+    visited: usize = 0,
+    evicted: usize = 0,
+
+    fn add(self: *EvictReport, reaction: EvictReaction) void {
+        self.stages.add(reaction, .{ reaction.stats.evict_count_batch, reaction.stats.evict_batch, reaction.stats.evict_flush_batch });
+        self.visited = reaction.stats.evict_entries_visited;
+        self.evicted = reaction.stats.evicted_results;
+    }
+
+    fn print(self: EvictReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
+        if (!options.details or self.stages.timed_ns == 0) return;
+        var shapes: [3][48]u8 = undefined;
+        const labels = self.stages.labels(&shapes);
         var main_buffer: [320]u8 = undefined;
         std.debug.print("  {s} {} {s}: evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
             group_name,
@@ -2530,11 +2761,11 @@ const EvictReport = struct {
             labels[0],
             labels[1],
             labels[2],
-            @as(u64, @intCast(self.main_ns / self.samples / std.time.ns_per_us)),
-            @as(u64, @intCast(self.main_ns * 100 / self.timed_ns)),
+            self.stages.mainUsPerSample(),
+            self.stages.mainPercent(),
             self.visited,
             self.evicted,
-            suite.formatNavMainInto(&main_buffer, self.nav_main),
+            suite.formatNavMainInto(&main_buffer, self.stages.nav_main),
         });
     }
 };
@@ -4719,6 +4950,239 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     stats.candidate_pairs = config.rooms();
     return stats;
 }
+
+// Where a link-fold run's timed batches land.
+const LinkFoldAxis = enum(u8) {
+    // Uniformly over level 0 and the deepest level, as the background pads do.
+    uniform,
+    // In probe chunks of their own, each preloaded and kept off by the background pads.
+    probe,
+};
+
+fn linkFoldItemCode(axis: LinkFoldAxis, preload: usize, pads: usize) usize {
+    return @as(usize, @backingInt(axis)) * link_fold_axis_encoding + preload * link_fold_preload_encoding + pads;
+}
+
+// A link-fold item code: axis * 10^9 + probe preload per chunk * 10^6 + background pads.
+const LinkFoldConfig = struct {
+    axis: LinkFoldAxis,
+    // Pads ending in each probe chunk before its batch lands.
+    preload: usize,
+    // Random pads before the run, off the probe chunks.
+    pads: usize,
+
+    // Each field reads only its own digits. An unknown axis, a uniform run with a preload, or
+    // a uniform run with no pads is an error.
+    fn decode(item_count: usize) !LinkFoldConfig {
+        const axis_index = item_count / link_fold_axis_encoding;
+        const preload = item_count % link_fold_axis_encoding / link_fold_preload_encoding;
+        const pads = item_count % link_fold_preload_encoding;
+        if (axis_index > @backingInt(LinkFoldAxis.probe)) return error.LinkFoldUnknownAxis;
+        const axis: LinkFoldAxis = @fromBackingInt(@as(u8, @intCast(axis_index)));
+        if (axis == .uniform and preload != 0) return error.LinkFoldUniformPreload;
+        if (axis == .uniform and pads == 0) return error.LinkFoldNoPads;
+        return .{ .axis = axis, .preload = preload, .pads = pads };
+    }
+
+    // Probe chunk pairs a run of `samples` batches takes: one set per batch.
+    fn probePairs(self: LinkFoldConfig, samples: usize) usize {
+        return if (self.axis == .probe) samples * link_fold_probe_pairs else 0;
+    }
+
+    // The pads a run of `samples` batches leaves in the world.
+    fn padsAfter(self: LinkFoldConfig, samples: usize) usize {
+        return self.pads + self.probePairs(samples) * self.preload + samples * link_fold_batch;
+    }
+};
+
+fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const config = try LinkFoldConfig.decode(item_count);
+    var threads = try initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    // Every sample adds a batch, so the size check holds at the most pads the run holds.
+    const samples = options.warmup_iterations + options.iterations;
+    const peak_pads = config.padsAfter(samples);
+    var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count);
+    // Every pad is bidirectional.
+    size_config.oneway_links = 0;
+    if (suite.navSizeSkip(link_fold_group.name, item_count, case, size_config)) |skip| return skip;
+
+    var prng = std.Random.DefaultPrng.init(random_pad_seed);
+    const random = prng.random();
+    const probe_pairs = config.probePairs(samples);
+    var fixture = try initLinkFoldFixture(allocator, io, random, config, probe_pairs, navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    setNavReactionTuners(&fixture.system, case);
+    configureNavUpdateThreads(&fixture.system, case);
+    var batch: usize = 0;
+    for (0..options.warmup_iterations) |_| {
+        _ = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
+        batch += 1;
+    }
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var report = LinkFoldReport{};
+    for (0..options.iterations) |_| {
+        const sample = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
+        batch += 1;
+        accumulator.record(sample.reaction.elapsed_ns, fixture.system.graph.last_patch_batch);
+        report.add(sample, fixture.system.graph.last_plan_batch, fixture.system.graph.last_patch_batch, fixture.open.world.levelLinks().len);
+    }
+    const pads_held = fixture.open.world.levelLinks().len;
+    if (pads_held != peak_pads) return error.LinkFoldDrift;
+    report.print(options, link_fold_group.name, item_count, case);
+    var stats = accumulator.finish();
+    stats.output_count = pads_held;
+    stats.candidate_pairs = report.chunks_patched;
+    stats.nav_main = report.stages.nav_main;
+    stats.items_per_second = suite.itemsPerSecond(link_fold_batch, stats.mean_ns);
+    return stats;
+}
+
+// The link-fold world, with no requests: `config.pads` random pads off the first
+// `probe_pairs` probe chunk pairs, and `config.preload` pads joining each pair.
+fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+    var open = try buildOpenWorld(allocator, io, link_fold_side, link_fold_levels);
+    errdefer open.world.deinit();
+    const deepest = link_fold_levels - 1;
+    try addRandomPads(&open.world, random, link_fold_side, deepest, config.pads, probe_pairs);
+    try addProbePads(&open.world, random, deepest, 0, probe_pairs, config.preload);
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try allocator.alloc(PathRequest, 0);
+    errdefer allocator.free(requests);
+    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+}
+
+// Adds `per_pair` bidirectional pads to each probe chunk pair in `[first_pair, first_pair +
+// pairs)`: pair `p` joins level-0 chunk `p` (row-major) to its point-mirror chunk on
+// `deepest`, each pad between random cells of the two. Fails when a pad's span falls under
+// `random_pad_min_span`, so a pad never reads as a short link.
+fn addProbePads(world: *WorldSystem, random: std.Random, deepest: u16, first_pair: usize, pairs: usize, per_pair: usize) !void {
+    const chunks_x: usize = world.chunksX();
+    const chunks_y: usize = world.chunksY();
+    const tiles = world.chunk_size_tiles;
+    if (first_pair + pairs > chunks_x * chunks_y) return error.LinkFoldProbeTooMany;
+    for (first_pair..first_pair + pairs) |pair| {
+        const entrance_chunk = CellCoord{ .x = @intCast(pair % chunks_x), .y = @intCast(pair / chunks_x) };
+        const exit_chunk = CellCoord{ .x = @intCast(chunks_x - 1 - entrance_chunk.x), .y = @intCast(chunks_y - 1 - entrance_chunk.y) };
+        for (0..per_pair) |_| {
+            const entrance = CellCoord{ .x = entrance_chunk.x * tiles + random.uintLessThan(u16, tiles), .y = entrance_chunk.y * tiles + random.uintLessThan(u16, tiles) };
+            const exit = CellCoord{ .x = exit_chunk.x * tiles + random.uintLessThan(u16, tiles), .y = exit_chunk.y * tiles + random.uintLessThan(u16, tiles) };
+            if (@max(@abs(@as(i32, entrance.x) - exit.x), @abs(@as(i32, entrance.y) - exit.y)) < random_pad_min_span) return error.LinkFoldProbeSpan;
+            try world.addLevelLink(.{
+                .kind = .teleport,
+                .level_a = 0,
+                .cell_a = entrance,
+                .level_b = deepest,
+                .cell_b = exit,
+                .traversal_cost = 1,
+                .bidirectional = true,
+            });
+        }
+    }
+}
+
+// One timed link-fold reaction and the chunks it touched: the batch's distinct endpoint
+// chunks and the link endpoints they hold after it.
+const LinkFoldSample = struct {
+    reaction: EvictReaction,
+    touched_chunks: usize,
+    touched_endpoints: usize,
+};
+
+// Adds batch `batch`'s `link_fold_batch` pads to the world (untimed): uniform random pads, or
+// `link_fold_probe_pairs` probe pairs of its own on the probe axis. Then times the post-commit
+// nav reaction that applies them and counts the touched chunks' endpoints untimed. Fails
+// unless the reaction applied every pad in one marks batch and patched exactly the touched
+// chunks.
+fn foldPadBatch(io: std.Io, fixture: *EvictFixture, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, batch: usize, thread_system: ?*ThreadSystem) !LinkFoldSample {
+    const world = &fixture.open.world;
+    const graph = &fixture.system.graph;
+    const applied_before = graph.links_applied;
+    std.debug.assert(applied_before == world.levelLinks().len);
+    const deepest = link_fold_levels - 1;
+    switch (config.axis) {
+        .uniform => try addRandomPads(world, random, link_fold_side, deepest, link_fold_batch, 0),
+        .probe => {
+            const first_pair = batch * link_fold_probe_pairs;
+            if (first_pair + link_fold_probe_pairs > probe_pairs) return error.LinkFoldProbeTooFew;
+            try addProbePads(world, random, deepest, first_pair, link_fold_probe_pairs, link_fold_batch / link_fold_probe_pairs);
+        },
+    }
+    fixture.frame.beginStep();
+    const version_before = graph.version;
+    const start_ns = suite.nowNs(io);
+    const stats = try fixture.system.reactToPostCommitNavEvents(&fixture.frame, &fixture.colliders, world, thread_system);
+    const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
+    if (stats.incremental_rebuilds != 1) return error.LinkFoldNoBatch;
+    if (graph.version != version_before) return error.LinkFoldRebuiltNav;
+    if (graph.links_applied != applied_before + link_fold_batch) return error.LinkFoldPadsPending;
+    var sample = LinkFoldSample{ .reaction = .{ .elapsed_ns = elapsed, .stats = stats }, .touched_chunks = 0, .touched_endpoints = 0 };
+    // Each endpoint's chunk as level << 32 | level-local chunk index, sorted so repeats sit together.
+    var keys: [2 * link_fold_batch]u64 = undefined;
+    for (world.levelLinks()[applied_before..], 0..) |link, index| {
+        keys[2 * index] = @as(u64, link.level_a) << 32 | levelChunkIndex(world, link.cell_a);
+        keys[2 * index + 1] = @as(u64, link.level_b) << 32 | levelChunkIndex(world, link.cell_b);
+    }
+    std.mem.sort(u64, &keys, {}, std.sort.asc(u64));
+    for (keys, 0..) |key, index| {
+        if (index != 0 and keys[index - 1] == key) continue;
+        sample.touched_chunks += 1;
+        // In range: the level and the level-local chunk index were packed above.
+        sample.touched_endpoints += world.levelChunkLinkEndpointCount(@intCast(key >> 32), @intCast(key & std.math.maxInt(u32)));
+    }
+    if (stats.chunks_patched != sample.touched_chunks) return error.LinkFoldPatchShape;
+    return sample;
+}
+
+// The timed link-fold reactions' plan, patch, and connectivity gather shapes and main-thread
+// share and split, the chunks the last reaction patched, the endpoints of the chunks the
+// reactions touched summed with those chunks, and the pads held after each reaction, summed.
+const LinkFoldReport = struct {
+    stages: ReactionStages = .{},
+    chunks_patched: usize = 0,
+    touched_chunks: usize = 0,
+    touched_endpoints: usize = 0,
+    pads_held: usize = 0,
+
+    fn add(self: *LinkFoldReport, sample: LinkFoldSample, plan: BatchStats, patch: BatchStats, pads_held: usize) void {
+        self.stages.add(sample.reaction, .{ plan, patch, sample.reaction.stats.conn_gather_batch });
+        self.chunks_patched = sample.reaction.stats.chunks_patched;
+        self.touched_chunks += sample.touched_chunks;
+        self.touched_endpoints += sample.touched_endpoints;
+        self.pads_held += pads_held;
+    }
+
+    fn print(self: LinkFoldReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
+        const stages = self.stages;
+        if (!options.details or stages.timed_ns == 0) return;
+        var shapes: [3][48]u8 = undefined;
+        const labels = stages.labels(&shapes);
+        var main_buffer: [320]u8 = undefined;
+        const endpoints_x10 = self.touched_endpoints * 10 / self.touched_chunks;
+        const pad_samples = stages.samples * link_fold_batch;
+        std.debug.print("  {s} {} {s}: plan={s} patch={s} conn_gather={s} per_pad={}ns commit_per_pad={}ns endpoints_per_touched_chunk={}.{} pads_held_mean={} main={}us ({}%) patched={}{s}\n", .{
+            group_name,
+            item_count,
+            case.name,
+            labels[0],
+            labels[1],
+            labels[2],
+            @as(u64, @intCast(stages.timed_ns / pad_samples)),
+            stages.nav_main.sections.commit_ns / pad_samples,
+            endpoints_x10 / 10,
+            endpoints_x10 % 10,
+            self.pads_held / stages.samples,
+            stages.mainUsPerSample(),
+            stages.mainPercent(),
+            self.chunks_patched,
+            suite.formatNavMainInto(&main_buffer, stages.nav_main),
+        });
+    }
+};
 
 fn appendRequest(stream: *RangeOutputStream(PathRequest), request: PathRequest) !void {
     const range_base = try stream.appendRangeCounts(1);

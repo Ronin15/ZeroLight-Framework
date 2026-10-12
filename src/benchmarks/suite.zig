@@ -859,7 +859,8 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-pan")) return "(resident layers * 10^9 + window edge chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-level-enter")) return "(resident layers * 10^9 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(replace case * 10^7 + level side * 1000 + levels)";
-    if (std.mem.eql(u8, group_name, "pathfinding-cross-level-teleport")) return "(teleports * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "pathfinding-cross-level-teleport")) return "(layout * 10^12 + teleports * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "pathfinding-link-fold")) return "(axis * 10^9 + probe preload per chunk * 10^6 + random pads before the run)";
     if (std.mem.eql(u8, group_name, "pathfinding-level-size") or std.mem.startsWith(u8, group_name, "pathfinding-cross-level-")) return "(level side * 1000 + levels)";
     if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
     return "items";
@@ -1824,6 +1825,11 @@ pub const NavSizeConfig = struct {
     /// per cached result; the default charges every cached result. A fixture whose paths
     /// all fit inline passes 0 and checks that no long block was taken.
     long_results: usize = std.math.maxInt(usize),
+    /// One-way links among `links`, clamped to it: the one-way closure is charged for these
+    /// only, since a bidirectional link joins its endpoints both ways and holds no closure
+    /// row; every link keeps its one-way registry entry. The default charges every link as
+    /// one-way.
+    oneway_links: usize = std.math.maxInt(usize),
 };
 
 /// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
@@ -1832,7 +1838,8 @@ pub const NavSizeConfig = struct {
 /// the tier-1 corridor pool, group fields, the result cache with the long-block pages of
 /// `long_results`, the path registry, the goal table, and reachability (connectivity node,
 /// comp, and root pools with the flood's buffers, and the one-way closure's links,
-/// terminals, H-components, and arena, every link charged as one-way). Search scratch and
+/// terminals, H-components, and arena for `oneway_links`, and a one-way registry entry per
+/// link). Search scratch and
 /// group fields are sized by their node and cell budgets, never by level cells.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
@@ -1902,7 +1909,10 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     // its border flags and the endpoints one chunk's cells can hold.
     const nodes = levels * chunks * max_border_portals + 2 * config.links;
     const chunk_endpoints = @min(2 * config.links, chunk_tiles * chunk_tiles);
-    const reachability = reachabilityBytesBound(nodes, config.links, participants, max_border_portals + chunk_endpoints);
+    // The bound charges the one-way registry entry for its one-way links only; every link holds one.
+    const oneway_links = @min(config.oneway_links, config.links);
+    const oneway_registry = (config.links - oneway_links) * @sizeOf(u32);
+    const reachability = reachabilityBytesBound(nodes, oneway_links, participants, max_border_portals + chunk_endpoints) + oneway_registry;
     return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results + registry + goal_table + reachability;
 }
 
@@ -2248,6 +2258,23 @@ test "batch modes align to cache-line item boundaries" {
     const large = default_cases[5].itemsPerRange(16).?;
     try std.testing.expectEqual(@as(usize, 32), small);
     try std.testing.expectEqual(@as(usize, 256), large);
+}
+
+test "nav storage charges the one-way closure for one-way links only, every link by default" {
+    const base = NavSizeConfig{ .side = 256, .levels = 2, .links = 4096, .participant_count = 1, .agent_budget = 8, .group_fields = 1 };
+    var two_way = base;
+    two_way.oneway_links = 0;
+    var all_oneway = base;
+    all_oneway.oneway_links = base.links;
+    var past_all = base;
+    past_all.oneway_links = 2 * base.links;
+    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(all_oneway));
+    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(past_all));
+    try std.testing.expectEqual(
+        navStorageBytes(base) - navStorageBytes(two_way),
+        // The two-way links keep their one-way registry entries.
+        reachabilityBytesBound(0, base.links, 1, 0) - reachabilityBytesBound(0, 0, 1, 0) - base.links * @sizeOf(u32),
+    );
 }
 
 test "nav storage charges the long-block pages of the long results, at most the pages of one per cached result" {
