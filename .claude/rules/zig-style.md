@@ -26,7 +26,7 @@ paths:
   bitsets (`std.bit_set`), sorts, searches, hashing, and parsing. Write your own
   only when std has no API for the job or a bench shows it beats std on a hot
   path; state that reason at the site. Code that duplicates std without that
-  reason is replaced with the std version when its file is next touched.
+  reason is replaced with the std version as soon as it is found.
 - Current spellings (`idiom-lint` enforces most):
   - `std.ArrayList` (unmanaged, `.empty`), never `std.ArrayListUnmanaged` or
     managed constructors.
