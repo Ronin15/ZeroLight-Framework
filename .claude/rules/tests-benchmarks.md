@@ -12,8 +12,9 @@ paths:
 - Tests are `test` blocks beside their code, named by behavior.
 - Prefer focused window-free contract tests; display/GPU checks belong in
   `gpu-smoke`.
-- A fix ships with a test that fails with the fix reverted. Never drop a proof
-  test or `FailingAllocator` proof to save time.
+- A fix ships with a test that would fail without it, judged from the code,
+  never by revert-and-rerun runs. Never drop a proof test or
+  `FailingAllocator` proof to save time.
 - Terrain contract tests cover a multi-chunk one-step change and repeated
   dig/fill.
 - An incremental path (nav patch, terrain or link change) gets an

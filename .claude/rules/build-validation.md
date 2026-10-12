@@ -4,9 +4,10 @@ Commands and options: `docs/development-workflow.md`.
 
 - Validation cadence:
   - while iterating: `zig build check`;
-  - per commit: `check` + `test` + `idiom-lint`;
-  - once per batch, and before a slice or broad change is complete:
-    `zig build verify`;
+  - per commit: `check` + `idiom-lint` + only the tests of the code it
+    touches (`zig build test -Dtest-filter=<module>`), nothing more;
+  - before a slice's or branch's final commit: the full `zig build test`
+    (inside `zig build verify`);
   - after shader source or shader wiring changes: `zig build shaders`;
   - `gpu-smoke` only when display/GPU validation is relevant and a display
     exists; otherwise report it as not run;

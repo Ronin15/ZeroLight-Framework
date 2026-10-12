@@ -165,8 +165,11 @@ pub fn build(b: *std.Build) void {
     });
 
     const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
+    // Repeatable; only tests whose names contain one of these texts compile and run.
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
     const unit_tests = b.addTest(.{
         .root_module = unitTestsModule,
+        .filters = test_filters,
     });
 
     // Ship/package mode: full LTO (`-flto=full`) for cross-module inlining and

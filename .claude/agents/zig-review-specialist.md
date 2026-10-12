@@ -80,8 +80,8 @@ model; routes to design) or **local**.
    construction or a precondition assert the rules allow is not a finding.
 4. **Tests**: for a weak test, name the untested contract and a narrow
    scenario that would expose a regression. For each new test, name the
-   mutation it catches; one that passes with the change reverted is a
-   finding. A threaded stage needs a test proving it ran on workers; an
+   mutation it catches, from the code; one that would pass with the change
+   reverted is a finding. A threaded stage needs a test proving it ran on workers; an
    inline run proves no threaded parity. The bench reports the threaded
    case's main-thread share, and main's time per item stays flat across sizes.
    A change path whose named cost-driver stage has no `runtime_perf_log`
