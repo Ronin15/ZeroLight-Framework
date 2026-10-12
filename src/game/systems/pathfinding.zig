@@ -24,6 +24,7 @@ pub const PathView = @import("pathfinding/types.zig").PathView;
 pub const PathStatus = @import("pathfinding/types.zig").PathStatus;
 pub const NavCellEdit = @import("pathfinding/types.zig").NavCellEdit;
 pub const NavUpdateStats = @import("pathfinding/types.zig").NavUpdateStats;
+pub const GoalResolveStats = @import("pathfinding/types.zig").GoalResolveStats;
 pub const PathfindingConfig = @import("pathfinding/types.zig").PathfindingConfig;
 pub const pathfinding_range_alignment_items = @import("pathfinding/types.zig").pathfinding_range_alignment_items;
 pub const default_max_fallback_requests_per_step = @import("pathfinding/types.zig").default_max_fallback_requests_per_step;
@@ -38,6 +39,7 @@ test {
     _ = @import("pathfinding/nav_graph.zig");
     _ = @import("pathfinding/connectivity.zig");
     _ = @import("pathfinding/caches.zig");
+    _ = @import("pathfinding/goal_table.zig");
     _ = @import("pathfinding/solve.zig");
     _ = @import("pathfinding/system.zig");
     _ = @import("pathfinding/test_support.zig");

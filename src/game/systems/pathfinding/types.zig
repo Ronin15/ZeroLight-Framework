@@ -174,7 +174,7 @@ pub const default_tier0_stitched_attempt_cap: usize = default_max_stitched_path_
 // request that still exhausts the tier-1 budget is genuinely hard for THIS fixed
 // budget, not "this particular map is big" — see PendingRequest.tier and
 // compactPendingAfterSolve's budget_exhausted handling, which drops such a request to
-// `.missing` (retryable later, NOT a false negative) rather than growing the budget.
+// `.missing` (retryable later, never `.unavailable`) rather than growing the budget.
 pub const default_tier1_abstract_node_cap: usize = default_max_abstract_nodes * 4;
 pub const default_tier1_stitched_cell_cap: usize = default_max_stitched_path_cells * 4;
 /// Link pairs (entrance box, exit box, least cost) in a nav graph's long-link summary: a
@@ -326,12 +326,10 @@ pub const NavUpdateStats = struct {
     evict_count_batch: BatchStats = .{},
     evict_batch: BatchStats = .{},
     evict_flush_batch: BatchStats = .{},
-    // Registry entries the halo walk visited, the cached results it evicted, the negatives
-    // the dirty keys' lists evicted (and a level add's world negatives), and the group fields
-    // a changed cell next to a costed cell dropped.
+    // Registry entries the halo walk visited, the cached results it evicted, and the group
+    // fields a changed cell next to a costed cell dropped.
     evict_entries_visited: usize = 0,
     evicted_results: usize = 0,
-    evicted_negatives: usize = 0,
     dropped_fields: usize = 0,
     // The connectivity stages of the level builds and the marks batch, summed: the seed over
     // changed keys, the gather over patch keys and new links, and the flood over its searches
@@ -517,6 +515,19 @@ pub const PathQueryKey = struct {
     goal: GridCell,
 };
 
+/// How an agent class moves over nav. Each traversal owns one nav graph (grid plus
+/// connectivity); classes that move alike share it.
+pub const TraversalClass = enum(u8) {
+    walk,
+};
+
+/// The traversal of `class`. Exhaustive, so a new class does not compile until it is mapped.
+pub fn traversalOf(class: PathAgentClass) TraversalClass {
+    return switch (class) {
+        .default => .walk,
+    };
+}
+
 pub const PathfindingCapacity = struct {
     // NOTE: this type doubles as both the caller-supplied base config (passed to
     // reserve()/applyDerivedCapacity) AND the internal derived-capacity storage
@@ -633,20 +644,20 @@ pub const PathfindingStats = struct {
     // was already reached this step (they simply wait for a later step).
     escalated_solves: usize = 0,
     escalated_deferred: usize = 0,
-    // A tier-1 attempt that still exhausted its (fixed) budget: dropped from pending
-    // WITHOUT negative-caching, so the next query falls through to `.missing` (retryable
-    // later) rather than a false definitive `.unavailable`. See compactPendingAfterSolve.
+    // A tier-1 attempt that still exhausted its (fixed) budget: dropped from pending, so
+    // the next query falls through to `.missing` (retryable later) rather than a false
+    // `.unavailable`. See compactPendingAfterSolve.
     escalated_dropped: usize = 0,
-    // Start-side solve failures dropped without negative-caching (see
-    // PathSolveResult.start_invalid).
+    // Start-side solve failures dropped from pending (see PathSolveResult.start_invalid).
     start_invalid_dropped: usize = 0,
-    // Failed solves answered for their request only, never cached (see
-    // PathSolveResult.start_unreachable); counted in `unavailable_results` too.
-    start_unreachable: usize = 0,
-    // Proven negatives claimed into the negative cache, and those proven after a search
-    // exhausted its budget.
-    negatives_published: usize = 0,
-    negatives_proven_after_exhaustion: usize = 0,
+    // Requests and solves answered unavailable because the start cannot reach the goal, or
+    // no open goal cell lies within the projection radius; never cached, never searched.
+    // Counted in `unavailable_results` too.
+    reach_unavailable: usize = 0,
+    // Intake requests whose blocked goal the step's goal table did not hold, so intake
+    // projected it itself.
+    goal_fallbacks: usize = 0,
+    // Accepted requests whose goal cell was blocked (their live goal is its projection).
     goal_projected: usize = 0,
     group_fields_built: usize = 0,
     group_field_reuses: usize = 0,
@@ -677,12 +688,10 @@ pub const PathfindingStats = struct {
     publish_copy_batch: BatchStats = .{},
     registry_flush_batch: BatchStats = .{},
     resize_copy_batch: BatchStats = .{},
-    // Path registry entries added and removed by this update's flush, the negative
-    // registry's, and both registries' shard storage growths.
+    // Path registry entries added and removed by this update's flush, and the registry's
+    // shard storage growths.
     registrations_added: usize = 0,
     registrations_removed: usize = 0,
-    negative_registrations_added: usize = 0,
-    negative_registrations_removed: usize = 0,
     registry_grows: usize = 0,
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
@@ -696,6 +705,18 @@ pub const PathfindingStats = struct {
     }
 };
 
+/// One step's goal resolve (`PathfindingSystem.resolveGoals`): the intents scanned, those
+/// whose goal cell was blocked, the distinct blocked goals the table holds, the projections
+/// computed (one per distinct goal), and the scan and project stage batches.
+pub const GoalResolveStats = struct {
+    intents: usize = 0,
+    blocked: usize = 0,
+    distinct: usize = 0,
+    projections: usize = 0,
+    scan_batch: BatchStats = .{},
+    project_batch: BatchStats = .{},
+};
+
 // A distinct group goal and how many agents declared it this step; the count
 // gates flow-field building.
 pub const GroupRequestTally = struct {
@@ -705,23 +726,19 @@ pub const GroupRequestTally = struct {
 
 /// One classified request of the `path_intake` stage, written into its range's window
 /// of the item-capacity record buffer: a candidate (its range's repeats folded in), or an
-/// expired result or negative to remove. Classified against step-start state only; the
-/// main-thread merge resolves expiry, in-step duplicates, and the pending cap in request
-/// order.
+/// expired result to remove. Classified against step-start state only; the main-thread
+/// merge resolves expiry, in-step duplicates, and the pending cap in request order.
 pub const IntakeRecord = struct {
     entity: EntityId,
     key: PathQueryKey,
     start_level: u16,
     start: GridCell,
-    // Projected open goal cell (`no_parent` when projection found none).
-    goal_index: usize,
     // The key's cached result was expired at step start: the merge removes it.
     expired: bool,
-    // The key's negative was expired at step start: the merge removes it.
-    expired_negative: bool,
-    // Not served by a group field or a cache and not pending at step start.
+    // Not served by a group field, a cache, or a reach answer, and not pending at step
+    // start.
     candidate: bool,
-    // The goal was blocked and projected to an open cell.
+    // The goal cell was blocked: its live goal is its projection.
     projected: bool,
     // Later candidate requests for the same key in this range, folded into this record.
     repeats: usize,
@@ -735,9 +752,9 @@ pub const GroupKeyCount = struct {
     count: usize,
 };
 
-/// One intake range's counts, written once by its job.
+/// One intake range's counts, written once by its job; on its own cache lines.
 pub const IntakeTally = struct {
-    record_count: usize = 0,
+    record_count: usize align(thread_shared_record_alignment) = 0,
     group_key_count: usize = 0,
     dropped_requests: usize = 0,
     duplicate_requests: usize = 0,
@@ -745,6 +762,8 @@ pub const IntakeTally = struct {
     available_results: usize = 0,
     unavailable_results: usize = 0,
     group_field_samples: usize = 0,
+    reach_unavailable: usize = 0,
+    goal_fallbacks: usize = 0,
 };
 
 /// Intake range alignment: a multiple of the SIMD lane count at which every range's
@@ -766,19 +785,13 @@ pub const PendingRequest = struct {
     start_level: u16,
     // Representative start cell for the single A* solve run for this goal key.
     start: GridCell,
-    // Projected open goal cell index (the original goal may be blocked).
-    // `no_parent` means projection found no open cell near the goal: a
-    // definitive unavailable.
-    goal_index: usize,
     // Two-tier retry ladder: 0 is the first (cheap, fixed-budget) attempt; a
     // budget_exhausted at tier 0 promotes to tier 1 (a larger but still FIXED
     // abstract-node/stitched-cell ceiling — never derived from world/graph size) and
     // rotates to the back of pending once. A budget_exhausted AT tier 1 drops the
-    // request WITHOUT negative-caching (not a definitive negative, just "doesn't fit
-    // either fixed budget") — worst case exactly two solve attempts per request, never
-    // the old unbounded retry storm, and never a false `.unavailable` for a goal that
-    // may genuinely be reachable. Reset implicitly: a solved or dropped entry leaves
-    // pending entirely.
+    // request (not `.unavailable`: the goal is reachable, it just did not fit either fixed
+    // budget) — worst case exactly two solve attempts per request. Reset implicitly: a
+    // solved or dropped entry leaves pending entirely.
     tier: u8 = 0,
 };
 
@@ -981,32 +994,18 @@ pub const RegRecord = struct {
     order: u32,
 };
 
-/// Per dirty key of an eviction. Its hit window at `base` holds its path hits (`bound`
-/// at most), then its negative hits (`negative_bound` at most), then its group-field hits
-/// (one slot per field for a changed key). `visited` counts the path registry entries
-/// walked. `changed_index` is its index in the batch's changed keys (`no_changed_index`:
-/// a link-only key). `owned` holds the registered halo keys it owns (bit
-/// `(dy + 1) * 3 + (dx + 1)`) and the coarser negative lists it walks
-/// (`evict_owns_superchunk`, `evict_owns_level`, `evict_owns_world`).
+/// Per changed key of an eviction, at its index in the batch's changed keys. Its hit window
+/// at `base` holds its path hits (`bound` at most), then its group-field hits (one slot per
+/// field). `visited` counts the path registry entries walked. `owned` holds the registered
+/// halo keys it owns (bit `(dy + 1) * 3 + (dx + 1)`).
 pub const EvictItem = struct {
     bound: u32 = 0,
     base: u32 = 0,
     hits: u32 = 0,
     visited: u32 = 0,
-    negative_bound: u32 = 0,
-    negative_hits: u32 = 0,
     field_hits: u32 = 0,
-    changed_index: u32 = no_changed_index,
     owned: u16 = 0,
 };
-
-/// `EvictItem.changed_index` of a dirty key that is no changed key.
-pub const no_changed_index: u32 = std.math.maxInt(u32);
-/// `EvictItem.owned` bits of the dirty key that walks its superchunk's, its level's, and
-/// the world's negative lists: the first of the batch's dirty keys in each.
-pub const evict_owns_superchunk: u16 = 1 << 9;
-pub const evict_owns_level: u16 = 1 << 10;
-pub const evict_owns_world: u16 = 1 << 11;
 
 /// Eviction range alignment: every range's items start on a cache line.
 pub const evict_range_alignment_items: usize = 16;
@@ -1016,7 +1015,7 @@ pub const hit_window_alignment_items: usize = thread_shared_record_alignment / @
 
 comptime {
     std.debug.assert(@sizeOf(RegRecord) == 16);
-    std.debug.assert(@sizeOf(EvictItem) == 36);
+    std.debug.assert(@sizeOf(EvictItem) == 24);
     std.debug.assert((@sizeOf(EvictItem) * evict_range_alignment_items) % thread_shared_record_alignment == 0);
 }
 
@@ -1033,43 +1032,24 @@ pub const PathResult = struct {
     // an abstract chunk/cross-level corridor, whose full obstacle-aware path is
     // stitched from per-segment local A* and walked per-agent on its current level.
     stitched_len: u32 = 0,
+    // The path's last cell: its stitched path's, or its plain path's on `path_level`.
+    end: StitchedCell,
 };
 
 pub const PathSolveResult = union(enum) {
     // Successful solve; its solved path sits at the same fallback ordinal.
     available: PathQueryKey,
+    // The start cannot reach the goal, or no open goal cell lies within the projection
+    // radius: answered for the request, never cached and never searched.
     unavailable: PathQueryKey,
     deferred: PathQueryKey,
     // Budget spill: request stays pending; counted as budget-exhausted.
     budget_exhausted: PathQueryKey,
     // Start-side failure (blocked/off-grid representative start, unseedable start
     // component): a property of the representative agent, not of the goal. Dropped
-    // from pending WITHOUT negative-caching — the goal-keyed negative cache is
-    // shared by every agent, so caching this would poison the goal for all of them.
-    // The next status query falls through to `.missing` (retryable).
+    // from pending, never cached; the next status query falls through to `.missing`
+    // (retryable).
     start_invalid: PathQueryKey,
-    // A failed search no proof extends past this start: answered unreachable for this
-    // request only and dropped from pending WITHOUT negative-caching, so the next status
-    // query reads `.missing` and the requester re-requests.
-    start_unreachable: PathQueryKey,
-};
-
-/// The chunk box a cached negative's proof leaves out, on one level, inclusive: the
-/// negative answers every start outside it. The empty box holds for every start.
-pub const Enclosure = struct {
-    level: u16 = 0,
-    min_x: u32 = 1,
-    min_y: u32 = 1,
-    max_x: u32 = 0,
-    max_y: u32 = 0,
-
-    pub const every_start: Enclosure = .{};
-
-    /// Whether a start in chunk (`chunk_x`, `chunk_y`) of `level` lies in the box, so the
-    /// negative does not answer it.
-    pub fn excludes(self: Enclosure, level: u16, chunk_x: u32, chunk_y: u32) bool {
-        return level == self.level and chunk_x >= self.min_x and chunk_x <= self.max_x and chunk_y >= self.min_y and chunk_y <= self.max_y;
-    }
 };
 
 pub const OpenNode = struct {

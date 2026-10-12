@@ -19,15 +19,20 @@ How it works: `docs/architecture.md` (pathfinding sections).
 - Path results are consumed on later steps and never stall same-step movement.
 - Cache and pending keys are goal-keyed (`nav_version`, `agent_class`,
   `goal_level`, `goal_cell`).
-- Never negative-cache a budget exhaustion unless the goal's enclosure is
-  proven; `unavailable` means a definitive negative only. An exhausted budget
-  defers deterministically, never returning a partial path as complete.
+- Reachability is maintained at every nav batch as connectivity IDs plus a
+  one-way reach closure, and answered in O(1) at intake, status, and solve.
+  It is never cached and never discovered by a failed search. `unavailable`
+  means start and goal are unreachable or no open goal cell lies within the
+  projection radius. An exhausted budget is never `unavailable`: it defers
+  deterministically and never returns a partial path as complete.
 - `PathfindingSystem` owns the post-commit nav reaction end to end.
 - Re-derive touched chunks whole from the world; the dirty buffer grows, never
   drops.
 - Graph node ids are internal: they never persist across steps and are never
   cache or pending keys; caches and results hold cells, so a patch may lay out
   the chunks it touches freely.
+- Connectivity IDs are internal to the graph: they change only in nav batches
+  and are never cache, pending, or save keys.
 - A local nav change never invalidates cached results world-wide; a version
   bump is reserved for changes that can invalidate every result.
 - Identical link sets yield identical layouts in incremental and full builds;

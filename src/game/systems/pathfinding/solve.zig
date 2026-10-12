@@ -23,12 +23,10 @@ const max_link_box_coord = @import("nav_graph.zig").max_link_box_coord;
 const AbstractScratch = @import("scratch.zig").AbstractScratch;
 const AbstractSlot = @import("scratch.zig").AbstractSlot;
 const CorridorScratch = @import("scratch.zig").CorridorScratch;
-const ChunkBox = @import("scratch.zig").ChunkBox;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const chunk_list_map = @import("../chunk_list_map.zig");
 const chunkKey = chunk_list_map.chunkKey;
 const types = @import("types.zig");
-const Enclosure = types.Enclosure;
 const GridCell = types.GridCell;
 const PathSolveResult = types.PathSolveResult;
 const CellCursor = types.CellCursor;
@@ -103,32 +101,35 @@ const LocalSolve = enum { found, budget_exhausted, none };
 // (see default_max_stitch_segments) — not just one, since a corridor can cross many
 // portals — each capped at the per-segment local budget, independent of total cells.
 /// Solves logical pending entry `pending_index`, writing its solved path at `ordinal`
-/// (its fallback ordinal: result slot, solved-path slot, and path stripe).
+/// (its fallback ordinal: result slot, solved-path slot, and path stripe). The live goal and
+/// reach come before any search: a goal no open start reaches is `.unavailable` with no
+/// search, and once reach holds no search ends without a path.
 pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *SearchScratch, ordinal: usize) PathSolveResult {
     const graph = &system.graph;
     const request = system.pending.at(pending_index);
-    if (!graph.valid()) return publishNegative(system, ordinal, request.key, NegativeKeys.world, Enclosure.every_start, false);
+    if (!graph.valid()) return .{ .unavailable = request.key };
     // Every local search of this solve clamps to the committed node budget, as the
     // abstract and stitched searches clamp theirs: a plain path then fits its stripe, and
     // every participant spills at the same count even when a failed re-reserve left
     // scratch tables at different limits.
     scratch.explored_budget = @min(system.capacity.max_explored_nodes, scratch.explored_limit);
 
-    // Start-side failures are start_invalid, never unavailable: the negative cache is
-    // goal-keyed and shared, so a blocked/off-grid representative start (e.g. an agent
-    // momentarily overlapping a body) must not mark the goal unavailable for everyone.
+    // Start-side failures are start_invalid, a property of the representative agent (e.g.
+    // one momentarily overlapping a body), never of the goal.
     const start_grid = graph.grid(request.start_level) orelse return .{ .start_invalid = request.key };
-    const goal_grid = graph.grid(request.key.goal_level) orelse return publishNegative(system, ordinal, request.key, NegativeKeys.world, Enclosure.every_start, false);
+    const goal_grid = graph.grid(request.key.goal_level) orelse return .{ .unavailable = request.key };
     const start_index = start_grid.indexForCell(request.start) orelse return .{ .start_invalid = request.key };
-    if (start_grid.isBlockedIndex(start_index)) return .{ .start_invalid = request.key };
 
-    // The goal against the grid now: a nav change since acceptance may have blocked the
-    // accepted projection or opened the key's own cell. No open cell within the projection
-    // radius is a negative for every start until a cell of that window changes.
-    const goal_index = currentGoal(goal_grid, request) orelse {
-        const window = goalWindow(goal_grid, request.key.goal, default_goal_projection_radius);
-        return publishNegative(system, ordinal, request.key, NegativeKeys.cover(request.key.goal_level, window, chunkCounts(graph)), Enclosure.every_start, false);
-    };
+    // The goal against the grid now (a nav change since acceptance may have moved it), and
+    // reach from this start: an accepted request whose goal became unreachable answers
+    // without a search. A blocked start is start_invalid whatever the goal.
+    const goal_index = system.liveGoal(request.key, goal_grid).cell orelse
+        return if (start_grid.isBlockedIndex(start_index)) .{ .start_invalid = request.key } else .{ .unavailable = request.key };
+    switch (system.reaches(request.key.agent_class, request.start_level, start_index, request.key.goal_level, goal_index)) {
+        .start_blocked => return .{ .start_invalid = request.key },
+        .unreachable_goal => return .{ .unavailable = request.key },
+        .reaches => {},
+    }
 
     const same_level = request.start_level == request.key.goal_level;
     if (same_level) {
@@ -146,7 +147,7 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
                 // Budget spill on a short same-component hop is a transient: keep
                 // it pending so a later frame retries rather than mislabeling it.
                 .budget_exhausted => return .{ .budget_exhausted = request.key },
-                .none => return .{ .start_unreachable = request.key },
+                .none => return reachContractBreak(request.key),
             }
         }
         // Same level but different component: NavGrid components are CHUNK-LOCAL (a flood
@@ -169,6 +170,13 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
     return solveAbstract(system, scratch, corridor, ordinal, request, start_grid, goal_grid, start_index, goal_index, abstract_node_cap, stitched_cell_cap, system.capacity.max_stitch_segments);
 }
 
+// A search that ended without a path after reach held: reach and the searches disagree.
+// Panics under runtime safety; a release build drops the request as start_invalid.
+fn reachContractBreak(key: PathQueryKey) PathSolveResult {
+    if (std.debug.runtime_safety) @panic("pathfinding: a search after reach found no path");
+    return .{ .start_invalid = key };
+}
+
 // The tier-1 pool entry `prepareSolvePhase` assigned to the escalated solve at `ordinal`.
 fn tier1Corridor(system: *PathfindingSystem, ordinal: usize) *CorridorScratch {
     const tier1_slot = system.fallback_tier1_slot.items[ordinal];
@@ -182,8 +190,8 @@ fn tier1Corridor(system: *PathfindingSystem, ordinal: usize) *CorridorScratch {
 // concatenated into one grid-adjacent (level,cell) path, with a discrete jump only
 // across an inter-level link. The query walks that path per-agent on its current
 // level, so every heading is to a traversable neighbor. Saturating the abstract
-// scratch or a segment's node budget spills to a later frame (budget_exhausted)
-// rather than mislabeling it; only a genuinely missing corridor is unavailable.
+// scratch or a segment's node budget spills to a later frame (budget_exhausted); reach
+// held before the search, so no search ends without a path.
 fn solveAbstract(
     system: *PathfindingSystem,
     scratch: *SearchScratch,
@@ -202,272 +210,31 @@ fn solveAbstract(
     const abstract = &corridor_scratch.abstract;
     const corridor = switch (abstractCorridor(graph, abstract, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap)) {
         .found => |c| c,
-        // Abstract scratch saturated: a negative only when the goal's region is proven
-        // closed within the attempt's cap, else retried on the two-tier ladder.
-        .saturated => return enclosedOutcome(system, abstract, ordinal, request, goal_grid, start_index, goal_index, abstract_node_cap, .saturated),
-        // No corridor: a negative only when the goal's region is proven closed within the
-        // failed search's claims, else answered for this start only.
-        .none => return enclosedOutcome(system, abstract, ordinal, request, goal_grid, start_index, goal_index, @min(abstract.nodes_used, abstract_node_cap), .none),
-        // Start-side seeding failure: drop without poisoning the goal-keyed negative cache.
+        // Abstract scratch saturated: a reachable goal past the attempt's cap, retried on
+        // the two-tier ladder.
+        .saturated => return .{ .budget_exhausted = request.key },
+        .none => return reachContractBreak(request.key),
+        // Start-side seeding failure: dropped, never cached.
         .unseedable => return .{ .start_invalid = request.key },
     };
 
     // Stitch the full obstacle-aware path across every corridor segment. A node-budget
     // spill, a stitched-buffer overflow, or a segment-count spill (see
     // default_max_stitch_segments) is a transient: retry next frame. A corridor reached
-    // the goal, so no stitch failure is a goal-side negative.
+    // the goal, so a stitch ending without a path breaks reach.
     switch (stitchCorridor(system, scratch, corridor_scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap, segment_cap)) {
         .found => {},
         .budget_exhausted => return .{ .budget_exhausted = request.key },
-        .none => return .{ .start_unreachable = request.key },
+        .none => return reachContractBreak(request.key),
     }
 
     const stitched = corridor_scratch.stitched.items;
-    if (stitched.len == 0) return .{ .start_unreachable = request.key };
+    if (stitched.len == 0) return reachContractBreak(request.key);
     recordStitched(system, ordinal, request.key, stitched, request.start_level);
     const solved = &system.solved_paths.items[ordinal];
     solved.via_abstract = true;
     solved.cross_level = corridor.crosses_level;
     return .{ .available = request.key };
-}
-
-// How a failed abstract search ended.
-const SearchEnd = enum { none, saturated };
-
-// The outcome of an abstract search that ended without a corridor: a proven goal-side
-// negative when the goal's region closes within `budget` claims (the start outside its
-// box), else `.start_unreachable` after `.none` or today's `.budget_exhausted` after a
-// saturation. The flood runs in `abstract` after the search. A goal projected off the
-// key's blocked cell holds only while it is that cell's projection now: otherwise the
-// request is answered `.start_unreachable`, uncached, so it re-requests and projects
-// afresh; and its negative also registers the projection window, whose every change can
-// move the projection.
-fn enclosedOutcome(system: *PathfindingSystem, abstract: *AbstractScratch, ordinal: usize, request: PendingRequest, goal_grid: *const NavGrid, start_index: usize, goal_index: usize, budget: usize, end: SearchEnd) PathSolveResult {
-    const graph = &system.graph;
-    const projected = goal_grid.indexForCell(request.key.goal) != goal_index;
-    // O(radius²), on failing projected solves only.
-    if (projected and goal_grid.projectToNearestOpen(request.key.goal, default_goal_projection_radius) != goal_index) return .{ .start_unreachable = request.key };
-    const enclosure = goalEnclosure(graph, abstract, goal_grid, request.key.goal_level, goal_index, request.start_level, start_index, budget) orelse return switch (end) {
-        .none => .{ .start_unreachable = request.key },
-        .saturated => .{ .budget_exhausted = request.key },
-    };
-    var box = ChunkBox{ .min_x = enclosure.min_x, .min_y = enclosure.min_y, .max_x = enclosure.max_x, .max_y = enclosure.max_y };
-    if (projected) {
-        const window = goalWindow(goal_grid, request.key.goal, default_goal_projection_radius);
-        box = .{ .min_x = @min(box.min_x, window.min_x), .min_y = @min(box.min_y, window.min_y), .max_x = @max(box.max_x, window.max_x), .max_y = @max(box.max_y, window.max_y) };
-    }
-    return publishNegative(system, ordinal, request.key, NegativeKeys.cover(enclosure.level, box, chunkCounts(graph)), enclosure, end == .saturated);
-}
-
-// Writes the proven negative of `key` at `ordinal`: its registry keys and their shards,
-// and the box it leaves out. `after_exhaustion` marks a proof after a saturated search.
-fn publishNegative(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, keys: NegativeKeys, enclosure: Enclosure, after_exhaustion: bool) PathSolveResult {
-    var solved = PathfindingSystem.SolvedPath{
-        .key = key,
-        .offset = 0,
-        .len = 0,
-        .negative = keys,
-        .enclosure = enclosure,
-        .negative_after_exhaustion = after_exhaustion,
-        .run_count = keys.count(),
-    };
-    keys.shardCounts(&solved.shard_counts);
-    system.solved_paths.items[ordinal] = solved;
-    return .{ .unavailable = key };
-}
-
-// The open goal cell of `request` against the grid now: its accepted projection while that
-// is still open and the key's own cell is blocked or is that cell, else the nearest open
-// cell to the key's cell within the projection radius. Null when none is.
-fn currentGoal(goal_grid: *const NavGrid, request: PendingRequest) ?usize {
-    const key_index = goal_grid.indexForCell(request.key.goal);
-    if (request.goal_index != no_parent and !goal_grid.isBlockedIndex(request.goal_index)) {
-        const key_cell = key_index orelse return request.goal_index;
-        if (key_cell == request.goal_index or goal_grid.isBlockedIndex(key_cell)) return request.goal_index;
-    }
-    return goal_grid.projectToNearestOpen(request.key.goal, default_goal_projection_radius);
-}
-
-// The chunk box of the cells within `radius` of `goal`, clamped to the grid.
-fn goalWindow(grid: *const NavGrid, goal: GridCell, radius: i32) ChunkBox {
-    // Widened before subtracting, clamped while wide.
-    const width: i64 = @intCast(grid.width);
-    const height: i64 = @intCast(grid.height);
-    const min_x: u32 = @intCast(std.math.clamp(@as(i64, goal.x) - radius, 0, width - 1));
-    const min_y: u32 = @intCast(std.math.clamp(@as(i64, goal.y) - radius, 0, height - 1));
-    const max_x: u32 = @intCast(std.math.clamp(@as(i64, goal.x) + radius, 0, width - 1));
-    const max_y: u32 = @intCast(std.math.clamp(@as(i64, goal.y) + radius, 0, height - 1));
-    const shift = grid.chunk_shift;
-    return .{ .min_x = min_x >> shift, .min_y = min_y >> shift, .max_x = max_x >> shift, .max_y = max_y >> shift };
-}
-
-/// A level's chunk grid size.
-pub const ChunkCounts = struct {
-    x: u32,
-    y: u32,
-};
-
-// The chunk grid of `graph`'s levels; below 2^31 chunks.
-fn chunkCounts(graph: *const NavGraph) ChunkCounts {
-    const geometry = types.ChunkGeometry{ .width = graph.width, .height = graph.height, .chunk_tiles = graph.chunk_tiles };
-    return .{ .x = @intCast(geometry.chunksX()), .y = @intCast(geometry.chunksY()) };
-}
-
-/// Most registry keys one cached negative registers.
-pub const max_negative_keys: u32 = 64;
-
-/// The registry keys a cached negative registers: every key of the finest tier that covers
-/// its chunk box grown by one chunk in at most `max_negative_keys` keys (chunks, then
-/// superchunks, then the level), or the world key.
-pub const NegativeKeys = struct {
-    pub const Tier = enum(u8) { chunk, superchunk, level, world };
-
-    tier: Tier = .world,
-    level: u16 = 0,
-    // Inclusive rect in tier units (chunks or superchunks) and the units per level row.
-    min_x: u32 = 0,
-    min_y: u32 = 0,
-    max_x: u32 = 0,
-    max_y: u32 = 0,
-    row_units: u32 = 0,
-
-    pub const world: NegativeKeys = .{};
-
-    /// The keys over `box` (chunks of `level`) grown by one chunk and clamped to a
-    /// `chunks.x` by `chunks.y` grid.
-    pub fn cover(level: u16, box: ChunkBox, chunks: ChunkCounts) NegativeKeys {
-        const min_x = box.min_x -| 1;
-        const min_y = box.min_y -| 1;
-        const max_x = @min(box.max_x + 1, chunks.x - 1);
-        const max_y = @min(box.max_y + 1, chunks.y - 1);
-        const grown = NegativeKeys{ .tier = .chunk, .level = level, .min_x = min_x, .min_y = min_y, .max_x = max_x, .max_y = max_y, .row_units = chunks.x };
-        if (grown.count() <= max_negative_keys) return grown;
-        const edge = chunk_list_map.superchunk_edge;
-        const superchunks = NegativeKeys{
-            .tier = .superchunk,
-            .level = level,
-            .min_x = min_x / edge,
-            .min_y = min_y / edge,
-            .max_x = max_x / edge,
-            .max_y = max_y / edge,
-            .row_units = (chunks.x + edge - 1) / edge,
-        };
-        if (superchunks.count() <= max_negative_keys) return superchunks;
-        return .{ .tier = .level, .level = level };
-    }
-
-    pub fn count(self: NegativeKeys) u32 {
-        return switch (self.tier) {
-            .chunk, .superchunk => (self.max_x - self.min_x + 1) * (self.max_y - self.min_y + 1),
-            .level, .world => 1,
-        };
-    }
-
-    /// Key `index` of `count()`, row-major over the rect.
-    pub fn keyAt(self: NegativeKeys, index: u32) u64 {
-        std.debug.assert(index < self.count());
-        return switch (self.tier) {
-            .chunk, .superchunk => blk: {
-                const width = self.max_x - self.min_x + 1;
-                const unit = (self.min_y + index / width) * self.row_units + self.min_x + index % width;
-                break :blk if (self.tier == .chunk) chunkKey(self.level, unit) else chunk_list_map.superchunkKey(self.level, unit);
-            },
-            .level => chunk_list_map.levelKey(self.level),
-            .world => chunk_list_map.world_key,
-        };
-    }
-
-    /// Adds each key's registry shard to `shard_counts`.
-    // SIMD verdict: scalar. At most 64 u64 hashes; simd.zig has no u64 lanes.
-    pub fn shardCounts(self: NegativeKeys, shard_counts: *[registry_shard_count]u32) void {
-        for (0..self.count()) |index| shard_counts[registryShard(self.keyAt(@intCast(index)))] += 1;
-    }
-};
-
-// The goal's region proof: an undirected flood over the abstract edges from the goal
-// chunk's portals of the goal's label, peers of one label within a chunk and border
-// mirrors, in claim order on `abstract` (reset first), claiming at most `budget` nodes.
-// Returns the box of the claimed nodes' chunks and the goal chunk when the flood closes
-// (every edge of every claimed portal stays inside the claims), no claimed portal is a link
-// endpoint (every open endpoint is link-flagged, incoming ones included), and the start is
-// outside the box; null otherwise. Then no start outside the box reaches the goal. A goal
-// component with no portal closes with no claim. The result depends only on the graph and
-// the budget.
-// SIMD verdict: scalar. A BFS frontier over hash-table claims is irreducible; the box over
-// the claims is four-lane (`AbstractScratch.chunkBox`).
-fn goalEnclosure(graph: *const NavGraph, abstract: *AbstractScratch, goal_grid: *const NavGrid, goal_level: u16, goal_index: usize, start_level: u16, start_index: usize, budget: usize) ?Enclosure {
-    abstract.reset();
-    abstract.node_budget = @min(budget, abstract.node_limit);
-    const goal_label = goal_grid.labelAt(goal_index);
-    if (goal_label == 0) return null;
-    const slots = abstract.slots;
-    const width: u32 = @intCast(graph.width);
-    const shift: u5 = @intCast(@ctz(graph.chunk_tiles));
-    const mask: u32 = @as(u32, graph.chunk_tiles) - 1;
-    std.debug.assert(std.math.isPowerOfTwo(graph.chunk_tiles));
-    const chunks_x: u32 = (width + mask) >> shift;
-    const goal: u32 = @intCast(goal_index);
-    const goal_y = goal / width;
-    const goal_x = goal - goal_y * width;
-    const goal_portals = graph.chunkPortals(goal_level, (goal_y >> shift) * chunks_x + (goal_x >> shift));
-    for ([_][]const NavPortal{ goal_portals.border, goal_portals.extra }) |portals| {
-        for (portals) |portal| {
-            if (portal.label != goal_label) continue;
-            const px = (goal_x & ~mask) + (portal.local & mask);
-            const py = (goal_y & ~mask) + (@as(u32, portal.local) >> shift);
-            if (!floodClaim(abstract, .{ .ref = packRef(goal_level, py * width + px), .x = px, .y = py, .portal = portal })) return null;
-        }
-    }
-    var head: usize = 0;
-    while (head < abstract.claimed.items.len) : (head += 1) {
-        const slot_index = abstract.claimed.items[head];
-        const node = slots[slot_index];
-        const level = refLevel(node.node);
-        const cell = refLocal(node.node);
-        const x = node.x;
-        const y = node.y;
-        const chunk = (y >> shift) * chunks_x + (x >> shift);
-        const local: u8 = @intCast(((y & mask) << shift) | (x & mask));
-        const portals = graph.chunkPortals(level, chunk);
-        // As in the search, a relaxed cell that is no portal is a dead end.
-        const portal: NavPortal = if (node.flags.portal_known)
-            .{ .local = local, .label = node.portal_label, .flags = node.portal_flags }
-        else
-            portals.find(local) orelse continue;
-        if (portal.flags.link) return null;
-        const origin_x = x & ~mask;
-        const origin_y = y & ~mask;
-        for ([_][]const NavPortal{ portals.border, portals.extra }) |peers| {
-            for (peers) |peer| {
-                if (peer.local == local or peer.label != portal.label) continue;
-                const px = origin_x + (peer.local & mask);
-                const py = origin_y + (@as(u32, peer.local) >> shift);
-                if (!floodClaim(abstract, .{ .ref = packRef(level, py * width + px), .x = px, .y = py, .portal = peer })) return null;
-            }
-        }
-        // A flag means the mirror cell exists in-grid.
-        if (portal.flags.west and !floodClaim(abstract, .{ .ref = packRef(level, cell - 1), .x = x - 1, .y = y, .portal = null })) return null;
-        if (portal.flags.east and !floodClaim(abstract, .{ .ref = packRef(level, cell + 1), .x = x + 1, .y = y, .portal = null })) return null;
-        if (portal.flags.north and !floodClaim(abstract, .{ .ref = packRef(level, cell - width), .x = x, .y = y - 1, .portal = null })) return null;
-        if (portal.flags.south and !floodClaim(abstract, .{ .ref = packRef(level, cell + width), .x = x, .y = y + 1, .portal = null })) return null;
-    }
-    const goal_chunk_x = goal_x >> shift;
-    const goal_chunk_y = goal_y >> shift;
-    var box = abstract.chunkBox(shift) orelse ChunkBox{ .min_x = goal_chunk_x, .min_y = goal_chunk_y, .max_x = goal_chunk_x, .max_y = goal_chunk_y };
-    box = .{ .min_x = @min(box.min_x, goal_chunk_x), .min_y = @min(box.min_y, goal_chunk_y), .max_x = @max(box.max_x, goal_chunk_x), .max_y = @max(box.max_y, goal_chunk_y) };
-    const enclosure = Enclosure{ .level = goal_level, .min_x = box.min_x, .min_y = box.min_y, .max_x = box.max_x, .max_y = box.max_y };
-    const start: u32 = @intCast(start_index);
-    const start_y = start / width;
-    if (enclosure.excludes(start_level, (start - start_y * width) >> shift, start_y >> shift)) return null;
-    return enclosure;
-}
-
-// Claims `node` for the flood, caching its coordinates and portal on a fresh claim; false
-// when the claim would pass the flood's budget.
-fn floodClaim(abstract: *AbstractScratch, node: AbstractNode) bool {
-    const claim = abstract.slotFor(node.ref) orelse return false;
-    if (claim.fresh) cacheAbstractNode(&abstract.slots[claim.slot], node);
-    return true;
 }
 
 // Stitches the chosen abstract corridor (corridor_scratch.abstract.corridor, ordered portal
@@ -583,7 +350,7 @@ const AbstractResult = union(enum) {
     // No corridor reaches the goal level/cell from the start.
     none,
     // The representative start carries no component label (a blocked/degenerate
-    // cell): a start-side condition, not a goal negative.
+    // cell): a start-side condition, not an unreachable goal.
     unseedable,
 };
 
@@ -832,8 +599,7 @@ fn abstractCorridor(
         }
     }
     // A labeled component with zero portals is structurally sealed off from every
-    // other chunk: a definitive negative (the disconnected-goal contract), not a
-    // transient start condition.
+    // other chunk, which reach answers before any search.
     if (seeded == 0) return .none;
 
     const goal_label = goal_grid.labelAt(goal_index);
@@ -881,7 +647,7 @@ fn abstractCorridor(
             }
             switch (buildCorridor(abstract, current_slot, start_level)) {
                 .ok => {},
-                // Budget-truncated reconstruction: spill+retry, never a hard negative.
+                // Budget-truncated reconstruction: spill+retry, never unavailable.
                 .truncated => return .saturated,
                 .none => return .none,
             }
@@ -958,8 +724,7 @@ const CorridorBuild = enum {
     // Full chain root->goal rebuilt and rooted on the start level.
     ok,
     // The parent chain filled corridor_limit (max_abstract_nodes) before reaching the
-    // seed root: a budget truncation, not an unreachable goal. Spill and retry rather
-    // than declare negative.
+    // seed root: a budget truncation, not an unreachable goal. Spill and retry.
     truncated,
     // Empty, or the chain rooted off the start level: a genuine missing corridor.
     none,
@@ -1093,6 +858,7 @@ fn recordPath(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, pat
         .offset = offset,
         .len = path.len,
         .path_level = path_level,
+        .end = .{ .level = path_level, .cell = path[path.len - 1] },
     };
     const starts = system.worker_run_starts.items[offset..][0..stripe_words];
     solved.run_count = splitRuns(RunGeometry.of(&system.graph), path, null, path_level, starts, &solved.shard_counts);
@@ -1116,6 +882,7 @@ fn recordStitched(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey,
         .len = 0,
         .stitched_len = stitched.len,
         .path_level = start_level,
+        .end = stitched[stitched.len - 1],
     };
     const starts = system.worker_run_starts.items[offset..][0..stripe_words];
     solved.run_count = splitRuns(RunGeometry.of(&system.graph), view.cells, view.levels, start_level, starts, &solved.shard_counts);
@@ -2583,9 +2350,9 @@ test "mirrored band teleports leave no level-0 band node closed and the objectiv
         try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 0, 2, start, goal, 4096) == .found);
         try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, 0, 2, start, goal), foundObjective(&abstract, graph.width, goal));
         var band_closed: usize = 0;
-        for (abstract.claimed.items) |slot_index| {
-            const slot = abstract.slots[slot_index];
-            if (slot.stamp & 1 == 0 or refLevel(slot.node) != 0) continue;
+        for (abstract.slots) |slot| {
+            // This search's claimed nodes carry its generation.
+            if (slot.stamp >> 1 != abstract.generation or slot.stamp & 1 == 0 or refLevel(slot.node) != 0) continue;
             band_closed += @intFromBool(inBand(slot.x, slot.y));
         }
         try std.testing.expectEqual(@as(usize, 0), band_closed);
@@ -2760,323 +2527,4 @@ test "per-ordinal shard counts equal the shard counts of the reference run keys"
         }
         try expectRunsMatchReference(test_run_geometry, &path, false);
     }
-}
-
-// A 16x16-cell level in 4-tile chunks (decorations at (4, 5) and (12, 10)) with `walls`
-// blocked and `links` added, its nav built.
-fn floodTestSystem(meta: *const WorldTilesetMeta, data: *const @import("../../data_system.zig").DataSystem, world: *WorldSystem, walls: []const [2]u16, links: []const LevelLink) !PathfindingSystem {
-    const grass = try test_support.requireTestTile(meta, "grass");
-    const tree = try test_support.requireTestTile(meta, "tree_0");
-    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
-    for (walls) |cell| _ = try world.setDenseTile(obstacle, cell[0], cell[1], tree);
-    for (links) |link| try world.addLevelLink(link);
-    var system = PathfindingSystem.init(std.testing.allocator);
-    errdefer system.deinit();
-    var capacity = test_support.abstractCapacity();
-    capacity.group_field_max_cells = 16;
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(data, world, null);
-    return system;
-}
-
-// Walls closing an 8x8 pocket at the origin: column x = 8 (rows 0 to 8) and row y = 8.
-const pocket_walls = blk: {
-    var cells: [17][2]u16 = undefined;
-    for (0..9) |y| cells[y] = .{ 8, y };
-    for (0..8) |x| cells[9 + x] = .{ x, 8 };
-    break :blk cells;
-};
-
-// A ring of walls on the border cells of chunk (1, 1), leaving (5..6, 5..6) open.
-const ring_walls = blk: {
-    var cells: [12][2]u16 = undefined;
-    var count: usize = 0;
-    for (4..8) |y| {
-        for (4..8) |x| {
-            if (x != 4 and x != 7 and y != 4 and y != 7) continue;
-            cells[count] = .{ x, y };
-            count += 1;
-        }
-    }
-    break :blk cells;
-};
-
-fn enclosureFor(system: *PathfindingSystem, abstract: *AbstractScratch, goal: [2]u16, start: [2]u16, budget: usize) ?Enclosure {
-    const grid = system.graph.grid(0).?;
-    const goal_index = grid.indexForCell(.{ .x = goal[0], .y = goal[1] }).?;
-    const start_index = grid.indexForCell(.{ .x = start[0], .y = start[1] }).?;
-    return goalEnclosure(&system.graph, abstract, grid, 0, goal_index, 0, start_index, budget);
-}
-
-test "the goal flood proves a portal-free goal with no claim and a closed region within its budget, and refuses on a link endpoint, its budget, an open region, and a start in its box" {
-    const allocator = std.testing.allocator;
-    const DataSystem = @import("../../data_system.zig").DataSystem;
-    var meta = try test_support.loadTestWorldMeta(allocator);
-    defer meta.deinit();
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
-    var abstract = AbstractScratch{};
-    defer abstract.deinit(allocator);
-    try abstract.reserve(allocator, 4096);
-
-    {
-        var world = try test_support.abstractTestWorld(&meta, 512, 512);
-        defer world.deinit();
-        var system = try floodTestSystem(&meta, &data, &world, &ring_walls, &.{});
-        defer system.deinit();
-        // No budget at all: the ring's inside has no portal.
-        const ring = enclosureFor(&system, &abstract, .{ 5, 5 }, .{ 12, 12 }, 0).?;
-        try std.testing.expectEqual(Enclosure{ .level = 0, .min_x = 1, .min_y = 1, .max_x = 1, .max_y = 1 }, ring);
-        try std.testing.expectEqual(@as(usize, 0), abstract.nodes_used);
-    }
-    {
-        var world = try test_support.abstractTestWorld(&meta, 512, 512);
-        defer world.deinit();
-        var system = try floodTestSystem(&meta, &data, &world, &pocket_walls, &.{});
-        defer system.deinit();
-        const pocket = enclosureFor(&system, &abstract, .{ 3, 3 }, .{ 12, 12 }, 4096).?;
-        try std.testing.expectEqual(Enclosure{ .level = 0, .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, pocket);
-        const claims = abstract.nodes_used;
-        try std.testing.expect(claims > 1);
-        try std.testing.expectEqual(pocket, enclosureFor(&system, &abstract, .{ 3, 3 }, .{ 12, 12 }, claims).?);
-        try std.testing.expect(enclosureFor(&system, &abstract, .{ 3, 3 }, .{ 12, 12 }, claims - 1) == null);
-        // A start in the box (here in the pocket itself) is not left out.
-        try std.testing.expect(enclosureFor(&system, &abstract, .{ 3, 3 }, .{ 6, 1 }, 4096) == null);
-    }
-    {
-        // Open: the region reaches the start.
-        var world = try test_support.abstractTestWorld(&meta, 512, 512);
-        defer world.deinit();
-        var system = try floodTestSystem(&meta, &data, &world, &.{}, &.{});
-        defer system.deinit();
-        try std.testing.expect(enclosureFor(&system, &abstract, .{ 3, 3 }, .{ 12, 12 }, 4096) == null);
-    }
-    {
-        // A one-way teleport into the pocket: its pocket endpoint is a link endpoint.
-        var world = try test_support.abstractTestWorld(&meta, 512, 512);
-        defer world.deinit();
-        const teleport = LevelLink{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 12, .y = 12 }, .level_b = 0, .cell_b = .{ .x = 2, .y = 2 }, .traversal_cost = 1, .bidirectional = false };
-        var system = try floodTestSystem(&meta, &data, &world, &pocket_walls, &.{teleport});
-        defer system.deinit();
-        try std.testing.expect(enclosureFor(&system, &abstract, .{ 3, 3 }, .{ 13, 14 }, 4096) == null);
-    }
-}
-
-// The undirected closure of the goal's portals over same-label peers and border mirrors,
-// by hash set; whether a claimed portal is a link endpoint.
-fn referenceClosure(allocator: std.mem.Allocator, graph: *const NavGraph, goal_grid: *const NavGrid, goal_index: usize, refs: *std.ArrayList(usize)) !bool {
-    const width: u32 = @intCast(graph.width);
-    const tiles: u32 = graph.chunk_tiles;
-    const chunks_x = (width + tiles - 1) / tiles;
-    var seen = std.AutoHashMap(usize, void).init(allocator);
-    defer seen.deinit();
-    refs.clearRetainingCapacity();
-    const goal: u32 = @intCast(goal_index);
-    const goal_label = goal_grid.labelAt(goal_index);
-    const goal_portals = graph.chunkPortals(0, (goal / width / tiles) * chunks_x + goal % width / tiles);
-    for ([_][]const NavPortal{ goal_portals.border, goal_portals.extra }) |portals| {
-        for (portals) |portal| {
-            if (portal.label != goal_label) continue;
-            const ref = packRef(0, (goal / width / tiles * tiles + portal.local / tiles) * width + goal % width / tiles * tiles + portal.local % tiles);
-            if ((try seen.getOrPut(ref)).found_existing) continue;
-            try refs.append(allocator, ref);
-        }
-    }
-    var link = false;
-    var head: usize = 0;
-    while (head < refs.items.len) : (head += 1) {
-        const cell = refLocal(refs.items[head]);
-        const x = cell % width;
-        const y = cell / width;
-        const portals = graph.chunkPortals(0, (y / tiles) * chunks_x + x / tiles);
-        const portal = portals.find(@intCast((y % tiles) * tiles + x % tiles)) orelse continue;
-        link = link or portal.flags.link;
-        var next: [36]u32 = undefined;
-        var count: usize = 0;
-        for ([_][]const NavPortal{ portals.border, portals.extra }) |peers| {
-            for (peers) |peer| {
-                if (peer.local == portal.local or peer.label != portal.label) continue;
-                next[count] = (y / tiles * tiles + peer.local / tiles) * width + x / tiles * tiles + peer.local % tiles;
-                count += 1;
-            }
-        }
-        if (portal.flags.west) next[count] = cell - 1;
-        count += @intFromBool(portal.flags.west);
-        if (portal.flags.east) next[count] = cell + 1;
-        count += @intFromBool(portal.flags.east);
-        if (portal.flags.north) next[count] = cell - width;
-        count += @intFromBool(portal.flags.north);
-        if (portal.flags.south) next[count] = cell + width;
-        count += @intFromBool(portal.flags.south);
-        for (next[0..count]) |target| {
-            if ((try seen.getOrPut(packRef(0, target))).found_existing) continue;
-            try refs.append(allocator, packRef(0, target));
-        }
-    }
-    return link;
-}
-
-test "the goal flood's region equals a reference undirected closure, and it refuses exactly when the closure holds a link endpoint" {
-    const allocator = std.testing.allocator;
-    const DataSystem = @import("../../data_system.zig").DataSystem;
-    var meta = try test_support.loadTestWorldMeta(allocator);
-    defer meta.deinit();
-    var abstract = AbstractScratch{};
-    defer abstract.deinit(allocator);
-    try abstract.reserve(allocator, 4096);
-    var reference: std.ArrayList(usize) = .empty;
-    defer reference.deinit(allocator);
-    var claimed: std.ArrayList(usize) = .empty;
-    defer claimed.deinit(allocator);
-    var proven: usize = 0;
-    var refused: usize = 0;
-    for (0..6) |seed| {
-        var prng = std.Random.DefaultPrng.init(0xf100d + seed);
-        const random = prng.random();
-        var data = DataSystem.init(allocator);
-        defer data.deinit();
-        var world = try test_support.abstractTestWorld(&meta, 512, 512);
-        defer world.deinit();
-        var walls: [256][2]u16 = undefined;
-        var wall_count: usize = 0;
-        for (0..16) |y| {
-            for (0..16) |x| {
-                if (random.uintLessThan(u32, 100) >= 30) continue;
-                walls[wall_count] = .{ @intCast(x), @intCast(y) };
-                wall_count += 1;
-            }
-        }
-        const teleport = LevelLink{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = random.uintLessThan(u16, 16), .y = random.uintLessThan(u16, 16) }, .level_b = 0, .cell_b = .{ .x = random.uintLessThan(u16, 16), .y = random.uintLessThan(u16, 16) }, .traversal_cost = 1, .bidirectional = false };
-        var system = try floodTestSystem(&meta, &data, &world, walls[0..wall_count], &.{teleport});
-        defer system.deinit();
-        const grid = system.graph.grid(0).?;
-        for (0..grid.cellCount()) |goal| {
-            if (grid.isBlockedIndex(goal)) continue;
-            // A start on another level is never in the box.
-            const enclosure = goalEnclosure(&system.graph, &abstract, grid, 0, goal, 1, 0, 4096);
-            const link = try referenceClosure(allocator, &system.graph, grid, goal, &reference);
-            try std.testing.expectEqual(link, enclosure == null);
-            if (enclosure == null) {
-                refused += 1;
-                continue;
-            }
-            proven += 1;
-            claimed.clearRetainingCapacity();
-            for (abstract.claimed.items) |slot| try claimed.append(allocator, abstract.slots[slot].node);
-            std.mem.sort(usize, claimed.items, {}, std.sort.asc(usize));
-            std.mem.sort(usize, reference.items, {}, std.sort.asc(usize));
-            try std.testing.expectEqualSlices(usize, reference.items, claimed.items);
-            var box = Enclosure{ .level = 0, .min_x = @intCast(goal % 16 / 4), .min_y = @intCast(goal / 16 / 4), .max_x = @intCast(goal % 16 / 4), .max_y = @intCast(goal / 16 / 4) };
-            for (reference.items) |ref| {
-                const cell = refLocal(ref);
-                box.min_x = @min(box.min_x, cell % 16 / 4);
-                box.min_y = @min(box.min_y, cell / 16 / 4);
-                box.max_x = @max(box.max_x, cell % 16 / 4);
-                box.max_y = @max(box.max_y, cell / 16 / 4);
-            }
-            try std.testing.expectEqual(box, enclosure.?);
-        }
-    }
-    try std.testing.expect(proven > 100 and refused > 0);
-}
-
-// The keys over `box` grown by one chunk in a `chunks` grid, by enumeration: chunk keys up
-// to the key limit, else superchunk keys, else the level key.
-fn referenceNegativeKeys(allocator: std.mem.Allocator, box: ChunkBox, chunks: ChunkCounts, keys: *std.ArrayList(u64)) !void {
-    keys.clearRetainingCapacity();
-    const min_x = if (box.min_x == 0) 0 else box.min_x - 1;
-    const min_y = if (box.min_y == 0) 0 else box.min_y - 1;
-    const max_x = @min(box.max_x + 1, chunks.x - 1);
-    const max_y = @min(box.max_y + 1, chunks.y - 1);
-    for (min_y..max_y + 1) |y| {
-        for (min_x..max_x + 1) |x| try keys.append(allocator, chunkKey(2, @intCast(y * chunks.x + x)));
-    }
-    if (keys.items.len <= max_negative_keys) return;
-    keys.clearRetainingCapacity();
-    const superchunks_x = (chunks.x + 7) / 8;
-    for (min_y..max_y + 1) |y| {
-        for (min_x..max_x + 1) |x| {
-            const key = chunk_list_map.superchunkKey(2, @intCast((y / 8) * superchunks_x + x / 8));
-            if (std.mem.indexOfScalar(u64, keys.items, key) == null) try keys.append(allocator, key);
-        }
-    }
-    if (keys.items.len <= max_negative_keys) return;
-    keys.clearRetainingCapacity();
-    try keys.append(allocator, chunk_list_map.levelKey(2));
-}
-
-test "negative keys cover the box one chunk wider at the finest tier of at most 64 keys, and their shard counts match" {
-    const allocator = std.testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0x6e9);
-    const random = prng.random();
-    var expected: std.ArrayList(u64) = .empty;
-    defer expected.deinit(allocator);
-    var actual: std.ArrayList(u64) = .empty;
-    defer actual.deinit(allocator);
-    var tiers = std.EnumArray(NegativeKeys.Tier, usize).initFill(0);
-    for ([_]ChunkCounts{ .{ .x = 1, .y = 1 }, .{ .x = 7, .y = 3 }, .{ .x = 40, .y = 40 }, .{ .x = 128, .y = 96 }, .{ .x = 1000, .y = 1000 } }) |chunks| {
-        for (0..60) |_| {
-            const x0 = random.uintLessThan(u32, chunks.x);
-            const y0 = random.uintLessThan(u32, chunks.y);
-            const span = random.uintLessThan(u32, if (random.boolean()) 6 else 200);
-            const box = ChunkBox{ .min_x = x0, .min_y = y0, .max_x = @min(x0 + span, chunks.x - 1), .max_y = @min(y0 + span / 2, chunks.y - 1) };
-            try referenceNegativeKeys(allocator, box, chunks, &expected);
-            const keys = NegativeKeys.cover(2, box, chunks);
-            tiers.getPtr(keys.tier).* += 1;
-            try std.testing.expect(keys.count() <= max_negative_keys);
-            actual.clearRetainingCapacity();
-            for (0..keys.count()) |index| try actual.append(allocator, keys.keyAt(@intCast(index)));
-            std.mem.sort(u64, expected.items, {}, std.sort.asc(u64));
-            std.mem.sort(u64, actual.items, {}, std.sort.asc(u64));
-            try std.testing.expectEqualSlices(u64, expected.items, actual.items);
-            var counts: [registry_shard_count]u32 = @splat(0);
-            keys.shardCounts(&counts);
-            var reference_counts: [registry_shard_count]u32 = @splat(0);
-            for (expected.items) |key| reference_counts[registryShard(key)] += 1;
-            try std.testing.expectEqualSlices(u32, &reference_counts, &counts);
-        }
-    }
-    try std.testing.expect(tiers.get(.chunk) != 0 and tiers.get(.superchunk) != 0 and tiers.get(.level) != 0);
-    try std.testing.expectEqual(@as(u32, 1), NegativeKeys.world.count());
-    try std.testing.expectEqual(chunk_list_map.world_key, NegativeKeys.world.keyAt(0));
-}
-
-test "a solve re-projects a goal whose accepted projection no longer holds: none found at acceptance, now blocked, or the key's own cell opened" {
-    const allocator = std.testing.allocator;
-    var grid = NavGrid{};
-    defer grid.deinit(allocator);
-    try grid.prepare(allocator, 0, 40, 40, types.default_cell_size, 4);
-    // Goal (20, 20) blocked with its ring; (22, 20) the nearest open cell.
-    var blocked: [9][2]usize = undefined;
-    for (0..3) |dy| {
-        for (0..3) |dx| blocked[dy * 3 + dx] = .{ 19 + dx, 19 + dy };
-    }
-    try test_support.setBlockedCells(allocator, &grid, &blocked);
-    const key_cell = GridCell{ .x = 20, .y = 20 };
-    const projected = grid.projectToNearestOpen(key_cell, default_goal_projection_radius).?;
-    var request = PendingRequest{ .entity = undefined, .key = .{ .nav_version = 1, .agent_class = .default, .goal = key_cell }, .start_level = 0, .start = .{ .x = 0, .y = 0 }, .goal_index = projected };
-    // The accepted projection still open and the key's cell still blocked: kept.
-    try std.testing.expectEqual(@as(?usize, projected), currentGoal(&grid, request));
-    // None found at acceptance: projected now.
-    request.goal_index = no_parent;
-    try std.testing.expectEqual(@as(?usize, projected), currentGoal(&grid, request));
-    // The accepted projection blocked since: the next nearest.
-    request.goal_index = projected;
-    var more = blocked ++ [_][2]usize{.{ projected % 40, projected / 40 }};
-    try test_support.setBlockedCells(allocator, &grid, &more);
-    const next = currentGoal(&grid, request).?;
-    try std.testing.expect(next != projected and !grid.isBlockedIndex(next));
-    try std.testing.expectEqual(grid.projectToNearestOpen(key_cell, default_goal_projection_radius), next);
-    // The key's own cell opened: it is the goal.
-    more[4] = .{ 0, 0 };
-    try test_support.setBlockedCells(allocator, &grid, &more);
-    try std.testing.expectEqual(@as(?usize, 20 * 40 + 20), currentGoal(&grid, request));
-    // Nothing open within the radius: none.
-    var wall: std.ArrayList([2]usize) = .empty;
-    defer wall.deinit(allocator);
-    for (0..40) |y| {
-        for (0..40) |x| try wall.append(allocator, .{ x, y });
-    }
-    try test_support.setBlockedCells(allocator, &grid, wall.items);
-    try std.testing.expectEqual(@as(?usize, null), currentGoal(&grid, request));
 }

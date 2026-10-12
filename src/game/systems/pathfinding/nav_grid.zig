@@ -622,9 +622,23 @@ pub const NavGrid = struct {
     /// The cell's chunk-local component label (1..m in the chunk's flood order), 0 for a
     /// blocked cell. At most 128 labels fit a 16x16 chunk under the corner rule.
     pub fn labelAt(self: *const NavGrid, index: usize) u8 {
+        return self.chunkLabelAt(index).label;
+    }
+
+    /// A cell's chunk and chunk-local label (`labelAt`, 0 for a blocked cell).
+    pub const ChunkLabel = struct {
+        chunk: u32,
+        label: u8,
+    };
+
+    /// The chunk and label of in-grid cell `index`, from one division. O(1): one
+    /// directory entry, plus a label read in a mixed chunk.
+    pub fn chunkLabelAt(self: *const NavGrid, index: usize) ChunkLabel {
+        std.debug.assert(index < self.cellCount());
         const y = index / self.width;
         const x = index - y * self.width;
-        return self.labelAtLocal(self.chunkAt(x, y), self.localAt(x, y));
+        const chunk = self.chunkAt(x, y);
+        return .{ .chunk = chunk, .label = self.labelAtLocal(chunk, self.localAt(x, y)) };
     }
 
     /// The cell's level-unique component id: chunk * (chunk_tiles^2 + 1) + label, or
@@ -849,7 +863,7 @@ fn referenceLabels(grid: *const NavGrid, chunk: u32) [max_chunk_cells]u8 {
     return labels;
 }
 
-test "a remasked chunk equals world bits OR static coverage, labels equal a reference flood" {
+test "a remasked chunk equals world bits OR static coverage, labels and chunkLabelAt equal a reference flood and chunkOfCell" {
     var meta = try test_support.loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     const grass = try test_support.requireTestTile(&meta, "grass");
@@ -894,7 +908,13 @@ test "a remasked chunk equals world bits OR static coverage, labels equal a refe
             const reference = referenceLabels(grid, chunk);
             const b = grid.chunkBounds(chunk);
             for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
-                try std.testing.expectEqual(reference[(y - b.y0) * edge + (x - b.x0)], grid.labelAt(y * grid.width + x));
+                const index = y * grid.width + x;
+                const label = reference[(y - b.y0) * edge + (x - b.x0)];
+                try std.testing.expectEqual(label, grid.labelAt(index));
+                // The one-division chunk and label equal the chunk geometry's and the flood's,
+                // in the short border chunks too.
+                try std.testing.expectEqual(NavGrid.ChunkLabel{ .chunk = grid.chunkOfCell(index), .label = label }, grid.chunkLabelAt(index));
+                try std.testing.expectEqual(chunk, grid.chunkLabelAt(index).chunk);
             };
         }
     }

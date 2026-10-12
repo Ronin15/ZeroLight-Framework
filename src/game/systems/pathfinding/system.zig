@@ -45,10 +45,6 @@ const NavBatchResult = @import("nav_graph.zig").NavBatchResult;
 const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
 const ChunkListMap = @import("../chunk_list_map.zig").ChunkListMap;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
-const superchunkKey = @import("../chunk_list_map.zig").superchunkKey;
-const levelKey = @import("../chunk_list_map.zig").levelKey;
-const world_key = @import("../chunk_list_map.zig").world_key;
-const superchunk_edge = @import("../chunk_list_map.zig").superchunk_edge;
 const no_entry = @import("../chunk_list_map.zig").no_entry;
 const GroupField = @import("group_field.zig").GroupField;
 const group_field_cell_limit = @import("group_field.zig").group_field_cell_limit;
@@ -56,7 +52,6 @@ const initialPoolBlocks = @import("group_field.zig").initialPoolBlocks;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const Tier1Scratch = @import("scratch.zig").Tier1Scratch;
 const ResultCache = @import("caches.zig").ResultCache;
-const NegativeCache = @import("caches.zig").NegativeCache;
 const ResizeMove = @import("caches.zig").ResizeMove;
 const KeySet = @import("caches.zig").KeySet;
 const GroupKeyMap = @import("caches.zig").GroupKeyMap;
@@ -67,6 +62,11 @@ const solveOne = solve.solveOne;
 const solveFallbackJob = solve.solveFallbackJob;
 const SolveJobContext = solve.SolveJobContext;
 const RunGeometry = solve.RunGeometry;
+const reach = @import("connectivity.zig").reach;
+const Reach = @import("connectivity.zig").Reach;
+const goal_table = @import("goal_table.zig");
+const GoalTable = goal_table.GoalTable;
+const goalRef = goal_table.goalRef;
 const types = @import("types.zig");
 const PathfindingCapacity = types.PathfindingCapacity;
 const PathfindingConfig = types.PathfindingConfig;
@@ -96,18 +96,12 @@ const OwnerOp = types.OwnerOp;
 const no_owner = types.no_owner;
 const RegRecord = types.RegRecord;
 const EvictItem = types.EvictItem;
-const Enclosure = types.Enclosure;
-const no_changed_index = types.no_changed_index;
-const evict_owns_superchunk = types.evict_owns_superchunk;
-const evict_owns_level = types.evict_owns_level;
-const evict_owns_world = types.evict_owns_world;
 const CellCursor = types.CellCursor;
 const registry_shard_count = types.registry_shard_count;
 const registryShard = types.registryShard;
 const evict_range_alignment_items = types.evict_range_alignment_items;
 const reg_window_alignment_items = types.reg_window_alignment_items;
 const hit_window_alignment_items = types.hit_window_alignment_items;
-const no_parent = types.no_parent;
 const min_capacity_floor = types.min_capacity_floor;
 const default_max_agent_budget = types.default_max_agent_budget;
 const cached_results_per_agent = types.cached_results_per_agent;
@@ -116,6 +110,10 @@ const deriveCapacity = types.deriveCapacity;
 const default_goal_projection_radius = types.default_goal_projection_radius;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
 const GridCell = types.GridCell;
+const TraversalClass = types.TraversalClass;
+const traversalOf = types.traversalOf;
+const GoalResolveStats = types.GoalResolveStats;
+const no_cell = types.no_cell;
 
 // `fallback_tier1_slot` entry of a tier-0 admission.
 const no_tier1_slot: u32 = std.math.maxInt(u32);
@@ -130,20 +128,13 @@ const PublishBandList = std.ArrayListAligned(PublishBand, .fromByteUnits(thread_
 const EvictItemList = std.ArrayListAligned(EvictItem, .fromByteUnits(thread_shared_record_alignment));
 const HitList = std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment));
 
-// `registry_flush` work pairs (registry index, shard), index-major: pair `p` is shard
-// `p % registry_shard_count` of index `p / registry_shard_count`. The path registry is
-// index 0, the negative registry index 1.
-const registry_index_count: usize = 2;
-const flush_pair_count = registry_index_count * registry_shard_count;
-const negative_pair_base = registry_shard_count;
+// `registry_flush` work pairs: one per path registry shard.
+const flush_pair_count = registry_shard_count;
 
 // One `publish_copy` range's registrations per flush pair, padded to its own cache line.
 const PublishBand = struct {
     counts: [flush_pair_count]u32 align(thread_shared_record_alignment) = @splat(0),
 };
-
-// `publish_records` long block of a claimed negative, which stores no path.
-const negative_claim_block: u32 = std.math.maxInt(u32);
 
 // One `registry_flush` pair's entries removed and added, padded to its own cache line.
 const FlushTally = struct {
@@ -189,10 +180,10 @@ pub const PathfindingSystem = struct {
     // chunk and sharded by key, owned by the result's cache owner id. Written only by
     // `registry_flush`; empty of ops whenever no system call is on the stack.
     path_index: [registry_shard_count]ChunkListMap,
-    // Proven negatives, and their registry: per negative, the keys of its `NegativeKeys`
-    // (chunk, superchunk, level, or world tier), sharded and flushed as the path registry.
-    negatives: NegativeCache = .{},
-    negative_index: [registry_shard_count]ChunkListMap,
+    // The step's goal table: one live projection per distinct blocked goal of the step's
+    // navigation intents (`resolveGoals`), read by status, intake, group fields, and solve;
+    // invalidated by every grid change.
+    goals: GoalTable = .{},
     pending_keys: KeySet = .{},
     group_fields: std.ArrayList(GroupField) = .empty,
     // Field slots one `group_field_expand` pass expands, one field per item.
@@ -291,6 +282,10 @@ pub const PathfindingSystem = struct {
     nav_conn_closure_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_conn_closure_rows_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_conn_closure_compact_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The goal resolve's scan over intents and its projection over distinct blocked goals
+    // each own a tuner.
+    goal_scan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    goal_project_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // The publish byte copy, the registry flush, and a shrink's resize copy each own a
     // tuner; so do the eviction's bound count, halo walk, and flush.
     publish_copy_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -327,6 +322,10 @@ pub const PathfindingSystem = struct {
     group_field_pool_growth_logged: bool = false,
     group_field_pool_failures: u64 = 0,
     group_field_pool_failure_logged: bool = false,
+    /// Telemetry: goal table growths at a resolve's entry (intents past the population
+    /// seam's reserve); logged once.
+    goal_table_grows: u64 = 0,
+    goal_table_growth_logged: bool = false,
     // Reusable safe-point snapshot buffers. A resize preserves the live deferred work and
     // group tally by round-tripping them through these. Allocated only at resize.
     resize_pending_snapshot: std.ArrayList(PendingRequest) = .empty,
@@ -354,37 +353,29 @@ pub const PathfindingSystem = struct {
         stitched_len: usize = 0,
         // Level the stored cells index into (start level for cross-level corridors).
         path_level: u16 = 0,
+        // The path's last cell (`PathResult.end`).
+        end: types.StitchedCell = .{ .level = 0, .cell = 0 },
         // Set when the solve routed through the abstract chunk-portal/link graph.
         via_abstract: bool = false,
         // Set when the chosen corridor crosses at least one inter-level link.
         cross_level: bool = false,
-        // Registry runs in the ordinal's run-start window, or a negative's keys, and their
-        // keys per shard.
+        // Registry runs in the ordinal's run-start window, and their keys per shard.
         run_count: u32 = 0,
         shard_counts: [registry_shard_count]u32 = @splat(0),
-        // An `.unavailable` result's registry keys, the box its proof leaves out, and
-        // whether it was proven after its search exhausted its budget.
-        negative: solve.NegativeKeys = .{},
-        enclosure: Enclosure = .{},
-        negative_after_exhaustion: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator) PathfindingSystem {
         // Tuners use their field defaults (AdaptiveWorkTuner.init(.{})); no need to re-set them.
         var path_index: [registry_shard_count]ChunkListMap = undefined;
-        var negative_index: [registry_shard_count]ChunkListMap = undefined;
-        for (&path_index, &negative_index) |*shard, *negative_shard| {
+        for (&path_index) |*shard| {
             shard.* = ChunkListMap.init(allocator, "path registry shard");
-            negative_shard.* = ChunkListMap.init(allocator, "negative registry shard");
-            // The system logs the registries' first growth once for every shard.
+            // The system logs the registry's first growth once for every shard.
             shard.growth_logged = true;
-            negative_shard.growth_logged = true;
         }
         return .{
             .allocator = allocator,
             .graph = .{ .allocator = allocator },
             .path_index = path_index,
-            .negative_index = negative_index,
         };
     }
 
@@ -414,8 +405,7 @@ pub const PathfindingSystem = struct {
         self.group_field_slots.deinit(self.allocator);
         self.group_fields.deinit(self.allocator);
         self.pending_keys.deinit(self.allocator);
-        for (&self.negative_index) |*shard| shard.deinit();
-        self.negatives.deinit(self.allocator);
+        self.goals.deinit(self.allocator);
         for (&self.path_index) |*shard| shard.deinit();
         self.completed.deinit(self.allocator);
         self.fallback_tier1_slot.deinit(self.allocator);
@@ -458,8 +448,8 @@ pub const PathfindingSystem = struct {
 
     // Sizes every pool from caps derived for `agent_count`. Used by reserve() at init and
     // by adjustCapacityForAgentCount() at the safe point. ArrayList pools grow amortized
-    // and shrink-and-free; the result cache and the negative set keep their entries (a
-    // shrink evicts what no longer fits). The caller preserves the pending queue and group
+    // and shrink-and-free; the result cache keeps its entries (a shrink evicts what no
+    // longer fits). The caller preserves the pending queue and group
     // tally, which these pools do not carry across.
     //
     // The logical limits (`self.capacity`, `effective_agent_capacity`) are committed only
@@ -529,24 +519,12 @@ pub const PathfindingSystem = struct {
         // never a caller-side multiplier (one load-factor policy, not two stacked).
         try self.reserveRegistryOwners(capacity.max_cached_results);
         const path_shrinking = capacity.max_cached_results < self.completed.logicalCapacity();
-        const negative_shrinking = capacity.max_cached_results < self.negatives.logicalCapacity();
         if (path_shrinking) try prepareTruncate(&self.path_index, capacity.max_cached_results);
         errdefer if (path_shrinking and !self.registry_truncate_pending) abortTruncate(&self.path_index);
-        if (negative_shrinking) try prepareTruncate(&self.negative_index, capacity.max_cached_results);
-        errdefer if (negative_shrinking and !self.registry_truncate_pending) abortTruncate(&self.negative_index);
-        // The negative cache's storage before the result cache commits, so both caches take
-        // the new capacity or neither does.
-        var negative_resize: ?NegativeCache.Resize = if (capacity.max_cached_results != self.negatives.logicalCapacity())
-            try self.negatives.prepareResize(self.allocator, capacity.max_cached_results)
-        else
-            null;
-        // A no-op once committed.
-        errdefer if (negative_resize) |*resize| self.negatives.abortResize(self.allocator, resize);
         const outcome = try self.completed.reserve(self.allocator, capacity.max_cached_results, capacity.max_stored_path_cells, types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells), self.step_counter);
-        if (negative_resize) |*resize| self.negatives.commitResize(self.allocator, resize, self.step_counter);
         if (outcome == .rebuilt) self.clearRegistry();
         self.last_resize_copy_batch = self.runResizeCopy(if (threads) |stage| stage.stage(&self.resize_copy_tuner) else null);
-        if (path_shrinking or negative_shrinking) self.registry_truncate_pending = true;
+        if (path_shrinking) self.registry_truncate_pending = true;
         try self.pending_keys.reserve(self.allocator, capacity.max_pending_requests);
         // Field slots first: every header appended at the end already has its slot, so no
         // failure point leaves more fields than slots. Headers hold no pool (a field
@@ -633,7 +611,7 @@ pub const PathfindingSystem = struct {
         const grown = @min(@max(target, current *| 2), self.agentBudget());
         try self.resizePreservingLiveState(grown, null);
         // A grow moves and evicts nothing, so it leaves no owner op for a flush.
-        std.debug.assert(self.completed.core.ownerLog().len == 0 and self.negatives.core.ownerLog().len == 0);
+        std.debug.assert(self.completed.core.ownerLog().len == 0);
     }
 
     // Adjusts the live capacity toward the agent count at the pre-dispatch safe
@@ -647,8 +625,8 @@ pub const PathfindingSystem = struct {
     // point the per-step scratch pools (intake staging, solve_results,
     // fallback_indices, solved_paths, worker_path_pool) are empty/cleared from last
     // step's prepare*, so no live offset spans the resize.
-    // pending/pending_keys/group_requests/completed/negatives hold cross-step state;
-    // completed and negatives keep their entries through the resize, while pending and
+    // pending/pending_keys/group_requests/completed hold cross-step state;
+    // completed keeps its entries through the resize, while pending and
     // the group tally round-trip through reusable snapshots and pending_keys is rebuilt
     // from the restored pending. Search scratch, the tier-1 pool, and group fields follow
     // fixed budgets an elastic resize does not change, so their reserves are no-ops here.
@@ -671,8 +649,8 @@ pub const PathfindingSystem = struct {
     }
 
     // Re-sizes all pools to `agent_count` while preserving the live deferred-work queue
-    // and group tally. The goal-keyed result cache and negative set keep their entries
-    // (a shrink evicts only what no longer fits), so a resize costs no re-solves.
+    // and group tally. The goal-keyed result cache keeps its entries (a shrink evicts only
+    // what no longer fits), so a resize costs no re-solves.
     fn resizePreservingLiveState(self: *PathfindingSystem, agent_count: usize, threads: ?StageThreads) !void {
         self.resize_pending_snapshot.clearRetainingCapacity();
         try self.resize_pending_snapshot.ensureTotalCapacity(self.allocator, self.pending.len);
@@ -763,6 +741,7 @@ pub const PathfindingSystem = struct {
         if (self.scratch_slots.items.len == 0) {
             try self.reserve(self.capacity);
         }
+        self.goals.invalidate();
         try self.graph.rebuild(colliders.view(), extent, self.navUpdateThreads(thread_system));
         // Search scratch and group fields follow budgets reserved at the capacity seam, never
         // the level's cell count, so the build sizes nothing for them.
@@ -791,6 +770,8 @@ pub const PathfindingSystem = struct {
         self.nav_conn_closure_plan_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_conn_closure_rows_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_conn_closure_compact_tuner = AdaptiveWorkTuner.init(.{});
+        self.goal_scan_tuner = AdaptiveWorkTuner.init(.{});
+        self.goal_project_tuner = AdaptiveWorkTuner.init(.{});
         self.publish_copy_tuner = AdaptiveWorkTuner.init(.{});
         self.registry_flush_tuner = AdaptiveWorkTuner.init(.{});
         self.resize_copy_tuner = AdaptiveWorkTuner.init(.{});
@@ -943,23 +924,22 @@ pub const PathfindingSystem = struct {
     }
 
     /// Applies every pending nav change, each step its own transaction: builds the levels
-    /// the world added (evicting the negatives of the world key), rebuilds the levels whose
-    /// content revision moved, then applies the recorded marks and new links as one batch,
-    /// evicting only the results, negatives, and group fields it reaches; pending requests
-    /// and group tallies survive it. A committed step stays on a later error; marks and the
+    /// the world added, rebuilds the levels whose content revision moved, then applies the
+    /// recorded marks and new links as one batch, evicting only the results and group
+    /// fields it reaches; pending requests and group tallies survive it. Invalidates the
+    /// step's goal table. A committed step stays on a later error; marks and the
     /// level, revision, and link gaps stay pending for the next call. The world-wide revision
     /// is compared once; levels are walked only when it moved. A non-null `thread_system`
     /// lets each stage thread under its tuner.
     pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
         var stats = NavUpdateStats{};
+        self.goals.invalidate();
         const threads = self.navUpdateThreads(thread_system);
         const view = colliders.view();
         if (self.graph.world_backed) {
-            const levels_before = self.graph.levelCount();
             while (self.graph.levelCount() < world.levelCount()) {
                 try self.graph.buildLevel(view, world, @intCast(self.graph.levelCount()), threads, &stats);
             }
-            if (self.graph.levelCount() != levels_before) self.evictWorldNegatives(&stats);
             if (world.contentRevision() != self.graph.built_world_revision) {
                 for (0..self.graph.levelCount()) |level_index| {
                     const level: u16 = @intCast(level_index);
@@ -984,9 +964,8 @@ pub const PathfindingSystem = struct {
             if (batch.changed) {
                 stats.remask_batch = self.graph.last_remask_batch;
                 // Graph node ids never persist, so cached results stay keyed by cells: evict
-                // only those with a cell within one cell of a changed cell, the negatives
-                // registered on a dirty key's lists, and the fields with a costed cell next
-                // to a changed cell.
+                // only those with a cell within one cell of a changed cell, and the fields
+                // with a costed cell next to a changed cell.
                 self.evictScoped(batch, thread_system, &stats);
             }
         }
@@ -1014,19 +993,17 @@ pub const PathfindingSystem = struct {
         return stats;
     }
 
-    // Eviction before the batch commit, one item per dirty key (a changed chunk or a new
-    // link's endpoint chunk): `nav_evict_count` gives each changed key the halo keys it owns
-    // (each key of a changed key's 3x3 block is owned by exactly one of them) and their
-    // registrations, and each dirty key the negatives on its chunk list and on the
-    // superchunk, level, and world lists it owns (the first dirty key in each); the main
-    // thread then sizes the hit windows (paths, negatives, and a slot per group field for a
-    // changed key) for the walk's selected shape and reserves them, O(1) per key. Reads only
-    // the batch's keys and the registries. On error the graph, caches, and registries are as
-    // they were.
+    // Eviction before the batch commit, one item per changed key (a chunk with a changed
+    // cell; a link-only key changes no cell, so it evicts nothing): `nav_evict_count` gives
+    // each changed key the halo keys it owns (each key of a changed key's 3x3 block is owned
+    // by exactly one of them) and their registrations; the main thread then sizes the hit
+    // windows (paths, then a slot per group field) for the walk's selected shape and reserves
+    // them, O(1) per key. Reads only the batch's keys and the registry. On error the graph,
+    // cache, and registry are as they were.
     fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) !void {
         // Every update and reaction ends flushed, so every registration names a live entry.
-        std.debug.assert(self.completed.core.ownerLog().len == 0 and self.negatives.core.ownerLog().len == 0 and self.publish_ranges == 0);
-        const keys = self.graph.dirty_keys.items;
+        std.debug.assert(self.completed.core.ownerLog().len == 0 and self.publish_ranges == 0);
+        const keys = self.graph.changed_keys.items;
         self.evict_items.clearRetainingCapacity();
         self.evict_hits.clearRetainingCapacity();
         self.evict_shape = .{};
@@ -1040,10 +1017,8 @@ pub const PathfindingSystem = struct {
         const count_dispatch = self.navDispatch(thread_system, &self.nav_evict_count_tuner);
         const count_shape = stageShape(count_dispatch, keys.len, evict_range_alignment_items);
         var job = EvictCountJob{
-            .keys = keys,
-            .changed_keys = self.graph.changed_keys.items,
+            .changed_keys = keys,
             .readers = self.registryReaders(),
-            .negative_readers = self.negativeReaders(),
             .chunks = self.chunkGrid(),
             .items = self.evict_items.items,
             .range_count = count_shape.range_count,
@@ -1058,8 +1033,7 @@ pub const PathfindingSystem = struct {
             // Hits are registrations of distinct keys and field slots, fewer than the
             // registries' u32 ids.
             item.base = @intCast(total);
-            total += item.bound + item.negative_bound;
-            if (item.changed_index != no_changed_index) total += field_count;
+            total += item.bound + field_count;
         }
         if (total > self.evict_hits.capacity) {
             try self.evict_hits.ensureTotalCapacity(self.allocator, total);
@@ -1068,24 +1042,21 @@ pub const PathfindingSystem = struct {
         self.evict_hits.items.len = total;
     }
 
-    // Eviction after the batch commit: `nav_evict` walks, per dirty key, each owned halo
+    // Eviction after the batch commit: `nav_evict` walks, per changed key, each owned halo
     // key's registrations, testing each run's cells from its start against the cells within
-    // one cell of a changed cell; its owned negative lists, every entry a hit; and for a
-    // changed key, each group field's costed cells within one cell of its changed cells. It
-    // writes the hits into the item's window; the main thread removes them in item order
-    // (paths, negatives, then fields), O(1) each, and the flush unlinks their
-    // registrations. A link-only key changes no cell, so it evicts no path and no field.
+    // one cell of a changed cell, and each group field's costed cells within one cell of its
+    // changed cells. It writes the hits into the item's window; the main thread removes them
+    // in item order (paths, then fields), O(1) each, and the flush unlinks their
+    // registrations.
     fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) void {
-        const keys = batch.dirty_keys;
-        std.debug.assert(keys.len == self.evict_items.items.len and batch.changed_masks.len == batch.changed_keys.len);
+        const keys = batch.changed_keys;
+        std.debug.assert(keys.len == self.evict_items.items.len and batch.changed_masks.len == keys.len);
         if (keys.len != 0) {
             var job = EvictJob{
                 .cache = &self.completed,
-                .keys = keys,
-                .changed_keys = batch.changed_keys,
+                .changed_keys = keys,
                 .masks = batch.changed_masks,
                 .readers = self.registryReaders(),
-                .negative_readers = self.negativeReaders(),
                 .fields = self.group_fields.items,
                 .chunks = self.chunkGrid(),
                 .geometry = RunGeometry.of(&self.graph),
@@ -1105,13 +1076,7 @@ pub const PathfindingSystem = struct {
                     self.completed.removeAt(self.completed.slotIndex(self.completed.core.keyOf(owner)).?);
                     stats.evicted_results += 1;
                 }
-                for (window[item.bound..][0..item.negative_hits]) |owner| {
-                    // Another list of this key or an earlier key may have hit it already.
-                    if (!self.negatives.core.records.items[owner].live) continue;
-                    self.negatives.removeOwner(owner);
-                    stats.evicted_negatives += 1;
-                }
-                for (window[item.bound + item.negative_bound ..][0..item.field_hits]) |slot| {
+                for (window[item.bound..][0..item.field_hits]) |slot| {
                     const field = &self.group_fields.items[slot];
                     if (field.state == .empty) continue;
                     field.state = .empty;
@@ -1138,26 +1103,6 @@ pub const PathfindingSystem = struct {
         var readers: [registry_shard_count]ChunkListMap.Reader = undefined;
         for (&readers, &self.path_index) |*reader, *shard| reader.* = shard.reader();
         return readers;
-    }
-
-    // Lookups of every negative registry shard, for readers on workers while nothing writes.
-    fn negativeReaders(self: *const PathfindingSystem) [registry_shard_count]ChunkListMap.Reader {
-        var readers: [registry_shard_count]ChunkListMap.Reader = undefined;
-        for (&readers, &self.negative_index) |*reader, *shard| reader.* = shard.reader();
-        return readers;
-    }
-
-    // A level add invalidates the negatives of a missing graph or goal level: removes every
-    // owner on the world key's list, then flushes. Cold, main thread, O(those negatives).
-    fn evictWorldNegatives(self: *PathfindingSystem, stats: *NavUpdateStats) void {
-        // Removals log ops only; the list stays as it is until the flush.
-        var owners = self.negative_index[registryShard(world_key)].iterator(world_key);
-        while (owners.next()) |owner| {
-            if (!self.negatives.core.records.items[owner].live) continue;
-            self.negatives.removeOwner(owner);
-            stats.evicted_negatives += 1;
-        }
-        _ = self.flushRegistry(null, null);
     }
 
     fn chunkGrid(self: *const PathfindingSystem) ChunkGrid {
@@ -1303,7 +1248,7 @@ pub const PathfindingSystem = struct {
         self.clearCompleted();
     }
 
-    // Clears request state and negatives but keeps the result cache.
+    // Clears request state but keeps the result cache.
     fn clearRequestStateKeepingCompleted(self: *PathfindingSystem) void {
         self.pending.clear();
         self.solve_results.clearRetainingCapacity();
@@ -1312,7 +1257,6 @@ pub const PathfindingSystem = struct {
         self.solved_paths.clearRetainingCapacity();
         self.group_requests.clearRetainingCapacity();
         self.group_key_map.clear();
-        self.clearNegatives();
         self.pending_keys.clear();
     }
 
@@ -1327,10 +1271,11 @@ pub const PathfindingSystem = struct {
         return self.statusForKeyAndStart(key, start_level, start_index, waypoint_hint);
     }
 
-    // Group field first (when ready), then individual cache, then negative cache,
-    // then pending. Missing means the caller may enqueue a request. The start cell
-    // is interpreted on `start_level`; cached corridors derive against the level
-    // their stored cells index into (start level for cross-level corridors).
+    // Group field first (when ready), then the live goal and, for an open start, reach,
+    // then the individual cache (served only while its path ends at the live goal), then
+    // pending. Missing means the caller may enqueue a request. The start cell is
+    // interpreted on `start_level`; cached corridors derive against the level their stored
+    // cells index into (start level for cross-level corridors).
     fn statusForKeyAndStart(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start_index: usize, waypoint_hint: ?*u32) PathView {
         if (self.findGroupField(key)) |field| {
             if (field.state == .ready and start_level == key.goal_level) {
@@ -1341,75 +1286,169 @@ pub const PathfindingSystem = struct {
                     }
                 }
                 // Sample miss (or no grid): the field simply does not cover this cell (e.g. a
-                // same-level but different-component agent) — not a definitive negative. Fall
-                // through to the individual cache/pending/negative-cache path below, mirroring
-                // the cross-level agent's exemption: an individual abstract-corridor solve may
-                // still reach the goal via a link this level-local field never routes through.
+                // same-level but different-component agent) — not an unavailable goal. Fall
+                // through to the individual answer below, mirroring the cross-level agent's
+                // exemption: an individual abstract-corridor solve may still reach the goal
+                // via a link this level-local field never routes through.
             }
         }
+        const goal_grid = self.graph.grid(key.goal_level) orelse return .{ .status = .unavailable };
+        const goal_index = self.liveGoal(key, goal_grid).cell orelse return .{ .status = .unavailable };
+        if (self.reaches(key.agent_class, start_level, start_index, key.goal_level, goal_index) == .unreachable_goal) return .{ .status = .unavailable };
         if (self.completed.freshSlotIndex(key, self.step_counter, types.default_cache_ttl_steps)) |slot| {
-            const result = self.completed.resultAt(slot);
-            const path_grid = self.graph.grid(result.path_level) orelse return .{ .status = .unavailable };
-            // Abstract chunk/cross-level corridor: a full obstacle-aware stitched
-            // (level,cell) path. Walk the run on the agent's CURRENT level cell by
-            // cell (every consecutive pair is a traversable neighbor), so multi-hop
-            // and cross-floor routes converge without any straight-line cut.
-            if (result.stitched_len != 0) {
-                const stitched = self.completed.stitchedSlice(slot, result.stitched_len);
-                if (waypointFromStitched(&self.graph, stitched, start_level, start_index, waypoint_hint)) |waypoint| {
-                    return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.stitched_len };
-                }
-                // Agent's level is not yet covered by the corridor (e.g. it has not
-                // reached the start-level run): steer toward the corridor's first cell.
-                const first_grid = self.graph.grid(stitched.levels[0]) orelse return .{ .status = .unavailable };
-                return .{ .status = .available, .next_waypoint = first_grid.cellCenter(stitched.cells[0]), .path_len = result.stitched_len };
-            }
-            const path = self.completed.pathSlice(slot, result.path_len);
-            // Plain same-component local solve: derive a forward waypoint from the
-            // agent's current cell against the stored path.
-            if (result.path_level == start_level) {
-                if (waypointFromPath(path_grid, path, start_index, waypoint_hint)) |waypoint| {
-                    return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.path_len };
-                }
-            }
-            if (path.len != 0) {
-                return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .path_len = result.path_len };
-            }
-            return .{ .status = .unavailable };
+            if (self.cachedView(slot, key.goal_level, goal_index, start_level, start_index, waypoint_hint)) |view| return view;
         }
-        const start = self.startChunk(start_index);
-        if (self.negatives.isFreshFor(key, self.step_counter, types.default_cache_ttl_steps, start_level, start.x, start.y)) return .{ .status = .unavailable };
         if (self.pending_keys.contains(key)) return .{ .status = .pending };
         return .{ .status = .missing };
     }
 
-    // The chunk of cell `cell_index`; every level shares one extent.
-    fn startChunk(self: *const PathfindingSystem, cell_index: usize) StartChunk {
-        const y = cell_index / self.graph.width;
-        return self.startChunkAt(.{ .x = @intCast(cell_index - y * self.graph.width), .y = @intCast(y) });
+    // The waypoint view of cached result `slot` for a start at `start_index` on
+    // `start_level`; null unless the result ends at `goal_index` on `goal_level`, so a result
+    // solved toward an older projection is not served.
+    fn cachedView(self: *const PathfindingSystem, slot: usize, goal_level: u16, goal_index: usize, start_level: u16, start_index: usize, waypoint_hint: ?*u32) ?PathView {
+        const result = self.completed.resultAt(slot);
+        if (!endsAt(result.end, goal_level, goal_index)) return null;
+        const path_grid = self.graph.grid(result.path_level) orelse return .{ .status = .unavailable };
+        // Abstract chunk/cross-level corridor: a full obstacle-aware stitched
+        // (level,cell) path. Walk the run on the agent's CURRENT level cell by
+        // cell (every consecutive pair is a traversable neighbor), so multi-hop
+        // and cross-floor routes converge without any straight-line cut.
+        if (result.stitched_len != 0) {
+            const stitched = self.completed.stitchedSlice(slot, result.stitched_len);
+            if (waypointFromStitched(&self.graph, stitched, start_level, start_index, waypoint_hint)) |waypoint| {
+                return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.stitched_len };
+            }
+            // Agent's level is not yet covered by the corridor (e.g. it has not
+            // reached the start-level run): steer toward the corridor's first cell.
+            const first_grid = self.graph.grid(stitched.levels[0]) orelse return .{ .status = .unavailable };
+            return .{ .status = .available, .next_waypoint = first_grid.cellCenter(stitched.cells[0]), .path_len = result.stitched_len };
+        }
+        const path = self.completed.pathSlice(slot, result.path_len);
+        // Plain same-component local solve: derive a forward waypoint from the
+        // agent's current cell against the stored path.
+        if (result.path_level == start_level) {
+            if (waypointFromPath(path_grid, path, start_index, waypoint_hint)) |waypoint| {
+                return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.path_len };
+            }
+        }
+        return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .path_len = result.path_len };
     }
 
-    fn startChunkAt(self: *const PathfindingSystem, cell: GridCell) StartChunk {
-        // Chunk edges are powers of two; in-grid cells are non-negative and below 2^32.
-        const shift: u5 = @intCast(@ctz(self.graph.chunk_tiles));
-        return .{ .x = @as(u32, @intCast(cell.x)) >> shift, .y = @as(u32, @intCast(cell.y)) >> shift };
+    /// A key's live goal on `goal_grid`, its goal level's grid: the key's cell when open,
+    /// else the nearest open cell within the projection radius, read from the step's goal
+    /// table when it holds the key, else computed (`fallback`). `cell` null: no open cell,
+    /// so every start reads unavailable. O(1) for an open cell or a table hit, O(radius²)
+    /// for a fallback. Const; safe on workers while the table is read-only.
+    pub fn liveGoal(self: *const PathfindingSystem, key: PathQueryKey, goal_grid: *const NavGrid) LiveGoal {
+        const key_index = goal_grid.indexForCell(key.goal) orelse return .{};
+        // `indexForCell` bounded the cell to the grid.
+        if (!goal_grid.isBlockedXY(@intCast(key.goal.x), @intCast(key.goal.y))) return .{ .cell = key_index };
+        if (self.goals.lookup(goalRef(traversalOf(key.agent_class), key.goal_level, key_index))) |live| {
+            return .{ .cell = if (live == no_cell) null else live, .blocked = true };
+        }
+        return .{ .cell = goal_grid.projectToNearestOpen(key.goal, default_goal_projection_radius), .blocked = true, .fallback = true };
     }
 
-    const StartChunk = struct {
-        x: u32,
-        y: u32,
+    pub const LiveGoal = struct {
+        cell: ?usize = null,
+        // The key's cell was blocked: `cell` is its projection.
+        blocked: bool = false,
+        // The goal table did not hold the blocked key, so the projection was computed.
+        fallback: bool = false,
     };
 
-    // Whether a fresh negative answers `key` for a start at `start` on `start_level`, and
-    // whether an expired one waits for removal; one probe. Const.
-    fn negativeFor(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start: GridCell) NegativeAnswer {
-        const negative = self.negatives.lookup(key, self.step_counter, types.default_cache_ttl_steps) orelse return .absent;
-        if (!negative.fresh) return .expired;
-        const chunk = self.startChunkAt(start);
-        return if (negative.enclosure.excludes(start_level, chunk.x, chunk.y)) .absent else .hit;
+    /// Reach from `start_index` on `start_level` to `goal_index` on `goal_level` for agents of
+    /// `class`, on its traversal's graph: `start_blocked` for a blocked start, else whether
+    /// it reaches the goal. O(1) (`connectivity.reach`); const.
+    pub fn reaches(self: *const PathfindingSystem, class: PathAgentClass, start_level: u16, start_index: usize, goal_level: u16, goal_index: usize) Reach {
+        return reach(self.graphFor(traversalOf(class)), start_level, start_index, goal_level, goal_index);
     }
 
-    const NegativeAnswer = enum { absent, hit, expired };
+    // The nav graph agents of `traversal` move over: one arm per traversal.
+    fn graphFor(self: *const PathfindingSystem, traversal: TraversalClass) *const NavGraph {
+        return switch (traversal) {
+            .walk => &self.graph,
+        };
+    }
+
+    // Whether a cached result ending at `end` ends at the live goal: a result solved toward
+    // an older projection is not served.
+    fn endsAt(end: types.StitchedCell, goal_level: u16, goal_index: usize) bool {
+        return end.level == goal_level and end.cell == goal_index;
+    }
+
+    /// Sizes the goal table for `intent_count` intents per step: the population seam's
+    /// reserve. Grow-only and failure-atomic at the old size.
+    pub fn reserveGoals(self: *PathfindingSystem, intent_count: usize) !void {
+        try self.goals.reserve(self.allocator, intent_count);
+    }
+
+    /// `path_goal_resolve`: builds the step's goal table from `intents` (any type with
+    /// `agent_class`, `goal_level`, and a `goal` position), so every status query, intake
+    /// request, group-field decision, and solve this step reads a blocked goal's projection
+    /// from one entry. `goal_scan` dispatches over intents, each range writing its window of
+    /// distinct blocked refs; the main thread merges the windows in range order (O(1) per
+    /// entry); `goal_project` dispatches over the distinct goals, one projection each. Both
+    /// stages run under their own tuners with `config`'s controls, inline without a thread
+    /// system. Intents past the reserved limit grow the table here, before any table write,
+    /// geometrically and counted; on error the table is invalid and its storage intact. The
+    /// table is valid until the next grid change. Equal for any partition.
+    pub fn resolveGoals(self: *PathfindingSystem, comptime Intent: type, intents: []const Intent, thread_system: ?*ThreadSystem, config: PathfindingConfig) !GoalResolveStats {
+        var stats = GoalResolveStats{ .intents = intents.len };
+        self.goals.invalidate();
+        if (intents.len > self.goals.limit) {
+            try self.goals.reserve(self.allocator, @max(intents.len, self.goals.limit *| 2));
+            self.countGoalTableGrowth();
+        }
+        const threads: ?StageThreads = if (thread_system) |system| .{ .thread_system = system, .config = config } else null;
+        if (!self.graph.valid()) {
+            self.goals.beginScan(0, 0);
+            _ = self.goals.mergeScan(1);
+            self.goals.finish();
+            return stats;
+        }
+        var graphs: goal_table.Graphs = undefined;
+        for (std.enums.values(TraversalClass)) |traversal| graphs.set(traversal, self.graphFor(traversal));
+        const scan_dispatch: ?Dispatch = if (threads) |stage| stage.stage(&self.goal_scan_tuner) else null;
+        // An empty stage has no shape to select.
+        const scan_shape: StageShape = if (intents.len == 0) .{} else stageShape(scan_dispatch, intents.len, goal_table.scan_range_alignment_items);
+        self.goals.beginScan(intents.len, scan_shape.range_count);
+        var scan = goal_table.ScanJob(Intent){
+            .intents = intents,
+            // Every level and traversal shares the world's extent.
+            .extent = self.graph.grid(0).?,
+            .graphs = graphs,
+            .items_per_range = scan_shape.items_per_range,
+            .refs = self.goals.scan_refs.items,
+            .tallies = self.goals.scan_tallies.items,
+        };
+        stats.scan_batch = runShaped(scan_dispatch, scan_shape, intents.len, goal_table.scan_range_alignment_items, &scan, goal_table.ScanJob(Intent).run);
+        stats.blocked = self.goals.mergeScan(scan_shape.items_per_range);
+        const distinct = self.goals.refs.items.len;
+        const project_dispatch: ?Dispatch = if (threads) |stage| stage.stage(&self.goal_project_tuner) else null;
+        const project_shape: StageShape = if (distinct == 0) .{} else stageShape(project_dispatch, distinct, goal_table.project_range_alignment_items);
+        var project = goal_table.ProjectJob{
+            .refs = self.goals.refs.items,
+            .live = self.goals.live.items,
+            .graphs = graphs,
+            .range_count = project_shape.range_count,
+        };
+        stats.project_batch = runShaped(project_dispatch, project_shape, distinct, goal_table.project_range_alignment_items, &project, goal_table.ProjectJob.run);
+        self.goals.finish();
+        stats.distinct = distinct;
+        stats.projections = distinct;
+        return stats;
+    }
+
+    fn countGoalTableGrowth(self: *PathfindingSystem) void {
+        self.goal_table_grows += 1;
+        if (self.goal_table_growth_logged) return;
+        self.goal_table_growth_logged = true;
+        if (comptime logging.enabled(.info) and !builtin.is_test) logging.game.info(
+            "path goal table grew to {d} intents",
+            .{self.goals.limit},
+        );
+    }
 
     // Shared accept + group-service + solve-limit prologue for update/updateSerial.
     // Safe-point elastic resize runs here, after last frame's publish and before any
@@ -1732,27 +1771,24 @@ pub const PathfindingSystem = struct {
                         continue;
                     }
                 }
-                if (self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps)) |found| {
-                    if (found.fresh) {
+                const cached = self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps);
+                // Removes the expired result, as the merge removes a record's.
+                if (cached != null and !cached.?.fresh) _ = self.completed.findFresh(key, self.step_counter, types.default_cache_ttl_steps);
+                const answer = self.intakeAnswer(key, request.start_level, cells.start, goal_grid, cached);
+                if (answer.fallback) stats.goal_fallbacks += 1;
+                switch (answer.kind) {
+                    .unavailable => {
+                        stats.unavailable_results += 1;
+                        stats.reach_unavailable += 1;
+                        continue;
+                    },
+                    .hit => {
                         stats.duplicate_requests += 1;
                         stats.cache_hits += 1;
                         stats.available_results += 1;
                         continue;
-                    }
-                    // Removes the expired result.
-                    _ = self.completed.findFresh(key, self.step_counter, types.default_cache_ttl_steps);
-                }
-                switch (self.negativeFor(key, request.start_level, cells.start)) {
-                    .hit => {
-                        stats.duplicate_requests += 1;
-                        stats.cache_hits += 1;
-                        stats.unavailable_results += 1;
-                        continue;
                     },
-                    // Removes the expired negative; the request goes on as if none were cached.
-                    .expired => _ = self.negatives.removeExpired(key, self.step_counter, types.default_cache_ttl_steps),
-                    // A start inside the negative's box goes on to a solve.
-                    .absent => {},
+                    .candidate => {},
                 }
                 if (self.pending_keys.contains(key)) {
                     stats.duplicate_requests += 1;
@@ -1762,20 +1798,48 @@ pub const PathfindingSystem = struct {
                     stats.dropped_requests += 1;
                     continue;
                 }
-                const goal = projectGoal(goal_grid, key.goal);
                 self.pending.push(.{
                     .entity = request.entity,
                     .key = key,
                     .start_level = request.start_level,
                     .start = cells.start,
-                    .goal_index = goal.index,
                 });
                 _ = self.pending_keys.insert(key);
                 stats.accepted_requests += 1;
-                if (goal.projected) stats.goal_projected += 1;
+                if (answer.projected) stats.goal_projected += 1;
             }
         }
     }
+
+    // How intake answers one request past its group field: unavailable when no open goal
+    // cell lies within the projection radius or an open start cannot reach the live goal;
+    // a hit when a fresh cached result ends at the live goal; else a candidate (a cached
+    // result toward an older projection is replaced by the candidate's solve). A blocked
+    // start is a candidate, dropped at solve. O(1) with the step's goal table. Const.
+    fn intakeAnswer(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start: GridCell, goal_grid: *const NavGrid, cached: ?ResultCache.SlotLookup) IntakeAnswer {
+        const live = self.liveGoal(key, goal_grid);
+        var answer = IntakeAnswer{ .projected = live.blocked, .fallback = live.fallback };
+        const goal_index = live.cell orelse {
+            answer.kind = .unavailable;
+            return answer;
+        };
+        // The level was checked against the graph's levels, and a clamped start is in-grid.
+        const start_index = self.graph.grid(start_level).?.indexForCell(start).?;
+        if (self.reaches(key.agent_class, start_level, start_index, key.goal_level, goal_index) == .unreachable_goal) {
+            answer.kind = .unavailable;
+            return answer;
+        }
+        if (cached) |found| {
+            if (found.fresh and endsAt(found.end, key.goal_level, goal_index)) answer.kind = .hit;
+        }
+        return answer;
+    }
+
+    const IntakeAnswer = struct {
+        kind: enum { unavailable, hit, candidate } = .candidate,
+        projected: bool,
+        fallback: bool,
+    };
 
     // A ready group field answers only members on the goal level whose own cell it
     // covers; an off-level member or a sample miss falls through to an individual
@@ -1834,44 +1898,42 @@ pub const PathfindingSystem = struct {
                     }
                 }
                 const cached = self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps);
-                if (cached) |found| {
-                    if (found.fresh) {
-                        tally.duplicate_requests += 1;
-                        tally.cache_hits += 1;
-                        tally.available_results += 1;
-                        continue;
-                    }
-                }
-                const negative = self.negativeFor(key, request.start_level, cells.start);
+                const answer = self.intakeAnswer(key, request.start_level, cells.start, goal_grid, cached);
+                if (answer.fallback) tally.goal_fallbacks += 1;
                 var record = IntakeRecord{
                     .entity = request.entity,
                     .key = key,
                     .start_level = request.start_level,
                     .start = cells.start,
-                    .goal_index = no_parent,
-                    .expired = cached != null,
-                    .expired_negative = negative == .expired,
+                    // A fresh result toward an older projection is neither served nor
+                    // expired: the candidate's publish replaces it.
+                    .expired = cached != null and !cached.?.fresh,
                     .candidate = false,
-                    .projected = false,
+                    .projected = answer.projected,
                     .repeats = 0,
                 };
-                if (negative == .hit) {
-                    tally.duplicate_requests += 1;
-                    tally.cache_hits += 1;
-                    tally.unavailable_results += 1;
-                } else if (self.pending_keys.contains(key)) {
-                    tally.duplicate_requests += 1;
-                } else {
-                    const goal = projectGoal(goal_grid, key.goal);
-                    record.candidate = true;
-                    record.goal_index = goal.index;
-                    record.projected = goal.projected;
+                switch (answer.kind) {
+                    .unavailable => {
+                        tally.unavailable_results += 1;
+                        tally.reach_unavailable += 1;
+                    },
+                    .hit => {
+                        tally.duplicate_requests += 1;
+                        tally.cache_hits += 1;
+                        tally.available_results += 1;
+                        continue;
+                    },
+                    .candidate => if (self.pending_keys.contains(key)) {
+                        tally.duplicate_requests += 1;
+                    } else {
+                        record.candidate = true;
+                    },
                 }
-                if (!record.candidate and !record.expired and !record.expired_negative) continue;
-                // A repeat of a key in this range carries its first record's removals and folds
-                // into it; only a candidate's repeats count in the merge. A start inside a
-                // fresh negative's box makes a candidate of a key whose first record was not
-                // one, which takes a record of its own.
+                if (!record.candidate and !record.expired) continue;
+                // A repeat of a key in this range carries its first record's removal and folds
+                // into it; only a candidate's repeats count in the merge. A start that reaches
+                // the goal makes a candidate of a key whose first record was not one (its start
+                // could not), which takes a record of its own.
                 if (recent_records.find(key)) |entry| {
                     if (record_window[entry].candidate) {
                         if (record.candidate) record_window[entry].repeats += 1;
@@ -1903,6 +1965,8 @@ pub const PathfindingSystem = struct {
             stats.available_results += tally.available_results;
             stats.unavailable_results += tally.unavailable_results;
             stats.group_field_samples += tally.group_field_samples;
+            stats.reach_unavailable += tally.reach_unavailable;
+            stats.goal_fallbacks += tally.goal_fallbacks;
         }
     }
 
@@ -1912,8 +1976,6 @@ pub const PathfindingSystem = struct {
             const fresh = self.completed.findFresh(record.key, self.step_counter, types.default_cache_ttl_steps);
             std.debug.assert(fresh == null);
         }
-        // Removes the negative that expired before this step; a repeat finds none.
-        if (record.expired_negative) _ = self.negatives.removeExpired(record.key, self.step_counter, types.default_cache_ttl_steps);
         if (!record.candidate) return;
         // Repeats follow their first occurrence: pending cannot shrink during intake, so a
         // repeat after an accept or a duplicate is a duplicate and after a drop is a drop.
@@ -1931,7 +1993,6 @@ pub const PathfindingSystem = struct {
             .key = record.key,
             .start_level = record.start_level,
             .start = record.start,
-            .goal_index = record.goal_index,
         });
         _ = self.pending_keys.insert(record.key);
         stats.accepted_requests += 1;
@@ -2097,7 +2158,8 @@ pub const PathfindingSystem = struct {
             return;
         }
         const goal_grid = self.graph.grid(key.goal_level) orelse return;
-        const goal_index = goal_grid.projectToNearestOpen(key.goal, default_goal_projection_radius) orelse return;
+        // The step's live goal: the key's cell, or its projection from the goal table.
+        const goal_index = self.liveGoal(key, goal_grid).cell orelse return;
         // Same agent class targeting a different (now stale) cell: the declared
         // goal crossed into a new nav cell. Rebuild only if throttle elapsed.
         if (self.staleGroupSlot(key)) |slot_index| {
@@ -2263,29 +2325,22 @@ pub const PathfindingSystem = struct {
     }
 
     // The publish reserve, before any claim: long-block pages for the step's results past
-    // an inline stripe, each registry shard's room for this step's registrations of it
-    // (path runs and negative keys), and the registration windows. O(solves * shards) on
-    // the main thread; on error nothing is claimed.
+    // an inline stripe, each registry shard's room for this step's path runs in it, and the
+    // registration windows. O(solves * shards) on the main thread; on error nothing is
+    // claimed.
     fn reservePublish(self: *PathfindingSystem, stats: *PathfindingStats) !void {
         var long_results: usize = 0;
         var registrations: usize = 0;
-        var pair_registrations: [flush_pair_count]usize = @splat(0);
+        var shard_registrations: [registry_shard_count]usize = @splat(0);
         for (self.solve_results.items, 0..) |result, ordinal| {
+            if (result != .available) continue;
             const solved = self.solved_paths.items[ordinal];
-            const segment: usize = switch (result) {
-                .available => available: {
-                    if (types.storedPathWords(solved.len, solved.stitched_len) > self.completed.inline_words) long_results += 1;
-                    break :available 0;
-                },
-                .unavailable => negative_pair_base,
-                else => continue,
-            };
+            if (types.storedPathWords(solved.len, solved.stitched_len) > self.completed.inline_words) long_results += 1;
             registrations += solved.run_count;
-            for (pair_registrations[segment..][0..registry_shard_count], solved.shard_counts) |*total, shard_count| total.* += shard_count;
+            for (&shard_registrations, solved.shard_counts) |*total, shard_count| total.* += shard_count;
         }
         const grows_before = self.registryGrowths();
-        for (&self.path_index, pair_registrations[0..registry_shard_count]) |*shard, count| try shard.reserve(count, count, self.completed.logicalCapacity());
-        for (&self.negative_index, pair_registrations[negative_pair_base..]) |*shard, count| try shard.reserve(count, count, self.negatives.logicalCapacity());
+        for (&self.path_index, shard_registrations) |*shard, count| try shard.reserve(count, count, self.completed.logicalCapacity());
         var grows = self.registryGrowths() - grows_before;
         // Each range window starts on a cache line.
         const padding = (reg_window_alignment_items - 1) * maxRangeCount(self.solve_results.items.len, 1);
@@ -2310,7 +2365,7 @@ pub const PathfindingSystem = struct {
     // Growths of every registry shard's table, entry pool, and owner heads so far.
     fn registryGrowths(self: *const PathfindingSystem) u64 {
         var grows: u64 = 0;
-        for (&self.path_index, &self.negative_index) |*shard, *negative_shard| grows += shard.grows + negative_shard.grows;
+        for (&self.path_index) |*shard| grows += shard.grows;
         return grows;
     }
 
@@ -2327,10 +2382,7 @@ pub const PathfindingSystem = struct {
     // Every registry shard holds an owner head per cache owner id below `capacity`.
     fn reserveRegistryOwners(self: *PathfindingSystem, capacity: usize) !void {
         const grows_before = self.registryGrowths();
-        for (&self.path_index, &self.negative_index) |*shard, *negative_shard| {
-            try shard.reserve(0, 0, capacity);
-            try negative_shard.reserve(0, 0, capacity);
-        }
+        for (&self.path_index) |*shard| try shard.reserve(0, 0, capacity);
         const grows = self.registryGrowths() - grows_before;
         if (grows != 0) self.countRegistryGrowth(grows);
     }
@@ -2339,14 +2391,6 @@ pub const PathfindingSystem = struct {
     fn clearRegistry(self: *PathfindingSystem) void {
         for (&self.path_index) |*shard| shard.clear();
         self.publish_ranges = 0;
-    }
-
-    // Empties the negative cache, its owner log, and the negative registry. Outside an
-    // update, so no publish waits for a flush.
-    fn clearNegatives(self: *PathfindingSystem) void {
-        std.debug.assert(self.publish_ranges == 0);
-        self.negatives.clear();
-        for (&self.negative_index) |*shard| shard.clear();
     }
 
     // Empties the result cache, its owner log, and the registry.
@@ -2364,43 +2408,30 @@ pub const PathfindingSystem = struct {
         std.debug.assert(self.publish_records.capacity >= self.solve_results.items.len);
         self.publish_records.items.len = self.solve_results.items.len;
         self.completed.core.beginPublish();
-        self.negatives.core.beginPublish();
         for (self.solve_results.items, self.publish_records.items, 0..) |result, *record, ordinal| {
             record.* = null;
             switch (result) {
                 .available => |key| {
                     const solved = self.solved_paths.items[ordinal];
                     if (self.completed.canStore()) {
-                        record.* = self.completed.claim(key, solved.len, solved.stitched_len, solved.path_level, self.step_counter, stats);
+                        record.* = self.completed.claim(key, solved.len, solved.stitched_len, solved.path_level, solved.end, self.step_counter, stats);
                     }
                     stats.solved_requests += 1;
                     stats.available_results += 1;
                     if (solved.via_abstract) stats.abstract_solves += 1;
                     if (solved.cross_level) stats.cross_level_solves += 1;
                 },
-                // A proven negative: its keys are registered by `publish_copy`.
-                .unavailable => |key| {
-                    const solved = self.solved_paths.items[ordinal];
-                    if (self.negatives.canStore()) {
-                        const owner = self.negatives.claim(key, solved.enclosure, self.step_counter, stats);
-                        record.* = .{ .owner = owner, .long_block = negative_claim_block };
-                        stats.negatives_published += 1;
-                        if (solved.negative_after_exhaustion) stats.negatives_proven_after_exhaustion += 1;
-                    }
-                    stats.solved_requests += 1;
+                // Answered without a search and never cached: dropped in
+                // compactPendingAfterSolve.
+                .unavailable => {
                     stats.unavailable_results += 1;
-                },
-                // Answered for its request only: dropped in compactPendingAfterSolve.
-                .start_unreachable => {
-                    stats.start_unreachable += 1;
-                    stats.solved_requests += 1;
-                    stats.unavailable_results += 1;
+                    stats.reach_unavailable += 1;
                 },
                 .budget_exhausted => {
                     stats.budget_exhausted += 1;
                 },
-                // Start-side failure: dropped in compactPendingAfterSolve without
-                // negative-caching; the next status query falls through to `.missing`.
+                // Start-side failure: dropped in compactPendingAfterSolve, never cached; the
+                // next status query falls through to `.missing`.
                 .start_invalid => {
                     stats.start_invalid_dropped += 1;
                 },
@@ -2411,10 +2442,9 @@ pub const PathfindingSystem = struct {
     }
 
     // `publish_copy`: each range copies its claimed results' paths into their stripes or
-    // blocks and buckets their registrations (path runs, and claimed negatives' keys) by
-    // flush pair into its window, recording each pair's count in its band. The main thread
-    // sizes the windows from the selected shape, O(1) per result; inline it is one range.
-    // Returns the stage's batch.
+    // blocks and buckets their path runs' registrations by flush pair into its window,
+    // recording each pair's count in its band. The main thread sizes the windows from the
+    // selected shape, O(1) per result; inline it is one range. Returns the stage's batch.
     fn publishCopy(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
         const item_count = self.solve_results.items.len;
         self.publish_ranges = 0;
@@ -2449,14 +2479,14 @@ pub const PathfindingSystem = struct {
         return batch;
     }
 
-    // `registry_flush`: pair by pair (registry index, shard), removes and renames the owners
-    // of its index's cache owner log (the result cache's or the negative cache's) in log
-    // order, then adds the last publish copy's registrations of the pair in range order, so
-    // every list holds its adds in (op, ordinal, run) order for any partition, and installs
-    // a shrink's prepared owner heads. Each pair writes only its shard and its tally. Then
-    // the logs are emptied, the replaced owner heads are freed, and `stats` (when given)
-    // takes the counts. Allocates nothing; every add was reserved by the publish.
-    // Items are work units: pair p weighs its index's ops + its adds + 1, and a range runs
+    // `registry_flush`: shard by shard, removes and renames the owners of the result
+    // cache's owner log in log order, then adds the last publish copy's registrations of the
+    // shard in range order, so every list holds its adds in (op, ordinal, run) order for any
+    // partition, and installs a shrink's prepared owner heads. Each pair (shard) writes only
+    // its shard and its tally. Then the log is emptied, the replaced owner heads are freed,
+    // and `stats` (when given) takes the counts. Allocates nothing; every add was reserved
+    // by the publish.
+    // Items are work units: pair p weighs the log's ops + its adds + 1, and a range runs
     // the pairs whose first unit lies in it, so each pair runs in exactly one range. The
     // main thread sums the weights, O(publish ranges * pairs). A shrink's flush carries ops
     // for most cache entries, a one-off the stage's tuner has no threaded profile for, so
@@ -2466,17 +2496,17 @@ pub const PathfindingSystem = struct {
     fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*PathfindingStats) BatchStats {
         var batch = BatchStats{};
         const truncate = self.registry_truncate_pending;
-        const ops = [registry_index_count][]const OwnerOp{ self.completed.core.ownerLog(), self.negatives.core.ownerLog() };
-        if (ops[0].len != 0 or ops[1].len != 0 or self.publish_ranges != 0 or truncate) {
+        const ops = self.completed.core.ownerLog();
+        if (ops.len != 0 or self.publish_ranges != 0 or truncate) {
             var pair_adds: [flush_pair_count]usize = @splat(0);
             for (self.publish_bands.items[0..self.publish_ranges]) |band| {
                 for (&pair_adds, band.counts) |*adds, count| adds.* += count;
             }
             var unit_starts: [flush_pair_count + 1]usize = undefined;
             var units: usize = 0;
-            for (unit_starts[0..flush_pair_count], pair_adds, 0..) |*start, adds, pair| {
+            for (unit_starts[0..flush_pair_count], pair_adds) |*start, adds| {
                 start.* = units;
-                units += ops[pair / registry_shard_count].len + adds + 1;
+                units += ops.len + adds + 1;
             }
             unit_starts[flush_pair_count] = units;
             const flush_dispatch: ?Dispatch = if (dispatch) |stage| pairs: {
@@ -2503,39 +2533,19 @@ pub const PathfindingSystem = struct {
             };
             batch = runShaped(flush_dispatch, shape, units, 1, &job, registryFlushJob);
             if (stats) |step| {
-                for (self.flush_tallies[0..negative_pair_base]) |tally| {
+                for (self.flush_tallies) |tally| {
                     step.registrations_removed += tally.removed;
                     step.registrations_added += tally.added;
-                }
-                for (self.flush_tallies[negative_pair_base..]) |tally| {
-                    step.negative_registrations_removed += tally.removed;
-                    step.negative_registrations_added += tally.added;
                 }
             }
         }
         self.publish_ranges = 0;
         self.completed.core.finishOwnerLog(self.allocator);
-        self.negatives.core.finishOwnerLog(self.allocator);
         if (truncate) {
-            for (&self.path_index, &self.negative_index) |*shard, *negative_shard| {
-                shard.releaseTruncated();
-                negative_shard.releaseTruncated();
-            }
+            for (&self.path_index) |*shard| shard.releaseTruncated();
             self.registry_truncate_pending = false;
         }
         return batch;
-    }
-
-    // The shard map of flush pair `pair`; each registry index needs its own arm.
-    fn flushPairMap(self: *PathfindingSystem, pair: usize) *ChunkListMap {
-        comptime std.debug.assert(registry_index_count == 2);
-        std.debug.assert(pair < flush_pair_count);
-        const shard = pair % registry_shard_count;
-        return switch (pair / registry_shard_count) {
-            0 => &self.path_index[shard],
-            1 => &self.negative_index[shard],
-            else => unreachable,
-        };
     }
 
     // `resize_copy`: copies a shrink's pending path moves, threaded over moves, then frees
@@ -2552,19 +2562,17 @@ pub const PathfindingSystem = struct {
         return batch;
     }
 
-    // Compacts the solve window [0, solve_count) of pending in O(solve_count). Solved
-    // entries (available/unavailable/start_invalid/start_unreachable) are removed; a
-    // negative proven after its search exhausted its budget is unavailable and promotes
-    // nothing. Deferred entries (not
+    // Compacts the solve window [0, solve_count) of pending in O(solve_count). Answered
+    // entries (available/unavailable/start_invalid) are removed. Deferred entries (not
     // admitted this frame, including a tier-1-ready request skipped by the escalated-solve
     // cap) keep their front order. A budget-exhausted entry follows the two-tier ladder:
     // tier 0 (the cheap, fixed-budget attempt) promotes to tier 1 and rotates to the BACK
     // of pending exactly once, so the untouched tail reaches the solve window before the
     // promoted entry retries at the larger — but still fixed, never derived from
-    // world/graph size — tier-1 budget; a budget-exhausted AT tier 1 drops the entry
-    // WITHOUT negative-caching (it does not fit either fixed budget, which is not the same
-    // as a definitive "no path exists") — worst case exactly two solve attempts per
-    // request, never an unbounded retry storm and never a false `.unavailable`.
+    // world/graph size — tier-1 budget; a budget-exhausted AT tier 1 drops the entry (the
+    // goal is reachable, it just does not fit either fixed budget, so it is never
+    // `.unavailable`) — worst case exactly two solve attempts per request, never an
+    // unbounded retry storm.
     //
     // The window is walked back to front, each outcome recovered by merge-walking the
     // increasing fallback_indices; kept entries are written toward the window end (a
@@ -2598,13 +2606,11 @@ pub const PathfindingSystem = struct {
                         request.tier = 1;
                         self.rotate_back_scratch.appendAssumeCapacity(request);
                     } else {
-                        // Tier 1 (the larger fixed ceiling) still exhausted: this is NOT a
-                        // definitive negative — it only means the request did not fit either
-                        // fixed budget, not that no path exists (`unavailable` is reserved for
-                        // structural negatives: disconnected component, no corridor). Drop it
-                        // from pending WITHOUT negative-caching, so the next status query falls
-                        // through to `.missing` (statusForKeyAndStart's fallthrough) rather than
-                        // a false "no path". The caller (steering) already treats `.missing` the
+                        // Tier 1 (the larger fixed ceiling) still exhausted: the goal is
+                        // reachable (solve checked), the request just did not fit either fixed
+                        // budget. Drop it from pending, so the next status query falls through
+                        // to `.missing` (statusForKeyAndStart's fallthrough) rather than a
+                        // false "no path". The caller (steering) already treats `.missing` the
                         // same as `.pending`/`.unavailable` for movement (direct-fallback steering
                         // toward the goal, see steering.zig's directionFromPathStatus) and
                         // re-requests after its own replan cooldown, so a genuinely-hard case
@@ -2615,10 +2621,10 @@ pub const PathfindingSystem = struct {
                     }
                 },
                 else => {
-                    // available/unavailable/start_invalid/start_unreachable: removed from
-                    // pending. A start_invalid or start_unreachable entry was never
-                    // negative-cached, so its next status query is `.missing` and the
-                    // caller may re-request.
+                    // available/unavailable/start_invalid: removed from pending. An
+                    // unavailable or start_invalid entry is never cached; the next status
+                    // query answers it again from reach, or reads `.missing` and the caller
+                    // may re-request.
                     self.pending_keys.remove(self.pending.at(pending_index).key);
                 },
             }
@@ -2776,21 +2782,6 @@ fn directIntakeJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerI
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.requests.len);
     job.system.acceptDirect(job.requests[range.start..range.end], job.stats);
-}
-
-const ProjectedGoal = struct {
-    // `no_parent` when no open cell is near the goal: a definitive unavailable.
-    index: usize,
-    projected: bool,
-};
-
-// Nearest-open goal projection on the goal level, resolved at intake so the solve
-// reuses it.
-fn projectGoal(goal_grid: *const NavGrid, goal: GridCell) ProjectedGoal {
-    const index = goal_grid.indexForCell(goal) orelse return .{ .index = no_parent, .projected = false };
-    if (!goal_grid.isBlockedIndex(index)) return .{ .index = index, .projected = false };
-    const projected = goal_grid.projectToNearestOpen(goal, default_goal_projection_radius) orelse return .{ .index = no_parent, .projected = false };
-    return .{ .index = projected, .projected = true };
 }
 
 // One range of a `group_field_expand` pass; slot indices are distinct by construction.
@@ -2968,7 +2959,7 @@ const PublishCopyJob = struct {
 };
 
 // SIMD verdict: the path copy is `@memcpy`; bucketing is a scalar counting-sort scatter
-// with one division per run start, and at most 64 key hashes per negative.
+// with one division per run start.
 fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *PublishCopyJob = @ptrCast(@alignCast(context));
     const system = job.system;
@@ -2977,15 +2968,13 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end and range.end <= system.publish_records.items.len and range.end <= system.solve_results.items.len);
     var counts: [flush_pair_count]u32 = @splat(0);
     for (range.start..range.end) |ordinal| {
+        // Only available results claim an entry.
         const claimed = system.publish_records.items[ordinal] orelse continue;
         const solved = system.solved_paths.items[ordinal];
-        const segment: usize = if (system.solve_results.items[ordinal] == .available) path: {
-            const words = types.storedPathWords(solved.len, solved.stitched_len);
-            // Claims of one publish never share a stripe or a block.
-            @memcpy(system.completed.destination(claimed)[0..words], system.worker_path_pool.items[solved.offset..][0..words]);
-            break :path 0;
-        } else negative_pair_base;
-        for (counts[segment..][0..registry_shard_count], solved.shard_counts) |*total, shard_count| total.* += shard_count;
+        const words = types.storedPathWords(solved.len, solved.stitched_len);
+        // Claims of one publish never share a stripe or a block.
+        @memcpy(system.completed.destination(claimed)[0..words], system.worker_path_pool.items[solved.offset..][0..words]);
+        for (&counts, solved.shard_counts) |*total, shard_count| total.* += shard_count;
     }
     var cursors: [flush_pair_count]usize = undefined;
     var next = system.publish_range_bases.items[range.index];
@@ -2997,15 +2986,6 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     for (range.start..range.end) |ordinal| {
         const claimed = system.publish_records.items[ordinal] orelse continue;
         const solved = system.solved_paths.items[ordinal];
-        if (system.solve_results.items[ordinal] != .available) {
-            for (0..solved.run_count) |index| {
-                const key = solved.negative.keyAt(@intCast(index));
-                const pair = negative_pair_base + registryShard(key);
-                job.buckets[cursors[pair]] = .{ .key = key, .owner = claimed.owner, .order = 0 };
-                cursors[pair] += 1;
-            }
-            continue;
-        }
         const stripe = system.worker_path_pool.items[solved.offset..][0..job.stripe_words];
         const view = types.stitchedView(stripe, solved.stitched_len);
         for (system.worker_run_starts.items[solved.offset..][0..solved.run_count]) |start| {
@@ -3018,13 +2998,13 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     job.bands[range.index] = .{ .counts = counts };
 }
 
-// One range of `registry_flush`: the pairs whose first work unit lies in the range, each
-// applying the owner log in order and then its segment of every publish range in range
-// order.
+// One range of `registry_flush`: the pairs (shards) whose first work unit lies in the
+// range, each applying the owner log in order and then its segment of every publish range
+// in range order.
 const RegistryFlushJob = struct {
     system: *PathfindingSystem,
-    // Per registry index, its cache's owner log.
-    ops: [registry_index_count][]const OwnerOp,
+    // The result cache's owner log.
+    ops: []const OwnerOp,
     publish_ranges: usize,
     // Install each pair's prepared owner heads after its ops and adds.
     truncate: bool,
@@ -3048,9 +3028,9 @@ fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
     var pair = std.sort.lowerBound(usize, starts, range.start, orderUnit);
     while (pair < flush_pair_count and starts[pair] < range.end) : (pair += 1) {
         std.debug.assert(pair < system.flush_tallies.len);
-        const map = system.flushPairMap(pair);
+        const map = &system.path_index[pair];
         var removed: usize = 0;
-        for (job.ops[pair / registry_shard_count]) |op| {
+        for (job.ops) |op| {
             // Most owners hold runs in few shards.
             if (!map.holdsOwner(op.old)) continue;
             if (op.new == no_owner) removed += map.removeOwner(op.old) else map.renameOwner(op.old, op.new);
@@ -3125,17 +3105,13 @@ fn chunkAround(chunks: ChunkGrid, level: u16, x: usize, y: usize, dx: isize, dy:
     return .{ .key = chunkKey(level, @intCast(at_y * chunks.chunks_x + at_x)), .x = at_x, .y = at_y };
 }
 
-// One range of `nav_evict_count`, per dirty key: for a changed key, the registered halo
-// keys it owns and their registration count (changed key K owns halo key H iff no changed
-// key in H's 3x3 block sorts before it); and the negatives on its chunk list and on the
-// superchunk, level, and world lists it owns (the first dirty key in each). Every list is
-// walked once whatever the partition.
+// One range of `nav_evict_count`, per changed key: the registered halo keys it owns and
+// their registration count (changed key K owns halo key H iff no changed key in H's 3x3
+// block sorts before it). Every list is walked once whatever the partition.
 const EvictCountJob = struct {
-    // The batch's dirty and changed keys, sorted.
-    keys: []const u64,
+    // The batch's changed keys, sorted.
     changed_keys: []const u64,
     readers: [registry_shard_count]ChunkListMap.Reader,
-    negative_readers: [registry_shard_count]ChunkListMap.Reader,
     chunks: ChunkGrid,
     items: []EvictItem,
     range_count: usize,
@@ -3146,71 +3122,25 @@ const EvictCountJob = struct {
 fn evictCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *EvictCountJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end <= job.items.len and range.end <= job.keys.len);
+    std.debug.assert(range.start <= range.end and range.end <= job.items.len and range.end <= job.changed_keys.len);
     for (range.start..range.end) |index| {
-        const key = job.keys[index];
+        const key = job.changed_keys[index];
         const level = keyLevel(key);
         const x = keyChunk(key) % job.chunks.chunks_x;
         const y = keyChunk(key) / job.chunks.chunks_x;
         var item = EvictItem{};
-        if (std.sort.binarySearch(u64, job.changed_keys, key, orderKey)) |changed_index| {
-            // Changed keys are fewer than the registries' u32 ids.
-            item.changed_index = @intCast(changed_index);
-            inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
-                if (chunkAround(job.chunks, level, x, y, dx, dy)) |halo| {
-                    // A halo key with no registration has nothing to walk.
-                    const registrations = job.readers[registryShard(halo.key)].keyCount(halo.key);
-                    if (registrations != 0 and ownsHalo(job.changed_keys[0..changed_index], key, job.chunks, level, halo.x, halo.y)) {
-                        item.owned |= haloBit(dx, dy);
-                        item.bound += registrations;
-                    }
+        inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
+            if (chunkAround(job.chunks, level, x, y, dx, dy)) |halo| {
+                // A halo key with no registration has nothing to walk.
+                const registrations = job.readers[registryShard(halo.key)].keyCount(halo.key);
+                if (registrations != 0 and ownsHalo(job.changed_keys[0..index], key, job.chunks, level, halo.x, halo.y)) {
+                    item.owned |= haloBit(dx, dy);
+                    item.bound += registrations;
                 }
-            };
-        }
-        item.negative_bound = negativeListCount(job.negative_readers, key);
-        const superchunk = superchunkOf(job.chunks, level, x, y);
-        const superchunk_count = negativeListCount(job.negative_readers, superchunk);
-        if (superchunk_count != 0 and ownsSuperchunk(job.keys[0..index], job.chunks, level, x, y)) {
-            item.owned |= evict_owns_superchunk;
-            item.negative_bound += superchunk_count;
-        }
-        if (index == 0 or keyLevel(job.keys[index - 1]) != level) {
-            item.owned |= evict_owns_level;
-            item.negative_bound += negativeListCount(job.negative_readers, levelKey(level));
-        }
-        if (index == 0) {
-            item.owned |= evict_owns_world;
-            item.negative_bound += negativeListCount(job.negative_readers, world_key);
-        }
+            }
+        };
         job.items[index] = item;
     }
-}
-
-fn negativeListCount(readers: [registry_shard_count]ChunkListMap.Reader, key: u64) u32 {
-    return readers[registryShard(key)].keyCount(key);
-}
-
-// The superchunk key of chunk (x, y) on `level`.
-fn superchunkOf(chunks: ChunkGrid, level: u16, x: usize, y: usize) u64 {
-    const superchunks_x = (chunks.chunks_x + superchunk_edge - 1) / superchunk_edge;
-    // A level's superchunk count stays below its chunk count, below 2^31.
-    return superchunkKey(level, @intCast((y / superchunk_edge) * superchunks_x + x / superchunk_edge));
-}
-
-// Whether no key of `earlier` (the dirty keys below chunk (x, y)'s, sorted) lies in its
-// superchunk: one search per superchunk row.
-fn ownsSuperchunk(earlier: []const u64, chunks: ChunkGrid, level: u16, x: usize, y: usize) bool {
-    const first_x = x / superchunk_edge * superchunk_edge;
-    const end_x = @min(first_x + superchunk_edge, chunks.chunks_x);
-    const first_y = y / superchunk_edge * superchunk_edge;
-    for (first_y..@min(first_y + superchunk_edge, chunks.chunks_y)) |row| {
-        // Chunk indices of a level stay below 2^31.
-        const row_first = chunkKey(level, @intCast(row * chunks.chunks_x + first_x));
-        const row_end = chunkKey(level, @intCast(row * chunks.chunks_x + end_x));
-        const at = std.sort.lowerBound(u64, earlier, row_first, orderKey);
-        if (at < earlier.len and earlier[at] < row_end) return false;
-    }
-    return true;
 }
 
 // Whether `key` is the smallest changed key in the 3x3 block around chunk (x, y): no key
@@ -3224,17 +3154,15 @@ fn ownsHalo(earlier: []const u64, key: u64, chunks: ChunkGrid, level: u16, x: us
     return true;
 }
 
-// One range of `nav_evict`, per dirty key, into its hit window: the owners whose runs in
-// its owned halo keys reach a cell within one cell of a changed cell, the negatives on its
-// owned lists, and the group fields with a costed cell within one cell of its changed cells.
+// One range of `nav_evict`, per changed key, into its hit window: the owners whose runs in
+// its owned halo keys reach a cell within one cell of a changed cell, and the group fields
+// with a costed cell within one cell of its changed cells.
 const EvictJob = struct {
     cache: *const ResultCache,
-    // The batch's dirty and changed keys, sorted, and each changed key's flipped cells.
-    keys: []const u64,
+    // The batch's changed keys, sorted, and each one's flipped cells.
     changed_keys: []const u64,
     masks: []const ChunkBits,
     readers: [registry_shard_count]ChunkListMap.Reader,
-    negative_readers: [registry_shard_count]ChunkListMap.Reader,
     fields: []const GroupField,
     chunks: ChunkGrid,
     geometry: RunGeometry,
@@ -3249,13 +3177,10 @@ const EvictJob = struct {
 fn evictJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *EvictJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end <= job.items.len and range.end <= job.keys.len);
-    for (job.items[range.start..range.end], job.keys[range.start..range.end]) |*item, key| {
-        const field_bound: usize = if (item.changed_index != no_changed_index) job.fields.len else 0;
-        std.debug.assert(@as(usize, item.base) + item.bound + item.negative_bound + field_bound <= job.hits.len);
-        evictNegatives(job, item, key);
-        if (item.changed_index == no_changed_index) continue;
-        evictFields(job, item, key);
+    std.debug.assert(range.start <= range.end and range.end <= job.items.len and range.end <= job.changed_keys.len);
+    for (job.items[range.start..range.end], job.changed_keys[range.start..range.end], job.masks[range.start..range.end]) |*item, key, *mask| {
+        std.debug.assert(@as(usize, item.base) + item.bound + job.fields.len <= job.hits.len);
+        evictFields(job, item, key, mask);
         const level = keyLevel(key);
         const x = keyChunk(key) % job.chunks.chunks_x;
         const y = keyChunk(key) / job.chunks.chunks_x;
@@ -3293,46 +3218,17 @@ fn evictJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     }
 }
 
-// Writes every negative on `key`'s chunk list and on the coarser lists `item` owns into its
-// negative hits.
-fn evictNegatives(job: *const EvictJob, item: *EvictItem, key: u64) void {
-    const window = job.hits[item.base + item.bound ..][0..item.negative_bound];
-    var hits: u32 = 0;
-    const level = keyLevel(key);
-    const x = keyChunk(key) % job.chunks.chunks_x;
-    const y = keyChunk(key) / job.chunks.chunks_x;
-    const lists = [_]struct { key: u64, owned: bool }{
-        .{ .key = key, .owned = true },
-        .{ .key = superchunkOf(job.chunks, level, x, y), .owned = item.owned & evict_owns_superchunk != 0 },
-        .{ .key = levelKey(level), .owned = item.owned & evict_owns_level != 0 },
-        .{ .key = world_key, .owned = item.owned & evict_owns_world != 0 },
-    };
-    for (lists) |list| {
-        if (!list.owned) continue;
-        const reader = job.negative_readers[registryShard(list.key)];
-        var entry = reader.head(list.key);
-        while (entry != no_entry) : (entry = reader.next_entries[entry]) {
-            // The bound counts every owned list's entries.
-            window[hits] = reader.owners[entry];
-            hits += 1;
-        }
-    }
-    std.debug.assert(hits == item.negative_bound);
-    item.negative_hits = hits;
-}
-
 // Writes the slot of every group field with a costed cell within one cell of `key`'s
 // changed cells into `item`'s field hits: the changed cells dilated into each chunk of the
 // 3x3 block around `key`, tested against the field's costed bits there.
-fn evictFields(job: *const EvictJob, item: *EvictItem, key: u64) void {
-    const window = job.hits[item.base + item.bound + item.negative_bound ..][0..job.fields.len];
+fn evictFields(job: *const EvictJob, item: *EvictItem, key: u64, mask: *const ChunkBits) void {
+    const window = job.hits[item.base + item.bound ..][0..job.fields.len];
     const level = keyLevel(key);
     var any_field = false;
     for (job.fields) |field| any_field = any_field or (field.state != .empty and field.key.goal_level == level);
     if (!any_field) return;
     const x = keyChunk(key) % job.chunks.chunks_x;
     const y = keyChunk(key) / job.chunks.chunks_x;
-    const mask = job.masks[item.changed_index];
     var near: [9]ChunkBits = undefined;
     var near_chunks: [9]?u32 = @splat(null);
     inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
@@ -3340,7 +3236,7 @@ fn evictFields(job: *const EvictJob, item: *EvictItem, key: u64) void {
         if (chunkAround(job.chunks, level, x, y, dx, dy)) |neighbour| {
             // This key's changed cells, seen from the neighbour at offset (-dx, -dy).
             var around: [9]ChunkBits = @splat(@splat(0));
-            around[(1 - dy) * 3 + (1 - dx)] = mask;
+            around[(1 - dy) * 3 + (1 - dx)] = mask.*;
             near[at] = dilateChanged3x3(job.chunk_edge, &around);
             near_chunks[at] = keyChunk(neighbour.key);
         }
@@ -3459,7 +3355,7 @@ test "pathfinding blocked start drops without poisoning the goal for other agent
     try system.reserve(baselineCapacity());
     try system.rebuildStaticNavGrid(&data, 128, 128, 32);
 
-    // The blocked agent requests first: a start-side drop, never a goal negative.
+    // The blocked agent requests first: a start-side drop, never an unavailable goal.
     var blocked_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer blocked_stream.deinit();
     try appendPathRequest(&blocked_stream, .{ .entity = blocked_agent, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
@@ -3612,13 +3508,14 @@ test "pathfinding rejects disconnected goals" {
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 128, .y = 8 } });
 
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 128, .y = 8 }, .default, null).status);
     const stats = try system.updateSerial(&stream, 8, .{});
+    // Start and goal are different labels of the level's one chunk: reach answers at intake,
+    // with no solve and nothing cached.
     try std.testing.expectEqual(@as(usize, 1), stats.unavailable_results);
-    // Start and goal share the level's one chunk, so no chunk box proven around the goal
-    // leaves the start out: answered for this request only, never cached.
-    try std.testing.expectEqual(@as(usize, 1), stats.start_unreachable);
-    try std.testing.expectEqual(@as(usize, 0), stats.negatives_published);
-    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 128, .y = 8 }, .default, null).status);
+    try std.testing.expectEqual(@as(usize, 1), stats.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), stats.solved_requests + system.pending.len + system.completed.count());
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 128, .y = 8 }, .default, null).status);
 }
 
 test "pathfinding drops an out-of-range level request instead of clamping and solving a goal it can never read back" {
@@ -3748,7 +3645,7 @@ test "pathfinding group mode builds one shared field sampled by all agents" {
 test "pathfinding same-level group agent falls through on a field-sample miss instead of a hard unavailable" {
     // A ready field does not cover every same-level cell (e.g. one blocked by a body added
     // after the field built): a sample miss there must fall through to the individual
-    // cache/pending/negative-cache path, exactly like an off-level member already does —
+    // live-goal/reach/cache/pending path, exactly like an off-level member already does —
     // never a blind `.unavailable` that starves the agent of any real solve attempt.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4474,7 +4371,7 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
     try std.testing.expectEqual(@as(usize, 1), blocked_stats.unavailable_results);
 
     // Identical world but the endpoint is open. Rebuilding the same system bumps
-    // nav_version (invalidating the prior negative) and the link becomes live.
+    // nav_version and the link becomes live.
     var open_world = try test_support.abstractTestWorld(&meta, 384, 384);
     defer open_world.deinit();
     _ = try open_world.addLevel(0);
@@ -4680,7 +4577,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     try std.testing.expectEqual(one_level_start_portals, four_level_start_portals);
 
     // The per-query abstract search completes within the node budget regardless of
-    // world size: a long diagonal solve never surfaces saturation as a hard negative.
+    // world size: a long diagonal solve never surfaces saturation as unavailable.
     const extents = [_]f32{ 512, 1024 };
     for (extents) |extent| {
         var data = DataSystem.init(std.testing.allocator);
@@ -4965,8 +4862,8 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
         .goal = .{ .x = 304, .y = 304 },
     });
     const stats = try system.updateSerial(&stream, 8, .{});
-    // Saturation spills to a later frame: counted as budget_exhausted, NOT cached
-    // as a hard negative, and the status reads pending (retryable).
+    // Saturation spills to a later frame: counted as budget_exhausted, never unavailable,
+    // and the status reads pending (retryable).
     try std.testing.expect(stats.budget_exhausted >= 1);
     try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
     try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
@@ -5038,11 +4935,11 @@ test "pathfinding tier0_abstract_node_cap above the tier-1 ceiling still solves 
     try std.testing.expectEqual(@as(usize, 0), stats.budget_exhausted);
 }
 
-// A tier-1 (already-escalated) budget_exhausted drops the request WITHOUT
-// negative-caching: it does not fit either fixed budget, which is not the same as a
-// definitive "no path exists" (unavailable is reserved for structural negatives). The
-// next query falls through to `.missing` (retryable — steering re-requests after its own
-// cooldown) rather than a permanent false negative, and the request cost at most two
+// A tier-1 (already-escalated) budget_exhausted drops the request: it does not fit either
+// fixed budget, which is not the same as "no path exists" (unavailable is reserved for an
+// unreachable goal). The next query falls through to `.missing` (retryable — steering
+// re-requests after its own cooldown) rather than a permanent false unavailable, and the
+// request cost at most two
 // solve attempts, never an unbounded retry storm. Forces both tiers to exhaust via
 // explicit PathfindingCapacity overrides (tier0_abstract_node_cap for the first attempt,
 // then a direct post-rebuild shrink of the live max_abstract_nodes for the second) on the
@@ -5097,18 +4994,18 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     // tightening for the test, below the pool's reserved limit.
     system.capacity.max_abstract_nodes = 1;
 
-    // Attempt 2 (tier 1): exhausts again -> dropped, NOT negative-cached.
+    // Attempt 2 (tier 1): exhausts again -> dropped, never unavailable.
     const second = try system.updateSerial(&stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
     try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), second.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), second.pending_requests);
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
-    // Exactly two solve attempts total across the two steps (never the old 32-retry storm).
+    // Exactly two solve attempts total across the two steps.
     try std.testing.expectEqual(@as(usize, 2), first.budget_exhausted + second.budget_exhausted);
 
-    // Dropped, not negative-cached: the next query reads .missing (retryable), never a
-    // false definitive .unavailable for a goal that may genuinely be reachable.
+    // Dropped: the next query reads .missing (retryable), never .unavailable for a goal
+    // that may be reachable.
     const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.missing, view.status);
 }
@@ -5446,14 +5343,13 @@ test "pathfinding incremental update disconnects a goal when the last gap is clo
     const nav_stats = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
 
-    // The cached path crossed the now-closed gap (5,3), so it was evicted and the
-    // re-solve answers unreachable, not a stale cached available. The goal's side holds
-    // more portals than the failed search claimed, so its proof stops on that budget and
-    // nothing is cached.
+    // The cached path crossed the now-closed gap (5,3), so it was evicted, and reach answers
+    // the re-request unavailable, not a stale cached available, with no solve.
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default, null).status);
     const after = try solveStep(&system, requester, start, goal);
     try std.testing.expectEqual(@as(usize, 1), after.unavailable_results);
-    try std.testing.expectEqual(@as(usize, 1), after.start_unreachable);
-    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
+    try std.testing.expectEqual(@as(usize, 1), after.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), after.solved_requests);
 }
 
 test "pathfinding incremental update retains a still-valid cached path when an off-path tile is unblocked" {
@@ -6926,12 +6822,15 @@ fn appendIndividual(stream: *RangeOutputStream(PathRequest), entity: EntityId, g
 const IntakeGoals = struct {
     const hit = cellWorld(1, 1);
     const expired = cellWorld(2, 1);
-    const expired_negative = cellWorld(3, 1);
-    const negative = cellWorld(4, 1);
-    const excluded_negative = cellWorld(5, 1);
+    // Open goals in the sealed pocket (`addIntakePocket`), the second with an expired path.
+    const sealed = cellWorld(14, 7);
+    const expired_sealed = cellWorld(15, 6);
+    // Blocked, its nearest open cell in the sealed pocket.
+    const sealed_blocked = cellWorld(15, 8);
     const field = cellWorld(8, 8);
     const group = cellWorld(12, 5);
-    // Inside the static body below: projected to an open cell.
+    // Inside the static body below: projected to an open cell; its cached path ends
+    // elsewhere.
     const blocked = cellWorld(10, 4);
 
     fn prefilled(index: usize) math.Vec2 {
@@ -6945,9 +6844,21 @@ const IntakeGoals = struct {
 
 const intake_prefilled_count: usize = 30;
 
+// The scenario's static bodies: the blocked goal's cell, and a pocket of cells
+// (14..15, 6..8) sealed by walls at rows 5 and 9 and column 13, with its corner (15, 8)
+// blocked.
+fn addIntakeBodies(data: *DataSystem) !void {
+    _ = try addNavBody(data, IntakeGoals.blocked, .{ .x = 32, .y = 32 }, true);
+    _ = try addNavBody(data, .{ .x = 416, .y = 160 }, .{ .x = 96, .y = 32 }, true);
+    _ = try addNavBody(data, .{ .x = 416, .y = 288 }, .{ .x = 96, .y = 32 }, true);
+    _ = try addNavBody(data, .{ .x = 416, .y = 192 }, .{ .x = 32, .y = 96 }, true);
+    _ = try addNavBody(data, .{ .x = 480, .y = 256 }, .{ .x = 32, .y = 32 }, true);
+}
+
 /// A 16x16-cell system at `intake_test_agents` agents holding, before the step under
-/// test: 31 pending entries, a ready group field, one fresh and three expired cached
-/// results (one of them also negative-cached, one also pending), and one negative.
+/// test: 31 pending entries, a ready group field, one fresh cached result, three expired
+/// ones (one at a sealed goal, one also pending), and a fresh one at the blocked goal
+/// that ends off its projection.
 fn intakeScenarioSystem(data: *const DataSystem, requester: EntityId, participant_count: usize) !PathfindingSystem {
     var system = PathfindingSystem.init(std.testing.allocator);
     errdefer system.deinit();
@@ -6974,31 +6885,21 @@ fn intakeScenarioSystem(data: *const DataSystem, requester: EntityId, participan
             return s.graph.keyForWorld(0, goal, .default).?;
         }
     }.of;
-    try publishTestPath(&system, key(&system, IntakeGoals.hit), &path, step, &put_stats);
+    // Ends at the hit goal's cell (1, 1).
+    const hit_path = [_]u32{ 18, 17 };
+    try publishTestPath(&system, key(&system, IntakeGoals.hit), &hit_path, step, &put_stats);
     try publishTestPath(&system, key(&system, IntakeGoals.expired), &path, step -% 400, &put_stats);
-    try publishTestPath(&system, key(&system, IntakeGoals.expired_negative), &path, step -% 400, &put_stats);
+    try publishTestPath(&system, key(&system, IntakeGoals.expired_sealed), &path, step -% 400, &put_stats);
     try publishTestPath(&system, key(&system, IntakeGoals.prefilled(0)), &path, step -% 400, &put_stats);
-    putTestNegative(&system, key(&system, IntakeGoals.negative), Enclosure.every_start, step);
-    putTestNegative(&system, key(&system, IntakeGoals.expired_negative), Enclosure.every_start, step -% 400);
-    // Every requester starts in the level's one chunk, inside this negative's box.
-    putTestNegative(&system, key(&system, IntakeGoals.excluded_negative), .{ .level = 0, .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 }, step);
+    try publishTestPath(&system, key(&system, IntakeGoals.blocked), &path, step, &put_stats);
     return system;
-}
-
-// Claims a negative for `key` leaving out `enclosure` at `step`, in a publish of its own
-// and with no registry key, then flushes.
-fn putTestNegative(system: *PathfindingSystem, key: PathQueryKey, enclosure: Enclosure, step: u32) void {
-    var stats = PathfindingStats{};
-    system.negatives.core.beginPublish();
-    _ = system.negatives.claim(key, enclosure, step, &stats);
-    _ = system.flushRegistry(null, null);
 }
 
 // Stores the level-0 plain `path` for `key` at `step` as one publish would, its registry
 // runs included, and flushes the registry.
 fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
     system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, path.len, 0, 0, step, stats);
+    const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, step, stats);
     @memcpy(system.completed.destination(claimed)[0..path.len], path);
     _ = system.flushRegistry(null, null);
     const starts = try std.testing.allocator.alloc(u16, path.len);
@@ -7016,19 +6917,19 @@ fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const 
 
 // Forty requests crossing every intake class, with repeats in different ranges.
 fn writeIntakeScenarioRequests(stream: *RangeOutputStream(PathRequest), entity: EntityId) !void {
-    const Kind = enum { hit, expired, negative, field, out_of_range, blocked, expired_negative, excluded_negative, prefilled, group, distinct };
+    const Kind = enum { hit, expired, sealed, field, out_of_range, blocked, expired_sealed, sealed_blocked, prefilled, group, distinct };
     const Item = struct { kind: Kind, index: usize = 0 };
     const items = [_]Item{
-        .{ .kind = .hit },                   .{ .kind = .expired },               .{ .kind = .negative },              .{ .kind = .field },
-        .{ .kind = .out_of_range },          .{ .kind = .blocked },               .{ .kind = .expired_negative },      .{ .kind = .distinct },
+        .{ .kind = .hit },                   .{ .kind = .expired },               .{ .kind = .sealed },                .{ .kind = .field },
+        .{ .kind = .out_of_range },          .{ .kind = .blocked },               .{ .kind = .expired_sealed },        .{ .kind = .distinct },
         .{ .kind = .prefilled, .index = 1 }, .{ .kind = .group },                 .{ .kind = .prefilled },             .{ .kind = .distinct, .index = 1 },
-        .{ .kind = .distinct, .index = 2 },  .{ .kind = .distinct, .index = 3 },  .{ .kind = .prefilled, .index = 2 }, .{ .kind = .excluded_negative },
+        .{ .kind = .distinct, .index = 2 },  .{ .kind = .distinct, .index = 3 },  .{ .kind = .prefilled, .index = 2 }, .{ .kind = .sealed_blocked },
         .{ .kind = .distinct, .index = 5 },  .{ .kind = .distinct, .index = 6 },  .{ .kind = .field },                 .{ .kind = .distinct, .index = 7 },
         .{ .kind = .distinct, .index = 8 },  .{ .kind = .distinct, .index = 9 },  .{ .kind = .distinct, .index = 10 }, .{ .kind = .distinct, .index = 11 },
         .{ .kind = .hit },                   .{ .kind = .prefilled, .index = 3 }, .{ .kind = .distinct, .index = 12 }, .{ .kind = .distinct, .index = 13 },
-        .{ .kind = .group },                 .{ .kind = .distinct, .index = 14 }, .{ .kind = .expired },               .{ .kind = .negative },
+        .{ .kind = .group },                 .{ .kind = .distinct, .index = 14 }, .{ .kind = .expired },               .{ .kind = .sealed },
         .{ .kind = .distinct, .index = 15 }, .{ .kind = .group },                 .{ .kind = .blocked },               .{ .kind = .distinct, .index = 16 },
-        .{ .kind = .distinct, .index = 17 }, .{ .kind = .excluded_negative },     .{ .kind = .distinct },              .{ .kind = .distinct, .index = 19 },
+        .{ .kind = .distinct, .index = 17 }, .{ .kind = .sealed_blocked },        .{ .kind = .distinct },              .{ .kind = .distinct, .index = 19 },
     };
     comptime std.debug.assert(items.len == intake_test_agents);
     for (items, 0..) |item, position| {
@@ -7036,12 +6937,12 @@ fn writeIntakeScenarioRequests(stream: *RangeOutputStream(PathRequest), entity: 
         request.goal = switch (item.kind) {
             .hit => IntakeGoals.hit,
             .expired => IntakeGoals.expired,
-            .negative => IntakeGoals.negative,
+            .sealed => IntakeGoals.sealed,
             .field => IntakeGoals.field,
             .out_of_range => IntakeGoals.hit,
             .blocked => IntakeGoals.blocked,
-            .expired_negative => IntakeGoals.expired_negative,
-            .excluded_negative => IntakeGoals.excluded_negative,
+            .expired_sealed => IntakeGoals.expired_sealed,
+            .sealed_blocked => IntakeGoals.sealed_blocked,
             .prefilled => IntakeGoals.prefilled(item.index),
             .group => IntakeGoals.group,
             .distinct => IntakeGoals.distinct(item.index),
@@ -7057,7 +6958,8 @@ fn expectRequestStatsEqual(expected: PathfindingStats, actual: PathfindingStats)
         "accepted_requests", "duplicate_requests",  "pending_requests",    "dropped_requests",
         "cache_hits",        "available_results",   "unavailable_results", "group_field_samples",
         "goal_projected",    "group_fields_built",  "group_field_reuses",  "group_field_rebuild_throttled",
-        "cache_evictions",   "distinct_group_keys", "deferred_requests",
+        "cache_evictions",   "distinct_group_keys", "deferred_requests",   "reach_unavailable",
+        "goal_fallbacks",
     }) |name| {
         try std.testing.expectEqual(@field(expected, name), @field(actual, name));
     }
@@ -7077,41 +6979,51 @@ fn expectRequestStateEqual(expected: *const PathfindingSystem, actual: *const Pa
     for (expected.completed.core.slots.items, actual.completed.core.slots.items) |expected_slot, actual_slot| {
         try std.testing.expectEqualDeep(expected_slot, actual_slot);
     }
-    try std.testing.expectEqual(expected.negatives.core.slots.items.len, actual.negatives.core.slots.items.len);
-    for (expected.negatives.core.slots.items, actual.negatives.core.slots.items) |expected_slot, actual_slot| {
-        try std.testing.expectEqualDeep(expected_slot, actual_slot);
-    }
 }
+
+// The goal table over the scenario's first 15 requests: it holds the blocked goal, and
+// the sealed blocked goal stays a fallback.
+const intake_table_requests: usize = 15;
 
 test "threaded request intake equals serial intake across range sizes and worker counts" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    _ = try addNavBody(&data, IntakeGoals.blocked, .{ .x = 32, .y = 32 }, true);
+    try addIntakeBodies(&data);
     const requester = try data.createEntity();
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try writeIntakeScenarioRequests(&stream, requester);
+    const table_requests = stream.mergedItems()[0..intake_table_requests];
 
     var serial = try intakeScenarioSystem(&data, requester, 1);
     defer serial.deinit();
+    _ = try serial.resolveGoals(PathRequest, table_requests, null, .{});
     const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_fallback_requests_per_step = 0 });
-    // The scenario reaches every class: of the negatives, only the fresh one whose box
-    // leaves the starts out answers.
+    // The scenario reaches every class: two sealed requests, the expired sealed one, and two
+    // sealed blocked ones read unavailable from reach, never pending.
     try std.testing.expectEqual(@as(usize, 2), serial_stats.group_field_samples);
     try std.testing.expectEqual(@as(usize, 2), serial_stats.available_results);
-    try std.testing.expectEqual(@as(usize, 2), serial_stats.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 5), serial_stats.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 5), serial_stats.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 2), serial_stats.goal_fallbacks);
     try std.testing.expectEqual(@as(usize, 1), serial_stats.goal_projected);
     try std.testing.expect(serial_stats.dropped_requests > 1);
     try std.testing.expectEqual(intake_test_agents, serial.pending.len);
-    try std.testing.expect(serial.completed.slotIndex(serial.graph.keyForWorld(0, IntakeGoals.expired, .default).?) == null);
-    try std.testing.expect(serial.completed.slotIndex(serial.graph.keyForWorld(0, IntakeGoals.expired_negative, .default).?) == null);
-    try std.testing.expect(serial.completed.slotIndex(serial.graph.keyForWorld(0, IntakeGoals.prefilled(0), .default).?) == null);
-    // The expired negative was removed; the excluded one stays and its key went pending.
-    try std.testing.expect(serial.negatives.lookup(serial.graph.keyForWorld(0, IntakeGoals.expired_negative, .default).?, serial.step_counter, 0) == null);
-    const excluded_key = serial.graph.keyForWorld(0, IntakeGoals.excluded_negative, .default).?;
-    try std.testing.expect(serial.negatives.lookup(excluded_key, serial.step_counter, 0) != null);
-    try std.testing.expect(serial.pending_keys.contains(excluded_key));
+    const key = struct {
+        fn of(s: *const PathfindingSystem, goal: math.Vec2) PathQueryKey {
+            return s.graph.keyForWorld(0, goal, .default).?;
+        }
+    }.of;
+    try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.expired)) == null);
+    try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.expired_sealed)) == null);
+    try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.prefilled(0))) == null);
+    try std.testing.expect(!serial.pending_keys.contains(key(&serial, IntakeGoals.sealed)));
+    try std.testing.expect(!serial.pending_keys.contains(key(&serial, IntakeGoals.sealed_blocked)));
+    // The blocked goal's fresh path ends off its projection: kept, not served, and the key
+    // went pending for the solve whose publish replaces it.
+    try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.blocked)) != null);
+    try std.testing.expect(serial.pending_keys.contains(key(&serial, IntakeGoals.blocked)));
 
     for ([_]usize{ 1, 3 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 8 });
@@ -7119,6 +7031,7 @@ test "threaded request intake equals serial intake across range sizes and worker
         for ([_]usize{ 8, 16, intake_test_agents }) |items_per_range| {
             var threaded = try intakeScenarioSystem(&data, requester, threads.participantSlotCount());
             defer threaded.deinit();
+            _ = try threaded.resolveGoals(PathRequest, table_requests, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
             const stats = try threaded.update(&stream, intake_test_agents, &threads, .{
                 .adaptive = false,
                 .items_per_range = items_per_range,
@@ -7229,13 +7142,14 @@ test "request intake after reserve allocates nothing on a multi-worker ThreadSys
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    _ = try addNavBody(&data, IntakeGoals.blocked, .{ .x = 32, .y = 32 }, true);
+    try addIntakeBodies(&data);
     const requester = try data.createEntity();
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try writeIntakeScenarioRequests(&stream, requester);
 
     var system = try intakeScenarioSystem(&data, requester, threads.participantSlotCount());
+    _ = try system.resolveGoals(PathRequest, stream.mergedItems()[0..intake_table_requests], &threads, .{ .adaptive = false, .items_per_range = 8 });
     defer system.deinit();
     const original = system.allocator;
     system.allocator = std.testing.failing_allocator;
@@ -7709,7 +7623,7 @@ test "pending compaction keeps deferred, tail, and rotated order across a ring w
     var keys: [7]PathQueryKey = undefined;
     for (&keys, 0..) |*key, index| {
         key.* = system.graph.keyForWorld(0, cellWorld(@intCast(index), 4), .default).?;
-        system.pending.push(.{ .entity = try data.createEntity(), .key = key.*, .start_level = 0, .start = .{ .x = 0, .y = 0 }, .goal_index = 0 });
+        system.pending.push(.{ .entity = try data.createEntity(), .key = key.*, .start_level = 0, .start = .{ .x = 0, .y = 0 } });
         _ = system.pending_keys.insert(key.*);
     }
     system.pending.ptr(3).tier = 1;
@@ -7762,7 +7676,7 @@ fn cachedPathCells(system: *const PathfindingSystem, goal: math.Vec2) !std.Array
     return cells;
 }
 
-test "pathfinding an elastic grow and shrink keep cached paths, negatives, and pending" {
+test "pathfinding an elastic grow and shrink keep cached paths and pending" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try data.createEntity();
@@ -7796,9 +7710,7 @@ test "pathfinding an elastic grow and shrink keep cached paths, negatives, and p
         copied += 1;
     }
 
-    // A definitive negative and two requests left pending.
-    const negative_goal = cellWorld(14, 14);
-    putTestNegative(&system, system.graph.keyForWorld(0, negative_goal, .default).?, Enclosure.every_start, system.step_counter);
+    // Two requests left pending.
     const pending_goals = [_]math.Vec2{ cellWorld(9, 12), cellWorld(2, 7) };
     var pending_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer pending_stream.deinit();
@@ -7817,7 +7729,6 @@ test "pathfinding an elastic grow and shrink keep cached paths, negatives, and p
         try std.testing.expectEqualSlices(u32, cells.items, after.items);
         try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
     }
-    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, cellWorld(1, 2), 0, negative_goal, .default, null).status);
     for (pending_goals) |goal| {
         try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
     }
@@ -9039,7 +8950,7 @@ test "a cached corridor is evicted only by a change on its own level's cells" {
 // runs included, and flushes the registry.
 fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const types.StitchedCell, step: u32, stats: *PathfindingStats) !void {
     system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, step, stats);
+    const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, corridor[corridor.len - 1], step, stats);
     types.writeStitched(system.completed.destination(claimed), corridor);
     _ = system.flushRegistry(null, null);
     const view = types.stitchedView(system.completed.destination(claimed), corridor.len);
@@ -9060,10 +8971,7 @@ fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: 
 fn setSystemAllocators(system: *PathfindingSystem, allocator: std.mem.Allocator) void {
     system.allocator = allocator;
     system.graph.allocator = allocator;
-    for (&system.path_index, &system.negative_index) |*shard, *negative_shard| {
-        shard.allocator = allocator;
-        negative_shard.allocator = allocator;
-    }
+    for (&system.path_index) |*shard| shard.allocator = allocator;
 }
 
 // A fixed-range threaded control: one item per range, so every stage with two or more items
@@ -9115,10 +9023,10 @@ test "threaded publish equals serial across range sizes and worker counts (cache
     }
 }
 
-// Work units of a registry flush over `path_ops` and `negative_ops` logged ops and `adds`
-// pending registrations: every pair weighs its index's whole log, its adds, and one.
-fn flushUnits(path_ops: usize, negative_ops: usize, adds: usize) usize {
-    return registry_shard_count * (path_ops + 1) + registry_shard_count * (negative_ops + 1) + adds;
+// Work units of a registry flush over `ops` logged ops and `adds` pending registrations:
+// every pair weighs the whole log, its adds, and one.
+fn flushUnits(ops: usize, adds: usize) usize {
+    return registry_shard_count * (ops + 1) + adds;
 }
 
 // Fills `system`'s 64-entry cache with routes [0, 64), then publishes routes [64, 80) into
@@ -9153,7 +9061,7 @@ fn logEveryOpKind(system: *PathfindingSystem) !void {
     fresh[1].goal = .{ .x = 0, .y = 30 };
     fresh[2].goal = .{ .x = 1, .y = 30 };
     for (fresh) |key| {
-        const claimed = system.completed.claim(key, 1, 0, 0, system.step_counter, &stats);
+        const claimed = system.completed.claim(key, 1, 0, 0, .{ .level = 0, .cell = 0 }, system.step_counter, &stats);
         system.completed.destination(claimed)[0] = 0;
     }
     try std.testing.expectEqual(@as(usize, 2), stats.cache_evictions);
@@ -9188,7 +9096,7 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
     try std.testing.expect(renames != 0 and renames < ops.len);
     try std.testing.expectEqual(@as(usize, 0), systems[1].publish_ranges);
     // One unit per range: a range per unit, most with no pair starting in it.
-    const units = flushUnits(ops.len, 0, 0);
+    const units = flushUnits(ops.len, 0);
     var serial_stats = PathfindingStats{};
     const serial_batch = systems[0].flushRegistry(null, &serial_stats);
     try std.testing.expectEqual(units, serial_batch.item_count);
@@ -9220,7 +9128,7 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
     var serial_stats = PathfindingStats{};
     const serial_batch = serial.flushRegistry(null, &serial_stats);
     try std.testing.expect(serial_stats.registrations_removed != 0 and serial_stats.registrations_added != 0);
-    const units = flushUnits(ops, 0, serial_stats.registrations_added);
+    const units = flushUnits(ops, serial_stats.registrations_added);
     try std.testing.expectEqual(units, serial_batch.item_count);
     try expectRegistryMatchesCache(&serial);
     // The widest pool has more workers than pairs.
@@ -9286,7 +9194,7 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 48), published.available_results);
     try std.testing.expect(!published.publish_copy_batch.ran_inline and !published.registry_flush_batch.ran_inline);
-    const units = flushUnits(0, 0, published.registrations_added);
+    const units = flushUnits(0, published.registrations_added);
     try std.testing.expectEqual(units, published.registry_flush_batch.item_count);
     try std.testing.expectEqual(units, published.registry_flush_batch.range_count);
     try expectRegistryMatchesCache(&system);
@@ -9431,9 +9339,8 @@ fn expectHaloOwnedOnce(system: *const PathfindingSystem) !void {
     defer owned.deinit();
     const chunks = system.chunkGrid();
     const keys = system.graph.changed_keys.items;
-    for (system.graph.dirty_keys.items, system.evict_items.items) |key, item| {
-        if (item.changed_index == no_changed_index) continue;
-        try std.testing.expectEqual(key, keys[item.changed_index]);
+    try std.testing.expectEqual(keys.len, system.evict_items.items.len);
+    for (keys, system.evict_items.items) |key, item| {
         const x = keyChunk(key) % chunks.chunks_x;
         const y = keyChunk(key) / chunks.chunks_x;
         inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
@@ -9569,7 +9476,7 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     system.registry_truncate_pending = true;
     try std.testing.expect(system.completed.pendingMoves().len > 1);
     try std.testing.expectEqual(@as(usize, 0), system.publish_ranges);
-    const units = flushUnits(system.completed.core.ownerLog().len, 0, 0);
+    const units = flushUnits(system.completed.core.ownerLog().len, 0);
     // Every allocation and every in-place resize fails.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
@@ -9743,7 +9650,7 @@ test "keys of one shard spread over its table (bounded probe length for a dense 
 }
 
 // ---------------------------------------------------------------------------------------
-// Negatives: goal-side proofs, scoped eviction, and the negative registry.
+// Reach at intake, status, and solve, and scoped eviction.
 // ---------------------------------------------------------------------------------------
 
 const pocket_world_side: u16 = 32;
@@ -9789,85 +9696,7 @@ fn solveFrom(system: *PathfindingSystem, requester: EntityId, start: math.Vec2, 
     return system.updateSerial(&stream, 16, config);
 }
 
-fn chunkCountsOf(system: *const PathfindingSystem) solve.ChunkCounts {
-    const chunks = system.chunkGrid();
-    return .{ .x = @intCast(chunks.chunks_x), .y = @intCast(chunks.chunks_y) };
-}
-
-// The keys a negative proven around its goal registers.
-fn enclosureKeys(system: *const PathfindingSystem, enclosure: Enclosure) solve.NegativeKeys {
-    return solve.NegativeKeys.cover(enclosure.level, .{ .min_x = enclosure.min_x, .min_y = enclosure.min_y, .max_x = enclosure.max_x, .max_y = enclosure.max_y }, chunkCountsOf(system));
-}
-
-// Claims a negative for `key` with `keys` registered, leaving out `enclosure`, at `step`, as
-// one publish would, and flushes.
-fn publishTestNegative(system: *PathfindingSystem, key: PathQueryKey, keys: solve.NegativeKeys, enclosure: Enclosure, step: u32) !void {
-    var stats = PathfindingStats{};
-    system.negatives.core.beginPublish();
-    const owner = system.negatives.claim(key, enclosure, step, &stats);
-    _ = system.flushRegistry(null, null);
-    for (0..keys.count()) |index| {
-        const registry_key = keys.keyAt(@intCast(index));
-        const shard = &system.negative_index[registryShard(registry_key)];
-        try shard.reserve(1, 1, system.negatives.logicalCapacity());
-        shard.add(owner, registry_key, 0);
-    }
-}
-
-// The negative registry lists only live negatives, every key in its shard with its count,
-// every live negative holds a key, and one proven around its goal holds exactly the keys
-// over its box; the owner log is empty.
-fn expectNegativeRegistryMatchesCache(system: *const PathfindingSystem) !void {
-    const allocator = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 0), system.negatives.core.ownerLog().len);
-    var held: std.ArrayList(Registration) = .empty;
-    defer held.deinit(allocator);
-    for (&system.negative_index, 0..) |*shard, shard_index| {
-        for (shard.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            try std.testing.expectEqual(shard_index, registryShard(key));
-            var length: u32 = 0;
-            var entry = shard.slot_heads[slot];
-            while (entry != no_entry) : (entry = shard.entry_next[entry]) {
-                length += 1;
-                try std.testing.expect(system.negatives.core.records.items[shard.entry_owner[entry]].live);
-                try held.append(allocator, .{ .key = key, .owner = shard.entry_owner[entry], .start = 0 });
-            }
-            try std.testing.expect(length != 0);
-            try std.testing.expectEqual(length, shard.slot_counts[slot]);
-        }
-        try std.testing.expect(shard.owner_heads.items.len >= system.negatives.logicalCapacity());
-        for (shard.owner_heads.items, 0..) |owner_head, owner| {
-            var entry = owner_head;
-            while (entry != no_entry) : (entry = shard.entry_owner_next[entry]) try std.testing.expectEqual(@as(u32, @intCast(owner)), shard.entry_owner[entry]);
-        }
-    }
-    std.mem.sort(Registration, held.items, {}, Registration.lessThan);
-    for (system.negatives.core.records.items, 0..) |record, owner_index| {
-        if (!record.live) continue;
-        const owner: u32 = @intCast(owner_index);
-        var keys: std.ArrayList(u64) = .empty;
-        defer keys.deinit(allocator);
-        for (held.items) |registration| {
-            if (registration.owner == owner) try keys.append(allocator, registration.key);
-        }
-        try std.testing.expect(keys.items.len != 0);
-        const enclosure = record.extra;
-        if (enclosure.min_x > enclosure.max_x) continue;
-        // A goal projected off its key's blocked cell also registers its projection window.
-        const key = system.negatives.core.keyOf(owner);
-        if (system.graph.grid(key.goal_level).?.isBlockedCell(key.goal)) continue;
-        const expected = enclosureKeys(system, enclosure);
-        var expected_keys: std.ArrayList(u64) = .empty;
-        defer expected_keys.deinit(allocator);
-        for (0..expected.count()) |index| try expected_keys.append(allocator, expected.keyAt(@intCast(index)));
-        std.mem.sort(u64, keys.items, {}, std.sort.asc(u64));
-        std.mem.sort(u64, expected_keys.items, {}, std.sort.asc(u64));
-        try std.testing.expectEqualSlices(u64, expected_keys.items, keys.items);
-    }
-}
-
-test "an agent sealed in a pocket does not make the goal unavailable for an agent outside it" {
+test "an agent sealed in a pocket reads its goal unavailable from reach, and an agent outside still reaches it" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -9878,13 +9707,13 @@ test "an agent sealed in a pocket does not make the goal unavailable for an agen
     var system = try registrySystem(&data, &fixture.world, 16);
     defer system.deinit();
     const goal = tileCenter(20, 20);
-    // The sealed-in agent's search ends without a corridor, and the goal's open side
-    // outgrows its claims: answered for that request only.
+    // The sealed-in agent's start cannot reach the goal: answered at intake, never pending.
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, pocketGoal(11), 0, goal, .default, null).status);
     const sealed = try solveFrom(&system, requester, pocketGoal(11), goal, .{});
     try std.testing.expectEqual(@as(usize, 1), sealed.unavailable_results);
-    try std.testing.expectEqual(@as(usize, 1), sealed.start_unreachable);
-    try std.testing.expectEqual(@as(usize, 0), sealed.negatives_published);
-    try std.testing.expectEqual(@as(usize, 0), system.negatives.count());
+    try std.testing.expectEqual(@as(usize, 1), sealed.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), sealed.accepted_requests + sealed.solved_requests);
+    try std.testing.expectEqual(@as(usize, 0), system.completed.count());
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
     // The outside agent reaches the same goal.
     const outside = try solveFrom(&system, requester, outsideStart(0), goal, .{});
@@ -9892,7 +9721,8 @@ test "an agent sealed in a pocket does not make the goal unavailable for an agen
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
 }
 
-test "a goal sealed in a pocket is unavailable to agents outside it, and an agent inside still gets a path" {
+test "a goal sealed in a pocket is unavailable at status and intake to agents outside it, with no pending or solve, inline and threaded, and an agent inside still gets a path" {
+    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -9900,101 +9730,34 @@ test "a goal sealed in a pocket is unavailable to agents outside it, and an agen
     var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
     defer fixture.world.deinit();
     const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var system = try registrySystemWith(&data, &fixture.world, 16, .{ .participants = threads.participantSlotCount() });
     defer system.deinit();
     const goal = pocketGoal(55);
-    const stats = try solveFrom(&system, requester, outsideStart(3), goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), stats.negatives_published);
-    try std.testing.expectEqual(@as(usize, 0), stats.start_unreachable);
-    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
-    // The proof's box is the pocket's chunks, and its keys cover it one chunk wider.
-    const found = system.negatives.lookup(system.graph.keyForWorld(0, goal, .default).?, system.step_counter, 0).?;
-    try std.testing.expectEqual(Enclosure{ .level = 0, .min_x = 0, .min_y = 0, .max_x = 2, .max_y = 2 }, found.enclosure);
-    try expectNegativeRegistryMatchesCache(&system);
-    // Every outside start reads unavailable and a repeat request is a hit; a start in the box
-    // does not.
+    // Before any request, every outside start reads unavailable.
     for (0..6) |index| try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(index * 7), 0, goal, .default, null).status);
-    const repeat = try solveFrom(&system, requester, outsideStart(9), goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), repeat.cache_hits);
-    try std.testing.expectEqual(@as(usize, 0), repeat.solved_requests);
+    const inline_stats = try solveFrom(&system, requester, outsideStart(3), goal, .{});
+    try std.testing.expectEqual(@as(usize, 1), inline_stats.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), inline_stats.accepted_requests + inline_stats.solved_requests + system.pending.len);
+    // Threaded intake: requests to every pocket goal from outside, over several ranges.
+    const threaded = try requestPocketGoals(&system, requester, 0, 16, 16, &threads, .{ .adaptive = false, .items_per_range = 8 });
+    try std.testing.expect(!threaded.intake_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 16), threaded.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 16), threaded.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 0), threaded.accepted_requests + threaded.solved_requests + system.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), system.completed.count());
+    // A start inside the pocket reaches it.
     const inside_start = pocketGoal(2);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, inside_start, 0, goal, .default, null).status);
     const inside = try solveFrom(&system, requester, inside_start, goal, .{});
     try std.testing.expectEqual(@as(usize, 1), inside.available_results);
-    try std.testing.expectEqual(@as(usize, 0), inside.cache_hits);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, inside_start, 0, goal, .default, null).status);
+    // The cached path does not answer an outside start.
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(3), 0, goal, .default, null).status);
 }
 
-test "a goal sealed in a room is cached as unavailable after a budget-exhausted search from outside" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    var capacity = abstractCapacity();
-    // The tier-0 cap saturates the forward search from outside but holds the room's flood.
-    capacity.tier0_abstract_node_cap = 96;
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &fixture.world, null);
-    try system.growForAgentCount(16);
-    const goal = pocketGoal(44);
-    const stats = try solveFrom(&system, requester, outsideStart(5), goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), stats.negatives_proven_after_exhaustion);
-    try std.testing.expectEqual(@as(usize, 1), stats.negatives_published);
-    try std.testing.expectEqual(@as(usize, 0), stats.budget_exhausted);
-    // No tier promotion: the request left pending answered.
-    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
-    try std.testing.expectEqual(@as(usize, 0), stats.escalated_solves);
-    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(5), 0, goal, .default, null).status);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "an unproven flood after exhaustion caches nothing and keeps the promote-then-drop ladder" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try registryWorld(&meta, pocket_world_side);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    var capacity = abstractCapacity();
-    capacity.tier0_abstract_node_cap = 8;
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &fixture.world, null);
-    const start = tileCenter(1, 1);
-    const goal = tileCenter(30, 30);
-    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer stream.deinit();
-    try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
-    // Tier 0 exhausts; the goal's open side outgrows the attempt's cap: promoted.
-    const first = try system.updateSerial(&stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
-    try std.testing.expectEqual(@as(usize, 0), first.negatives_published);
-    try std.testing.expectEqual(@as(usize, 0), first.unavailable_results);
-    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
-    try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
-    // Tier 1, its cap forced below the corridor, exhausts again: dropped, never cached.
-    system.capacity.max_abstract_nodes = 8;
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    const second = try system.updateSerial(&empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
-    try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
-    try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
-    try std.testing.expectEqual(@as(usize, 0), second.negatives_published);
-    try std.testing.expectEqual(@as(usize, 0), second.unavailable_results);
-    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
-    try std.testing.expectEqual(@as(usize, 0), system.negatives.count());
-    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
-}
-
-test "one dig leaves unrelated pending requests, negatives, fields, tallies, and paths intact, and a request queued before it is solved after it" {
+test "one dig leaves unrelated pending requests, fields, tallies, and paths intact, and a request queued before it is solved after it" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -10004,9 +9767,7 @@ test "one dig leaves unrelated pending requests, negatives, fields, tallies, and
     const requester = try data.createEntity();
     var system = try registrySystem(&data, &fixture.world, 16);
     defer system.deinit();
-    // A negative for a pocket goal, a path along the top right, and a group field inside the
-    // pocket from its own agents.
-    _ = try requestPocketGoals(&system, requester, 0, 1, 16, null, .{});
+    // A path along the top right, and a group field inside the pocket from its own agents.
     const path_goal = tileCenter(28, 2);
     try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, tileCenter(16, 2), path_goal, .{})).available_results);
     var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -10026,14 +9787,12 @@ test "one dig leaves unrelated pending requests, negatives, fields, tallies, and
     try setRegistryCells(&system, &fixture, &.{.{ 28, 26 }}, fixture.tree);
     const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), reaction.evicted_negatives + reaction.evicted_results + reaction.dropped_fields);
-    try std.testing.expect(system.negatives.lookup(pocketKey(&system, 0), system.step_counter, 0) != null);
+    try std.testing.expectEqual(@as(usize, 0), reaction.evicted_results + reaction.dropped_fields);
     try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, path_goal, .default).?) != null);
     try std.testing.expectEqual(field_state, system.findGroupField(field_key).?.state);
     try std.testing.expectEqual(tallies, system.group_requests.items.len);
     try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     try std.testing.expect(system.pending_keys.contains(system.graph.keyForWorld(0, queued_goal, .default).?));
-    try expectNegativeRegistryMatchesCache(&system);
     try expectRegistryMatchesCache(&system);
     // The queued request is solved on the next update.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -10043,222 +9802,10 @@ test "one dig leaves unrelated pending requests, negatives, fields, tallies, and
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, tileCenter(16, 20), 0, queued_goal, .default, null).status);
 }
 
-test "a negative is evicted by a change next to its proof's box and kept by a change elsewhere" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    try std.testing.expectEqual(@as(usize, 2), (try requestPocketGoals(&system, requester, 0, 2, 16, null, .{})).negatives_published);
-    // Two chunks past the box: kept.
-    try setRegistryCells(&system, &fixture, &.{.{ 17, 5 }}, fixture.tree);
-    const far = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 0), far.evicted_negatives);
-    try std.testing.expectEqual(@as(usize, 2), system.negatives.count());
-    // One chunk past it (chunk 3 of the box's row): both evicted, and the goal re-solves.
-    try setRegistryCells(&system, &fixture, &.{.{ 13, 5 }}, fixture.tree);
-    const near = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 2), near.evicted_negatives);
-    try std.testing.expectEqual(@as(usize, 0), system.negatives.count());
-    try expectNegativeRegistryMatchesCache(&system);
-    for (&system.negative_index) |*shard| try std.testing.expectEqual(shard.entries.len, shard.entry_free.items.len);
-    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outsideStart(0), 0, pocketGoal(0), .default, null).status);
-    try std.testing.expectEqual(@as(usize, 1), (try requestPocketGoals(&system, requester, 0, 1, 16, null, .{})).solved_requests);
-}
-
-test "a status query reads a stale negative as missing and leaves it for intake to remove" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    _ = try requestPocketGoals(&system, requester, 0, 1, 16, null, .{});
-    const key = pocketKey(&system, 0);
-    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(0), 0, pocketGoal(0), .default, null).status);
-    system.step_counter +%= types.default_cache_ttl_steps;
-    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outsideStart(0), 0, pocketGoal(0), .default, null).status);
-    try std.testing.expect(system.negatives.lookup(key, system.step_counter, 0) != null);
-    try std.testing.expectEqual(@as(usize, 0), system.negatives.core.ownerLog().len);
-    // The next intake removes it, retiring its keys, and the goal is solved again.
-    const again = try requestPocketGoals(&system, requester, 0, 1, 16, null, .{});
-    try std.testing.expectEqual(@as(usize, 1), again.solved_requests);
-    try std.testing.expectEqual(@as(usize, 1), again.negatives_published);
-    try std.testing.expect(again.negative_registrations_removed != 0);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "a full negative cache keeps publishing every proven negative, evicting round-robin victims" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 8);
-    defer system.deinit();
-    try std.testing.expectEqual(@as(usize, 32), system.negatives.logicalCapacity());
-    var victims: usize = 0;
-    for (0..6) |step| {
-        const stats = try requestPocketGoals(&system, requester, step * 8, 8, 8, null, .{});
-        try std.testing.expectEqual(@as(usize, 8), stats.negatives_published);
-        victims += stats.cache_evictions;
-        try expectNegativeRegistryMatchesCache(&system);
-    }
-    try std.testing.expectEqual(@as(usize, 32), system.negatives.count());
-    try std.testing.expectEqual(@as(usize, 48 - 32), victims);
-    // The last step's negatives all stand.
-    for (40..48) |index| try std.testing.expect(system.negatives.lookup(pocketKey(&system, index), system.step_counter, 0) != null);
-}
-
-// A negative for `key` on the chunk-key rect (min_x, min_y)..(max_x, max_y), every start.
-fn chunkRectNegative(system: *PathfindingSystem, key: PathQueryKey, min_x: u32, min_y: u32, max_x: u32, max_y: u32) !void {
-    const keys = solve.NegativeKeys{ .tier = .chunk, .level = 0, .min_x = min_x, .min_y = min_y, .max_x = max_x, .max_y = max_y, .row_units = @intCast(system.chunkGrid().chunks_x) };
-    try publishTestNegative(system, key, keys, Enclosure.every_start, system.step_counter);
-}
-
 fn testGoalKeyAt(system: *const PathfindingSystem, x: i32, y: i32) PathQueryKey {
     var key = emptyKey(system.graph.version);
     key.goal = .{ .x = x, .y = y };
     return key;
-}
-
-test "world-key negatives are evicted by any nav batch, and other negatives only by their own keys" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    _ = try requestPocketGoals(&system, requester, 0, 1, 16, null, .{});
-    try publishTestNegative(&system, testGoalKeyAt(&system, 30, 30), solve.NegativeKeys.world, Enclosure.every_start, system.step_counter);
-    try expectNegativeRegistryMatchesCache(&system);
-    try setRegistryCells(&system, &fixture, &.{.{ 28, 26 }}, fixture.tree);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.evicted_negatives);
-    try std.testing.expect(system.negatives.lookup(testGoalKeyAt(&system, 30, 30), system.step_counter, 0) == null);
-    try std.testing.expect(system.negatives.lookup(pocketKey(&system, 0), system.step_counter, 0) != null);
-    try std.testing.expectEqual(evict_owns_world | evict_owns_level, system.evict_items.items[0].owned & (evict_owns_world | evict_owns_level));
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "a level add evicts world-key negatives and keeps the rest" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    _ = try requestPocketGoals(&system, requester, 0, 1, 16, null, .{});
-    try publishTestNegative(&system, testGoalKeyAt(&system, 30, 30), solve.NegativeKeys.world, Enclosure.every_start, system.step_counter);
-    _ = try fixture.world.addLevel(-16);
-    _ = try fixture.world.addDenseLayer(1, 0, .floor, fixture.grass);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
-    try std.testing.expectEqual(@as(usize, 1), stats.evicted_negatives);
-    try std.testing.expect(system.negatives.lookup(testGoalKeyAt(&system, 30, 30), system.step_counter, 0) == null);
-    try std.testing.expect(system.negatives.lookup(pocketKey(&system, 0), system.step_counter, 0) != null);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "a new link evicts the negatives registered on its endpoint chunks and keeps the rest" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    _ = try requestPocketGoals(&system, requester, 0, 1, 16, null, .{});
-    // Far from both endpoints.
-    try chunkRectNegative(&system, testGoalKeyAt(&system, 27, 1), 6, 0, 7, 1);
-    try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 12, .y = 4 }, .level_b = 0, .cell_b = .{ .x = 20, .y = 28 }, .traversal_cost = 1, .bidirectional = false });
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), system.graph.changed_keys.items.len);
-    try std.testing.expectEqual(@as(usize, 1), stats.evicted_negatives);
-    try std.testing.expect(system.negatives.lookup(pocketKey(&system, 0), system.step_counter, 0) == null);
-    try std.testing.expect(system.negatives.lookup(testGoalKeyAt(&system, 27, 1), system.step_counter, 0) != null);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "superchunk keys cover a wide proof's box, and a dense change walks its list once" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    // A 33-tile pocket spans nine chunks a side: one chunk wider, a hundred chunk keys.
-    var fixture = try pocketWorld(&meta, 80, 33);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    for (0..2) |index| {
-        const stats = try solveFrom(&system, requester, tileCenter(@intCast(40 + index), 60), pocketGoal(index), .{});
-        try std.testing.expectEqual(@as(usize, 1), stats.negatives_published);
-    }
-    const enclosure = system.negatives.lookup(pocketKey(&system, 0), system.step_counter, 0).?.enclosure;
-    const keys = enclosureKeys(&system, enclosure);
-    try std.testing.expectEqual(solve.NegativeKeys.Tier.superchunk, keys.tier);
-    try std.testing.expectEqual(@as(u32, 4), keys.count());
-    try expectNegativeRegistryMatchesCache(&system);
-    // Cells in four chunks of superchunk (1, 1), none of them registered.
-    try setRegistryCells(&system, &fixture, &.{ .{ 37, 37 }, .{ 41, 37 }, .{ 37, 41 }, .{ 45, 45 } }, fixture.tree);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 2), stats.evicted_negatives);
-    var owners: usize = 0;
-    var bound: usize = 0;
-    for (system.evict_items.items) |item| {
-        owners += @intFromBool(item.owned & evict_owns_superchunk != 0);
-        bound += item.negative_bound;
-    }
-    try std.testing.expectEqual(@as(usize, 1), owners);
-    try std.testing.expectEqual(@as(usize, 2), bound);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-// Negative entries a one-cell change at (28, 26) walks with `unrelated` negatives
-// registered far from it beside two near it.
-fn negativeVisitsWithUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !usize {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var fixture = try pocketWorld(meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    var system = try registrySystem(&data, &fixture.world, 128);
-    defer system.deinit();
-    for (0..unrelated) |index| try chunkRectNegative(&system, testGoalKeyAt(&system, @intCast(index % 30), @intCast(100 + index / 30)), 0, 6, 1, 7);
-    try chunkRectNegative(&system, testGoalKeyAt(&system, 0, 200), 6, 5, 7, 7);
-    try chunkRectNegative(&system, testGoalKeyAt(&system, 1, 200), 7, 6, 7, 6);
-    try setRegistryCells(&system, &fixture, &.{.{ 28, 26 }}, fixture.tree);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 2), stats.evicted_negatives);
-    try std.testing.expectEqual(unrelated, system.negatives.count());
-    var visited: usize = 0;
-    for (system.evict_items.items) |item| visited += item.negative_hits;
-    return visited;
-}
-
-test "negative eviction visits only the dirty keys' lists (equal entries walked with 10 and 300 unrelated negatives)" {
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    try std.testing.expectEqual(@as(usize, 2), try negativeVisitsWithUnrelated(&meta, 10));
-    try std.testing.expectEqual(@as(usize, 2), try negativeVisitsWithUnrelated(&meta, 300));
 }
 
 // Whether the group field toward (9, 9), covering at most nine cells and given `budget`
@@ -10318,173 +9865,23 @@ test "a group field, ready or building, drops exactly when a changed cell lies w
     }
 }
 
-test "a negative publish reserve out of memory claims nothing and leaves the requests pending (FailingAllocator)" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var fail_index: usize = 0;
-    while (true) : (fail_index += 1) {
-        var system = try registrySystem(&data, &fixture.world, 16);
-        defer system.deinit();
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
-        setSystemAllocators(&system, failing.allocator());
-        const result = requestPocketGoals(&system, requester, 0, 8, 16, null, .{});
-        setSystemAllocators(&system, std.testing.allocator);
-        if (result) |stats| {
-            try std.testing.expectEqual(@as(usize, 8), stats.negatives_published);
-            try expectNegativeRegistryMatchesCache(&system);
-            break;
-        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-        try std.testing.expectEqual(@as(usize, 0), system.negatives.count());
-        try std.testing.expectEqual(@as(usize, 0), system.negatives.core.ownerLog().len);
-        for (&system.negative_index) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.live_keys);
-        try std.testing.expectEqual(@as(usize, 8), system.pending.len);
-        // The retry publishes them.
-        var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-        defer empty.deinit();
-        try std.testing.expectEqual(@as(usize, 8), (try system.updateSerial(&empty, 16, .{})).negatives_published);
-        try expectNegativeRegistryMatchesCache(&system);
-    }
-    try std.testing.expect(fail_index >= 1);
-}
-
-// Two systems' negative caches hold the same entries under the same owner ids and probe
-// slots, and their negative registries the same lists in the same order.
-fn expectSameNegatives(a: *const PathfindingSystem, b: *const PathfindingSystem) !void {
-    try std.testing.expectEqual(a.negatives.count(), b.negatives.count());
-    try std.testing.expectEqual(a.negatives.logicalCapacity(), b.negatives.logicalCapacity());
-    for (a.negatives.core.slots.items, b.negatives.core.slots.items) |slot_a, slot_b| {
-        try std.testing.expectEqual(slot_a.occupied, slot_b.occupied);
-        if (slot_a.occupied) try std.testing.expectEqual(slot_a.payload_index, slot_b.payload_index);
-    }
-    for (a.negatives.core.records.items, b.negatives.core.records.items, 0..) |record_a, record_b, owner| {
-        try std.testing.expectEqual(record_a.live, record_b.live);
-        if (!record_a.live) continue;
-        try std.testing.expect(keysEqual(a.negatives.core.keyOf(@intCast(owner)), b.negatives.core.keyOf(@intCast(owner))));
-        try std.testing.expectEqual(record_a.stamp, record_b.stamp);
-        try std.testing.expectEqual(record_a.extra, record_b.extra);
-    }
-    for (&a.negative_index, &b.negative_index) |*shard_a, *shard_b| {
-        try std.testing.expectEqualSlices(u64, shard_a.slot_keys, shard_b.slot_keys);
-        for (shard_a.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            var entry_a = shard_a.slot_heads[slot];
-            var entry_b = shard_b.slot_heads[slot];
-            while (entry_a != no_entry or entry_b != no_entry) {
-                try std.testing.expect(entry_a != no_entry and entry_b != no_entry);
-                try std.testing.expectEqual(shard_a.entry_owner[entry_a], shard_b.entry_owner[entry_b]);
-                entry_a = shard_a.entry_next[entry_a];
-                entry_b = shard_b.entry_next[entry_b];
-            }
-        }
-    }
-}
-
-// A pocket system at 16 agents (64 cache entries each) holding `routes` routes and a
-// negative for each of the pocket goals [0, `negatives`).
-fn negativeFixture(data: *const DataSystem, fixture: *const RegistryWorld, requester: EntityId, participants: usize, routes: usize, negatives: usize) !PathfindingSystem {
+// A pocket-world system holding `routes` cached paths.
+fn evictionFixture(data: *const DataSystem, fixture: *const RegistryWorld, requester: EntityId, participants: usize, routes: usize) !PathfindingSystem {
     var system = try registrySystemWith(data, &fixture.world, 16, .{ .participants = participants });
     errdefer system.deinit();
-    var first: usize = 0;
-    while (first < negatives) : (first += 16) {
-        const stats = try requestPocketGoals(&system, requester, first, @min(16, negatives - first), 16, null, .{});
-        try std.testing.expectEqual(@min(16, negatives - first), stats.negatives_published);
-    }
     var route: usize = 0;
     while (route < routes) : (route += 16) try solveRegistryRoutes(&system, requester, pocket_world_side, route, @min(16, routes - route), 16, null, .{});
     return system;
 }
 
-test "a negative publish after its reserve allocates nothing on a multi-worker ThreadSystem, every shard allocator swapped (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
-    defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    var system = try registrySystemWith(&data, &fixture.world, 16, .{ .participants = threads.participantSlotCount() });
-    defer system.deinit();
-    // One publish reserves the negative registry and the windows; cleared, the same publish
-    // fits them.
-    _ = try requestPocketGoals(&system, requester, 0, 16, 16, &threads, fixed_threads_config);
-    system.clearRuntimeState();
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    setSystemAllocators(&system, failing.allocator());
-    const result = requestPocketGoals(&system, requester, 0, 16, 16, &threads, fixed_threads_config);
-    setSystemAllocators(&system, std.testing.allocator);
-    const stats = try result;
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(usize, 16), stats.negatives_published);
-    try std.testing.expect(stats.negative_registrations_added != 0);
-    try std.testing.expect(!stats.fallback_batch.ran_inline and !stats.publish_copy_batch.ran_inline and !stats.registry_flush_batch.ran_inline);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "threaded negative publish and flush equal serial across range sizes and worker counts, with victims in the log" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    // A full negative cache, then sixteen more negatives and routes: victims in both logs.
-    var serial = try negativeFixture(&data, &fixture, requester, 1, 16, 64);
-    defer serial.deinit();
-    var serial_stats = PathfindingStats{};
-    var serial_stream = try pocketStream(requester, 64, 16);
-    defer serial_stream.stream.deinit();
-    try serial.updateInline(&serial_stream.stream, 16, .{}, &serial_stats);
-    try std.testing.expect(serial.negatives.core.ownerLog().len != 0 and serial.publish_ranges != 0);
-    const negative_ops = serial.negatives.core.ownerLog().len;
-    const path_ops = serial.completed.core.ownerLog().len;
-    var serial_flush = PathfindingStats{};
-    const serial_batch = serial.flushRegistry(null, &serial_flush);
-    try std.testing.expect(serial_flush.negative_registrations_added != 0 and serial_flush.negative_registrations_removed != 0);
-    try std.testing.expectEqual(flushUnits(path_ops, negative_ops, serial_flush.registrations_added + serial_flush.negative_registrations_added), serial_batch.item_count);
-    try expectNegativeRegistryMatchesCache(&serial);
-    for ([_]usize{ 1, 3 }) |workers| {
-        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
-        defer threads.deinit();
-        if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-        var worker_ranges: usize = 0;
-        for ([_]usize{ 1, 3, 40 }) |items_per_range| {
-            var threaded = try negativeFixture(&data, &fixture, requester, threads.participantSlotCount(), 16, 64);
-            defer threaded.deinit();
-            const config = PathfindingConfig{ .adaptive = false, .items_per_range = items_per_range };
-            var stream = try pocketStream(requester, 64, 16);
-            defer stream.stream.deinit();
-            var stats = PathfindingStats{};
-            try threaded.updateThreaded(&stream.stream, 16, .{ .thread_system = &threads, .config = config }, &stats);
-            try std.testing.expectEqual(serial_stats.negatives_published, stats.negatives_published);
-            try std.testing.expectEqual(serial_stats.cache_evictions, stats.cache_evictions);
-            var flush_stats = PathfindingStats{};
-            const stage = (PathfindingSystem.StageThreads{ .thread_system = &threads, .config = config }).stage(&threaded.registry_flush_tuner);
-            const batch = threaded.flushRegistry(stage, &flush_stats);
-            try std.testing.expect(!batch.ran_inline);
-            worker_ranges += batch.worker_thread_ranges;
-            try std.testing.expectEqual(serial_batch.item_count, batch.item_count);
-            try std.testing.expectEqual(serial_flush.negative_registrations_added, flush_stats.negative_registrations_added);
-            try std.testing.expectEqual(serial_flush.negative_registrations_removed, flush_stats.negative_registrations_removed);
-            try std.testing.expectEqual(serial_flush.registrations_added, flush_stats.registrations_added);
-            try expectSameNegatives(&serial, &threaded);
-            try expectSameCache(&serial, &threaded);
-            try expectSameRegistry(&serial, &threaded);
-            try expectNegativeRegistryMatchesCache(&threaded);
-        }
-        try std.testing.expect(worker_ranges != 0);
-    }
-}
+// A dense one-step change across the pocket wall and the open side.
+const pocket_change_cells = blk: {
+    var cells: [23][2]u16 = undefined;
+    for (0..4) |row| cells[row] = .{ 13, 2 + 4 * row };
+    for (0..3) |column| cells[4 + column] = .{ 2 + 4 * column, 13 };
+    for (0..16) |index| cells[7 + index] = .{ 17 + 4 * (index % 4), 17 + 4 * (index / 4) };
+    break :blk cells;
+};
 
 // Requests for pocket goals [first, first + count) from outside starts.
 fn pocketStream(requester: EntityId, first: usize, count: usize) !struct { stream: RangeOutputStream(PathRequest) } {
@@ -10494,17 +9891,7 @@ fn pocketStream(requester: EntityId, first: usize, count: usize) !struct { strea
     return .{ .stream = stream };
 }
 
-// Cells of a dense change, one per chunk: seven on the chunks one past the pocket's box and
-// sixteen far from it.
-const negative_change_cells = blk: {
-    var cells: [23][2]u16 = undefined;
-    for (0..4) |row| cells[row] = .{ 13, 2 + 4 * row };
-    for (0..3) |column| cells[4 + column] = .{ 2 + 4 * column, 13 };
-    for (0..16) |index| cells[7 + index] = .{ 17 + 4 * (index % 4), 17 + 4 * (index / 4) };
-    break :blk cells;
-};
-
-test "threaded eviction with negatives and fields equals serial over a dense change (bounds, flags, hits), and runs on workers" {
+test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits), and runs on workers" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -10520,9 +9907,8 @@ test "threaded eviction with negatives and fields equals serial over a dense cha
     var built: usize = 0;
     defer for (systems[0..built]) |*system| system.deinit();
     for (&systems) |*system| {
-        system.* = try negativeFixture(&data, &fixture, requester, threads.participantSlotCount(), 32, 24);
+        system.* = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
         built += 1;
-        try publishTestNegative(system, testGoalKeyAt(system, 31, 31), solve.NegativeKeys.world, Enclosure.every_start, system.step_counter);
         // A group field toward the far corner.
         var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer group.deinit();
@@ -10531,14 +9917,13 @@ test "threaded eviction with negatives and fields equals serial over a dense cha
     }
     systems[1].nav_thread_adaptive = false;
     systems[1].nav_thread_items_per_range = 1;
-    try setRegistryCells(&systems[0], &fixture, &negative_change_cells, fixture.tree);
-    for (negative_change_cells) |cell| try systems[1].markNavDirty(0, cell[0], cell[1]);
+    try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
+    for (pocket_change_cells) |cell| try systems[1].markNavDirty(0, cell[0], cell[1]);
     const serial_stats = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     const stats = try systems[1].applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     try std.testing.expect(!stats.evict_count_batch.ran_inline and stats.evict_count_batch.range_count > 1);
     try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
-    try std.testing.expect(serial_stats.evicted_negatives > 1 and serial_stats.dropped_fields == 1);
-    try std.testing.expectEqual(serial_stats.evicted_negatives, stats.evicted_negatives);
+    try std.testing.expect(serial_stats.evicted_results > 1 and serial_stats.dropped_fields == 1);
     try std.testing.expectEqual(serial_stats.evicted_results, stats.evicted_results);
     try std.testing.expectEqual(serial_stats.dropped_fields, stats.dropped_fields);
     for (systems[0].evict_items.items, systems[1].evict_items.items) |a, b| {
@@ -10546,19 +9931,15 @@ test "threaded eviction with negatives and fields equals serial over a dense cha
         var a_unplaced = a;
         a_unplaced.base = b.base;
         try std.testing.expectEqualDeep(a_unplaced, b);
-        const field_bound: usize = if (a.changed_index != no_changed_index) systems[0].group_fields.items.len else 0;
-        try std.testing.expectEqualSlices(u32, systems[0].evict_hits.items[a.base..][0 .. a.bound + a.negative_bound + field_bound], systems[1].evict_hits.items[b.base..][0 .. b.bound + b.negative_bound + field_bound]);
+        const field_bound = systems[0].group_fields.items.len;
+        try std.testing.expectEqualSlices(u32, systems[0].evict_hits.items[a.base..][0 .. a.bound + field_bound], systems[1].evict_hits.items[b.base..][0 .. b.bound + field_bound]);
     }
-    try expectSameNegatives(&systems[0], &systems[1]);
     try expectSameCache(&systems[0], &systems[1]);
     try expectSameRegistry(&systems[0], &systems[1]);
-    for (&systems) |*system| {
-        try expectNegativeRegistryMatchesCache(system);
-        try expectRegistryMatchesCache(system);
-    }
+    for (&systems) |*system| try expectRegistryMatchesCache(system);
 }
 
-test "eviction with negatives and fields allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
+test "eviction with paths and fields allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -10570,7 +9951,7 @@ test "eviction with negatives and fields allocates nothing after its pre-commit 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    var system = try negativeFixture(&data, &fixture, requester, threads.participantSlotCount(), 32, 24);
+    var system = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
     defer system.deinit();
     system.nav_thread_adaptive = false;
     system.nav_thread_items_per_range = 1;
@@ -10578,93 +9959,24 @@ test "eviction with negatives and fields allocates nothing after its pre-commit 
     defer group.deinit();
     try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
     // A warm cycle sizes the eviction scratch and the batch buffers.
-    try setRegistryCells(&system, &fixture, &negative_change_cells, fixture.tree);
+    try setRegistryCells(&system, &fixture, &pocket_change_cells, fixture.tree);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try setRegistryCells(&system, &fixture, &negative_change_cells, fixture.grass);
+    try setRegistryCells(&system, &fixture, &pocket_change_cells, fixture.grass);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    _ = try requestPocketGoals(&system, requester, 0, 16, 16, null, .{});
-    _ = try requestPocketGoals(&system, requester, 16, 8, 16, null, .{});
+    var route: usize = 0;
+    while (route < 32) : (route += 16) try solveRegistryRoutes(&system, requester, pocket_world_side, route, 16, 16, null, .{});
     _ = try system.updateSerial(&group, 16, .{ .max_fallback_requests_per_step = 0 });
 
-    try setRegistryCells(&system, &fixture, &negative_change_cells, fixture.tree);
+    try setRegistryCells(&system, &fixture, &pocket_change_cells, fixture.tree);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
     const reaction = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     setSystemAllocators(&system, std.testing.allocator);
     const stats = try reaction;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(stats.evicted_negatives != 0 and stats.dropped_fields == 1);
+    try std.testing.expect(stats.evicted_results != 0 and stats.dropped_fields == 1);
     try std.testing.expect(!stats.evict_batch.ran_inline and !stats.evict_flush_batch.ran_inline);
-    try expectNegativeRegistryMatchesCache(&system);
     try expectRegistryMatchesCache(&system);
-}
-
-test "a shrink keeps the youngest negatives, renames the rest below the capacity, and its flush allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
-    defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    var system = try negativeFixture(&data, &fixture, requester, threads.participantSlotCount(), 0, 64);
-    defer system.deinit();
-    try std.testing.expectEqual(@as(usize, 64), system.negatives.count());
-    // The youngest 32 (the last two publishes) survive.
-    try prepareTruncate(&system.negative_index, 32);
-    var resize = try system.negatives.prepareResize(system.allocator, 32);
-    system.negatives.commitResize(system.allocator, &resize, system.step_counter);
-    system.registry_truncate_pending = true;
-    var renames: usize = 0;
-    for (system.negatives.core.ownerLog()) |op| renames += @intFromBool(op.new != no_owner);
-    try std.testing.expect(renames != 0);
-    const units = flushUnits(0, system.negatives.core.ownerLog().len, 0);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    setSystemAllocators(&system, failing.allocator());
-    const stage = (PathfindingSystem.StageThreads{ .thread_system = &threads, .config = fixed_threads_config });
-    const flush = system.flushRegistry(stage.stage(&system.registry_flush_tuner), null);
-    setSystemAllocators(&system, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(!failing.has_induced_failure);
-    try std.testing.expect(!flush.ran_inline);
-    try std.testing.expectEqual(units, flush.item_count);
-    for (&system.negative_index) |*shard| try std.testing.expectEqual(@as(usize, 32), shard.owner_heads.items.len);
-    try std.testing.expectEqual(@as(usize, 32), system.negatives.count());
-    for (32..64) |index| try std.testing.expect(system.negatives.lookup(pocketKey(&system, index), system.step_counter, 0) != null);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "an elastic grow and shrink keep negatives and their registrations through the resize seam" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 8);
-    defer system.deinit();
-    try std.testing.expectEqual(@as(usize, 32), system.negatives.logicalCapacity());
-    _ = try requestPocketGoals(&system, requester, 0, 8, 8, null, .{});
-    try system.growForAgentCount(40);
-    try std.testing.expectEqual(system.completed.logicalCapacity(), system.negatives.logicalCapacity());
-    try expectNegativeRegistryMatchesCache(&system);
-    for (1..5) |step| _ = try requestPocketGoals(&system, requester, step * 8, 8, 40, null, .{});
-    try std.testing.expectEqual(@as(usize, 40), system.negatives.count());
-    try expectNegativeRegistryMatchesCache(&system);
-    // Sustained low load shrinks back to the floor: the 32 youngest stay.
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    for (0..system.capacity.capacity_shrink_window) |_| _ = try system.updateSerial(&empty, 1, .{});
-    try std.testing.expectEqual(@as(usize, 32), system.negatives.logicalCapacity());
-    try std.testing.expectEqual(@as(usize, 32), system.negatives.count());
-    for (8..40) |index| try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(0), 0, pocketGoal(index), .default, null).status);
-    for (&system.negative_index) |*shard| try std.testing.expect(shard.owner_heads.items.len <= 32);
-    try expectNegativeRegistryMatchesCache(&system);
 }
 
 // Solves `request` alone at fallback ordinal 0 on the first participant's scratch.
@@ -10674,16 +9986,23 @@ fn solveRequest(system: *PathfindingSystem, request: PendingRequest) PathSolveRe
     var stats = PathfindingStats{};
     system.prepareSolvePhase(1, 1, &stats);
     system.resetSolvedPaths();
+    // A search claims nodes in it; an answer without one leaves it empty.
+    system.scratch_slots.items[0].corridor.abstract.reset();
     return solveOne(system, 0, &system.scratch_slots.items[0], 0);
 }
 
 fn pocketRequest(system: *const PathfindingSystem, requester: EntityId, start: math.Vec2, goal: math.Vec2) PendingRequest {
     const grid = system.graph.grid(0).?;
     const key = system.graph.keyForWorld(0, goal, .default).?;
-    return .{ .entity = requester, .key = key, .start_level = 0, .start = grid.worldToCellClamped(start), .goal_index = grid.indexForCell(key.goal).? };
+    return .{ .entity = requester, .key = key, .start_level = 0, .start = grid.worldToCellClamped(start) };
 }
 
-test "each solve failure maps to its outcome: world, proven region, or proven after exhaustion published; start-side, unproven, and corridor failures not" {
+// Abstract nodes the first participant's tier-0 search claimed in its last solve.
+fn lastSolveNodes(system: *const PathfindingSystem) usize {
+    return system.scratch_slots.items[0].corridor.abstract.nodes_used;
+}
+
+test "each solve outcome: an invalid graph, a missing goal level, no live goal, and no reach are unavailable without a search; a blocked start is dropped; reachable searches past their caps retry" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -10692,34 +10011,28 @@ test "each solve failure maps to its outcome: world, proven region, or proven af
     defer fixture.world.deinit();
     const requester = try data.createEntity();
     {
-        // An unbuilt graph: a world negative.
+        // An unbuilt graph.
         var system = PathfindingSystem.init(std.testing.allocator);
         defer system.deinit();
         try system.reserve(abstractCapacity());
-        const result = solveRequest(&system, .{ .entity = requester, .key = emptyKey(0), .start_level = 0, .start = .{ .x = 0, .y = 0 }, .goal_index = 0 });
+        const result = solveRequest(&system, .{ .entity = requester, .key = emptyKey(0), .start_level = 0, .start = .{ .x = 0, .y = 0 } });
         try std.testing.expect(result == .unavailable);
-        try std.testing.expectEqual(solve.NegativeKeys.Tier.world, system.solved_paths.items[0].negative.tier);
-        try std.testing.expectEqual(Enclosure.every_start, system.solved_paths.items[0].enclosure);
     }
     var system = try registrySystem(&data, &fixture.world, 16);
     defer system.deinit();
-    // A goal level the graph lacks: a world negative.
+    // A goal level the graph lacks.
     var missing_level = pocketRequest(&system, requester, outsideStart(0), tileCenter(20, 20));
     missing_level.key.goal_level = 7;
     try std.testing.expect(solveRequest(&system, missing_level) == .unavailable);
-    try std.testing.expectEqual(solve.NegativeKeys.Tier.world, system.solved_paths.items[0].negative.tier);
-    // No corridor from outside to the pocket: its region proven, keys one chunk wider.
+    // No path from outside into the pocket: answered from reach, no search.
     try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, outsideStart(0), pocketGoal(12))) == .unavailable);
-    const proven = system.solved_paths.items[0];
-    try std.testing.expectEqual(Enclosure{ .level = 0, .min_x = 0, .min_y = 0, .max_x = 2, .max_y = 2 }, proven.enclosure);
-    try std.testing.expectEqual(solve.NegativeKeys.Tier.chunk, proven.negative.tier);
-    try std.testing.expectEqual(@as(u32, 16), proven.run_count);
-    try std.testing.expect(!proven.negative_after_exhaustion);
-    // No corridor out of the pocket: the open side outgrows the search's claims.
-    try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, pocketGoal(12), tileCenter(20, 20))) == .start_unreachable);
+    try std.testing.expectEqual(@as(usize, 0), lastSolveNodes(&system));
+    // No path out of the pocket either.
+    try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, pocketGoal(12), tileCenter(20, 20))) == .unavailable);
+    try std.testing.expectEqual(@as(usize, 0), lastSolveNodes(&system));
     // A blocked start.
     try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, tileCenter(pocket_cells, 3), tileCenter(20, 20))) == .start_invalid);
-    // A corridor found but its stitch past the cap: retried, never a negative.
+    // A corridor found but its stitch past the cap: retried.
     system.capacity.tier0_stitched_cell_cap = 2;
     try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, tileCenter(14, 20), tileCenter(28, 28))) == .budget_exhausted);
     system.capacity.tier0_stitched_cell_cap = abstractCapacity().max_stitched_path_cells;
@@ -10727,15 +10040,37 @@ test "each solve failure maps to its outcome: world, proven region, or proven af
     system.capacity.max_explored_nodes = 2;
     try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, tileCenter(12, 12), tileCenter(15, 15))) == .budget_exhausted);
     system.capacity.max_explored_nodes = abstractCapacity().max_explored_nodes;
-    // A saturated search: proven around the pocket, else retried.
-    system.capacity.tier0_abstract_node_cap = 96;
-    try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, outsideStart(0), pocketGoal(12))) == .unavailable);
-    try std.testing.expect(system.solved_paths.items[0].negative_after_exhaustion);
+    // A saturated reachable search: retried, its claims within the cap (no goal flood).
     system.capacity.tier0_abstract_node_cap = 8;
     try std.testing.expect(solveRequest(&system, pocketRequest(&system, requester, tileCenter(12, 12), tileCenter(28, 28))) == .budget_exhausted);
+    try std.testing.expect(lastSolveNodes(&system) <= 8);
+    system.capacity.tier0_abstract_node_cap = abstractCapacity().tier0_abstract_node_cap;
+    // Published: every unavailable is counted, never cached and never solved.
+    system.clearTransientRequestsRetainingFields();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester, .start = outsideStart(0), .goal = tileCenter(20, 20), .goal_level = 0 });
+    _ = try system.updateSerial(&stream, 16, .{ .max_fallback_requests_per_step = 0 });
+    const goal_key = system.graph.keyForWorld(0, tileCenter(20, 20), .default).?;
+    try std.testing.expect(system.pending_keys.contains(goal_key));
+    // The pending request's goal sealed off before its solve.
+    try setRegistryCells(&system, &fixture, &.{ .{ 19, 19 }, .{ 20, 19 }, .{ 21, 19 }, .{ 19, 20 }, .{ 21, 20 }, .{ 19, 21 }, .{ 20, 21 }, .{ 21, 21 } }, fixture.tree);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    system.scratch_slots.items[0].corridor.abstract.reset();
+    const answered = try system.updateSerial(&empty, 16, .{});
+    try std.testing.expectEqual(@as(usize, 1), answered.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 1), answered.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 1), answered.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), answered.solved_requests);
+    try std.testing.expectEqual(@as(usize, 0), lastSolveNodes(&system));
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expectEqual(@as(?usize, null), system.completed.slotIndex(goal_key));
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(0), 0, tileCenter(20, 20), .default, null).status);
 }
 
-test "a goal with no open cell within the projection radius is a negative for every start over its window's keys" {
+test "a goal with no open cell within the projection radius is unavailable for every start at status and intake, never pending or cached" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -10749,25 +10084,12 @@ test "a goal with no open cell within the projection radius is a negative for ev
     var system = try registrySystem(&data, &fixture.world, 16);
     defer system.deinit();
     const goal = tileCenter(20, 20);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, tileCenter(45, 45), 0, goal, .default, null).status);
     const stats = try solveFrom(&system, requester, tileCenter(45, 45), goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), stats.negatives_published);
-    const key = system.graph.keyForWorld(0, goal, .default).?;
-    const owner = system.negatives.core.ownerOf(key).?;
-    try std.testing.expectEqual(Enclosure.every_start, system.negatives.core.records.items[owner].extra);
-    // The window's cells (4..36) span chunks 1..9; one chunk wider is past the chunk-key
-    // limit, so its superchunks register.
-    const expected = solve.NegativeKeys.cover(0, .{ .min_x = 1, .min_y = 1, .max_x = 9, .max_y = 9 }, chunkCountsOf(&system));
-    try std.testing.expectEqual(solve.NegativeKeys.Tier.superchunk, expected.tier);
-    var registered: u32 = 0;
-    for (0..expected.count()) |index| {
-        const registry_key = expected.keyAt(@intCast(index));
-        var owners = system.negative_index[registryShard(registry_key)].iterator(registry_key);
-        while (owners.next()) |listed| registered += @intFromBool(listed == owner);
-    }
-    try std.testing.expectEqual(expected.count(), registered);
-    try std.testing.expectEqual(@as(usize, expected.count()), stats.negative_registrations_added);
+    try std.testing.expectEqual(@as(usize, 1), stats.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 1), stats.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests + stats.solved_requests + system.pending.len + system.completed.count());
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, tileCenter(1, 45), 0, goal, .default, null).status);
-    try expectNegativeRegistryMatchesCache(&system);
 }
 
 // A 48-tile registry world with rock over [0, 40)² except a sealed 2x2 pocket at (1..2,
@@ -10789,7 +10111,7 @@ fn digProjectionTunnel(system: *PathfindingSystem, fixture: *RegistryWorld, firs
     for (first..40) |x| try setRegistryCells(system, fixture, &.{.{ @intCast(x), 1 }}, fixture.grass);
 }
 
-test "a negative proven for a projected goal is evicted by a change in its projection window outside the proof's box" {
+test "a blocked goal whose projection lies in a sealed area is unavailable at status and intake, and reads its new projection's answer after a nearer cell opens outside" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -10801,53 +10123,347 @@ test "a negative proven for a projected goal is evicted by a change in its proje
     defer system.deinit();
     const start = tileCenter(45, 45);
     const goal = tileCenter(14, 1);
-    const first = try solveFrom(&system, requester, start, goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), first.goal_projected);
-    try std.testing.expectEqual(@as(usize, 1), first.negatives_published);
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    // The keys cover the pocket's chunk and the projection window's chunks (x 0..30,
-    // y 0..17), one chunk wider: chunks 0..8 by 0..5.
-    try std.testing.expectEqual(@as(usize, 54), first.negative_registrations_added);
-    try expectNegativeRegistryMatchesCache(&system);
-    // A tunnel to the key's cell, outside the pocket's chunk and its neighbours.
-    try digProjectionTunnel(&system, &fixture, 13);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), reaction.evicted_negatives);
-    try std.testing.expect(system.statusForWorld(0, start, 0, goal, .default, null).status != .unavailable);
-    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, start, goal, .{})).available_results);
-    try expectNegativeRegistryMatchesCache(&system);
-}
-
-test "a pending request whose projection a change made stale publishes no negative and is answered for itself" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try projectionWorld(&meta);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    const start = tileCenter(45, 45);
-    const goal = tileCenter(14, 1);
-    // Accepted with its projection into the pocket, left pending.
-    const accepted = try solveFrom(&system, requester, start, goal, .{ .max_fallback_requests_per_step = 0 });
-    try std.testing.expectEqual(@as(usize, 1), accepted.goal_projected);
-    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
+    const sealed = try solveFrom(&system, requester, start, goal, .{});
+    try std.testing.expectEqual(@as(usize, 1), sealed.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), sealed.accepted_requests + sealed.solved_requests);
     // A tunnel stopping one cell short of the key's still-blocked cell: its projection is
-    // now (15, 1), reachable, while the pending one still holds the open pocket cell.
+    // now (15, 1), reachable.
     try digProjectionTunnel(&system, &fixture, 15);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
+    const solved = try solveFrom(&system, requester, start, goal, .{});
+    try std.testing.expectEqual(@as(usize, 1), solved.available_results);
+    try std.testing.expectEqual(@as(usize, 1), solved.goal_projected);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
+}
+
+test "a dig opening a sealed pocket makes its goals reachable after that step's reaction, and a fill sealing it answers a pending request at solve with no search" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var system = try registrySystem(&data, &fixture.world, 16);
+    defer system.deinit();
+    const goal = pocketGoal(55);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
+    // Dig a gap in the pocket's wall column.
+    try setRegistryCells(&system, &fixture, &.{.{ pocket_cells, 3 }}, fixture.grass);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
+    // Accepted and left pending, then the gap filled before its solve.
+    _ = try solveFrom(&system, requester, outsideStart(0), goal, .{ .max_fallback_requests_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 1), system.pending.len);
+    try setRegistryCells(&system, &fixture, &.{.{ pocket_cells, 3 }}, fixture.tree);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const stale = try system.updateSerial(&empty, 16, .{});
-    try std.testing.expectEqual(@as(usize, 0), stale.negatives_published);
-    try std.testing.expectEqual(@as(usize, 1), stale.start_unreachable);
-    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    system.scratch_slots.items[0].corridor.abstract.reset();
+    const answered = try system.updateSerial(&empty, 16, .{});
+    try std.testing.expectEqual(@as(usize, 1), answered.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 1), answered.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), answered.solved_requests);
+    try std.testing.expectEqual(@as(usize, 0), lastSolveNodes(&system));
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len + system.completed.count());
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
+}
+
+// The stored end of `key`'s cached result, checked against its stored path's last cell.
+fn expectStoredEnd(system: *const PathfindingSystem, key: PathQueryKey) !types.StitchedCell {
+    const slot = system.completed.slotIndex(key) orelse return error.TestExpectedEntry;
+    const result = system.completed.resultAt(slot);
+    const last = if (result.stitched_len != 0)
+        system.completed.stitchedSlice(slot, result.stitched_len).at(result.stitched_len - 1)
+    else
+        types.StitchedCell{ .level = result.path_level, .cell = system.completed.pathSlice(slot, result.path_len)[result.path_len - 1] };
+    try std.testing.expectEqual(last, result.end);
+    try std.testing.expectEqual(last, system.completed.lookup(key, system.step_counter, 0).?.end);
+    return result.end;
+}
+
+test "a solved result stores its path's last cell as its end, plain and stitched" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 48);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var system = try registrySystem(&data, &fixture.world, 16);
+    defer system.deinit();
+    const start = tileCenter(1, 1);
+    // A same-chunk hop stores a plain path; a cross-chunk route a stitched one.
+    for ([_][2]u16{ .{ 2, 2 }, .{ 40, 41 } }, [_]bool{ false, true }) |goal_tile, stitched| {
+        const goal = tileCenter(goal_tile[0], goal_tile[1]);
+        try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, start, goal, .{})).available_results);
+        const key = system.graph.keyForWorld(0, goal, .default).?;
+        try std.testing.expectEqual(stitched, system.completed.find(key).?.stitched_len != 0);
+        const end = try expectStoredEnd(&system, key);
+        try std.testing.expectEqual(types.StitchedCell{ .level = 0, .cell = @as(u32, goal_tile[1]) * 48 + goal_tile[0] }, end);
+    }
+}
+
+test "a cached path to an older projection is not served after the projection moves: status reads missing, intake makes a candidate, and the publish re-puts the entry" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 48);
+    defer fixture.world.deinit();
+    // A 5x5 block around the goal key (20, 20): its projection is the ring-3 corner (17, 17).
+    for (18..23) |y| {
+        for (18..23) |x| _ = try fixture.world.setDenseTile(fixture.obstacle, @intCast(x), @intCast(y), fixture.tree);
+    }
+    const requester = try data.createEntity();
+    var system = try registrySystem(&data, &fixture.world, 16);
+    defer system.deinit();
+    const start = tileCenter(2, 2);
+    const goal = tileCenter(20, 20);
+    const key = system.graph.keyForWorld(0, goal, .default).?;
+    const grid = system.graph.grid(0).?;
+    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, start, goal, .{})).available_results);
+    try std.testing.expectEqual(@as(u32, 17 * 48 + 17), (try expectStoredEnd(&system, key)).cell);
+    // A notch from the block's top edge to the key's neighbour (20, 19): the projection moves
+    // there, more than one cell from the cached path.
+    try setRegistryCells(&system, &fixture, &.{ .{ 20, 18 }, .{ 20, 19 } }, fixture.grass);
+    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expectEqual(@as(usize, 0), reaction.evicted_results);
+    try std.testing.expect(system.completed.slotIndex(key) != null);
+    try std.testing.expectEqual(@as(?usize, 19 * 48 + 20), system.liveGoal(key, grid).cell);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    // The re-request projects afresh and reaches the goal.
     const again = try solveFrom(&system, requester, start, goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), again.goal_projected);
+    try std.testing.expectEqual(@as(usize, 0), again.cache_hits);
+    try std.testing.expectEqual(@as(usize, 1), again.accepted_requests);
     try std.testing.expectEqual(@as(usize, 1), again.available_results);
+    try std.testing.expectEqual(@as(usize, 1), system.completed.count());
+    try std.testing.expectEqual(@as(u32, 19 * 48 + 20), (try expectStoredEnd(&system, key)).cell);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
+    try expectRegistryMatchesCache(&system);
+}
+
+test "a one-way teleport into a sealed pocket solves forward, answers the reverse unavailable with no search, and closing its source flips the forward answer the same step" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
+    defer fixture.world.deinit();
+    try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 20, .y = 20 }, .level_b = 0, .cell_b = .{ .x = 3, .y = 3 }, .traversal_cost = 1, .bidirectional = false });
+    const requester = try data.createEntity();
+    var system = try registrySystem(&data, &fixture.world, 16);
+    defer system.deinit();
+    const outside = outsideStart(0);
+    const inside_goal = pocketGoal(55);
+    const inside_start = pocketGoal(2);
+    const outside_goal = tileCenter(24, 24);
+    // Forward, along the link.
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outside, 0, inside_goal, .default, null).status);
+    const forward = try solveFrom(&system, requester, outside, inside_goal, .{});
+    try std.testing.expectEqual(@as(usize, 1), forward.available_results);
+    try std.testing.expectEqual(@as(usize, 1), forward.abstract_solves);
+    // The reverse: unavailable at status and intake, never searched.
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, inside_start, 0, outside_goal, .default, null).status);
+    const reverse = try solveFrom(&system, requester, inside_start, outside_goal, .{});
+    try std.testing.expectEqual(@as(usize, 1), reverse.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), reverse.solved_requests + system.pending.len);
+    // Closing the link's source cell: the forward goal reads unavailable after the reaction.
+    try setRegistryCells(&system, &fixture, &.{.{ 20, 20 }}, fixture.tree);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outside, 0, inside_goal, .default, null).status);
+    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, outside, inside_goal, .{})).reach_unavailable);
+}
+
+test "a crowd at one blocked unreachable goal shares one projection: the resolve projects once, intake answers every request from the table, and every status reads unavailable" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try projectionWorld(&meta);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    const crowd = 64;
+    var system = try registrySystem(&data, &fixture.world, crowd);
+    defer system.deinit();
+    try system.reserveGoals(crowd);
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    const goal = tileCenter(14, 1);
+    for (0..crowd) |index| try appendPathRequest(&stream, .{ .entity = requester, .start = tileCenter(@intCast(40 + index % 8), @intCast(10 + index / 8)), .goal = goal });
+    const resolve = try system.resolveGoals(PathRequest, stream.mergedItems(), null, .{});
+    try std.testing.expectEqual(@as(usize, crowd), resolve.blocked);
+    try std.testing.expectEqual(@as(usize, 1), resolve.distinct);
+    try std.testing.expectEqual(@as(usize, 1), resolve.projections);
+    for (stream.mergedItems()) |request| try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, request.start, 0, goal, .default, null).status);
+    const stats = try system.updateSerial(&stream, crowd, .{});
+    try std.testing.expectEqual(@as(usize, 0), stats.goal_fallbacks);
+    try std.testing.expectEqual(@as(usize, crowd), stats.reach_unavailable);
+    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests + system.pending.len);
+}
+
+test "the default class walks, and reach by class equals connectivity reach on the walk graph" {
+    try std.testing.expectEqual(TraversalClass.walk, traversalOf(.default));
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try pocketWorld(&meta, pocket_world_side, pocket_cells);
+    defer fixture.world.deinit();
+    var system = try registrySystem(&data, &fixture.world, 16);
+    defer system.deinit();
+    const grid = system.graph.grid(0).?;
+    var prng = std.Random.DefaultPrng.init(0x7c2);
+    const random = prng.random();
+    var reachable: usize = 0;
+    for (0..400) |_| {
+        const from = random.uintLessThan(usize, grid.cellCount());
+        const to = random.uintLessThan(usize, grid.cellCount());
+        if (grid.isBlockedIndex(from) or grid.isBlockedIndex(to)) continue;
+        const expected = reach(&system.graph, 0, from, 0, to);
+        try std.testing.expectEqual(expected, system.reaches(.default, 0, from, 0, to));
+        reachable += @intFromBool(expected == .reaches);
+    }
+    try std.testing.expect(reachable != 0);
+}
+
+test "a group field for a blocked goal builds at the goal table's live goal" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    for (9..12) |y| {
+        for (9..12) |x| _ = try fixture.world.setDenseTile(fixture.obstacle, @intCast(x), @intCast(y), fixture.tree);
+    }
+    const requester = try data.createEntity();
+    var system = try registrySystem(&data, &fixture.world, 16);
+    defer system.deinit();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    const goal = tileCenter(10, 10);
+    for (0..3) |index| try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = tileCenter(@intCast(2 + index), 2), .goal = goal });
+    _ = try system.resolveGoals(PathRequest, stream.mergedItems(), null, .{});
+    try std.testing.expectEqual(@as(usize, 1), system.goals.refs.items.len);
+    // The decision reads the table's entry: point it at another open cell.
+    const grid = system.graph.grid(0).?;
+    const table_goal: u32 = 8 * 24 + 12;
+    try std.testing.expect(!grid.isBlockedIndex(table_goal) and table_goal != system.goals.live.items[0]);
+    system.goals.live.items[0] = table_goal;
+    _ = try system.updateSerial(&stream, 16, .{ .max_fallback_requests_per_step = 0 });
+    const field = system.findGroupField(system.graph.keyForWorld(0, goal, .default).?).?;
+    try std.testing.expectEqual(@as(usize, table_goal), field.goal_index);
+}
+
+// Cells reachable from `start` on `grid`: orthogonal moves between open cells, diagonal
+// moves through two open orthogonal cells, two-way links both ways and one-way links
+// forward, each with both ends open.
+fn referenceReachable(allocator: std.mem.Allocator, grid: *const NavGrid, links: []const @import("../../world_system.zig").LevelLink, start: usize, reached: []bool) !void {
+    @memset(reached, false);
+    var queue: std.ArrayList(usize) = .empty;
+    defer queue.deinit(allocator);
+    reached[start] = true;
+    try queue.append(allocator, start);
+    var head: usize = 0;
+    const width = grid.width;
+    while (head < queue.items.len) : (head += 1) {
+        const cell = queue.items[head];
+        const x: isize = @intCast(cell % width);
+        const y: isize = @intCast(cell / width);
+        var neighbours: [12]usize = undefined;
+        var count: usize = 0;
+        for ([_][2]isize{ .{ 1, 0 }, .{ -1, 0 }, .{ 0, 1 }, .{ 0, -1 }, .{ 1, 1 }, .{ 1, -1 }, .{ -1, 1 }, .{ -1, -1 } }) |step| {
+            const nx = x + step[0];
+            const ny = y + step[1];
+            if (nx < 0 or ny < 0 or nx >= @as(isize, @intCast(width)) or ny >= @as(isize, @intCast(grid.height))) continue;
+            if (grid.isBlockedXY(@intCast(nx), @intCast(ny))) continue;
+            if (step[0] != 0 and step[1] != 0 and (grid.isBlockedXY(@intCast(nx), @intCast(y)) or grid.isBlockedXY(@intCast(x), @intCast(ny)))) continue;
+            neighbours[count] = @as(usize, @intCast(ny)) * width + @as(usize, @intCast(nx));
+            count += 1;
+        }
+        for (links) |link| {
+            const a = @as(usize, link.cell_a.y) * width + link.cell_a.x;
+            const b = @as(usize, link.cell_b.y) * width + link.cell_b.x;
+            if (grid.isBlockedIndex(a) or grid.isBlockedIndex(b) or count == neighbours.len) continue;
+            if (cell == a) {
+                neighbours[count] = b;
+                count += 1;
+            } else if (cell == b and link.bidirectional) {
+                neighbours[count] = a;
+                count += 1;
+            }
+        }
+        for (neighbours[0..count]) |next| {
+            if (reached[next]) continue;
+            reached[next] = true;
+            try queue.append(allocator, next);
+        }
+    }
+}
+
+test "status and intake read unavailable exactly when a reference directed search does not reach the goal, over random walls and one-way and two-way links, and solve only reachable pairs" {
+    const allocator = std.testing.allocator;
+    var meta = try loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    var prng = std.Random.DefaultPrng.init(0x7c22);
+    const random = prng.random();
+    for (0..3) |_| {
+        var data = DataSystem.init(allocator);
+        defer data.deinit();
+        var fixture = try registryWorld(&meta, 16);
+        defer fixture.world.deinit();
+        for (0..16) |y| {
+            for (0..16) |x| {
+                if (random.uintLessThan(u8, 100) < 35) _ = try fixture.world.setDenseTile(fixture.obstacle, @intCast(x), @intCast(y), fixture.tree);
+            }
+        }
+        for (0..6) |index| {
+            try fixture.world.addLevelLink(.{
+                .kind = .teleport,
+                .level_a = 0,
+                .cell_a = .{ .x = random.uintLessThan(u16, 16), .y = random.uintLessThan(u16, 16) },
+                .level_b = 0,
+                .cell_b = .{ .x = random.uintLessThan(u16, 16), .y = random.uintLessThan(u16, 16) },
+                .traversal_cost = 1,
+                .bidirectional = index % 3 == 0,
+            });
+        }
+        const requester = try data.createEntity();
+        var system = try registrySystem(&data, &fixture.world, 16);
+        defer system.deinit();
+        const grid = system.graph.grid(0).?;
+        const reached = try allocator.alloc(bool, grid.cellCount());
+        defer allocator.free(reached);
+        var solved_pairs: usize = 0;
+        var unreachable_pairs: usize = 0;
+        for (0..grid.cellCount()) |from| {
+            if (grid.isBlockedIndex(from)) continue;
+            try referenceReachable(allocator, grid, fixture.world.levelLinks(), from, reached);
+            const start = grid.cellCenter(from);
+            for (0..grid.cellCount()) |to| {
+                if (grid.isBlockedIndex(to)) continue;
+                const status = system.statusForWorld(0, start, 0, grid.cellCenter(to), .default, null).status;
+                try std.testing.expectEqual(!reached[to], status == .unavailable);
+                unreachable_pairs += @intFromBool(!reached[to]);
+            }
+            // Intake and solve on a few goals per start.
+            for (0..3) |_| {
+                const to = random.uintLessThan(usize, grid.cellCount());
+                if (grid.isBlockedIndex(to)) continue;
+                system.clearTransientRequestsRetainingFields();
+                const stats = try solveFrom(&system, requester, start, grid.cellCenter(to), .{});
+                if (reached[to]) {
+                    try std.testing.expectEqual(@as(usize, 0), stats.reach_unavailable);
+                    try std.testing.expectEqual(@as(usize, 1), stats.available_results + stats.budget_exhausted);
+                    solved_pairs += stats.solved_requests;
+                } else {
+                    try std.testing.expectEqual(@as(usize, 1), stats.reach_unavailable);
+                    try std.testing.expectEqual(@as(usize, 0), stats.solved_requests + stats.accepted_requests);
+                }
+            }
+        }
+        try std.testing.expect(solved_pairs != 0 and unreachable_pairs != 0);
+    }
 }

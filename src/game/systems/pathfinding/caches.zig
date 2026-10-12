@@ -4,8 +4,8 @@
 
 //! Goal-keyed query caches: the linear-probe pending KeySet, the shared `CacheCore` slot
 //! table with its owner log, the completed-path ResultCache (exact path storage in pages,
-//! entries kept across resizes), and the proven-negative NegativeCache, plus the per-agent
-//! waypoint derivation that turns a cached plain or stitched path into a forward heading.
+//! entries kept across resizes), plus the per-agent waypoint derivation that turns a
+//! cached plain or stitched path into a forward heading.
 
 const std = @import("std");
 const math = @import("../../../core/math.zig");
@@ -20,7 +20,6 @@ const PathResult = types.PathResult;
 const PathfindingStats = types.PathfindingStats;
 const ListResize = types.ListResize;
 const OwnerOp = types.OwnerOp;
-const Enclosure = types.Enclosure;
 const no_owner = types.no_owner;
 const hashPathKey = types.hashPathKey;
 const keysEqual = types.keysEqual;
@@ -726,6 +725,7 @@ pub const ResultCache = struct {
             .path_len = payload.path_len,
             .path_level = payload.path_level,
             .stitched_len = payload.stitched_len,
+            .end = .{ .level = payload.end_level, .cell = payload.end_cell },
         };
     }
 
@@ -979,14 +979,20 @@ pub const ResultCache = struct {
     pub const SlotLookup = struct {
         slot: usize,
         fresh: bool,
+        // Where the result ends (`PathResult.end`).
+        end: StitchedCell,
     };
 
-    /// The key's slot and whether its result is within `ttl` at `step`, from one probe;
-    /// null when absent. ttl 0 disables expiry. Const: never evicts.
+    /// The key's slot, whether its result is within `ttl` at `step`, and where it ends, from
+    /// one probe and its record; null when absent. ttl 0 disables expiry. Const: never evicts.
     pub fn lookup(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?SlotLookup {
         const index = self.slotIndex(key) orelse return null;
-        const owner = self.core.slots.items[index].payload_index;
-        return .{ .slot = index, .fresh = ttl == 0 or (step -% self.core.records.items[owner].stamp) < ttl };
+        const record = &self.core.records.items[self.core.slots.items[index].payload_index];
+        return .{
+            .slot = index,
+            .fresh = ttl == 0 or (step -% record.stamp) < ttl,
+            .end = .{ .level = record.extra.end_level, .cell = record.extra.end_cell },
+        };
     }
 
     // find, but a result older than `ttl` steps is removed (returns null) so the caller
@@ -1008,13 +1014,16 @@ pub const ResultCache = struct {
     };
 
     /// Claims `key`'s entry for a result of `path_len` plain or `stitched_len` stitched
-    /// cells at `step` (see `CacheCore.claim`) and records its shape; the caller copies the
+    /// cells ending at `end` at `step` (see `CacheCore.claim`) and records its shape and
+    /// end; the caller copies the
     /// path into `destination`. A result past the inline stripe takes a long block, which
     /// `reserveLongBlocks` made free; a re-put or a victim releases its block first. Opens
     /// no publish: call `core.beginPublish` first. Main thread; allocates nothing.
-    pub fn claim(self: *ResultCache, key: PathQueryKey, path_len: usize, stitched_len: usize, path_level: u16, step: u32, stats: *PathfindingStats) Claimed {
+    pub fn claim(self: *ResultCache, key: PathQueryKey, path_len: usize, stitched_len: usize, path_level: u16, end: StitchedCell, step: u32, stats: *PathfindingStats) Claimed {
         std.debug.assert(self.canStore());
-        std.debug.assert(path_len == 0 or stitched_len == 0);
+        // A solve stores at least its goal cell, as a plain or a stitched path.
+        std.debug.assert((path_len == 0) != (stitched_len == 0));
+        std.debug.assert(stitched_len != 0 or end.level == path_level);
         const words = types.storedPathWords(path_len, stitched_len);
         const owner = self.core.claim(key, step, stats);
         const payload = &self.core.records.items[owner].extra;
@@ -1029,110 +1038,11 @@ pub const ResultCache = struct {
             .path_len = @intCast(path_len), // bounded by the solve's node budget
             .stitched_len = @intCast(stitched_len), // bounded by max_stitched_path_cells
             .long_block = long_block,
+            .end_cell = end.cell,
             .path_level = path_level,
+            .end_level = end.level,
         };
         return .{ .owner = owner, .long_block = long_block };
-    }
-};
-
-/// Goal-keyed cache of proven negatives, each with the chunk box its proof leaves out:
-/// TTL by stamp, a round-robin victim when full (a claim is never refused), and a resize
-/// that keeps entries (a shrink evicts oldest first). Every removal and move is logged
-/// for the negative registry's flush. Main thread mutates; const readers are safe on
-/// workers while nothing mutates.
-pub const NegativeCache = struct {
-    const Core = CacheCore(Enclosure);
-    pub const Resize = Core.Resize;
-
-    core: Core = .{},
-
-    pub fn deinit(self: *NegativeCache, allocator: std.mem.Allocator) void {
-        self.core.deinit(allocator);
-        self.* = undefined;
-    }
-
-    /// Bytes one entry of logical capacity holds: two probe slots, its record and key,
-    /// free index, and owner-log room.
-    pub fn bytesPerEntry() usize {
-        return 2 * @sizeOf(ProbeSlot) + @sizeOf(Core.Record) + @sizeOf(PathQueryKey) + @sizeOf(u32) + ops_per_entry * @sizeOf(OwnerOp);
-    }
-
-    pub fn logicalCapacity(self: *const NegativeCache) usize {
-        return self.core.logical_capacity;
-    }
-
-    pub fn count(self: *const NegativeCache) usize {
-        return self.core.len;
-    }
-
-    pub fn canStore(self: *const NegativeCache) bool {
-        return self.core.logical_capacity != 0;
-    }
-
-    /// Allocates a resize to `capacity` without moving an entry; `commitResize` or
-    /// `abortResize` follows. Failure-atomic.
-    pub fn prepareResize(self: *NegativeCache, allocator: std.mem.Allocator, capacity: usize) !Resize {
-        return self.core.prepareResize(allocator, capacity);
-    }
-
-    /// Frees a prepared resize; a no-op after its commit.
-    pub fn abortResize(self: *NegativeCache, allocator: std.mem.Allocator, resize: *Resize) void {
-        self.core.abortResize(allocator, resize);
-    }
-
-    /// Commits a prepared resize, keeping the entries that fit (a shrink evicts oldest
-    /// first, age `step -% stamp`, then owner id). Infallible. Main thread, resize seam.
-    pub fn commitResize(self: *NegativeCache, allocator: std.mem.Allocator, resize: *Resize, step: u32) void {
-        self.core.commitResize(allocator, resize, step, NoRecordHooks{});
-    }
-
-    pub fn clear(self: *NegativeCache) void {
-        self.core.clear();
-    }
-
-    pub const Lookup = struct {
-        slot: usize,
-        fresh: bool,
-        enclosure: Enclosure,
-    };
-
-    /// The key's slot, whether it is within `ttl` at `step` (ttl 0: never expires), and its
-    /// enclosure, from one probe; null when absent. Const: never removes.
-    pub fn lookup(self: *const NegativeCache, key: PathQueryKey, step: u32, ttl: u32) ?Lookup {
-        const index = self.core.slotIndex(key) orelse return null;
-        const record = self.core.records.items[self.core.slots.items[index].payload_index];
-        return .{ .slot = index, .fresh = ttl == 0 or (step -% record.stamp) < ttl, .enclosure = record.extra };
-    }
-
-    /// Whether a fresh negative answers a start in chunk (`chunk_x`, `chunk_y`) of
-    /// `level`: present, within `ttl`, and the start outside its box. Const.
-    pub fn isFreshFor(self: *const NegativeCache, key: PathQueryKey, step: u32, ttl: u32, level: u16, chunk_x: u32, chunk_y: u32) bool {
-        const found = self.lookup(key, step, ttl) orelse return false;
-        return found.fresh and !found.enclosure.excludes(level, chunk_x, chunk_y);
-    }
-
-    /// Removes the key's negative when it is past `ttl` at `step`, retiring its owner;
-    /// true when removed. O(1) expected; allocates nothing.
-    pub fn removeExpired(self: *NegativeCache, key: PathQueryKey, step: u32, ttl: u32) bool {
-        const found = self.lookup(key, step, ttl) orelse return false;
-        if (found.fresh) return false;
-        self.core.removeAt(found.slot);
-        return true;
-    }
-
-    /// Removes the entry of live owner `owner`, retiring it. O(1) expected.
-    pub fn removeOwner(self: *NegativeCache, owner: u32) void {
-        // A live owner's key holds its probe slot.
-        self.core.removeAt(self.core.slotIndex(self.core.keyOf(owner)).?);
-    }
-
-    /// Claims `key`'s entry with `enclosure` at `step` (see `CacheCore.claim`): a full
-    /// cache evicts a round-robin victim, never refusing. Opens no publish: call
-    /// `core.beginPublish` first. Returns the owner id. Main thread; allocates nothing.
-    pub fn claim(self: *NegativeCache, key: PathQueryKey, enclosure: Enclosure, step: u32, stats: *PathfindingStats) u32 {
-        const owner = self.core.claim(key, step, stats);
-        self.core.records.items[owner].extra = enclosure;
-        return owner;
     }
 };
 
@@ -1152,14 +1062,21 @@ const ProbeSlot = struct {
     payload_index: u32 = 0,
 };
 
-// A cached result's shape: four u32s, then the u16: 20 bytes.
+// A cached result's shape and end: four u32s, then two u16s: 20 bytes.
 const SlotPayload = struct {
     path_len: u32 = 0,
     stitched_len: u32 = 0,
     // The long block holding the path, or no_block when it sits in the inline stripe.
     long_block: u32 = no_block,
+    // Where the path ends (`PathResult.end`), so a goal check reads no path page.
+    end_cell: u32 = 0,
     path_level: u16 = 0,
+    end_level: u16 = 0,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(SlotPayload) == 20);
+}
 
 // Inserts a live slot into a rebuilt probe table at the first empty slot of its chain.
 fn insertRehashed(comptime Slot: type, slots: []Slot, slot: Slot) void {
@@ -1474,7 +1391,8 @@ fn testPut(cache: *ResultCache, key: PathQueryKey, path: []const u32, stitched: 
 }
 
 fn testClaimAndCopy(cache: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, step: u32, stats: *PathfindingStats) void {
-    const claimed = cache.claim(key, path.len, stitched.len, path_level, step, stats);
+    const end: StitchedCell = if (stitched.len != 0) stitched[stitched.len - 1] else .{ .level = path_level, .cell = path[path.len - 1] };
+    const claimed = cache.claim(key, path.len, stitched.len, path_level, end, step, stats);
     const words = cache.destination(claimed);
     if (stitched.len != 0) types.writeStitched(words, stitched) else @memcpy(words[0..path.len], path);
 }
@@ -1502,6 +1420,7 @@ fn expectTestEntry(cache: *const ResultCache, index: usize) !void {
             const stored = cache.pathSlice(slot, result.path_len);
             try std.testing.expectEqual(len, stored.len);
             for (stored, 0..) |cell, offset| try std.testing.expectEqual(testEntryCell(index, offset), cell);
+            try std.testing.expectEqual(StitchedCell{ .level = 0, .cell = stored[len - 1] }, result.end);
         },
         else => {
             const len: usize = if (index % 4 == 2) 2 else 5;
@@ -1512,6 +1431,7 @@ fn expectTestEntry(cache: *const ResultCache, index: usize) !void {
                 try std.testing.expectEqual(@as(u16, @intCast(index % 3)), stored.levels[offset]);
                 try std.testing.expectEqual(testEntryCell(index, offset), stored.cells[offset]);
             }
+            try std.testing.expectEqual(stored.at(len - 1), result.end);
         },
     }
 }
@@ -1580,6 +1500,25 @@ test "pathfinding result cache long pool never passes the page of the entry limi
     for ([_]usize{ 9, 11, 13 }) |index| try expectTestEntry(&cache, index);
     try std.testing.expectEqual(@as(usize, 4), cache.long_block_count);
     try expectResultCacheConsistent(&cache);
+}
+
+test "a cached result's end is its plain path's last cell on its path level, or its stitched path's last cell, inline and long, from find and lookup" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try testResize(&cache, std.testing.allocator, 8, test_inline_words, test_long_block_words, 0);
+    _ = try cache.reserveLongBlocks(std.testing.allocator, 2);
+    const plain_short = [_]u32{ 5, 6, 7 };
+    const plain_long = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 9 };
+    const stitched = [_]StitchedCell{ .{ .level = 0, .cell = 3 }, .{ .level = 0, .cell = 4 }, .{ .level = 2, .cell = 40 }, .{ .level = 2, .cell = 41 } };
+    testPut(&cache, testGoalKey(1), &plain_short, &.{}, 3, 0, &stats);
+    testPut(&cache, testGoalKey(2), &plain_long, &.{}, 1, 0, &stats);
+    testPut(&cache, testGoalKey(3), &.{}, &stitched, 0, 0, &stats);
+    const ends = [_]StitchedCell{ .{ .level = 3, .cell = 7 }, .{ .level = 1, .cell = 9 }, .{ .level = 2, .cell = 41 } };
+    for (ends, 1..) |end, index| {
+        try std.testing.expectEqual(end, cache.find(testGoalKey(index)).?.end);
+        try std.testing.expectEqual(end, cache.lookup(testGoalKey(index), 0, 0).?.end);
+    }
 }
 
 test "pathfinding result cache grow and shrink keep entries, evicting oldest first" {
@@ -2228,157 +2167,4 @@ test "pathfinding stitched waypoint matches full scan and recovers from a stale 
     const recovered = waypointFromStitched(&graph, stitched, 0, 12, &stale).?;
     try std.testing.expectEqual(baseline.x, recovered.x);
     try std.testing.expectEqual(@as(u32, 2), stale);
-}
-
-// A negative cache resized to `capacity` with its owner log flushed.
-fn testNegativeResize(cache: *NegativeCache, allocator: std.mem.Allocator, capacity: usize, step: u32) !void {
-    var resize = try cache.prepareResize(allocator, capacity);
-    cache.commitResize(allocator, &resize, step);
-    cache.core.finishOwnerLog(allocator);
-}
-
-fn testEnclosure(index: usize) Enclosure {
-    return .{ .level = @intCast(index % 3), .min_x = @intCast(index), .min_y = 1, .max_x = @intCast(index + 2), .max_y = 4 };
-}
-
-// Claims `key` in a publish of its own; the owner log is emptied first, as a flush would.
-fn testPutNegative(cache: *NegativeCache, index: usize, step: u32, stats: *PathfindingStats) void {
-    cache.core.finishOwnerLog(std.testing.allocator);
-    cache.core.beginPublish();
-    _ = cache.claim(testGoalKey(index), testEnclosure(index), step, stats);
-}
-
-fn expectNegativeCacheConsistent(cache: *const NegativeCache) !void {
-    const core = &cache.core;
-    try std.testing.expectEqual(2 * core.logical_capacity, core.slots.items.len);
-    try std.testing.expectEqual(core.logical_capacity, core.records.items.len);
-    try std.testing.expectEqual(core.logical_capacity - core.len, core.free.items.len);
-    var live: usize = 0;
-    for (core.records.items, 0..) |record, owner| {
-        if (!record.live) continue;
-        live += 1;
-        try std.testing.expectEqual(@as(?u32, @intCast(owner)), core.ownerOf(core.keyOf(@intCast(owner))));
-    }
-    try std.testing.expectEqual(core.len, live);
-}
-
-test "pathfinding a full negative cache evicts round-robin victims deterministically and never refuses a claim" {
-    var caches: [2]NegativeCache = .{ .{}, .{} };
-    defer for (&caches) |*cache| cache.deinit(std.testing.allocator);
-    var victims: [2]std.ArrayList(usize) = .{ .empty, .empty };
-    defer for (&victims) |*list| list.deinit(std.testing.allocator);
-    for (&caches, &victims) |*cache, *lost| {
-        var stats = PathfindingStats{};
-        try testNegativeResize(cache, std.testing.allocator, 4, 0);
-        for (0..4) |index| testPutNegative(cache, index, 0, &stats);
-        try std.testing.expectEqual(@as(usize, 0), stats.cache_evictions);
-        // Six more claims into the full cache, two in one publish: each takes a victim, and
-        // neither claim of that publish evicts the other.
-        for (4..8) |index| testPutNegative(cache, index, 1, &stats);
-        cache.core.finishOwnerLog(std.testing.allocator);
-        cache.core.beginPublish();
-        for (8..10) |index| _ = cache.claim(testGoalKey(index), testEnclosure(index), 2, &stats);
-        try std.testing.expectEqual(@as(usize, 6), stats.cache_evictions);
-        try std.testing.expectEqual(@as(usize, 4), cache.count());
-        for (8..10) |index| try std.testing.expectEqual(testEnclosure(index), cache.lookup(testGoalKey(index), 2, 300).?.enclosure);
-        for (0..10) |index| {
-            if (cache.lookup(testGoalKey(index), 2, 300) == null) try lost.append(std.testing.allocator, index);
-        }
-        try expectNegativeCacheConsistent(cache);
-    }
-    try std.testing.expectEqualSlices(usize, victims[0].items, victims[1].items);
-}
-
-test "pathfinding a negative expires by its stamp, a const lookup never removes, and one expired removal retires once" {
-    var stats = PathfindingStats{};
-    var cache = NegativeCache{};
-    defer cache.deinit(std.testing.allocator);
-    try testNegativeResize(&cache, std.testing.allocator, 4, 0);
-    testPutNegative(&cache, 1, 100, &stats);
-    cache.core.finishOwnerLog(std.testing.allocator);
-    const enclosure = testEnclosure(1);
-    // Fresh within the TTL, for a start outside the box only.
-    try std.testing.expect(cache.lookup(testGoalKey(1), 149, 50).?.fresh);
-    try std.testing.expect(cache.isFreshFor(testGoalKey(1), 149, 50, enclosure.level, enclosure.max_x + 1, 1));
-    try std.testing.expect(!cache.isFreshFor(testGoalKey(1), 149, 50, enclosure.level, enclosure.min_x, 1));
-    try std.testing.expect(cache.isFreshFor(testGoalKey(1), 149, 50, enclosure.level + 1, enclosure.min_x, 1));
-    // Stale at the TTL: reads stale and stays put until a mutating removal.
-    try std.testing.expect(!cache.lookup(testGoalKey(1), 150, 50).?.fresh);
-    try std.testing.expect(!cache.isFreshFor(testGoalKey(1), 150, 50, enclosure.level, enclosure.max_x + 1, 1));
-    try std.testing.expectEqual(@as(usize, 1), cache.count());
-    try std.testing.expectEqual(@as(usize, 0), cache.core.ownerLog().len);
-    try std.testing.expect(!cache.removeExpired(testGoalKey(1), 149, 50));
-    try std.testing.expect(cache.removeExpired(testGoalKey(1), 150, 50));
-    try std.testing.expect(!cache.removeExpired(testGoalKey(1), 150, 50));
-    try std.testing.expectEqual(@as(usize, 0), cache.count());
-    try std.testing.expectEqual(@as(usize, 1), cache.core.ownerLog().len);
-    try std.testing.expectEqual(no_owner, cache.core.ownerLog()[0].new);
-    // TTL 0 never expires.
-    testPutNegative(&cache, 2, 0, &stats);
-    try std.testing.expect(cache.lookup(testGoalKey(2), 1_000_000, 0).?.fresh);
-    // The every-start enclosure excludes nothing.
-    try std.testing.expect(!Enclosure.every_start.excludes(0, 0, 0));
-}
-
-test "pathfinding a negative cache grow and shrink keep entries and enclosures, logging each retire and rename" {
-    var stats = PathfindingStats{};
-    var cache = NegativeCache{};
-    defer cache.deinit(std.testing.allocator);
-    try testNegativeResize(&cache, std.testing.allocator, 16, 0);
-    for (0..12) |index| testPutNegative(&cache, index, @intCast(index), &stats);
-    cache.core.finishOwnerLog(std.testing.allocator);
-    try testNegativeResize(&cache, std.testing.allocator, 64, 12);
-    try std.testing.expectEqual(@as(usize, 12), cache.count());
-    for (0..12) |index| try std.testing.expectEqual(testEnclosure(index), cache.lookup(testGoalKey(index), 12, 0).?.enclosure);
-
-    // A shrink to 4 retires the eight oldest and renames survivors past the capacity.
-    var resize = try cache.prepareResize(std.testing.allocator, 4);
-    cache.commitResize(std.testing.allocator, &resize, 12);
-    var retires: usize = 0;
-    var renames: usize = 0;
-    for (cache.core.ownerLog()) |op| {
-        if (op.new == no_owner) retires += 1 else {
-            renames += 1;
-            try std.testing.expect(op.old >= 4 and op.new < 4);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 8), retires);
-    try std.testing.expect(renames != 0);
-    cache.core.finishOwnerLog(std.testing.allocator);
-    for (0..8) |index| try std.testing.expect(cache.lookup(testGoalKey(index), 12, 0) == null);
-    for (8..12) |index| try std.testing.expectEqual(testEnclosure(index), cache.lookup(testGoalKey(index), 12, 0).?.enclosure);
-    try expectNegativeCacheConsistent(&cache);
-}
-
-test "pathfinding a negative cache resize out of memory at every allocation leaves its entries and log intact (FailingAllocator)" {
-    for ([_]usize{ 2, 8, 64 }) |target| {
-        var fail_index: usize = 0;
-        while (true) : (fail_index += 1) {
-            var stats = PathfindingStats{};
-            var cache = NegativeCache{};
-            defer cache.deinit(std.testing.allocator);
-            try testNegativeResize(&cache, std.testing.allocator, 16, 0);
-            for (0..6) |index| testPutNegative(&cache, index, @intCast(index), &stats);
-            const logged = cache.core.ownerLog().len;
-            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
-            var resize = cache.prepareResize(failing.allocator(), target) catch |err| {
-                try std.testing.expectEqual(error.OutOfMemory, err);
-                try std.testing.expectEqual(@as(usize, 16), cache.logicalCapacity());
-                try std.testing.expectEqual(logged, cache.core.ownerLog().len);
-                try expectNegativeCacheConsistent(&cache);
-                for (0..6) |index| try std.testing.expectEqual(testEnclosure(index), cache.lookup(testGoalKey(index), 6, 0).?.enclosure);
-                // Still claims at the old limit.
-                for (0..16) |index| testPutNegative(&cache, 100 + index, 7, &stats);
-                try expectNegativeCacheConsistent(&cache);
-                continue;
-            };
-            cache.commitResize(failing.allocator(), &resize, 6);
-            cache.core.finishOwnerLog(failing.allocator());
-            try std.testing.expectEqual(target, cache.logicalCapacity());
-            try std.testing.expectEqual(@min(target, 6), cache.count());
-            try expectNegativeCacheConsistent(&cache);
-            break;
-        }
-        try std.testing.expect(fail_index >= 1);
-    }
 }

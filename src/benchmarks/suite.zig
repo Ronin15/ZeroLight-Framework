@@ -27,8 +27,8 @@ const resultBlockWords = @import("../game/systems/pathfinding/types.zig").result
 const registry_shard_count = @import("../game/systems/pathfinding/types.zig").registry_shard_count;
 const RegRecord = @import("../game/systems/pathfinding/types.zig").RegRecord;
 const ResultCache = @import("../game/systems/pathfinding/caches.zig").ResultCache;
-const NegativeCache = @import("../game/systems/pathfinding/caches.zig").NegativeCache;
-const max_negative_keys = @import("../game/systems/pathfinding/solve.zig").max_negative_keys;
+const reachabilityBytesBound = @import("../game/systems/pathfinding/connectivity.zig").storageBytesBound;
+const max_border_portals = @import("../game/systems/pathfinding/nav_graph.zig").max_border_portals;
 const SolvedPath = @import("../game/systems/pathfinding/system.zig").PathfindingSystem.SolvedPath;
 const ChunkListMap = @import("../game/systems/chunk_list_map.zig").ChunkListMap;
 
@@ -803,7 +803,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) return "uncached unreachable path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-negative-steady")) return "fresh unreachable path requests per step";
     if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) return "(level side * 1000 + unreachable path requests)";
-    if (std.mem.eql(u8, group_name, "pathfinding-negative-burst")) return "unreachable path requests in one burst";
+    if (std.mem.eql(u8, group_name, "pathfinding-negative-burst")) return "(variant * 10^6 + unreachable path requests in one burst)";
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) return "(variant * 10^10 + edge chunks * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-oneway")) return "(variant * 10^10 + terminals per system * 10^5 + one-way systems)";
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) return "agents before the drop";
@@ -1000,23 +1000,23 @@ fn printValidationSummary(
             );
         } else if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) {
             std.debug.print(
-                "workload negatives={} deferred={}. ",
-                .{ best.stats.output_count, best.stats.deferred_count },
+                "workload unavailable={} solves={} deferred={}. ",
+                .{ best.stats.output_count, best.stats.candidate_pairs, best.stats.deferred_count },
             );
         } else if (std.mem.eql(u8, group_name, "pathfinding-negative-steady")) {
             std.debug.print(
-                "workload negatives={} victims={} hits={}. ",
+                "workload unavailable={} victims={} hits={}. ",
                 .{ best.stats.output_count, best.stats.cache_evictions, best.stats.candidate_pairs },
             );
         } else if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) {
             std.debug.print(
-                "workload hits={} solves={} exhausted={} pending={}. ",
+                "workload unavailable={} solves={} exhausted={} pending={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.sample_count, best.stats.deferred_count },
             );
         } else if (std.mem.eql(u8, group_name, "pathfinding-negative-burst")) {
             std.debug.print(
-                "workload searches={} unavailable={} steps={} status_steps={} max_step={f}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.sample_count, best.stats.deferred_count, formatDuration(best.stats.max_step_ns) },
+                "workload searches={} unavailable={} steps={} status_steps={} projections={} fallbacks={} max_step={f}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.sample_count, best.stats.deferred_count, best.stats.cache_evictions, best.stats.fallback_deferred_count, formatDuration(best.stats.max_step_ns) },
             );
         } else if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) {
             std.debug.print(
@@ -1353,16 +1353,16 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         return std.fmt.bufPrint(buffer, "field_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-cold-unreachable")) {
-        return std.fmt.bufPrint(buffer, "negatives={} deferred={}", .{ stats.output_count, stats.deferred_count }) catch "workload";
+        return std.fmt.bufPrint(buffer, "unavailable={} solves={} deferred={}", .{ stats.output_count, stats.candidate_pairs, stats.deferred_count }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-negative-steady")) {
-        return std.fmt.bufPrint(buffer, "negatives={} victims={} hits={}", .{ stats.output_count, stats.cache_evictions, stats.candidate_pairs }) catch "workload";
+        return std.fmt.bufPrint(buffer, "unavailable={} victims={} hits={}", .{ stats.output_count, stats.cache_evictions, stats.candidate_pairs }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-negative-dig")) {
-        return std.fmt.bufPrint(buffer, "hits={} solves={} exhausted={} pending={}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count }) catch "workload";
+        return std.fmt.bufPrint(buffer, "unavailable={} solves={} exhausted={} pending={}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-negative-burst")) {
-        return std.fmt.bufPrint(buffer, "searches={} unavailable={} steps={} status_steps={} max_step={f}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count, formatDuration(stats.max_step_ns) }) catch "workload";
+        return std.fmt.bufPrint(buffer, "searches={} unavailable={} steps={} status_steps={} projections={} fallbacks={} max_step={f}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count, stats.cache_evictions, stats.fallback_deferred_count, formatDuration(stats.max_step_ns) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) {
         var stage_buffer: [1536]u8 = undefined;
@@ -1761,18 +1761,16 @@ pub const NavSizeConfig = struct {
     /// per cached result; the default charges every cached result. A fixture whose paths
     /// all fit inline passes 0 and checks that no long block was taken.
     long_results: usize = std.math.maxInt(usize),
-    /// Proven negatives the fixture caches, clamped to the negative cache's capacity: each
-    /// is charged its most registry keys. A fixture caching none passes 0.
-    negatives: usize = 0,
 };
 
 /// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
 /// ceiling: per-level chunk directories, cell blocks, and records (every chunk mixed and
 /// holding portals), link slots, one level's batch window, per-participant search scratch,
 /// the tier-1 corridor pool, group fields, the result cache with the long-block pages of
-/// `long_results`, the path registry, and the negative cache with the registry keys of
-/// `negatives`. Search scratch and group fields are sized by their node and cell budgets,
-/// never by level cells.
+/// `long_results`, the path registry, the goal table, and reachability (connectivity node,
+/// comp, and root pools with the flood's buffers, and the one-way closure's links,
+/// terminals, H-components, and arena, every link charged as one-way). Search scratch and
+/// group fields are sized by their node and cell budgets, never by level cells.
 pub fn navStorageBytes(config: NavSizeConfig) usize {
     // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
     // abstract node and stitched cell caps, escalated solves per step, group field cells,
@@ -1833,14 +1831,16 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
     const runs_per_result = stored_path_cells / chunk_tiles;
     const registry = cached_results * (registry_shard_count * @sizeOf(u32) + runs_per_result * (ChunkListMap.bytes_per_entry + 2 * ChunkListMap.bytes_per_key_slot)) +
         solves_per_step * runs_per_result * @sizeOf(RegRecord);
-    // Negative cache, per entry: its probe slots, record, free index, owner-log room, and an
-    // owner head per negative-registry shard; each cached negative its keys, each an entry
-    // with, at most, a key of its own in two table slots, and a step's registration windows.
-    const negative_keys: usize = max_negative_keys;
-    const negatives = cached_results * (NegativeCache.bytesPerEntry() + registry_shard_count * @sizeOf(u32)) +
-        @min(config.negatives, cached_results) * negative_keys * (ChunkListMap.bytes_per_entry + 2 * ChunkListMap.bytes_per_key_slot) +
-        @min(config.negatives, solves_per_step) * negative_keys * @sizeOf(RegRecord);
-    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results + registry + negatives;
+    // Goal table, per intent (one per agent): four map slots of key, value, and stamp, an
+    // entry's ref and live cell, its scan slot, and a scan tally per aligned range.
+    const goal_table = agents * (4 * (@sizeOf(u64) + 2 * @sizeOf(u32)) + @sizeOf(u64) + @sizeOf(u32) + @sizeOf(u64) + 2 * @sizeOf(usize));
+    // Reachability: a node row per portal a chunk record holds (its border window and every
+    // link endpoint), a flood participant per threaded participant, and one node's slack of
+    // its border flags and the endpoints one chunk's cells can hold.
+    const nodes = levels * chunks * max_border_portals + 2 * config.links;
+    const chunk_endpoints = @min(2 * config.links, chunk_tiles * chunk_tiles);
+    const reachability = reachabilityBytesBound(nodes, config.links, participants, max_border_portals + chunk_endpoints);
+    return level_chunks + link_slots + batch + group_fields + search + tier1_pool + results + registry + goal_table + reachability;
 }
 
 // Rows the pathfinding tables reserve for `keys` keys; the library defaults sized here

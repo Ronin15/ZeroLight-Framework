@@ -127,32 +127,40 @@ fn nodeKeyLabel(key: u64) u8 {
     return @truncate(key);
 }
 
+/// Reach from a start cell to a goal cell (`reach`).
+pub const Reach = enum {
+    // The start cell is blocked: nothing is decided about the goal.
+    start_blocked,
+    reaches,
+    unreachable_goal,
+};
+
 /// Whether `goal_cell` on `goal_level` is reachable from `start_cell` on `start_level` over
 /// the graph's border mirrors, two-way links, and live one-way links in their direction: the
 /// same chunk label, two nodes under one root, or the start root's terminal reaching the goal
-/// root's terminal in their H-component's closure. A blocked cell reaches nothing; a label
-/// holding no portal, or a chunk holding no record, reaches only its own chunk label. Exact
-/// after every nav batch. O(1): two label reads, two record node walks (at most the
-/// portal-bearing labels of one chunk each), two root and two terminal reads, one bit.
-pub fn reach(graph: *const NavGraph, start_level: u16, start_cell: usize, goal_level: u16, goal_cell: usize) bool {
-    const start_grid = graph.grid(start_level) orelse return false;
-    const goal_grid = graph.grid(goal_level) orelse return false;
-    const start_label = start_grid.labelAt(start_cell);
-    const goal_label = goal_grid.labelAt(goal_cell);
-    if (start_label == 0 or goal_label == 0) return false;
-    const start_chunk = start_grid.chunkOfCell(start_cell);
-    const goal_chunk = goal_grid.chunkOfCell(goal_cell);
-    if (start_level == goal_level and start_chunk == goal_chunk and start_label == goal_label) return true;
+/// root's terminal in their H-component's closure. A blocked start is `start_blocked`; an
+/// open start reaches no blocked goal; a label holding no portal, or a chunk holding no
+/// record, reaches only its own chunk label. Exact after every nav batch. O(1): one division
+/// and label read per cell, two record node walks (at most the portal-bearing labels of one
+/// chunk each), two root and two terminal reads, one bit.
+pub fn reach(graph: *const NavGraph, start_level: u16, start_cell: usize, goal_level: u16, goal_cell: usize) Reach {
+    const start_grid = graph.grid(start_level) orelse return .unreachable_goal;
+    const goal_grid = graph.grid(goal_level) orelse return .unreachable_goal;
+    const start = start_grid.chunkLabelAt(start_cell);
+    if (start.label == 0) return .start_blocked;
+    const goal = goal_grid.chunkLabelAt(goal_cell);
+    if (goal.label == 0) return .unreachable_goal;
+    if (start_level == goal_level and start.chunk == goal.chunk and start.label == goal.label) return .reaches;
     const start_graph = graph.levelGraph(start_level).?;
     const goal_graph = graph.levelGraph(goal_level).?;
-    const start_row = start_graph.nodeOf(start_chunk, start_label);
-    const goal_row = goal_graph.nodeOf(goal_chunk, goal_label);
-    if (start_row == no_node or goal_row == no_node) return false;
+    const start_row = start_graph.nodeOf(start.chunk, start.label);
+    const goal_row = goal_graph.nodeOf(goal.chunk, goal.label);
+    if (start_row == no_node or goal_row == no_node) return .unreachable_goal;
     const conn = &graph.connectivity;
     const start_root = conn.comp_root[start_graph.node_comp[start_row]];
     const goal_root = conn.comp_root[goal_graph.node_comp[goal_row]];
-    if (start_root == goal_root) return true;
-    return conn.closure.termReaches(conn.root_term[start_root], conn.root_term[goal_root]);
+    if (start_root == goal_root) return .reaches;
+    return if (conn.closure.termReaches(conn.root_term[start_root], conn.root_term[goal_root])) .reaches else .unreachable_goal;
 }
 
 // One edge a seed or gather item found: its two node keys and, per end, the end's row when
@@ -340,9 +348,10 @@ pub const default_flood_window: usize = 16384;
 /// participant's search table.
 pub const default_flood_budget_cap: u32 = 512;
 
-// Open-addressed u64 -> u32 map, cleared by a generation bump. Its slot count is a power of
-// two at least twice its logical limit, so probes stay short and an insert always finds room.
-const ElementMap = struct {
+/// Open-addressed u64 -> u32 map, cleared by a generation bump. Its slot count is a power of
+/// two at least twice its logical limit, so probes stay short and an insert always finds
+/// room. Const lookups are safe on workers while nothing writes.
+pub const ElementMap = struct {
     keys: std.ArrayList(u64) = .empty,
     values: std.ArrayList(u32) = .empty,
     stamps: std.ArrayList(u32) = .empty,
@@ -350,14 +359,14 @@ const ElementMap = struct {
     limit: usize = 0,
     used: usize = 0,
 
-    fn deinit(self: *ElementMap, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ElementMap, allocator: std.mem.Allocator) void {
         self.stamps.deinit(allocator);
         self.values.deinit(allocator);
         self.keys.deinit(allocator);
         self.* = .{};
     }
 
-    fn reserve(self: *ElementMap, allocator: std.mem.Allocator, limit: usize) !void {
+    pub fn reserve(self: *ElementMap, allocator: std.mem.Allocator, limit: usize) !void {
         const slots = try std.math.ceilPowerOfTwo(usize, @max(2 * limit, 16));
         if (slots > self.keys.items.len) {
             try self.keys.ensureTotalCapacityPrecise(allocator, slots);
@@ -376,7 +385,7 @@ const ElementMap = struct {
 
     // Shrinks the slots to what `limit` needs when it holds more, emptying the map. Never
     // fails: a failed shrink keeps the larger buffers.
-    fn shrink(self: *ElementMap, allocator: std.mem.Allocator, limit: usize) void {
+    pub fn shrink(self: *ElementMap, allocator: std.mem.Allocator, limit: usize) void {
         const slots = std.math.ceilPowerOfTwo(usize, @max(2 * limit, 16)) catch return;
         if (self.keys.items.len <= slots) return;
         self.keys.shrinkAndFree(allocator, slots);
@@ -388,7 +397,7 @@ const ElementMap = struct {
         self.used = 0;
     }
 
-    fn clear(self: *ElementMap) void {
+    pub fn clear(self: *ElementMap) void {
         self.used = 0;
         self.generation +%= 1;
         if (self.generation == 0) {
@@ -405,19 +414,37 @@ const ElementMap = struct {
         return slot;
     }
 
-    fn get(self: *const ElementMap, key: u64) ?u32 {
+    pub fn get(self: *const ElementMap, key: u64) ?u32 {
         const slot = self.slotOf(key);
         return if (self.stamps.items[slot] == self.generation) self.values.items[slot] else null;
     }
 
-    fn put(self: *ElementMap, key: u64, value: u32) void {
+    pub fn put(self: *ElementMap, key: u64, value: u32) void {
         const slot = self.slotOf(key);
         std.debug.assert(self.stamps.items[slot] != self.generation);
+        self.claimSlot(slot, key);
+        self.values.items[slot] = value;
+    }
+
+    /// `key`'s value slot from one probe: `found` when the key was present, else the key is
+    /// inserted and the caller writes its value. Within the reserved limit.
+    pub fn getOrPut(self: *ElementMap, key: u64) GetOrPut {
+        const slot = self.slotOf(key);
+        const found = self.stamps.items[slot] == self.generation;
+        if (!found) self.claimSlot(slot, key);
+        return .{ .value = &self.values.items[slot], .found = found };
+    }
+
+    pub const GetOrPut = struct {
+        value: *u32,
+        found: bool,
+    };
+
+    fn claimSlot(self: *ElementMap, slot: usize, key: u64) void {
         std.debug.assert(self.used < self.limit);
         self.used += 1;
         self.stamps.items[slot] = self.generation;
         self.keys.items[slot] = key;
-        self.values.items[slot] = value;
     }
 };
 
@@ -1255,6 +1282,30 @@ fn shrinkRows(comptime Row: type, rows: *std.MultiArrayList(Row), allocator: std
     rows.len = rows.capacity;
     rows.shrinkAndFree(allocator, keep);
     rows.len = 0;
+}
+
+/// An over-estimate of the bytes reachability keeps, for storage size limits: per node row
+/// its row, and a comp and a root of its own with their free-list entries; per one-way link
+/// its row and link index, two terminals and two H-components with their free-list entries,
+/// and the closure arena at twice the live words of one H-component holding every terminal;
+/// the flood's round buffers at the default window; and per flood participant a search
+/// table at the default budget cap, with `slack` the most proposals one node adds.
+pub fn storageBytesBound(nodes: usize, oneway_links: usize, participants: usize, slack: usize) usize {
+    const free_entry = @sizeOf(u32);
+    const node_rows = nodes * (@sizeOf(NodeRow) + free_entry + @sizeOf(CompRow) + free_entry + @sizeOf(RootRow) + free_entry);
+    const terminals = 2 * oneway_links;
+    // Terminal ids stay below 2^31, so a cap past u32 saturates.
+    const k_cap: usize = if (terminals == 0) 0 else std.math.ceilPowerOfTwo(usize, terminals) catch std.math.maxInt(usize);
+    const block_words: usize = if (k_cap == 0) 0 else blockWords(std.math.cast(u32, k_cap) orelse std.math.maxInt(u32));
+    const closure = oneway_links * (@sizeOf(OneWayRow) + @sizeOf(u32)) +
+        terminals * (@sizeOf(TermRow) + free_entry + @sizeOf(HCompRow) + free_entry) +
+        2 *| block_words *| @sizeOf(u32);
+    const window = @max(default_flood_window, default_flood_budget_cap) + slack;
+    const items = window / (1 + slack);
+    const rounds = window * @sizeOf(Proposal) + items * (@sizeOf(FloodItem) + @sizeOf(FloodOut));
+    const table_slots = std.math.ceilPowerOfTwo(usize, 2 * (default_flood_budget_cap + slack)) catch std.math.maxInt(usize);
+    const tables = participants *| (@sizeOf(FloodScratch) + table_slots *| (@sizeOf(u64) + @sizeOf(u32)));
+    return node_rows +| closure +| rounds +| tables;
 }
 
 /// Per-world comps and roots, plus the batch staging the stages share and the flood's round
@@ -5006,7 +5057,7 @@ test "enclosing a room splits off exactly the room, floods only on its scale, an
             defer system.deinit();
             const inside = fixture.cell(1, 1);
             const outside = fixture.cell(@as(usize, side) * test_chunk - 2, @as(usize, side) * test_chunk - 2);
-            try std.testing.expect(reach(&system.graph, 0, inside, 0, outside));
+            try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) == .reaches);
             const roots = system.graph.connectivity.rootCount();
 
             try fixture.setChunk(&system, 0, edge, edge / 2, fixture.tree);
@@ -5014,7 +5065,7 @@ test "enclosing a room splits off exactly the room, floods only on its scale, an
             // A one-chunk room loses its only portal: no node is left to split off.
             const split: usize = if (edge > 1) 1 else 0;
             try std.testing.expectEqual(split, enclosed.conn_splits);
-            try std.testing.expect(!reach(&system.graph, 0, inside, 0, outside));
+            try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) != .reaches);
             try std.testing.expectEqual(roots + split, system.graph.connectivity.rootCount());
             // The outside side searches up to the room side's claims plus half again, so the
             // flood stays within a constant of the room.
@@ -5026,7 +5077,7 @@ test "enclosing a room splits off exactly the room, floods only on its scale, an
             try fixture.setChunk(&system, 0, edge, edge / 2, fixture.grass);
             const opened = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
             try std.testing.expectEqual(@as(usize, 0), opened.conn_flood_nodes);
-            try std.testing.expect(reach(&system.graph, 0, inside, 0, outside));
+            try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) == .reaches);
             try std.testing.expectEqual(roots, system.graph.connectivity.rootCount());
             try fixture.expectMatchesRebuild(&system);
         }
@@ -5059,7 +5110,7 @@ test "cutting a ring floods around the ring until both sides meet and splits not
         const slack = system.graph.levelGraph(0).?.border_stride;
         try std.testing.expect(cut.conn_flood_nodes <= ring * 3 / 2 + slack);
         try std.testing.expectEqual(roots, system.graph.connectivity.rootCount());
-        try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)));
+        try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)) == .reaches);
         try fixture.expectMatchesRebuild(&system);
     }
 }
@@ -5088,7 +5139,7 @@ test "an opening dig floods nothing and moves no node outside its chunk to anoth
     for (0..6) |cy| try fixture.setChunk(null, 0, 2, @intCast(cy), fixture.tree);
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    try std.testing.expect(!reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 20)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 20)) != .reaches);
     var before = std.AutoHashMap(u64, u32).init(std.testing.allocator);
     defer before.deinit();
     var after = std.AutoHashMap(u64, u32).init(std.testing.allocator);
@@ -5100,7 +5151,7 @@ test "an opening dig floods nothing and moves no node outside its chunk to anoth
     try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_nodes);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_splits);
     try std.testing.expectEqual(@as(usize, 1), stats.conn_merges);
-    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 20)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 20)) == .reaches);
     try snapshotComps(&system.graph, &.{gap_chunk}, &after);
     try std.testing.expectEqual(before.count(), after.count());
     var entries = before.iterator();
@@ -5138,33 +5189,33 @@ test "a new two-way link joins two components; a one-way link joins none but rea
     defer system.deinit();
     const top = fixture.cell(1, 1);
     const bottom = fixture.cell(14, 14);
-    try std.testing.expect(!reach(&system.graph, 0, top, 1, bottom));
+    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) != .reaches);
     // One-way: no undirected edge, one directed reach.
     const roots = system.graph.connectivity.rootCount();
     try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 3, .y = 3 }, .level_b = 1, .cell_b = .{ .x = 9, .y = 9 }, .traversal_cost = 1, .bidirectional = false });
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(roots, system.graph.connectivity.rootCount());
-    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom));
-    try std.testing.expect(!reach(&system.graph, 1, bottom, 0, top));
+    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
+    try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) != .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Two-way: one edge, a root merge.
     try fixture.world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 5, .y = 6 }, .level_b = 1, .cell_b = .{ .x = 10, .y = 2 }, .traversal_cost = 1, .bidirectional = true });
     const linked = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), linked.conn_merges);
-    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom));
-    try std.testing.expect(reach(&system.graph, 1, bottom, 0, top));
+    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
+    try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) == .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Blocking the level-1 endpoint cuts the only connection.
     try fixture.setCell(&system, 1, 10, 2, fixture.tree);
     const blocked = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), blocked.conn_splits);
     // The one-way link still reaches forward; nothing reaches back.
-    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom));
-    try std.testing.expect(!reach(&system.graph, 1, bottom, 0, top));
+    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
+    try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) != .reaches);
     try fixture.expectMatchesRebuild(&system);
     try fixture.setCell(&system, 1, 10, 2, fixture.grass);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom));
+    try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -5182,12 +5233,12 @@ test "a level added with a link to it while a dig closes the link's old-level en
         try fixture.setCell(&system, 0, end[0], end[1], fixture.tree);
         const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
         try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
-        try std.testing.expect(!reach(&system.graph, 0, fixture.cell(1, 1), level, fixture.cell(1, 1)));
+        try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), level, fixture.cell(1, 1)) != .reaches);
         try fixture.expectMatchesRebuild(&system);
         // Reopening the end joins them.
         try fixture.setCell(&system, 0, end[0], end[1], fixture.grass);
         _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-        try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), level, fixture.cell(1, 1)));
+        try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), level, fixture.cell(1, 1)) == .reaches);
         try fixture.expectMatchesRebuild(&system);
     }
 }
@@ -5200,7 +5251,7 @@ test "replacing a level that held the only link between two halves of another sp
     try fixture.world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 20, .y = 20 }, .level_b = 1, .cell_b = .{ .x = 20, .y = 20 }, .traversal_cost = 1, .bidirectional = true });
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 21)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 21)) == .reaches);
     // A blocking layer over level 1 changes its content without per-cell events: a rebuild.
     _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
@@ -5213,7 +5264,7 @@ test "replacing a level that held the only link between two halves of another sp
         stats.recordTo(runtime_perf_log.Context.bind(&perf));
         try std.testing.expectEqual(@as(u64, 1), perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_connect)].calls);
     }
-    try std.testing.expect(!reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 21)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 21)) != .reaches);
     try std.testing.expectEqual(@as(usize, 0), system.graph.levelGraph(1).?.nodeCount());
     try fixture.expectMatchesRebuild(&system);
 }
@@ -5304,7 +5355,7 @@ fn expectReachMatchesCells(graph: *const NavGraph, world: *const WorldSystem) !v
             const to_level: u16 = @intCast(to / cells);
             if (graph.grid(to_level).?.isBlockedIndex(to % cells)) continue;
             const expected = reached[@as(usize, from_class) * parents.len + cellFind(parents, @intCast(to))];
-            try std.testing.expectEqual(expected, reach(graph, from_level, from % cells, to_level, to % cells));
+            try std.testing.expectEqual(expected, reach(graph, from_level, from % cells, to_level, to % cells) == .reaches);
         }
     }
 }
@@ -5356,11 +5407,11 @@ test "start and goal in one portal-less chunk label reach each other and nothing
     defer system.deinit();
     const chunk = system.graph.chunkOf(fixture.cell(5, 5));
     try std.testing.expectEqual(no_node, system.graph.levelGraph(0).?.nodeOf(chunk, system.graph.grid(0).?.labelAt(fixture.cell(5, 5))));
-    try std.testing.expect(reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(6, 6)));
-    try std.testing.expect(!reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(1, 1)));
-    try std.testing.expect(!reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(6, 5)));
-    // A blocked cell reaches nothing.
-    try std.testing.expect(!reach(&system.graph, 0, fixture.cell(4, 4), 0, fixture.cell(4, 4)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(6, 6)) == .reaches);
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(1, 1)) != .reaches);
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(6, 5)) != .reaches);
+    // A blocked start decides nothing.
+    try std.testing.expectEqual(Reach.start_blocked, reach(&system.graph, 0, fixture.cell(4, 4), 0, fixture.cell(4, 4)));
 }
 
 test "two hundred seeded random steps of digs, fills, and links match a full rebuild after each" {
@@ -5698,7 +5749,7 @@ fn ringCutTwice(side: u16, edge: u16) !usize {
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.conn_splits);
     try std.testing.expectEqual(roots + 1, system.graph.connectivity.rootCount());
-    try std.testing.expect(!reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
     return stats.conn_flood_nodes;
 }
@@ -6139,7 +6190,7 @@ test "a batch whose only change is a two-way link between unbuilt levels commits
     // Building both levels later joins the link's ends.
     const built = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 2), built.levels_built);
-    try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)));
+    try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)) == .reaches);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -6259,7 +6310,7 @@ test "the closure equals a full recompute after one-way adds, endpoint toggles, 
     const appended = try applyWithinBounds(&fixture, &system);
     try std.testing.expectEqual(@as(usize, 1), appended.levels_built);
     try fixture.expectMatchesRebuild(&system);
-    try std.testing.expect(reach(&system.graph, level, fixture.cell(3, 3), 0, fixture.cell(latticeRoom(chunks, 3)[0], latticeRoom(chunks, 3)[1])));
+    try std.testing.expect(reach(&system.graph, level, fixture.cell(3, 3), 0, fixture.cell(latticeRoom(chunks, 3)[0], latticeRoom(chunks, 3)[1])) == .reaches);
     // Replacing level 1 with a blocking layer drops its terminals.
     const terms = system.graph.connectivity.closure.termCount();
     _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
@@ -6831,8 +6882,8 @@ test "a one-way link between unbuilt levels commits without allocating, stays de
     try std.testing.expectEqual(@as(usize, 0), closure.termCount());
     try system.graph.buildLevel(no_colliders.view(), &fixture.world, 2, null, &stats);
     try std.testing.expect(closure.oneway.items(.hcomp)[0] != no_hcomp);
-    try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)));
-    try std.testing.expect(!reach(&system.graph, 2, fixture.cell(9, 9), 1, fixture.cell(2, 2)));
+    try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)) == .reaches);
+    try std.testing.expect(reach(&system.graph, 2, fixture.cell(9, 9), 1, fixture.cell(2, 2)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -6885,14 +6936,14 @@ test "a merge and a split of terminal roots far from every endpoint join and par
     const merged = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), merged.conn_merges);
     try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.hcompCount());
-    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) == .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Refilled: the root splits and so does the system.
     try fixture.setChunk(&system, 0, 4, 4, fixture.tree);
     const split = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), split.conn_splits);
     try std.testing.expectEqual(@as(usize, 2), system.graph.connectivity.closure.hcompCount());
-    try std.testing.expect(!reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)));
+    try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
 }
 

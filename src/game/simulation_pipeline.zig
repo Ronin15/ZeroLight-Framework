@@ -60,6 +60,8 @@ const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapaci
 const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
+const GoalResolveStats = @import("systems/pathfinding.zig").GoalResolveStats;
+const NavigationIntent = @import("simulation.zig").NavigationIntent;
 const PerceptionStats = @import("systems/perception.zig").PerceptionStats;
 const PerceptionSystem = @import("systems/perception.zig").PerceptionSystem;
 const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPerceptionCandidate;
@@ -126,6 +128,9 @@ const PipelineResource = enum {
     ai_cognition_indices,
     spatial_index,
     navigation_intents,
+    /// `PathfindingSystem.goals`: the step's live projection per distinct blocked goal of
+    /// `navigation_intents`, read by steering's status queries and the pathfinding update.
+    path_goals,
     action_intents,
     movement_intents,
     path_requests,
@@ -155,6 +160,7 @@ const StageId = enum {
     ai_memory_update,
     affect_update,
     ai_decide,
+    path_goal_resolve,
     steering_update,
     pathfinding_update,
     apply_ai_movement_intents,
@@ -215,8 +221,11 @@ fn stageContract(stage: StageId) StageContract {
             .writes = resources(&.{ .navigation_intents, .ai_behavior }),
             .carried = resources(&.{.interest_markers}),
         },
-        .steering_update => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{ .movement_intents, .path_requests }) },
-        .pathfinding_update => .{ .reads = resources(&.{.path_requests}), .writes = .empty },
+        // One projection per distinct blocked goal of this step's intents, before every
+        // reader of a live goal.
+        .path_goal_resolve => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{.path_goals}) },
+        .steering_update => .{ .reads = resources(&.{ .navigation_intents, .path_goals }), .writes = resources(&.{ .movement_intents, .path_requests }) },
+        .pathfinding_update => .{ .reads = resources(&.{ .path_requests, .path_goals }), .writes = .empty },
         .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
         // Movement integrates the full contiguous range (non-moving rows are
         // zero-velocity no-ops), so there is no movement scope filter to read.
@@ -289,6 +298,7 @@ const stage_order = [_]StageId{
     .ai_memory_update,
     .affect_update,
     .ai_decide,
+    .path_goal_resolve,
     .steering_update,
     .pathfinding_update,
     .apply_ai_movement_intents,
@@ -474,6 +484,8 @@ pub const SimulationPipelineStats = struct {
     affect: AffectStats = .{},
     ai: AiStats = .{},
     steering: SteeringStats = .{},
+    /// The step's goal resolve (`path_goal_resolve`).
+    path_goals: GoalResolveStats = .{},
     pathfinding: PathfindingStats = .{},
     apply_intents: MovementIntentStats = .{},
     movement: MovementStats = .{},
@@ -743,6 +755,7 @@ pub const SimulationPipeline = struct {
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
+        try pathfinding.reserveGoals(population);
         // With a world, nav covers its levels at its own tile and chunk dimensions; the
         // bounds and `nav_cell_size` shape only a world-less build. The colliders build first,
         // on nav's cell grid, and nav reads them.
@@ -956,6 +969,7 @@ pub const SimulationPipeline = struct {
             try self.dig.ensurePlaneScratchReserve(body + 1);
             try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = body }));
             try self.steering.reserve(body);
+            try self.pathfinding.reserveGoals(body);
         }
 
         self.movement_body_capacity = body;
@@ -1173,6 +1187,7 @@ pub const SimulationPipeline = struct {
         affect: AffectStats = .{},
         ai: AiStats = .{},
         steering: SteeringStats = .{},
+        path_goals: GoalResolveStats = .{},
         pathfinding: PathfindingStats = .{},
         apply_intents: MovementIntentStats = .{},
         movement: MovementStats = .{},
@@ -1209,6 +1224,7 @@ pub const SimulationPipeline = struct {
                 .affect = self.affect,
                 .ai = self.ai,
                 .steering = self.steering,
+                .path_goals = self.path_goals,
                 .pathfinding = self.pathfinding,
                 .apply_intents = self.apply_intents,
                 .movement = self.movement,
@@ -1250,6 +1266,7 @@ pub const SimulationPipeline = struct {
             .ai_memory_update => try self.stageAiMemoryUpdate(step),
             .affect_update => try self.stageAffectUpdate(step),
             .ai_decide => try self.stageAiDecide(step),
+            .path_goal_resolve => try self.stagePathGoalResolve(step),
             .steering_update => try self.stageSteeringUpdate(step),
             .pathfinding_update => try self.stagePathfindingUpdate(step),
             .apply_ai_movement_intents => self.stageApplyAiMovementIntents(step),
@@ -1430,6 +1447,13 @@ pub const SimulationPipeline = struct {
             },
         );
         ai_timer.stop(context.perf, .pipeline_ai);
+    }
+
+    fn stagePathGoalResolve(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        var path_goals_timer = StageTimer.start();
+        step.path_goals = try self.pathfinding.resolveGoals(NavigationIntent, context.frame.navigation_intents.mergedItems(), context.thread_system, .{});
+        path_goals_timer.stop(context.perf, .pipeline_path_goals);
     }
 
     fn stageSteeringUpdate(self: *SimulationPipeline, step: *StepState) !void {
@@ -7186,4 +7210,98 @@ test "a full-template create costs max_structural_events_per_create events" {
     try std.testing.expectError(error.EventCapacityExceeded, frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share - 1 }));
     _ = try frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share });
     try std.testing.expectEqual(share, frame.events.mergedItems().len);
+}
+
+test "the goal resolve stage writes path_goals, read by steering's status queries and the pathfinding update after it" {
+    const resolve = stageContract(.path_goal_resolve);
+    try std.testing.expect(resolve.reads.contains(.navigation_intents));
+    try std.testing.expect(resolve.writes.contains(.path_goals));
+    try std.testing.expect(stageContract(.steering_update).reads.contains(.path_goals));
+    try std.testing.expect(stageContract(.pathfinding_update).reads.contains(.path_goals));
+    const resolve_at = std.mem.indexOfScalar(StageId, &stage_order, .path_goal_resolve).?;
+    try std.testing.expect(std.mem.indexOfScalar(StageId, &stage_order, .ai_decide).? < resolve_at);
+    try std.testing.expect(resolve_at < std.mem.indexOfScalar(StageId, &stage_order, .steering_update).?);
+}
+
+// A static solid box of `size` from its min corner `position`.
+fn addStaticBox(data: *DataSystem, position: math.Vec2, size: math.Vec2) !void {
+    const box = try data.createEntity();
+    try data.setMovementBody(box, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 });
+    try data.setCollisionBounds(box, .{ .size = size });
+    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+}
+
+test "a crowd pursuing a blocked goal whose projection is sealed reads it unavailable on the first step, with one shared projection and no request" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // The crowd's goal: the focus target, the player at (400, 225), nav cell (12, 7). A 3x3
+    // block covers cells (11..13, 6..8); a wall ring at cells x 9..15, y 4..10 seals the
+    // ring of open cells between them, which holds the goal's projection.
+    var player = try Player.spawn(&data);
+    try addStaticBox(&data, .{ .x = 352, .y = 192 }, .{ .x = 96, .y = 96 });
+    try addStaticBox(&data, .{ .x = 288, .y = 128 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(&data, .{ .x = 288, .y = 320 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(&data, .{ .x = 288, .y = 160 }, .{ .x = 32, .y = 160 });
+    try addStaticBox(&data, .{ .x = 480, .y = 160 }, .{ .x = 32, .y = 160 });
+    const crowd = 6;
+    for (0..crowd) |index| {
+        const agent = try data.createEntity();
+        const position = math.Vec2{ .x = 48 + 96 * @as(f32, @floatFromInt(index)), .y = 400 };
+        try data.setMovementBody(agent, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 });
+        try data.setAiAgent(agent, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
+        try data.setSteeringAgent(agent, .{
+            .agent_radius = 8,
+            .waypoint_tolerance = 4,
+            .avoidance_radius = 48,
+            .avoidance_weight = 1.5,
+            .max_neighbor_samples = 8,
+            .stuck_step_threshold = 3,
+            .replan_cooldown_steps = 4,
+            .unavailable_backoff_steps = 12,
+        });
+    }
+    try markAllAlwaysActive(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 25,
+        .height = 15,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 16,
+        .structural_headroom = 16,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 16, 16, 16, 16, 16 + 16);
+    try frame.reservePathRequests(1, 16);
+    try pipeline.reserve(&frame, 16);
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    });
+    try std.testing.expectEqual(@as(usize, crowd), frame.navigation_intents.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, crowd), stats.path_goals.blocked);
+    try std.testing.expectEqual(@as(usize, 1), stats.path_goals.distinct);
+    try std.testing.expectEqual(@as(usize, 1), stats.path_goals.projections);
+    try std.testing.expectEqual(@as(usize, crowd), stats.steering.path_unavailable_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.steering.path_request_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.pathfinding.goal_fallbacks + stats.pathfinding.accepted_requests);
 }
