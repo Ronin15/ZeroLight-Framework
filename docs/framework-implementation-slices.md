@@ -82,19 +82,22 @@ files it links. Do not load the whole roadmap.
    **Goal**, **Current foundation**, and **Architecture notes**, plus
    architecture.md, the header's track file, and any doc the slice links; no
    other slice files unless linked.
-3. **Design pass, right before implementation.** `zig-design-specialist`
-   works out how to build the slice. The design goes to the implementer, not
-   into the slice.
+3. **Design plan right before implementation.** `zig-design-specialist`
+   writes the plan for the slice, or for each landing of a multi-commit slice,
+   against the live code (`CLAUDE.md` § Agent Pipeline). The plan goes to the
+   implementer, not into the slice.
 4. **Implement only that slice's scope** in the owning `src/` modules.
 5. **Review before commit** (`CLAUDE.md` § Agent Pipeline); fixes fold into
    the commit.
-6. **Check off Checklist items** as each lands with its tests. Items marked
-   "(added by Slice N)" are part of this slice's scope.
-7. **Pass every Acceptance check.**
-8. **Update durable docs** (`architecture.md`, rendering/sim docs) when
-   contracts change, and Tables T1–T6 when a number moves.
-9. **Set Status**, run `zig build verify`, and when complete archive the file
-   (Ground Rules). Follow-ups go into a slice Checklist or a new slice file.
+6. **Pass every Acceptance check.** Items marked "(added by Slice N)" are
+   part of this slice's scope.
+7. **Docs commit, once the slice's programming is done:** check off Checklist
+   items, update durable docs (`architecture.md`, rendering/sim docs) and
+   Tables T1–T6 from the landings' commit notes (`CLAUDE.md` § Agent
+   Pipeline).
+8. **Set Status**, run `zig build verify` before the slice's final commit, and
+   when complete archive the file (Ground Rules). Follow-ups go into a slice
+   Checklist or a new slice file.
 
 ### Standard slice section shape
 
