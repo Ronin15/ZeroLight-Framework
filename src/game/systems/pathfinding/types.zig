@@ -833,72 +833,6 @@ pub const PendingRequest = struct {
     tier: u8 = 0,
 };
 
-/// Deferred requests in FIFO order over a fixed slot buffer: logical index 0 is the
-/// oldest. Dropping a front window and appending at the tail cost what they touch,
-/// never the queue length. Main thread mutates; solve workers only read through `at`.
-pub const PendingRing = struct {
-    slots: std.ArrayList(PendingRequest) = .empty,
-    head: usize = 0,
-    len: usize = 0,
-
-    pub fn deinit(self: *PendingRing, allocator: std.mem.Allocator) void {
-        self.slots.deinit(allocator);
-        self.* = undefined;
-    }
-
-    /// Resizes to `slot_count` slots and empties the ring. An OOM leaves the storage
-    /// and contents as they were.
-    pub fn reserve(self: *PendingRing, allocator: std.mem.Allocator, slot_count: usize) !void {
-        try resizeArrayList(PendingRequest, &self.slots, allocator, slot_count);
-        self.slots.items.len = slot_count;
-        self.clear();
-    }
-
-    pub fn slotCount(self: *const PendingRing) usize {
-        return self.slots.items.len;
-    }
-
-    pub fn clear(self: *PendingRing) void {
-        self.head = 0;
-        self.len = 0;
-    }
-
-    fn physicalIndex(self: *const PendingRing, logical: usize) usize {
-        const slot_count = self.slots.items.len;
-        std.debug.assert(logical < slot_count);
-        const index = self.head + logical;
-        return if (index >= slot_count) index - slot_count else index;
-    }
-
-    pub fn at(self: *const PendingRing, logical: usize) PendingRequest {
-        std.debug.assert(logical < self.len);
-        return self.slots.items[self.physicalIndex(logical)];
-    }
-
-    pub fn ptr(self: *PendingRing, logical: usize) *PendingRequest {
-        std.debug.assert(logical < self.len);
-        return &self.slots.items[self.physicalIndex(logical)];
-    }
-
-    /// Appends at the tail. The caller gates on its logical pending limit, which every
-    /// reserve keeps at or below the slot count.
-    pub fn push(self: *PendingRing, request: PendingRequest) void {
-        std.debug.assert(self.len < self.slots.items.len);
-        self.slots.items[self.physicalIndex(self.len)] = request;
-        self.len += 1;
-    }
-
-    /// Removes the first `count` entries.
-    pub fn dropFront(self: *PendingRing, count: usize) void {
-        std.debug.assert(count <= self.len);
-        if (count == 0) return;
-        const slot_count = self.slots.items.len;
-        const index = self.head + count;
-        self.head = if (index >= slot_count) index - slot_count else index;
-        self.len -= count;
-    }
-};
-
 // One cell of a stitched obstacle-aware corridor path, tagged with its level. The
 // stitched path is grid-adjacent within each level's contiguous run; at an
 // inter-level link the level changes between consecutive cells (a discrete jump,
@@ -1109,6 +1043,8 @@ fn octileCost(dx: u64, dy: u64) u64 {
     return diagonal * diagonal_cost + straight * cardinal_cost;
 }
 
+// A* open-list heap (`popHeap`, `siftUp`, `siftDown`): std.PriorityQueue has no push into
+// reserved capacity, which the allocation-free worker search needs.
 pub fn popHeap(heap: *std.ArrayList(OpenNode)) OpenNode {
     std.debug.assert(heap.items.len != 0); // empty pop would underflow `last` below
     const result = heap.items[0];
@@ -1202,18 +1138,12 @@ pub fn siftDown(heap: []OpenNode, start_index: usize) void {
     }
 }
 
-pub fn keysEqual(a: PathQueryKey, b: PathQueryKey) bool {
-    return a.nav_version == b.nav_version and
-        a.agent_class == b.agent_class and
-        a.goal_level == b.goal_level and
-        a.goal.x == b.goal.x and
-        a.goal.y == b.goal.y;
-}
-
 // FNV-1a 64-bit offset basis and prime of `hashPathKey`.
 const fnv_offset_basis: u64 = 14695981039346656037;
 const fnv_prime: u64 = 1099511628211;
 
+// Word-wise FNV-1a, not std.hash: Wyhash through autoHash benches about 1.5x slower on the
+// cache probe (pathfinding-cache-open).
 pub fn hashPathKey(key: PathQueryKey) usize {
     var h: u64 = fnv_offset_basis;
     inline for (.{ key.nav_version, @backingInt(key.agent_class), @as(u32, key.goal_level), @as(u32, @bitCast(key.goal.x)), @as(u32, @bitCast(key.goal.y)) }) |part| {
@@ -1250,14 +1180,6 @@ pub fn emptyKey(nav_version: u32) PathQueryKey {
         .agent_class = .default,
         .goal = .{ .x = 0, .y = 0 },
     };
-}
-
-// Grows `list` to hold exactly `len` items (reusing capacity) and sets the active
-// length, leaving the new tail uninitialized — callers fill or @memset it. Collapses
-// the repeated ensureTotalCapacity + items.len pair.
-pub fn setLen(list: anytype, allocator: std.mem.Allocator, len: usize) !void {
-    try list.ensureTotalCapacity(allocator, len);
-    list.items.len = len;
 }
 
 // Whether a list should shrink-and-free before regrowing to `target_capacity`, given its

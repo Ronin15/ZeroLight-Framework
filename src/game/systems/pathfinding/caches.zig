@@ -22,7 +22,6 @@ const ListResize = types.ListResize;
 const OwnerOp = types.OwnerOp;
 const no_owner = types.no_owner;
 const hashPathKey = types.hashPathKey;
-const keysEqual = types.keysEqual;
 const emptyKey = types.emptyKey;
 
 // Forward window probed around a per-agent waypoint hint before falling back to a full
@@ -42,6 +41,8 @@ const waypoint_hint_window: usize = 8;
 // The physical slot array is 2x the LOGICAL capacity (inserts stop at logical), so
 // occupancy never exceeds 50% and every probe chain — hit or miss — terminates at an
 // empty slot instead of degenerating to an O(capacity) scan when the table fills.
+// Not std.HashMapUnmanaged: its tombstone deletes lengthen chains under fixed-capacity
+// churn until a rehash, where back-shift deletion keeps them contiguous.
 fn ProbeTable(comptime Payload: type) type {
     return struct {
         const Self = @This();
@@ -95,7 +96,7 @@ fn ProbeTable(comptime Payload: type) type {
             for (0..capacity) |probe| {
                 const index = (start + probe) % capacity;
                 const slot = self.slots.items[index];
-                if (slot.occupied and keysEqual(slot.key, key)) return index;
+                if (slot.occupied and std.meta.eql(slot.key, key)) return index;
                 // Chains are contiguous (back-shift deletion) and the table is never
                 // more than half full, so the first empty slot ends this key's chain.
                 if (!slot.occupied) return null;
@@ -117,7 +118,7 @@ fn ProbeTable(comptime Payload: type) type {
             for (0..capacity) |probe| {
                 const index = (start + probe) % capacity;
                 const slot = &self.slots.items[index];
-                if (slot.occupied and keysEqual(slot.key, key)) {
+                if (slot.occupied and std.meta.eql(slot.key, key)) {
                     slot.payload = payload;
                     return true;
                 }
@@ -148,7 +149,7 @@ fn ProbeTable(comptime Payload: type) type {
                 const index = (start + probe) % capacity;
                 const slot = self.slots.items[index];
                 if (!slot.occupied) return; // chain end; key not present
-                if (keysEqual(slot.key, key)) {
+                if (std.meta.eql(slot.key, key)) {
                     hole = index;
                     break;
                 }
@@ -270,6 +271,9 @@ fn pageCount(blocks: usize, shift: u6) usize {
     return (blocks + per_page - 1) / per_page;
 }
 
+// Not std.HashMapUnmanaged: back-shift deletion keeps chains contiguous under churn (std
+// tombstones lengthen them), and eviction needs round-robin victims by slot position and
+// stable owner ids.
 /// The slot table and entry records of a goal-keyed cache. An entry's record index is its
 /// owner id in the path registry: it stays below the logical capacity, so registry owner
 /// heads follow the capacity. Every removal logs a retire and every move a rename into the
@@ -336,7 +340,7 @@ fn CacheCore(comptime Extra: type) type {
             for (0..capacity) |probe| {
                 const index = (start + probe) % capacity;
                 const slot = self.slots.items[index];
-                if (slot.occupied and keysEqual(slot.key, key)) return index;
+                if (slot.occupied and std.meta.eql(slot.key, key)) return index;
                 // Chains are contiguous (back-shift deletion) and the table is at most half
                 // full, so the first empty slot ends this key's chain.
                 if (!slot.occupied) return null;
@@ -1398,15 +1402,22 @@ fn testClaimAndCopy(cache: *ResultCache, key: PathQueryKey, path: []const u32, s
 }
 
 fn putTestEntry(cache: *ResultCache, index: usize, step: u32, stats: *PathfindingStats) void {
+    cache.core.finishOwnerLog(std.testing.allocator);
+    cache.core.beginPublish();
+    claimTestEntry(cache, index, step, stats);
+}
+
+// `putTestEntry`'s claim and copy inside the caller's open publish.
+fn claimTestEntry(cache: *ResultCache, index: usize, step: u32, stats: *PathfindingStats) void {
     var plain: [10]u32 = undefined;
     var stitched: [5]StitchedCell = undefined;
     for (&plain, 0..) |*cell, offset| cell.* = testEntryCell(index, offset);
     for (&stitched, 0..) |*cell, offset| cell.* = .{ .level = @intCast(index % 3), .cell = testEntryCell(index, offset) };
     switch (index % 4) {
-        0 => testPut(cache, testGoalKey(index), plain[0..3], &.{}, 0, step, stats),
-        1 => testPut(cache, testGoalKey(index), plain[0..10], &.{}, 0, step, stats),
-        2 => testPut(cache, testGoalKey(index), &.{}, stitched[0..2], 0, step, stats),
-        else => testPut(cache, testGoalKey(index), &.{}, stitched[0..5], 0, step, stats),
+        0 => testClaimAndCopy(cache, testGoalKey(index), plain[0..3], &.{}, 0, step, stats),
+        1 => testClaimAndCopy(cache, testGoalKey(index), plain[0..10], &.{}, 0, step, stats),
+        2 => testClaimAndCopy(cache, testGoalKey(index), &.{}, stitched[0..2], 0, step, stats),
+        else => testClaimAndCopy(cache, testGoalKey(index), &.{}, stitched[0..5], 0, step, stats),
     }
 }
 
@@ -1492,13 +1503,18 @@ test "pathfinding result cache long pool never passes the page of the entry limi
     try std.testing.expectEqual(@as(usize, 4), cache.long_block_count);
     try std.testing.expectEqual(@as(usize, 0), cache.free_long_blocks.items.len);
 
-    // Three more long results: the pool stays at the limit; each claim evicts a long victim
-    // before it takes a block, so every claim finds one.
+    // Three more long results in one publish, as one reserve serves: the pool stays at the
+    // limit; each claim evicts a long victim before it takes a block, so every claim finds
+    // one, and no claim of this publish is another's victim.
     try std.testing.expectEqual(@as(usize, 0), try cache.reserveLongBlocks(std.testing.allocator, 3));
-    for ([_]usize{ 9, 11, 13 }) |index| putTestEntry(&cache, index, 1, &stats);
+    cache.core.finishOwnerLog(std.testing.allocator);
+    cache.core.beginPublish();
+    for ([_]usize{ 9, 11, 13 }) |index| claimTestEntry(&cache, index, 1, &stats);
     try std.testing.expectEqual(@as(usize, 3), stats.cache_evictions);
     for ([_]usize{ 9, 11, 13 }) |index| try expectTestEntry(&cache, index);
+    try std.testing.expectEqual(@as(usize, 4), cache.count());
     try std.testing.expectEqual(@as(usize, 4), cache.long_block_count);
+    try std.testing.expectEqual(@as(usize, 0), cache.free_long_blocks.items.len);
     try expectResultCacheConsistent(&cache);
 }
 
@@ -1741,7 +1757,7 @@ test "pathfinding result cache full-cache put stays reachable when the evicted v
     testPut(&cache, new_key, &.{3}, &.{}, 0, 0, &stats);
     var holders: usize = 0;
     for (cache.core.slots.items) |slot| {
-        if (slot.occupied and keysEqual(slot.key, new_key)) holders += 1;
+        if (slot.occupied and std.meta.eql(slot.key, new_key)) holders += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), holders);
     try std.testing.expectEqual(@as(usize, 4), cache.count());

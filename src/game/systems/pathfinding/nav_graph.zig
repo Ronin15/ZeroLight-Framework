@@ -48,7 +48,6 @@ const NavMark = types.NavMark;
 const NavSpan = types.NavSpan;
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
-const setLen = types.setLen;
 const Connectivity = @import("connectivity.zig").Connectivity;
 const ConnectivityCounters = @import("connectivity.zig").ConnectivityCounters;
 const ClosureCounters = @import("connectivity.zig").ClosureCounters;
@@ -118,21 +117,14 @@ pub const ChunkPortals = struct {
         for (self.border) |portal| {
             if (portal.local == local) return portal;
         }
-        if (findLocal(self.extra, local)) |index| return self.extra[index];
+        if (std.sort.binarySearch(NavPortal, self.extra, local, orderPortalLocal)) |index| return self.extra[index];
         return null;
     }
 
     /// The links leaving chunk-local cell `local`, in link order. O(log links).
     pub fn linksAt(self: ChunkPortals, local: u8) []const NavLink {
-        var lo: usize = 0;
-        var hi: usize = self.links.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.links[mid].local < local) lo = mid + 1 else hi = mid;
-        }
-        var end = lo;
-        while (end < self.links.len and self.links[end].local == local) end += 1;
-        return self.links[lo..end];
+        const start, const end = std.sort.equalRange(NavLink, self.links, local, orderLinkLocal);
+        return self.links[start..end];
     }
 
     pub fn portalCount(self: ChunkPortals) usize {
@@ -140,15 +132,12 @@ pub const ChunkPortals = struct {
     }
 };
 
-fn findLocal(portals: []const NavPortal, local: u8) ?usize {
-    var lo: usize = 0;
-    var hi: usize = portals.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (portals[mid].local == local) return mid;
-        if (portals[mid].local < local) lo = mid + 1 else hi = mid;
-    }
-    return null;
+fn orderPortalLocal(local: u8, portal: NavPortal) std.math.Order {
+    return std.math.order(local, portal.local);
+}
+
+fn orderLinkLocal(local: u8, link: NavLink) std.math.Order {
+    return std.math.order(local, link.local);
 }
 
 fn portalLessThan(_: void, a: NavPortal, b: NavPortal) bool {
@@ -1585,14 +1574,14 @@ pub const NavGraph = struct {
         try fresh_grid.prepare(self.allocator, level_index, self.width, self.height, self.cell_size, self.chunk_tiles);
         var fresh_graph = NavLevelGraph{ .border_stride = borderPortalBound(self.chunk_tiles) };
         errdefer fresh_graph.deinit(self.allocator);
-        try setLen(&fresh_graph.record_dir, self.allocator, chunk_count);
+        try fresh_graph.record_dir.resize(self.allocator, chunk_count);
         @memset(fresh_graph.record_dir.items, no_record);
         stats.main.reserve_ns += section.lap();
 
         // Plan: every chunk of the level, in order.
         section = StageTimer.begin();
-        try setLen(&self.changed_keys, self.allocator, chunk_count);
-        try setLen(&self.patch_keys, self.allocator, chunk_count);
+        try self.changed_keys.resize(self.allocator, chunk_count);
+        try self.patch_keys.resize(self.allocator, chunk_count);
         // The marks batch's key lists share the build's one-level window high-water.
         try self.dirty_keys.ensureTotalCapacity(self.allocator, chunk_count);
         self.dirty_keys.clearRetainingCapacity();
@@ -1696,7 +1685,7 @@ pub const NavGraph = struct {
         };
         try self.planKeys(world, marks, new_links, planThreads(threads), stats);
         var section = StageTimer.begin();
-        try setLen(&self.changed_masks, self.allocator, self.changed_keys.items.len);
+        try self.changed_masks.resize(self.allocator, self.changed_keys.items.len);
         if (self.patch_keys.items.len != 0) {
             const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
             try self.planPatchInfo(prepared.world);
@@ -1872,8 +1861,8 @@ pub const NavGraph = struct {
         } else .{ .range_count = 1, .items_per_range = item_count, .selection = null };
 
         // Windows: each range's key bounds, starting on a cache line.
-        try setLen(&self.plan_windows, self.allocator, selection.range_count);
-        try setLen(&self.plan_tallies, self.allocator, selection.range_count);
+        try self.plan_windows.resize(self.allocator, selection.range_count);
+        try self.plan_tallies.resize(self.allocator, selection.range_count);
         try self.merge_heap.ensureTotalCapacity(self.allocator, selection.range_count);
         var totals: [plan_streams]usize = @splat(0);
         for (self.plan_windows.items, 0..) |*window, range_index| {
@@ -1888,7 +1877,7 @@ pub const NavGraph = struct {
         }
         var staging: [plan_streams][]u64 = undefined;
         for (&self.plan_staging, totals, &staging) |*list, total, *slice| {
-            try setLen(list, self.allocator, total);
+            try list.resize(self.allocator, total);
             slice.* = list.items;
         }
         @memset(self.plan_tallies.items, .{});
@@ -1987,7 +1976,7 @@ pub const NavGraph = struct {
     // (statics only add blocked cells), and one whose orthogonal neighbours are all BLOCKED
     // has no border run, so it needs a record only for an endpoint. O(keys + endpoints).
     fn planPatchInfo(self: *NavGraph, world: ?*const WorldSystem) !void {
-        try setLen(&self.patch_info, self.allocator, self.patch_keys.items.len);
+        try self.patch_info.resize(self.allocator, self.patch_keys.items.len);
         const cx_count = self.chunksX();
         const cy_count = self.chunksY();
         for (self.patch_keys.items, self.patch_info.items) |key, *info| {
@@ -2068,8 +2057,8 @@ pub const NavGraph = struct {
     // to cover the claims (worst case: every such key ends mixed). O(keys).
     fn reserveCellBlocks(self: *NavGraph, levels: BatchLevels, world: ?*const WorldSystem, colliders: ColliderView) !void {
         const keys = self.changed_keys.items;
-        try setLen(&self.remask_slots, self.allocator, keys.len);
-        try setLen(&self.remask_deltas, self.allocator, keys.len);
+        try self.remask_slots.resize(self.allocator, keys.len);
+        try self.remask_deltas.resize(self.allocator, keys.len);
         var start: usize = 0;
         while (start < keys.len) {
             const level = keyLevel(keys[start]);
@@ -2237,7 +2226,7 @@ pub const NavGraph = struct {
                     const cell = @as(usize, endpoint.cell.y) * w + endpoint.cell.x;
                     if (level_grid.isBlockedIndex(cell)) continue;
                     const local = self.localOf(cell);
-                    if (findLocal(portals[0..count], local)) |existing| {
+                    if (std.sort.binarySearch(NavPortal, portals[0..count], local, orderPortalLocal)) |existing| {
                         portals[existing].flags.link = true;
                     } else if (findLocalLinear(extra.items, local) == null) {
                         // The reserve sized the slot's lists to the planned endpoint count.

@@ -77,7 +77,7 @@ const NavCellEdit = types.NavCellEdit;
 const NavMark = types.NavMark;
 const NavUpdateStats = types.NavUpdateStats;
 const PendingRequest = types.PendingRequest;
-const PendingRing = types.PendingRing;
+const shouldShrinkCapacity = types.shouldShrinkCapacity;
 const IntakeRecord = types.IntakeRecord;
 const GroupKeyCount = types.GroupKeyCount;
 const IntakeTally = types.IntakeTally;
@@ -89,8 +89,6 @@ const PathSolveResult = types.PathSolveResult;
 const GroupRequestTally = types.GroupRequestTally;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
 const emptyKey = types.emptyKey;
-const keysEqual = types.keysEqual;
-const setLen = types.setLen;
 const resizeArrayList = types.resizeArrayList;
 const OwnerOp = types.OwnerOp;
 const no_owner = types.no_owner;
@@ -165,7 +163,9 @@ pub const PathfindingSystem = struct {
     capacity: PathfindingCapacity = .{},
     step_counter: u32 = 0,
     graph: NavGraph,
-    pending: PendingRing = .{},
+    // Deferred requests in FIFO order: index 0 is the oldest. Main thread mutates; solve
+    // workers only read through `at`.
+    pending: std.Deque(PendingRequest) = .empty,
     // `path_intake` staging: one record and one group-key slot per admitted request (each
     // range writes only its own window) and one padded tally per range. Reserved at the
     // capacity seam from max_frame_requests.
@@ -501,7 +501,7 @@ pub const PathfindingSystem = struct {
             self.capacity = fallback;
             self.effective_agent_capacity = fallback.max_pending_requests;
         }
-        try self.pending.reserve(self.allocator, capacity.max_pending_requests);
+        try reservePending(&self.pending, self.allocator, capacity.max_pending_requests);
         try resizeList(&self.intake_records, self.allocator, capacity.max_frame_requests);
         try resizeList(&self.intake_group_counts, self.allocator, capacity.max_frame_requests);
         try resizeList(&self.intake_tallies, self.allocator, maxRangeCount(capacity.max_frame_requests, intake_range_alignment_items));
@@ -680,11 +680,11 @@ pub const PathfindingSystem = struct {
         // `pending`/`group_requests` than that would silently drop their dedup registration
         // (a live entry that reads back `.missing` instead of `.pending`, inviting a
         // duplicate accept) while resize_dropped undercounts the real loss.
-        self.pending.clear();
+        clearPending(&self.pending);
         const keep_pending = @min(self.resize_pending_snapshot.items.len, self.capacity.max_pending_requests);
         self.pending_keys.clear();
         for (self.resize_pending_snapshot.items[0..keep_pending]) |pending_request| {
-            self.pending.push(pending_request);
+            self.pending.pushBackAssumeCapacity(pending_request);
             _ = self.pending_keys.insert(pending_request.key);
         }
         self.group_requests.clearRetainingCapacity();
@@ -1290,7 +1290,7 @@ pub const PathfindingSystem = struct {
 
     // Clears request state but keeps the result cache.
     fn clearRequestStateKeepingCompleted(self: *PathfindingSystem) void {
-        self.pending.clear();
+        clearPending(&self.pending);
         self.solve_results.clearRetainingCapacity();
         self.fallback_indices.clearRetainingCapacity();
         self.fallback_tier1_slot.clearRetainingCapacity();
@@ -1838,7 +1838,7 @@ pub const PathfindingSystem = struct {
                     stats.dropped_requests += 1;
                     continue;
                 }
-                self.pending.push(.{
+                self.pending.pushBackAssumeCapacity(.{
                     .entity = request.entity,
                     .key = key,
                     .start_level = request.start_level,
@@ -2028,7 +2028,7 @@ pub const PathfindingSystem = struct {
             return;
         }
         stats.duplicate_requests += record.repeats;
-        self.pending.push(.{
+        self.pending.pushBackAssumeCapacity(.{
             .entity = record.entity,
             .key = record.key,
             .start_level = record.start_level,
@@ -2278,7 +2278,7 @@ pub const PathfindingSystem = struct {
         var best_dist: i64 = std.math.maxInt(i64);
         for (self.group_fields.items, 0..) |field, index| {
             if (field.state == .empty) continue;
-            if (keysEqual(field.key, key)) continue;
+            if (std.meta.eql(field.key, key)) continue;
             if (field.key.agent_class != key.agent_class) continue;
             if (field.key.nav_version != key.nav_version) continue;
             if (field.key.goal_level != key.goal_level) continue;
@@ -2297,14 +2297,14 @@ pub const PathfindingSystem = struct {
 
     fn findGroupField(self: *const PathfindingSystem, key: PathQueryKey) ?*const GroupField {
         for (self.group_fields.items) |*field| {
-            if (field.state != .empty and keysEqual(field.key, key)) return field;
+            if (field.state != .empty and std.meta.eql(field.key, key)) return field;
         }
         return null;
     }
 
     fn findGroupFieldMut(self: *PathfindingSystem, key: PathQueryKey) ?*GroupField {
         for (self.group_fields.items) |*field| {
-            if (field.state != .empty and keysEqual(field.key, key)) return field;
+            if (field.state != .empty and std.meta.eql(field.key, key)) return field;
         }
         return null;
     }
@@ -2635,7 +2635,7 @@ pub const PathfindingSystem = struct {
             switch (result) {
                 .deferred => {
                     write_index -= 1;
-                    self.pending.ptr(write_index).* = self.pending.at(pending_index);
+                    self.pending.atPtr(write_index).* = self.pending.at(pending_index);
                 },
                 .budget_exhausted => |key| {
                     var request = self.pending.at(pending_index);
@@ -2670,16 +2670,43 @@ pub const PathfindingSystem = struct {
             }
         }
         std.debug.assert(ordinal == 0);
-        self.pending.dropFront(write_index);
+        dropPendingFront(&self.pending, write_index);
         // Aged spillers trail the untouched tail so the tail makes progress before they
         // retry; they were gathered back to front.
         var rotated = self.rotate_back_scratch.items.len;
         while (rotated > 0) {
             rotated -= 1;
-            self.pending.push(self.rotate_back_scratch.items[rotated]);
+            self.pending.pushBackAssumeCapacity(self.rotate_back_scratch.items[rotated]);
         }
     }
 };
+
+// Resizes `pending` to `slot_count` slots and empties it; an OOM leaves its storage and
+// contents as they were. Below half the slots it reallocates, else it keeps them.
+fn reservePending(pending: *std.Deque(PendingRequest), allocator: std.mem.Allocator, slot_count: usize) !void {
+    if (shouldShrinkCapacity(pending.buffer.len, slot_count)) {
+        const fresh: std.Deque(PendingRequest) = try .initCapacity(allocator, slot_count);
+        pending.deinit(allocator);
+        pending.* = fresh;
+        return;
+    }
+    try pending.ensureTotalCapacityPrecise(allocator, slot_count);
+    clearPending(pending);
+}
+
+// Empties `pending`, keeping its slots (std.Deque has no clear).
+fn clearPending(pending: *std.Deque(PendingRequest)) void {
+    pending.head = 0;
+    pending.len = 0;
+}
+
+// Removes the first `count` entries in O(1) (std.Deque drops only one at a time).
+fn dropPendingFront(pending: *std.Deque(PendingRequest), count: usize) void {
+    std.debug.assert(count <= pending.len);
+    if (count == 0) return;
+    pending.head = (pending.head + count) % pending.buffer.len;
+    pending.len -= count;
+}
 
 fn tileMark(level: u16, min_x: u32, min_y: u32, max_x: u32, max_y: u32) NavMark {
     return .{ .level = level, .kind = .tile_box, .min_x = min_x, .min_y = min_y, .max_x = max_x, .max_y = max_y };
@@ -2852,7 +2879,7 @@ const RecentKeys = struct {
 
     fn find(self: *const RecentKeys, key: PathQueryKey) ?usize {
         for (self.keys[0..self.len], self.entries[0..self.len]) |recent_key, entry| {
-            if (keysEqual(recent_key, key)) return entry;
+            if (std.meta.eql(recent_key, key)) return entry;
         }
         return null;
     }
@@ -5080,7 +5107,7 @@ test "pathfinding max_escalated_solves_per_step caps tier-1 admission to exactly
     try std.testing.expectEqual(@as(usize, 4), system.pending.len);
 
     // Promote every pending entry to tier 1 (as if each had already spilled once).
-    for (0..system.pending.len) |index| system.pending.ptr(index).tier = 1;
+    for (0..system.pending.len) |index| system.pending.atPtr(index).tier = 1;
 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
@@ -6280,7 +6307,7 @@ test "pathfinding capacity stays unchanged across a steady-state solve" {
     // Grow once to a steady 16-agent load.
     _ = try driveAgentCount(&system, &requesters, 16);
     const steady_cap = system.effective_agent_capacity;
-    const steady_pending = system.pending.slotCount();
+    const steady_pending = system.pending.buffer.len;
     const steady_cache = system.completed.core.slots.items.len;
     const steady_pool = system.worker_path_pool.items.len;
     // A constant agent count holds capacity (and every pool's backing) fixed across
@@ -6288,7 +6315,7 @@ test "pathfinding capacity stays unchanged across a steady-state solve" {
     for (0..30) |_| {
         _ = try driveAgentCount(&system, &requesters, 16);
         try std.testing.expectEqual(steady_cap, system.effective_agent_capacity);
-        try std.testing.expectEqual(steady_pending, system.pending.slotCount());
+        try std.testing.expectEqual(steady_pending, system.pending.buffer.len);
         try std.testing.expectEqual(steady_cache, system.completed.core.slots.items.len);
         try std.testing.expectEqual(steady_pool, system.worker_path_pool.items.len);
     }
@@ -6479,7 +6506,7 @@ test "pathfinding intake drop count is independent of world size" {
 /// committed logical limits.
 fn expectPoolsFitLogicalCaps(system: *const PathfindingSystem) !void {
     const cap = system.capacity;
-    try std.testing.expect(system.pending.slotCount() >= cap.max_pending_requests);
+    try std.testing.expect(system.pending.buffer.len >= cap.max_pending_requests);
     try std.testing.expect(system.intake_records.capacity >= cap.max_frame_requests);
     try std.testing.expect(system.intake_group_counts.capacity >= cap.max_frame_requests);
     try std.testing.expect(system.intake_tallies.capacity >= maxRangeCount(cap.max_frame_requests, intake_range_alignment_items));
@@ -7618,8 +7645,8 @@ test "solve results land at their fallback ordinal and publish in pending order"
     try std.testing.expectEqual(goals.len, system.pending.len);
     // Pending 0 and 1 are escalated: the one-per-step tier-1 cap admits 0 and defers 1,
     // so ordinals 0, 1, 2 hold pending 0, 2, 3.
-    system.pending.ptr(0).tier = 1;
-    system.pending.ptr(1).tier = 1;
+    system.pending.atPtr(0).tier = 1;
+    system.pending.atPtr(1).tier = 1;
     var keys: [goals.len]PathQueryKey = undefined;
     for (&keys, 0..) |*key, index| key.* = system.pending.at(index).key;
 
@@ -7647,6 +7674,30 @@ test "solve results land at their fallback ordinal and publish in pending order"
     try std.testing.expectEqualDeep(keys[1], system.pending.at(0).key);
 }
 
+test "pending reserve keeps its slots down to half, reallocates below it, and an out-of-memory shrink keeps slots and entries (FailingAllocator)" {
+    var pending: std.Deque(PendingRequest) = .empty;
+    defer pending.deinit(std.testing.allocator);
+    try reservePending(&pending, std.testing.allocator, 64);
+    try std.testing.expectEqual(@as(usize, 64), pending.buffer.len);
+    try reservePending(&pending, std.testing.allocator, 40);
+    try std.testing.expectEqual(@as(usize, 64), pending.buffer.len);
+    try reservePending(&pending, std.testing.allocator, 16);
+    try std.testing.expectEqual(@as(usize, 16), pending.buffer.len);
+
+    var requests: [3]PendingRequest = undefined;
+    for (&requests, 0..) |*request, index| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(index);
+        request.* = .{ .entity = try EntityId.init(@intCast(index), 1), .key = key, .start_level = 0, .start = .{ .x = @intCast(index), .y = 0 } };
+        pending.pushBackAssumeCapacity(request.*);
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, reservePending(&pending, failing.allocator(), 4));
+    try std.testing.expectEqual(@as(usize, 16), pending.buffer.len);
+    try std.testing.expectEqual(requests.len, pending.len);
+    for (requests, 0..) |request, index| try std.testing.expectEqualDeep(request, pending.at(index));
+}
+
 test "pending compaction keeps deferred, tail, and rotated order across a ring wrap" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -7654,18 +7705,18 @@ test "pending compaction keeps deferred, tail, and rotated order across a ring w
     defer system.deinit();
     try system.reserve(baselineCapacity());
     try system.rebuildStaticNavGrid(&data, 256, 256, 32);
-    try std.testing.expectEqual(@as(usize, 8), system.pending.slotCount());
+    try std.testing.expectEqual(@as(usize, 8), system.pending.buffer.len);
 
     // Seven entries starting at physical slot 6, so logical 2.. wrap to slot 0.
-    system.pending.clear();
+    clearPending(&system.pending);
     system.pending.head = 6;
     var keys: [7]PathQueryKey = undefined;
     for (&keys, 0..) |*key, index| {
         key.* = system.graph.keyForWorld(0, cellWorld(@intCast(index), 4), .default).?;
-        system.pending.push(.{ .entity = try data.createEntity(), .key = key.*, .start_level = 0, .start = .{ .x = 0, .y = 0 } });
+        system.pending.pushBackAssumeCapacity(.{ .entity = try data.createEntity(), .key = key.*, .start_level = 0, .start = .{ .x = 0, .y = 0 } });
         _ = system.pending_keys.insert(key.*);
     }
-    system.pending.ptr(3).tier = 1;
+    system.pending.atPtr(3).tier = 1;
     var entities: [7]EntityId = undefined;
     for (&entities, 0..) |*entity, index| entity.* = system.pending.at(index).entity;
 
@@ -8084,7 +8135,7 @@ fn queueWithTiers(system: *PathfindingSystem, requesters: []const EntityId, star
     for (requesters[0..goals.len], goals) |requester, goal| try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
     _ = try system.updateSerial(&stream, 8, .{ .max_fallback_requests_per_step = 0 });
     try std.testing.expectEqual(goals.len, system.pending.len);
-    for (tiers, 0..) |tier, index| system.pending.ptr(index).tier = tier;
+    for (tiers, 0..) |tier, index| system.pending.atPtr(index).tier = tier;
 }
 
 // Goals east of `buildCorridorWorld`'s wall, reached from `tileCenter(1, 1)` by abstract solves.
@@ -8677,7 +8728,7 @@ fn expectSameCache(a: *const PathfindingSystem, b: *const PathfindingSystem) !vo
     for (a.completed.core.records.items, b.completed.core.records.items, 0..) |record_a, record_b, owner| {
         try std.testing.expectEqual(record_a.live, record_b.live);
         if (!record_a.live) continue;
-        try std.testing.expect(keysEqual(a.completed.core.keyOf(@intCast(owner)), b.completed.core.keyOf(@intCast(owner))));
+        try std.testing.expect(std.meta.eql(a.completed.core.keyOf(@intCast(owner)), b.completed.core.keyOf(@intCast(owner))));
         try std.testing.expectEqual(record_a.stamp, record_b.stamp);
         try std.testing.expectEqualDeep(record_a.extra, record_b.extra);
         const words = types.storedPathWords(record_a.extra.path_len, record_a.extra.stitched_len);
@@ -10020,8 +10071,8 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
 
 // Solves `request` alone at fallback ordinal 0 on the first participant's scratch.
 fn solveRequest(system: *PathfindingSystem, request: PendingRequest) PathSolveResult {
-    system.pending.clear();
-    system.pending.push(request);
+    clearPending(&system.pending);
+    system.pending.pushBackAssumeCapacity(request);
     var stats = PathfindingStats{};
     system.prepareSolvePhase(1, 1, &stats);
     system.resetSolvedPaths();

@@ -22,7 +22,6 @@ const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
 const no_component = types.no_component;
 const GridCell = types.GridCell;
 const NavSpan = types.NavSpan;
-const setLen = types.setLen;
 const neighbor_dirs = types.neighbor_dirs;
 const rect_edge_epsilon = types.rect_edge_epsilon;
 
@@ -171,7 +170,7 @@ pub const NavGrid = struct {
         self.chunk_tiles = chunk_tiles;
         self.chunk_shift = @intCast(@ctz(chunk_tiles));
         self.chunks_x = self.chunkGeometry().chunksX();
-        try setLen(&self.dir, allocator, self.chunkGeometry().chunkCount());
+        try self.dir.resize(allocator, self.chunkGeometry().chunkCount());
         @memset(self.dir.items, open_entry);
         self.blocks.clearRetainingCapacity();
         self.block_free.clearRetainingCapacity();

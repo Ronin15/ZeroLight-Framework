@@ -43,7 +43,6 @@ const keyChunk = @import("nav_graph.zig").keyChunk;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
-const setLen = types.setLen;
 const accumulateBatch = @import("nav_graph.zig").accumulateBatch;
 const simd = @import("../../../core/simd.zig");
 
@@ -348,6 +347,8 @@ pub const default_flood_window: usize = 16384;
 /// participant's search table.
 pub const default_flood_budget_cap: u32 = 512;
 
+// Not std.HashMapUnmanaged: its clear costs the high-water capacity per batch, where the
+// generation bump costs nothing.
 /// Open-addressed u64 -> u32 map, cleared by a generation bump. Its slot count is a power of
 /// two at least twice its logical limit, so probes stay short and an insert always finds
 /// room. Const lookups are safe on workers while nothing writes.
@@ -1710,9 +1711,9 @@ pub const Connectivity = struct {
         var section = StageTimer.begin();
         const new_link_count = new_links.len;
         // Flags and seed windows: changed keys are a sorted subset of the sorted patch keys.
-        try setLen(&self.patch_changed, allocator, patch_keys.len);
-        try setLen(&self.seed_starts, allocator, changed_keys.len + 1);
-        try setLen(&self.seed_counts, allocator, changed_keys.len);
+        try self.patch_changed.resize(allocator, patch_keys.len);
+        try self.seed_starts.resize(allocator, changed_keys.len + 1);
+        try self.seed_counts.resize(allocator, changed_keys.len);
         var changed_index: usize = 0;
         var seed_total: usize = 0;
         for (patch_keys, patch_info, self.patch_changed.items) |key, info, *changed| {
@@ -1724,15 +1725,15 @@ pub const Connectivity = struct {
         }
         std.debug.assert(changed_index == changed_keys.len);
         self.seed_starts.items[changed_keys.len] = seed_total;
-        try setLen(&self.seed_edges, allocator, seed_total);
+        try self.seed_edges.resize(allocator, seed_total);
 
         // Gather windows: per patch key its old nodes and new labels as rows and one edge per
         // border flag and link endpoint; per new link one edge.
         const item_count = patch_keys.len + new_link_count;
-        try setLen(&self.row_starts, allocator, item_count + 1);
-        try setLen(&self.edge_starts, allocator, item_count + 1);
-        try setLen(&self.row_counts, allocator, item_count);
-        try setLen(&self.edge_counts, allocator, item_count);
+        try self.row_starts.resize(allocator, item_count + 1);
+        try self.edge_starts.resize(allocator, item_count + 1);
+        try self.row_counts.resize(allocator, item_count);
+        try self.edge_counts.resize(allocator, item_count);
         var row_total: usize = 0;
         var edge_total: usize = 0;
         for (0..item_count) |item| {
@@ -1749,8 +1750,8 @@ pub const Connectivity = struct {
         }
         self.row_starts.items[item_count] = row_total;
         self.edge_starts.items[item_count] = edge_total;
-        try setLen(&self.gather_rows, allocator, row_total);
-        try setLen(&self.gather_edges, allocator, edge_total);
+        try self.gather_rows.resize(allocator, row_total);
+        try self.gather_edges.resize(allocator, edge_total);
 
         // Node rows: each patch key may gain up to its node bound, per level.
         var start: usize = 0;
@@ -1892,12 +1893,12 @@ pub const Connectivity = struct {
         var section = StageTimer.begin();
         // The staging shrinks back when the build ends, and on an error too.
         errdefer self.shrinkStaging(allocator, self.marks_staging_high.max(self.oneChunkStaging(level_graph.border_stride)));
-        try setLen(&self.row_starts, allocator, keys.len + 1);
-        try setLen(&self.edge_starts, allocator, keys.len + 1);
-        try setLen(&self.row_counts, allocator, keys.len);
-        try setLen(&self.edge_counts, allocator, keys.len);
-        try setLen(&self.seed_starts, allocator, if (seeding) keys.len + 1 else 1);
-        try setLen(&self.seed_counts, allocator, if (seeding) keys.len else 0);
+        try self.row_starts.resize(allocator, keys.len + 1);
+        try self.edge_starts.resize(allocator, keys.len + 1);
+        try self.row_counts.resize(allocator, keys.len);
+        try self.edge_counts.resize(allocator, keys.len);
+        try self.seed_starts.resize(allocator, if (seeding) keys.len + 1 else 1);
+        try self.seed_counts.resize(allocator, if (seeding) keys.len else 0);
         var labels: usize = 0;
         var edge_total: usize = 0;
         var endpoint_total: usize = 0;
@@ -1921,11 +1922,11 @@ pub const Connectivity = struct {
         self.row_starts.items[keys.len] = labels;
         self.edge_starts.items[keys.len] = edge_total;
         self.seed_starts.items[self.seed_starts.items.len - 1] = seed_total;
-        try setLen(&self.gather_rows, allocator, labels);
-        try setLen(&self.gather_edges, allocator, edge_total);
-        try setLen(&self.seed_edges, allocator, seed_total);
+        try self.gather_rows.resize(allocator, labels);
+        try self.gather_edges.resize(allocator, edge_total);
+        try self.seed_edges.resize(allocator, seed_total);
         // No fresh row is old, so no key reads as remasked.
-        try setLen(&self.patch_changed, allocator, keys.len);
+        try self.patch_changed.resize(allocator, keys.len);
         @memset(self.patch_changed.items, false);
         try level_graph.ensureNodesExact(allocator, labels);
         // A mirror's far end is an added row of the level; only a link's far end, a seed's far
@@ -2921,12 +2922,12 @@ pub const Connectivity = struct {
         const closure = &self.closure;
         self.advanceStamp();
         const scan = closure.oneway.len != 0;
-        try setLen(&closure.ow_starts, allocator, keys.len + 1);
-        try setLen(&closure.ow_counts, allocator, keys.len);
+        try closure.ow_starts.resize(allocator, keys.len + 1);
+        try closure.ow_counts.resize(allocator, keys.len);
         if (scan) {
-            try setLen(&closure.cand_starts, allocator, keys.len + 1);
-            try setLen(&closure.cand_counts, allocator, keys.len);
-            try setLen(&closure.cand_tallies, allocator, keys.len);
+            try closure.cand_starts.resize(allocator, keys.len + 1);
+            try closure.cand_counts.resize(allocator, keys.len);
+            try closure.cand_tallies.resize(allocator, keys.len);
         }
         var ow_total: usize = 0;
         var cand_total: usize = 0;
@@ -2941,7 +2942,7 @@ pub const Connectivity = struct {
             cand_total += old_labels + 2 * endpoints;
         }
         closure.ow_starts.items[keys.len] = ow_total;
-        try setLen(&closure.ow_entries, allocator, ow_total);
+        try closure.ow_entries.resize(allocator, ow_total);
 
         // Every new link is loose, and each end of a new one-way link may pop a terminal.
         var bounds = ClosureBounds{ .loose = new_oneway, .live_prepared = closure.live_words };
@@ -2952,7 +2953,7 @@ pub const Connectivity = struct {
         var distinct: usize = 0;
         if (scan) {
             closure.cand_starts.items[keys.len] = cand_total;
-            try setLen(&closure.cand_hcomps, allocator, cand_total);
+            try closure.cand_hcomps.resize(allocator, cand_total);
             var job = CandidateJob{
                 .levels = levels,
                 .world = world,
@@ -3067,7 +3068,7 @@ pub const Connectivity = struct {
             closure.s_words.items.len = bounds.s_words;
             @memset(closure.s_words.items[s_before..], 0);
         }
-        try setLen(&closure.s_list, allocator, bounds.k_cap_sum);
+        try closure.s_list.resize(allocator, bounds.k_cap_sum);
         try closure.loose.ensureTotalCapacity(allocator, bounds.loose);
         try closure.resolve_items.ensureTotalCapacity(allocator, bounds.e_t);
         try closure.resolve_out.ensureTotalCapacity(allocator, bounds.e_t);
@@ -4701,17 +4702,17 @@ fn compactJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *CompactJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end and range.end * span_words <= job.dst.len);
+    // The first block starts at line 0, so every line has a block at or before it.
+    std.debug.assert(range.start == range.end or job.blocks[0].line_start == 0);
     for (range.start..range.end) |line| {
-        var low: usize = 0;
-        var high: usize = job.blocks.len;
-        while (high - low > 1) {
-            const mid = (low + high) / 2;
-            if (job.blocks[mid].line_start <= line) low = mid else high = mid;
-        }
-        const block = job.blocks[low];
+        const block = job.blocks[std.sort.upperBound(CompactBlock, job.blocks, line, orderLineStart) - 1];
         const offset = (line - block.line_start) * span_words;
         @memcpy(job.dst[block.dst + offset ..][0..span_words], job.src[block.src + offset ..][0..span_words]);
     }
+}
+
+fn orderLineStart(line: usize, block: CompactBlock) std.math.Order {
+    return std.math.order(line, block.line_start);
 }
 
 // The resolve: each item's link resolved on the final graph. Reads only; writes its outputs.
