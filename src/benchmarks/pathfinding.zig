@@ -413,13 +413,20 @@ pub const connectivity_split_group = suite.BenchmarkGroup{
 // `terminals - 64` rooms once, untimed (its block narrows), then toggles its last room.
 // Variant 5 is a fan: every room joined by a one-way teleport to a hub room, the hub to the
 // last room, which toggles, so one round recomputes every source's row (rows narrower than a
-// cache line below 512 terminals). Variants 1 to 5 hold one chain or fan. The toggled end's 8 rooms sit in one
-// fixed chunk whose orthogonal neighbours hold no other chain room, so every config's toggle
-// patches the same chunks. One timed sample blocks the cell and runs the nav reaction, then
-// reopens it and runs the reaction again; the tile writes are untimed. `outputs` is the
-// one-way links and `candidates` the rooms. Passes when variants 0, 3, and 4 are flat (4 in
-// its peak terminals), variant 2 grows at most linearly in terminals, and variants 1 and 5 at
-// most as terminals² / 32. `--details` as for `pathfinding-connectivity-split`.
+// cache line below 512 terminals). Variants 1 to 5 hold one chain or fan. Variant 7 adds to
+// variant 0's chains a ballast chain on level 1 whose block holds over twice the chains' live
+// words; before every sample, untimed and with the nav tuners restored after, the ballast
+// reopens and then every ballast room closes (its block retires), and the nav's bytes are
+// checked. Its timed block reaction must compact the closure arena once and its timed reopen
+// never. The toggled end's 8 rooms sit in one fixed chunk whose orthogonal neighbours hold no
+// other chain room, so every config's toggle patches the same chunks. One timed sample blocks
+// the cell and runs the nav reaction, then reopens it and runs the reaction again; the tile
+// writes are untimed. `outputs` is the one-way links and `candidates` the rooms. Passes when
+// variants 0, 3, and 4 are flat (4 in its peak terminals), variant 2 grows at most linearly
+// in terminals, and variants 1 and 5 at most as terminals² / 32. Variant 7 measures the
+// compacting block reaction against systems; its target is flat in systems. `--details` as
+// for `pathfinding-connectivity-split`, plus variant 7's ballast retire and the split of its
+// timed block reaction.
 pub const connectivity_oneway_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-oneway",
     .defaultItemCounts = connectivityOnewayItemCounts,
@@ -1965,6 +1972,9 @@ const connectivity_oneway_item_counts = [_]usize{
     onewayItemCode(.dense, oneway_dense_terminals, 2),
     onewayItemCode(.dense, oneway_dense_terminals, 8),
     onewayItemCode(.dense, oneway_dense_terminals, 32),
+    onewayItemCode(.ballast, 8, 64),
+    onewayItemCode(.ballast, 8, 512),
+    onewayItemCode(.ballast, 8, 2048),
 };
 
 fn connectivityOnewayItemCounts(_: suite.Profile) []const usize {
@@ -2694,7 +2704,12 @@ const EvictFixture = struct {
     // of the events and the post-commit nav reaction; returns the reaction's time and stats.
     // `changed` holds `cells.len` entries.
     fn changeAndReact(self: *EvictFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
-        const layer = OpenWorld.floor(0);
+        return self.changeLevelAndReact(io, 0, cells, tile, thread_system);
+    }
+
+    // `changeAndReact` on `level`.
+    fn changeLevelAndReact(self: *EvictFixture, io: std.Io, level: u16, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
+        const layer = OpenWorld.floor(level);
         self.changed.clearRetainingCapacity();
         try self.system.reserveTerrainNavRecord(cells.len);
         self.open.world.beginDenseCellWriteReserve();
@@ -2937,6 +2952,34 @@ fn setNavReactionTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) v
         system.evict_flush_tuner = suite.adaptiveTunerForCase(case, 1).?;
     }
 }
+
+// The tuners `setNavReactionTuners` sets, by value: an untimed reaction restores them after
+// it runs, so it never trains the timed reactions' stages.
+const NavReactionTuners = struct {
+    nav_tuners: @FieldType(PathfindingSystem, "nav_tuners"),
+    nav_mark_tuner: @FieldType(PathfindingSystem, "nav_mark_tuner"),
+    nav_evict_count_tuner: @FieldType(PathfindingSystem, "nav_evict_count_tuner"),
+    nav_evict_tuner: @FieldType(PathfindingSystem, "nav_evict_tuner"),
+    evict_flush_tuner: @FieldType(PathfindingSystem, "evict_flush_tuner"),
+
+    fn capture(system: *const PathfindingSystem) NavReactionTuners {
+        return .{
+            .nav_tuners = system.nav_tuners,
+            .nav_mark_tuner = system.nav_mark_tuner,
+            .nav_evict_count_tuner = system.nav_evict_count_tuner,
+            .nav_evict_tuner = system.nav_evict_tuner,
+            .evict_flush_tuner = system.evict_flush_tuner,
+        };
+    }
+
+    fn restore(self: *const NavReactionTuners, system: *PathfindingSystem) void {
+        system.nav_tuners = self.nav_tuners;
+        system.nav_mark_tuner = self.nav_mark_tuner;
+        system.nav_evict_count_tuner = self.nav_evict_count_tuner;
+        system.nav_evict_tuner = self.nav_evict_tuner;
+        system.evict_flush_tuner = self.evict_flush_tuner;
+    }
+};
 
 const group_field_pack_agents: usize = 24;
 
@@ -4209,6 +4252,8 @@ const ToggleSample = struct {
 const ToggleChecks = struct {
     fixed_blocks: bool = true,
     reserve_ratio: bool = true,
+    // The change reaction compacts the closure arena exactly once and the revert never.
+    compacts: bool = false,
 };
 
 // Fails when a reaction's closure reserved past its fixed ratio: an arena tail over twice its
@@ -4233,6 +4278,7 @@ fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, threa
     const revert = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
     // A toggle and its revert never resize a one-way block.
     if (checks.fixed_blocks and (change.stats.closure_shrinks != 0 or revert.stats.closure_shrinks != 0)) return error.ConnectivityOnewayShrinkFlip;
+    if (checks.compacts and (change.stats.closure_compactions != 1 or revert.stats.closure_compactions != 0)) return error.ConnectivityOnewayBallastCompactions;
     if (checks.reserve_ratio) {
         try checkOnewayReserve(change.stats);
         try checkOnewayReserve(revert.stats);
@@ -4425,15 +4471,21 @@ const ToggleReport = struct {
 };
 
 // Times `options.iterations` toggles of `cells` after `options.warmup_iterations` untimed
-// ones. Items/s is the cells flipped per second.
-fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !suite.RunStats {
-    for (0..options.warmup_iterations) |_| _ = try runToggle(io, fixture, cells, thread_system, checks);
+// ones, each toggle after an untimed retire of `ballast` when there is one. Items/s is the
+// cells flipped per second.
+fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
+    for (0..options.warmup_iterations) |_| {
+        if (ballast) |chain| try chain.retire(io, fixture, thread_system);
+        _ = try runToggle(io, fixture, cells, thread_system, checks);
+    }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = ToggleReport{};
     for (0..options.iterations) |_| {
+        if (ballast) |chain| try chain.retire(io, fixture, thread_system);
         const sample = try runToggle(io, fixture, cells, thread_system, checks);
         accumulator.record(sample.elapsedNs(), sample.change.stats.remask_batch);
         report.add(sample);
+        if (ballast) |chain| chain.addSample(sample);
     }
     if (case.adaptive and thread_system != null) {
         const tuner = fixture.system.nav_tuners.getPtrConst(.conn_flood).report();
@@ -4698,7 +4750,7 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     setNavReactionTuners(&fixture.system, case);
     configureNavUpdateThreads(&fixture.system, case);
 
-    var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr, .{});
+    var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr, .{}, null);
     try suite.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     stats.output_count = gap.len;
     stats.candidate_pairs = config.structureChunks();
@@ -4722,6 +4774,8 @@ const OnewayVariant = enum(u8) {
     // toggle fills every such cell in one reaction (the systems part) and reopens them in
     // the next (one dense opening merges them).
     dense,
+    // The locality chains plus a ballast chain on level 1, retired before every sample.
+    ballast,
 };
 
 fn onewayItemCode(variant: OnewayVariant, terminals: usize, systems: usize) usize {
@@ -4839,10 +4893,10 @@ const OnewayConfig = struct {
         const variant_index = item_count / connectivity_variant_encoding;
         const terminals = item_count % connectivity_variant_encoding / oneway_terminals_encoding;
         const systems = item_count % oneway_terminals_encoding;
-        if (variant_index > @backingInt(OnewayVariant.dense)) return error.ConnectivityOnewayUnknownVariant;
+        if (variant_index > @backingInt(OnewayVariant.ballast)) return error.ConnectivityOnewayUnknownVariant;
         const variant: OnewayVariant = @fromBackingInt(@as(u8, @intCast(variant_index)));
         if (terminals < oneway_site_rooms or systems == 0) return error.ConnectivityOnewayChainTooShort;
-        if (variant != .locality and variant != .dense and systems != 1) return error.ConnectivityOnewayOneChainOnly;
+        if (variant != .locality and variant != .dense and variant != .ballast and systems != 1) return error.ConnectivityOnewayOneChainOnly;
         if (variant == .dense and (systems < 2 or systems > oneway_rooms_per_row)) return error.ConnectivityOnewayDenseSystems;
         // The cut must leave a block at most a quarter full.
         if (variant == .shrunk and terminals <= 4 * oneway_shrunk_live) return error.ConnectivityOnewayShrunkTooSmall;
@@ -4855,6 +4909,23 @@ const OnewayConfig = struct {
 
     fn links(self: OnewayConfig) usize {
         return (self.terminals - 1) * self.systems;
+    }
+
+    // The ballast chain's rooms (none outside the ballast variant): the smallest power of two
+    // whose block holds over twice the chains' words, so its retired block alone outweighs
+    // every live one.
+    fn ballastRooms(self: OnewayConfig) usize {
+        if (self.variant != .ballast) return 0;
+        const chain_words = self.systems * onewayBlockWords(self.terminals);
+        var ballast: usize = oneway_site_rooms;
+        while (onewayBlockWords(ballast) <= 2 * chain_words) ballast *= 2;
+        return ballast;
+    }
+
+    // The one-way links of every chain and the ballast.
+    fn allLinks(self: OnewayConfig) usize {
+        const ballast = self.ballastRooms();
+        return self.links() + if (ballast == 0) 0 else ballast - 1;
     }
 
     // Chain 0's room `index`: its end group in the site (the first rooms for the head
@@ -4870,11 +4941,153 @@ const OnewayConfig = struct {
     // variant's first wall (it toggles every wall).
     fn toggleCell(self: OnewayConfig) CellCoord {
         return switch (self.variant) {
-            .locality, .tail, .shrunk, .fan => onewaySiteRoom(oneway_site_rooms - 1).cell,
+            .locality, .tail, .shrunk, .fan, .ballast => onewaySiteRoom(oneway_site_rooms - 1).cell,
             .head => onewaySiteRoom(0).cell,
             .far_dig => pocketDigCell(oneway_side),
             .dense => .{ .x = denseHead(0).cell.x + 1, .y = oneway_dense_row },
         };
+    }
+};
+
+// The words of the one-way block a system of `terminals` terminals holds after a relocation:
+// at a power-of-two cap, one row of `cap` bits (at least a word) and one index-map word per
+// index. Sizes the ballast only; its retire checks the measured words.
+fn onewayBlockWords(terminals: usize) usize {
+    const cap = std.math.ceilPowerOfTwoAssert(usize, terminals);
+    return cap * (@max(1, cap / 32) + 1);
+}
+
+// The ballast variant's chain: `config.ballastRooms()` rooms on level 1 after every chain
+// room, in fill order.
+fn onewayBallastRooms(allocator: std.mem.Allocator, config: OnewayConfig) ![]OnewayRoom {
+    const free_rooms = try onewayFreeRooms(allocator);
+    defer allocator.free(free_rooms);
+    // The chains took the free rooms before `start`; chain 0's end group sits in the site.
+    var start = config.rooms() - oneway_site_rooms;
+    while (start < free_rooms.len and free_rooms[start].level == 0) start += 1;
+    const count = config.ballastRooms();
+    if (start + count > free_rooms.len) return error.ConnectivityOnewayRoomsTooFew;
+    return allocator.dupe(OnewayRoom, free_rooms[start..][0..count]);
+}
+
+// The ballast chain on `ballast_level`, retired (every room closed) before each timed toggle
+// so its dead block outweighs the live blocks the toggle's close prepares against.
+const OnewayBallast = struct {
+    const ballast_level: u16 = 1;
+
+    cells: []const CellCoord,
+    // What `checkNavBytes` charges the nav, checked after every retire.
+    size_config: suite.NavSizeConfig,
+    item_count: usize,
+    // The last retire's reopen and close reactions.
+    reopen: EvictReaction = .{ .elapsed_ns = 0, .stats = .{} },
+    close: EvictReaction = .{ .elapsed_ns = 0, .stats = .{} },
+    retires: usize = 0,
+    // The timed block reactions' split, summed over `samples`: the main-thread reserve
+    // section (it frees the old arena and allocates the new one) and the compaction stage,
+    // with the last sample's live words copied and arena words freed and allocated.
+    samples: usize = 0,
+    reserve_ns: u128 = 0,
+    compact_ns: u128 = 0,
+    copied_words: usize = 0,
+    freed_words: usize = 0,
+    allocated_words: usize = 0,
+    // Untimed probes, outside every reaction, at the last sample's sizes: one allocation of
+    // the words the timed close allocated and one free of the words it freed, each timed
+    // alone and summed over `probes`.
+    probes: usize = 0,
+    alloc_probe_ns: u128 = 0,
+    free_probe_ns: u128 = 0,
+
+    // Reopens the ballast's rooms and closes them, one untimed reaction each; fails when the
+    // block the close retired holds no more than twice the live words it left, or when the
+    // nav holds more bytes than charged.
+    fn retire(self: *OnewayBallast, io: std.Io, fixture: *EvictFixture, thread_system: ?*ThreadSystem) !void {
+        self.reopen = try untimedReaction(io, fixture, self.cells, fixture.open.walkable, thread_system);
+        try self.closeAll(io, fixture, thread_system);
+        self.retires += 1;
+        const retired_words = self.reopen.stats.closure_live_words -| self.close.stats.closure_live_words;
+        if (retired_words <= 2 * self.close.stats.closure_live_words) return error.ConnectivityOnewayBallastTooSmall;
+        try suite.checkNavBytes(connectivity_oneway_group.name, self.item_count, self.size_config, &fixture.system);
+    }
+
+    // Closes every ballast room in one untimed reaction.
+    fn closeAll(self: *OnewayBallast, io: std.Io, fixture: *EvictFixture, thread_system: ?*ThreadSystem) !void {
+        self.close = try untimedReaction(io, fixture, self.cells, fixture.open.blocking, thread_system);
+    }
+
+    // Sets the ballast's rooms to `tile` in one reaction, leaving every nav tuner as it was.
+    fn untimedReaction(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
+        const tuners = NavReactionTuners.capture(&fixture.system);
+        defer tuners.restore(&fixture.system);
+        return fixture.changeLevelAndReact(io, ballast_level, cells, tile, thread_system);
+    }
+
+    // Adds a timed sample's block reaction, which ran right after the last retire.
+    fn addSample(self: *OnewayBallast, sample: ToggleSample) void {
+        const change = sample.change.stats;
+        self.samples += 1;
+        self.reserve_ns += change.main.reserve_ns;
+        self.compact_ns += change.conn_closure_compact_batch.batch_duration_ns;
+        self.copied_words = change.closure_live_prepared;
+        self.freed_words = self.close.stats.closure_arena_capacity;
+        self.allocated_words = change.closure_arena_limit;
+    }
+
+    // Runs `probes` allocation and free probes at the last sample's sizes.
+    fn probe(self: *OnewayBallast, allocator: std.mem.Allocator, io: std.Io, probes: usize) !void {
+        for (0..probes) |_| {
+            const alloc_start = suite.nowNs(io);
+            const allocated = try allocator.alloc(u32, self.allocated_words);
+            self.alloc_probe_ns += suite.elapsedNs(alloc_start, suite.nowNs(io));
+            allocator.free(allocated);
+            const freed = try allocator.alloc(u32, self.freed_words);
+            const free_start = suite.nowNs(io);
+            allocator.free(freed);
+            self.free_probe_ns += suite.elapsedNs(free_start, suite.nowNs(io));
+            self.probes += 1;
+        }
+    }
+
+    // The last retire: the ballast's block words, the reopen's arena tail bound and candidate
+    // words, the live and dead words and arena the timed close prepares against, and the
+    // compactions the retire ran; then the timed block reactions' split and the probes.
+    // Printed under --details.
+    fn print(self: OnewayBallast, options: suite.Options, case: suite.BenchmarkCase) void {
+        if (!options.details or self.retires == 0) return;
+        const reopen = self.reopen.stats;
+        const close = self.close.stats;
+        std.debug.print("  {s} {} {s}: ballast rooms={} block_words={} retires={} reopen_tail_bound={} reopen_cand_words={} left_live_words={} left_dead_words={} left_arena_capacity={} left_arena_bytes={} retire_compactions={}\n", .{
+            connectivity_oneway_group.name,
+            self.item_count,
+            case.name,
+            self.cells.len,
+            reopen.closure_live_words -| close.closure_live_words,
+            self.retires,
+            reopen.closure_tail_bound,
+            reopen.closure_candidate_words,
+            close.closure_live_words,
+            close.closure_dead_words,
+            close.closure_arena_capacity,
+            close.closure_arena_capacity * @sizeOf(u32),
+            reopen.closure_compactions + close.closure_compactions,
+        });
+        if (self.samples == 0) return;
+        const samples: u128 = self.samples;
+        const probes: u128 = @max(1, self.probes);
+        std.debug.print("  {s} {} {s}: timed block split reserve={}ns compact={}ns copied_words={} freed_bytes={} allocated_bytes={} alloc_probe={}ns free_probe={}ns probes={}\n", .{
+            connectivity_oneway_group.name,
+            self.item_count,
+            case.name,
+            @as(u64, @intCast(self.reserve_ns / samples)),
+            @as(u64, @intCast(self.compact_ns / samples)),
+            self.copied_words,
+            self.freed_words * @sizeOf(u32),
+            self.allocated_words * @sizeOf(u32),
+            @as(u64, @intCast(self.alloc_probe_ns / probes)),
+            @as(u64, @intCast(self.free_probe_ns / probes)),
+            self.probes,
+        });
     }
 };
 
@@ -4932,7 +5145,20 @@ fn onewayRooms(allocator: std.mem.Allocator, config: OnewayConfig) ![]OnewayRoom
     return rooms;
 }
 
-fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, rooms: []const OnewayRoom, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+// One one-way teleport from room `from` to room `to`.
+fn addOnewayLink(world: *WorldSystem, from: OnewayRoom, to: OnewayRoom) !void {
+    try world.addLevelLink(.{
+        .kind = .teleport,
+        .level_a = from.level,
+        .cell_a = from.cell,
+        .level_b = to.level,
+        .cell_b = to.cell,
+        .traversal_cost = 1,
+        .bidirectional = false,
+    });
+}
+
+fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, rooms: []const OnewayRoom, ballast: []const OnewayRoom, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
     var open = try buildOpenWorld(allocator, io, oneway_side, oneway_levels);
     errdefer open.world.deinit();
     std.debug.assert(open.world.chunk_size_tiles == default_chunk_size_tiles);
@@ -4956,16 +5182,12 @@ fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayCon
         for (system_rooms[1..], 0..) |room, previous| {
             const from = system_rooms[previous];
             const to = if (config.variant == .fan and previous < hub) system_rooms[hub] else room;
-            try open.world.addLevelLink(.{
-                .kind = .teleport,
-                .level_a = from.level,
-                .cell_a = from.cell,
-                .level_b = to.level,
-                .cell_b = to.cell,
-                .traversal_cost = 1,
-                .bidirectional = false,
-            });
+            try addOnewayLink(&open.world, from, to);
         }
+    }
+    std.debug.assert(ballast.len == config.ballastRooms());
+    if (ballast.len != 0) {
+        for (ballast[1..], 0..) |room, previous| try addOnewayLink(&open.world, ballast[previous], room);
     }
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -4997,25 +5219,29 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
     const rooms = try onewayRooms(allocator, config);
     defer allocator.free(rooms);
-    // The toggle, the dense variant's walls, or the shrunk variant's cut, whichever writes the
-    // most cells and patches the most chunks.
+    const ballast_rooms = if (config.variant == .ballast) try onewayBallastRooms(allocator, config) else try allocator.alloc(OnewayRoom, 0);
+    defer allocator.free(ballast_rooms);
+    // The toggle, the dense variant's walls, the shrunk variant's cut, or the ballast's retire,
+    // whichever writes the most cells and patches the most chunks.
     const cut_rooms = if (config.variant == .shrunk) config.terminals - oneway_shrunk_live else 0;
     const batch = suite.NavBatch{
-        .mark_chunks = @max(1, @max(config.systems, cut_rooms)),
+        .mark_chunks = @max(1, @max(config.systems, cut_rooms, ballast_rooms.len)),
         .links = 0,
         .keys = @max(toggle_batch_keys, if (config.variant == .dense)
             config.systems * toggle_batch_keys
         else if (config.variant == .shrunk)
             try roomBatchKeys(allocator, rooms[0..cut_rooms])
+        else if (config.variant == .ballast)
+            try roomBatchKeys(allocator, ballast_rooms)
         else
             toggle_batch_keys),
     };
-    var size_config = toggleSizeConfig(oneway_side, oneway_levels, config.links(), participant_count, batch);
+    var size_config = toggleSizeConfig(oneway_side, oneway_levels, config.allLinks(), participant_count, batch);
     // A system is one chain or fan of rooms; the dense variant's opening merges every one.
-    size_config.oneway_system_terminals = if (config.variant == .dense) config.rooms() else config.terminals;
+    size_config.oneway_system_terminals = if (config.variant == .dense) config.rooms() else @max(config.terminals, ballast_rooms.len);
     if (suite.navSizeSkip(connectivity_oneway_group.name, item_count, case, size_config)) |skip| return skip;
 
-    var fixture = try initOnewayFixture(allocator, io, config, rooms, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initOnewayFixture(allocator, io, config, rooms, ballast_rooms, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     // One toggled cell, or the dense variant's walls.
@@ -5023,15 +5249,30 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     defer allocator.free(dense_walls);
     const toggle_cell = config.toggleCell();
     const cells = if (config.variant == .dense) dense_walls else &[_]CellCoord{toggle_cell};
-    try fixture.changed.ensureTotalCapacity(allocator, cells.len);
+    const ballast_cells = try allocator.alloc(CellCoord, ballast_rooms.len);
+    defer allocator.free(ballast_cells);
+    for (ballast_rooms, ballast_cells) |room, *cell| {
+        std.debug.assert(room.level == OnewayBallast.ballast_level);
+        cell.* = room.cell;
+    }
+    try fixture.changed.ensureTotalCapacity(allocator, @max(cells.len, ballast_cells.len));
     setNavReactionTuners(&fixture.system, case);
     configureNavUpdateThreads(&fixture.system, case);
     if (config.variant == .shrunk) try cutOnewayChain(allocator, io, &fixture, rooms[0 .. config.terminals - oneway_shrunk_live], thread_ptr);
+    // The ballast starts retired: every sample reopens it first.
+    var ballast = OnewayBallast{ .cells = ballast_cells, .size_config = size_config, .item_count = item_count };
+    if (config.variant == .ballast) try ballast.closeAll(io, &fixture, thread_ptr);
 
     // The dense variant's fill and reopen resize blocks and reserve the merged block the
     // opening can create: its ratio is what the variant measures.
-    const checks: ToggleChecks = if (config.variant == .dense) .{ .fixed_blocks = false, .reserve_ratio = false } else .{};
-    var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks);
+    const checks: ToggleChecks = switch (config.variant) {
+        .dense => .{ .fixed_blocks = false, .reserve_ratio = false },
+        .ballast => .{ .compacts = true },
+        else => .{},
+    };
+    var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null);
+    if (config.variant == .ballast and options.details) try ballast.probe(allocator, io, options.iterations);
+    ballast.print(options, case);
     try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     stats.output_count = config.links();
     stats.candidate_pairs = config.rooms();
