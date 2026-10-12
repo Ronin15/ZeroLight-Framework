@@ -265,6 +265,24 @@ pub const NavGrid = struct {
         };
     }
 
+    /// The world's composed blocked bits of `chunk` on this grid's level, without colliders:
+    /// none for a null world, every in-level cell for a level the world lacks (as
+    /// `levelBlocksMovement` reads it). O(1); never writes.
+    pub fn worldChunkBits(self: *const NavGrid, chunk: u32, world: ?*const WorldSystem) ChunkBits {
+        const world_system = world orelse return @splat(0);
+        // A nav build over a world takes its tiles and chunks.
+        std.debug.assert(world_system.chunk_size_tiles == self.chunk_tiles);
+        const form = if (@as(usize, self.level) < world_system.levelCount()) world_system.levelChunkBlockedForm(self.level, chunk) else .blocked;
+        return switch (form) {
+            .open => @splat(0),
+            .blocked => blocked: {
+                const b = self.chunkBounds(chunk);
+                break :blocked world_terrain.inLevelMask(self.edgeGeometry(), .{ .min_x = 0, .min_y = 0, .cols = @intCast(b.x1 - b.x0), .rows = @intCast(b.y1 - b.y0) });
+            },
+            .mixed => world_system.levelChunkBlockedBits(self.level, chunk).?.*,
+        };
+    }
+
     /// Composes `chunk`'s blocked bits: the world's composed bits for this level (null
     /// world: none) OR the cells of every static collider listed at the chunk, clipped to
     /// it. Out-of-level bits stay clear. Reads only the world and the colliders, so chunks
@@ -274,22 +292,7 @@ pub const NavGrid = struct {
     pub fn composeChunk(self: *const NavGrid, chunk: u32, world: ?*const WorldSystem, colliders: ColliderView) ChunkBits {
         const b = self.chunkBounds(chunk);
         const edge = self.edgeGeometry();
-        const in_level = world_terrain.inLevelMask(edge, .{ .min_x = 0, .min_y = 0, .cols = @intCast(b.x1 - b.x0), .rows = @intCast(b.y1 - b.y0) });
-        var bits: ChunkBits = @splat(0);
-        if (world) |world_system| {
-            // A nav build over a world takes its tiles and chunks.
-            std.debug.assert(world_system.chunk_size_tiles == self.chunk_tiles);
-            if (@as(usize, self.level) < world_system.levelCount()) {
-                bits = switch (world_system.levelChunkBlockedForm(self.level, chunk)) {
-                    .open => @splat(0),
-                    .blocked => in_level,
-                    .mixed => world_system.levelChunkBlockedBits(self.level, chunk).?.*,
-                };
-            } else {
-                // A level the world lacks reads as blocked, as `levelBlocksMovement` does.
-                bits = in_level;
-            }
-        }
+        var bits = self.worldChunkBits(chunk, world);
         var rows = colliders.chunkRows(self.level, chunk);
         while (rows.next()) |row| {
             const cells = colliders.rowCells(row);

@@ -355,6 +355,42 @@ pub const NavUpdateStats = struct {
     conn_flood_nodes: usize = 0,
     conn_splits: usize = 0,
     conn_merges: usize = 0,
+    // The one-way closure's stages across level builds and the marks batch: the candidate
+    // scan and compaction (prepare), and link resolve, row mask, SCC plan, and rows (rounds
+    // folded into one).
+    conn_candidates_batch: BatchStats = .{},
+    conn_closure_compact_batch: BatchStats = .{},
+    conn_closure_resolve_batch: BatchStats = .{},
+    conn_closure_mask_batch: BatchStats = .{},
+    conn_closure_plan_batch: BatchStats = .{},
+    conn_closure_rows_batch: BatchStats = .{},
+    // The closure's components touched, links resolved, terminals new and left, rows
+    // recomputed (|A|), row rounds (round 0 included), arena words written, and blocks
+    // narrowed, summed;
+    // compactions; and the arena's live and dead words and its allocated words after the
+    // last batch.
+    closure_touched: usize = 0,
+    closure_links: usize = 0,
+    closure_terms_new: usize = 0,
+    closure_terms_left: usize = 0,
+    closure_a_rows: usize = 0,
+    closure_rounds: usize = 0,
+    closure_words_written: usize = 0,
+    closure_shrinks: usize = 0,
+    closure_compactions: usize = 0,
+    closure_live_words: usize = 0,
+    closure_dead_words: usize = 0,
+    closure_arena_capacity: usize = 0,
+    // Each the most over the update's closure batches: the arena tail words a batch's bound
+    // reserved and its relocated blocks took, the arena's word limit after its prepare, its
+    // candidate components' block words, the live words at its prepare, and the terminals it
+    // could number.
+    closure_tail_bound: usize = 0,
+    closure_tail_used: usize = 0,
+    closure_arena_limit: usize = 0,
+    closure_candidate_words: usize = 0,
+    closure_live_prepared: usize = 0,
+    closure_kb: usize = 0,
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -364,6 +400,7 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_records_patched, metric(self.records_patched));
         perf.recordBatch(.nav_remask, self.remask_batch);
         perf.recordBatch(.nav_connect, self.conn_flood_batch);
+        perf.recordBatch(.nav_closure, self.conn_closure_rows_batch);
         perf.recordBatch(.nav_evict, self.evict_batch);
     }
 };
@@ -372,7 +409,7 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-test "nav update stats record the remask, the connectivity flood, and the eviction halo walk under their own perf stages" {
+test "nav update stats record the remask, the connectivity flood, the closure rows, and the eviction halo walk under their own perf stages" {
     if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var perf = runtime_perf_log.RuntimePerfLog.init(0);
     const stats = NavUpdateStats{
@@ -380,6 +417,8 @@ test "nav update stats record the remask, the connectivity flood, and the evicti
         .conn_seed_batch = .{ .item_count = 7 },
         .conn_gather_batch = .{ .item_count = 8 },
         .conn_flood_batch = .{ .item_count = 6 },
+        .conn_closure_resolve_batch = .{ .item_count = 10 },
+        .conn_closure_rows_batch = .{ .item_count = 9 },
         .evict_count_batch = .{ .item_count = 2 },
         .evict_batch = .{ .item_count = 3 },
         .evict_flush_batch = .{ .item_count = 4 },
@@ -392,6 +431,9 @@ test "nav update stats record the remask, the connectivity flood, and the evicti
     try std.testing.expectEqual(@as(u64, 5), remask.items);
     try std.testing.expectEqual(@as(u64, 1), connect.calls);
     try std.testing.expectEqual(@as(u64, 6), connect.items);
+    const closure = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_closure)];
+    try std.testing.expectEqual(@as(u64, 1), closure.calls);
+    try std.testing.expectEqual(@as(u64, 9), closure.items);
     try std.testing.expectEqual(@as(u64, 1), evict.calls);
     try std.testing.expectEqual(@as(u64, 3), evict.items);
 }

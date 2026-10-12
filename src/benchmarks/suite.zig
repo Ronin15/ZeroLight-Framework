@@ -240,7 +240,13 @@ pub const RunStats = struct {
 /// dispatched, the active sets the round builds walked on the main thread, nodes expanded,
 /// components split off, and roots merged, the flood's summed
 /// dispatch time and its share on workers, and the flood tuner's policy after the case
-/// (null when the case runs no adaptive tuner; zero workers is inline).
+/// (null when the case runs no adaptive tuner; zero workers is inline). Then the one-way
+/// closure's stage shapes (candidates, resolve, mask, plan, rows with round 0 and its rounds
+/// folded, compaction) and counters: components touched, links resolved, terminals new and
+/// left, rows recomputed, rounds, words written, blocks narrowed, the arena's live, dead, and
+/// allocated words, and compactions; and the reserve of its busiest batch: the arena tail
+/// words its bound reserved and its blocks took, the arena's word limit, its candidates' block
+/// words, the live words at its prepare, and the terminals it could number.
 pub const NavConnSummary = struct {
     seed: BatchSummary = .{},
     gather: BatchSummary = .{},
@@ -255,6 +261,30 @@ pub const NavConnSummary = struct {
     merges: usize = 0,
     flood_off_main_ns: u64 = 0,
     flood_tuner_workers: ?usize = null,
+    candidates: BatchSummary = .{},
+    closure_resolve: BatchSummary = .{},
+    closure_mask: BatchSummary = .{},
+    closure_plan: BatchSummary = .{},
+    closure_rows: BatchSummary = .{},
+    closure_compact: BatchSummary = .{},
+    closure_touched: usize = 0,
+    closure_links: usize = 0,
+    closure_terms_new: usize = 0,
+    closure_terms_left: usize = 0,
+    closure_a_rows: usize = 0,
+    closure_rounds: usize = 0,
+    closure_words_written: usize = 0,
+    closure_shrinks: usize = 0,
+    closure_live_words: usize = 0,
+    closure_dead_words: usize = 0,
+    closure_arena_capacity: usize = 0,
+    closure_compactions: usize = 0,
+    closure_tail_bound: usize = 0,
+    closure_tail_used: usize = 0,
+    closure_arena_limit: usize = 0,
+    closure_candidate_words: usize = 0,
+    closure_live_prepared: usize = 0,
+    closure_kb: usize = 0,
 };
 
 pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
@@ -870,7 +900,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [768]u8 = undefined;
+        var workload_buffer: [2048]u8 = undefined;
 
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
@@ -1212,7 +1242,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     // Workload labels translate shared counters into subsystem language so the
     // report remains compact without hiding what was measured.
     if (std.mem.startsWith(u8, group_name, "nav-update-static-dense")) {
-        var stage_buffer: [512]u8 = undefined;
+        var stage_buffer: [1536]u8 = undefined;
         var splice_buffer: [32]u8 = undefined;
         var query_splice_buffer: [32]u8 = undefined;
         const splice = stats.splice_batch orelse BatchSummary{};
@@ -1226,7 +1256,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "nav-update-")) {
-        var stage_buffer: [512]u8 = undefined;
+        var stage_buffer: [1536]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "movement-apply-intents")) {
@@ -1261,7 +1291,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) {
-        var stage_buffer: [512]u8 = undefined;
+        var stage_buffer: [1536]u8 = undefined;
         return std.fmt.bufPrint(buffer, "levels={} {s}", .{ stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
@@ -1279,7 +1309,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (isChunkScaleNavBatchGroup(group_name)) {
-        var stage_buffer: [512]u8 = undefined;
+        var stage_buffer: [1536]u8 = undefined;
         const stages = formatNavStagesInto(&stage_buffer, stats);
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
@@ -1290,7 +1320,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-dig") or std.mem.eql(u8, group_name, "chunk-scale-nav-ramp")) {
-        var stage_buffer: [512]u8 = undefined;
+        var stage_buffer: [1536]u8 = undefined;
         return std.fmt.bufPrint(buffer, "cells={} {s}", .{ stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "ai")) {
@@ -1335,11 +1365,11 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         return std.fmt.bufPrint(buffer, "searches={} unavailable={} steps={} status_steps={} max_step={f}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count, formatDuration(stats.max_step_ns) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) {
-        var stage_buffer: [512]u8 = undefined;
+        var stage_buffer: [1536]u8 = undefined;
         return std.fmt.bufPrint(buffer, "cells={} structure_chunks={} {s}", .{ stats.output_count, stats.candidate_pairs, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-oneway")) {
-        var stage_buffer: [512]u8 = undefined;
+        var stage_buffer: [1536]u8 = undefined;
         return std.fmt.bufPrint(buffer, "rooms={} oneway_links={} {s}", .{ stats.candidate_pairs, stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
@@ -1491,7 +1521,7 @@ fn formatNavStagesInto(buffer: []u8, stats: RunStats) []const u8 {
     var plan_buffer: [32]u8 = undefined;
     var remask_buffer: [32]u8 = undefined;
     var patch_buffer: [32]u8 = undefined;
-    var conn_buffer: [320]u8 = undefined;
+    var conn_buffer: [1280]u8 = undefined;
     const plan = formatStageShapeInto(&plan_buffer, stats.nav_plan_batch orelse .{});
     const remask = formatStageShapeInto(&remask_buffer, stats.batch);
     const patch = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
@@ -1513,7 +1543,8 @@ fn formatNavConnInto(buffer: []u8, summary: ?NavConnSummary) []const u8 {
         (if (workers == 0) "inline" else std.fmt.bufPrint(&tuner_buffer, "{}w", .{workers}) catch "tuner")
     else
         "-";
-    return std.fmt.bufPrint(buffer, " conn_seed={s} conn_gather={s} conn_flood={s} families={} rounds={} round_items={}-{} build_visits={} flood_nodes={} splits={} merges={} flood_dispatch={f} flood_off_main={f} flood_tuner={s}", .{
+    var closure_buffer: [768]u8 = undefined;
+    return std.fmt.bufPrint(buffer, " conn_seed={s} conn_gather={s} conn_flood={s} families={} rounds={} round_items={}-{} build_visits={} flood_nodes={} splits={} merges={} flood_dispatch={f} flood_off_main={f} flood_tuner={s}{s}", .{
         formatRunStageShapeInto(&seed_buffer, conn.seed),
         formatRunStageShapeInto(&gather_buffer, conn.gather),
         formatRunStageShapeInto(&flood_buffer, conn.flood),
@@ -1528,7 +1559,69 @@ fn formatNavConnInto(buffer: []u8, summary: ?NavConnSummary) []const u8 {
         formatDuration(conn.flood.batch_duration_ns),
         formatDuration(conn.flood_off_main_ns),
         tuner,
+        formatClosureInto(&closure_buffer, conn),
     }) catch " conn";
+}
+
+// The one-way closure block of a nav reaction, or nothing when the reaction ran no closure
+// stage.
+fn formatClosureInto(buffer: []u8, conn: NavConnSummary) []const u8 {
+    if (conn.candidates.item_count == 0 and conn.closure_links == 0 and conn.closure_compact.item_count == 0) return "";
+    var shape_buffers: [6][32]u8 = undefined;
+    return std.fmt.bufPrint(buffer, " conn_candidates={s} closure_resolve={s} closure_mask={s} closure_plan={s} closure_rows={s} closure_compact={s} touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} live_words={} dead_words={} arena_capacity={} compactions={} tail_bound={} tail_used={} arena_limit={} cand_words={} live_prepared={} kb={}", .{
+        formatRunStageShapeInto(&shape_buffers[0], conn.candidates),
+        formatRunStageShapeInto(&shape_buffers[1], conn.closure_resolve),
+        formatRunStageShapeInto(&shape_buffers[2], conn.closure_mask),
+        formatRunStageShapeInto(&shape_buffers[3], conn.closure_plan),
+        formatRunStageShapeInto(&shape_buffers[4], conn.closure_rows),
+        formatRunStageShapeInto(&shape_buffers[5], conn.closure_compact),
+        conn.closure_touched,
+        conn.closure_links,
+        conn.closure_terms_new,
+        conn.closure_terms_left,
+        conn.closure_a_rows,
+        conn.closure_rounds,
+        conn.closure_words_written,
+        conn.closure_shrinks,
+        conn.closure_live_words,
+        conn.closure_dead_words,
+        conn.closure_arena_capacity,
+        conn.closure_compactions,
+        conn.closure_tail_bound,
+        conn.closure_tail_used,
+        conn.closure_arena_limit,
+        conn.closure_candidate_words,
+        conn.closure_live_prepared,
+        conn.closure_kb,
+    }) catch " closure";
+}
+
+/// The one-way closure fields of `stats` copied into `summary`.
+pub fn fillClosureSummary(summary: *NavConnSummary, stats: anytype) void {
+    summary.candidates = batchSummaryFromBatch(stats.conn_candidates_batch);
+    summary.closure_resolve = batchSummaryFromBatch(stats.conn_closure_resolve_batch);
+    summary.closure_mask = batchSummaryFromBatch(stats.conn_closure_mask_batch);
+    summary.closure_plan = batchSummaryFromBatch(stats.conn_closure_plan_batch);
+    summary.closure_rows = batchSummaryFromBatch(stats.conn_closure_rows_batch);
+    summary.closure_compact = batchSummaryFromBatch(stats.conn_closure_compact_batch);
+    summary.closure_touched = stats.closure_touched;
+    summary.closure_links = stats.closure_links;
+    summary.closure_terms_new = stats.closure_terms_new;
+    summary.closure_terms_left = stats.closure_terms_left;
+    summary.closure_a_rows = stats.closure_a_rows;
+    summary.closure_rounds = stats.closure_rounds;
+    summary.closure_words_written = stats.closure_words_written;
+    summary.closure_shrinks = stats.closure_shrinks;
+    summary.closure_live_words = stats.closure_live_words;
+    summary.closure_dead_words = stats.closure_dead_words;
+    summary.closure_arena_capacity = stats.closure_arena_capacity;
+    summary.closure_compactions = stats.closure_compactions;
+    summary.closure_tail_bound = stats.closure_tail_bound;
+    summary.closure_tail_used = stats.closure_tail_used;
+    summary.closure_arena_limit = stats.closure_arena_limit;
+    summary.closure_candidate_words = stats.closure_candidate_words;
+    summary.closure_live_prepared = stats.closure_live_prepared;
+    summary.closure_kb = stats.closure_kb;
 }
 
 // Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the

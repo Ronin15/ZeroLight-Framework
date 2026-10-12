@@ -368,13 +368,17 @@ pub const connectivity_split_group = suite.BenchmarkGroup{
 // lattice of one-cell walled rooms, holding `systems` chains of `terminals` rooms, each room
 // joined to the next room of its chain by a one-way teleport. Variants 0 and 1 toggle the
 // first chain's last room (its last link's target), variant 2 its first room (its first
-// link's source), and variant 3 a far room no chain uses; variants 1 to 3 hold one chain.
-// The toggled end's 8 rooms sit in one fixed chunk whose orthogonal neighbours hold no other
-// chain room, so every config's toggle patches the same chunks. One timed sample blocks the
-// cell and runs the nav reaction, then reopens it and runs the reaction again; the tile
-// writes are untimed. `outputs` is the one-way links and `candidates` the rooms. Passes when variants 0 and 3 are flat, variant 2 grows at most
-// linearly in terminals, and variant 1 at most as terminals² / 32. `--details` as for
-// `pathfinding-connectivity-split`.
+// link's source), and variant 3 a far room no chain uses. Variant 4 closes the chain's first
+// `terminals - 64` rooms once, untimed (its block narrows), then toggles its last room.
+// Variant 5 is a fan: every room joined by a one-way teleport to a hub room, the hub to the
+// last room, which toggles, so one round recomputes every source's row (rows narrower than a
+// cache line below 512 terminals). Variants 1 to 5 hold one chain or fan. The toggled end's 8 rooms sit in one
+// fixed chunk whose orthogonal neighbours hold no other chain room, so every config's toggle
+// patches the same chunks. One timed sample blocks the cell and runs the nav reaction, then
+// reopens it and runs the reaction again; the tile writes are untimed. `outputs` is the
+// one-way links and `candidates` the rooms. Passes when variants 0, 3, and 4 are flat (4 in
+// its peak terminals), variant 2 grows at most linearly in terminals, and variants 1 and 5 at
+// most as terminals² / 32. `--details` as for `pathfinding-connectivity-split`.
 pub const connectivity_oneway_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-oneway",
     .defaultItemCounts = connectivityOnewayItemCounts,
@@ -1874,6 +1878,15 @@ const connectivity_oneway_item_counts = [_]usize{
     onewayItemCode(.far_dig, 64, 1),
     onewayItemCode(.far_dig, 512, 1),
     onewayItemCode(.far_dig, 4096, 1),
+    onewayItemCode(.shrunk, 512, 1),
+    onewayItemCode(.shrunk, 2048, 1),
+    onewayItemCode(.shrunk, 8192, 1),
+    onewayItemCode(.fan, 64, 1),
+    onewayItemCode(.fan, 128, 1),
+    onewayItemCode(.fan, 256, 1),
+    onewayItemCode(.dense, oneway_dense_terminals, 2),
+    onewayItemCode(.dense, oneway_dense_terminals, 8),
+    onewayItemCode(.dense, oneway_dense_terminals, 32),
 };
 
 fn connectivityOnewayItemCounts(_: suite.Profile) []const usize {
@@ -3813,8 +3826,9 @@ const toggle_agent_budget: usize = 8;
 // reaction, with the change reaction's plan, remask, and patch batches.
 const ToggleSample = struct {
     change: EvictReaction,
-    // The change reaction's plan, remask, patch, and connectivity seed, gather, and flood.
-    change_stages: [6]BatchStats,
+    // The change reaction's plan, remask, patch, connectivity seed, gather, and flood, and
+    // closure candidates, resolve, mask, plan, rows, and compaction.
+    change_stages: [toggle_stage_count]BatchStats,
     revert: EvictReaction,
 
     fn elapsedNs(self: ToggleSample) u64 {
@@ -3822,29 +3836,81 @@ const ToggleSample = struct {
     }
 };
 
+// What a toggle's reactions must keep: every one-way block at its size, and each closure
+// reserve within its fixed ratio of the words the reaction touches (`checkOnewayReserve`).
+const ToggleChecks = struct {
+    fixed_blocks: bool = true,
+    reserve_ratio: bool = true,
+};
+
+// Fails when a reaction's closure reserved past its fixed ratio: an arena tail over twice its
+// candidates' block words, or an arena limit over three times the live words at its prepare,
+// each plus 32 words per terminal it could number (a small piece's 16-word block).
+fn checkOnewayReserve(stats: NavUpdateStats) !void {
+    const slack = 32 * stats.closure_kb;
+    if (stats.closure_tail_bound > 2 * stats.closure_candidate_words + slack) return error.ConnectivityOnewayReserveRatio;
+    if (stats.closure_arena_limit > 3 * stats.closure_live_prepared + slack) return error.ConnectivityOnewayReserveRatio;
+}
+
 // Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again.
-fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem) !ToggleSample {
+fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !ToggleSample {
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
     const graph = &fixture.system.graph;
-    const change_stages = [6]BatchStats{ graph.last_plan_batch, change.stats.remask_batch, graph.last_patch_batch, change.stats.conn_seed_batch, change.stats.conn_gather_batch, change.stats.conn_flood_batch };
+    const stats = change.stats;
+    const change_stages = [toggle_stage_count]BatchStats{
+        graph.last_plan_batch,         stats.remask_batch,               graph.last_patch_batch,
+        stats.conn_seed_batch,         stats.conn_gather_batch,          stats.conn_flood_batch,
+        stats.conn_candidates_batch,   stats.conn_closure_resolve_batch, stats.conn_closure_mask_batch,
+        stats.conn_closure_plan_batch, stats.conn_closure_rows_batch,    stats.conn_closure_compact_batch,
+    };
     const revert = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+    // A toggle and its revert never resize a one-way block.
+    if (checks.fixed_blocks and (change.stats.closure_shrinks != 0 or revert.stats.closure_shrinks != 0)) return error.ConnectivityOnewayShrinkFlip;
+    if (checks.reserve_ratio) {
+        try checkOnewayReserve(change.stats);
+        try checkOnewayReserve(revert.stats);
+    }
     return .{ .change = change, .change_stages = change_stages, .revert = revert };
 }
 
+const toggle_stage_count = 12;
+
 // The timed toggles' change and revert reactions, the change reaction's plan, remask, patch,
-// and connectivity seed, gather, and flood shapes (each stage's busiest batch), its
-// connectivity flood (nodes expanded, root-groups, families, rounds, the fewest and most
-// searches a round dispatched, components split off, dispatch time on workers) beside the
-// revert's flood nodes, the flood tuner's policy after the samples, and the reactions'
-// main-thread share: each reaction minus its worker-side stage time. Printed under --details.
+// connectivity seed, gather, and flood, and closure candidates, resolve, mask, plan, rows,
+// and compaction shapes (each stage's busiest batch), its closure counters and closure rows'
+// dispatch time on workers, its connectivity flood (nodes expanded, root-groups, families,
+// rounds, the fewest and most searches a round dispatched, components split off, dispatch
+// time on workers) beside the revert's flood nodes, the flood tuner's policy after the
+// samples, and the reactions' main-thread share: each reaction minus its worker-side stage
+// time. Printed under --details.
 const ToggleReport = struct {
     samples: usize = 0,
     change_ns: u128 = 0,
     revert_ns: u128 = 0,
     main_ns: u128 = 0,
-    busiest: [6]BatchStats = @splat(.{}),
-    threaded: [6]usize = @splat(0),
-    dispatched: [6]usize = @splat(0),
+    busiest: [toggle_stage_count]BatchStats = @splat(.{}),
+    threaded: [toggle_stage_count]usize = @splat(0),
+    dispatched: [toggle_stage_count]usize = @splat(0),
+    closure_touched: usize = 0,
+    closure_links: usize = 0,
+    closure_terms_new: usize = 0,
+    closure_terms_left: usize = 0,
+    closure_a_rows: usize = 0,
+    closure_rounds: usize = 0,
+    closure_words_written: usize = 0,
+    closure_shrinks: usize = 0,
+    closure_live_words: usize = 0,
+    closure_dead_words: usize = 0,
+    closure_arena_capacity: usize = 0,
+    closure_compactions: usize = 0,
+    closure_rows_off_main_ns: u128 = 0,
+    // The closure reserve of the sample's reaction with the larger arena tail bound.
+    closure_tail_bound: usize = 0,
+    closure_tail_used: usize = 0,
+    closure_arena_limit: usize = 0,
+    closure_candidate_words: usize = 0,
+    closure_live_prepared: usize = 0,
+    closure_kb: usize = 0,
     chunks_patched: usize = 0,
     records_patched: usize = 0,
     flood_nodes: usize = 0,
@@ -3875,6 +3941,27 @@ const ToggleReport = struct {
         self.flood_off_main_ns = sample.change.stats.conn_flood_off_main_ns;
         self.splits = sample.change.stats.conn_splits;
         self.revert_flood_nodes = sample.revert.stats.conn_flood_nodes;
+        const closure = sample.change.stats;
+        self.closure_touched = closure.closure_touched;
+        self.closure_links = closure.closure_links;
+        self.closure_terms_new = closure.closure_terms_new;
+        self.closure_terms_left = closure.closure_terms_left;
+        self.closure_a_rows = closure.closure_a_rows;
+        self.closure_rounds = closure.closure_rounds;
+        self.closure_words_written = closure.closure_words_written;
+        self.closure_shrinks += closure.closure_shrinks + sample.revert.stats.closure_shrinks;
+        self.closure_live_words = closure.closure_live_words;
+        self.closure_dead_words = closure.closure_dead_words;
+        self.closure_arena_capacity = closure.closure_arena_capacity;
+        self.closure_compactions += closure.closure_compactions + sample.revert.stats.closure_compactions;
+        self.closure_rows_off_main_ns += offMainNs(closure.conn_closure_rows_batch);
+        const reserve = if (sample.revert.stats.closure_tail_bound > closure.closure_tail_bound) sample.revert.stats else closure;
+        self.closure_tail_bound = reserve.closure_tail_bound;
+        self.closure_tail_used = reserve.closure_tail_used;
+        self.closure_arena_limit = reserve.closure_arena_limit;
+        self.closure_candidate_words = reserve.closure_candidate_words;
+        self.closure_live_prepared = reserve.closure_live_prepared;
+        self.closure_kb = reserve.closure_kb;
         for (sample.change_stages, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
             if (batch.item_count == 0) continue;
             dispatched.* += 1;
@@ -3893,8 +3980,8 @@ const ToggleReport = struct {
 
     fn print(self: ToggleReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.samples == 0) return;
-        var shapes: [6][48]u8 = undefined;
-        var labels: [6][]const u8 = undefined;
+        var shapes: [toggle_stage_count][48]u8 = undefined;
+        var labels: [toggle_stage_count][]const u8 = undefined;
         for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
             label.* = stageShape(buffer, batch, threaded, dispatched);
         }
@@ -3905,7 +3992,7 @@ const ToggleReport = struct {
             (if (workers == 0) "inline" else std.fmt.bufPrint(&tuner_buffer, "{}w", .{workers}) catch "tuner")
         else
             "-";
-        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%) plan={s} remask={s} patch={s} conn_seed={s} conn_gather={s} conn_flood={s} flood_nodes={} groups={} families={} rounds={} round_items={}-{} splits={} flood_off_main={}us flood_tuner={s} reopen_flood_nodes={} chunks_patched={} records_patched={}\n", .{
+        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%) plan={s} remask={s} patch={s} conn_seed={s} conn_gather={s} conn_flood={s} flood_nodes={} groups={} families={} rounds={} round_items={}-{} splits={} flood_off_main={}us flood_tuner={s} reopen_flood_nodes={} chunks_patched={} records_patched={}", .{
             group_name,
             item_count,
             case.name,
@@ -3932,17 +4019,46 @@ const ToggleReport = struct {
             self.chunks_patched,
             self.records_patched,
         });
+        std.debug.print(" conn_candidates={s} closure_resolve={s} closure_mask={s} closure_plan={s} closure_rows={s} closure_compact={s} touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} live_words={} dead_words={} arena_capacity={} compactions={} closure_rows_off_main={}us tail_bound={} tail_used={} arena_limit={} cand_words={} live_prepared={} kb={} reserve_ratio={d:.2}\n", .{
+            labels[6],
+            labels[7],
+            labels[8],
+            labels[9],
+            labels[10],
+            labels[11],
+            self.closure_touched,
+            self.closure_links,
+            self.closure_terms_new,
+            self.closure_terms_left,
+            self.closure_a_rows,
+            self.closure_rounds,
+            self.closure_words_written,
+            self.closure_shrinks,
+            self.closure_live_words,
+            self.closure_dead_words,
+            self.closure_arena_capacity,
+            self.closure_compactions,
+            @as(u64, @intCast(self.closure_rows_off_main_ns / samples)),
+            self.closure_tail_bound,
+            self.closure_tail_used,
+            self.closure_arena_limit,
+            self.closure_candidate_words,
+            self.closure_live_prepared,
+            self.closure_kb,
+            // The arena limit over the live words at prepare.
+            if (self.closure_live_prepared == 0) 0.0 else @as(f64, @floatFromInt(self.closure_arena_limit)) / @as(f64, @floatFromInt(self.closure_live_prepared)),
+        });
     }
 };
 
 // Times `options.iterations` toggles of `cells` after `options.warmup_iterations` untimed
 // ones. Items/s is the cells flipped per second.
-fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem) !suite.RunStats {
-    for (0..options.warmup_iterations) |_| _ = try runToggle(io, fixture, cells, thread_system);
+fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !suite.RunStats {
+    for (0..options.warmup_iterations) |_| _ = try runToggle(io, fixture, cells, thread_system, checks);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = ToggleReport{};
     for (0..options.iterations) |_| {
-        const sample = try runToggle(io, fixture, cells, thread_system);
+        const sample = try runToggle(io, fixture, cells, thread_system, checks);
         accumulator.record(sample.elapsedNs(), sample.change.stats.remask_batch);
         report.add(sample);
     }
@@ -4205,7 +4321,7 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     setNavReactionTuners(&fixture.system, case);
     configureNavUpdateThreads(&fixture.system, case);
 
-    var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr);
+    var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr, .{});
     stats.output_count = gap.len;
     stats.candidate_pairs = config.structureChunks();
     return stats;
@@ -4220,6 +4336,14 @@ const OnewayVariant = enum(u8) {
     head,
     // One chain; a far level-0 cell outside every room toggles.
     far_dig,
+    // One chain cut once to its last `oneway_shrunk_live` rooms; its last room toggles.
+    shrunk,
+    // Every room links to a hub that links to the last room, which toggles.
+    fan,
+    // Many chains whose heads share one root through the open wall cells between them; the
+    // toggle fills every such cell in one reaction (the systems part) and reopens them in
+    // the next (one dense opening merges them).
+    dense,
 };
 
 fn onewayItemCode(variant: OnewayVariant, terminals: usize, systems: usize) usize {
@@ -4238,6 +4362,13 @@ const oneway_levels: u16 = 2;
 const oneway_rooms_per_row: usize = oneway_side / 2;
 const oneway_site_rooms: usize = 8;
 const oneway_site_chunk: ChunkCoord = .{ .x = 1, .y = 1 };
+// Rooms the shrunk variant's cut leaves on its chain.
+const oneway_shrunk_live: usize = 64;
+// Rooms per chain of the dense variant: its systems' merged terminals stay off a power of
+// two, so the merged block keeps slack for the pieces a fill splits off.
+const oneway_dense_terminals: usize = 96;
+// The dense variant's heads: level-0 rooms side by side on the last room row.
+const oneway_dense_row: u16 = oneway_side - 2;
 
 comptime {
     // The end group fits the first room row of one chunk.
@@ -4257,6 +4388,24 @@ fn inOnewaySite(level: u16, cell: CellCoord) bool {
     const dx = @abs(@as(i32, chunk_x) - oneway_site_chunk.x);
     const dy = @abs(@as(i32, chunk_y) - oneway_site_chunk.y);
     return dx + dy <= 1;
+}
+
+// Chain `index`'s head in the dense variant.
+fn denseHead(index: usize) OnewayRoom {
+    std.debug.assert(index < oneway_rooms_per_row);
+    // In range: one room row of level 0.
+    return .{ .level = 0, .cell = .{ .x = @intCast(2 * index), .y = oneway_dense_row } };
+}
+
+// The wall cells joining the dense variant's `systems` heads: between each head and the next.
+fn denseWalls(allocator: std.mem.Allocator, systems: usize) ![]CellCoord {
+    const walls = try allocator.alloc(CellCoord, systems - 1);
+    for (walls, 0..) |*wall, index| wall.* = .{ .x = denseHead(index).cell.x + 1, .y = oneway_dense_row };
+    return walls;
+}
+
+fn isDenseHead(room: OnewayRoom, systems: usize) bool {
+    return room.level == 0 and room.cell.y == oneway_dense_row and room.cell.x < 2 * systems;
 }
 
 fn onewaySiteRoom(index: usize) OnewayRoom {
@@ -4295,10 +4444,13 @@ const OnewayConfig = struct {
         const variant_index = item_count / connectivity_variant_encoding;
         const terminals = item_count % connectivity_variant_encoding / oneway_terminals_encoding;
         const systems = item_count % oneway_terminals_encoding;
-        if (variant_index > @backingInt(OnewayVariant.far_dig)) return error.ConnectivityOnewayUnknownVariant;
+        if (variant_index > @backingInt(OnewayVariant.dense)) return error.ConnectivityOnewayUnknownVariant;
         const variant: OnewayVariant = @fromBackingInt(@as(u8, @intCast(variant_index)));
         if (terminals < oneway_site_rooms or systems == 0) return error.ConnectivityOnewayChainTooShort;
-        if (variant != .locality and systems != 1) return error.ConnectivityOnewayOneChainOnly;
+        if (variant != .locality and variant != .dense and systems != 1) return error.ConnectivityOnewayOneChainOnly;
+        if (variant == .dense and (systems < 2 or systems > oneway_rooms_per_row)) return error.ConnectivityOnewayDenseSystems;
+        // The cut must leave a block at most a quarter full.
+        if (variant == .shrunk and terminals <= 4 * oneway_shrunk_live) return error.ConnectivityOnewayShrunkTooSmall;
         return .{ .variant = variant, .terminals = terminals, .systems = systems };
     }
 
@@ -4319,12 +4471,14 @@ const OnewayConfig = struct {
     }
 
     // The toggled level-0 cell: chain 0's first room (head), its last room (locality,
-    // tail), or a far room in a corner chunk no chain room reaches (far dig).
+    // tail), a far room in a corner chunk no chain room reaches (far dig), or the dense
+    // variant's first wall (it toggles every wall).
     fn toggleCell(self: OnewayConfig) CellCoord {
         return switch (self.variant) {
-            .locality, .tail => onewaySiteRoom(oneway_site_rooms - 1).cell,
+            .locality, .tail, .shrunk, .fan => onewaySiteRoom(oneway_site_rooms - 1).cell,
             .head => onewaySiteRoom(0).cell,
             .far_dig => pocketDigCell(oneway_side),
+            .dense => .{ .x = denseHead(0).cell.x + 1, .y = oneway_dense_row },
         };
     }
 };
@@ -4352,7 +4506,38 @@ fn checkOnewayFarRoom(room: OnewayRoom) !void {
     if (dx + dy <= 1) return error.ConnectivityOnewayChainReachesFarRoom;
 }
 
-fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+// Every system's rooms in order, `config.terminals` each: chain 0's end group in the site,
+// every other room the next free room.
+fn onewayRooms(allocator: std.mem.Allocator, config: OnewayConfig) ![]OnewayRoom {
+    const free_rooms = try onewayFreeRooms(allocator);
+    defer allocator.free(free_rooms);
+    if (config.rooms() - oneway_site_rooms > free_rooms.len) return error.ConnectivityOnewayRoomsTooFew;
+    const rooms = try allocator.alloc(OnewayRoom, config.rooms());
+    errdefer allocator.free(rooms);
+    var next_free: usize = 0;
+    for (0..config.systems) |system_index| {
+        // Chain 0's index at the toggled end: its first link's source for head, else its
+        // last link's target.
+        const toggle_index = if (config.variant == .head) 0 else config.terminals - 1;
+        for (0..config.terminals) |index| {
+            const site_index = if (system_index == 0 and config.variant != .dense) config.firstChainSiteIndex(index) else null;
+            const room = if (config.variant == .dense and index == 0) denseHead(system_index) else if (site_index) |site| onewaySiteRoom(site) else free: {
+                while (config.variant == .dense and isDenseHead(free_rooms[next_free], config.systems)) next_free += 1;
+                defer next_free += 1;
+                break :free free_rooms[next_free];
+            };
+            if (config.variant == .far_dig) try checkOnewayFarRoom(room);
+            if (system_index == 0 and index == toggle_index and config.variant != .far_dig and config.variant != .dense) {
+                const toggle_cell = config.toggleCell();
+                if (room.level != 0 or room.cell.x != toggle_cell.x or room.cell.y != toggle_cell.y) return error.ConnectivityOnewayToggleNotChainEnd;
+            }
+            rooms[system_index * config.terminals + index] = room;
+        }
+    }
+    return rooms;
+}
+
+fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, rooms: []const OnewayRoom, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
     var open = try buildOpenWorld(allocator, io, oneway_side, oneway_levels);
     errdefer open.world.deinit();
     std.debug.assert(open.world.chunk_size_tiles == default_chunk_size_tiles);
@@ -4361,38 +4546,30 @@ fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayCon
         defer allocator.free(walls);
         for (0..oneway_levels) |level_index| try writeLevelCells(&open, @intCast(level_index), walls, open.blocking);
     }
-    const free_rooms = try onewayFreeRooms(allocator);
-    defer allocator.free(free_rooms);
-    if (config.rooms() - oneway_site_rooms > free_rooms.len) return error.ConnectivityOnewayRoomsTooFew;
-    var next_free: usize = 0;
+    if (config.variant == .dense) {
+        // The heads' joining walls start open: one root, one system.
+        const walls = try denseWalls(allocator, config.systems);
+        defer allocator.free(walls);
+        try writeLevelCells(&open, 0, walls, open.walkable);
+    }
+    std.debug.assert(rooms.len == config.rooms());
     for (0..config.systems) |system_index| {
-        var previous: ?OnewayRoom = null;
-        // Chain 0's index at the toggled end: its first link's source for head, else its
-        // last link's target.
-        const toggle_index = if (config.variant == .head) 0 else config.terminals - 1;
-        for (0..config.terminals) |index| {
-            const site_index = if (system_index == 0) config.firstChainSiteIndex(index) else null;
-            const room = if (site_index) |site| onewaySiteRoom(site) else free: {
-                defer next_free += 1;
-                break :free free_rooms[next_free];
-            };
-            if (config.variant == .far_dig) try checkOnewayFarRoom(room);
-            if (system_index == 0 and index == toggle_index and config.variant != .far_dig) {
-                const toggle_cell = config.toggleCell();
-                if (room.level != 0 or room.cell.x != toggle_cell.x or room.cell.y != toggle_cell.y) return error.ConnectivityOnewayToggleNotChainEnd;
-            }
-            if (previous) |from| {
-                try open.world.addLevelLink(.{
-                    .kind = .teleport,
-                    .level_a = from.level,
-                    .cell_a = from.cell,
-                    .level_b = room.level,
-                    .cell_b = room.cell,
-                    .traversal_cost = 1,
-                    .bidirectional = false,
-                });
-            }
-            previous = room;
+        const system_rooms = rooms[system_index * config.terminals ..][0..config.terminals];
+        // A chain joins each room to the next; a fan joins each room to its hub, the next to
+        // last room, and the hub to the last room.
+        const hub = config.terminals - 2;
+        for (system_rooms[1..], 0..) |room, previous| {
+            const from = system_rooms[previous];
+            const to = if (config.variant == .fan and previous < hub) system_rooms[hub] else room;
+            try open.world.addLevelLink(.{
+                .kind = .teleport,
+                .level_a = from.level,
+                .cell_a = from.cell,
+                .level_b = to.level,
+                .cell_b = to.cell,
+                .traversal_cost = 1,
+                .bidirectional = false,
+            });
         }
     }
     var data = DataSystem.init(allocator);
@@ -4402,10 +4579,23 @@ fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayCon
     return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
+// Closes `rooms` (level-0 rooms of one chain) in one untimed nav reaction.
+fn cutOnewayChain(allocator: std.mem.Allocator, io: std.Io, fixture: *EvictFixture, rooms: []const OnewayRoom, thread_system: ?*ThreadSystem) !void {
+    const cells = try allocator.alloc(CellCoord, rooms.len);
+    defer allocator.free(cells);
+    for (rooms, cells) |room, *cell| {
+        if (room.level != 0) return error.ConnectivityOnewayCutOffFloor;
+        cell.* = room.cell;
+    }
+    try fixture.changed.ensureTotalCapacity(allocator, cells.len);
+    const cut = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
+    if (cut.stats.closure_shrinks != 1) return error.ConnectivityOnewayCutNoShrink;
+    try checkOnewayReserve(cut.stats);
+}
+
 fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try OnewayConfig.decode(item_count);
-    const toggle_cell = config.toggleCell();
     var threads = try initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
@@ -4413,13 +4603,24 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     const size_config = toggleSizeConfig(oneway_side, oneway_levels, config.links(), participant_count);
     if (suite.navSizeSkip(connectivity_oneway_group.name, item_count, case, size_config)) |skip| return skip;
 
-    var fixture = try initOnewayFixture(allocator, io, config, navSizeCapacity(size_config), thread_ptr);
+    const rooms = try onewayRooms(allocator, config);
+    defer allocator.free(rooms);
+    var fixture = try initOnewayFixture(allocator, io, config, rooms, navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try fixture.changed.ensureTotalCapacity(allocator, 1);
+    // One toggled cell, or the dense variant's walls.
+    const dense_walls: []CellCoord = if (config.variant == .dense) try denseWalls(allocator, config.systems) else &.{};
+    defer allocator.free(dense_walls);
+    const toggle_cell = config.toggleCell();
+    const cells = if (config.variant == .dense) dense_walls else &[_]CellCoord{toggle_cell};
+    try fixture.changed.ensureTotalCapacity(allocator, cells.len);
     setNavReactionTuners(&fixture.system, case);
     configureNavUpdateThreads(&fixture.system, case);
+    if (config.variant == .shrunk) try cutOnewayChain(allocator, io, &fixture, rooms[0 .. config.terminals - oneway_shrunk_live], thread_ptr);
 
-    var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, &.{toggle_cell}, thread_ptr);
+    // The dense variant's fill and reopen resize blocks and reserve the merged block the
+    // opening can create: its ratio is what the variant measures.
+    const checks: ToggleChecks = if (config.variant == .dense) .{ .fixed_blocks = false, .reserve_ratio = false } else .{};
+    var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks);
     stats.output_count = config.links();
     stats.candidate_pairs = config.rooms();
     return stats;

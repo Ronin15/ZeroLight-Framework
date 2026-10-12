@@ -31,6 +31,10 @@ const NavGraph = @import("nav_graph.zig").NavGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const no_node = @import("connectivity.zig").no_node;
 const no_comp = @import("connectivity.zig").no_comp;
+const no_term = @import("connectivity.zig").no_term;
+const no_hcomp = @import("connectivity.zig").no_hcomp;
+const no_oneway = @import("connectivity.zig").no_oneway;
+const CellCoord = @import("../../world_system.zig").CellCoord;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
@@ -413,6 +417,195 @@ pub fn expectSameConnectivityPartition(a: *const NavGraph, b: *const NavGraph) !
                 try t.expectEqual((try a_to_b.getOrPutValue(root_a, root_b)).value_ptr.*, root_b);
                 try t.expectEqual((try b_to_a.getOrPutValue(root_b, root_a)).value_ptr.*, root_a);
             }
+        }
+    }
+}
+
+// One-way closure checks: a reference over the world's links and terminal pairs.
+
+// The root of the node at `cell` of `level` when the level is built and the cell open.
+fn closureRootAt(graph: *const NavGraph, level: u16, cell: CellCoord) ?u32 {
+    const grid = graph.grid(level) orelse return null;
+    const index = @as(usize, cell.y) * grid.width + cell.x;
+    if (grid.isBlockedIndex(index)) return null;
+    const row = graph.levelGraph(level).?.nodeOf(grid.chunkOfCell(index), grid.labelAt(index));
+    std.debug.assert(row != no_node);
+    return graph.connectivity.comp_root[graph.levelGraph(level).?.node_comp[row]];
+}
+
+/// Asserts `graph`'s one-way closure against `world`: every world link registered (one-way
+/// ones with a row), live one-way links on their component's list with their roots'
+/// terminals and dead ones on none; exactly the roots holding a live endpoint have
+/// terminals; every terminal at its index in its component's map; free indices with zero
+/// rows and columns and rows past the handed-out indices zero; every block at least a quarter
+/// full from 64 indices up; live words summing the live blocks; and each terminal's row equal
+/// to a search over live links between roots.
+pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem) !void {
+    const t = std.testing;
+    const allocator = t.allocator;
+    const conn = &graph.connectivity;
+    const closure = &conn.closure;
+    const links = world.levelLinks();
+    try t.expectEqual(links.len, closure.oneway_cursor);
+    try t.expectEqual(links.len, closure.oneway_of_link.items.len);
+    const oneway = closure.oneway.slice();
+    const roots = conn.roots.len;
+    const holds = try allocator.alloc(bool, roots);
+    defer allocator.free(holds);
+    @memset(holds, false);
+    // Live links as root pairs, for the reference search.
+    var edges: std.ArrayList([2]u32) = .empty;
+    defer edges.deinit(allocator);
+    var live_links: usize = 0;
+    for (links, 0..) |link, index| {
+        const row = closure.oneway_of_link.items[index];
+        if (link.bidirectional) {
+            try t.expectEqual(no_oneway, row);
+            continue;
+        }
+        try t.expect(row != no_oneway and oneway.items(.link)[row] == index);
+        const src = closureRootAt(graph, link.level_a, link.cell_a);
+        const dst = closureRootAt(graph, link.level_b, link.cell_b);
+        if (src == null or dst == null) {
+            try t.expectEqual(no_hcomp, oneway.items(.hcomp)[row]);
+            continue;
+        }
+        live_links += 1;
+        holds[src.?] = true;
+        holds[dst.?] = true;
+        try edges.append(allocator, .{ src.?, dst.? });
+        try t.expect(oneway.items(.hcomp)[row] != no_hcomp);
+        try t.expectEqual(conn.root_term[src.?], oneway.items(.src_term)[row]);
+        try t.expectEqual(conn.root_term[dst.?], oneway.items(.dst_term)[row]);
+    }
+    const free_root = try allocator.alloc(bool, roots);
+    defer allocator.free(free_root);
+    @memset(free_root, false);
+    for (conn.root_free.items) |root| free_root[root] = true;
+    var terminals: std.ArrayList(u32) = .empty;
+    defer terminals.deinit(allocator);
+    for (0..roots) |root| {
+        const term = conn.root_term[root];
+        if (free_root[root]) {
+            try t.expectEqual(no_term, term);
+            continue;
+        }
+        try t.expectEqual(holds[root], term != no_term);
+        if (term == no_term) continue;
+        try t.expectEqual(@as(u32, @intCast(root)), closure.term.root[term]);
+        try terminals.append(allocator, @intCast(root));
+    }
+    try t.expectEqual(terminals.items.len, closure.termCount());
+    // Components: maps, free lists, zero rows and columns, links, words.
+    var live_words: usize = 0;
+    var listed_links: usize = 0;
+    var live_terms: usize = 0;
+    const words = closure.words.items;
+    for (0..closure.hcomps.len) |id| {
+        const k_cap = closure.hcomp.k_cap[id];
+        if (k_cap == 0) continue;
+        const row_words: usize = @max(1, k_cap / 32);
+        const block = closure.hcomp.block[id];
+        const map = words[block + @as(usize, k_cap) * row_words ..][0..k_cap];
+        const k_high = closure.hcomp.k_high[id];
+        live_words += std.mem.alignForward(usize, @as(usize, k_cap) * (row_words + 1), 16);
+        var live: u32 = 0;
+        var free: u32 = 0;
+        for (map[0..k_high], 0..) |entry, index| {
+            if (entry & (1 << 31) != 0) {
+                free += 1;
+                for (words[block + index * row_words ..][0..row_words]) |word| try t.expectEqual(@as(u32, 0), word);
+                for (0..k_high) |other| {
+                    const word = words[block + other * row_words + index / 32];
+                    try t.expectEqual(@as(u32, 0), (word >> @intCast(index % 32)) & 1);
+                }
+                continue;
+            }
+            live += 1;
+            try t.expectEqual(@as(u32, @intCast(id)), closure.term.hcomp[entry]);
+            try t.expectEqual(@as(u32, @intCast(index)), closure.term.index[entry]);
+        }
+        for (k_high..k_cap) |index| {
+            for (words[block + index * row_words ..][0..row_words]) |word| try t.expectEqual(@as(u32, 0), word);
+        }
+        try t.expectEqual(live, closure.hcomp.k_live[id]);
+        // Blocks follow their live terminals: under a quarter full only below 64 indices.
+        try t.expect(k_high <= k_cap);
+        try t.expect(k_cap < 64 or 4 * live >= k_cap);
+        var walked: u32 = 0;
+        var cursor = closure.hcomp.index_free[id];
+        while (cursor != (1 << 31) - 1) : (cursor = map[cursor] & ~@as(u32, 1 << 31)) walked += 1;
+        try t.expectEqual(free, walked);
+        live_terms += live;
+        var link_count: u32 = 0;
+        var link = closure.hcomp.link_head[id];
+        while (link != no_oneway) : (link = oneway.items(.next)[link]) {
+            try t.expectEqual(@as(u32, @intCast(id)), oneway.items(.hcomp)[link]);
+            link_count += 1;
+        }
+        try t.expectEqual(closure.hcomp.link_count[id], link_count);
+        listed_links += link_count;
+    }
+    try t.expectEqual(live_words, closure.live_words);
+    try t.expectEqual(live_links, listed_links);
+    try t.expectEqual(terminals.items.len, live_terms);
+    // Reference: per terminal root, a search over live links between roots.
+    const seen = try allocator.alloc(bool, roots);
+    defer allocator.free(seen);
+    var queue: std.ArrayList(u32) = .empty;
+    defer queue.deinit(allocator);
+    for (terminals.items) |from| {
+        @memset(seen, false);
+        queue.clearRetainingCapacity();
+        seen[from] = true;
+        try queue.append(allocator, from);
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            const at = queue.items[head];
+            for (edges.items) |edge| {
+                if (edge[0] != at or seen[edge[1]]) continue;
+                seen[edge[1]] = true;
+                try queue.append(allocator, edge[1]);
+            }
+        }
+        for (terminals.items) |to| {
+            try t.expectEqual(seen[to], closure.termReaches(conn.root_term[from], conn.root_term[to]));
+        }
+    }
+}
+
+/// Asserts `a` and `b` hold the same terminals, keyed by a node of their root, with the same
+/// closure reach between every pair (ids, indices, and blocks may differ).
+pub fn expectSameClosure(a: *const NavGraph, b: *const NavGraph) !void {
+    const t = std.testing;
+    const allocator = t.allocator;
+    try t.expectEqual(a.connectivity.closure.termCount(), b.connectivity.closure.termCount());
+    // Per terminal of `a`: the terminal of `b` at one of its root's nodes.
+    var pairs: std.ArrayList([2]u32) = .empty;
+    defer pairs.deinit(allocator);
+    const mapped = try allocator.alloc(bool, a.connectivity.roots.len);
+    defer allocator.free(mapped);
+    @memset(mapped, false);
+    for (a.level_graphs.items, b.level_graphs.items) |*graph_a, *graph_b| {
+        for (0..graph_a.record_dir.items.len) |chunk_usize| {
+            const chunk: u32 = @intCast(chunk_usize);
+            const record = graph_a.recordOf(chunk) orelse continue;
+            var row = graph_a.record_node_head[record];
+            while (row != no_node) : (row = graph_a.node_sibling[row]) {
+                const root = a.connectivity.comp_root[graph_a.node_comp[row]];
+                if (mapped[root] or a.connectivity.root_term[root] == no_term) continue;
+                mapped[root] = true;
+                const other = graph_b.nodeOf(chunk, graph_a.node_label[row]);
+                try t.expect(other != no_node);
+                const other_term = b.connectivity.root_term[b.connectivity.comp_root[graph_b.node_comp[other]]];
+                try t.expect(other_term != no_term);
+                try pairs.append(allocator, .{ a.connectivity.root_term[root], other_term });
+            }
+        }
+    }
+    for (pairs.items) |from| {
+        for (pairs.items) |to| {
+            try t.expectEqual(a.connectivity.closure.termReaches(from[0], to[0]), b.connectivity.closure.termReaches(from[1], to[1]));
         }
     }
 }

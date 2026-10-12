@@ -50,6 +50,8 @@ const NavUpdateStats = types.NavUpdateStats;
 const setLen = types.setLen;
 const Connectivity = @import("connectivity.zig").Connectivity;
 const ConnectivityCounters = @import("connectivity.zig").ConnectivityCounters;
+const ClosureCounters = @import("connectivity.zig").ClosureCounters;
+const ClosureThreads = @import("connectivity.zig").ClosureThreads;
 const NodeRow = @import("connectivity.zig").NodeRow;
 const no_node = @import("connectivity.zig").no_node;
 const no_comp = @import("connectivity.zig").no_comp;
@@ -459,7 +461,8 @@ pub const NavStageThreads = struct {
 };
 
 /// Threading for nav batches: the shared thread system plus one tuner per stage (key
-/// plan, remask and component flood, record patch, connectivity seed, gather, and flood).
+/// plan, remask and component flood, record patch, connectivity seed, gather, and flood, and
+/// the one-way closure's candidates, resolve, mask, plan, rows, and compaction).
 /// Absent: every stage runs inline.
 pub const NavUpdateThreads = struct {
     thread_system: *ThreadSystem,
@@ -469,6 +472,12 @@ pub const NavUpdateThreads = struct {
     conn_seed_tuner: *AdaptiveWorkTuner,
     conn_gather_tuner: *AdaptiveWorkTuner,
     conn_flood_tuner: *AdaptiveWorkTuner,
+    conn_candidates_tuner: *AdaptiveWorkTuner,
+    conn_closure_resolve_tuner: *AdaptiveWorkTuner,
+    conn_closure_mask_tuner: *AdaptiveWorkTuner,
+    conn_closure_plan_tuner: *AdaptiveWorkTuner,
+    conn_closure_rows_tuner: *AdaptiveWorkTuner,
+    conn_closure_compact_tuner: *AdaptiveWorkTuner,
     adaptive: bool = true,
     items_per_range: ?usize = null,
 
@@ -509,6 +518,18 @@ fn connGatherThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
 
 fn connFloodThreads(threads: ?NavUpdateThreads) ?NavStageThreads {
     return if (threads) |t| t.stage(t.conn_flood_tuner) else null;
+}
+
+fn closureThreads(threads: ?NavUpdateThreads) ClosureThreads {
+    const t = threads orelse return .{};
+    return .{
+        .candidates = t.stage(t.conn_candidates_tuner),
+        .resolve = t.stage(t.conn_closure_resolve_tuner),
+        .mask = t.stage(t.conn_closure_mask_tuner),
+        .plan = t.stage(t.conn_closure_plan_tuner),
+        .rows = t.stage(t.conn_closure_rows_tuner),
+        .compact = t.stage(t.conn_closure_compact_tuner),
+    };
 }
 
 /// A batch key: the (level, chunk) pair, sorted level-major.
@@ -681,12 +702,23 @@ fn remaskJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     }
 }
 
-// One range of the patch stage: each key re-derives its own chunk's record.
+// Grows a link slot's list to hold `limit` entries, geometrically and counted.
+fn growSlotList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, limit: usize, pool_grows: *u64) !void {
+    if (list.capacity < limit) {
+        try list.ensureTotalCapacity(allocator, limit);
+        pool_grows.* += 1;
+    }
+    std.debug.assert(list.capacity >= limit);
+}
+
+// One range of the patch stage: each key re-derives its own chunk's record, appending at most
+// its planned endpoint count to its link slot.
 const PatchJob = struct {
     graph: *const NavGraph,
     levels: BatchLevels,
     world: ?*const WorldSystem,
     keys: []const u64,
+    infos: []const PatchInfo,
     range_count: usize = 0,
 };
 
@@ -694,10 +726,10 @@ fn patchJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *PatchJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= job.keys.len);
-    for (job.keys[range.start..range.end]) |key| {
+    std.debug.assert(range.end <= job.keys.len and job.infos.len == job.keys.len);
+    for (job.keys[range.start..range.end], job.infos[range.start..range.end]) |key, info| {
         const level = keyLevel(key);
-        job.graph.patchRecord(job.levels.grid(level), job.levels.graph(level), job.world, level, keyChunk(key));
+        job.graph.patchRecord(job.levels.grid(level), job.levels.graph(level), job.world, level, keyChunk(key), info.endpoints);
     }
 }
 
@@ -744,9 +776,9 @@ fn inlineBatch(item_count: usize) BatchStats {
     };
 }
 
-// Folds one batch's shape into a running total: summed counts and times, the widest range
-// and worker use, and inline only when every batch ran inline.
-fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
+/// Folds one batch's shape into a running total: summed counts and times, the widest range
+/// and worker use, and inline only when every batch ran inline.
+pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
     if (batch.item_count == 0) return;
     total.item_count += batch.item_count;
     total.range_count += batch.range_count;
@@ -855,6 +887,37 @@ fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, count
     accumulateBatch(&stats.conn_seed_batch, conn.last_seed_batch);
     accumulateBatch(&stats.conn_gather_batch, conn.last_gather_batch);
     accumulateBatch(&stats.conn_flood_batch, conn.last_flood_batch);
+    addClosureStats(stats, conn, counters.closure);
+}
+
+// Folds one batch's closure counters and commit-side stage shapes into `stats`; the prepare
+// stages (candidates, compaction) fold where they run.
+fn addClosureStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ClosureCounters) void {
+    stats.closure_touched += counters.touched;
+    stats.closure_links += counters.links;
+    stats.closure_terms_new += counters.terms_new;
+    stats.closure_terms_left += counters.terms_left;
+    stats.closure_a_rows += counters.a_rows;
+    stats.closure_rounds += counters.rounds;
+    stats.closure_words_written += counters.words_written;
+    stats.closure_shrinks += counters.shrinks;
+    stats.closure_live_words = conn.closure.live_words;
+    stats.closure_dead_words = conn.closure.dead_words;
+    stats.closure_arena_capacity = conn.closure.words.capacity;
+    if (conn.closure.active) {
+        const limits = conn.closure.limits;
+        stats.closure_tail_bound = @max(stats.closure_tail_bound, limits.arena_tail);
+        stats.closure_tail_used = @max(stats.closure_tail_used, counters.tail_words);
+        stats.closure_arena_limit = @max(stats.closure_arena_limit, conn.closure.arena_limit);
+        stats.closure_candidate_words = @max(stats.closure_candidate_words, limits.candidate_words);
+        stats.closure_live_prepared = @max(stats.closure_live_prepared, limits.live_prepared);
+        stats.closure_kb = @max(stats.closure_kb, limits.k_b);
+    }
+    if (counters.links == 0) return;
+    accumulateBatch(&stats.conn_closure_resolve_batch, conn.closure.last_resolve_batch);
+    accumulateBatch(&stats.conn_closure_mask_batch, conn.closure.last_mask_batch);
+    accumulateBatch(&stats.conn_closure_plan_batch, conn.closure.last_plan_batch);
+    accumulateBatch(&stats.conn_closure_rows_batch, conn.closure.last_rows_batch);
 }
 
 /// A marks batch between `NavGraph.prepareMarks` and its commit or abort.
@@ -1479,6 +1542,10 @@ pub const NavGraph = struct {
         try fresh.level_graphs.ensureTotalCapacity(self.allocator, level_count);
         var stats = NavUpdateStats{};
         for (0..level_count) |level| try fresh.buildLevel(colliders, world, @intCast(level), threads, &stats);
+        // The one-way closure over every level at once, after the levels and before the swap.
+        const fresh_levels = BatchLevels{ .grids = fresh.levels.items, .graphs = fresh.level_graphs.items };
+        const closure_counters = try fresh.connectivity.buildClosure(self.allocator, fresh_levels, world, closureThreads(threads), &fresh.pool_grows, &stats);
+        addClosureStats(&stats, &fresh.connectivity, closure_counters);
         if (world) |world_system| {
             fresh.link_bounds.foldLinks(world_system.levelLinks());
             fresh.links_applied = world_system.levelLinks().len;
@@ -1552,6 +1619,7 @@ pub const NavGraph = struct {
             connSeedThreads(threads),
             connGatherThreads(threads),
             connFloodThreads(threads),
+            closureThreads(threads),
             &self.pool_grows,
             stats,
         );
@@ -1577,7 +1645,7 @@ pub const NavGraph = struct {
         const links = world.levelLinks();
         // Links are append-only.
         std.debug.assert(links.len >= self.links_applied);
-        return links[@min(self.links_applied, links.len)..];
+        return links[self.links_applied..];
     }
 
     /// Prepares `marks` and every link added since the last batch as one transaction, the
@@ -1619,12 +1687,15 @@ pub const NavGraph = struct {
                 self.changed_keys.items,
                 self.patch_keys.items,
                 self.patch_info.items,
-                new_links.len,
+                new_links,
                 connSeedThreads(threads),
+                closureThreads(threads),
                 &self.pool_grows,
                 stats,
             );
         }
+        // The one-way registry rows the commit appends for the new links.
+        try self.connectivity.reserveRegistry(self.allocator, new_links, &self.pool_grows);
         self.batch_prepared = true;
         return prepared;
     }
@@ -1645,13 +1716,14 @@ pub const NavGraph = struct {
         const new_links: []const LevelLink = if (prepared.world) |world| world.levelLinks()[first_link..][0..prepared.new_link_count] else &.{};
         self.link_bounds.foldLinks(new_links);
         self.links_applied += prepared.new_link_count;
+        self.connectivity.appendRegistry(new_links);
         if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .changed_keys = &.{}, .changed_masks = &.{} };
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
         std.debug.assert(self.changed_masks.items.len == self.changed_keys.items.len);
         self.remaskKeys(levels, colliders, prepared.world, self.changed_masks.items, remaskThreads(threads), stats);
         self.claimRecords(levels);
         self.patchKeys(levels, prepared.world, patchThreads(threads), stats);
-        const counters = self.connectivity.commitMarks(levels, prepared.world, self.patch_keys.items, new_links, connGatherThreads(threads), connFloodThreads(threads), stats);
+        const counters = self.connectivity.commitMarks(levels, prepared.world, self.patch_keys.items, new_links, connGatherThreads(threads), connFloodThreads(threads), closureThreads(threads), stats);
         addConnectivityStats(stats, &self.connectivity, counters);
         stats.records_patched += self.releaseRecords(levels);
         stats.dirty_chunks += self.changed_keys.items.len;
@@ -1945,10 +2017,10 @@ pub const NavGraph = struct {
                     slot_claims += 1;
                     break :blk level_graph.link_free.items[level_graph.link_free.items.len - slot_claims];
                 };
-                // Precise: a slot holds its chunk's endpoint count, which grows one link at a
-                // time, and a patch that read more endpoints than planned trips its append.
-                try level_graph.slot_extra[slot].ensureTotalCapacityPrecise(self.allocator, info.endpoints);
-                try level_graph.slot_links[slot].ensureTotalCapacityPrecise(self.allocator, info.endpoints);
+                // Geometric: a chunk's endpoint count only grows (links are append-only). The
+                // patch bounds its appends by the planned count, not the capacity.
+                try growSlotList(NavPortal, &level_graph.slot_extra[slot], self.allocator, info.endpoints, &self.pool_grows);
+                try growSlotList(NavLink, &level_graph.slot_links[slot], self.allocator, info.endpoints, &self.pool_grows);
             }
             start = end;
         }
@@ -2032,7 +2104,7 @@ pub const NavGraph = struct {
     }
 
     fn patchKeys(self: *NavGraph, levels: BatchLevels, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
-        var job = PatchJob{ .graph = self, .levels = levels, .world = world, .keys = self.patch_keys.items };
+        var job = PatchJob{ .graph = self, .levels = levels, .world = world, .keys = self.patch_keys.items, .infos = self.patch_info.items };
         self.last_patch_batch = runStage(threads, self.patch_keys.items.len, &job, &job.range_count, patchJob);
         stats.off_main_stage_ns += offMainNs(self.last_patch_batch);
     }
@@ -2062,7 +2134,7 @@ pub const NavGraph = struct {
     // its link slot, so keys patch in parallel. Border portals follow one rule per side: one
     // portal per maximal run of open cell pairs across the side, at the run's midpoint
     // (floor-biased), so both chunks sharing a side pick the same pair independently.
-    fn patchRecord(self: *const NavGraph, level_grid: *const NavGrid, level_graph: *NavLevelGraph, world: ?*const WorldSystem, level: u16, chunk: u32) void {
+    fn patchRecord(self: *const NavGraph, level_grid: *const NavGrid, level_graph: *NavLevelGraph, world: ?*const WorldSystem, level: u16, chunk: u32, endpoint_limit: u32) void {
         const record = level_graph.record_dir.items[chunk];
         if (record == no_record) return;
         const bounds = level_grid.chunkBounds(chunk);
@@ -2127,10 +2199,12 @@ pub const NavGraph = struct {
                     if (findLocal(portals[0..count], local)) |existing| {
                         portals[existing].flags.link = true;
                     } else if (findLocalLinear(extra.items, local) == null) {
-                        // The reserve sized the slot's lists to the chunk's endpoint count.
+                        // The reserve sized the slot's lists to the planned endpoint count.
+                        std.debug.assert(extra.items.len < endpoint_limit);
                         extra.appendAssumeCapacity(.{ .local = local, .label = level_grid.labelAt(cell), .flags = .{ .link = true } });
                     }
                     if (endpoint.side == .a or endpoint.bidirectional) {
+                        std.debug.assert(links.items.len < endpoint_limit);
                         links.appendAssumeCapacity(.{
                             .local = local,
                             .to_level = endpoint.other_level,
@@ -2251,8 +2325,8 @@ const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 
 // Asserts graph `a` equals graph `b` level by level: every chunk's form, cell bits, and
 // labels, the blocked count, every chunk's record content (border portals, extra portals,
-// links), and the connectivity partition, each graph's connectivity consistent with its own
-// records.
+// links), the connectivity partition, each graph's connectivity consistent with its own
+// records, and the one-way closure's reach between terminals.
 fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
     const t = std.testing;
     try t.expectEqual(a.levels.items.len, b.levels.items.len);
@@ -2262,6 +2336,7 @@ fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
     try test_support.expectConnectivityConsistent(a);
     try test_support.expectConnectivityConsistent(b);
     try test_support.expectSameConnectivityPartition(a, b);
+    try test_support.expectSameClosure(a, b);
 }
 
 // Whether `level` holds the same cells and records in `a` and `b`.
@@ -3462,15 +3537,23 @@ test "a nav-record reserve OOM before a cave-in or explosion dense write leaves 
     }
 }
 
-test "one chunk's change leaves every other chunk's record and connectivity nodes untouched" {
+test "one chunk's change leaves every other chunk's record, connectivity nodes, and one-way terminals and rows untouched" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     var fixture = try twoLevelWorld(&meta);
     defer fixture.world.deinit();
+    // A one-way link between corner chunks the change never patches.
+    try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 1, .y = 1 }, .level_b = 1, .cell_b = .{ .x = 10, .y = 10 }, .traversal_cost = 1, .bidirectional = false });
     var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer system.deinit();
+    const closure = &system.graph.connectivity.closure;
+    try std.testing.expectEqual(@as(usize, 2), closure.termCount());
+    const closure_words_before = try std.testing.allocator.dupe(u32, closure.words.items);
+    defer std.testing.allocator.free(closure_words_before);
+    const term_index_before = try std.testing.allocator.dupe(u32, closure.term.index);
+    defer std.testing.allocator.free(term_index_before);
     var before = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer before.deinit();
     const record_dir_before = try std.testing.allocator.dupe(u32, system.graph.levelGraph(0).?.record_dir.items);
@@ -3485,6 +3568,11 @@ test "one chunk's change leaves every other chunk's record and connectivity node
     const stats = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_nodes);
+    try std.testing.expectEqual(@as(usize, 0), stats.closure_links);
+    try std.testing.expectEqualSlices(u32, closure_words_before, closure.words.items);
+    // The prepare may grow the terminal pool (the dig shares a root with a terminal); the
+    // live terminals keep their indices.
+    try std.testing.expectEqualSlices(u32, term_index_before, closure.term.index[0..term_index_before.len]);
     const patched = [_]u32{ 4, 3, 5, 1, 7 };
     const level_graph = system.graph.levelGraph(0).?;
     for (0..system.graph.chunkCount()) |chunk_index| {
@@ -3553,9 +3641,10 @@ test "a batch touching more than eight levels applies incrementally and never ch
 }
 
 // Nav changes the out-of-memory sweeps apply, each recorded with the real allocator.
-const OomEdit = enum { dig, cave_in, ramp, static_add, level_add, blocking_layer, level_and_link };
+const OomEdit = enum { dig, cave_in, ramp, static_add, level_add, blocking_layer, level_and_link, oneway };
 
-// Three open levels in 4-tile chunks with an obstacle band each and a blocked ramp cell.
+// Three open levels in 4-tile chunks with an obstacle band each, a blocked ramp cell, and a
+// one-way system: levels 0 to 1 to 2 and back to 0.
 fn oomWorld(meta: *const @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta) !WorldSystem {
     const grass = try requireTestTile(meta, "grass");
     const tree = try requireTestTile(meta, "tree_0");
@@ -3568,6 +3657,10 @@ fn oomWorld(meta: *const @import("../../../assets/world_tileset_meta.zig").World
         _ = try world.addDenseLayer(@intCast(level), 0, .obstacle, grass);
     }
     _ = try world.setDenseTile(oomObstacle(&world, 1), 5, 5, tree);
+    // Level 2 is open everywhere, so its end shares one root with the next link's start.
+    for ([_][4]u16{ .{ 0, 10, 1, 1 }, .{ 1, 10, 2, 9 }, .{ 2, 8, 0, 1 } }) |end| {
+        try world.addLevelLink(.{ .kind = .teleport, .level_a = end[0], .cell_a = .{ .x = end[1], .y = end[1] }, .level_b = end[2], .cell_b = .{ .x = end[3], .y = end[3] }, .traversal_cost = 1, .bidirectional = false });
+    }
     return world;
 }
 
@@ -3610,6 +3703,12 @@ fn applyOomEdit(edit: OomEdit, system: *PathfindingSystem, data: *DataSystem, co
             const level = try world.addLevel(-48);
             _ = try world.addDenseLayer(level, 0, .floor, grass);
             try world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 2, .y = 2 }, .level_b = level, .cell_b = .{ .x = 9, .y = 9 }, .traversal_cost = 3, .bidirectional = true });
+        },
+        // A one-way endpoint closed and a new one-way link joining another system.
+        .oneway => {
+            const changed = (try world.setDenseTile(oomObstacle(world, 1), 10, 10, tree)).?;
+            try system.markNavDirty(changed.level, changed.x, changed.y);
+            try world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 11, .y = 0 }, .level_b = 1, .cell_b = .{ .x = 0, .y = 11 }, .traversal_cost = 1, .bidirectional = false });
         },
     }
 }
@@ -3896,19 +3995,51 @@ test "a patch reads only its chunk's link endpoints" {
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[1], 6, 5, fixture.tree)).?;
     _ = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
-    // The patched record holds exactly its level-local link, and its link slot was sized to
-    // the one planned endpoint, so reading more would have tripped the slot's append.
+    // The patched record holds exactly its level-local link: the batch planned one endpoint,
+    // and the patch asserts its appends stay within the planned count.
     const chunk = system.graph.chunkOf(5 * system.graph.width + 5);
     const portals = system.graph.chunkPortals(1, chunk);
     try std.testing.expectEqual(@as(usize, 1), portals.links.len);
     try std.testing.expectEqual(@as(u16, 0), portals.links[0].to_level);
-    const level_graph = system.graph.levelGraph(1).?;
-    const slot = level_graph.record_link_slot[level_graph.record_dir.items[chunk]];
-    try std.testing.expectEqual(@as(usize, 1), level_graph.slot_links[slot].capacity);
-    try std.testing.expect(level_graph.slot_extra[slot].capacity <= 1);
     var planned: u64 = 0;
     for (system.graph.patch_info.items) |info| planned += info.endpoints;
     try std.testing.expectEqual(@as(u64, 1), planned);
+    const level_graph = system.graph.levelGraph(1).?;
+    const slot = level_graph.record_link_slot[level_graph.record_dir.items[chunk]];
+    try std.testing.expect(level_graph.slot_links[slot].capacity >= planned);
+    var rebuilt = try fullRebuild(&data, &fixture.world, abstractCapacity());
+    defer rebuilt.deinit();
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "a chunk gaining a link per batch grows its link slot geometrically, each growth counted" {
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var fixture = try twoLevelWorld(&meta);
+    defer fixture.world.deinit();
+    var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
+    defer system.deinit();
+    const chunk = system.graph.chunkOf(6 * system.graph.width + 6);
+    var capacity: usize = 0;
+    var growths: u64 = 0;
+    const batches = 32;
+    for (0..batches) |_| {
+        try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 6, .y = 6 }, .level_b = 0, .cell_b = .{ .x = 6, .y = 7 }, .traversal_cost = 1, .bidirectional = false });
+        const pool_grows = system.graph.pool_grows;
+        _ = try system.applyNavUpdates(no_colliders, &fixture.world, &.{});
+        const level_graph = system.graph.levelGraph(0).?;
+        const slot = level_graph.record_link_slot[level_graph.record_dir.items[chunk]];
+        if (level_graph.slot_links[slot].capacity != capacity) {
+            capacity = level_graph.slot_links[slot].capacity;
+            growths += 1;
+            try std.testing.expect(system.graph.pool_grows > pool_grows);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, batches), system.graph.chunkPortals(0, chunk).links.len);
+    // Geometric: a handful of growths for 32 links (one per link if grown exactly).
+    try std.testing.expect(growths <= 8);
     var rebuilt = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer rebuilt.deinit();
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);

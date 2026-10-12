@@ -7,7 +7,10 @@
   changed, never to level size, depth, or world count. The one exception is
   reachability maintenance. After a removed connection it costs the smaller
   side when the removal splits a component, or the reach until both sides'
-  floods meet when nothing splits (a cut ring costs its ring).
+  floods meet when nothing splits (a cut ring costs its ring). While one-way
+  links exist, a change to a one-way link or to a component holding one costs
+  that one-way system's terminals and links plus the closure rows of its
+  affected terminals.
 - Everything lives per world instance; no global or cross-world caps or tables.
   Worlds, levels, and dungeons are created and released in play, and their
   memory goes with them.

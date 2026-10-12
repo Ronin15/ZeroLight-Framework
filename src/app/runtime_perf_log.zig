@@ -239,6 +239,9 @@ pub const BatchStage = enum {
     // The nav reaction's connectivity flood, its rounds summed: the removal-shaped share of a
     // dig, fill, or dense terrain change.
     nav_connect,
+    // The nav reaction's one-way closure rows, round 0 and its rounds summed: the cost of a
+    // change to a one-way system.
+    nav_closure,
     nav_evict,
     particles,
     sprite_prep,

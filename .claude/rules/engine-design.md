@@ -44,7 +44,9 @@ Every design, and every fix touching storage or per-change work, states:
   order.
 - Pass: local-change cost depends only on what changed, except reachability
   maintenance, which costs the smaller side of a split or, when nothing
-  splits, the reach until both sides meet (`budgets-capacities.md`); a
+  splits, the reach until both sides meet, and, in a touched one-way system,
+  its terminals and links plus the affected closure rows
+  (`budgets-capacities.md`); a
   population's per-step load costs O(1) per requester plus the distinct work
   requested (goals, regions, chunks), summed over worlds; memory follows what
   exists and is released with it; nothing is sized from demo constants;

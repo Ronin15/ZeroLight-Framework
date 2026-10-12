@@ -283,6 +283,14 @@ pub const PathfindingSystem = struct {
     nav_conn_seed_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_conn_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_conn_flood_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The one-way closure's stages (candidate scan, link resolve, row mask, SCC plan, rows,
+    // arena compaction) each own a tuner.
+    nav_conn_candidates_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_conn_closure_resolve_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_conn_closure_mask_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_conn_closure_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_conn_closure_rows_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    nav_conn_closure_compact_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // The publish byte copy, the registry flush, and a shrink's resize copy each own a
     // tuner; so do the eviction's bound count, halo walk, and flush.
     publish_copy_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -777,6 +785,12 @@ pub const PathfindingSystem = struct {
         self.nav_conn_seed_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_conn_gather_tuner = AdaptiveWorkTuner.init(.{});
         self.nav_conn_flood_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_candidates_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_closure_resolve_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_closure_mask_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_closure_plan_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_closure_rows_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_conn_closure_compact_tuner = AdaptiveWorkTuner.init(.{});
         self.publish_copy_tuner = AdaptiveWorkTuner.init(.{});
         self.registry_flush_tuner = AdaptiveWorkTuner.init(.{});
         self.resize_copy_tuner = AdaptiveWorkTuner.init(.{});
@@ -795,6 +809,12 @@ pub const PathfindingSystem = struct {
             .conn_seed_tuner = &self.nav_conn_seed_tuner,
             .conn_gather_tuner = &self.nav_conn_gather_tuner,
             .conn_flood_tuner = &self.nav_conn_flood_tuner,
+            .conn_candidates_tuner = &self.nav_conn_candidates_tuner,
+            .conn_closure_resolve_tuner = &self.nav_conn_closure_resolve_tuner,
+            .conn_closure_mask_tuner = &self.nav_conn_closure_mask_tuner,
+            .conn_closure_plan_tuner = &self.nav_conn_closure_plan_tuner,
+            .conn_closure_rows_tuner = &self.nav_conn_closure_rows_tuner,
+            .conn_closure_compact_tuner = &self.nav_conn_closure_compact_tuner,
             .adaptive = self.nav_thread_adaptive,
             .items_per_range = self.nav_thread_items_per_range,
         };

@@ -68,6 +68,15 @@ pub fn storeFloat4Slice(values: []f32, vector: Float4) void {
     }
 }
 
+/// Stores the four lanes of `vector` into the first four values of `values`, in lane order;
+/// the rest of `values` is left as it was.
+pub fn storeUint4Slice(values: []u32, vector: Uint4) void {
+    std.debug.assert(values.len >= lane_count);
+    inline for (0..lane_count) |index| {
+        values[index] = vector[index];
+    }
+}
+
 pub fn storeInt4(values: *[lane_count]i32, vector: Int4) void {
     values.* = toIntArray(vector);
 }
@@ -508,6 +517,15 @@ test "uint load and equal match scalar results, including the u32-max lane" {
     inline for (0..lane_count) |lane| {
         try std.testing.expectEqual(lhs_source[lane] == rhs_source[lane], mask[lane]);
     }
+}
+
+test "storeUint4Slice round-trips loadUint4 and writes exactly four words" {
+    const source = [_]u32{ 1, std.math.maxInt(u32), 0, 0x8000_0001 };
+    var stored = [_]u32{ 9, 9, 9, 9, 9, 9 };
+    storeUint4Slice(stored[1..], loadUint4(&source));
+    try std.testing.expectEqualSlices(u32, &source, stored[1..5]);
+    try std.testing.expectEqual(@as(u32, 9), stored[0]);
+    try std.testing.expectEqual(@as(u32, 9), stored[5]);
 }
 
 test "float operations match scalar results" {

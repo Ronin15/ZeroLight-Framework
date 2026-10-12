@@ -69,4 +69,5 @@ paths:
   regardless of the absolute number, except reachability maintenance
   (`budgets-capacities.md`), whose benches pass when each removal's cost
   follows its own smaller side or detour reach and never another change or
-  the level around it.
+  the level around it; and each one-way change's closure cost follows its own
+  one-way system and affected rows, never another system's.
