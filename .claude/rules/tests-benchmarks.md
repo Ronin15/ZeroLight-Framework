@@ -48,9 +48,7 @@ paths:
   the owner or a slice asks.
 - Bench only changes that can move a hot path. Compare before/after on adjacent
   commits in Debug (ReleaseFast only per `build-validation.md`) with 3
-  reps and medians (`tools/bench_ab.py`, which reuses a side's reps cached
-  within hours; `--fresh` reruns both interleaved when a verdict sits at the
-  edge of spread); a regression is a change
+  reps and medians (`tools/bench_ab.py`); a regression is a change
   beyond the run-to-run spread. Act on one only when it shows a worse growth
   order or a material total; a nanosecond-per-item constant is reported, not
   redesigned. A constant is material when it moves the stage's total beyond
