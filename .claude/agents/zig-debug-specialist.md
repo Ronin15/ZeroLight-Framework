@@ -65,8 +65,8 @@ hypothesis until a measurement tests it; say which.
 3. Test one hypothesis.
 4. At a runtime/integration boundary, add or keep diagnostics that make the
    failure class diagnosable next time.
-5. Fix the confirmed cause; re-run; widen validation only after it passes
-   (`verify` after a multi-layer fix).
+5. Fix the confirmed cause; re-run the failing command, then validate per
+   `.claude/rules/build-validation.md`.
 
 Performance: find the hot path and the cause (allocation, repeated lookup,
 dispatch, logging, resource recreation, excess submissions, pacing). For
