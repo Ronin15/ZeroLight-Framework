@@ -848,8 +848,9 @@ pub const WorldSystem = struct {
         const tile_size = self.tile_size;
         const min_tile_x = floorTileClamped(rect.x, tile_size, self.width);
         const min_tile_y = floorTileClamped(rect.y, tile_size, self.height);
-        const max_tile_x = lastTileClamped(rect.x, rect.w, tile_size, self.width);
-        const max_tile_y = lastTileClamped(rect.y, rect.h, tile_size, self.height);
+        // Clamped below the u16 width/height.
+        const max_tile_x: u16 = @intCast(math.lastCellOfSpan(rect.x, rect.x + rect.w, tile_size, self.width));
+        const max_tile_y: u16 = @intCast(math.lastCellOfSpan(rect.y, rect.y + rect.h, tile_size, self.height));
         return .{
             .min_tile_x = min_tile_x,
             .min_tile_y = min_tile_y,
@@ -3174,16 +3175,6 @@ fn ceilDiv(value: u16, divisor: u16) u16 {
 
 fn floorTileClamped(value: f32, tile_size: f32, max_tiles: u16) u16 {
     return @intCast(math.worldPosToCell(value, tile_size, max_tiles));
-}
-
-// The last tile a span from `origin` of `extent` pixels covers, clamped to the
-// grid: an end exactly on a tile edge excludes the tile starting there, at any f32
-// magnitude. Never before the span's first tile.
-fn lastTileClamped(origin: f32, extent: f32, tile_size: f32, max_tiles: u16) u16 {
-    const first = floorTileClamped(origin, tile_size, max_tiles);
-    if (!(extent > 0)) return first;
-    const end_tiles = @ceil((origin + extent) / tile_size);
-    return @max(first, floorTileClamped(end_tiles - 1, 1, max_tiles));
 }
 
 // Chunks a pixel extent spans at most, capped at `chunks`.

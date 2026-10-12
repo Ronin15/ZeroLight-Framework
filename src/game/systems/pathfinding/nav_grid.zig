@@ -26,7 +26,6 @@ const no_component = types.no_component;
 const GridCell = types.GridCell;
 const NavSpan = types.NavSpan;
 const neighbor_dirs = types.neighbor_dirs;
-const rect_edge_epsilon = types.rect_edge_epsilon;
 
 // Directory sentinels; block slots stay below them (at most one slot per chunk, and
 // `validateChunkGrid` keeps a level's chunk count below 2^31).
@@ -409,16 +408,18 @@ pub const NavGrid = struct {
         return label;
     }
 
-    // World-rect -> inclusive nav-cell span, clamped to the grid. Shared by tile-edit span
-    // derivation and tests so every rect->cell site uses identical epsilon-adjusted clamping.
+    // Half-open world rect -> inclusive nav-cell span, clamped to the grid, mapped as
+    // `ColliderGeometry.footprint` maps a static. Precondition: a prepared grid.
     pub fn cellSpanForWorldRect(self: *const NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) NavSpan {
-        const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
-        const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - rect_edge_epsilon), .y = @max(min_y, max_y - rect_edge_epsilon) });
+        std.debug.assert(self.width != 0 and self.height != 0);
+        // `validateChunkGrid` keeps the cell count, so each dimension, below 2^32.
+        const width: u32 = @intCast(self.width);
+        const height: u32 = @intCast(self.height);
         return .{
-            .min_x = @intCast(@min(min_cell.x, max_cell.x)),
-            .min_y = @intCast(@min(min_cell.y, max_cell.y)),
-            .max_x = @intCast(@max(min_cell.x, max_cell.x)),
-            .max_y = @intCast(@max(min_cell.y, max_cell.y)),
+            .min_x = math.worldPosToCell(min_x, self.cell_size, width),
+            .min_y = math.worldPosToCell(min_y, self.cell_size, height),
+            .max_x = math.lastCellOfSpan(min_x, max_x, self.cell_size, width),
+            .max_y = math.lastCellOfSpan(min_y, max_y, self.cell_size, height),
         };
     }
 
@@ -841,6 +842,40 @@ test "pathfinding nav grid blocked set matches per-level composed mask" {
     }
     try std.testing.expect(expected_blocked > 0);
     try std.testing.expectEqual(expected_blocked, system.graph.grid(0).?.blocked_count);
+}
+
+test "a cell-aligned static past 32768 world units blocks only its own nav cell" {
+    const static_colliders = @import("../static_colliders.zig");
+    // 2048 x 2048 cells of 32 units in 16-cell chunks: the max edge 35,328 sits between
+    // cells 1103 and 1104 and chunks 68 and 69, where f32 spacing is about 0.004.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 35_296, .y = 35_296 }, .{ .x = 32, .y = 32 }, true);
+    var colliders = static_colliders.StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, .{ .cell_size = 32, .width = 2048, .height = 2048, .chunk_tiles = 16 });
+    var grid = NavGrid{};
+    defer grid.deinit(std.testing.allocator);
+    try grid.prepare(std.testing.allocator, 0, 2048, 2048, 32, 16);
+    const chunks_x: u32 = @intCast(grid.chunks_x);
+    const own = grid.composeChunk(68 * chunks_x + 68, null, colliders.view());
+    try std.testing.expectEqual(world_terrain.rectMask(grid.edgeGeometry(), 15, 15, 16, 16), own);
+    const empty: ChunkBits = @splat(0);
+    try std.testing.expectEqual(empty, grid.composeChunk(68 * chunks_x + 69, null, colliders.view()));
+    try std.testing.expectEqual(empty, grid.composeChunk(69 * chunks_x + 68, null, colliders.view()));
+    try std.testing.expectEqual(empty, grid.composeChunk(69 * chunks_x + 69, null, colliders.view()));
+    try std.testing.expectEqual(NavSpan{ .min_x = 1103, .min_y = 1103, .max_x = 1103, .max_y = 1103 }, grid.cellSpanForWorldRect(35_296, 35_296, 35_328, 35_328));
+}
+
+test "a tile box past 32768 world units spans only its own nav cells" {
+    // 2048 x 2048 tiles of 32 units: tile 1103's max edge 35,328 sits on the next tile's edge.
+    var world = WorldSystem{ .allocator = std.testing.allocator, .width = 2048, .height = 2048, .tile_size = 32, .chunk_size_tiles = 16 };
+    defer world.deinit();
+    var grid = NavGrid{};
+    defer grid.deinit(std.testing.allocator);
+    try grid.prepare(std.testing.allocator, 0, 2048, 2048, 32, 16);
+    try std.testing.expectEqual(NavSpan{ .min_x = 1103, .min_y = 1103, .max_x = 1103, .max_y = 1103 }, grid.cellSpanForTileBox(&world, 1103, 1103, 1103, 1103).?);
+    try std.testing.expectEqual(NavSpan{ .min_x = 2040, .min_y = 1024, .max_x = 2047, .max_y = 2047 }, grid.cellSpanForTileBox(&world, 2040, 1024, 2047, 2047).?);
 }
 
 test "pathfinding nav grid survives degenerate cell size and bounds" {

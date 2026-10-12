@@ -229,11 +229,6 @@ pub const no_slot: u32 = std.math.maxInt(u32);
 /// after clearing every stamp.
 pub const max_stamp_generation: u32 = std.math.maxInt(u32) >> 1;
 
-// Half-open-rect shrink applied to a max world coordinate before clamping to a cell, so a
-// rect whose edge lands exactly on a cell boundary does not spuriously include the next
-// cell. Must stay identical at every rect->cell site for remask-vs-rebuild parity.
-pub const rect_edge_epsilon: f32 = 0.001;
-
 comptime {
     // The abstract search identifies a node by a packed (level << 32) | cell ref
     // stored in a usize, so the target must have a 64-bit usize.

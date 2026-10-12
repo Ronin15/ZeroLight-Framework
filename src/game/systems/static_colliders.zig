@@ -72,10 +72,6 @@ const empty_anchor_block = AnchorBlock{ .words = @splat(0), .set_bits = 0 };
 // A fine query key's chunk-tier key and anchor-block bit.
 const AnchorBit = struct { chunk_key: u64, bit: usize };
 
-// Half-open-rect shrink applied to an AABB's max corner before it maps to a cell, so a
-// rect whose edge lands exactly on a cell boundary does not cover the next cell.
-const footprint_edge_epsilon: f32 = 0.001;
-
 /// The cell grid rows are placed on: `cell_size` world units per cell, `width` x
 /// `height` cells per level, `chunk_tiles` (a power of two) cells per chunk edge.
 pub const ColliderGeometry = struct {
@@ -92,14 +88,15 @@ pub const ColliderGeometry = struct {
         return (self.width + self.chunk_tiles - 1) >> self.chunkShift();
     }
 
-    /// The inclusive cells `aabb` covers, clamped to the grid: its min corner's cell to its
-    /// max corner's cell, the max corner shrunk by an epsilon first.
+    /// The inclusive cells the half-open `aabb` covers, clamped to the grid: its min
+    /// corner's cell to the last cell before its max edge (`math.lastCellOfSpan`).
     pub fn footprint(self: ColliderGeometry, aabb: math.Aabb) CellSpan {
-        const min_x = math.worldPosToCell(aabb.min_x, self.cell_size, self.width);
-        const min_y = math.worldPosToCell(aabb.min_y, self.cell_size, self.height);
-        const max_x = math.worldPosToCell(@max(aabb.min_x, aabb.max_x - footprint_edge_epsilon), self.cell_size, self.width);
-        const max_y = math.worldPosToCell(@max(aabb.min_y, aabb.max_y - footprint_edge_epsilon), self.cell_size, self.height);
-        return .{ .min_x = @min(min_x, max_x), .min_y = @min(min_y, max_y), .max_x = @max(min_x, max_x), .max_y = @max(min_y, max_y) };
+        return .{
+            .min_x = math.worldPosToCell(aabb.min_x, self.cell_size, self.width),
+            .min_y = math.worldPosToCell(aabb.min_y, self.cell_size, self.height),
+            .max_x = math.lastCellOfSpan(aabb.min_x, aabb.max_x, self.cell_size, self.width),
+            .max_y = math.lastCellOfSpan(aabb.min_y, aabb.max_y, self.cell_size, self.height),
+        };
     }
 
     /// The query class whose single cell covers the whole level: the smallest k with
@@ -1388,6 +1385,22 @@ test "creating a static from a template indexes it once" {
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
+}
+
+test "a cell-aligned static past 32768 world units covers only its own cell and chunk" {
+    // 2048 x 2048 cells of 32 units in 16-cell chunks: the max edge 35,328 sits between
+    // cells 1103 and 1104 and chunks 68 and 69, where f32 spacing is about 0.004.
+    const far = ColliderGeometry{ .cell_size = 32, .width = 2048, .height = 2048, .chunk_tiles = 16 };
+    var fixture = try SeamFixture.initWith(far);
+    defer fixture.deinit();
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 35_296, .y = 35_296 }, .{ .x = 32, .y = 32 }) }});
+    const placement = fixture.colliders.changesThisStep()[0].new.?;
+    try std.testing.expectEqual(CellSpan{ .min_x = 1103, .min_y = 1103, .max_x = 1103, .max_y = 1103 }, placement.cells);
+    try std.testing.expectEqual(@as(usize, 1), listEntryCount(&fixture.colliders));
+    var listed: std.ArrayList(u32) = .empty;
+    defer listed.deinit(std.testing.allocator);
+    try listedIndices(&fixture.colliders, 0, 68 * far.chunksX() + 68, &listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.items.len);
 }
 
 test "destroying a template-created static frees every footprint entry" {

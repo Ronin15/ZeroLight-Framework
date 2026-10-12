@@ -145,6 +145,16 @@ pub fn worldPosToCell4(world_pos: Float4, tile_size: f32, max_cells: u32) Int4 {
     return clampInt4(cells, splatInt4(0), splatInt4(@intCast(max_cells - 1)));
 }
 
+/// Vectorized counterpart of `math.lastCellOfSpan`, lane for lane: the last cell each
+/// half-open span `[min_pos, max_pos)` covers, clamped to `[0, max_cells - 1]`, never
+/// before the lane's min cell. Returns `i32` lanes like `worldPosToCell4`.
+pub fn lastCellOfSpan4(min_pos: Float4, max_pos: Float4, cell_size: f32, max_cells: u32) Int4 {
+    const first = worldPosToCell4(min_pos, cell_size, max_cells);
+    const end_cells = @ceil(divFloat4(max_pos, splatFloat4(cell_size)));
+    const last = worldPosToCell4(subFloat4(end_cells, splatFloat4(1)), 1, max_cells);
+    return selectInt4(greaterThanFloat4(max_pos, min_pos), maxInt4(first, last), first);
+}
+
 /// Vectorized counterpart of `math.floorToI32`: floors each lane to `i32`,
 /// saturating identically to the scalar form (NaN -> 0; at/below `minInt(i32)`
 /// -> `minInt(i32)`; at/above the f32 rounding of `maxInt(i32)` -> `maxInt(i32)`).
@@ -892,6 +902,53 @@ test "worldPosToCell4 matches math.worldPosToCell lane-for-lane" {
     try std.testing.expectEqual(
         @as(i32, @intCast(math.worldPosToCell(100, tile_size, 1))),
         toIntArray(worldPosToCell4(splatFloat4(100), tile_size, 1))[0],
+    );
+}
+
+test "lastCellOfSpan4 matches math.lastCellOfSpan lane-for-lane" {
+    const cells: u32 = 4096;
+    const inf = std.math.inf(f32);
+    const nan = std.math.nan(f32);
+    const up = struct {
+        fn f(value: f32) f32 {
+            return std.math.nextAfter(f32, value, std.math.inf(f32));
+        }
+    }.f;
+    const down = struct {
+        fn f(value: f32) f32 {
+            return std.math.nextAfter(f32, value, -std.math.inf(f32));
+        }
+    }.f;
+    // (min, max) pairs: boundaries and one ulp either side near 0, 32768, and 65536;
+    // empty, inverted, NaN, infinite, and off-grid spans.
+    const spans = [_][2]f32{
+        .{ 0, 32 },                  .{ 0, up(32) },             .{ 0, down(32) },           .{ 0, 0.001 },
+        .{ 32_768, 32_800 },         .{ 32_768, up(32_800) },    .{ 32_768, down(32_800) },  .{ 35_296, 35_328 },
+        .{ 35_296, up(35_328) },     .{ 35_296, down(35_328) },  .{ 65_536, 65_568 },        .{ 65_536, up(65_568) },
+        .{ 65_536, down(65_568) },   .{ 32_768, 33_280 },        .{ 35_296, 35_296 },        .{ 35_328, 35_328 },
+        .{ 35_296, 100 },            .{ 35_296, nan },           .{ nan, 35_328 },           .{ 0, inf },
+        .{ -inf, 32 },               .{ -100, -40 },             .{ 0, 1.0e9 },              .{ 35_328, 35_328.001 },
+    };
+    comptime std.debug.assert(spans.len % lane_count == 0);
+    var start: usize = 0;
+    while (start < spans.len) : (start += lane_count) {
+        var mins: [lane_count]f32 = undefined;
+        var maxs: [lane_count]f32 = undefined;
+        for (0..lane_count) |lane| {
+            mins[lane] = spans[start + lane][0];
+            maxs[lane] = spans[start + lane][1];
+        }
+        const simd_result = toIntArray(lastCellOfSpan4(loadFloat4(&mins), loadFloat4(&maxs), 32, cells));
+        for (0..lane_count) |lane| {
+            try std.testing.expectEqual(
+                @as(i32, @intCast(math.lastCellOfSpan(mins[lane], maxs[lane], 32, cells))),
+                simd_result[lane],
+            );
+        }
+    }
+    try std.testing.expectEqual(
+        @as(i32, @intCast(math.lastCellOfSpan(0, 100, 32, 0))),
+        toIntArray(lastCellOfSpan4(splatFloat4(0), splatFloat4(100), 32, 0))[0],
     );
 }
 
