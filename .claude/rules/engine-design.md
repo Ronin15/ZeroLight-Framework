@@ -88,7 +88,10 @@ Every design, and every fix touching storage or per-change work, states:
   in `src/game/`, math/SIMD/logging in `src/core/`, SDL wrappers in
   `src/platform/`. Never move a boundary for a local convenience.
 - Dependencies point down: `src/game/` may import `render/`, `assets/`,
-  `core/`, and `platform/`; `render/`, `assets/`, `core/`, and `platform/`
+  `core/`, `platform/`, and the `src/app/` services it runs on
+  (`ThreadSystem`, the state and input interfaces, audio, the runtime perf
+  log); `src/app/` imports game states only to construct them;
+  `render/`, `assets/`, `core/`, and `platform/`
   (gpu-smoke included) never import `src/game/`, and `core/` and `platform/`
   never import `src/app/`.
 - Gameplay logic lives in states, controllers, and processors, never in
