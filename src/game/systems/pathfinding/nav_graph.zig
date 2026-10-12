@@ -47,6 +47,7 @@ const PathQueryKey = types.PathQueryKey;
 const NavMark = types.NavMark;
 const NavSpan = types.NavSpan;
 const NavUpdateStats = types.NavUpdateStats;
+const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
 const setLen = types.setLen;
 const Connectivity = @import("connectivity.zig").Connectivity;
 const ConnectivityCounters = @import("connectivity.zig").ConnectivityCounters;
@@ -733,8 +734,8 @@ fn patchJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     }
 }
 
-/// Dispatch time of a batch that ran on workers; zero when it ran inline.
-pub fn offMainNs(batch: BatchStats) u64 {
+// Dispatch time of a batch that ran on workers; zero when it ran inline.
+fn offMainNs(batch: BatchStats) u64 {
     return if (batch.ran_inline) 0 else batch.batch_duration_ns;
 }
 
@@ -760,8 +761,12 @@ pub fn runStage(threads: ?NavStageThreads, item_count: usize, context: *anyopaqu
         });
     }
     range_count.* = 1;
+    // No thread system times the batch, so it is timed here.
+    const stage_timer = StageTimer.begin();
     job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-    return inlineBatch(item_count);
+    var batch = inlineBatch(item_count);
+    batch.batch_duration_ns = stage_timer.lap();
+    return batch;
 }
 
 // The batch shape of a stage run inline as one range on the main thread.
@@ -802,8 +807,9 @@ pub const RoundDispatch = struct {
     selection: ?BatchSelection = null,
     // The rounds folded into one.
     total: BatchStats = .{},
-    /// Dispatch time of the rounds that ran on workers.
+    /// Dispatch time of the rounds that ran on workers, and of those that ran inline.
     off_main_ns: u64 = 0,
+    inline_ns: u64 = 0,
     /// The fewest and most items a round dispatched (both zero with no round).
     round_items_min: usize = 0,
     round_items_max: usize = 0,
@@ -840,11 +846,16 @@ pub const RoundDispatch = struct {
             });
         } else blk: {
             range_count.* = 1;
+            // No thread system times the round, so it is timed here.
+            const round_timer = StageTimer.begin();
             job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-            break :blk inlineBatch(item_count);
+            var round = inlineBatch(item_count);
+            round.batch_duration_ns = round_timer.lap();
+            break :blk round;
         };
         std.debug.assert(batch.range_count == range_count.*);
         self.off_main_ns += offMainNs(batch);
+        if (batch.ran_inline) self.inline_ns += batch.batch_duration_ns;
         accumulateBatch(&self.total, batch);
     }
 
@@ -1568,6 +1579,7 @@ pub const NavGraph = struct {
     pub fn buildLevel(self: *NavGraph, colliders: ColliderView, world: ?*const WorldSystem, level_index: u16, threads: ?NavUpdateThreads, stats: *NavUpdateStats) !void {
         std.debug.assert(@as(usize, level_index) <= self.levels.items.len);
         const chunk_count = self.chunkCount();
+        var section = StageTimer.begin();
         var fresh_grid = NavGrid{};
         errdefer fresh_grid.deinit(self.allocator);
         try fresh_grid.prepare(self.allocator, level_index, self.width, self.height, self.cell_size, self.chunk_tiles);
@@ -1575,8 +1587,10 @@ pub const NavGraph = struct {
         errdefer fresh_graph.deinit(self.allocator);
         try setLen(&fresh_graph.record_dir, self.allocator, chunk_count);
         @memset(fresh_graph.record_dir.items, no_record);
+        stats.main.reserve_ns += section.lap();
 
         // Plan: every chunk of the level, in order.
+        section = StageTimer.begin();
         try setLen(&self.changed_keys, self.allocator, chunk_count);
         try setLen(&self.patch_keys, self.allocator, chunk_count);
         // The marks batch's key lists share the build's one-level window high-water.
@@ -1587,7 +1601,9 @@ pub const NavGraph = struct {
             self.changed_keys.items[chunk] = key;
             self.patch_keys.items[chunk] = key;
         }
+        stats.main.plan_ns += section.lap();
         // Reserve.
+        section = StageTimer.begin();
         const appending = @as(usize, level_index) == self.levels.items.len;
         if (appending) {
             try self.levels.ensureUnusedCapacity(self.allocator, 1);
@@ -1601,10 +1617,13 @@ pub const NavGraph = struct {
         try self.planPatchInfo(world);
         try self.reserveCellBlocks(levels, world, colliders);
         try self.reserveRecords(levels);
+        stats.main.reserve_ns += section.lap();
 
         // Commit into the fresh storage.
         self.remaskKeys(levels, colliders, world, null, remaskThreads(threads), stats);
+        section = StageTimer.begin();
         self.claimRecords(levels);
+        stats.main.commit_ns += section.lap();
         self.patchKeys(levels, world, patchThreads(threads), stats);
         // Connectivity: reserves first, so an error leaves every other level as it was.
         const old_levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
@@ -1624,6 +1643,7 @@ pub const NavGraph = struct {
             stats,
         );
         addConnectivityStats(stats, &self.connectivity, counters);
+        section = StageTimer.begin();
         _ = self.releaseRecords(levels);
         fresh_graph.built_revision = if (world) |world_system| world_system.levelContentRevision(level_index) else 0;
         if (appending) {
@@ -1635,6 +1655,7 @@ pub const NavGraph = struct {
             self.levels.items[level_index] = fresh_grid;
             self.level_graphs.items[level_index] = fresh_graph;
         }
+        stats.main.commit_ns += section.lap();
         stats.levels_built += 1;
         self.logPoolGrowth();
     }
@@ -1674,12 +1695,14 @@ pub const NavGraph = struct {
             .world = if (self.world_backed) world else null,
         };
         try self.planKeys(world, marks, new_links, planThreads(threads), stats);
+        var section = StageTimer.begin();
         try setLen(&self.changed_masks, self.allocator, self.changed_keys.items.len);
         if (self.patch_keys.items.len != 0) {
             const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
             try self.planPatchInfo(prepared.world);
             try self.reserveCellBlocks(levels, prepared.world, colliders);
             try self.reserveRecords(levels);
+            stats.main.reserve_ns += section.lap();
             try self.connectivity.prepareMarks(
                 self.allocator,
                 levels,
@@ -1693,9 +1716,11 @@ pub const NavGraph = struct {
                 &self.pool_grows,
                 stats,
             );
+            section = StageTimer.begin();
         }
         // The one-way registry rows the commit appends for the new links.
         try self.connectivity.reserveRegistry(self.allocator, new_links, &self.pool_grows);
+        stats.main.reserve_ns += section.lap();
         self.batch_prepared = true;
         return prepared;
     }
@@ -1712,20 +1737,26 @@ pub const NavGraph = struct {
         self.batch_prepared = false;
         // Only a world-backed graph has links to apply.
         std.debug.assert(prepared.new_link_count == 0 or prepared.world != null);
+        var section = StageTimer.begin();
         const first_link = self.links_applied;
         const new_links: []const LevelLink = if (prepared.world) |world| world.levelLinks()[first_link..][0..prepared.new_link_count] else &.{};
         self.link_bounds.foldLinks(new_links);
         self.links_applied += prepared.new_link_count;
         self.connectivity.appendRegistry(new_links);
+        stats.main.commit_ns += section.lap();
         if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .changed_keys = &.{}, .changed_masks = &.{} };
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
         std.debug.assert(self.changed_masks.items.len == self.changed_keys.items.len);
         self.remaskKeys(levels, colliders, prepared.world, self.changed_masks.items, remaskThreads(threads), stats);
+        section = StageTimer.begin();
         self.claimRecords(levels);
+        stats.main.commit_ns += section.lap();
         self.patchKeys(levels, prepared.world, patchThreads(threads), stats);
         const counters = self.connectivity.commitMarks(levels, prepared.world, self.patch_keys.items, new_links, connGatherThreads(threads), connFloodThreads(threads), closureThreads(threads), stats);
         addConnectivityStats(stats, &self.connectivity, counters);
+        section = StageTimer.begin();
         stats.records_patched += self.releaseRecords(levels);
+        stats.main.commit_ns += section.lap();
         stats.dirty_chunks += self.changed_keys.items.len;
         stats.chunks_patched += self.patch_keys.items.len;
         stats.incremental_rebuilds = 1;
@@ -1829,6 +1860,7 @@ pub const NavGraph = struct {
         for (std.meta.tags(PlanStream)) |stream| self.keyList(stream).clearRetainingCapacity();
         self.last_plan_batch = .{};
         if (item_count == 0) return;
+        var section = StageTimer.begin();
         const selection: BatchSelectionShape = if (threads) |stage| blk: {
             const selected = stage.thread_system.selectBatchProfile(stage.tuner, .{
                 .item_count = item_count,
@@ -1870,6 +1902,7 @@ pub const NavGraph = struct {
             .staging = staging,
             .tallies = self.plan_tallies.items,
         };
+        stats.main.plan_ns += section.lap();
         if (threads) |stage| {
             const selected = selection.selection.?;
             self.last_plan_batch = stage.thread_system.parallelForWithOptions(item_count, &job, planJob, .{
@@ -1879,12 +1912,16 @@ pub const NavGraph = struct {
                 .range_alignment_items = 1,
                 .selected_profile = selected.profile,
             });
-            stats.off_main_stage_ns += offMainNs(self.last_plan_batch);
         } else {
+            const stage_timer = StageTimer.begin();
             planJob(&job, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
             self.last_plan_batch = inlineBatch(item_count);
+            self.last_plan_batch.batch_duration_ns = stage_timer.lap();
         }
+        stats.addStageTime(self.last_plan_batch);
 
+        section = StageTimer.begin();
+        defer stats.main.plan_ns += section.lap();
         for (std.meta.tags(PlanStream)) |stream| {
             const out = self.keyList(stream);
             if (selection.range_count == 1) {
@@ -2062,6 +2099,7 @@ pub const NavGraph = struct {
     fn remaskKeys(self: *NavGraph, levels: BatchLevels, colliders: ColliderView, world: ?*const WorldSystem, masks: ?[]ChunkBits, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
         const keys = self.changed_keys.items;
         std.debug.assert(self.remask_deltas.items.len == keys.len and self.remask_slots.items.len == keys.len);
+        var section = StageTimer.begin();
         for (keys, self.remask_slots.items, self.remask_deltas.items) |key, *slot, *delta| {
             const level_grid = levels.grid(keyLevel(key));
             // A chunk holds at most max_chunk_size_tiles^2 cells.
@@ -2077,8 +2115,10 @@ pub const NavGraph = struct {
             .deltas = self.remask_deltas.items,
             .masks = masks,
         };
+        stats.main.commit_ns += section.lap();
         self.last_remask_batch = runStage(threads, keys.len, &job, &job.range_count, remaskJob);
-        stats.off_main_stage_ns += offMainNs(self.last_remask_batch);
+        stats.addStageTime(self.last_remask_batch);
+        section = StageTimer.begin();
         for (keys, self.remask_slots.items, self.remask_deltas.items) |key, slot, delta| {
             const level_grid = levels.grid(keyLevel(key));
             if (slot != no_block and level_grid.chunkBlock(keyChunk(key)) != slot) level_grid.releaseBlock(slot);
@@ -2086,6 +2126,7 @@ pub const NavGraph = struct {
             std.debug.assert(count >= 0);
             level_grid.blocked_count = @intCast(@max(count, 0));
         }
+        stats.main.commit_ns += section.lap();
     }
 
     // Claims a record for every patch key that may hold portals and has none, and a link
@@ -2106,7 +2147,7 @@ pub const NavGraph = struct {
     fn patchKeys(self: *NavGraph, levels: BatchLevels, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) void {
         var job = PatchJob{ .graph = self, .levels = levels, .world = world, .keys = self.patch_keys.items, .infos = self.patch_info.items };
         self.last_patch_batch = runStage(threads, self.patch_keys.items.len, &job, &job.range_count, patchJob);
-        stats.off_main_stage_ns += offMainNs(self.last_patch_batch);
+        stats.addStageTime(self.last_patch_batch);
     }
 
     // Releases the records the patch left without portals and the link slots left empty, in

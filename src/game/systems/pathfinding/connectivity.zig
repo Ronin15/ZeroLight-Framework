@@ -37,12 +37,12 @@ const NavStageThreads = @import("nav_graph.zig").NavStageThreads;
 const PatchInfo = @import("nav_graph.zig").PatchInfo;
 const RoundDispatch = @import("nav_graph.zig").RoundDispatch;
 const runStage = @import("nav_graph.zig").runStage;
-const offMainNs = @import("nav_graph.zig").offMainNs;
 const chunkKey = @import("nav_graph.zig").chunkKey;
 const keyLevel = @import("nav_graph.zig").keyLevel;
 const keyChunk = @import("nav_graph.zig").keyChunk;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
+const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
 const setLen = types.setLen;
 const accumulateBatch = @import("nav_graph.zig").accumulateBatch;
 const simd = @import("../../../core/simd.zig");
@@ -1707,6 +1707,7 @@ pub const Connectivity = struct {
         stats: *NavUpdateStats,
     ) !void {
         std.debug.assert(patch_info.len == patch_keys.len);
+        var section = StageTimer.begin();
         const new_link_count = new_links.len;
         // Flags and seed windows: changed keys are a sorted subset of the sorted patch keys.
         try setLen(&self.patch_changed, allocator, patch_keys.len);
@@ -1781,16 +1782,21 @@ pub const Connectivity = struct {
             .counts = self.seed_counts.items,
             .edges = self.seed_edges.items,
         };
+        stats.main.reserve_ns += section.lap();
         self.last_seed_batch = runStage(threads, changed_keys.len, &job, &job.range_count, seedJob);
-        stats.off_main_stage_ns += offMainNs(self.last_seed_batch);
+        stats.addStageTime(self.last_seed_batch);
 
         // The closure reads the seed windows' counts and the graph before the change.
+        section = StageTimer.begin();
         const new_oneway = countOneWay(new_links);
         self.closure.active = self.closure.oneway.len != 0 or new_oneway != 0;
+        stats.main.reserve_ns += section.lap();
         const bounds: ClosureBounds = if (self.closure.active)
             try self.prepareClosure(allocator, levels, world, patch_keys, true, self.patch_changed.items, new_oneway, new_link_count, closure_threads, pool_grows, stats)
         else
             .{};
+        section = StageTimer.begin();
+        defer stats.main.reserve_ns += section.lap();
         self.marks_staging_high = self.marks_staging_high.max(.{
             .changed_keys = changed_keys.len,
             .patch_keys = patch_keys.len,
@@ -1843,8 +1849,10 @@ pub const Connectivity = struct {
         };
         self.bindOneWayWindows(&gather);
         self.last_gather_batch = runStage(gather_threads, patch_keys.len + new_links.len, &gather, &gather.range_count, gatherJob);
-        stats.off_main_stage_ns += offMainNs(self.last_gather_batch);
+        stats.addStageTime(self.last_gather_batch);
+        const merge_timer = StageTimer.begin();
         self.mergeBatch(levels, patch_keys, true, patch_keys.len + new_links.len, null);
+        stats.main.conn_merge_ns += merge_timer.lap();
         var counters = self.settleAndFlood(levels, world, flood_threads, stats);
         if (self.closure.active) counters.closure = self.updateClosure(levels, world, patch_keys.len, closure_threads, stats);
         return counters;
@@ -1881,6 +1889,7 @@ pub const Connectivity = struct {
         const fresh = levels.fresh.?;
         const level_graph = fresh.graph;
         const seeding = replaced != null;
+        var section = StageTimer.begin();
         // The staging shrinks back when the build ends, and on an error too.
         errdefer self.shrinkStaging(allocator, self.marks_staging_high.max(self.oneChunkStaging(level_graph.border_stride)));
         try setLen(&self.row_starts, allocator, keys.len + 1);
@@ -1927,6 +1936,7 @@ pub const Connectivity = struct {
             self.noteLinks(world);
             try self.reserveFlood(allocator, level_graph.border_stride, participantCount(flood_threads));
         }
+        stats.main.reserve_ns += section.lap();
 
         if (seeding) {
             var seed = SeedJob{
@@ -1940,7 +1950,7 @@ pub const Connectivity = struct {
                 .edges = self.seed_edges.items,
             };
             self.last_seed_batch = runStage(seed_threads, keys.len, &seed, &seed.range_count, seedJob);
-            stats.off_main_stage_ns += offMainNs(self.last_seed_batch);
+            stats.addStageTime(self.last_seed_batch);
         } else {
             self.last_seed_batch = .{};
         }
@@ -1963,11 +1973,15 @@ pub const Connectivity = struct {
         };
         self.bindOneWayWindows(&gather);
         self.last_gather_batch = runStage(gather_threads, keys.len, &gather, &gather.range_count, gatherJob);
-        stats.off_main_stage_ns += offMainNs(self.last_gather_batch);
+        stats.addStageTime(self.last_gather_batch);
+        section = StageTimer.begin();
         self.mergeBatch(levels, keys, false, keys.len, replaced);
+        stats.main.conn_merge_ns += section.lap();
         var counters = self.settleAndFlood(levels, world, flood_threads, stats);
         if (self.closure.active) counters.closure = self.updateClosure(levels, world, keys.len, closure_threads, stats);
+        section = StageTimer.begin();
         self.shrinkStaging(allocator, self.marks_staging_high.max(self.oneChunkStaging(level_graph.border_stride)));
+        stats.main.commit_ns += section.lap();
         return counters;
     }
 
@@ -2165,6 +2179,7 @@ pub const Connectivity = struct {
     // ------------------------------------------------------------------------------------
 
     fn settleAndFlood(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, threads: ?NavStageThreads, stats: *NavUpdateStats) ConnectivityCounters {
+        var section = StageTimer.begin();
         self.units.len = self.element_limit;
         self.sets.len = self.element_limit;
         self.families.len = self.element_limit;
@@ -2183,8 +2198,11 @@ pub const Connectivity = struct {
         self.settle(views);
         self.openSets(views);
         self.last_flood_batch = .{};
+        stats.main.conn_layout_ns += section.lap();
         if (counters.families != 0) self.runFlood(views, threads, &counters, stats);
+        section = StageTimer.begin();
         self.finish(views, &counters);
+        stats.main.conn_layout_ns += section.lap();
         return counters;
     }
 
@@ -2522,6 +2540,8 @@ pub const Connectivity = struct {
     // with an empty queue (a whole component) while its family keeps another active set. One
     // thread profile serves every round of the batch, recorded once.
     fn runFlood(self: *Connectivity, views: BatchViews, threads: ?NavStageThreads, counters: *ConnectivityCounters, stats: *NavUpdateStats) void {
+        // Builds, merges, and closes: every span between the rounds' searches.
+        var section = StageTimer.begin();
         const families = views.families;
         const sets = views.sets;
         const family_count: u32 = @intCast(self.families.len);
@@ -2651,7 +2671,9 @@ pub const Connectivity = struct {
                 .comp_set = self.comp_set,
                 .set_parent = sets.parent,
             };
+            stats.main.flood_ns += section.lap();
             dispatch.run(item_count, &job, &job.range_count, floodJob);
+            section = StageTimer.begin();
 
             // Merge, in item order.
             for (self.flood_items.items, self.flood_outs.items) |item, out| {
@@ -2692,6 +2714,8 @@ pub const Connectivity = struct {
         counters.flood_off_main_ns = dispatch.off_main_ns;
         self.last_flood_batch = dispatch.finish(self.sets.len);
         stats.off_main_stage_ns += dispatch.off_main_ns;
+        stats.inline_stage_ns += dispatch.inline_ns;
+        stats.main.flood_ns += section.lap();
     }
 
     // Appends the linked queue segment from (`head_key`, `head_row`) to (`tail_key`,
@@ -2836,7 +2860,9 @@ pub const Connectivity = struct {
         for (0..links) |row| closure.resolve_items.appendAssumeCapacity(@intCast(row));
         var counters = ClosureCounters{};
         self.resolveLinks(levels, world, threads.resolve, stats);
+        const merge_timer = StageTimer.begin();
         self.mergeResolved(&counters);
+        stats.main.closure_ns += merge_timer.lap();
         // The arena, exactly: every piece takes a new block.
         var words: usize = closure.words.items.len;
         const pieces = closure.pieces.slice();
@@ -2890,6 +2916,8 @@ pub const Connectivity = struct {
         pool_grows: *u64,
         stats: *NavUpdateStats,
     ) !ClosureBounds {
+        var section = StageTimer.begin();
+        defer stats.main.reserve_ns += section.lap();
         const closure = &self.closure;
         self.advanceStamp();
         const scan = closure.oneway.len != 0;
@@ -2943,9 +2971,11 @@ pub const Connectivity = struct {
                 .hcomps = closure.cand_hcomps.items,
                 .tallies = closure.cand_tallies.items,
             };
+            stats.main.reserve_ns += section.lap();
             const batch = runStage(threads.candidates, keys.len, &job, &job.range_count, candidateJob);
+            section = StageTimer.begin();
             accumulateBatch(&stats.conn_candidates_batch, batch);
-            stats.off_main_stage_ns += offMainNs(batch);
+            stats.addStageTime(batch);
             // Distinct candidates move to the front in first-sight order; a write never
             // passes the entry being read.
             const hcomp = closure.hcomp;
@@ -2990,7 +3020,10 @@ pub const Connectivity = struct {
         try self.reserveClosure(allocator, bounds, pool_grows);
         // A batch that can touch no component still reclaims dead blocks.
         if (bounds.k_b != 0 or closure.dead_words > closure.live_words) {
+            // The arena reserve times its own sections.
+            stats.main.reserve_ns += section.lap();
             try self.reserveArena(allocator, if (bounds.k_b == 0) 0 else bounds.arena_tail, threads.compact, pool_grows, stats);
+            section = StageTimer.begin();
         }
         return bounds;
     }
@@ -3061,6 +3094,8 @@ pub const Connectivity = struct {
     // O(1) per H-component), and the old arena is freed; a larger arena counts as a pool
     // growth.
     fn reserveArena(self: *Connectivity, allocator: std.mem.Allocator, tail: usize, threads: ?NavStageThreads, pool_grows: *u64, stats: *NavUpdateStats) !void {
+        var section = StageTimer.begin();
+        defer stats.main.reserve_ns += section.lap();
         const closure = &self.closure;
         const needed = closure.live_words + tail;
         if (needed >= std.math.maxInt(u32)) return error.NavConnectivityOverflow;
@@ -3087,9 +3122,11 @@ pub const Connectivity = struct {
         std.debug.assert(offset == closure.live_words);
         fresh.items.len = offset;
         var job = CompactJob{ .blocks = closure.compact_blocks.items, .src = closure.words.items, .dst = fresh.items };
+        stats.main.reserve_ns += section.lap();
         const batch = runStage(threads, offset / span_words, &job, &job.range_count, compactJob);
+        section = StageTimer.begin();
         accumulateBatch(&stats.conn_closure_compact_batch, batch);
-        stats.off_main_stage_ns += offMainNs(batch);
+        stats.addStageTime(batch);
         for (closure.compact_blocks.items) |moved| hcomp.block[moved.hcomp] = moved.dst;
         if (limit > closure.arena_limit) pool_grows.* += 1;
         closure.words.deinit(allocator);
@@ -3123,7 +3160,9 @@ pub const Connectivity = struct {
     // Allocation-free after the batch's closure reserve.
     fn updateClosure(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, key_count: usize, threads: ClosureThreads, stats: *NavUpdateStats) ClosureCounters {
         var counters = ClosureCounters{};
+        const touch_timer = StageTimer.begin();
         self.touchClosure(levels, key_count);
+        stats.main.closure_ns += touch_timer.lap();
         if (self.closure.resolve_items.items.len == 0) {
             self.closure.last_resolve_batch = .{};
             self.closure.last_mask_batch = .{};
@@ -3132,7 +3171,9 @@ pub const Connectivity = struct {
             return counters;
         }
         self.resolveLinks(levels, world, threads.resolve, stats);
+        const merge_timer = StageTimer.begin();
         self.mergeResolved(&counters);
+        stats.main.closure_ns += merge_timer.lap();
         self.finishClosure(threads, &counters, stats);
         return counters;
     }
@@ -3235,7 +3276,7 @@ pub const Connectivity = struct {
             .comp_root = self.comp_root,
         };
         closure.last_resolve_batch = runStage(threads, count, &job, &job.range_count, resolveJob);
-        stats.off_main_stage_ns += offMainNs(closure.last_resolve_batch);
+        stats.addStageTime(closure.last_resolve_batch);
     }
 
     // The terminal of live root `root`, a new one popped when it holds none.
@@ -3575,7 +3616,8 @@ pub const Connectivity = struct {
             .a_flag = slots.a_flag,
         };
         closure.last_mask_batch = runStage(threads.mask, closure.mask_items.items.len, &mask, &mask.range_count, maskJob);
-        stats.off_main_stage_ns += offMainNs(closure.last_mask_batch);
+        stats.addStageTime(closure.last_mask_batch);
+        var section = StageTimer.begin();
 
         // A lists per piece, in slot order.
         for (slots.a_flag[0..slot_count], slots.piece[0..slot_count]) |flag, piece| {
@@ -3609,8 +3651,10 @@ pub const Connectivity = struct {
             .targets = closure.targets.items,
             .apos = apos,
         };
+        stats.main.closure_ns += section.lap();
         closure.last_plan_batch = runStage(threads.plan, closure.plan_items.items.len, &plan, &plan.range_count, planJob);
-        stats.off_main_stage_ns += offMainNs(closure.last_plan_batch);
+        stats.addStageTime(closure.last_plan_batch);
+        section = StageTimer.begin();
 
         // Blocks, then the round-0 copy and zero spans, then the round lists.
         self.assignBlocks(slots, pieces, touched, counters);
@@ -3648,8 +3692,10 @@ pub const Connectivity = struct {
         if (closure.copy_items.items.len + round_total == 0) {
             closure.last_rows_batch = .{};
             self.commitClosure(slots, pieces, touched);
+            stats.main.closure_ns += section.lap();
             return;
         }
+        stats.main.closure_ns += section.lap();
         var dispatch = RoundDispatch.begin(threads.rows, closure.copy_items.items.len + round_total);
         if (closure.copy_items.items.len != 0) {
             var copy = CopyJob{ .items = closure.copy_items.items, .words = closure.words.items };
@@ -3670,11 +3716,14 @@ pub const Connectivity = struct {
         }
         closure.last_rows_batch = dispatch.finish(closure.copy_items.items.len + round_total);
         stats.off_main_stage_ns += dispatch.off_main_ns;
+        stats.inline_stage_ns += dispatch.inline_ns;
+        section = StageTimer.begin();
         counters.rounds = rounds + @intFromBool(closure.copy_items.items.len != 0);
         for (closure.copy_items.items) |item| counters.words_written += item.len;
         for (closure.plan_items.items) |piece| counters.words_written += @as(usize, pieces.a_count[piece]) * rowWords(pieces.k_cap[piece]);
 
         self.commitClosure(slots, pieces, touched);
+        stats.main.closure_ns += section.lap();
     }
 
     // Block assignment and round-0 spans, in piece order: a relocated piece takes a tail block

@@ -26,6 +26,8 @@ const hashTableSlots = @import("../game/systems/pathfinding/types.zig").hashTabl
 const resultBlockWords = @import("../game/systems/pathfinding/types.zig").resultBlockWords;
 const registry_shard_count = @import("../game/systems/pathfinding/types.zig").registry_shard_count;
 const RegRecord = @import("../game/systems/pathfinding/types.zig").RegRecord;
+const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
+const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 const ResultCache = @import("../game/systems/pathfinding/caches.zig").ResultCache;
 const reachabilityBytesBound = @import("../game/systems/pathfinding/connectivity.zig").storageBytesBound;
 const max_border_portals = @import("../game/systems/pathfinding/nav_graph.zig").max_border_portals;
@@ -221,6 +223,8 @@ pub const RunStats = struct {
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
     // Nav groups: the reaction's connectivity stages and flood (the removal reaction).
     nav_conn: ?NavConnSummary = null,
+    // Nav groups: the reaction's main-thread time split by section.
+    nav_main: ?NavMainSummary = null,
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
@@ -285,6 +289,39 @@ pub const NavConnSummary = struct {
     closure_candidate_words: usize = 0,
     closure_live_prepared: usize = 0,
     closure_kb: usize = 0,
+};
+
+/// Nav reaction main-thread time (wall time outside every worker dispatch), its stage time run
+/// inline, and its ordered sections, summed over the reactions added and divided by `samples`
+/// when printed. `rest` is the main time neither holds: untimed glue.
+pub const NavMainSummary = struct {
+    samples: u64 = 0,
+    main_ns: u64 = 0,
+    inline_ns: u64 = 0,
+    sections: NavMainPhases = .{},
+
+    /// Adds one reaction: its main time and its stats' inline stage time and sections.
+    pub fn add(self: *NavMainSummary, main_ns: u64, stats: NavUpdateStats) void {
+        self.main_ns += main_ns;
+        self.inline_ns += stats.inline_stage_ns;
+        addSections(&self.sections, stats.main);
+    }
+
+    /// Adds `other`'s reactions, its samples not counted.
+    pub fn merge(self: *NavMainSummary, other: NavMainSummary) void {
+        self.main_ns += other.main_ns;
+        self.inline_ns += other.inline_ns;
+        addSections(&self.sections, other.sections);
+    }
+
+    /// Counts one sample: a reaction, or an iteration whose reactions were added.
+    pub fn endSample(self: *NavMainSummary) void {
+        self.samples += 1;
+    }
+
+    fn addSections(total: *NavMainPhases, phases: NavMainPhases) void {
+        inline for (@typeInfo(NavMainPhases).@"struct".field_names) |name| @field(total, name) += @field(phases, name);
+    }
 };
 
 pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
@@ -900,7 +937,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [2048]u8 = undefined;
+        var workload_buffer: [2560]u8 = undefined;
 
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
@@ -1242,7 +1279,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     // Workload labels translate shared counters into subsystem language so the
     // report remains compact without hiding what was measured.
     if (std.mem.startsWith(u8, group_name, "nav-update-static-dense")) {
-        var stage_buffer: [1536]u8 = undefined;
+        var stage_buffer: [2048]u8 = undefined;
         var splice_buffer: [32]u8 = undefined;
         var query_splice_buffer: [32]u8 = undefined;
         const splice = stats.splice_batch orelse BatchSummary{};
@@ -1256,7 +1293,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "nav-update-")) {
-        var stage_buffer: [1536]u8 = undefined;
+        var stage_buffer: [2048]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}", .{formatNavStagesInto(&stage_buffer, stats)}) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "movement-apply-intents")) {
@@ -1291,7 +1328,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) {
-        var stage_buffer: [1536]u8 = undefined;
+        var stage_buffer: [2048]u8 = undefined;
         return std.fmt.bufPrint(buffer, "levels={} {s}", .{ stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
@@ -1309,7 +1346,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (isChunkScaleNavBatchGroup(group_name)) {
-        var stage_buffer: [1536]u8 = undefined;
+        var stage_buffer: [2048]u8 = undefined;
         const stages = formatNavStagesInto(&stage_buffer, stats);
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
@@ -1320,7 +1357,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-dig") or std.mem.eql(u8, group_name, "chunk-scale-nav-ramp")) {
-        var stage_buffer: [1536]u8 = undefined;
+        var stage_buffer: [2048]u8 = undefined;
         return std.fmt.bufPrint(buffer, "cells={} {s}", .{ stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "ai")) {
@@ -1365,11 +1402,11 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         return std.fmt.bufPrint(buffer, "searches={} unavailable={} steps={} status_steps={} projections={} fallbacks={} max_step={f}", .{ stats.candidate_pairs, stats.output_count, stats.sample_count, stats.deferred_count, stats.cache_evictions, stats.fallback_deferred_count, formatDuration(stats.max_step_ns) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-split")) {
-        var stage_buffer: [1536]u8 = undefined;
+        var stage_buffer: [2048]u8 = undefined;
         return std.fmt.bufPrint(buffer, "cells={} structure_chunks={} {s}", .{ stats.output_count, stats.candidate_pairs, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-connectivity-oneway")) {
-        var stage_buffer: [1536]u8 = undefined;
+        var stage_buffer: [2048]u8 = undefined;
         return std.fmt.bufPrint(buffer, "rooms={} oneway_links={} {s}", .{ stats.candidate_pairs, stats.output_count, formatNavStagesInto(&stage_buffer, stats) }) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "pathfinding-elastic-shrink")) {
@@ -1526,10 +1563,36 @@ fn formatNavStagesInto(buffer: []u8, stats: RunStats) []const u8 {
     const remask = formatStageShapeInto(&remask_buffer, stats.batch);
     const patch = formatStageShapeInto(&patch_buffer, stats.secondary_batch orelse .{});
     const conn = formatNavConnInto(&conn_buffer, stats.nav_conn);
+    var main_buffer: [320]u8 = undefined;
+    const main_split = formatNavMainInto(&main_buffer, stats.nav_main);
     if (stats.nav_mark_batch) |mark| {
-        return std.fmt.bufPrint(buffer, "mark={s} plan={s} remask={s} patch={s}{s}", .{ formatStageShapeInto(&mark_buffer, mark), plan, remask, patch, conn }) catch "stages";
+        return std.fmt.bufPrint(buffer, "mark={s} plan={s} remask={s} patch={s}{s}{s}", .{ formatStageShapeInto(&mark_buffer, mark), plan, remask, patch, conn, main_split }) catch "stages";
     }
-    return std.fmt.bufPrint(buffer, "plan={s} remask={s} patch={s}{s}", .{ plan, remask, patch, conn }) catch "stages";
+    return std.fmt.bufPrint(buffer, "plan={s} remask={s} patch={s}{s}{s}", .{ plan, remask, patch, conn, main_split }) catch "stages";
+}
+
+/// The ` main_split=` block of a nav reaction's main-thread sections, inline stage time, and
+/// rest, per sample, or nothing.
+pub fn formatNavMainInto(buffer: []u8, summary: ?NavMainSummary) []const u8 {
+    const main = summary orelse return "";
+    if (main.samples == 0) return "";
+    var writer: std.Io.Writer = .fixed(buffer);
+    writeNavMain(&writer, main) catch return " main_split";
+    return writer.buffered();
+}
+
+fn writeNavMain(writer: *std.Io.Writer, main: NavMainSummary) std.Io.Writer.Error!void {
+    const samples = main.samples;
+    var held = main.inline_ns;
+    try writer.writeAll(" main_split=");
+    inline for (@typeInfo(NavMainPhases).@"struct".field_names, 0..) |name, index| {
+        comptime std.debug.assert(std.mem.endsWith(u8, name, "_ns"));
+        const section_ns = @field(main.sections, name);
+        held += section_ns;
+        if (index != 0) try writer.writeByte(' ');
+        try writer.print("{s}:{f}", .{ name[0 .. name.len - "_ns".len], formatDuration(section_ns / samples) });
+    }
+    try writer.print(" inline:{f} rest:{f}", .{ formatDuration(main.inline_ns / samples), formatDuration((main.main_ns -| held) / samples) });
 }
 
 // The connectivity block of a nav reaction, or nothing.
@@ -2078,6 +2141,38 @@ test "benchmark table formatters keep compact text" {
             .output_count = 4,
             .cache_evictions = 1,
         }),
+    );
+}
+
+test "nav main split prints each section, the inline stage time, and the rest per sample" {
+    var buffer: [320]u8 = undefined;
+    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, null));
+    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, NavMainSummary{}));
+    const stats = NavUpdateStats{
+        .inline_stage_ns = 20_000,
+        .main = .{
+            .mark_ns = 1_000,
+            .plan_ns = 2_000,
+            .reserve_ns = 3_000,
+            .commit_ns = 4_000,
+            .conn_merge_ns = 5_000,
+            .conn_layout_ns = 6_000,
+            .flood_ns = 7_000,
+            .closure_ns = 8_000,
+            .evict_ns = 9_000,
+        },
+    };
+    // Two samples: one reaction, then an iteration of a reaction merged from another summary.
+    var summary = NavMainSummary{};
+    summary.add(70_000, stats);
+    summary.endSample();
+    var other = NavMainSummary{};
+    other.add(70_000, stats);
+    summary.merge(other);
+    summary.endSample();
+    try std.testing.expectEqualStrings(
+        " main_split=mark:1.00 us plan:2.00 us reserve:3.00 us commit:4.00 us conn_merge:5.00 us conn_layout:6.00 us flood:7.00 us closure:8.00 us evict:9.00 us inline:20.00 us rest:5.00 us",
+        formatNavMainInto(&buffer, summary),
     );
 }
 

@@ -12,11 +12,12 @@ const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const PathRequest = @import("../game/simulation.zig").PathRequest;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
+const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const SimulationEvent = @import("../game/simulation.zig").SimulationEvent;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
-const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
@@ -2406,11 +2407,14 @@ const EvictFixture = struct {
     empty: RangeOutputStream(PathRequest),
     system: PathfindingSystem,
     agent_count: usize,
-    // Cells whose blocking the last change flipped.
-    changed: std.ArrayList(NavCellEdit) = .empty,
+    // The step the nav reaction runs in.
+    frame: SimulationFrame,
+    // The last change's tile events, each a cell whose blocking flipped.
+    changed: std.ArrayList(SimulationEvent) = .empty,
 
     fn deinit(self: *EvictFixture, allocator: std.mem.Allocator) void {
         self.changed.deinit(allocator);
+        self.frame.deinit();
         self.system.deinit();
         self.empty.deinit();
         self.stream.deinit();
@@ -2448,24 +2452,28 @@ const EvictFixture = struct {
         return cached;
     }
 
-    // Sets `cells` on level 0 to `tile` in one step (untimed) and runs the nav reaction
-    // over them, marking included; returns the reaction's time and stats. `changed` holds
-    // `cells.len` entries.
+    // Sets `cells` on level 0 to `tile` in one step as a terrain writer does (untimed: the
+    // record reserve, then the write and its tile events), then times the writer's nav record
+    // of the events and the post-commit nav reaction; returns the reaction's time and stats.
+    // `changed` holds `cells.len` entries.
     fn changeAndReact(self: *EvictFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
         const layer = OpenWorld.floor(0);
         self.changed.clearRetainingCapacity();
+        try self.system.reserveTerrainNavRecord(cells.len);
         self.open.world.beginDenseCellWriteReserve();
         for (cells) |cell| try self.open.world.reserveDenseCellWrite(layer, cell.x, cell.y, tile);
         for (cells) |cell| {
             const changed = (try self.open.world.setDenseTile(layer, cell.x, cell.y, tile)) orelse return error.EvictDigUnchanged;
             if (changed.old_blocks_movement == changed.new_blocks_movement) return error.EvictDigUnchanged;
-            self.changed.appendAssumeCapacity(.{ .level = changed.level, .x = changed.x, .y = changed.y });
+            self.changed.appendAssumeCapacity(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
         }
+        self.frame.beginStep();
         const version_before = self.system.graph.version;
         const start_ns = suite.nowNs(io);
-        for (self.changed.items) |edit| try self.system.markNavDirty(edit.level, edit.x, edit.y);
-        const stats = try self.system.applyBufferedNavUpdates(&self.colliders, &self.open.world, thread_system);
+        self.system.recordTerrainNavEvents(self.changed.items, &self.open.world, thread_system);
+        const stats = try self.system.reactToPostCommitNavEvents(&self.frame, &self.colliders, &self.open.world, thread_system);
         const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
+        if (stats.incremental_rebuilds != 1) return error.EvictReactionUnchanged;
         if (self.system.graph.version != version_before) return error.EvictDigRebuiltNav;
         return .{ .elapsed_ns = elapsed, .stats = stats };
     }
@@ -2487,11 +2495,14 @@ const EvictReport = struct {
     dispatched: [3]usize = @splat(0),
     visited: usize = 0,
     evicted: usize = 0,
+    nav_main: suite.NavMainSummary = .{},
 
     fn add(self: *EvictReport, reaction: EvictReaction) void {
         self.samples += 1;
         self.timed_ns += reaction.elapsed_ns;
         self.main_ns += reaction.elapsed_ns -| reaction.stats.off_main_stage_ns;
+        self.nav_main.add(reaction.elapsed_ns -| reaction.stats.off_main_stage_ns, reaction.stats);
+        self.nav_main.endSample();
         self.visited = reaction.stats.evict_entries_visited;
         self.evicted = reaction.stats.evicted_results;
         const batches = [_]BatchStats{ reaction.stats.evict_count_batch, reaction.stats.evict_batch, reaction.stats.evict_flush_batch };
@@ -2511,7 +2522,8 @@ const EvictReport = struct {
         for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
             label.* = stageShape(buffer, batch, threaded, dispatched);
         }
-        std.debug.print("  {s} {} {s}: evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}\n", .{
+        var main_buffer: [320]u8 = undefined;
+        std.debug.print("  {s} {} {s}: evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
             group_name,
             item_count,
             case.name,
@@ -2522,6 +2534,7 @@ const EvictReport = struct {
             @as(u64, @intCast(self.main_ns * 100 / self.timed_ns)),
             self.visited,
             self.evicted,
+            suite.formatNavMainInto(&main_buffer, self.nav_main),
         });
     }
 };
@@ -2546,6 +2559,7 @@ fn assembleEvictFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *D
         .empty = RangeOutputStream(PathRequest).init(allocator),
         .system = system,
         .agent_count = capacity.max_agent_budget,
+        .frame = SimulationFrame.init(allocator),
     };
 }
 
@@ -2559,7 +2573,8 @@ fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usiz
     return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
-// The region config's square: chunk-aligned from chunk (2, 2), `side` chunks a side.
+// The region config's square: chunk-aligned from chunk (2, 2), `side` chunks a side, its
+// cells chunk by chunk (row-major within each chunk) as a dense writer emits them.
 fn evictRegionCells(allocator: std.mem.Allocator, region_chunks: usize, chunk_tiles: usize) ![]CellCoord {
     const side = std.math.sqrt(region_chunks);
     std.debug.assert(side * side == region_chunks);
@@ -2567,8 +2582,14 @@ fn evictRegionCells(allocator: std.mem.Allocator, region_chunks: usize, chunk_ti
     const extent = side * chunk_tiles;
     std.debug.assert(origin + extent <= short_route_side);
     const cells = try allocator.alloc(CellCoord, extent * extent);
+    const chunk_cells = chunk_tiles * chunk_tiles;
     for (cells, 0..) |*cell, index| {
-        cell.* = .{ .x = @intCast(origin + index % extent), .y = @intCast(origin + index / extent) };
+        const chunk = index / chunk_cells;
+        const local = index % chunk_cells;
+        cell.* = .{
+            .x = @intCast(origin + (chunk % side) * chunk_tiles + local % chunk_tiles),
+            .y = @intCast(origin + (chunk / side) * chunk_tiles + local / chunk_tiles),
+        };
     }
     return cells;
 }
@@ -2639,6 +2660,16 @@ fn setNavReactionTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) v
         system.nav_remask_tuner = tuner;
         system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
         system.nav_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_mark_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_seed_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_gather_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_flood_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_candidates_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_closure_resolve_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_closure_mask_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_closure_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_closure_rows_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_conn_closure_compact_tuner = suite.adaptiveTunerForCase(case, 1).?;
         system.nav_evict_count_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
         system.nav_evict_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
         system.evict_flush_tuner = suite.adaptiveTunerForCase(case, 1).?;
@@ -3981,12 +4012,17 @@ const ToggleReport = struct {
     revert_flood_nodes: usize = 0,
     // The flood tuner's workers when the case runs it adaptive (zero: inline).
     flood_tuner_workers: ?usize = null,
+    // Both reactions' main-thread split, per sample.
+    nav_main: suite.NavMainSummary = .{},
 
     fn add(self: *ToggleReport, sample: ToggleSample) void {
         self.samples += 1;
         self.change_ns += sample.change.elapsed_ns;
         self.revert_ns += sample.revert.elapsed_ns;
         self.main_ns += (sample.change.elapsed_ns -| sample.change.stats.off_main_stage_ns) + (sample.revert.elapsed_ns -| sample.revert.stats.off_main_stage_ns);
+        self.nav_main.add(sample.change.elapsed_ns -| sample.change.stats.off_main_stage_ns, sample.change.stats);
+        self.nav_main.add(sample.revert.elapsed_ns -| sample.revert.stats.off_main_stage_ns, sample.revert.stats);
+        self.nav_main.endSample();
         self.chunks_patched = sample.change.stats.chunks_patched;
         self.records_patched = sample.change.stats.records_patched;
         self.flood_nodes = sample.change.stats.conn_flood_nodes;
@@ -4030,6 +4066,7 @@ const ToggleReport = struct {
 
     // The busiest plan, remask, and patch batches into `stats`' nav stage summaries.
     fn summarize(self: ToggleReport, stats: *suite.RunStats) void {
+        stats.nav_main = self.nav_main;
         stats.nav_plan_batch = suite.batchSummaryFromBatch(self.busiest[0]);
         stats.batch = suite.batchSummaryFromBatch(self.busiest[1]);
         stats.secondary_batch = suite.batchSummaryFromBatch(self.busiest[2]);

@@ -300,6 +300,34 @@ pub const NavMark = struct {
     max_y: u32,
 };
 
+/// Main-thread wall time of one nav reaction's ordered sections, in ns, summed over its level
+/// builds and marks batch. No section spans a stage job, dispatched or inline, so the reaction's
+/// main time minus their sum and its inline stage time is untimed glue. Zero in ReleaseFast and
+/// ReleaseSmall (`StageTimer`). Diagnostic only.
+pub const NavMainPhases = struct {
+    // The terrain records' event check and `nav_mark`'s profile select, tally reset, and
+    // window append.
+    mark_ns: u64 = 0,
+    // The key plan's window sizing, staging reserve, and merge or swap.
+    plan_ns: u64 = 0,
+    // Patch info, cell blocks, records, the connectivity and closure prepare, the registry,
+    // and the eviction sizing.
+    reserve_ns: u64 = 0,
+    // Link fold, remask claim and release loops, record claims and releases.
+    commit_ns: u64 = 0,
+    // The connectivity merge of rows, unions, and groups.
+    conn_merge_ns: u64 = 0,
+    // The connectivity layout, settle, set opening, and finish.
+    conn_layout_ns: u64 = 0,
+    // The flood rounds' builds, merges, and closes.
+    flood_ns: u64 = 0,
+    // The closure's touch, terminal merge, A lists, blocks, round lists, and commit.
+    closure_ns: u64 = 0,
+    // Eviction's hit removal, the registry flush outside its dispatch, and a rebuilt level's
+    // cache and request clear.
+    evict_ns: u64 = 0,
+};
+
 // Diagnostics for one nav update (level builds plus the marks batch). Recorded by the
 // caller into runtime perf metrics. A step with nothing to apply leaves every counter zero.
 pub const NavUpdateStats = struct {
@@ -318,6 +346,8 @@ pub const NavUpdateStats = struct {
     // Remask, patch, mark, and eviction dispatch time that ran on workers; inline stages
     // add nothing. Diagnostic only.
     off_main_stage_ns: u64 = 0,
+    // The same stages' time run inline on the main thread. Diagnostic only.
+    inline_stage_ns: u64 = 0,
     // The marks batch's chunk remask; empty when no marks batch changed the graph. Level
     // builds' remasks are not in it.
     remask_batch: BatchStats = .{},
@@ -389,6 +419,18 @@ pub const NavUpdateStats = struct {
     closure_candidate_words: usize = 0,
     closure_live_prepared: usize = 0,
     closure_kb: usize = 0,
+    // The reaction's main-thread sections, the terrain records' `nav_mark` folded in.
+    main: NavMainPhases = .{},
+
+    /// Adds a stage batch's time: to `inline_stage_ns` when it ran inline, else to
+    /// `off_main_stage_ns`.
+    pub fn addStageTime(self: *NavUpdateStats, batch: BatchStats) void {
+        if (batch.ran_inline) {
+            self.inline_stage_ns += batch.batch_duration_ns;
+        } else {
+            self.off_main_stage_ns += batch.batch_duration_ns;
+        }
+    }
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
@@ -619,10 +661,6 @@ pub const PathfindingConfig = struct {
     max_solved_requests_per_step: ?usize = null,
     max_fallback_requests_per_step: ?usize = null,
 };
-
-// The fixed-step pathfinding update's phase timer: the one shared StageTimer
-// (see runtime_perf_log.zig), used here via its `begin`/`lap` interface.
-pub const PhaseTimer = runtime_perf_log.StageTimer;
 
 pub const PathfindingStats = struct {
     accepted_requests: usize = 0,

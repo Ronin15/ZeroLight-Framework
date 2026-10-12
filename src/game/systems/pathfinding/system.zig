@@ -87,7 +87,7 @@ const resizeList = types.resizeList;
 const resizeUnwritten = types.resizeUnwritten;
 const PathSolveResult = types.PathSolveResult;
 const GroupRequestTally = types.GroupRequestTally;
-const PhaseTimer = types.PhaseTimer;
+const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
 const emptyKey = types.emptyKey;
 const keysEqual = types.keysEqual;
 const setLen = types.setLen;
@@ -243,8 +243,11 @@ pub const PathfindingSystem = struct {
     nav_mark_tallies: NavMarkTallyList = .empty,
     // Batch shape of the most recent `nav_mark` stage, for bench and diagnostic reporting.
     last_mark_batch: BatchStats = .{},
-    // Off-main time of the terrain records since the last reaction, folded into its stats.
+    // Off-main, inline, and main-section time of the terrain records since the last reaction,
+    // folded into its stats.
     pending_mark_off_main_ns: u64 = 0,
+    pending_mark_inline_ns: u64 = 0,
+    pending_mark_main_ns: u64 = 0,
     /// Telemetry: mark reserves that grew the mark buffer, the `nav_mark` staging, or its
     /// tallies; logged once.
     nav_mark_grows: u64 = 0,
@@ -868,9 +871,13 @@ pub const PathfindingSystem = struct {
     /// main work is O(1) per mark.
     pub fn recordTerrainNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) void {
         if (events.len == 0) return;
-        if (std.debug.runtime_safety) for (events) |event| {
-            std.debug.assert(event.payload == .world_tile_changed or event.payload == .world_obstacle_changed);
-        };
+        if (std.debug.runtime_safety) {
+            const check_timer = StageTimer.begin();
+            for (events) |event| {
+                std.debug.assert(event.payload == .world_tile_changed or event.payload == .world_obstacle_changed);
+            }
+            self.pending_mark_main_ns += check_timer.lap();
+        }
         self.pending_mark_off_main_ns += self.markNavEvents(events, world, thread_system);
     }
 
@@ -946,9 +953,11 @@ pub const PathfindingSystem = struct {
                     if (self.graph.level_graphs.items[level].built_revision == world.levelContentRevision(level)) continue;
                     try self.graph.buildLevel(view, world, level, threads, &stats);
                     // The level changed without per-cell changes: no cached result is known good.
+                    const clear_timer = StageTimer.begin();
                     self.clearCompleted();
                     self.clearRequestStateKeepingCompleted();
                     self.dropGroupFields();
+                    stats.main.evict_ns += clear_timer.lap();
                 }
                 self.graph.built_world_revision = world.contentRevision();
             }
@@ -980,11 +989,17 @@ pub const PathfindingSystem = struct {
     /// next step.
     pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
         const mark_off_main_ns = self.pending_mark_off_main_ns;
+        const mark_inline_ns = self.pending_mark_inline_ns;
+        const mark_main_ns = self.pending_mark_main_ns;
         self.pending_mark_off_main_ns = 0;
-        if (!self.hasPendingNavUpdates(world)) return .{ .off_main_stage_ns = mark_off_main_ns };
+        self.pending_mark_inline_ns = 0;
+        self.pending_mark_main_ns = 0;
+        if (!self.hasPendingNavUpdates(world)) return .{ .off_main_stage_ns = mark_off_main_ns, .inline_stage_ns = mark_inline_ns, .main = .{ .mark_ns = mark_main_ns } };
         try frame.events.ensureCanAppend(1);
         var stats = try self.applyBufferedNavUpdates(colliders, world, thread_system);
         stats.off_main_stage_ns += mark_off_main_ns;
+        stats.inline_stage_ns += mark_inline_ns;
+        stats.main.mark_ns += mark_main_ns;
         if (stats.incremental_rebuilds == 0 and stats.levels_built == 0) return stats;
         try frame.events.appendRequired(.{
             .stage = .domain_reaction,
@@ -1003,6 +1018,8 @@ pub const PathfindingSystem = struct {
     fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) !void {
         // Every update and reaction ends flushed, so every registration names a live entry.
         std.debug.assert(self.completed.core.ownerLog().len == 0 and self.publish_ranges == 0);
+        var section = StageTimer.begin();
+        defer stats.main.reserve_ns += section.lap();
         const keys = self.graph.changed_keys.items;
         self.evict_items.clearRetainingCapacity();
         self.evict_hits.clearRetainingCapacity();
@@ -1023,7 +1040,9 @@ pub const PathfindingSystem = struct {
             .items = self.evict_items.items,
             .range_count = count_shape.range_count,
         };
+        stats.main.reserve_ns += section.lap();
         stats.evict_count_batch = runShaped(count_dispatch, count_shape, keys.len, evict_range_alignment_items, &job, evictCountJob);
+        section = StageTimer.begin();
         // The walk's shape now, so each of its ranges' hit windows starts on a line.
         self.evict_shape = stageShape(self.navDispatch(thread_system, &self.nav_evict_tuner), keys.len, evict_range_alignment_items);
         const field_count = self.group_fields.items.len;
@@ -1066,6 +1085,8 @@ pub const PathfindingSystem = struct {
                 .range_count = self.evict_shape.range_count,
             };
             stats.evict_batch = runShaped(self.navDispatch(thread_system, &self.nav_evict_tuner), self.evict_shape, keys.len, evict_range_alignment_items, &job, evictJob);
+            const removal_timer = StageTimer.begin();
+            defer stats.main.evict_ns += removal_timer.lap();
             for (self.evict_items.items) |item| {
                 stats.evict_entries_visited += item.visited;
                 const window = self.evict_hits.items[item.base..];
@@ -1084,8 +1105,14 @@ pub const PathfindingSystem = struct {
                 }
             }
         }
-        stats.evict_flush_batch = self.flushRegistry(self.navDispatch(thread_system, &self.evict_flush_tuner), null);
-        stats.off_main_stage_ns += offMainNs(stats.evict_count_batch) + offMainNs(stats.evict_batch) + offMainNs(stats.evict_flush_batch);
+        const flush_dispatch = self.navDispatch(thread_system, &self.evict_flush_tuner);
+        const flush_timer = StageTimer.begin();
+        stats.evict_flush_batch = self.flushRegistry(flush_dispatch, null);
+        // The flush's code outside its dispatch, inline or not.
+        stats.main.evict_ns += flush_timer.lap() -| stats.evict_flush_batch.batch_duration_ns;
+        stats.addStageTime(stats.evict_count_batch);
+        stats.addStageTime(stats.evict_batch);
+        stats.addStageTime(stats.evict_flush_batch);
     }
 
     fn countEvictGrowth(self: *PathfindingSystem) void {
@@ -1123,12 +1150,16 @@ pub const PathfindingSystem = struct {
         const mark_bound = events.len;
         std.debug.assert(self.nav_marks.capacity - self.nav_marks.items.len >= mark_bound);
         const ts = thread_system orelse {
+            const stage_timer = StageTimer.begin();
             self.appendEventMarks(world, events);
             self.last_mark_batch = inlineBatch(events.len, nav_mark_range_alignment_items);
+            self.last_mark_batch.batch_duration_ns = stage_timer.lap();
+            self.pending_mark_inline_ns += self.last_mark_batch.batch_duration_ns;
             return 0;
         };
         std.debug.assert(self.nav_mark_staging.capacity >= mark_bound);
         std.debug.assert(self.nav_mark_tallies.capacity >= maxRangeCount(events.len, nav_mark_range_alignment_items));
+        var section = StageTimer.begin();
         const selection = ts.selectBatchProfile(&self.nav_mark_tuner, .{
             .item_count = events.len,
             .items_per_range = self.nav_thread_items_per_range,
@@ -1140,7 +1171,9 @@ pub const PathfindingSystem = struct {
             // Inline on the main thread in range order; still dispatched so the tuner
             // records the batch.
             var direct = DirectNavMarkJob{ .system = self, .world = world, .events = events };
+            self.pending_mark_main_ns += section.lap();
             self.last_mark_batch = ts.parallelForWithOptions(events.len, &direct, directNavMarkJob, options);
+            self.pending_mark_inline_ns += self.last_mark_batch.batch_duration_ns;
             return 0;
         }
         std.debug.assert(self.nav_mark_tallies.capacity >= selection.range_count);
@@ -1155,13 +1188,20 @@ pub const PathfindingSystem = struct {
             .staging = self.nav_mark_staging.items,
             .tallies = self.nav_mark_tallies.items,
         };
+        self.pending_mark_main_ns += section.lap();
         const batch = ts.parallelForWithOptions(events.len, &job, navMarkJob, options);
+        section = StageTimer.begin();
         self.last_mark_batch = batch;
         for (self.nav_mark_tallies.items, 0..) |tally, range_index| {
             const window_start = range_index * selection.items_per_range;
             for (self.nav_mark_staging.items[window_start .. window_start + tally.count]) |mark| self.appendEventMark(mark);
         }
-        return if (batch.ran_inline) 0 else batch.batch_duration_ns;
+        self.pending_mark_main_ns += section.lap();
+        if (batch.ran_inline) {
+            self.pending_mark_inline_ns += batch.batch_duration_ns;
+            return 0;
+        }
+        return batch.batch_duration_ns;
     }
 
     fn navMarkDispatchOptions(self: *const PathfindingSystem, selection: BatchSelection) ParallelForOptions {
@@ -1459,7 +1499,7 @@ pub const PathfindingSystem = struct {
         self.step_counter +%= 1;
         self.last_resize_copy_batch = .{};
         try self.adjustCapacityForAgentCount(agent_count, threads);
-        var accept_timer = PhaseTimer.begin();
+        var accept_timer = StageTimer.begin();
         stats.* = self.acceptRequests(requests.mergedItems(), threads);
         stats.resize_copy_batch = self.last_resize_copy_batch;
         // Fold in any requests an elastic shrink dropped (it ran before acceptRequests
@@ -1467,7 +1507,7 @@ pub const PathfindingSystem = struct {
         stats.dropped_requests += self.resize_dropped;
         self.resize_dropped = 0;
         stats.accept_ns = accept_timer.lap();
-        var group_timer = PhaseTimer.begin();
+        var group_timer = StageTimer.begin();
         self.serviceGroupFields(stats, threads);
         stats.group_service_ns = group_timer.lap();
         // Diagnostic only: how many DISTINCT group keys were tallied this step, after
@@ -1495,7 +1535,7 @@ pub const PathfindingSystem = struct {
     // publish-reserve OOM nothing is claimed and pending is left intact for retry; the
     // caller's flush still applies the ops logged so far.
     fn finishUpdate(self: *PathfindingSystem, solve_count: usize, threads: ?StageThreads, stats: *PathfindingStats) !void {
-        var publish_timer = PhaseTimer.begin();
+        var publish_timer = StageTimer.begin();
         try self.reservePublish(stats);
         self.claimPublish(stats);
         stats.publish_copy_batch = self.publishCopy(if (threads) |stage| stage.stage(&self.publish_copy_tuner) else null);
@@ -1530,7 +1570,7 @@ pub const PathfindingSystem = struct {
         const thread_system = threads.thread_system;
         const config = threads.config;
         const solve_count = (try self.beginSolve(requests, agent_count, config, threads, stats)) orelse return;
-        var solve_timer = PhaseTimer.begin();
+        var solve_timer = StageTimer.begin();
         var system_config = config;
         self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(system_config), stats);
 
@@ -1592,7 +1632,7 @@ pub const PathfindingSystem = struct {
 
     fn updateInline(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, stats: *PathfindingStats) !void {
         const solve_count = (try self.beginSolve(requests, agent_count, config, null, stats)) orelse return;
-        var solve_timer = PhaseTimer.begin();
+        var solve_timer = StageTimer.begin();
         self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(config), stats);
         if (self.fallback_indices.items.len != 0) {
             // Mirrors the threaded path's misconfiguration contract (see update()'s
@@ -2926,8 +2966,12 @@ fn stageShape(dispatch: ?Dispatch, item_count: usize, range_alignment_items: usi
 fn runShaped(dispatch: ?Dispatch, shape: StageShape, item_count: usize, range_alignment_items: usize, context: *anyopaque, job: JobFn) BatchStats {
     if (item_count == 0) return .{};
     const stage = dispatch orelse {
+        // No thread system times the batch, so it is timed here.
+        const stage_timer = StageTimer.begin();
         job(context, .{ .start = 0, .end = item_count, .index = 0 }, WorkerId.main);
-        return inlineBatch(item_count, range_alignment_items);
+        var batch = inlineBatch(item_count, range_alignment_items);
+        batch.batch_duration_ns = stage_timer.lap();
+        return batch;
     };
     // A shape selected under a dispatch holds its selection.
     const selection = shape.selection.?;
@@ -2939,11 +2983,6 @@ fn runShaped(dispatch: ?Dispatch, shape: StageShape, item_count: usize, range_al
         .adaptive_tuner = selection.active_tuner,
         .selected_profile = selection.profile,
     });
-}
-
-// Dispatch time of a batch that ran on workers; zero when it ran inline.
-fn offMainNs(batch: BatchStats) u64 {
-    return if (batch.ran_inline) 0 else batch.batch_duration_ns;
 }
 
 // One range of `publish_copy`: its ordinals' paths into their claimed stripes or blocks,
