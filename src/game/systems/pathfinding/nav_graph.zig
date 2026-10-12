@@ -2394,6 +2394,9 @@ pub const NavGraph = struct {
             extra.clearRetainingCapacity();
             links.clearRetainingCapacity();
             if (world) |world_system| {
+                // Locals already in `extra`: an O(1) dedupe per endpoint, so a chunk holding E
+                // endpoints patches in O(E log E) (the sorts below), not O(E²).
+                var extra_locals: std.bit_set.Array(usize, 256) = .empty;
                 var endpoints = world_system.levelChunkLinkEndpoints(level, chunk);
                 while (endpoints.next()) |endpoint| {
                     const cell = @as(usize, endpoint.cell.y) * w + endpoint.cell.x;
@@ -2401,7 +2404,8 @@ pub const NavGraph = struct {
                     const local = self.localOf(cell);
                     if (std.sort.binarySearch(NavPortal, portals[0..count], local, orderPortalLocal)) |existing| {
                         portals[existing].flags.link = true;
-                    } else if (findLocalLinear(extra.items, local) == null) {
+                    } else if (!extra_locals.isSet(local)) {
+                        extra_locals.set(local);
                         // The reserve sized the slot's lists to the planned endpoint count.
                         std.debug.assert(extra.items.len < endpoint_limit);
                         extra.appendAssumeCapacity(.{ .local = local, .label = level_grid.labelAt(cell), .flags = .{ .link = true } });
@@ -4217,7 +4221,11 @@ test "a chunk gaining a link per batch grows its link slot geometrically, each g
             try std.testing.expect(system.graph.pool_grows > pool_grows);
         }
     }
-    try std.testing.expectEqual(@as(usize, batches), system.graph.chunkPortals(0, chunk).links.len);
+    const portals = system.graph.chunkPortals(0, chunk);
+    try std.testing.expectEqual(@as(usize, batches), portals.links.len);
+    // 32 links over two cells keep one extra portal per distinct non-border cell.
+    try std.testing.expect(portals.extra.len >= 1 and portals.extra.len <= 2);
+    if (portals.extra.len == 2) try std.testing.expect(portals.extra[0].local != portals.extra[1].local);
     // Geometric: a handful of growths for 32 links (one per link if grown exactly).
     try std.testing.expect(growths <= 8);
     var rebuilt = try fullRebuild(&data, &fixture.world, abstractCapacity());
