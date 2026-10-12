@@ -2900,12 +2900,14 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = EvictReport{};
     var evicted: usize = 0;
+    var last_stats: NavUpdateStats = .{};
     for (0..options.iterations) |_| {
         const reaction = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         evicted = result_count - fixture.cachedCount();
         // The reaction evicted exactly the results the cache lost.
         if (reaction.stats.evicted_results != evicted) return error.EvictCountMismatch;
-        accumulator.record(reaction.elapsed_ns, fixture.system.graph.last_remask_batch);
+        last_stats = reaction.stats;
+        accumulator.record(reaction.elapsed_ns, reaction.stats.remask_batch);
         report.add(reaction);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
@@ -2920,27 +2922,16 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = result_count;
     // Registry entries the reaction's eviction visited per second.
     stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
     return stats;
 }
 
 // Gives the nav reaction's stages this case's tuners.
 fn setNavReactionTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
-        system.nav_remask_tuner = tuner;
-        system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_mark_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_seed_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_gather_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_flood_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_candidates_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_closure_resolve_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_closure_mask_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_closure_plan_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_closure_rows_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.nav_conn_closure_compact_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.nav_tuners = .initFill(tuner);
+        system.nav_mark_tuner = tuner;
         system.nav_evict_count_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
         system.nav_evict_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
         system.evict_flush_tuner = suite.adaptiveTunerForCase(case, 1).?;
@@ -4232,13 +4223,12 @@ fn checkOnewayReserve(stats: NavUpdateStats) !void {
 // Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again.
 fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !ToggleSample {
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
-    const graph = &fixture.system.graph;
     const stats = change.stats;
     const change_stages = [toggle_stage_count]BatchStats{
-        graph.last_plan_batch,         stats.remask_batch,               graph.last_patch_batch,
-        stats.conn_seed_batch,         stats.conn_gather_batch,          stats.conn_flood_batch,
-        stats.conn_candidates_batch,   stats.conn_closure_resolve_batch, stats.conn_closure_mask_batch,
-        stats.conn_closure_plan_batch, stats.conn_closure_rows_batch,    stats.conn_closure_compact_batch,
+        stats.plan_batch,                    stats.remask_batch,               stats.patch_batch,
+        stats.conn_seed_batch,               stats.conn_gather_batch,          stats.conn_flood_batch,
+        stats.conn_closure_candidates_batch, stats.conn_closure_resolve_batch, stats.conn_closure_mask_batch,
+        stats.conn_closure_plan_batch,       stats.conn_closure_rows_batch,    stats.conn_closure_compact_batch,
     };
     const revert = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
     // A toggle and its revert never resize a one-way block.
@@ -4446,7 +4436,7 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
         report.add(sample);
     }
     if (case.adaptive and thread_system != null) {
-        const tuner = fixture.system.nav_conn_flood_tuner.report();
+        const tuner = fixture.system.nav_tuners.getPtrConst(.conn_flood).report();
         report.flood_tuner_workers = if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
     }
     report.print(options, group_name, item_count, case);
@@ -5126,8 +5116,8 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     for (0..options.iterations) |_| {
         const sample = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
-        accumulator.record(sample.reaction.elapsed_ns, fixture.system.graph.last_patch_batch);
-        report.add(sample, fixture.system.graph.last_plan_batch, fixture.system.graph.last_patch_batch, fixture.open.world.levelLinks().len);
+        accumulator.record(sample.reaction.elapsed_ns, sample.reaction.stats.patch_batch);
+        report.add(sample, sample.reaction.stats.plan_batch, sample.reaction.stats.patch_batch, fixture.open.world.levelLinks().len);
     }
     const pads_held = fixture.open.world.levelLinks().len;
     if (pads_held != peak_pads) return error.LinkFoldDrift;

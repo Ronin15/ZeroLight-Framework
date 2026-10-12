@@ -216,7 +216,6 @@ pub const default_cache_ttl_steps: u32 = 300;
 
 pub const no_parent: usize = std.math.maxInt(usize);
 pub const no_cell: u32 = std.math.maxInt(u32);
-pub const no_component: u32 = 0;
 pub const diagonal_cost: u32 = 14;
 pub const cardinal_cost: u32 = 10;
 pub const unreachable_cost: u32 = std.math.maxInt(u32);
@@ -341,9 +340,11 @@ pub const NavUpdateStats = struct {
     off_main_stage_ns: u64 = 0,
     // The same stages' time run inline on the main thread. Diagnostic only.
     inline_stage_ns: u64 = 0,
-    // The marks batch's chunk remask; empty when no marks batch changed the graph. Level
-    // builds' remasks are not in it.
+    // The graph's stages of the level builds and the marks batch, summed: the key plan
+    // (marks batches only), the chunk remask, and the record patch.
+    plan_batch: BatchStats = .{},
     remask_batch: BatchStats = .{},
+    patch_batch: BatchStats = .{},
     // Path eviction: the pre-commit bound count over the changed keys, the halo walk over
     // their registrations, and the registry flush of the removals.
     evict_count_batch: BatchStats = .{},
@@ -379,7 +380,7 @@ pub const NavUpdateStats = struct {
     // The one-way closure's stages across level builds and the marks batch: the candidate
     // scan and compaction (prepare), and link resolve, row mask, SCC plan, and rows (rounds
     // folded into one).
-    conn_candidates_batch: BatchStats = .{},
+    conn_closure_candidates_batch: BatchStats = .{},
     conn_closure_compact_batch: BatchStats = .{},
     conn_closure_resolve_batch: BatchStats = .{},
     conn_closure_mask_batch: BatchStats = .{},
@@ -485,56 +486,73 @@ pub const NavSpan = struct {
     max_y: usize,
 };
 
-// Single source of the chunk-tiling geometry shared by NavGrid and NavGraph: the chunk_id
-// <-> cell mapping and the chunk-local label encoding. NavGrid encodes labels as
-// chunk_id * labelStride() + local; NavGraph decodes the owning chunk back via integer
-// division. Both delegate here so the encode/decode and chunk bounds cannot drift apart.
+/// The chunk tiling of a nav level: power-of-two chunks of `chunk_tiles` cells a side,
+/// row-major over `chunks_x` x `chunks_y`, border chunks clipped to the level. Cell and
+/// chunk-local coordinates map by shifts and masks; only a flat cell index divides (once).
+/// Sides are `usize`: a bounds build may exceed `u16`.
 pub const ChunkGeometry = struct {
     width: usize,
     height: usize,
-    chunk_tiles: usize,
+    chunk_tiles: u16,
+    shift: u4,
+    chunks_x: usize,
+    chunks_y: usize,
+
+    /// No cells: an unbuilt grid's.
+    pub const empty: ChunkGeometry = .{ .width = 0, .height = 0, .chunk_tiles = 1, .shift = 0, .chunks_x = 0, .chunks_y = 0 };
 
     pub const Bounds = struct { x0: usize, y0: usize, x1: usize, y1: usize };
 
-    pub fn chunksX(self: ChunkGeometry) usize {
-        return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
-    }
-
-    pub fn chunksY(self: ChunkGeometry) usize {
-        return (self.height + self.chunk_tiles - 1) / self.chunk_tiles;
-    }
-
-    pub fn chunkCount(self: ChunkGeometry) usize {
-        return self.chunksX() * self.chunksY();
-    }
-
-    pub fn chunkOf(self: ChunkGeometry, cell_index: usize) u32 {
-        const cx = (cell_index % self.width) / self.chunk_tiles;
-        const cy = (cell_index / self.width) / self.chunk_tiles;
-        return @intCast(cy * self.chunksX() + cx);
-    }
-
-    // Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the grid.
-    pub fn chunkBounds(self: ChunkGeometry, chunk_id: u32) Bounds {
-        const cx_count = self.chunksX();
-        const cx = chunk_id % cx_count;
-        const cy = chunk_id / cx_count;
-        const x0 = cx * self.chunk_tiles;
-        const y0 = cy * self.chunk_tiles;
+    pub fn init(width: usize, height: usize, chunk_tiles: u16) ChunkGeometry {
+        std.debug.assert(chunk_tiles != 0 and std.math.isPowerOfTwo(chunk_tiles));
+        const shift: u4 = @intCast(@ctz(chunk_tiles));
+        const edge: usize = chunk_tiles;
         return .{
-            .x0 = x0,
-            .y0 = y0,
-            .x1 = @min(x0 + self.chunk_tiles, self.width),
-            .y1 = @min(y0 + self.chunk_tiles, self.height),
+            .width = width,
+            .height = height,
+            .chunk_tiles = chunk_tiles,
+            .shift = shift,
+            .chunks_x = (width + edge - 1) >> shift,
+            .chunks_y = (height + edge - 1) >> shift,
         };
     }
 
-    // Per-chunk label stride: chunk_tiles^2 + 1 (max local labels per chunk plus the
-    // reserved 0). Computed in u64 for headroom on the encode multiply; encoded labels
-    // are asserted to fit u32 at the encode site.
-    pub fn labelStride(self: ChunkGeometry) u64 {
-        const ct: u64 = self.chunk_tiles;
-        return ct * ct + 1;
+    pub fn chunksX(self: ChunkGeometry) usize {
+        return self.chunks_x;
+    }
+
+    pub fn chunksY(self: ChunkGeometry) usize {
+        return self.chunks_y;
+    }
+
+    pub fn chunkCount(self: ChunkGeometry) usize {
+        return self.chunks_x * self.chunks_y;
+    }
+
+    /// The chunk of in-level cell (x, y).
+    pub inline fn chunkOf(self: ChunkGeometry, x: usize, y: usize) u32 {
+        // Below the level's chunk count, which `validateChunkGrid` keeps below 2^31.
+        return @intCast((y >> self.shift) * self.chunks_x + (x >> self.shift));
+    }
+
+    /// Chunk-local index (`row * chunk_tiles + column`) of in-level cell (x, y).
+    pub inline fn localOf(self: ChunkGeometry, x: usize, y: usize) u8 {
+        const mask: usize = self.chunk_tiles - 1;
+        // A chunk holds at most 256 cells.
+        return @intCast(((y & mask) << self.shift) | (x & mask));
+    }
+
+    /// Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the level.
+    pub fn chunkBounds(self: ChunkGeometry, chunk: u32) Bounds {
+        const cy = chunk / self.chunks_x;
+        const x0 = (chunk - cy * self.chunks_x) << self.shift;
+        const y0 = cy << self.shift;
+        return .{
+            .x0 = x0,
+            .y0 = y0,
+            .x1 = @min(x0 + @as(usize, self.chunk_tiles), self.width),
+            .y1 = @min(y0 + @as(usize, self.chunk_tiles), self.height),
+        };
     }
 };
 
@@ -1406,6 +1424,33 @@ pub fn ListResize(comptime T: type) type {
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
+
+const test_support = @import("test_support.zig");
+
+test "the shift-based chunk geometry equals division over every cell, short border chunks included" {
+    for ([_]u16{ 1, 2, 4, 16 }) |edge| {
+        // Two full chunks and a short one per axis, different per axis.
+        const width: usize = 2 * @as(usize, edge) + (edge + 1) / 2;
+        const height: usize = 3 * @as(usize, edge) - edge / 2;
+        const geometry = ChunkGeometry.init(width, height, edge);
+        const ct: usize = edge;
+        try std.testing.expectEqual((width + ct - 1) / ct, geometry.chunksX());
+        try std.testing.expectEqual((height + ct - 1) / ct, geometry.chunksY());
+        for (0..height) |y| for (0..width) |x| {
+            const chunk: u32 = @intCast((y / ct) * geometry.chunksX() + x / ct);
+            const local: u8 = @intCast((y % ct) * ct + x % ct);
+            try std.testing.expectEqual(chunk, geometry.chunkOf(x, y));
+            try std.testing.expectEqual(chunk, test_support.chunkOfCell(geometry, y * width + x));
+            try std.testing.expectEqual(local, geometry.localOf(x, y));
+            try std.testing.expectEqual(local, test_support.localOfCell(geometry, y * width + x));
+            try std.testing.expectEqual(y * width + x, @as(usize, test_support.cellOfLocal(geometry, chunk, local)));
+            const bounds = geometry.chunkBounds(chunk);
+            try std.testing.expect(x >= bounds.x0 and x < bounds.x1 and y >= bounds.y0 and y < bounds.y1);
+            try std.testing.expectEqual(@min(bounds.x0 + ct, width), bounds.x1);
+            try std.testing.expectEqual(@min(bounds.y0 + ct, height), bounds.y1);
+        };
+    }
+}
 
 test "octileXY is exact on a small delta and saturates instead of wrapping" {
     try std.testing.expectEqual(@as(u32, 3 * diagonal_cost), octileXY(0, 0, 3, 3));

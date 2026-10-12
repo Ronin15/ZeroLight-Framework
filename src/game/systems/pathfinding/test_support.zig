@@ -13,6 +13,7 @@ const EntityId = @import("../../data_system.zig").EntityId;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const PathfindingCapacity = @import("types.zig").PathfindingCapacity;
+const ChunkGeometry = @import("types.zig").ChunkGeometry;
 const assets = @import("../../../assets/assets.zig");
 const manifest = @import("../../../assets/manifest.zig");
 const world_tileset_meta = @import("../../../assets/world_tileset_meta.zig");
@@ -29,6 +30,7 @@ const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
+const LabelSet = @import("nav_graph.zig").LabelSet;
 const no_node = @import("connectivity.zig").no_node;
 const no_comp = @import("connectivity.zig").no_comp;
 const no_term = @import("connectivity.zig").no_term;
@@ -159,7 +161,7 @@ pub fn setBlockedCells(allocator: std.mem.Allocator, grid: *NavGrid, cells: []co
         var bits: ChunkBits = @splat(0);
         for (cells) |cell| {
             if (cell[0] < bounds.x0 or cell[0] >= bounds.x1 or cell[1] < bounds.y0 or cell[1] >= bounds.y1) continue;
-            const local = (cell[1] - bounds.y0) * grid.chunk_tiles + (cell[0] - bounds.x0);
+            const local = (cell[1] - bounds.y0) * grid.geometry.chunk_tiles + (cell[0] - bounds.x0);
             bits[local / 64] |= @as(u64, 1) << @intCast(local % 64);
         }
         try grid.ensureFreeBlocks(allocator, 1, &pool_grows);
@@ -169,17 +171,49 @@ pub fn setBlockedCells(allocator: std.mem.Allocator, grid: *NavGrid, cells: []co
     }
 }
 
+/// The chunk of in-level cell index `cell` (`y * width + x`) under `geometry`.
+pub fn chunkOfCell(geometry: ChunkGeometry, cell: usize) u32 {
+    const y = cell / geometry.width;
+    return geometry.chunkOf(cell - y * geometry.width, y);
+}
+
+/// The chunk-local index of in-level cell index `cell` under `geometry`.
+pub fn localOfCell(geometry: ChunkGeometry, cell: usize) u8 {
+    const y = cell / geometry.width;
+    return geometry.localOf(cell - y * geometry.width, y);
+}
+
+/// The in-level cell index of chunk-local index `local` of `chunk` under `geometry`.
+pub fn cellOfLocal(geometry: ChunkGeometry, chunk: u32, local: u8) u32 {
+    const bounds = geometry.chunkBounds(chunk);
+    const mask: usize = geometry.chunk_tiles - 1;
+    // Cells of a validated grid are below 2^32.
+    return @intCast((bounds.y0 + (@as(usize, local) >> geometry.shift)) * geometry.width + bounds.x0 + (local & mask));
+}
+
+/// Mixed chunks of `grid` holding a cell block.
+pub fn liveBlockCount(grid: *const NavGrid) usize {
+    return grid.blocks.len - grid.block_free.items.len;
+}
+
+/// Portals across every record of every level of `graph`.
+pub fn totalPortals(graph: *const NavGraph) usize {
+    var count: usize = 0;
+    for (0..graph.levelCount()) |level| count += levelLivePortalCount(graph, @intCast(level));
+    return count;
+}
+
+/// Portals across every record of `level` of `graph`.
+pub fn levelLivePortalCount(graph: *const NavGraph, level: u16) usize {
+    var count: usize = 0;
+    for (0..graph.chunkCount()) |chunk| {
+        const portals = graph.chunkPortals(level, @intCast(chunk));
+        count += portals.border.len + portals.extra.len;
+    }
+    return count;
+}
+
 // Connectivity checks: node keys (level, chunk, label) and a reference union over the records.
-
-const ConnLabels = [4]u64;
-
-fn connLabelAdd(set: *ConnLabels, label: u8) void {
-    set[label >> 6] |= @as(u64, 1) << @intCast(label & 63);
-}
-
-fn connLabelHas(set: *const ConnLabels, label: u8) bool {
-    return (set[label >> 6] >> @intCast(label & 63)) & 1 != 0;
-}
 
 // One flat index per pooled node row of every level.
 const ConnNodeIndex = struct {
@@ -230,7 +264,7 @@ fn connListsLink(portals: ChunkPortals, local: u8, link: u32) bool {
 // The node row at `cell` of `level`, which must be a node.
 fn connNodeAt(graph: *const NavGraph, level: u16, cell: usize) u32 {
     const grid = graph.grid(level).?;
-    const row = graph.levelGraph(level).?.nodeOf(grid.chunkOfCell(cell), grid.labelAt(cell));
+    const row = graph.levelGraph(level).?.nodeOf(chunkOfCell(grid.geometry, cell), grid.labelAt(cell));
     std.debug.assert(row != no_node);
     return row;
 }
@@ -243,17 +277,17 @@ fn connUniteRecordEdges(graph: *const NavGraph, index: *const ConnNodeIndex, par
     const label = graph.levelGraph(level).?.node_label[row];
     const portals = graph.chunkPortals(level, chunk);
     const bounds = grid.chunkBounds(chunk);
-    const mask: usize = grid.chunk_tiles - 1;
+    const mask: usize = grid.geometry.chunk_tiles - 1;
     const from = index.of(level, row);
     for (portals.border) |portal| {
         if (portal.label != label) continue;
         const x = bounds.x0 + (portal.local & mask);
-        const y = bounds.y0 + (@as(usize, portal.local) >> grid.chunk_shift);
+        const y = bounds.y0 + (@as(usize, portal.local) >> grid.geometry.shift);
         const mirrors = [_]struct { on: bool, cell: usize }{
-            .{ .on = portal.flags.west, .cell = y * grid.width + x -% 1 },
-            .{ .on = portal.flags.east, .cell = y * grid.width + x + 1 },
-            .{ .on = portal.flags.north, .cell = (y -% 1) *% grid.width +% x },
-            .{ .on = portal.flags.south, .cell = (y + 1) * grid.width + x },
+            .{ .on = portal.flags.west, .cell = y * grid.geometry.width + x -% 1 },
+            .{ .on = portal.flags.east, .cell = y * grid.geometry.width + x + 1 },
+            .{ .on = portal.flags.north, .cell = (y -% 1) *% grid.geometry.width +% x },
+            .{ .on = portal.flags.south, .cell = (y + 1) * grid.geometry.width + x },
         };
         for (mirrors) |mirror| {
             if (mirror.on) connUnite(parents, from, index.of(level, connNodeAt(graph, level, mirror.cell)));
@@ -263,10 +297,10 @@ fn connUniteRecordEdges(graph: *const NavGraph, index: *const ConnNodeIndex, par
         if (grid.labelAtLocal(chunk, link.local) != label) continue;
         const target = graph.grid(link.to_level) orelse continue;
         if (target.isBlockedIndex(link.to_cell)) continue;
-        const target_chunk = target.chunkOfCell(link.to_cell);
-        const x = link.to_cell % target.width;
-        const y = link.to_cell / target.width;
-        const local: u8 = @intCast(((y & mask) << target.chunk_shift) | (x & mask));
+        const target_chunk = chunkOfCell(target.geometry, link.to_cell);
+        const x = link.to_cell % target.geometry.width;
+        const y = link.to_cell / target.geometry.width;
+        const local = target.geometry.localOf(x, y);
         if (!connListsLink(graph.chunkPortals(link.to_level, target_chunk), local, link.link)) continue;
         connUnite(parents, from, index.of(link.to_level, connNodeAt(graph, link.to_level, link.to_cell)));
     }
@@ -293,30 +327,28 @@ pub fn expectConnectivityConsistent(graph: *const NavGraph) !void {
         const level: u16 = @intCast(level_usize);
         for (0..level_graph.record_dir.items.len) |chunk_usize| {
             const chunk: u32 = @intCast(chunk_usize);
-            var labels: ConnLabels = @splat(0);
+            var labels: LabelSet = .empty;
             const portals = level_graph.chunkPortals(chunk);
-            for (portals.border) |portal| connLabelAdd(&labels, portal.label);
-            for (portals.extra) |portal| connLabelAdd(&labels, portal.label);
+            for (portals.border) |portal| labels.set(portal.label);
+            for (portals.extra) |portal| labels.set(portal.label);
             const record = level_graph.recordOf(chunk) orelse {
-                try t.expect(std.mem.allEqual(u64, &labels, 0));
+                try t.expectEqual(@as(usize, 0), labels.count());
                 continue;
             };
-            var label_count: usize = 0;
-            for (labels) |word| label_count += @popCount(word);
-            try t.expectEqual(label_count, @as(usize, level_graph.record_label_count[record]));
-            var seen: ConnLabels = @splat(0);
+            try t.expectEqual(labels.count(), @as(usize, level_graph.record_label_count[record]));
+            var seen: LabelSet = .empty;
             var row = level_graph.record_node_head[record];
             while (row != no_node) : (row = level_graph.node_sibling[row]) {
                 const label = level_graph.node_label[row];
-                try t.expect(connLabelHas(&labels, label) and !connLabelHas(&seen, label));
-                connLabelAdd(&seen, label);
+                try t.expect(labels.isSet(label) and !seen.isSet(label));
+                seen.set(label);
                 try t.expect(!listed[index.of(level, row)]);
                 listed[index.of(level, row)] = true;
                 const comp = level_graph.node_comp[row];
                 try t.expect(comp < conn.comps.len);
                 comp_sizes[comp] += 1;
             }
-            try t.expect(std.mem.eql(u64, &labels, &seen));
+            try t.expect(std.mem.eql(u64, &labels.masks, &seen.masks));
         }
         var live: usize = 0;
         for (level_graph.node_comp) |comp| {
@@ -426,9 +458,9 @@ pub fn expectSameConnectivityPartition(a: *const NavGraph, b: *const NavGraph) !
 // The root of the node at `cell` of `level` when the level is built and the cell open.
 fn closureRootAt(graph: *const NavGraph, level: u16, cell: CellCoord) ?u32 {
     const grid = graph.grid(level) orelse return null;
-    const index = @as(usize, cell.y) * grid.width + cell.x;
+    const index = @as(usize, cell.y) * grid.geometry.width + cell.x;
     if (grid.isBlockedIndex(index)) return null;
-    const row = graph.levelGraph(level).?.nodeOf(grid.chunkOfCell(index), grid.labelAt(index));
+    const row = graph.levelGraph(level).?.nodeOf(chunkOfCell(grid.geometry, index), grid.labelAt(index));
     std.debug.assert(row != no_node);
     return graph.connectivity.comp_root[graph.levelGraph(level).?.node_comp[row]];
 }

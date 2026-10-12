@@ -2633,6 +2633,7 @@ const plane_entry_range_alignment_items = @import("systems/plane_entry.zig").pla
 const DigIntent = @import("simulation.zig").DigIntent;
 const demoWorldWithChunkSize = @import("world_test_support.zig").demoWorldWithChunkSize;
 const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
+const nav_test_support = @import("systems/pathfinding/test_support.zig");
 const AiAgent = @import("data_system.zig").AiAgent;
 const MovementBody = @import("data_system.zig").MovementBody;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
@@ -3760,10 +3761,10 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
         },
     });
     defer pipeline.deinit();
-    try std.testing.expectEqual(world.chunk_size_tiles, pipeline.pathfinding.graph.chunk_tiles);
+    try std.testing.expectEqual(world.chunk_size_tiles, pipeline.pathfinding.graph.geometry.chunk_tiles);
     try std.testing.expectEqual(world.tile_size, pipeline.pathfinding.graph.cell_size);
-    try std.testing.expectEqual(@as(usize, world.width), pipeline.pathfinding.graph.width);
-    try std.testing.expectEqual(@as(usize, world.height), pipeline.pathfinding.graph.height);
+    try std.testing.expectEqual(@as(usize, world.width), pipeline.pathfinding.graph.geometry.width);
+    try std.testing.expectEqual(@as(usize, world.height), pipeline.pathfinding.graph.geometry.height);
 
     frame.beginStep();
     _ = try pipeline.update(.{
@@ -3788,7 +3789,7 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
     const nav_grid = pipeline.pathfinding.graph.grid(0).?;
     const nav_cell = nav_grid.indexForCell(nav_grid.worldToCellClamped(body.position)).?;
     const world_chunk_index: u32 = @intCast(world_chunk.y * @as(i32, world.chunksX()) + world_chunk.x);
-    try std.testing.expectEqual(world_chunk_index, nav_grid.chunkOfCell(nav_cell));
+    try std.testing.expectEqual(world_chunk_index, nav_test_support.chunkOfCell(nav_grid.geometry, nav_cell));
 }
 
 test "pipeline plane traversal batches fall landing tile events into one range" {
@@ -5533,10 +5534,7 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.steering.grid_bucket_tuner,
         &pipeline.steering.grid_sort_tuner,
         &pipeline.pathfinding.fallback_tuner,
-        &pipeline.pathfinding.nav_remask_tuner,
-        &pipeline.pathfinding.nav_patch_tuner,
         &pipeline.pathfinding.nav_mark_tuner,
-        &pipeline.pathfinding.nav_plan_tuner,
         &pipeline.scope.chunk_derive_tuner,
         &pipeline.scope.collision_gather_tuner,
         &pipeline.scope.ai_gather_tuner,
@@ -5548,6 +5546,7 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.plane_entry.tuner,
     };
     for (tuners) |tuner| pinThreadedProfile(tuner, profile);
+    for (&pipeline.pathfinding.nav_tuners.values) |*tuner| pinThreadedProfile(tuner, profile);
 }
 
 /// Pins one tuner as `pinPipelineThreadedProfiles` does. Test-only local fixture.
@@ -6587,7 +6586,7 @@ const NavSeamFixture = struct {
             };
             try std.testing.expectEqual(rebuilt.graph.levelGraph(level).?.recordCount(), live.levelGraph(level).?.recordCount());
         }
-        try std.testing.expectEqual(rebuilt.graph.totalPortals(), live.totalPortals());
+        try std.testing.expectEqual(nav_test_support.totalPortals(&rebuilt.graph), nav_test_support.totalPortals(live));
     }
 };
 

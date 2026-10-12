@@ -184,6 +184,8 @@ const Fixture = struct {
     edits: std.ArrayList(NavCellEdit),
     // Chunks each update must remask, when the footprint fixes it.
     expected_dirty_chunks: ?usize = null,
+    // The stats of the most recent timed update.
+    last_stats: NavUpdateStats = .{},
 
     fn deinit(self: *Fixture) void {
         self.edits.deinit(self.allocator);
@@ -386,6 +388,7 @@ fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !
     }
     if (stats.incremental_rebuilds != 1) return error.NavUpdateNotApplied;
     if (fixture.expected_dirty_chunks) |expected| if (stats.dirty_chunks != expected) return error.NavUpdateNotApplied;
+    fixture.last_stats = stats;
     return elapsed;
 }
 
@@ -414,17 +417,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // Reuse the variant's world + nav system (built once); only the footprint changes per count.
     const fixture = try sharedFixture(allocator, io, variant);
     try setFootprint(fixture, allocator, variant, item_count);
-    // Reset both stage tuners per case so a prior case's training never leaks into this one (a
-    // fresh system would have fresh tuners). Adaptive cases use the configured probing tuner.
-    if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
-        fixture.system.nav_remask_tuner = tuner;
-        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
-        fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
-    } else {
-        fixture.system.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
-        fixture.system.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
-        fixture.system.nav_plan_tuner = AdaptiveWorkTuner.init(.{});
-    }
+    // Reset every nav stage tuner per case so a prior case's training never leaks into this
+    // one (a fresh system would have fresh tuners). Adaptive cases use the configured probing
+    // tuner.
+    fixture.system.nav_tuners = .initFill(suite.adaptiveTunerForCase(case, nav_range_alignment_items) orelse AdaptiveWorkTuner.init(.{}));
     // Drive the threaded stages with this case's control config: adaptive cases let the tuner
     // size ranges; fixed control cases pin a fixed partition so the tuner is measured against them.
     fixture.system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = benchmarkItemsPerRange(case) };
@@ -439,12 +435,12 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.nav_plan_tuner.isSettled() or !fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!fixture.system.nav_tuners.getPtrConst(.plan).isSettled() or !fixture.system.nav_tuners.getPtrConst(.remask).isSettled() or !fixture.system.nav_tuners.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runToggle(fixture, io, thread_ptr);
         }
     }
-    const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.nav_patch_tuner.isSettled() else false;
+    const remask_settled = if (case.adaptive) fixture.system.nav_tuners.getPtrConst(.remask).isSettled() else false;
+    const patch_settled = if (case.adaptive) fixture.system.nav_tuners.getPtrConst(.patch).isSettled() else false;
 
     // Throughput is over the cells ACTUALLY edited, not the requested count: both variants cap
     // their footprint, so a requested count above the cap edits fewer cells and the
@@ -463,12 +459,12 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // Report the worker profile each stage actually used so threaded rows are not mistaken for
     // serial ones (a tuner may keep a borderline footprint inline). Primary = the remask/re-flood
     // stage (runs first and dominates at scale); secondary = the abstract chunk patch.
-    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    stats.batch = suite.batchSummaryFromBatch(fixture.last_stats.remask_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.last_stats.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.last_stats.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_patch_tuner.report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_tuners.getPtrConst(.remask).report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_tuners.getPtrConst(.patch).report(), patch_settled);
     }
     return stats;
 }
@@ -663,9 +659,9 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     var fixture = try initStaticMoveFixture(allocator, io, other_statics, dynamic_bodies, participant_count);
     defer fixture.deinit();
     if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
-        fixture.system.nav_remask_tuner = tuner;
-        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
-        fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
+        fixture.system.nav_tuners.set(.remask, tuner);
+        fixture.system.nav_tuners.set(.patch, suite.adaptiveTunerForCase(case, nav_range_alignment_items).?);
+        fixture.system.nav_tuners.set(.plan, suite.adaptiveTunerForCase(case, nav_range_alignment_items).?);
         fixture.system.nav_mark_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
         fixture.colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
         fixture.colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
@@ -677,32 +673,34 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.nav_mark_tuner.isSettled() or !fixture.system.nav_plan_tuner.isSettled() or !fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!fixture.system.nav_mark_tuner.isSettled() or !fixture.system.nav_tuners.getPtrConst(.plan).isSettled() or !fixture.system.nav_tuners.getPtrConst(.remask).isSettled() or !fixture.system.nav_tuners.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try fixture.moveAndReact(io, thread_ptr);
         }
     }
-    const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.nav_patch_tuner.isSettled() else false;
+    const remask_settled = if (case.adaptive) fixture.system.nav_tuners.getPtrConst(.remask).isSettled() else false;
+    const patch_settled = if (case.adaptive) fixture.system.nav_tuners.getPtrConst(.patch).isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(other_statics + dynamic_bodies);
     var chunks_patched: usize = 0;
+    var last_stats: NavUpdateStats = .{};
     for (0..options.iterations) |_| {
         const result = try fixture.moveAndReact(io, thread_ptr);
         chunks_patched = result.stats.chunks_patched;
-        accumulator.record(result.ns, fixture.system.graph.last_remask_batch);
+        last_stats = result.stats;
+        accumulator.record(result.ns, result.stats.remask_batch);
     }
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = fixture.body_count;
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
+    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(fixture.system.last_mark_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_patch_tuner.report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_tuners.getPtrConst(.remask).report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_tuners.getPtrConst(.patch).report(), patch_settled);
     }
     return stats;
 }
@@ -990,9 +988,9 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var fixture = try initStaticDenseFixture(allocator, io, item_count, participant_count, tail);
     defer fixture.deinit();
     if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
-        fixture.system.nav_remask_tuner = tuner;
-        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
-        fixture.system.nav_plan_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
+        fixture.system.nav_tuners.set(.remask, tuner);
+        fixture.system.nav_tuners.set(.patch, suite.adaptiveTunerForCase(case, nav_range_alignment_items).?);
+        fixture.system.nav_tuners.set(.plan, suite.adaptiveTunerForCase(case, nav_range_alignment_items).?);
         fixture.colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
         fixture.colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
@@ -1003,12 +1001,12 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.colliders.splice_tuner.isSettled() or !fixture.colliders.query_splice_tuner.isSettled() or !fixture.system.nav_plan_tuner.isSettled() or !fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!fixture.colliders.splice_tuner.isSettled() or !fixture.colliders.query_splice_tuner.isSettled() or !fixture.system.nav_tuners.getPtrConst(.plan).isSettled() or !fixture.system.nav_tuners.getPtrConst(.remask).isSettled() or !fixture.system.nav_tuners.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try fixture.changeAndReact(io, thread_ptr);
         }
     }
-    const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.nav_patch_tuner.isSettled() else false;
+    const remask_settled = if (case.adaptive) fixture.system.nav_tuners.getPtrConst(.remask).isSettled() else false;
+    const patch_settled = if (case.adaptive) fixture.system.nav_tuners.getPtrConst(.patch).isSettled() else false;
 
     const change_count = fixture.layout.chunk_count * dense_changes_per_chunk;
     var accumulator = suite.StatsAccumulator.init(change_count);
@@ -1017,22 +1015,24 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var nav_total: u128 = 0;
     var main_total: u128 = 0;
     var chunks_patched: usize = 0;
+    var last_stats: NavUpdateStats = .{};
     for (0..options.iterations) |_| {
         const result = try fixture.changeAndReact(io, thread_ptr);
         chunks_patched = result.stats.chunks_patched;
+        last_stats = result.stats;
         commit_total += result.commit_ns;
         sync_total += result.sync_ns;
         nav_total += result.nav_ns;
         main_total += result.ns -| result.off_main_ns;
-        accumulator.record(result.ns, fixture.system.graph.last_remask_batch);
+        accumulator.record(result.ns, result.stats.remask_batch);
     }
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = fixture.colliders.rowCount();
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_splice_batch);
     stats.query_splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_query_splice_batch);
     if (stats.iterations > 0) {
@@ -1046,8 +1046,8 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_patch_tuner.report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_tuners.getPtrConst(.remask).report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_tuners.getPtrConst(.patch).report(), patch_settled);
     }
     return stats;
 }

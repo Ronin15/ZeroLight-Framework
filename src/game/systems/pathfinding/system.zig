@@ -43,6 +43,7 @@ const ColliderChange = @import("../static_colliders.zig").ColliderChange;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavExtent = @import("nav_graph.zig").NavExtent;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
+const NavStageTuners = @import("nav_graph.zig").NavStageTuners;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const dilateChanged3x3 = @import("nav_grid.zig").dilateChanged3x3;
 const NavBatchResult = @import("nav_graph.zig").NavBatchResult;
@@ -269,28 +270,10 @@ pub const PathfindingSystem = struct {
     // Re-dispatches of fields stalled for pool room see only those few fields, so they own
     // a tuner rather than skew the passes'.
     group_field_stall_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // The incremental nav update has two independently-timed threaded stages — remask + component
-    // re-flood, and the abstract chunk patch — so each owns its own tuner (per docs: one tuner
-    // per stage, never shared across work shapes).
-    nav_remask_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_patch_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // The `nav_mark` stage (structural events interpreted into nav marks) and the nav
-    // batch's key plan each own a tuner.
+    // Each threaded stage of a nav batch (`NavStage`) owns a tuner.
+    nav_tuners: NavStageTuners = .initFill(AdaptiveWorkTuner.init(.{})),
+    // The `nav_mark` stage (structural events interpreted into nav marks) owns a tuner.
     nav_mark_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // The connectivity stages of a nav batch (seed over changed keys, gather over patch keys,
-    // the connectivity flood's rounds) each own a tuner.
-    nav_conn_seed_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_conn_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_conn_flood_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // The one-way closure's stages (candidate scan, link resolve, row mask, SCC plan, rows,
-    // arena compaction) each own a tuner.
-    nav_conn_candidates_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_conn_closure_resolve_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_conn_closure_mask_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_conn_closure_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_conn_closure_rows_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    nav_conn_closure_compact_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // The goal resolve's scan over intents and its projection over distinct blocked goals
     // each own a tuner.
     goal_scan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -749,7 +732,7 @@ pub const PathfindingSystem = struct {
             try self.reserve(self.capacity);
         }
         self.goals.invalidate();
-        try self.graph.rebuild(colliders.view(), extent, self.navUpdateThreads(thread_system));
+        _ = try self.graph.rebuild(colliders.view(), extent, self.navUpdateThreads(thread_system));
         // Search scratch and group fields follow budgets reserved at the capacity seam, never
         // the level's cell count, so the build sizes nothing for them.
         // Grid versions are part of query keys. A rebuild invalidates pending
@@ -764,19 +747,8 @@ pub const PathfindingSystem = struct {
         self.group_field_tuner = AdaptiveWorkTuner.init(.{});
         self.group_field_begin_tuner = AdaptiveWorkTuner.init(.{});
         self.group_field_stall_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_tuners = .initFill(AdaptiveWorkTuner.init(.{}));
         self.nav_mark_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_plan_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_seed_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_gather_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_flood_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_candidates_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_closure_resolve_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_closure_mask_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_closure_plan_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_closure_rows_tuner = AdaptiveWorkTuner.init(.{});
-        self.nav_conn_closure_compact_tuner = AdaptiveWorkTuner.init(.{});
         self.goal_scan_tuner = AdaptiveWorkTuner.init(.{});
         self.goal_project_tuner = AdaptiveWorkTuner.init(.{});
         self.publish_copy_tuner = AdaptiveWorkTuner.init(.{});
@@ -791,18 +763,7 @@ pub const PathfindingSystem = struct {
         const threads = thread_system orelse return null;
         return .{
             .thread_system = threads,
-            .plan_tuner = &self.nav_plan_tuner,
-            .remask_tuner = &self.nav_remask_tuner,
-            .patch_tuner = &self.nav_patch_tuner,
-            .conn_seed_tuner = &self.nav_conn_seed_tuner,
-            .conn_gather_tuner = &self.nav_conn_gather_tuner,
-            .conn_flood_tuner = &self.nav_conn_flood_tuner,
-            .conn_candidates_tuner = &self.nav_conn_candidates_tuner,
-            .conn_closure_resolve_tuner = &self.nav_conn_closure_resolve_tuner,
-            .conn_closure_mask_tuner = &self.nav_conn_closure_mask_tuner,
-            .conn_closure_plan_tuner = &self.nav_conn_closure_plan_tuner,
-            .conn_closure_rows_tuner = &self.nav_conn_closure_rows_tuner,
-            .conn_closure_compact_tuner = &self.nav_conn_closure_compact_tuner,
+            .tuners = &self.nav_tuners,
             .controls = self.nav_controls,
         };
     }
@@ -816,7 +777,7 @@ pub const PathfindingSystem = struct {
         edits: []const NavCellEdit,
     ) !NavUpdateStats {
         try self.reserveNavMarks(edits.len);
-        for (edits) |edit| appendMergedMark(&self.nav_marks, tileMark(edit.level, edit.x, edit.y, edit.x, edit.y), self.graph.chunk_tiles);
+        for (edits) |edit| appendMergedMark(&self.nav_marks, tileMark(edit.level, edit.x, edit.y, edit.x, edit.y), self.graph.geometry.chunk_tiles);
         return self.applyBufferedNavUpdates(colliders, world, null);
     }
 
@@ -829,7 +790,7 @@ pub const PathfindingSystem = struct {
     /// than dropping.
     pub fn markNavDirty(self: *PathfindingSystem, level: u16, x: u16, y: u16) !void {
         try self.reserveNavMarks(1);
-        appendMergedMark(&self.nav_marks, tileMark(level, x, y, x, y), self.graph.chunk_tiles);
+        appendMergedMark(&self.nav_marks, tileMark(level, x, y, x, y), self.graph.geometry.chunk_tiles);
     }
 
     /// The commit seam's static mark reserve, before the structural commit: room for the
@@ -888,7 +849,7 @@ pub const PathfindingSystem = struct {
                     .min_y = placement.cells.min_y,
                     .max_x = placement.cells.max_x,
                     .max_y = placement.cells.max_y,
-                }, self.graph.chunk_tiles);
+                }, self.graph.geometry.chunk_tiles);
             }
         }
     }
@@ -974,7 +935,6 @@ pub const PathfindingSystem = struct {
             }
             const batch = self.graph.commitMarks(prepared, view, threads, &stats);
             if (batch.changed) {
-                stats.remask_batch = self.graph.last_remask_batch;
                 // Graph node ids never persist, so cached results stay keyed by cells: evict
                 // only those with a cell within one cell of a changed cell, and the fields
                 // with a costed cell next to a changed cell.
@@ -1087,7 +1047,7 @@ pub const PathfindingSystem = struct {
                 .fields = self.group_fields.items,
                 .chunks = self.chunkGrid(),
                 .geometry = RunGeometry.of(&self.graph),
-                .chunk_edge = self.graph.chunk_tiles,
+                .chunk_edge = self.graph.geometry.chunk_tiles,
                 .items = self.evict_items.items,
                 .hits = self.evict_hits.items,
                 .range_count = self.evict_shape.range_count,
@@ -1141,7 +1101,7 @@ pub const PathfindingSystem = struct {
     }
 
     fn chunkGrid(self: *const PathfindingSystem) ChunkGrid {
-        const geometry = types.ChunkGeometry{ .width = self.graph.width, .height = self.graph.height, .chunk_tiles = self.graph.chunk_tiles };
+        const geometry = self.graph.chunkGeometry();
         return .{ .chunks_x = geometry.chunksX(), .chunks_y = geometry.chunksY() };
     }
 
@@ -1184,7 +1144,7 @@ pub const PathfindingSystem = struct {
         self.nav_mark_tallies.items.len = selection.range_count;
         @memset(self.nav_mark_tallies.items, .{});
         var job = NavMarkJob{
-            .chunk_tiles = self.graph.chunk_tiles,
+            .chunk_tiles = self.graph.geometry.chunk_tiles,
             .world = world,
             .events = events,
             .items_per_range = selection.items_per_range,
@@ -1218,7 +1178,7 @@ pub const PathfindingSystem = struct {
     // Appends one event's mark into reserved capacity, merging a tile box into the previous
     // mark when both lie in one chunk.
     fn appendEventMark(self: *PathfindingSystem, mark: NavMark) void {
-        appendMergedMark(&self.nav_marks, mark, self.graph.chunk_tiles);
+        appendMergedMark(&self.nav_marks, mark, self.graph.geometry.chunk_tiles);
     }
 
     /// Whether the post-commit nav reaction may run and emit its event this step: a pending
@@ -2843,12 +2803,12 @@ const IntakeCells = struct {
 // level shares one extent, so one grid converts for all of them.
 fn intakeCells(grid: *const NavGrid, requests: []const PathRequest, out: []IntakeCells) void {
     std.debug.assert(out.len == requests.len);
-    std.debug.assert(grid.width != 0 and grid.height != 0);
+    std.debug.assert(grid.geometry.width != 0 and grid.geometry.height != 0);
     const cell_size = simd.splatFloat4(grid.cell_size);
     const min_cell = simd.splatInt4(0);
     // Grid dimensions fit i32, as in worldToCellClamped.
-    const max_x = simd.splatInt4(@intCast(grid.width - 1));
-    const max_y = simd.splatInt4(@intCast(grid.height - 1));
+    const max_x = simd.splatInt4(@intCast(grid.geometry.width - 1));
+    const max_y = simd.splatInt4(@intCast(grid.geometry.height - 1));
     const vector_end = simd.vectorizedEnd(requests.len);
     var index: usize = 0;
     while (index < vector_end) : (index += simd.lane_count) {
@@ -3243,7 +3203,6 @@ fn runHits(cache: *const ResultCache, geometry: RunGeometry, owner: u32, start: 
 
 const PathStatus = types.PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
-const no_component = types.no_component;
 const test_support = @import("test_support.zig");
 const addNavBody = test_support.addNavBody;
 const appendPathRequest = test_support.appendPathRequest;
@@ -4486,7 +4445,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     defer one_system.deinit();
     try one_system.reserve(abstractCapacity());
     try one_system.rebuildStaticNavGridWithWorld(&one_data, &one_world, null);
-    const one_level_start_portals = one_system.graph.levelLivePortalCount(0);
+    const one_level_start_portals = test_support.levelLivePortalCount(&one_system.graph, 0);
 
     var four_data = DataSystem.init(std.testing.allocator);
     defer four_data.deinit();
@@ -4502,12 +4461,12 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     defer four_system.deinit();
     try four_system.reserve(abstractCapacity());
     try four_system.rebuildStaticNavGridWithWorld(&four_data, &four_world, null);
-    const four_level_start_portals = four_system.graph.levelLivePortalCount(0);
+    const four_level_start_portals = test_support.levelLivePortalCount(&four_system.graph, 0);
 
     try std.testing.expect(one_level_start_portals > 0);
     // The extra open levels add many total portals, but the start level's seeded
     // count is unchanged: seeding never touches the other levels' portals.
-    try std.testing.expect(four_system.graph.totalPortals() > four_level_start_portals);
+    try std.testing.expect(test_support.totalPortals(&four_system.graph) > four_level_start_portals);
     try std.testing.expectEqual(one_level_start_portals, four_level_start_portals);
 
     // The per-query abstract search completes within the node budget regardless of
@@ -5038,20 +4997,19 @@ test "pathfinding chunk-local portal seeding scans only the start chunk's local 
     const grid = system.graph.grid(0).?;
     const left_cell = grid.indexForCell(.{ .x = 1, .y = 5 }).?;
     const right_cell = grid.indexForCell(.{ .x = 9, .y = 5 }).?;
-    const left_component = grid.componentOf(left_cell);
-    const right_component = grid.componentOf(right_cell);
-    // Chunk-local labels: the two cells sit in different chunks AND different regions,
-    // so their encoded labels differ.
-    try std.testing.expect(left_component != no_component);
-    try std.testing.expect(right_component != no_component);
-    try std.testing.expect(left_component != right_component);
+    const left_component = grid.chunkLabelAt(left_cell);
+    const right_component = grid.chunkLabelAt(right_cell);
+    // The two cells sit in different chunks AND different regions.
+    try std.testing.expect(left_component.label != 0);
+    try std.testing.expect(right_component.label != 0);
+    try std.testing.expect(!std.meta.eql(left_component, right_component));
 
     // A start chunk's record holds only its own portals; those sharing the start cell's
     // label (the seeds) all lie in that chunk with that component, and each seed set is a
     // strict subset of the level's portals.
-    const left_chunk = grid.chunkOfCell(left_cell);
-    const right_chunk = grid.chunkOfCell(right_cell);
-    for ([_]struct { chunk: u32, cell: usize, component: u32 }{
+    const left_chunk = test_support.chunkOfCell(grid.geometry, left_cell);
+    const right_chunk = test_support.chunkOfCell(grid.geometry, right_cell);
+    for ([_]struct { chunk: u32, cell: usize, component: NavGrid.ChunkLabel }{
         .{ .chunk = left_chunk, .cell = left_cell, .component = left_component },
         .{ .chunk = right_chunk, .cell = right_cell, .component = right_component },
     }) |start| {
@@ -5059,13 +5017,13 @@ test "pathfinding chunk-local portal seeding scans only the start chunk's local 
         var seeds: usize = 0;
         for (portals.border) |portal| {
             if (portal.label != grid.labelAt(start.cell)) continue;
-            const cell = system.graph.cellOfLocal(start.chunk, portal.local);
-            try std.testing.expectEqual(start.component, grid.componentOf(cell));
-            try std.testing.expectEqual(start.chunk, grid.chunkOfCell(cell));
+            const cell = test_support.cellOfLocal(system.graph.geometry, start.chunk, portal.local);
+            try std.testing.expectEqual(start.component, grid.chunkLabelAt(cell));
+            try std.testing.expectEqual(start.chunk, test_support.chunkOfCell(grid.geometry, cell));
             seeds += 1;
         }
         try std.testing.expect(seeds > 0);
-        try std.testing.expect(seeds < system.graph.levelLivePortalCount(0));
+        try std.testing.expect(seeds < test_support.levelLivePortalCount(&system.graph, 0));
     }
 
     // Correctness preserved: a cross-component goal (no link) is unavailable, and a
@@ -5495,12 +5453,12 @@ test "nav over a world takes the world's chunk edge and tile size; a world-less 
     defer system.deinit();
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-    try std.testing.expectEqual(world.chunk_size_tiles, system.graph.chunk_tiles);
+    try std.testing.expectEqual(world.chunk_size_tiles, system.graph.geometry.chunk_tiles);
     try std.testing.expectEqual(world.tile_size, system.graph.cell_size);
-    try std.testing.expectEqual(@as(usize, world.width), system.graph.width);
-    try std.testing.expectEqual(@as(usize, world.height), system.graph.height);
+    try std.testing.expectEqual(@as(usize, world.width), system.graph.geometry.width);
+    try std.testing.expectEqual(@as(usize, world.height), system.graph.geometry.height);
     const level_grid = system.graph.grid(0).?;
-    try std.testing.expectEqual(world.chunk_size_tiles, level_grid.chunk_tiles);
+    try std.testing.expectEqual(world.chunk_size_tiles, level_grid.geometry.chunk_tiles);
     try std.testing.expectEqual(@as(usize, world.chunksX()), level_grid.chunksX());
     try std.testing.expectEqual(@as(usize, world.chunksY()), level_grid.chunksY());
     // Every tile's nav chunk is its world chunk.
@@ -5508,12 +5466,12 @@ test "nav over a world takes the world's chunk edge and tile size; a world-less 
         for (0..world.width) |x| {
             const tile_chunk = world.chunkCoordForCell(@intCast(x), @intCast(y));
             const expected: u32 = @intCast(tile_chunk.y * @as(i32, world.chunksX()) + tile_chunk.x);
-            try std.testing.expectEqual(expected, level_grid.chunkOfCell(y * level_grid.width + x));
+            try std.testing.expectEqual(expected, test_support.chunkOfCell(level_grid.geometry, y * level_grid.geometry.width + x));
         }
     }
 
     try system.rebuildStaticNavGrid(&data, 512, 256, 8);
-    try std.testing.expectEqual(capacity.nav_chunk_tiles, system.graph.chunk_tiles);
+    try std.testing.expectEqual(capacity.nav_chunk_tiles, system.graph.geometry.chunk_tiles);
     try std.testing.expectEqual(@as(f32, 8), system.graph.cell_size);
 }
 
@@ -5641,7 +5599,7 @@ test "reactToPostCommitNavEvents maps world_obstacle_changed to one mark (not O(
     try system.reserve(abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
     const grid = system.graph.grid(0).?;
-    try std.testing.expect(grid.width >= 8);
+    try std.testing.expect(grid.geometry.width >= 8);
     try std.testing.expectEqual(@as(u16, 4), system.capacity.nav_chunk_tiles);
 
     // Paint a rect that crosses the chunk boundary at x=4 (tiles 2..5 inclusive).
@@ -5822,7 +5780,7 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     defer system.deinit();
     try system.reserve(abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-    const high_water = system.graph.totalPortals();
+    const high_water = test_support.totalPortals(&system.graph);
     try std.testing.expect(high_water > 0);
 
     // Warmup: the same block and reopen, so every batch buffer and record pool reaches
@@ -5850,7 +5808,7 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     const opened = (try world.setDenseTile(built.wall_layer, 5, 3, grass)) orelse return error.TestExpectedEqual;
     const open_stats = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = opened.level, .x = opened.x, .y = opened.y }});
     try std.testing.expectEqual(@as(usize, 1), open_stats.incremental_rebuilds);
-    try std.testing.expect(system.graph.totalPortals() <= high_water);
+    try std.testing.expect(test_support.totalPortals(&system.graph) <= high_water);
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -5921,9 +5879,9 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     // Every stage must have actually threaded, not fallen back to the inline slot-0 path —
     // otherwise this would silently retest the already-covered serial path. A plan over
     // several ranges merges through the plan order set into its reserved key lists.
-    try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
-    try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
-    try std.testing.expect(!system.graph.last_plan_batch.ran_inline);
+    try std.testing.expect(!stats.remask_batch.ran_inline);
+    try std.testing.expect(!stats.patch_batch.ran_inline);
+    try std.testing.expect(!stats.plan_batch.ran_inline);
     try std.testing.expect(system.graph.plan_tallies.items.len > 1);
 
     for (cells) |cell| {
@@ -5959,7 +5917,7 @@ test "a fully walled level opened past its prior records grows at the reserve an
     defer system.deinit();
     try system.reserve(abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
-    try std.testing.expectEqual(@as(usize, 0), system.graph.totalPortals());
+    try std.testing.expectEqual(@as(usize, 0), test_support.totalPortals(&system.graph));
 
     // Open a 6x6 block spanning chunk borders, creating records past the (zero) init pool.
     var edits = std.ArrayList(NavCellEdit).empty;
@@ -5975,10 +5933,11 @@ test "a fully walled level opened past its prior records grows at the reserve an
     const stats = try system.applyNavUpdates(no_colliders, &world, edits.items);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     // The opened block holds portals.
-    try std.testing.expect(system.graph.totalPortals() > 0);
+    try std.testing.expect(test_support.totalPortals(&system.graph) > 0);
 
-    // A subsequent edit within the NEW high-water mark is allocation-free again.
-    const closed = (try world.setDenseTile(wall_layer, 4, 4, tree)) orelse return error.TestExpectedEqual;
+    // A subsequent edit within the NEW high-water mark (a cell of a chunk already mixed, so
+    // no new block) is allocation-free again.
+    const closed = (try world.setDenseTile(wall_layer, 3, 3, tree)) orelse return error.TestExpectedEqual;
     const original = system.allocator;
     system.allocator = std.testing.failing_allocator;
     system.graph.allocator = std.testing.failing_allocator;
@@ -8587,7 +8546,7 @@ fn expectSameCache(a: *const PathfindingSystem, b: *const PathfindingSystem) !vo
 // `changed` ((level, x, y) cells).
 fn pathNearCells(system: *const PathfindingSystem, owner: u32, changed: []const [3]u16) bool {
     const path = storedPath(system, owner);
-    const width = system.graph.width;
+    const width = system.graph.geometry.width;
     for (path.cells, 0..) |cell, index| {
         const x: isize = @intCast(cell % width);
         const y: isize = @intCast(cell / width);
@@ -9770,8 +9729,8 @@ fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget
     var near = false;
     for (0..grid.cellCount()) |index| {
         if (field.lookup(grid, index) == null) continue;
-        const x: isize = @intCast(index % grid.width);
-        const y: isize = @intCast(index / grid.width);
+        const x: isize = @intCast(index % grid.geometry.width);
+        const y: isize = @intCast(index / grid.geometry.width);
         if (@abs(x - @as(isize, cell[0])) <= 1 and @abs(y - @as(isize, cell[1])) <= 1) near = true;
     }
     try setRegistryCells(&system, &fixture, &.{cell}, fixture.tree);
@@ -10372,7 +10331,7 @@ fn referenceReachable(allocator: std.mem.Allocator, grid: *const NavGrid, links:
     reached[start] = true;
     try queue.append(allocator, start);
     var head: usize = 0;
-    const width = grid.width;
+    const width = grid.geometry.width;
     while (head < queue.items.len) : (head += 1) {
         const cell = queue.items[head];
         const x: isize = @intCast(cell % width);
@@ -10382,7 +10341,7 @@ fn referenceReachable(allocator: std.mem.Allocator, grid: *const NavGrid, links:
         for ([_][2]isize{ .{ 1, 0 }, .{ -1, 0 }, .{ 0, 1 }, .{ 0, -1 }, .{ 1, 1 }, .{ 1, -1 }, .{ -1, 1 }, .{ -1, -1 } }) |step| {
             const nx = x + step[0];
             const ny = y + step[1];
-            if (nx < 0 or ny < 0 or nx >= @as(isize, @intCast(width)) or ny >= @as(isize, @intCast(grid.height))) continue;
+            if (nx < 0 or ny < 0 or nx >= @as(isize, @intCast(width)) or ny >= @as(isize, @intCast(grid.geometry.height))) continue;
             if (grid.isBlockedXY(@intCast(nx), @intCast(ny))) continue;
             if (step[0] != 0 and step[1] != 0 and (grid.isBlockedXY(@intCast(nx), @intCast(y)) or grid.isBlockedXY(@intCast(x), @intCast(ny)))) continue;
             neighbours[count] = @as(usize, @intCast(ny)) * width + @as(usize, @intCast(nx));

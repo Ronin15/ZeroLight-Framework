@@ -10,6 +10,9 @@ const std = @import("std");
 const math = @import("../../../core/math.zig");
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const allowed_moves = @import("nav_grid.zig").allowed_moves;
+const testBit = @import("nav_grid.zig").testBit;
+const setBit = @import("nav_grid.zig").setBit;
+const clearBit = @import("nav_grid.zig").clearBit;
 const world_terrain = @import("../../world_terrain.zig");
 const ChunkBits = world_terrain.ChunkBits;
 const max_chunk_cells = world_terrain.max_chunk_cells;
@@ -121,39 +124,14 @@ const DirProbe = struct {
     found: bool,
 };
 
-// The low six bits of a chunk-local cell pick its bit in a 64-bit word.
-inline fn testBit(words: *const ChunkBits, local: u32) bool {
-    return (words[local >> 6] >> @as(u6, @truncate(local))) & 1 != 0;
-}
-
-inline fn setBit(words: *ChunkBits, local: u32) void {
-    words[local >> 6] |= @as(u64, 1) << @as(u6, @truncate(local));
-}
-
-inline fn clearBit(words: *ChunkBits, local: u32) void {
-    words[local >> 6] &= ~(@as(u64, 1) << @as(u6, @truncate(local)));
-}
-
 inline fn slotId(block: u32, local: u32) u32 {
     return block << 8 | local;
-}
-
-// Chunk id of in-grid cell (x, y), as `NavGrid` numbers chunks; below 2^31 for a
-// validated level.
-inline fn chunkAt(grid: *const NavGrid, x: usize, y: usize) u32 {
-    return @intCast((y >> grid.chunk_shift) * grid.chunks_x + (x >> grid.chunk_shift));
-}
-
-// Chunk-local cell of (x, y): `ly << chunk_shift | lx`, as `NavGrid` lays out a block.
-inline fn localAt(grid: *const NavGrid, x: usize, y: usize) u32 {
-    const mask: usize = grid.chunk_tiles - 1;
-    return @intCast(((y & mask) << grid.chunk_shift) | (x & mask));
 }
 
 // Most chunks one pop can newly claim: its 3x3 window crosses at most two chunks per
 // axis when the chunk edge is at least 2, so at most three besides its own.
 fn perPopBlocks(grid: *const NavGrid) u32 {
-    return if (grid.chunk_tiles >= 2) 3 else 8;
+    return if (grid.geometry.chunk_tiles >= 2) 3 else 8;
 }
 
 // Most blocks a build toward `max_cells` cells on `grid` can claim: one per pushed cell
@@ -165,7 +143,7 @@ fn blockBound(grid: *const NavGrid, max_cells: usize) u32 {
 /// Blocks a field's first build reserves: room for the goal, one step's budget of cells
 /// in dense chunks, and a pop's new chunks; later builds reuse the high-water pool.
 pub fn initialPoolBlocks(grid: *const NavGrid, max_cells: usize, build_budget: usize) usize {
-    const chunk_cells: usize = @as(usize, grid.chunk_tiles) * grid.chunk_tiles;
+    const chunk_cells: usize = @as(usize, grid.geometry.chunk_tiles) * grid.geometry.chunk_tiles;
     const dense = 4 + (@min(max_cells, build_budget) + chunk_cells - 1) / chunk_cells;
     return @max(1 + perPopBlocks(grid), dense);
 }
@@ -312,12 +290,12 @@ pub const GroupField = struct {
     /// Read-only: safe on workers while no stage writes the field.
     pub fn lookup(self: *const GroupField, grid: *const NavGrid, cell_index: usize) ?FieldCell {
         if (self.directory.len == 0) return null;
-        const y = cell_index / grid.width;
-        const x = cell_index - y * grid.width;
-        const probe = self.findChunk(chunkAt(grid, x, y));
+        const y = cell_index / grid.geometry.width;
+        const x = cell_index - y * grid.geometry.width;
+        const probe = self.findChunk(grid.geometry.chunkOf(x, y));
         if (!probe.found) return null;
         const block = self.directory[probe.row].block;
-        const local = localAt(grid, x, y);
+        const local = grid.geometry.localOf(x, y);
         if (!testBit(&self.columns.costed[block], local)) return null;
         return .{ .cost = self.columns.cost[block][local], .flow_dir = self.columns.flow[block][local] };
     }
@@ -371,12 +349,12 @@ pub const GroupField = struct {
             self.state = .empty;
             return false;
         }
-        const y = goal_index / grid.width;
-        const x = goal_index - y * grid.width;
-        const chunk = chunkAt(grid, x, y);
+        const y = goal_index / grid.geometry.width;
+        const x = goal_index - y * grid.geometry.width;
+        const chunk = grid.geometry.chunkOf(x, y);
         const probe = self.findChunk(chunk);
         self.claimBlock(grid, probe.row, chunk, x, y, 0);
-        const local = localAt(grid, x, y);
+        const local = grid.geometry.localOf(x, y);
         setBit(&self.columns.costed[0], local);
         self.columns.cost[0][local] = 0;
         self.columns.flow[0][local] = no_flow;
@@ -390,7 +368,7 @@ pub const GroupField = struct {
     // Takes pool block `block` for the chunk holding (x, y) and records it at directory
     // row `row`; clears its bitmaps.
     fn claimBlock(self: *GroupField, grid: *const NavGrid, row: usize, chunk: u32, x: usize, y: usize, block: u32) void {
-        const mask: usize = grid.chunk_tiles - 1;
+        const mask: usize = grid.geometry.chunk_tiles - 1;
         self.columns.chunk[block] = chunk;
         self.columns.origin_x[block] = @intCast(x & ~mask);
         self.columns.origin_y[block] = @intCast(y & ~mask);
@@ -428,10 +406,10 @@ pub const GroupField = struct {
         const max_cells = self.max_cells;
         const block_bound = self.block_bound;
         const per_pop = perPopBlocks(grid);
-        const edge: u32 = grid.chunk_tiles;
+        const edge: u32 = grid.geometry.chunk_tiles;
         const mask: u32 = edge - 1;
-        const shift = grid.chunk_shift;
-        const width = grid.width;
+        const shift = grid.geometry.shift;
+        const width = grid.geometry.width;
         var local_steps: [neighbor_dirs.len]u32 = undefined;
         for (neighbor_dirs, &local_steps) |dir, *step| step.* = @bitCast(dir.y * @as(i32, @intCast(edge)) + dir.x);
         while (true) {
@@ -473,8 +451,8 @@ pub const GroupField = struct {
                     // In-grid: the move table admits only in-level neighbours.
                     const next_x: usize = @intCast(@as(i64, @intCast(x)) + dir.x);
                     const next_y: usize = @intCast(@as(i64, @intCast(y)) + dir.y);
-                    next_local = localAt(grid, next_x, next_y);
-                    next_chunk = chunkAt(grid, next_x, next_y);
+                    next_local = grid.geometry.localOf(next_x, next_y);
+                    next_chunk = grid.geometry.chunkOf(next_x, next_y);
                     if (next_chunk != current_chunk) {
                         const probe = self.findChunk(next_chunk);
                         if (probe.found) next_block = self.directory[probe.row].block else free_row = probe.row;
@@ -555,8 +533,8 @@ pub const GroupField = struct {
             return null;
         }
         const neighbor = neighbor_dirs[dir];
-        const cx: i32 = @intCast(cell_index % grid.width);
-        const cy: i32 = @intCast(cell_index / grid.width);
+        const cx: i32 = @intCast(cell_index % grid.geometry.width);
+        const cy: i32 = @intCast(cell_index / grid.geometry.width);
         const next = GridCell{ .x = cx + neighbor.x, .y = cy + neighbor.y };
         const next_index = grid.indexForCell(next) orelse return grid.cellCenter(cell_index);
         return grid.cellCenter(next_index);
@@ -636,8 +614,8 @@ fn referenceFlowField(allocator: std.mem.Allocator, grid: *const NavGrid, goal_i
     while (heap.items.len != 0) {
         const current = popHeap(&heap);
         if (out_cost[current.index] != current.f) continue;
-        const cx: i32 = @intCast(current.index % grid.width);
-        const cy: i32 = @intCast(current.index / grid.width);
+        const cx: i32 = @intCast(current.index % grid.geometry.width);
+        const cy: i32 = @intCast(current.index / grid.geometry.width);
         for (neighbor_dirs, 0..) |dir, dir_index| {
             const next_index = grid.indexForCell(.{ .x = cx + dir.x, .y = cy + dir.y }) orelse continue;
             if (grid.isBlockedIndex(next_index)) continue;
@@ -730,8 +708,8 @@ const FlatField = struct {
     fn parentIndex(self: *const FlatField, grid: *const NavGrid, cell: usize) usize {
         const dir = self.flow[cell];
         if (dir == GroupField.no_flow) return cell;
-        const x: i32 = @intCast(cell % grid.width);
-        const y: i32 = @intCast(cell / grid.width);
+        const x: i32 = @intCast(cell % grid.geometry.width);
+        const y: i32 = @intCast(cell / grid.geometry.width);
         return grid.indexForCell(.{ .x = x + neighbor_dirs[dir].x, .y = y + neighbor_dirs[dir].y }) orelse cell;
     }
 
@@ -744,12 +722,12 @@ const FlatField = struct {
             };
             expansions += 1;
             const current_cost = self.cost[current];
-            const y = current / grid.width;
-            const x = current - y * grid.width;
+            const y = current / grid.geometry.width;
+            const x = current - y * grid.geometry.width;
             const moves = allowed_moves[grid.neighborhood(x, y)];
             for (neighbor_dirs, 0..) |dir, dir_index| {
                 if (moves & (@as(u8, 1) << @intCast(dir_index)) == 0) continue;
-                const next: u32 = @intCast((@as(i64, @intCast(y)) + dir.y) * @as(i64, @intCast(grid.width)) + @as(i64, @intCast(x)) + dir.x);
+                const next: u32 = @intCast((@as(i64, @intCast(y)) + dir.y) * @as(i64, @intCast(grid.geometry.width)) + @as(i64, @intCast(x)) + dir.x);
                 const candidate = current_cost + (if (dir.diagonal) diagonal_cost else cardinal_cost);
                 const existing = self.cost[next];
                 if (existing == unreachable_cost and self.pushed >= self.max_cells) continue;
@@ -879,12 +857,12 @@ test "costedNear is exact against the current build's costed cells, mid-build an
         if (round != 0) _ = try stepGrowing(allocator, &field, &grid, 9);
         // Each cell alone: set exactly when the build costed it.
         for (0..grid.cellCount()) |cell| {
-            const x = cell % grid.width;
-            const y = cell / grid.width;
-            const local = localAt(&grid, x, y);
+            const x = cell % grid.geometry.width;
+            const y = cell / grid.geometry.width;
+            const local = grid.geometry.localOf(x, y);
             single = @splat(0);
             setBit(&single, local);
-            try std.testing.expectEqual(field.lookup(&grid, cell) != null, field.costedNear(chunkAt(&grid, x, y), &single));
+            try std.testing.expectEqual(field.lookup(&grid, cell) != null, field.costedNear(grid.geometry.chunkOf(x, y), &single));
         }
     }
     try buildToReady(allocator, &field, &grid, 64);
@@ -893,7 +871,7 @@ test "costedNear is exact against the current build's costed cells, mid-build an
     for (0..grid.dir.items.len) |chunk| {
         var any = false;
         for (0..grid.cellCount()) |cell| {
-            if (chunkAt(&grid, cell % grid.width, cell / grid.width) == chunk and field.lookup(&grid, cell) != null) any = true;
+            if (grid.geometry.chunkOf(cell % grid.geometry.width, cell / grid.geometry.width) == chunk and field.lookup(&grid, cell) != null) any = true;
         }
         try std.testing.expectEqual(any, field.costedNear(@intCast(chunk), &all));
     }
@@ -901,7 +879,7 @@ test "costedNear is exact against the current build's costed cells, mid-build an
     try std.testing.expect(!field.costedNear(0, &all));
     field.state = .empty;
     single[0] = std.math.maxInt(u64);
-    try std.testing.expect(!field.costedNear(chunkAt(&grid, field.goal_index % grid.width, field.goal_index / grid.width), &single));
+    try std.testing.expect(!field.costedNear(grid.geometry.chunkOf(field.goal_index % grid.geometry.width, field.goal_index / grid.geometry.width), &single));
 }
 
 test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra field" {
@@ -919,7 +897,7 @@ test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra fie
     defer allocator.free(ref_cost);
     const ref_dir = try allocator.alloc(u8, cell_count);
     defer allocator.free(ref_dir);
-    const goal_index = 9 * grid.width + 9;
+    const goal_index = 9 * grid.geometry.width + 9;
     try referenceFlowField(allocator, &grid, goal_index, ref_cost, ref_dir);
 
     var field = GroupField{};
@@ -1036,7 +1014,7 @@ test "GroupField generation wraparound clears the directory and a rebuild reads 
 
     var field = GroupField{};
     defer field.deinit(allocator);
-    const goal_index = 3 * grid.width + 3;
+    const goal_index = 3 * grid.geometry.width + 3;
     // The last generation: this build stamps its directory rows with it.
     field.generation = max_stamp_generation - 1;
     try std.testing.expect(try beginTestBuild(allocator, &field, &grid, goal_index, grid.cellCount(), 2));
@@ -1044,10 +1022,10 @@ test "GroupField generation wraparound clears the directory and a rebuild reads 
     _ = try stepGrowing(allocator, &field, &grid, 2);
     const some_cell = goal_index + 1;
     try std.testing.expect(field.lookup(&grid, some_cell) != null);
-    const far_cell = 14 * grid.width + 14;
+    const far_cell = 14 * grid.geometry.width + 14;
 
     // Rebuilding wraps the generation to 1 and clears every directory row first.
-    const other_goal = 12 * grid.width + 12;
+    const other_goal = 12 * grid.geometry.width + 12;
     try std.testing.expect(field.beginBuild(&grid, emptyKey(1), other_goal, 2, grid.cellCount()));
     try std.testing.expectEqual(@as(u32, 1), field.generation);
     var live_rows: usize = 0;

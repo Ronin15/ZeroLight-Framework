@@ -17,12 +17,10 @@ const ChunkForm = world_terrain.ChunkForm;
 const max_chunk_cells = world_terrain.max_chunk_cells;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
 const types = @import("types.zig");
-const pooledRows = @import("nav_graph.zig").pooledRows;
-const pooledList = @import("nav_graph.zig").pooledList;
 const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const default_cell_size = types.default_cell_size;
 const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
-const no_component = types.no_component;
+const growPool = @import("connectivity.zig").growPool;
 const GridCell = types.GridCell;
 const NavSpan = types.NavSpan;
 const neighbor_dirs = types.neighbor_dirs;
@@ -37,8 +35,15 @@ pub const no_block: u32 = std.math.maxInt(u32);
 
 comptime {
     // A 16x16 chunk under the corner rule holds at most 128 components, so labels fit u8.
-    std.debug.assert(max_chunk_cells / 2 <= std.math.maxInt(u8));
+    std.debug.assert(maxChunkLabels(world_terrain.max_chunk_edge) <= std.math.maxInt(u8));
     std.debug.assert(neighbor_dirs.len == 8);
+}
+
+/// Most components (labels) a chunk of edge `chunk_tiles` holds: its open cells pairwise
+/// non-adjacent orthogonally (a checkerboard), since orthogonal neighbours always join and
+/// the corner rule only splits diagonals.
+pub fn maxChunkLabels(chunk_tiles: u16) usize {
+    return (@as(usize, chunk_tiles) * chunk_tiles + 1) / 2;
 }
 
 const NavCellBlock = struct {
@@ -48,14 +53,23 @@ const NavCellBlock = struct {
     label_count: u8,
 };
 
+const empty_block = NavCellBlock{ .bits = @splat(0), .labels = @splat(0), .blocked_count = 0, .label_count = 0 };
+
 // One pooled block's columns.
 const cell_block_bytes = @sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8);
 
-inline fn testBit(words: *const ChunkBits, local: usize) bool {
+/// Chunk-local cell bit tests on `ChunkBits` words, shared by the nav cell kernels. Not
+/// std.bit_set: per-cell tests in the remask flood measured about 3x the serial reaction with
+/// std's per-bit methods, in Debug, on nav-update-scattered at 256 digs.
+pub inline fn testBit(words: *const ChunkBits, local: usize) bool {
     return (words[local >> 6] >> @intCast(local & 63)) & 1 != 0;
 }
 
-inline fn clearBit(words: *ChunkBits, local: usize) void {
+pub inline fn setBit(words: *ChunkBits, local: usize) void {
+    words[local >> 6] |= @as(u64, 1) << @intCast(local & 63);
+}
+
+pub inline fn clearBit(words: *ChunkBits, local: usize) void {
     words[local >> 6] &= ~(@as(u64, 1) << @intCast(local & 63));
 }
 
@@ -128,16 +142,12 @@ fn chunkRow(bits: *const ChunkBits, edge: usize, row: usize) u32 {
 }
 
 pub const NavGrid = struct {
-    // Nav cells for ONE level (Z-floor). All levels of a graph share the dimensions,
-    // cell_size, and chunk_tiles, so chunk ids and cell indices agree across levels.
+    // Nav cells for ONE level (Z-floor). All levels of a graph share the geometry (sides
+    // and power-of-two chunk edge) and cell_size, so chunk ids and cell indices agree across
+    // levels.
     level: u16 = 0,
     cell_size: f32 = default_cell_size,
-    width: usize = 0,
-    height: usize = 0,
-    // Chunk side length in cells, a power of two.
-    chunk_tiles: u16 = default_nav_chunk_tiles,
-    chunk_shift: u4 = 0,
-    chunks_x: usize = 0,
+    geometry: types.ChunkGeometry = .empty,
     blocked_count: usize = 0,
     dir: std.ArrayList(u32) = .empty,
     blocks: std.MultiArrayList(NavCellBlock) = .{},
@@ -170,12 +180,8 @@ pub const NavGrid = struct {
         std.debug.assert(chunk_tiles != 0 and std.math.isPowerOfTwo(chunk_tiles));
         self.level = level;
         self.cell_size = cell_size;
-        self.width = width;
-        self.height = height;
-        self.chunk_tiles = chunk_tiles;
-        self.chunk_shift = @intCast(@ctz(chunk_tiles));
-        self.chunks_x = self.chunkGeometry().chunksX();
-        try self.dir.resize(allocator, self.chunkGeometry().chunkCount());
+        self.geometry = .init(width, height, chunk_tiles);
+        try self.dir.resize(allocator, self.geometry.chunkCount());
         @memset(self.dir.items, open_entry);
         self.blocks.clearRetainingCapacity();
         self.block_free.clearRetainingCapacity();
@@ -192,28 +198,14 @@ pub const NavGrid = struct {
     }
 
     /// Grows the free block list to at least `needed` slots, so the next `needed` claims
-    /// pop without allocating. Pool growth is geometric and counted.
+    /// pop without allocating (`growPool`).
     pub fn ensureFreeBlocks(self: *NavGrid, allocator: std.mem.Allocator, needed: usize, pool_grows: *u64) !void {
-        if (self.block_free.items.len >= needed) return;
-        const added = needed - self.block_free.items.len;
-        const total = self.blocks.len + added;
-        std.debug.assert(total < blocked_entry);
-        if (total > self.blocks.capacity) {
-            try self.blocks.ensureTotalCapacity(allocator, @max(total, self.blocks.capacity *| 2));
-            // The pool moved: the column views follow it before anything else can fail.
-            self.refreshColumns();
-            pool_grows.* += 1;
-        }
-        try self.block_free.ensureTotalCapacity(allocator, self.blocks.capacity);
-        // Pushed in descending slot order so claims hand out ascending slots.
-        const first: u32 = @intCast(self.blocks.len);
-        for (0..added) |_| self.blocks.appendAssumeCapacity(undefined);
-        var slot: u32 = @intCast(self.blocks.len);
-        while (slot > first) {
-            slot -= 1;
-            self.block_free.appendAssumeCapacity(slot);
-        }
-        self.refreshColumns();
+        // The pool may move before a later step fails: the views follow it either way.
+        defer self.refreshColumns();
+        // Live blocks plus a batch's claims, each for a chunk holding none: at most the
+        // chunk count, which `validateChunkGrid` keeps below 2^31.
+        std.debug.assert(self.blocks.len - self.block_free.items.len + needed < blocked_entry);
+        try growPool(NavCellBlock, allocator, &self.blocks, &self.block_free, needed, empty_block, blocked_entry, pool_grows);
     }
 
     /// Takes a free block slot for a chunk's writer; the reserve covered it.
@@ -275,7 +267,7 @@ pub const NavGrid = struct {
     pub fn worldChunkBits(self: *const NavGrid, chunk: u32, world: ?*const WorldSystem) ChunkBits {
         const world_system = world orelse return @splat(0);
         // A nav build over a world takes its tiles and chunks.
-        std.debug.assert(world_system.chunk_size_tiles == self.chunk_tiles);
+        std.debug.assert(world_system.chunk_size_tiles == self.geometry.chunk_tiles);
         const form = if (@as(usize, self.level) < world_system.levelCount()) world_system.levelChunkBlockedForm(self.level, chunk) else .blocked;
         return switch (form) {
             .open => @splat(0),
@@ -314,7 +306,7 @@ pub const NavGrid = struct {
 
     // One chunk square of this grid's edge, for chunk-local bit masks.
     fn edgeGeometry(self: *const NavGrid) world_terrain.ChunkGeometry {
-        return world_terrain.ChunkGeometry.init(self.chunk_tiles, self.chunk_tiles, self.chunk_tiles);
+        return world_terrain.ChunkGeometry.init(self.geometry.chunk_tiles, self.geometry.chunk_tiles, self.geometry.chunk_tiles);
     }
 
     /// Stores `bits` as `chunk`'s cells: OPEN or BLOCKED when every in-level cell agrees,
@@ -322,6 +314,7 @@ pub const NavGrid = struct {
     /// never leaves the chunk. Returns the chunk's blocked count. Writes only `chunk`'s
     /// directory entry and `slot`, so distinct chunks write in parallel. A result that can
     /// be mixed needs a slot (`slot != no_block`); an unused slot stays with the caller.
+    // SIMD verdict: word-parallel scalar. The blocked count is four word popcounts.
     pub fn writeChunk(self: *NavGrid, chunk: u32, slot: u32, bits: ChunkBits) u32 {
         var count: u32 = 0;
         for (bits) |word| count += @popCount(word);
@@ -353,8 +346,8 @@ pub const NavGrid = struct {
         const b = self.chunkBounds(chunk);
         const cols = b.x1 - b.x0;
         const rows = b.y1 - b.y0;
-        const shift = self.chunk_shift;
-        const edge: usize = self.chunk_tiles;
+        const shift = self.geometry.shift;
+        const edge: usize = self.geometry.chunk_tiles;
         const mask: usize = edge - 1;
         const in_level = world_terrain.inLevelMask(self.edgeGeometry(), .{ .min_x = 0, .min_y = 0, .cols = @intCast(cols), .rows = @intCast(rows) });
         var open: ChunkBits = undefined;
@@ -411,10 +404,10 @@ pub const NavGrid = struct {
     // Half-open world rect -> inclusive nav-cell span, clamped to the grid, mapped as
     // `ColliderGeometry.footprint` maps a static. Precondition: a prepared grid.
     pub fn cellSpanForWorldRect(self: *const NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) NavSpan {
-        std.debug.assert(self.width != 0 and self.height != 0);
+        std.debug.assert(self.geometry.width != 0 and self.geometry.height != 0);
         // `validateChunkGrid` keeps the cell count, so each dimension, below 2^32.
-        const width: u32 = @intCast(self.width);
-        const height: u32 = @intCast(self.height);
+        const width: u32 = @intCast(self.geometry.width);
+        const height: u32 = @intCast(self.geometry.height);
         return .{
             .min_x = math.worldPosToCell(min_x, self.cell_size, width),
             .min_y = math.worldPosToCell(min_y, self.cell_size, height),
@@ -424,20 +417,20 @@ pub const NavGrid = struct {
     }
 
     pub fn cellCount(self: *const NavGrid) usize {
-        return self.width * self.height;
+        return self.geometry.width * self.geometry.height;
     }
 
     pub fn valid(self: *const NavGrid) bool {
         // `prepare` sizes the directory to the chunk count.
-        return self.width != 0 and self.height != 0 and self.dir.items.len != 0;
+        return self.geometry.width != 0 and self.geometry.height != 0 and self.dir.items.len != 0;
     }
 
     // Precondition: a prepared grid (width/height != 0). Every real caller resolves a
     // NavGrid via NavGraph.grid()/rebuild(), which floors both dimensions to >= 1.
     pub fn worldToCellClamped(self: *const NavGrid, value: math.Vec2) GridCell {
-        std.debug.assert(self.width != 0 and self.height != 0);
-        const max_x: i32 = @intCast(self.width - 1);
-        const max_y: i32 = @intCast(self.height - 1);
+        std.debug.assert(self.geometry.width != 0 and self.geometry.height != 0);
+        const max_x: i32 = @intCast(self.geometry.width - 1);
+        const max_y: i32 = @intCast(self.geometry.height - 1);
         const raw_x: i32 = math.floorToI32(value.x / self.cell_size);
         const raw_y: i32 = math.floorToI32(value.y / self.cell_size);
         return .{
@@ -447,8 +440,8 @@ pub const NavGrid = struct {
     }
 
     pub fn cellCenter(self: *const NavGrid, index: usize) math.Vec2 {
-        const x = index % self.width;
-        const y = index / self.width;
+        const x = index % self.geometry.width;
+        const y = index / self.geometry.width;
         return .{
             .x = (@as(f32, @floatFromInt(x)) + 0.5) * self.cell_size,
             .y = (@as(f32, @floatFromInt(y)) + 0.5) * self.cell_size,
@@ -459,35 +452,24 @@ pub const NavGrid = struct {
         if (cell.x < 0 or cell.y < 0) return null;
         const x: usize = @intCast(cell.x);
         const y: usize = @intCast(cell.y);
-        if (x >= self.width or y >= self.height) return null;
-        return y * self.width + x;
-    }
-
-    inline fn chunkAt(self: *const NavGrid, x: usize, y: usize) u32 {
-        // Below the level's chunk count, which `validateChunkGrid` keeps below 2^31.
-        return @intCast((y >> self.chunk_shift) * self.chunks_x + (x >> self.chunk_shift));
-    }
-
-    inline fn localAt(self: *const NavGrid, x: usize, y: usize) u8 {
-        const mask: usize = self.chunk_tiles - 1;
-        // A chunk holds at most 256 cells.
-        return @intCast(((y & mask) << self.chunk_shift) | (x & mask));
+        if (x >= self.geometry.width or y >= self.geometry.height) return null;
+        return y * self.geometry.width + x;
     }
 
     /// Whether in-grid cell (x, y) blocks movement. O(1): one directory entry plus a bit.
     pub inline fn isBlockedXY(self: *const NavGrid, x: usize, y: usize) bool {
-        std.debug.assert(x < self.width and y < self.height);
-        return switch (self.dir.items[self.chunkAt(x, y)]) {
+        std.debug.assert(x < self.geometry.width and y < self.geometry.height);
+        return switch (self.dir.items[self.geometry.chunkOf(x, y)]) {
             open_entry => false,
             blocked_entry => true,
-            else => |slot| testBit(&self.block_bits[slot], self.localAt(x, y)),
+            else => |slot| testBit(&self.block_bits[slot], self.geometry.localOf(x, y)),
         };
     }
 
     pub fn isBlockedIndex(self: *const NavGrid, index: usize) bool {
         std.debug.assert(index < self.cellCount());
-        const y = index / self.width;
-        return self.isBlockedXY(index - y * self.width, y);
+        const y = index / self.geometry.width;
+        return self.isBlockedXY(index - y * self.geometry.width, y);
     }
 
     pub fn isBlockedCell(self: *const NavGrid, cell: GridCell) bool {
@@ -500,19 +482,21 @@ pub const NavGrid = struct {
         if (x < 0 or y < 0) return true;
         const ux: usize = @intCast(x);
         const uy: usize = @intCast(y);
-        if (ux >= self.width or uy >= self.height) return true;
+        if (ux >= self.geometry.width or uy >= self.geometry.height) return true;
         return self.isBlockedXY(ux, uy);
     }
 
     /// The 3x3 blocked mask around in-grid cell (x, y): bit `(dy + 1) * 3 + (dx + 1)` for
     /// cell (x + dx, y + dy), out-of-level cells set. Index `allowed_moves` with it. A cell
     /// inside its chunk reads one directory entry; a chunk-edge cell up to four.
+    // SIMD verdict: word-parallel scalar. An interior cell takes three 3-bit windows of its
+    // chunk's words; an edge cell nine directory reads. No lane-wide loop.
     pub inline fn neighborhood(self: *const NavGrid, x: usize, y: usize) u16 {
-        const mask: usize = self.chunk_tiles - 1;
+        const mask: usize = self.geometry.chunk_tiles - 1;
         const local_x = x & mask;
         const local_y = y & mask;
-        if (local_x != 0 and local_y != 0 and local_x != mask and local_y != mask and x + 1 < self.width and y + 1 < self.height) {
-            switch (self.dir.items[self.chunkAt(x, y)]) {
+        if (local_x != 0 and local_y != 0 and local_x != mask and local_y != mask and x + 1 < self.geometry.width and y + 1 < self.geometry.height) {
+            switch (self.dir.items[self.geometry.chunkOf(x, y)]) {
                 open_entry => return 0,
                 blocked_entry => return 0x1ff,
                 else => |slot| {
@@ -521,7 +505,7 @@ pub const NavGrid = struct {
                     // Each row of the chunk sits inside one 64-bit word (64 is a multiple of
                     // every chunk edge), so a 3-bit window never straddles words.
                     inline for (0..3) |row| {
-                        const local = ((local_y + row - 1) << self.chunk_shift) + local_x - 1;
+                        const local = ((local_y + row - 1) << self.geometry.shift) + local_x - 1;
                         const window: u16 = @intCast((bits[local / 64] >> @intCast(local % 64)) & 0b111);
                         result |= window << (3 * row);
                     }
@@ -553,33 +537,30 @@ pub const NavGrid = struct {
         return self.cellSpanForWorldRect(first.x, first.y, last.x + last.w, last.y + last.h);
     }
 
-    // Chunk-tiling geometry for this grid; the shared source of the chunk_id<->cell and
-    // label-encoding convention that NavGraph must agree with (see types.ChunkGeometry).
+    // Chunk-tiling geometry for this grid; every level of a graph shares it.
     pub fn chunkGeometry(self: *const NavGrid) types.ChunkGeometry {
-        return .{ .width = self.width, .height = self.height, .chunk_tiles = self.chunk_tiles };
+        return self.geometry;
     }
 
     pub fn chunksX(self: *const NavGrid) usize {
-        return self.chunkGeometry().chunksX();
+        return self.geometry.chunksX();
     }
 
     pub fn chunksY(self: *const NavGrid) usize {
-        return self.chunkGeometry().chunksY();
-    }
-
-    pub fn chunkOfCell(self: *const NavGrid, index: usize) u32 {
-        return self.chunkGeometry().chunkOf(index);
+        return self.geometry.chunksY();
     }
 
     pub const ChunkBounds = types.ChunkGeometry.Bounds;
 
     // Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the grid.
     pub fn chunkBounds(self: *const NavGrid, chunk_id: u32) ChunkBounds {
-        return self.chunkGeometry().chunkBounds(chunk_id);
+        return self.geometry.chunkBounds(chunk_id);
     }
 
     /// The blocked bits of `chunk`'s cells along one side, bit `i` for the side's `i`-th
     /// cell (rows top to bottom for west/east, columns left to right for north/south).
+    // SIMD verdict: scalar. A north/south side is one word shift; a west/east column is at
+    // most 16 single-bit reads, too short for lanes.
     pub fn sideBits(self: *const NavGrid, chunk: u32, side: ChunkSide) u16 {
         const b = self.chunkBounds(chunk);
         const cols = b.x1 - b.x0;
@@ -595,7 +576,7 @@ pub const NavGrid = struct {
             else => |slot| slot,
         };
         const bits = &self.block_bits[slot];
-        const shift = self.chunk_shift;
+        const shift = self.geometry.shift;
         switch (side) {
             .north, .south => {
                 // A chunk row sits inside one 64-bit word.
@@ -641,27 +622,18 @@ pub const NavGrid = struct {
     /// directory entry, plus a label read in a mixed chunk.
     pub fn chunkLabelAt(self: *const NavGrid, index: usize) ChunkLabel {
         std.debug.assert(index < self.cellCount());
-        const y = index / self.width;
-        const x = index - y * self.width;
-        const chunk = self.chunkAt(x, y);
-        return .{ .chunk = chunk, .label = self.labelAtLocal(chunk, self.localAt(x, y)) };
+        const y = index / self.geometry.width;
+        const x = index - y * self.geometry.width;
+        const chunk = self.geometry.chunkOf(x, y);
+        return .{ .chunk = chunk, .label = self.labelAtLocal(chunk, self.geometry.localOf(x, y)) };
     }
 
-    /// The cell's level-unique component id: chunk * (chunk_tiles^2 + 1) + label, or
-    /// `no_component` for a blocked cell.
-    pub fn componentOf(self: *const NavGrid, index: usize) u32 {
-        const label = self.labelAt(index);
-        if (label == 0) return no_component;
-        // Below no_cell for a validated grid (`validateChunkGrid` bounds the label space).
-        return @intCast(@as(u64, self.chunkOfCell(index)) * self.chunkGeometry().labelStride() + label);
-    }
-
-    // True only when both cells share a chunk-local component, i.e. a local path exists
-    // entirely within one chunk. Cross-chunk reachability routes through the abstract
-    // graph, never through this predicate.
+    /// Whether open cells `a` and `b` share a chunk-local component: a path between them
+    /// stays inside one chunk. False when either is blocked. Says nothing across chunks
+    /// (`connectivity.reach` answers that).
     pub fn connected(self: *const NavGrid, a: usize, b: usize) bool {
-        const component = self.componentOf(a);
-        return component != no_component and component == self.componentOf(b);
+        const first = self.chunkLabelAt(a);
+        return first.label != 0 and std.meta.eql(first, self.chunkLabelAt(b));
     }
 
     /// Bytes held by the directory and the block pool (allocated capacity).
@@ -674,16 +646,11 @@ pub const NavGrid = struct {
     /// An over-estimate of `residentBytes` summed over `levels` levels of `chunks` chunks
     /// each, whose block needs (mixed chunks, plus the fresh blocks a batch takes before it
     /// frees the old) sum to `block_need`: the directories, and each level's block pool and
-    /// free list at their worst growth (the pool doubles past its need, std then grows each
-    /// list by half again plus its first slots).
+    /// free list at their worst growth (`growPool`: the pool at most twice its need, the free
+    /// list exactly the pool).
     pub fn storageBytesBound(levels: usize, chunks: usize, block_need: usize) usize {
-        const blocks = pooledRows(NavCellBlock, levels, block_need);
-        return levels *| listBytesBound(u32, chunks) +| blocks *| cell_block_bytes +| pooledList(u32, levels, blocks);
-    }
-
-    /// Mixed chunks holding a cell block.
-    pub fn liveBlockCount(self: *const NavGrid) usize {
-        return self.blocks.len - self.block_free.items.len;
+        const blocks = 2 *| block_need;
+        return levels *| listBytesBound(u32, chunks) +| blocks *| (cell_block_bytes +| @sizeOf(u32));
     }
 
     // Projects a blocked goal cell to the nearest open cell on this level within a
@@ -691,12 +658,14 @@ pub const NavGrid = struct {
     // reachability from any start (that is the search's job); returns the open index, or
     // null if no open cell is found within the radius. A ring's top and bottom rows test
     // a chunk row at a time; its side columns test per cell.
+    // SIMD verdict: scalar. An early-exit ring walk; each row segment is already one word
+    // test per chunk (`firstOpenInRow`).
     pub fn projectToNearestOpen(self: *const NavGrid, cell: GridCell, radius: i32) ?usize {
         if (self.indexForCell(cell)) |index| {
             if (!self.isBlockedIndex(index)) return index;
         }
-        const width: i64 = @intCast(self.width);
-        const height: i64 = @intCast(self.height);
+        const width: i64 = @intCast(self.geometry.width);
+        const height: i64 = @intCast(self.geometry.height);
         var ring: i64 = 1;
         while (ring <= radius) : (ring += 1) {
             var dy: i64 = -ring;
@@ -709,12 +678,12 @@ pub const NavGrid = struct {
                     const lo = @max(@as(i64, cell.x) - ring, 0);
                     const hi = @min(@as(i64, cell.x) + ring, width - 1);
                     if (lo > hi) continue;
-                    if (self.firstOpenInRow(uy, @intCast(lo), @intCast(hi))) |x| return uy * self.width + x;
+                    if (self.firstOpenInRow(uy, @intCast(lo), @intCast(hi))) |x| return uy * self.geometry.width + x;
                     continue;
                 }
                 inline for (.{ -1, 1 }) |sign| {
                     const x = @as(i64, cell.x) + sign * ring;
-                    if (x >= 0 and x < width and !self.isBlockedXY(@intCast(x), uy)) return uy * self.width + @as(usize, @intCast(x));
+                    if (x >= 0 and x < width and !self.isBlockedXY(@intCast(x), uy)) return uy * self.geometry.width + @as(usize, @intCast(x));
                 }
             }
         }
@@ -724,14 +693,15 @@ pub const NavGrid = struct {
     // The smallest x in [lo, hi] on row y whose cell is open, chunk by chunk: an OPEN chunk
     // answers at once, a BLOCKED one is skipped, a mixed one tests its row's bits as one
     // word (`@ctz` of the open bits keeps the smallest x).
+    // SIMD verdict: word-parallel scalar, one masked word per chunk.
     fn firstOpenInRow(self: *const NavGrid, y: usize, lo: usize, hi: usize) ?usize {
-        const shift = self.chunk_shift;
-        const mask: usize = self.chunk_tiles - 1;
+        const shift = self.geometry.shift;
+        const mask: usize = self.geometry.chunk_tiles - 1;
         var x = lo;
         while (x <= hi) {
             const chunk_x0 = x & ~mask;
-            const chunk_end = @min(chunk_x0 + self.chunk_tiles - 1, hi);
-            switch (self.dir.items[self.chunkAt(x, y)]) {
+            const chunk_end = @min(chunk_x0 + self.geometry.chunk_tiles - 1, hi);
+            switch (self.dir.items[self.geometry.chunkOf(x, y)]) {
                 open_entry => return x,
                 blocked_entry => {},
                 else => |slot| {
@@ -786,21 +756,24 @@ test "a block pool grow that fails after the pool moved keeps the column views o
     try std.testing.expectEqual(@as(u16, 7), grid.block_counts[slot]);
 }
 
-test "a level whose every chunk turns mixed one block at a time stays within its storage bound" {
+test "a block pool grown one claim at a time stays within its storage bound, its doubling charged" {
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 64, 64, 1, 4);
     const chunks = grid.chunkGeometry().chunkCount();
     var pool_grows: u64 = 0;
-    // One claim per chunk, each grown for just the next one: the pool doubles at its worst.
-    for (0..chunks) |_| {
+    // Half the chunks plus one claimed one at a time, each grown for just the next one: the
+    // last claim doubles the pool to nearly twice its need.
+    const claims = chunks / 2 + 1;
+    for (0..claims) |_| {
         try grid.ensureFreeBlocks(std.testing.allocator, 1, &pool_grows);
         _ = grid.claimBlock();
     }
     try std.testing.expect(pool_grows > 1);
-    try std.testing.expect(grid.residentBytes() <= NavGrid.storageBytesBound(1, chunks, chunks));
+    try std.testing.expectEqual(chunks, grid.blocks.capacity);
+    try std.testing.expect(grid.residentBytes() <= NavGrid.storageBytesBound(1, chunks, claims));
     // The pool's doubling past its need is charged: half the blocks' bound is short of it.
-    try std.testing.expect(grid.residentBytes() > NavGrid.storageBytesBound(1, chunks, chunks / 2));
+    try std.testing.expect(grid.residentBytes() > NavGrid.storageBytesBound(1, chunks, claims / 2));
 }
 
 test "pathfinding nav grid blocked set matches per-level composed mask" {
@@ -857,7 +830,7 @@ test "a cell-aligned static past 32768 world units blocks only its own nav cell"
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 2048, 2048, 32, 16);
-    const chunks_x: u32 = @intCast(grid.chunks_x);
+    const chunks_x: u32 = @intCast(grid.geometry.chunks_x);
     const own = grid.composeChunk(68 * chunks_x + 68, null, colliders.view());
     try std.testing.expectEqual(world_terrain.rectMask(grid.edgeGeometry(), 15, 15, 16, 16), own);
     const empty: ChunkBits = @splat(0);
@@ -890,8 +863,8 @@ test "pathfinding nav grid survives degenerate cell size and bounds" {
     // cell_size 0 and a non-finite bound would feed inf/NaN into @intFromFloat;
     // the guard collapses to at least a 1x1 grid instead of crashing.
     try system.rebuildStaticNavGrid(&data, std.math.inf(f32), 256, 0);
-    try std.testing.expect(system.graph.width >= 1);
-    try std.testing.expect(system.graph.height >= 1);
+    try std.testing.expect(system.graph.geometry.width >= 1);
+    try std.testing.expect(system.graph.geometry.height >= 1);
 }
 
 // The per-cell reference of a chunk's labels: clear, then flood each unlabelled open cell
@@ -902,7 +875,7 @@ fn referenceLabels(grid: *const NavGrid, chunk: u32) [max_chunk_cells]u8 {
     var label: u8 = 0;
     var queue: [max_chunk_cells][2]usize = undefined;
     for (b.y0..b.y1) |sy| for (b.x0..b.x1) |sx| {
-        const start = (sy - b.y0) * grid.chunk_tiles + (sx - b.x0);
+        const start = (sy - b.y0) * grid.geometry.chunk_tiles + (sx - b.x0);
         if (grid.isBlockedXY(sx, sy) or labels[start] != 0) continue;
         label += 1;
         labels[start] = label;
@@ -918,7 +891,7 @@ fn referenceLabels(grid: *const NavGrid, chunk: u32) [max_chunk_cells]u8 {
                 if (nx < @as(i64, @intCast(b.x0)) or ny < @as(i64, @intCast(b.y0)) or nx >= @as(i64, @intCast(b.x1)) or ny >= @as(i64, @intCast(b.y1))) continue;
                 const ux: usize = @intCast(nx);
                 const uy: usize = @intCast(ny);
-                const local = (uy - b.y0) * grid.chunk_tiles + (ux - b.x0);
+                const local = (uy - b.y0) * grid.geometry.chunk_tiles + (ux - b.x0);
                 if (grid.isBlockedXY(ux, uy) or labels[local] != 0) continue;
                 if (dir.diagonal and (grid.isBlockedXY(ux, y) or grid.isBlockedXY(x, uy))) continue;
                 labels[local] = label;
@@ -975,12 +948,12 @@ test "a remasked chunk equals world bits OR static coverage, labels and chunkLab
             const reference = referenceLabels(grid, chunk);
             const b = grid.chunkBounds(chunk);
             for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
-                const index = y * grid.width + x;
+                const index = y * grid.geometry.width + x;
                 const label = reference[(y - b.y0) * edge + (x - b.x0)];
                 try std.testing.expectEqual(label, grid.labelAt(index));
                 // The one-division chunk and label equal the chunk geometry's and the flood's,
                 // in the short border chunks too.
-                try std.testing.expectEqual(NavGrid.ChunkLabel{ .chunk = grid.chunkOfCell(index), .label = label }, grid.chunkLabelAt(index));
+                try std.testing.expectEqual(NavGrid.ChunkLabel{ .chunk = test_support.chunkOfCell(grid.geometry, index), .label = label }, grid.chunkLabelAt(index));
                 try std.testing.expectEqual(chunk, grid.chunkLabelAt(index).chunk);
             };
         }
@@ -1033,7 +1006,7 @@ fn expectBlocksOnlyInMixedChunks(grid: *const NavGrid, world: *const WorldSystem
         try std.testing.expectEqual(form == .mixed, grid.chunkBlock(chunk) != null);
         if (form == .mixed) mixed += 1;
     }
-    try std.testing.expectEqual(mixed, grid.liveBlockCount());
+    try std.testing.expectEqual(mixed, test_support.liveBlockCount(grid));
 }
 
 test "neighborhood equals eight isBlocked reads at chunk corners and level edges" {
@@ -1061,7 +1034,7 @@ test "neighborhood equals eight isBlocked reads at chunk corners and level edges
         try system.reserve(capacity);
         try system.rebuildStaticNavGridWithWorld(&data, &world, null);
         const grid = system.graph.grid(0).?;
-        for (0..grid.height) |y| for (0..grid.width) |x| {
+        for (0..grid.geometry.height) |y| for (0..grid.geometry.width) |x| {
             var expected: u16 = 0;
             for ([_]i32{ -1, 0, 1 }) |dy| for ([_]i32{ -1, 0, 1 }) |dx| {
                 const blocked = grid.isBlockedCell(.{ .x = @as(i32, @intCast(x)) + dx, .y = @as(i32, @intCast(y)) + dy });
@@ -1128,9 +1101,9 @@ test "word-parallel projection returns the same cell as the per-cell ring scan" 
         try system.rebuildStaticNavGridWithWorld(&data, &world, null);
         const grid = system.graph.grid(0).?;
         var y: i32 = -3;
-        while (y < @as(i32, @intCast(grid.height)) + 3) : (y += 1) {
+        while (y < @as(i32, @intCast(grid.geometry.height)) + 3) : (y += 1) {
             var x: i32 = -3;
-            while (x < @as(i32, @intCast(grid.width)) + 3) : (x += 1) {
+            while (x < @as(i32, @intCast(grid.geometry.width)) + 3) : (x += 1) {
                 for ([_]i32{ 0, 1, 3, 16 }) |radius| {
                     try std.testing.expectEqual(projectReference(grid, .{ .x = x, .y = y }, radius), grid.projectToNearestOpen(.{ .x = x, .y = y }, radius));
                 }

@@ -1126,13 +1126,13 @@ pub fn waypointFromPath(grid: *const NavGrid, path: []const u32, start_index: us
     if (exactCellIndex(path, @intCast(start_index))) |index| return waypointAt(grid, path, index, hint); // cell indices are u32
     // Off path: head from the nearest cell. Scalar: the cell -> (x, y) split is an
     // integer division per cell, which simd.zig has no vector form of.
-    const start_x: i32 = @intCast(start_index % grid.width);
-    const start_y: i32 = @intCast(start_index / grid.width);
+    const start_x: i32 = @intCast(start_index % grid.geometry.width);
+    const start_y: i32 = @intCast(start_index / grid.geometry.width);
     var best_index: usize = 0;
     var best_dist: i64 = std.math.maxInt(i64);
     for (path, 0..) |cell, i| {
-        const cx: i32 = @intCast(cell % grid.width);
-        const cy: i32 = @intCast(cell / grid.width);
+        const cx: i32 = @intCast(cell % grid.geometry.width);
+        const cy: i32 = @intCast(cell / grid.geometry.width);
         const ddx: i64 = cx - start_x;
         const ddy: i64 = cy - start_y;
         const dist = ddx * ddx + ddy * ddy;
@@ -1202,12 +1202,12 @@ pub fn waypointFromStitched(graph: *const NavGraph, stitched: StitchedView, star
     var nearest_index: usize = 0;
     var best_dist: i64 = std.math.maxInt(i64);
     var found_run = false;
-    const start_x: i32 = @intCast(start_index % start_grid.width);
-    const start_y: i32 = @intCast(start_index / start_grid.width);
+    const start_x: i32 = @intCast(start_index % start_grid.geometry.width);
+    const start_y: i32 = @intCast(start_index / start_grid.geometry.width);
     for (stitched.cells, stitched.levels, 0..) |cell, level, j| {
         if (level != start_level) continue;
-        const cx: i32 = @intCast(cell % start_grid.width);
-        const cy: i32 = @intCast(cell / start_grid.width);
+        const cx: i32 = @intCast(cell % start_grid.geometry.width);
+        const cy: i32 = @intCast(cell / start_grid.geometry.width);
         const ddx: i64 = cx - start_x;
         const ddy: i64 = cy - start_y;
         const dist = ddx * ddx + ddy * ddy;
@@ -1248,7 +1248,7 @@ fn stitchedWaypointAt(grid: *const NavGrid, stitched: StitchedView, level: u16, 
 // ----------------------------------------------------------------------------
 
 test "pathfinding waypoint hint matches full scan and recovers from a stale hint" {
-    const grid = NavGrid{ .width = 100, .height = 1, .cell_size = 1 };
+    const grid = NavGrid{ .geometry = .init(100, 1, types.default_nav_chunk_tiles), .cell_size = 1 };
     const path = [_]u32{ 10, 11, 12, 13, 14, 15 };
 
     // Baseline: agent on cell 12 heads to its successor 13.
@@ -1654,7 +1654,7 @@ test "pathfinding waypoint exact-match scan in four lanes equals the scalar scan
 
     // Through the waypoint derivation: a match in the body and in the tail heads to the
     // successor; an off-path start heads from the nearest cell.
-    const grid = NavGrid{ .width = 100, .height = 100, .cell_size = 1 };
+    const grid = NavGrid{ .geometry = .init(100, 100, types.default_nav_chunk_tiles), .cell_size = 1 };
     const path = [_]u32{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 };
     try std.testing.expectEqual(grid.cellCenter(14).x, waypointFromPath(&grid, &path, 13, null).?.x);
     try std.testing.expectEqual(grid.cellCenter(19).x, waypointFromPath(&grid, &path, 18, null).?.x);
@@ -1691,7 +1691,7 @@ test "pathfinding stitched exact-match scan in four lanes equals scalar (body, t
     // Through the waypoint: cell 41 on level 1 sits at index 3, after its level-0 copy at 2.
     var graph = try makeTestGraph(std.testing.allocator, 100, 1);
     defer graph.levels.deinit(std.testing.allocator);
-    try graph.levels.append(std.testing.allocator, NavGrid{ .level = 1, .width = 100, .height = 1, .cell_size = 1 });
+    try graph.levels.append(std.testing.allocator, NavGrid{ .level = 1, .geometry = .init(100, 1, types.default_nav_chunk_tiles), .cell_size = 1 });
     types.writeStitched(&words, &stitched);
     var hint: u32 = 99;
     _ = waypointFromStitched(&graph, types.stitchedView(&words, stitched.len), 1, 41, &hint).?;
@@ -2133,12 +2133,13 @@ test "pathfinding fixed-capacity key set stays correct at full logical occupancy
     try std.testing.expect(!keys.contains(testGoalKey(capacity)));
 }
 
-// Minimal single-level NavGraph for waypoint tests: only the grid dimensions are read, so
-// an empty-backed grid of the requested size suffices. Caller must deinit the returned
-// graph's level list.
+// Minimal single-level NavGraph for waypoint tests: only the grid geometry is read, so an
+// empty-backed grid of the requested size suffices. Caller must deinit the returned graph's
+// level list.
 fn makeTestGraph(allocator: std.mem.Allocator, width: usize, height: usize) !NavGraph {
-    var graph = NavGraph{ .allocator = allocator, .width = width, .height = height };
-    try graph.levels.append(allocator, NavGrid{ .width = width, .height = height, .cell_size = 1 });
+    const geometry = types.ChunkGeometry.init(width, height, types.default_nav_chunk_tiles);
+    var graph = NavGraph{ .allocator = allocator, .geometry = geometry };
+    try graph.levels.append(allocator, NavGrid{ .geometry = geometry, .cell_size = 1 });
     return graph;
 }
 

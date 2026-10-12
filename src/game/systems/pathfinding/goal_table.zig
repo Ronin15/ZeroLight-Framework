@@ -200,12 +200,12 @@ const RecentRefs = struct {
 // AoS intents is a fixed four-field copy per lane.
 pub fn goalCells(comptime Intent: type, grid: *const NavGrid, intents: []const Intent, out: []GridCell) void {
     std.debug.assert(out.len == intents.len);
-    std.debug.assert(grid.width != 0 and grid.height != 0);
+    std.debug.assert(grid.geometry.width != 0 and grid.geometry.height != 0);
     const cell_size = simd.splatFloat4(grid.cell_size);
     const min_cell = simd.splatInt4(0);
     // Grid dimensions fit i32, as in worldToCellClamped.
-    const max_x = simd.splatInt4(@intCast(grid.width - 1));
-    const max_y = simd.splatInt4(@intCast(grid.height - 1));
+    const max_x = simd.splatInt4(@intCast(grid.geometry.width - 1));
+    const max_y = simd.splatInt4(@intCast(grid.geometry.height - 1));
     const vector_end = simd.vectorizedEnd(intents.len);
     var index: usize = 0;
     while (index < vector_end) : (index += simd.lane_count) {
@@ -294,7 +294,7 @@ pub fn projectRef(graphs: Graphs, ref: u64) u32 {
     // A table ref names a built level of its traversal's graph.
     const grid = graphs.get(refTraversal(ref)).grid(refLevel(ref)).?;
     const cell = refCell(ref);
-    const goal = GridCell{ .x = @intCast(cell % grid.width), .y = @intCast(cell / grid.width) };
+    const goal = GridCell{ .x = @intCast(cell % grid.geometry.width), .y = @intCast(cell / grid.geometry.width) };
     const projected = grid.projectToNearestOpen(goal, default_goal_projection_radius) orelse return no_cell;
     // Below the level's cell count.
     return @intCast(projected);
@@ -362,7 +362,7 @@ fn blockedCells(grid: *const NavGrid, out: []GridCell) []GridCell {
     var len: usize = 0;
     for (0..grid.cellCount()) |index| {
         if (!grid.isBlockedIndex(index) or len == out.len) continue;
-        out[len] = .{ .x = @intCast(index % grid.width), .y = @intCast(index / grid.width) };
+        out[len] = .{ .x = @intCast(index % grid.geometry.width), .y = @intCast(index / grid.geometry.width) };
         len += 1;
     }
     return out[0..len];
@@ -402,7 +402,7 @@ fn expectReferenceTable(system: *const PathfindingSystem, intents: []const TestI
     for (expected.items, table.live.items) |ref, live| {
         const grid = system.graph.grid(refLevel(ref)).?;
         const cell = refCell(ref);
-        const projected = grid.projectToNearestOpen(.{ .x = @intCast(cell % grid.width), .y = @intCast(cell / grid.width) }, default_goal_projection_radius);
+        const projected = grid.projectToNearestOpen(.{ .x = @intCast(cell % grid.geometry.width), .y = @intCast(cell / grid.geometry.width) }, default_goal_projection_radius);
         try std.testing.expectEqual(if (projected) |open| @as(u32, @intCast(open)) else no_cell, live);
         try std.testing.expectEqual(live, table.lookup(ref).?);
     }

@@ -81,9 +81,9 @@ const chunk_grid_index_sentinel: u64 = std.math.maxInt(u32);
 
 /// O(1) loud index-width check for one level of `width` x `height` cells cut into
 /// `chunk_size`-cell chunks: the edge is a power of two in [1, max_chunk_size_tiles],
-/// every cell index is below the u32 sentinel, and so is every chunk-local label
-/// (`chunk * (chunk_size² + 1) + local`). World create, level add, and the nav build
-/// call it before sizing anything from these widths.
+/// every cell index is below the u32 sentinel, and so is the label space `chunks *
+/// (chunk_size² + 1)`, which bounds a nav level's node rows. World create, level add, and
+/// the nav build call it before sizing anything from these widths.
 pub fn validateChunkGrid(width: usize, height: usize, chunk_size: u16) ChunkGridError!void {
     if (chunk_size == 0 or chunk_size > max_chunk_size_tiles or !std.math.isPowerOfTwo(chunk_size)) {
         return error.InvalidChunkSize;

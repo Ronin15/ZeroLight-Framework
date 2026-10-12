@@ -1651,7 +1651,7 @@ fn formatClosureInto(buffer: []u8, conn: NavConnSummary) []const u8 {
 
 /// The one-way closure fields of `stats` copied into `summary`.
 pub fn fillClosureSummary(summary: *NavConnSummary, stats: anytype) void {
-    summary.candidates = batchSummaryFromBatch(stats.conn_candidates_batch);
+    summary.candidates = batchSummaryFromBatch(stats.conn_closure_candidates_batch);
     summary.closure_resolve = batchSummaryFromBatch(stats.conn_closure_resolve_batch);
     summary.closure_mask = batchSummaryFromBatch(stats.conn_closure_mask_batch);
     summary.closure_plan = batchSummaryFromBatch(stats.conn_closure_plan_batch);

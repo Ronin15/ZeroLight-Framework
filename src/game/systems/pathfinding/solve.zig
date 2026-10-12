@@ -38,7 +38,6 @@ const StitchedCell = types.StitchedCell;
 const OpenNode = types.OpenNode;
 const no_parent = types.no_parent;
 const no_slot = types.no_slot;
-const no_component = types.no_component;
 const unreachable_cost = types.unreachable_cost;
 const long_link_pairs = types.long_link_pairs;
 const long_lane_cap = types.long_lane_cap;
@@ -445,7 +444,7 @@ const CrossLevelHeuristic = struct {
         const bounds = &graph.link_bounds;
         // Links exist only on world-backed graphs, whose u16 sides keep box lanes in i32.
         if (bounds.pairs.count != 0) {
-            std.debug.assert(graph.world_backed and graph.width <= max_link_box_coord + 1 and graph.height <= max_link_box_coord + 1);
+            std.debug.assert(graph.world_backed and graph.geometry.width <= max_link_box_coord + 1 and graph.geometry.height <= max_link_box_coord + 1);
         }
         return fromBounds(bounds, goal_level, goal_x, goal_y);
     }
@@ -555,13 +554,13 @@ fn abstractCorridor(
     abstract.node_budget = @min(node_cap, abstract.node_limit);
     const slots = abstract.slots;
 
-    // Chunk geometry once per query: `validateChunkGrid` keeps the chunk edge a power of
-    // two, so a cell's chunk and chunk-local index are shifts and masks of its coordinates.
-    const width: u32 = @intCast(graph.width);
-    const shift: u5 = @intCast(@ctz(graph.chunk_tiles));
-    const mask: u32 = @as(u32, graph.chunk_tiles) - 1;
-    std.debug.assert(std.math.isPowerOfTwo(graph.chunk_tiles));
-    const chunks_x: u32 = (width + mask) >> shift;
+    // Chunk geometry once per query: a cell's chunk and chunk-local index are shifts and
+    // masks of its coordinates. Sides and chunk counts of a validated level fit u32.
+    const geometry = graph.chunkGeometry();
+    const width: u32 = @intCast(geometry.width);
+    const shift: u5 = geometry.shift;
+    const mask: u32 = @as(u32, geometry.chunk_tiles) - 1;
+    const chunks_x: u32 = @intCast(geometry.chunksX());
     // Coordinates and indices stay unsigned: a validated level's cell index can pass 2^31.
     const goal: u32 = @intCast(goal_index);
     const goal_y = goal / width;
@@ -772,13 +771,13 @@ fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize,
     }
     scratch.reset();
     const slots = scratch.slots;
-    const width: i32 = @intCast(grid.width);
-    const goal_x: i32 = @intCast(goal_index % grid.width);
-    const goal_y: i32 = @intCast(goal_index / grid.width);
+    const width: i32 = @intCast(grid.geometry.width);
+    const goal_x: i32 = @intCast(goal_index % grid.geometry.width);
+    const goal_y: i32 = @intCast(goal_index / grid.geometry.width);
     const start_slot = scratch.slotFor(start_index) orelse return .budget_exhausted;
     // The root keeps parent no_slot.
     slots[start_slot].g = 0;
-    const h0 = octileXY(@intCast(start_index % grid.width), @intCast(start_index / grid.width), goal_x, goal_y);
+    const h0 = octileXY(@intCast(start_index % grid.geometry.width), @intCast(start_index / grid.geometry.width), goal_x, goal_y);
     scratch.open.appendAssumeCapacity(.{ .index = start_index, .f = h0, .h = h0 });
 
     while (scratch.open.items.len != 0) {
@@ -800,8 +799,8 @@ fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize,
         // neighbor coordinates feed the heuristic directly, so the inner loop has no
         // per-neighbor div/mod. One 3x3 neighborhood read and one table lookup give every
         // allowed move, bounds and the corner rule included.
-        const current_y_index = current.index / grid.width;
-        const current_x_index = current.index - current_y_index * grid.width;
+        const current_y_index = current.index / grid.geometry.width;
+        const current_x_index = current.index - current_y_index * grid.geometry.width;
         const moves = allowed_moves[grid.neighborhood(current_x_index, current_y_index)];
         const current_x: i32 = @intCast(current_x_index);
         const current_y: i32 = @intCast(current_y_index);
@@ -896,12 +895,8 @@ pub const RunGeometry = struct {
     chunks_x: usize,
 
     pub fn of(graph: *const NavGraph) RunGeometry {
-        // Chunk edges are powers of two.
-        return .{
-            .width = graph.width,
-            .chunk_shift = @intCast(@ctz(graph.chunk_tiles)),
-            .chunks_x = (types.ChunkGeometry{ .width = graph.width, .height = graph.height, .chunk_tiles = graph.chunk_tiles }).chunksX(),
-        };
+        const geometry = graph.chunkGeometry();
+        return .{ .width = geometry.width, .chunk_shift = geometry.shift, .chunks_x = geometry.chunksX() };
     }
 
     /// The key of the chunk holding (x, y) on `level`.
@@ -1012,12 +1007,12 @@ fn referenceLocalAStar(allocator: std.mem.Allocator, grid: *const NavGrid, budge
     };
 
     path.clearRetainingCapacity();
-    const width: i32 = @intCast(grid.width);
-    const goal_x: i32 = @intCast(goal_index % grid.width);
-    const goal_y: i32 = @intCast(goal_index / grid.width);
+    const width: i32 = @intCast(grid.geometry.width);
+    const goal_x: i32 = @intCast(goal_index % grid.geometry.width);
+    const goal_y: i32 = @intCast(goal_index / grid.geometry.width);
     if (!Touch.cell(start_index, touched, g, parent, closed, &explored, budget)) return .{ .result = .budget_exhausted, .explored = explored };
     g[start_index] = 0;
-    const h0 = octileXY(@intCast(start_index % grid.width), @intCast(start_index / grid.width), goal_x, goal_y);
+    const h0 = octileXY(@intCast(start_index % grid.geometry.width), @intCast(start_index / grid.geometry.width), goal_x, goal_y);
     try open.append(allocator, .{ .index = start_index, .f = h0, .h = h0 });
     while (open.items.len != 0) {
         const current = popHeap(&open);
@@ -1034,8 +1029,8 @@ fn referenceLocalAStar(allocator: std.mem.Allocator, grid: *const NavGrid, budge
             std.mem.reverse(u32, path.items);
             return .{ .result = .found, .explored = explored };
         }
-        const cy = current.index / grid.width;
-        const cx = current.index - cy * grid.width;
+        const cy = current.index / grid.geometry.width;
+        const cx = current.index - cy * grid.geometry.width;
         const moves = allowed_moves[grid.neighborhood(cx, cy)];
         for (neighbor_dirs, 0..) |dir, dir_index| {
             if (moves & (@as(u8, 1) << @intCast(dir_index)) == 0) continue;
@@ -1288,8 +1283,8 @@ const ReferenceAbstract = struct {
 
     fn search(self: *ReferenceAbstract, graph: *const NavGraph, start_grid: *const NavGrid, goal_grid: *const NavGrid, start_level: u16, goal_level: u16, start_index: usize, goal_index: usize) !AbstractResult {
         const allocator = self.nodes.allocator;
-        const width: u32 = @intCast(graph.width);
-        const tiles: u32 = graph.chunk_tiles;
+        const width: u32 = @intCast(graph.geometry.width);
+        const tiles: u32 = graph.geometry.chunk_tiles;
         const chunks_x = (width + tiles - 1) / tiles;
         const goal: u32 = @intCast(goal_index);
         const goal_x = goal % width;
@@ -1526,11 +1521,11 @@ test "abstract expansion visits only same-label peers, border mirrors, and live 
         touched += 1;
         try std.testing.expectEqual(@as(u16, 0), refLevel(slot.node));
         const cell = refLocal(slot.node);
-        try std.testing.expect(cell % grid.width > 5);
+        try std.testing.expect(cell % grid.geometry.width > 5);
         // Cached coordinates are the node's own.
-        try std.testing.expectEqual(cell % grid.width, slot.x);
-        try std.testing.expectEqual(cell / grid.width, slot.y);
-        try std.testing.expect(graph.chunkPortals(0, graph.chunkOf(cell)).find(graph.localOf(cell)) != null);
+        try std.testing.expectEqual(cell % grid.geometry.width, slot.x);
+        try std.testing.expectEqual(cell / grid.geometry.width, slot.y);
+        try std.testing.expect(graph.chunkPortals(0, test_support.chunkOfCell(graph.geometry, cell)).find(test_support.localOfCell(graph.geometry, cell)) != null);
         if (cell == grid.indexForCell(.{ .x = 9, .y = 9 }).?) reached_link_source = true;
     }
     try std.testing.expect(touched > 1);
@@ -1628,8 +1623,8 @@ fn pushDistance(allocator: std.mem.Allocator, distances: *std.AutoHashMap(usize,
 // path `abstractCorridor` may take: an exhaustive Dijkstra over the same nodes and edges with
 // goal portals terminal. Null when no goal portal is reachable.
 fn exhaustiveAbstractObjective(allocator: std.mem.Allocator, graph: *const NavGraph, start_grid: *const NavGrid, goal_grid: *const NavGrid, start_level: u16, goal_level: u16, start_index: usize, goal_index: usize) !?u32 {
-    const width: u32 = @intCast(graph.width);
-    const tiles: u32 = graph.chunk_tiles;
+    const width: u32 = @intCast(graph.geometry.width);
+    const tiles: u32 = graph.geometry.chunk_tiles;
     const chunks_x = (width + tiles - 1) / tiles;
     const goal: u32 = @intCast(goal_index);
     const goal_x = goal % width;
@@ -1744,7 +1739,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
         try std.testing.expectEqual(levels - 1, bounds.short_span);
         try std.testing.expect(bounds.short_cost < 100 and bounds.long_cost <= 43 and bounds.pairs.count > 0);
         if (seed >= 6) try std.testing.expectEqual(@as(u32, long_link_pairs), bounds.pairs.count);
-        const width: u32 = @intCast(graph.width);
+        const width: u32 = @intCast(graph.geometry.width);
         // Random goals, then the first open cell on the wide teleport's exit row beyond its
         // exit: there a path through the teleport saves exactly its planar span.
         const wide = links[4];
@@ -1766,7 +1761,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
             const goal_x = goal % width;
             const goal_y = goal / width;
             const goal_label = goal_grid.labelAt(goal);
-            const goal_chunk = graph.chunkOf(goal);
+            const goal_chunk = test_support.chunkOfCell(graph.geometry, goal);
             var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
             for (0..levels) |level_index| {
                 const level: u16 = @intCast(level_index);
@@ -1775,7 +1770,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
                     const portals = graph.chunkPortals(level, chunk);
                     for ([_][]const NavPortal{ portals.border, portals.extra }) |list| {
                         for (list) |portal| {
-                            const cell = graph.cellOfLocal(chunk, portal.local);
+                            const cell = test_support.cellOfLocal(graph.geometry, chunk, portal.local);
                             const x = cell % width;
                             const y = cell / width;
                             const h = heuristicAt(&heuristic, level, x, y);
@@ -1786,7 +1781,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
                             for ([_][]const NavPortal{ portals.border, portals.extra }) |peers| {
                                 for (peers) |peer| {
                                     if (peer.local == portal.local or peer.label != portal.label) continue;
-                                    const peer_cell = graph.cellOfLocal(chunk, peer.local);
+                                    const peer_cell = test_support.cellOfLocal(graph.geometry, chunk, peer.local);
                                     const px = peer_cell % width;
                                     const py = peer_cell / width;
                                     try std.testing.expect(h <= octileU32(x, y, px, py) +| heuristicAt(&heuristic, level, px, py));
@@ -1895,12 +1890,12 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
                 const expected = try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, start_level, goal_level, start, goal);
                 switch (abstractCorridor(graph, &abstract, start_grid, goal_grid, start_level, goal_level, start, goal, 4096)) {
                     .found => {
-                        try std.testing.expectEqual(expected, foundObjective(&abstract, graph.width, goal));
+                        try std.testing.expectEqual(expected, foundObjective(&abstract, graph.geometry.width, goal));
                         found += 1;
                         found_cross_level += @intFromBool(start_level != goal_level);
                         for (abstract.corridor.items[1..], abstract.corridor.items[0 .. abstract.corridor.items.len - 1], abstract.corridor_link.items[1..]) |to, from, via_link| {
                             if (!via_link) continue;
-                            const planar = octileU32(@intCast(refLocal(from) % graph.width), @intCast(refLocal(from) / graph.width), @intCast(refLocal(to) % graph.width), @intCast(refLocal(to) / graph.width));
+                            const planar = octileU32(@intCast(refLocal(from) % graph.geometry.width), @intCast(refLocal(from) / graph.geometry.width), @intCast(refLocal(to) % graph.geometry.width), @intCast(refLocal(to) / graph.geometry.width));
                             if (planar > 43) found_via_long += 1;
                         }
                     },
@@ -1947,7 +1942,7 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
         const start = grid.indexForCell(pocket_start).?;
         const goal = grid.indexForCell(pocket_goal).?;
         try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
-        try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal), foundObjective(&abstract, graph.width, goal));
+        try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
     }
 }
 
@@ -2170,7 +2165,7 @@ test "a goal portal whose estimate the long floor cut is re-queued before it end
     try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
     // The near gap: g 84 + octile 140, against g 74 + octile 192 through the far one.
     try std.testing.expectEqual(grid.indexForCell(.{ .x = 16, .y = 30 }).?, refLocal(abstract.corridor.items[abstract.corridor.items.len - 1]));
-    try std.testing.expectEqual(@as(u32, 224), foundObjective(&abstract, graph.width, goal));
+    try std.testing.expectEqual(@as(u32, 224), foundObjective(&abstract, graph.geometry.width, goal));
     try std.testing.expectEqual(@as(?u32, 224), try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal));
 }
 
@@ -2215,7 +2210,7 @@ test "a long link landing next to the goal from an unreachable level leaves abst
             const start = start_grid.indexForCell(.{ .x = 0, .y = 0 }).?;
             const goal = goal_grid.indexForCell(.{ .x = 14, .y = 14 }).?;
             try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 1, 4, start, goal, 4096) == .found);
-            objective.* = foundObjective(&abstract, graph.width, goal);
+            objective.* = foundObjective(&abstract, graph.geometry.width, goal);
             try std.testing.expectEqual(@as(?u32, objective.*), try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, 1, 4, start, goal));
             if (!teleport) continue;
             level_nodes.* = abstract.nodes_used;
@@ -2269,7 +2264,7 @@ test "a long link's estimate pairs its entrance with its own exit and chains thr
     defer abstract.deinit(allocator);
     try abstract.reserve(allocator, 4096);
     try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
-    try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal), foundObjective(&abstract, graph.width, goal));
+    try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
     try std.testing.expect(std.mem.indexOfScalar(bool, abstract.corridor_link.items, true) != null);
 }
 
@@ -2348,7 +2343,7 @@ test "mirrored band teleports leave no level-0 band node closed and the objectiv
         const start = start_grid.indexForCell(.{ .x = center, .y = center - 8 }).?;
         const goal = goal_grid.indexForCell(.{ .x = center, .y = center + 8 }).?;
         try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 0, 2, start, goal, 4096) == .found);
-        try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, 0, 2, start, goal), foundObjective(&abstract, graph.width, goal));
+        try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, 0, 2, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
         var band_closed: usize = 0;
         for (abstract.slots) |slot| {
             // This search's claimed nodes carry its generation.

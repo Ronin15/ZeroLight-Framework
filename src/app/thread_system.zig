@@ -1344,6 +1344,7 @@ pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
     total.item_count += batch.item_count;
     total.range_count += batch.range_count;
     total.items_per_range = @max(total.items_per_range, batch.items_per_range);
+    total.range_alignment_items = @max(total.range_alignment_items, batch.range_alignment_items);
     total.available_worker_threads = @max(total.available_worker_threads, batch.available_worker_threads);
     total.active_worker_threads = @max(total.active_worker_threads, batch.active_worker_threads);
     total.main_thread_ranges += batch.main_thread_ranges;
@@ -1351,6 +1352,7 @@ pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
     total.batch_duration_ns += batch.batch_duration_ns;
     total.main_thread_wait_ns += batch.main_thread_wait_ns;
     total.ran_inline = total.ran_inline and batch.ran_inline;
+    total.worker_utilization = workerUtilization(total.worker_thread_ranges, total.active_worker_threads, total.range_count);
 }
 
 /// A stage's range controls. A fixed `items_per_range` opts the stage out of its tuner;
@@ -2169,6 +2171,7 @@ test "accumulate batch sums counts, keeps widest shape, and skips empty batches"
         .item_count = 20,
         .range_count = 2,
         .items_per_range = 10,
+        .range_alignment_items = 4,
         .available_worker_threads = 1,
         .active_worker_threads = 1,
         .main_thread_ranges = 1,
@@ -2190,6 +2193,9 @@ test "accumulate batch sums counts, keeps widest shape, and skips empty batches"
     try std.testing.expectEqual(@as(usize, 4), total.worker_thread_ranges);
     try std.testing.expectEqual(@as(u64, 800), total.batch_duration_ns);
     try std.testing.expectEqual(@as(u64, 110), total.main_thread_wait_ns);
+    try std.testing.expectEqual(@as(usize, 4), total.range_alignment_items);
+    // Recomputed over the summed ranges: 4 of 7 ranges ran on workers.
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0 / 7.0), total.worker_utilization, 1e-6);
     try std.testing.expect(!total.ran_inline);
 }
 

@@ -2385,7 +2385,7 @@ test "a population-seam OOM still records the step's static changes" {
     try rebuilt.rebuildStaticNavGrid(&fixture.data, 64, 64, fixture.pipeline.pathfinding.graph.cell_size);
     const fresh = rebuilt.graph.grid(0).?;
     var blocked: usize = 0;
-    for (0..live.height) |y| for (0..live.width) |x| {
+    for (0..live.geometry.height) |y| for (0..live.geometry.width) |x| {
         const cell: @import("systems/pathfinding/types.zig").GridCell = .{ .x = @intCast(x), .y = @intCast(y) };
         try std.testing.expectEqual(fresh.isBlockedCell(cell), live.isBlockedCell(cell));
         if (live.isBlockedCell(cell)) blocked += 1;

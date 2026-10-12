@@ -42,6 +42,12 @@ const PatchInfo = @import("nav_graph.zig").PatchInfo;
 const chunkKey = @import("nav_graph.zig").chunkKey;
 const keyLevel = @import("nav_graph.zig").keyLevel;
 const keyChunk = @import("nav_graph.zig").keyChunk;
+const LevelRuns = @import("nav_graph.zig").LevelRuns;
+const sortedContains = @import("nav_graph.zig").sortedContains;
+const LabelSet = @import("nav_graph.zig").LabelSet;
+const maxChunkLabels = @import("nav_grid.zig").maxChunkLabels;
+const CellCoord = @import("../../world_system.zig").CellCoord;
+const no_link_endpoint = @import("../../world_terrain.zig").no_link_endpoint;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
@@ -51,7 +57,7 @@ const simd = @import("../../../core/simd.zig");
 
 pub const no_node: u32 = std.math.maxInt(u32);
 pub const no_comp: u32 = std.math.maxInt(u32);
-pub const no_root: u32 = std.math.maxInt(u32);
+const no_root: u32 = std.math.maxInt(u32);
 const no_set: u32 = std.math.maxInt(u32);
 const no_unit: u32 = std.math.maxInt(u32);
 const no_group: u32 = std.math.maxInt(u32);
@@ -73,6 +79,11 @@ const free_bit: u32 = 1 << 31;
 const free_end: u32 = free_bit - 1;
 // Words of one rows item's span and one compaction line: a 64-byte cache line.
 const span_words: usize = 16;
+
+comptime {
+    // Arena offsets and flood table sizes are proven against a 64-bit usize.
+    std.debug.assert(@bitSizeOf(usize) == 64);
+}
 
 /// One node of a level: its chunk-local label, its comp, the next node of its record, and the
 /// key and row of the next node in a flood queue (scratch, valid only inside a flood).
@@ -110,7 +121,7 @@ const old_bit: u64 = 1 << 63;
 const root_bit: u64 = 1 << 62;
 
 fn nodeKey(level: u16, chunk: u32, label: u8) u64 {
-    return (@as(u64, level) << 40) | (@as(u64, chunk) << 8) | label;
+    return (chunkKey(level, chunk) << 8) | label;
 }
 
 fn oldKey(level: u16, chunk: u32, label: u8) u64 {
@@ -343,13 +354,20 @@ const FloodScratch = struct {
     }
 };
 
-/// Default proposal slots per flood round (W): rounds pack served sets' windows up to it.
-/// A round width, not a budget: every round of a batch completes in that batch.
-pub const default_flood_window: usize = 16384;
+// Default proposal slots per flood round (W): rounds pack served sets' windows up to it.
+// A round width, not a budget: every round of a batch completes in that batch.
+const default_flood_window: usize = 16384;
 
-/// Default most nodes one flood item proposes (K): a work quantum that bounds each
-/// participant's search table.
-pub const default_flood_budget_cap: u32 = 512;
+// Default most nodes one flood item proposes (K): a work quantum that bounds each
+// participant's search table.
+const default_flood_budget_cap: u32 = 512;
+
+// A key's first probe slot in a power-of-two table of `mask + 1` slots: a Fibonacci hash's
+// high bits.
+fn homeSlot(key: u64, mask: usize) usize {
+    const hash: usize = @truncate((key *% 0x9E3779B97F4A7C15) >> 32);
+    return hash & mask;
+}
 
 /// The most keys per slot an `ElementMapAt` table holds.
 const SlotLoad = enum { half, three_quarters };
@@ -445,8 +463,7 @@ fn ElementMapAt(comptime load: SlotLoad) type {
 
         fn slotOf(self: *const Self, key: u64) usize {
             const mask = self.keys.items.len - 1;
-            var slot: usize = @truncate((key *% 0x9E3779B97F4A7C15) >> 32);
-            slot &= mask;
+            var slot = homeSlot(key, mask);
             while (self.stamps.items[slot] == self.generation and self.keys.items[slot] != key) slot = (slot + 1) & mask;
             return slot;
         }
@@ -492,7 +509,7 @@ pub const ElementMap = ElementMapAt(.half);
 // batch's elements, so it trades probe length for memory.
 const MergeMap = ElementMapAt(.three_quarters);
 
-// Union-find find with full path compression.
+// Union-find over u32 index columns (std has none): find with full path compression.
 fn findRoot(parents: []u32, index: u32) u32 {
     var root = index;
     while (parents[root] != root) root = parents[root];
@@ -554,7 +571,8 @@ const TermRow = struct {
 // index words), the indices handed out (`k_high`) and live, the head of its free index list,
 // its one-way link list, and its batch slot and stamp. A free id has `k_cap == 0`.
 const HCompRow = struct {
-    block: u32,
+    // Arena word offset: the arena grows with the world's one-way systems, past u32.
+    block: usize,
     k_cap: u32,
     k_high: u32,
     k_live: u32,
@@ -574,7 +592,7 @@ const TermColumns = struct {
 };
 
 const HCompColumns = struct {
-    block: []u32 = &.{},
+    block: []usize = &.{},
     k_cap: []u32 = &.{},
     k_high: []u32 = &.{},
     k_live: []u32 = &.{},
@@ -690,7 +708,7 @@ const SlotRow = struct {
 const PieceRow = struct {
     inherit: u32,
     hcomp: u32,
-    block: u32,
+    block: usize,
     k_cap: u32,
     k_high: u32,
     free_head: u32,
@@ -735,18 +753,19 @@ const FreedIndex = struct {
     index: u32,
 };
 
-// One kept terminal's old row and the S window it is tested against.
+// One kept terminal's old row (an arena offset) and the S window it is tested against.
 const MaskItem = struct {
     slot: u32,
-    row: u32,
+    row: usize,
     touch: u32,
     words: u32,
 };
 
-// One round-0 span: `src_len` words copied from `src`, the rest of `len` words zeroed.
+// One round-0 span: `src_len` words copied from arena offset `src`, the rest of `len`
+// words zeroed.
 const CopyItem = struct {
-    dst: u32,
-    src: u32,
+    dst: usize,
+    src: usize,
     len: u32,
     src_len: u32,
 };
@@ -762,9 +781,9 @@ const RowsItem = struct {
 // line in the copy's line numbering.
 const CompactBlock = struct {
     hcomp: u32,
-    src: u32,
-    dst: u32,
-    line_start: u32,
+    src: usize,
+    dst: usize,
+    line_start: usize,
 };
 
 // What one batch's closure stages may touch, bounded in prepare from counts: its candidate
@@ -872,8 +891,6 @@ pub const ClosureCounters = struct {
     links: usize = 0,
     terms_new: usize = 0,
     terms_left: usize = 0,
-    // Freed terminals a root at a link end took back instead of popping a new one.
-    adopted: usize = 0,
     a_rows: usize = 0,
     rounds: usize = 0,
     words_written: usize = 0,
@@ -905,7 +922,6 @@ pub const Closure = struct {
     arena_limit: usize = 0,
     live_words: usize = 0,
     dead_words: usize = 0,
-    compactions: u64 = 0,
     // Batch stamps: a prepare stamps candidates with `stamp`, the touch stamps with `stamp + 1`.
     stamp: u32 = 0,
     // Whether the current batch maintains the closure: the registry or the batch's new links
@@ -1030,8 +1046,9 @@ pub const Closure = struct {
     fn ensureFreeIds(self: *Closure, allocator: std.mem.Allocator, terms: usize, hcomps: usize, pool_grows: *u64) !void {
         // The pools may move before a later step fails: the views follow them either way.
         defer self.refreshColumns();
-        try growPool(TermRow, allocator, &self.terms, &self.term_free, terms, .{ .root = no_root, .hcomp = no_hcomp, .index = no_index, .slot = no_slot }, pool_grows);
-        try growPool(HCompRow, allocator, &self.hcomps, &self.hcomp_free, hcomps, emptyHComp(), pool_grows);
+        // Ids stay below `free_end`, so a terminal id never reads as a free index-map entry.
+        try growPool(TermRow, allocator, &self.terms, &self.term_free, terms, .{ .root = no_root, .hcomp = no_hcomp, .index = no_index, .slot = no_slot }, free_end, pool_grows);
+        try growPool(HCompRow, allocator, &self.hcomps, &self.hcomp_free, hcomps, emptyHComp(), free_end, pool_grows);
     }
 
     fn bytes(self: *const Closure) usize {
@@ -1069,14 +1086,27 @@ fn emptyHComp() HCompRow {
     return .{ .block = 0, .k_cap = 0, .k_high = 0, .k_live = 0, .index_free = free_end, .link_head = no_oneway, .link_tail = no_oneway, .link_count = 0, .slot = no_slot, .stamp = 0 };
 }
 
-// Grows `free` to at least `needed` ids of `rows`, new rows set to `empty`. Pool growth is
-// geometric and counted in `pool_grows`; ids stay below `free_end`, so a terminal id never
-// reads as a free index-map entry.
-fn growPool(comptime Row: type, allocator: std.mem.Allocator, rows: *std.MultiArrayList(Row), free: *std.ArrayList(u32), needed: usize, empty: Row, pool_grows: *u64) !void {
+/// Grows the free id list `free` of the pool `rows` to at least `needed` ids, new rows set to
+/// `empty` and pushed in descending order so pops hand out ascending ids. The pool grows to
+/// exactly the larger of its need and twice its capacity (an empty pool to its need), counted
+/// once in `pool_grows`; the free list covers the pool exactly, so a release never allocates.
+/// Ids stay below `id_end`, the pool's sentinel: `NavConnectivityOverflow` past it. The
+/// caller refreshes its column views after the call, success or not (the pool may have
+/// moved). On error the pool keeps its rows and ids.
+pub fn growPool(
+    comptime Row: type,
+    allocator: std.mem.Allocator,
+    rows: *std.MultiArrayList(Row),
+    free: *std.ArrayList(u32),
+    needed: usize,
+    empty: Row,
+    id_end: u32,
+    pool_grows: *u64,
+) error{ OutOfMemory, NavConnectivityOverflow }!void {
     if (free.items.len >= needed) return;
     const added = needed - free.items.len;
     const total = rows.len + added;
-    if (total >= free_end) return error.NavConnectivityOverflow;
+    if (total >= id_end) return error.NavConnectivityOverflow;
     if (total > rows.capacity) {
         try rows.setCapacity(allocator, @max(total, rows.capacity *| 2));
         pool_grows.* += 1;
@@ -1342,7 +1372,7 @@ pub const StorageShape = struct {
     participants: usize,
 };
 
-/// An over-estimate of `Connectivity.residentBytes` for `shape`, for storage size limits.
+/// An over-estimate of `Connectivity.residentBytes` for `shape`.
 /// Every list is charged at std's growth past the most it is reserved for, every pool at its
 /// doubling past its need. Staging is the larger of one level build and the largest marks
 /// batch, per list: a key holds at most `border_stride + chunk_endpoints` nodes. Comps and
@@ -1493,11 +1523,11 @@ pub const Connectivity = struct {
     flood_slack: usize = 0,
     // The most proposals an item writes before it stops expanding: K, at most W.
     flood_budget_limit: u32 = 0,
-    /// Proposal slots per flood round (W) beyond one node's slack; a bench or test may
-    /// narrow it. Changes round count, never the partition.
+    /// Proposal slots per flood round (W) beyond one node's slack, read at each flood reserve.
+    /// Changes round count, never the partition.
     flood_window: usize = default_flood_window,
-    /// The most proposals one flood item writes before it stops expanding (K); a bench or
-    /// test may change it. Changes round count, never the partition.
+    /// The most proposals one flood item writes before it stops expanding (K), read at each
+    /// flood reserve. Changes round count, never the partition.
     flood_budget_cap: u32 = default_flood_budget_cap,
     // The most link endpoints any chunk holds, over the first `endpoint_links_seen` links.
     max_chunk_endpoints: usize = 0,
@@ -1616,17 +1646,17 @@ pub const Connectivity = struct {
     }
 
     /// Live comps.
-    pub fn compCount(self: *const Connectivity) usize {
+    fn compCount(self: *const Connectivity) usize {
         return self.comps.len - self.comp_free.items.len;
     }
 
     /// Live roots: one per connected set of nodes.
-    pub fn rootCount(self: *const Connectivity) usize {
+    fn rootCount(self: *const Connectivity) usize {
         return self.roots.len - self.root_free.items.len;
     }
 
     /// Bytes of the comp and root pools and their free lists.
-    pub fn poolBytes(self: *const Connectivity) usize {
+    fn poolBytes(self: *const Connectivity) usize {
         return self.comps.capacity * @sizeOf(CompRow) +
             self.comp_free.capacity * @sizeOf(u32) +
             self.roots.capacity * @sizeOf(RootRow) +
@@ -1635,7 +1665,7 @@ pub const Connectivity = struct {
     }
 
     /// Bytes of the batch staging.
-    pub fn stagingBytes(self: *const Connectivity) usize {
+    fn stagingBytes(self: *const Connectivity) usize {
         return (self.seed_starts.capacity + self.row_starts.capacity + self.edge_starts.capacity) * @sizeOf(usize) +
             (self.seed_counts.capacity + self.row_counts.capacity + self.edge_counts.capacity) * @sizeOf(u32) +
             (self.seed_edges.capacity + self.gather_edges.capacity) * @sizeOf(EdgeEntry) +
@@ -1654,7 +1684,7 @@ pub const Connectivity = struct {
     }
 
     /// Bytes of the flood's round buffers and search tables.
-    pub fn floodBytes(self: *const Connectivity) usize {
+    fn floodBytes(self: *const Connectivity) usize {
         var bytes = self.flood_items.capacity * @sizeOf(FloodItem) +
             self.flood_outs.capacity * @sizeOf(FloodOut) +
             self.proposals.capacity * @sizeOf(Proposal) +
@@ -1705,46 +1735,10 @@ pub const Connectivity = struct {
     // pop without allocating. Pool growth is geometric and counted in `pool_grows`; ids stay
     // below their sentinels.
     fn ensureFreeIds(self: *Connectivity, allocator: std.mem.Allocator, needed: usize, pool_grows: *u64) !void {
-        if (self.comp_free.items.len < needed) {
-            const added = needed - self.comp_free.items.len;
-            const total = self.comps.len + added;
-            if (total >= no_comp) return error.NavConnectivityOverflow;
-            if (total > self.comps.capacity) {
-                try self.comps.setCapacity(allocator, @max(total, self.comps.capacity *| 2));
-                // The pool moved: the column views follow it before anything else can fail.
-                self.refreshColumns();
-                pool_grows.* += 1;
-            }
-            try self.comp_free.ensureTotalCapacityPrecise(allocator, self.comps.capacity);
-            // Pushed in descending id order so claims hand out ascending ids.
-            const first: u32 = @intCast(self.comps.len);
-            for (0..added) |_| self.comps.appendAssumeCapacity(.{ .root = no_root, .size = 0, .prev = no_comp, .next = no_comp, .set = no_set });
-            var id: u32 = @intCast(self.comps.len);
-            while (id > first) {
-                id -= 1;
-                self.comp_free.appendAssumeCapacity(id);
-            }
-            self.refreshColumns();
-        }
-        if (self.root_free.items.len < needed) {
-            const added = needed - self.root_free.items.len;
-            const total = self.roots.len + added;
-            if (total >= no_root) return error.NavConnectivityOverflow;
-            if (total > self.roots.capacity) {
-                try self.roots.setCapacity(allocator, @max(total, self.roots.capacity *| 2));
-                self.refreshColumns();
-                pool_grows.* += 1;
-            }
-            try self.root_free.ensureTotalCapacityPrecise(allocator, self.roots.capacity);
-            const first: u32 = @intCast(self.roots.len);
-            for (0..added) |_| self.roots.appendAssumeCapacity(.{ .head = no_comp, .members = 0, .term = no_term });
-            var id: u32 = @intCast(self.roots.len);
-            while (id > first) {
-                id -= 1;
-                self.root_free.appendAssumeCapacity(id);
-            }
-            self.refreshColumns();
-        }
+        // The pools may move before a later step fails: the views follow them either way.
+        defer self.refreshColumns();
+        try growPool(CompRow, allocator, &self.comps, &self.comp_free, needed, .{ .root = no_root, .size = 0, .prev = no_comp, .next = no_comp, .set = no_set }, no_comp, pool_grows);
+        try growPool(RootRow, allocator, &self.roots, &self.root_free, needed, .{ .head = no_comp, .members = 0, .term = no_term }, no_root, pool_grows);
     }
 
     // Reserves the merge staging for `limit` elements (element rows and the map, units,
@@ -1775,11 +1769,10 @@ pub const Connectivity = struct {
         const world_system = world orelse return;
         const links = world_system.levelLinks();
         std.debug.assert(self.endpoint_links_seen <= links.len);
-        const ct: usize = world_system.chunk_size_tiles;
-        const chunks_x = (@as(usize, world_system.width) + ct - 1) / ct;
+        const geometry = types.ChunkGeometry.init(world_system.width, world_system.height, world_system.chunk_size_tiles);
         for (links[self.endpoint_links_seen..]) |link| {
             inline for (.{ .{ link.level_a, link.cell_a }, .{ link.level_b, link.cell_b } }) |end| {
-                const chunk: u32 = @intCast((end[1].y / ct) * chunks_x + end[1].x / ct);
+                const chunk = geometry.chunkOf(end[1].x, end[1].y);
                 self.max_chunk_endpoints = @max(self.max_chunk_endpoints, world_system.levelChunkLinkEndpointCount(end[0], chunk));
             }
         }
@@ -1797,7 +1790,9 @@ pub const Connectivity = struct {
         const budget: u32 = @intCast(@max(@min(@as(usize, self.flood_budget_cap), self.flood_window), 1));
         const window = @max(self.flood_window, budget) + slack;
         const items = window / (1 + slack);
-        const slots = std.math.ceilPowerOfTwo(usize, 2 * (@as(usize, budget) + slack)) catch return error.NavConnectivityOverflow;
+        // The budget is a u32 and the slack 32 border flags plus a chunk's endpoints (two per
+        // world link, below 2^32), so the table is under 2^35 slots: no usize overflow.
+        const slots = std.math.ceilPowerOfTwoAssert(usize, 2 * (@as(usize, budget) + slack));
         try types.growList(&self.flood_items, allocator, items, pool_grows);
         try types.growList(&self.flood_outs, allocator, items, pool_grows);
         try types.growList(&self.proposals, allocator, window, pool_grows);
@@ -1892,16 +1887,15 @@ pub const Connectivity = struct {
         window.note(.edges, edge_total);
         try types.resizeStaging(&self.gather_edges, allocator, edge_total, pool_grows);
 
-        // Node rows: each patch key may gain up to its node bound, per level.
-        var start: usize = 0;
-        while (start < patch_keys.len) {
-            const level = keyLevel(patch_keys[start]);
-            var end = start + 1;
-            while (end < patch_keys.len and keyLevel(patch_keys[end]) == level) end += 1;
+        // Node rows: each patch key gains at most one per portal-bearing label, so at most
+        // its node bound and at most its chunk's label bound, per level.
+        var runs = LevelRuns{ .keys = patch_keys };
+        while (runs.next()) |run| {
+            const level_graph = levels.graph(run.level);
+            const label_bound = maxChunkLabels(levels.grid(run.level).geometry.chunk_tiles);
             var needed: usize = 0;
-            for (patch_info[start..end]) |info| needed += levels.graph(level).border_stride + info.endpoints;
-            try levels.graph(level).ensureFreeNodes(allocator, needed, pool_grows);
-            start = end;
+            for (patch_info[run.start..run.end]) |info| needed += @min(level_graph.border_stride + info.endpoints, label_bound);
+            try level_graph.ensureFreeNodes(allocator, needed, pool_grows);
         }
         // Each row is one element; a gathered edge adds at most its far end (its near end is an
         // added row, a new link's ends are patch keys' rows) and a seed edge at most both.
@@ -1952,20 +1946,7 @@ pub const Connectivity = struct {
         closure_threads: ClosureThreads,
         stats: *NavUpdateStats,
     ) ConnectivityCounters {
-        var gather = GatherJob{
-            .levels = levels,
-            .world = world,
-            .keys = patch_keys,
-            .changed = self.patch_changed.items,
-            .links = new_links,
-            .row_starts = self.row_starts.items,
-            .row_counts = self.row_counts.items,
-            .rows = self.gather_rows.items,
-            .edge_starts = self.edge_starts.items,
-            .edge_counts = self.edge_counts.items,
-            .edges = self.gather_edges.items,
-        };
-        self.bindOneWayWindows(&gather);
+        var gather = self.gatherJobFor(levels, world, patch_keys, new_links);
         self.last_gather_batch = runStage(gather_threads, patch_keys.len + new_links.len, 1, &gather, &gather.range_count, gatherJob);
         stats.addStageTime(self.last_gather_batch);
         const merge_timer = StageTimer.begin();
@@ -2052,7 +2033,8 @@ pub const Connectivity = struct {
         window.note(.patch_keys, keys.len + 1);
         try types.resizeStaging(&self.patch_changed, allocator, keys.len, pool_grows);
         @memset(self.patch_changed.items, false);
-        try level_graph.ensureNodesExact(allocator, labels);
+        // An empty pool grows to exactly the level's labels.
+        try level_graph.ensureFreeNodes(allocator, labels, pool_grows);
         // A mirror's far end is an added row of the level; only a link's far end, a seed's far
         // end, and the one old element standing for a replaced level add elements. Fresh ids go
         // one pair per set or rootless unit: at most the added rows plus the seeds' far ends.
@@ -2083,20 +2065,7 @@ pub const Connectivity = struct {
         // replaced level's old nodes and every key's link partners on the other levels.
         self.closure.active = self.closure.oneway.len != 0;
         if (self.closure.active) _ = try self.prepareClosure(allocator, old_levels, world, keys, seeding, null, 0, 0, closure_threads, pool_grows, stats);
-        var gather = GatherJob{
-            .levels = levels,
-            .world = world,
-            .keys = keys,
-            .changed = self.patch_changed.items,
-            .links = &.{},
-            .row_starts = self.row_starts.items,
-            .row_counts = self.row_counts.items,
-            .rows = self.gather_rows.items,
-            .edge_starts = self.edge_starts.items,
-            .edge_counts = self.edge_counts.items,
-            .edges = self.gather_edges.items,
-        };
-        self.bindOneWayWindows(&gather);
+        var gather = self.gatherJobFor(levels, world, keys, &.{});
         self.last_gather_batch = runStage(gather_threads, keys.len, 1, &gather, &gather.range_count, gatherJob);
         stats.addStageTime(self.last_gather_batch);
         section = StageTimer.begin();
@@ -2332,6 +2301,8 @@ pub const Connectivity = struct {
     // spanning two units marks both as sets and joins their families. Numbers units, groups,
     // sets, and families on first sight in element order, and lays out each unit's elements,
     // each group's old roots and sets, and every set's and rootless unit's fresh comp and root.
+    // SIMD verdict: scalar. Union-find finds and first-sight numbering per element on the
+    // main thread (data-dependent chains), O(α) each.
     fn layout(self: *Connectivity, views: BatchViews, counters: *ConnectivityCounters) void {
         const elements = views.elements;
         const count = self.element_count;
@@ -2925,16 +2896,13 @@ pub const Connectivity = struct {
     pub fn reserveRegistry(self: *Connectivity, allocator: std.mem.Allocator, new_links: []const LevelLink, pool_grows: *u64) !void {
         const closure = &self.closure;
         const oneway_total = closure.oneway.len + countOneWay(new_links);
-        if (oneway_total >= no_oneway) return error.NavConnectivityOverflow;
         const link_total = closure.oneway_cursor + new_links.len;
-        if (link_total > closure.oneway_of_link.capacity) {
-            try closure.oneway_of_link.ensureTotalCapacity(allocator, link_total);
-            pool_grows.* += 1;
-        }
-        if (oneway_total > closure.oneway.capacity) {
-            try closure.oneway.ensureTotalCapacity(allocator, oneway_total);
-            pool_grows.* += 1;
-        }
+        // One row per world link at most, and the world holds at most `no_link_endpoint / 2`
+        // (2^31 - 1) links (two u32 endpoint entries each, `WorldSystem.reserveLevelLink`),
+        // so rows stay below `no_oneway` (2^32 - 1).
+        std.debug.assert(oneway_total <= link_total and link_total <= no_link_endpoint / 2);
+        try types.growList(&closure.oneway_of_link, allocator, link_total, pool_grows);
+        try types.growList(&closure.oneway, allocator, oneway_total, pool_grows);
     }
 
     /// Registers `new_links`, the world links from the registry's cursor on; each one-way link
@@ -2989,8 +2957,10 @@ pub const Connectivity = struct {
         var words: usize = closure.words.items.len;
         const pieces = closure.pieces.slice();
         for (pieces.items(.k_cap)) |k_cap| words += blockWords(k_cap);
-        if (words >= std.math.maxInt(u32)) return error.NavConnectivityOverflow;
-        try closure.words.ensureTotalCapacityPrecise(allocator, words);
+        if (words > closure.words.capacity) {
+            try closure.words.ensureTotalCapacityPrecise(allocator, words);
+            pool_grows.* += 1;
+        }
         closure.arena_limit = words;
         std.debug.assert(closure.words.capacity >= closure.arena_limit);
         self.finishClosure(threads, &counters, stats);
@@ -3097,7 +3067,7 @@ pub const Connectivity = struct {
             stats.main.reserve_ns += section.lap();
             const batch = runStage(threads.candidates, keys.len, 1, &job, &job.range_count, candidateJob);
             section = StageTimer.begin();
-            accumulateBatch(&stats.conn_candidates_batch, batch);
+            accumulateBatch(&stats.conn_closure_candidates_batch, batch);
             stats.addStageTime(batch);
             // Distinct candidates move to the front in first-sight order; a write never
             // passes the entry being read.
@@ -3236,10 +3206,9 @@ pub const Connectivity = struct {
         defer stats.main.reserve_ns += section.lap();
         const closure = &self.closure;
         const needed = closure.live_words + tail;
-        if (needed >= std.math.maxInt(u32)) return error.NavConnectivityOverflow;
         if (closure.dead_words <= closure.live_words and closure.arena_limit - closure.words.items.len >= tail) return;
         // Headroom on the live words only: the tail is the batch's worst case.
-        const limit = @min(needed + closure.live_words / 2, std.math.maxInt(u32) - 1);
+        const limit = needed + closure.live_words / 2;
         var fresh: std.ArrayList(u32) = .empty;
         errdefer fresh.deinit(allocator);
         try fresh.ensureTotalCapacityPrecise(allocator, limit);
@@ -3253,8 +3222,8 @@ pub const Connectivity = struct {
             closure.compact_blocks.appendAssumeCapacity(.{
                 .hcomp = @intCast(id),
                 .src = hcomp.block[id],
-                .dst = @intCast(offset),
-                .line_start = @intCast(offset / span_words),
+                .dst = offset,
+                .line_start = offset / span_words,
             });
             offset += blockWords(k_cap);
         }
@@ -3273,7 +3242,6 @@ pub const Connectivity = struct {
         closure.arena_limit = limit;
         std.debug.assert(closure.words.capacity >= closure.arena_limit);
         closure.dead_words = 0;
-        closure.compactions += 1;
         stats.closure_compactions += 1;
     }
 
@@ -3281,16 +3249,31 @@ pub const Connectivity = struct {
     // One-way closure: commit
     // ------------------------------------------------------------------------------------
 
-    // Points `job` at the registry and the prepared one-way windows when the closure is active.
-    fn bindOneWayWindows(self: *Connectivity, job: *GatherJob) void {
+    // The gather stage over `keys` then `links` on the prepared windows, with the registry and
+    // the one-way windows when the closure is active.
+    fn gatherJobFor(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, keys: []const u64, links: []const LevelLink) GatherJob {
+        var job = GatherJob{
+            .levels = levels,
+            .world = world,
+            .keys = keys,
+            .changed = self.patch_changed.items,
+            .links = links,
+            .row_starts = self.row_starts.items,
+            .row_counts = self.row_counts.items,
+            .rows = self.gather_rows.items,
+            .edge_starts = self.edge_starts.items,
+            .edge_counts = self.edge_counts.items,
+            .edges = self.gather_edges.items,
+        };
         const closure = &self.closure;
-        if (!closure.active) return;
-        std.debug.assert(closure.ow_counts.items.len == job.keys.len);
+        if (!closure.active) return job;
+        std.debug.assert(closure.ow_counts.items.len == keys.len);
         job.oneway_of_link = closure.oneway_of_link.items;
         job.oneway_cursor = closure.oneway_cursor;
         job.ow_starts = closure.ow_starts.items;
         job.ow_counts = closure.ow_counts.items;
         job.ow_entries = closure.ow_entries.items;
+        return job;
     }
 
     // Brings the closure up to date after `finish`: touches the H-components the batch can
@@ -3444,13 +3427,12 @@ pub const Connectivity = struct {
     // `term` (its root was released) and `root` holds none. A stored terminal of a link live
     // before was live at the last commit, so a released root marks it freed; once taken, it
     // is not freed any more.
-    fn adoptTerm(self: *Connectivity, root: u32, term: u32, counters: *ClosureCounters) void {
+    fn adoptTerm(self: *Connectivity, root: u32, term: u32) void {
         const closure = &self.closure;
         std.debug.assert(term != no_term);
         if (self.root_term[root] != no_term or closure.term.root[term] != no_root) return;
         self.root_term[root] = term;
         closure.term.root[term] = root;
-        counters.adopted += 1;
     }
 
     // The batch slot of terminal `term`, numbered on first sight.
@@ -3513,6 +3495,8 @@ pub const Connectivity = struct {
     // heirs' free lists, every terminal's index (kept, or popped from its piece's free list, or
     // past its handed-out indices), moved-out terminals in their old S, and the mask items.
     // O(1)/O(α) per link and terminal slot.
+    // SIMD verdict: scalar. Union-find, first-sight numbering, and free-list pops per link and
+    // slot on the main thread (data-dependent), O(1)/O(α) each.
     fn mergeResolved(self: *Connectivity, counters: *ClosureCounters) void {
         const closure = &self.closure;
         const items = closure.resolve_items.items;
@@ -3531,8 +3515,8 @@ pub const Connectivity = struct {
         // yet. Merged and re-created roots keep their terminal, so only new ones pop.
         for (items, outs) |link, out| {
             if (!out.live or oneway.hcomp[link] == no_hcomp) continue;
-            self.adoptTerm(out.src_root, oneway.src_term[link], counters);
-            self.adoptTerm(out.dst_root, oneway.dst_term[link], counters);
+            self.adoptTerm(out.src_root, oneway.src_term[link]);
+            self.adoptTerm(out.dst_root, oneway.dst_term[link]);
         }
         for (items, outs) |link, out| {
             const old_live = oneway.hcomp[link] != no_hcomp;
@@ -3728,7 +3712,7 @@ pub const Connectivity = struct {
             if (touched.s_count[touch] == 0) continue;
             const id = touched.hcomp[touch];
             const words = rowWords(hcomp.k_cap[id]);
-            closure.mask_items.appendAssumeCapacity(.{ .slot = @intCast(slot), .row = @intCast(hcomp.block[id] + @as(usize, slots.index[slot]) * words), .touch = @intCast(touch), .words = words });
+            closure.mask_items.appendAssumeCapacity(.{ .slot = @intCast(slot), .row = hcomp.block[id] + @as(usize, slots.index[slot]) * words, .touch = @intCast(touch), .words = words });
         }
     }
 
@@ -3783,7 +3767,7 @@ pub const Connectivity = struct {
         counters.a_rows = a_total;
 
         // Plan.
-        var plan = PlanJob{
+        var plan = SccPlanJob{
             .items = closure.plan_items.items,
             .pieces = pieces,
             .slots = slots,
@@ -3791,7 +3775,7 @@ pub const Connectivity = struct {
             .apos = apos,
         };
         stats.main.closure_ns += section.lap();
-        closure.last_plan_batch = runStage(threads.plan, closure.plan_items.items.len, 1, &plan, &plan.range_count, planJob);
+        closure.last_plan_batch = runStage(threads.plan, closure.plan_items.items.len, 1, &plan, &plan.range_count, sccPlanJob);
         stats.addStageTime(closure.last_plan_batch);
         section = StageTimer.begin();
 
@@ -3881,7 +3865,7 @@ pub const Connectivity = struct {
             closure.words.items.len = offset + words;
             closure.live_words += words;
             counters.tail_words += words;
-            pieces.block[piece] = @intCast(offset);
+            pieces.block[piece] = offset;
             const row_words = rowWords(pieces.k_cap[piece]);
             // Unused indices past those handed out: one zeroed range.
             self.zeroWords(offset + @as(usize, pieces.k_high[piece]) * row_words, @as(usize, pieces.k_cap[piece] - pieces.k_high[piece]) * row_words);
@@ -3914,7 +3898,7 @@ pub const Connectivity = struct {
             while (start < new_words) : (start += span_words) {
                 const len = @min(span_words, new_words - start);
                 const src_len = if (start >= old_words) 0 else @min(len, old_words - start);
-                self.appendCopy(.{ .dst = @intCast(dst + start), .src = @intCast(src + start), .len = @intCast(len), .src_len = @intCast(src_len) });
+                self.appendCopy(.{ .dst = dst + start, .src = src + start, .len = @intCast(len), .src_len = @intCast(src_len) });
             }
         }
     }
@@ -3923,7 +3907,7 @@ pub const Connectivity = struct {
     fn zeroWords(self: *Connectivity, start: usize, len: usize) void {
         var offset: usize = 0;
         while (offset < len) : (offset += span_words) {
-            self.appendCopy(.{ .dst = @intCast(start + offset), .src = 0, .len = @intCast(@min(span_words, len - offset)), .src_len = 0 });
+            self.appendCopy(.{ .dst = start + offset, .src = 0, .len = @intCast(@min(span_words, len - offset)), .src_len = 0 });
         }
     }
 
@@ -4030,18 +4014,11 @@ const Neighbour = struct {
     label: u8,
 };
 
-fn cellLocal(grid: *const NavGrid, cell: usize) u8 {
-    const mask: usize = grid.chunk_tiles - 1;
-    const x = cell % grid.width;
-    const y = cell / grid.width;
-    // A chunk holds at most 256 cells.
-    return @intCast(((y & mask) << grid.chunk_shift) | (x & mask));
-}
-
-fn neighbourAt(grid: *const NavGrid, level: u16, cell: usize) Neighbour {
-    const label = grid.labelAt(cell);
+// The node of open cell (x, y) of `level`: its chunk and label from shifts.
+fn neighbourAt(grid: *const NavGrid, level: u16, x: usize, y: usize) Neighbour {
+    const chunk = grid.geometry.chunkOf(x, y);
+    const label = grid.labelAtLocal(chunk, grid.geometry.localOf(x, y));
     std.debug.assert(label != 0);
-    const chunk = grid.chunkOfCell(cell);
     return .{ .key = nodeKey(level, chunk, label), .level = level, .chunk = chunk, .label = label };
 }
 
@@ -4050,10 +4027,9 @@ fn neighbourAt(grid: *const NavGrid, level: u16, cell: usize) Neighbour {
 fn portalNode(levels: BatchLevels, level: u16, x: u16, y: u16) ?Neighbour {
     if (!levels.built(level)) return null;
     const grid = levels.grid(level);
-    const cell = @as(usize, y) * grid.width + x;
-    if (grid.isBlockedIndex(cell)) return null;
-    const neighbour = neighbourAt(grid, level, cell);
-    if (levels.graph(level).chunkPortals(neighbour.chunk).find(cellLocal(grid, cell)) == null) return null;
+    if (grid.isBlockedXY(x, y)) return null;
+    const neighbour = neighbourAt(grid, level, x, y);
+    if (levels.graph(level).chunkPortals(neighbour.chunk).find(grid.geometry.localOf(x, y)) == null) return null;
     return neighbour;
 }
 
@@ -4069,19 +4045,18 @@ fn forEachEdge(levels: BatchLevels, world: ?*const WorldSystem, level: u16, chun
     const grid = levels.grid(level);
     const portals = levels.graph(level).chunkPortals(chunk);
     const bounds = grid.chunkBounds(chunk);
-    const mask: usize = grid.chunk_tiles - 1;
-    const width = grid.width;
+    const mask: usize = grid.geometry.chunk_tiles - 1;
     for (portals.border) |portal| {
         if (only_label) |wanted| {
             if (portal.label != wanted) continue;
         }
         const x = bounds.x0 + (portal.local & mask);
-        const y = bounds.y0 + (@as(usize, portal.local) >> grid.chunk_shift);
+        const y = bounds.y0 + (@as(usize, portal.local) >> grid.geometry.shift);
         // A flag means the mirror cell exists in-grid.
-        if (portal.flags.west) visitor.visit(portal.label, neighbourAt(grid, level, y * width + x - 1));
-        if (portal.flags.east) visitor.visit(portal.label, neighbourAt(grid, level, y * width + x + 1));
-        if (portal.flags.north) visitor.visit(portal.label, neighbourAt(grid, level, (y - 1) * width + x));
-        if (portal.flags.south) visitor.visit(portal.label, neighbourAt(grid, level, (y + 1) * width + x));
+        if (portal.flags.west) visitor.visit(portal.label, neighbourAt(grid, level, x - 1, y));
+        if (portal.flags.east) visitor.visit(portal.label, neighbourAt(grid, level, x + 1, y));
+        if (portal.flags.north) visitor.visit(portal.label, neighbourAt(grid, level, x, y - 1));
+        if (portal.flags.south) visitor.visit(portal.label, neighbourAt(grid, level, x, y + 1));
     }
     if (kinds == .mirrors) return;
     const world_system = world orelse return;
@@ -4122,11 +4097,7 @@ const SeedJob = struct {
     range_count: usize = 0,
 
     fn changed(self: *const SeedJob, level: u16, chunk: u32) bool {
-        return std.sort.binarySearch(u64, self.changed_keys, chunkKey(level, chunk), struct {
-            fn order(key: u64, item: u64) std.math.Order {
-                return std.math.order(key, item);
-            }
-        }.order) != null;
+        return sortedContains(self.changed_keys, chunkKey(level, chunk));
     }
 
     // The far end of a seed edge: an old key in a changed chunk, else the node's key and row.
@@ -4170,16 +4141,10 @@ fn seedJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             while (endpoints.next()) |endpoint| {
                 if (!endpoint.bidirectional) continue;
                 if (job.replaced and endpoint.other_level == level) continue;
-                const cell = @as(usize, endpoint.cell.y) * grid.width + endpoint.cell.x;
-                if (grid.isBlockedIndex(cell)) continue;
-                if (!job.levels.built(endpoint.other_level)) continue;
-                const far_grid = job.levels.grid(endpoint.other_level);
-                const far_cell = @as(usize, endpoint.other_cell.y) * far_grid.width + endpoint.other_cell.x;
-                if (far_grid.isBlockedIndex(far_cell)) continue;
-                const neighbour = neighbourAt(far_grid, endpoint.other_level, far_cell);
-                if (job.levels.graph(endpoint.other_level).chunkPortals(neighbour.chunk).find(cellLocal(far_grid, far_cell)) == null) continue;
+                if (grid.isBlockedXY(endpoint.cell.x, endpoint.cell.y)) continue;
+                const neighbour = portalNode(job.levels, endpoint.other_level, endpoint.other_cell.x, endpoint.other_cell.y) orelse continue;
                 const end = job.far(neighbour);
-                const near_key = if (job.replaced) oldKey(level, 0, 0) else oldKey(level, chunk, grid.labelAt(cell));
+                const near_key = if (job.replaced) oldKey(level, 0, 0) else oldKey(level, chunk, grid.labelAtLocal(chunk, grid.geometry.localOf(endpoint.cell.x, endpoint.cell.y)));
                 mirrors.window[mirrors.written] = .{ .a = near_key, .b = end.key, .a_row = no_node, .b_row = end.row };
                 mirrors.written += 1;
             }
@@ -4244,20 +4209,6 @@ fn gatherOneWay(job: *const GatherJob, level: u16, chunk: u32, window: []OneWayE
     return @intCast(written);
 }
 
-const LabelSet = [4]u64;
-
-fn labelSetHas(set: *const LabelSet, label: u8) bool {
-    return (set[label >> 6] >> @intCast(label & 63)) & 1 != 0;
-}
-
-fn labelSetAdd(set: *LabelSet, label: u8) void {
-    set[label >> 6] |= @as(u64, 1) << @intCast(label & 63);
-}
-
-fn labelSetRemove(set: *LabelSet, label: u8) void {
-    set[label >> 6] &= ~(@as(u64, 1) << @intCast(label & 63));
-}
-
 const GatherEdges = struct {
     levels: BatchLevels,
     level: u16,
@@ -4267,7 +4218,7 @@ const GatherEdges = struct {
     written: usize = 0,
 
     fn visit(self: *GatherEdges, label: u8, neighbour: Neighbour) void {
-        if (!labelSetHas(self.added, label)) return;
+        if (!self.added.isSet(label)) return;
         self.window[self.written] = .{
             .a = nodeKey(self.level, self.chunk, label),
             .b = neighbour.key,
@@ -4308,31 +4259,28 @@ fn gatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         };
         const row_window = job.rows[job.row_starts[item]..job.row_starts[item + 1]];
         var row_count: usize = 0;
-        var labels: LabelSet = @splat(0);
+        var labels: LabelSet = .empty;
         const portals = level_graph.chunkPortals(chunk);
-        for (portals.border) |portal| labelSetAdd(&labels, portal.label);
-        for (portals.extra) |portal| labelSetAdd(&labels, portal.label);
+        for (portals.border) |portal| labels.set(portal.label);
+        for (portals.extra) |portal| labels.set(portal.label);
         var added = labels;
         var row = level_graph.record_node_head[record];
         while (row != no_node) : (row = level_graph.node_sibling[row]) {
             const label = level_graph.node_label[row];
-            const keep = !job.changed[item] and labelSetHas(&labels, label);
-            if (keep) labelSetRemove(&added, label);
+            const keep = !job.changed[item] and labels.isSet(label);
+            if (keep) added.unset(label);
             row_window[row_count] = .{ .row = row, .label = label, .kind = if (keep) .kept else .removed };
             row_count += 1;
         }
-        for (added, 0..) |word, word_index| {
-            var bits = word;
-            while (bits != 0) : (bits &= bits - 1) {
-                const label: u8 = @intCast(word_index * 64 + @ctz(bits));
-                row_window[row_count] = .{ .row = no_node, .label = label, .kind = .added };
-                row_count += 1;
-            }
+        var added_labels = added.iterator(.{});
+        while (added_labels.next()) |label| {
+            row_window[row_count] = .{ .row = no_node, .label = @intCast(label), .kind = .added };
+            row_count += 1;
         }
         job.row_counts[item] = @intCast(row_count);
         // A chunk that only lost or kept labels has no new edge: its neighbours' new edges
         // come from their added side.
-        if (std.mem.allEqual(u64, &added, 0)) {
+        if (added.findFirstSet() == null) {
             job.edge_counts[item] = 0;
             continue;
         }
@@ -4406,8 +4354,7 @@ const FloodVisitor = struct {
         if (owner != no_set and !foreign) return;
         // The table holds at most a window of keys in twice as many slots.
         const mask = self.keys.len - 1;
-        var slot: usize = @truncate((neighbour.key *% 0x9E3779B97F4A7C15) >> 32);
-        slot &= mask;
+        var slot = homeSlot(neighbour.key, mask);
         while (self.stamps[slot] == self.generation) : (slot = (slot + 1) & mask) {
             if (self.keys[slot] == neighbour.key) return;
         }
@@ -4550,7 +4497,7 @@ const SlotColumns = struct {
 const PieceColumns = struct {
     inherit: []u32,
     hcomp: []u32,
-    block: []u32,
+    block: []usize,
     k_cap: []u32,
     k_high: []u32,
     free_head: []u32,
@@ -4701,29 +4648,19 @@ const CandidateJob = struct {
     }
 
     fn isKey(self: *const CandidateJob, key: u64) bool {
-        return std.sort.binarySearch(u64, self.keys, key, struct {
-            fn order(wanted: u64, item: u64) std.math.Order {
-                return std.math.order(wanted, item);
-            }
-        }.order) != null;
+        return sortedContains(self.keys, key);
     }
 };
 
 // Labels of one key's qualifying endpoint cells that hold an old edge.
 const SplitEdges = struct {
     labels: *const LabelSet,
-    edged: LabelSet = @splat(0),
+    edged: LabelSet = .empty,
 
     fn visit(self: *SplitEdges, label: u8, _: Neighbour) void {
-        if (labelSetHas(self.labels, label)) labelSetAdd(&self.edged, label);
+        if (self.labels.isSet(label)) self.edged.set(label);
     }
 };
-
-fn labelSetCount(set: *const LabelSet) u32 {
-    var count: u32 = 0;
-    for (set) |word| count += @popCount(word);
-    return count;
-}
 
 // SIMD verdict: scalar. Record node walks and endpoint list walks; the opened test is four
 // word-parallel ANDs.
@@ -4762,11 +4699,11 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             for (old_bits, world_bits) |old_word, world_word| tally.opened = tally.opened or old_word & ~world_word != 0;
         }
         if (job.world) |world| {
-            const ct: u32 = world.chunk_size_tiles;
-            const chunks_x: u32 = (@as(u32, world.width) + ct - 1) / ct;
+            // The world's tiling: `level` may be the one being built, absent from `levels`.
+            const geometry = types.ChunkGeometry.init(world.width, world.height, world.chunk_size_tiles);
             // The distinct qualifying endpoint cells (chunk-local) and their old labels.
-            var cells: LabelSet = @splat(0);
-            var labels: LabelSet = @splat(0);
+            var cells: LabelSet = .empty;
+            var labels: LabelSet = .empty;
             var cell_count: u32 = 0;
             var endpoints = world.levelChunkLinkEndpoints(level, chunk);
             while (endpoints.next()) |endpoint| {
@@ -4780,7 +4717,7 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
                         window[written] = job.oneway_hcomp[oneway];
                         written += 1;
                     } else {
-                        const partner_chunk = (endpoint.other_cell.y / ct) * chunks_x + endpoint.other_cell.x / ct;
+                        const partner_chunk = geometry.chunkOf(endpoint.other_cell.x, endpoint.other_cell.y);
                         const own_order = cellOrder(world, level, endpoint.cell);
                         const partner_order = cellOrder(world, endpoint.other_level, endpoint.other_cell);
                         if (!job.isKey(chunkKey(endpoint.other_level, partner_chunk)) or own_order <= partner_order) tally.loose += 1;
@@ -4789,11 +4726,11 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
                         if (portalNode(job.levels, level, endpoint.cell.x, endpoint.cell.y)) |own| {
                             const own_row = job.levels.graph(level).nodeOf(own.chunk, own.label);
                             if (own_row != no_node and job.nodeTerm(level, own_row) != no_term) {
-                                const local = cellLocal(job.levels.grid(level), @as(usize, endpoint.cell.y) * job.levels.grid(level).width + endpoint.cell.x);
-                                if (!labelSetHas(&cells, local)) {
-                                    labelSetAdd(&cells, local);
+                                const local = geometry.localOf(endpoint.cell.x, endpoint.cell.y);
+                                if (!cells.isSet(local)) {
+                                    cells.set(local);
                                     cell_count += 1;
-                                    labelSetAdd(&labels, own.label);
+                                    labels.set(own.label);
                                 }
                             }
                         } else if (dead) {
@@ -4808,11 +4745,13 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
                 window[written] = hcomp;
                 written += 1;
             }
-            const label_count = labelSetCount(&labels);
+            // At most 128 labels and 256 cells a chunk.
+            const label_count: u32 = @intCast(labels.count());
             if (label_count != 0) {
                 var edges = SplitEdges{ .labels = &labels };
                 forEachEdge(job.levels, job.world, level, chunk, null, .mirrors_and_links, &edges);
-                tally.split = cell_count - label_count + labelSetCount(&edges.edged);
+                const edged: u32 = @intCast(edges.edged.count());
+                tally.split = cell_count - label_count + edged;
             }
         }
         std.debug.assert(written <= window.len);
@@ -4822,7 +4761,7 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 }
 
 // A cell's order for picking one end of a link: its level, then its row-major index.
-fn cellOrder(world: *const WorldSystem, level: u16, cell: @import("../../world_system.zig").CellCoord) u64 {
+fn cellOrder(world: *const WorldSystem, level: u16, cell: CellCoord) u64 {
     return (@as(u64, level) << 32) | (@as(u64, cell.y) * world.width + cell.x);
 }
 
@@ -4863,7 +4802,7 @@ const ResolveJob = struct {
     comp_root: []const u32,
     range_count: usize = 0,
 
-    fn rootAt(self: *const ResolveJob, level: u16, cell: @import("../../world_system.zig").CellCoord) ?u32 {
+    fn rootAt(self: *const ResolveJob, level: u16, cell: CellCoord) ?u32 {
         const node = portalNode(self.levels, level, cell.x, cell.y) orelse return null;
         const row = self.levels.graph(level).nodeOf(node.chunk, node.label);
         std.debug.assert(row != no_node);
@@ -4931,7 +4870,7 @@ fn maskJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 // level of an SCC it reaches in A, 0 if none), and the SCCs counting-sorted by level, stable
 // in completion order. Writes only its pieces' A windows, SCC counts and levels, and their
 // A slots' SCC ids. O(|A| + edges of A) per piece.
-const PlanJob = struct {
+const SccPlanJob = struct {
     items: []const u32,
     pieces: PieceColumns,
     slots: SlotColumns,
@@ -4941,8 +4880,8 @@ const PlanJob = struct {
 };
 
 // SIMD verdict: scalar. An irreducible depth-first search.
-fn planJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *PlanJob = @ptrCast(@alignCast(context));
+fn sccPlanJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *SccPlanJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end and range.end <= job.items.len);
     const apos = job.apos;
@@ -5470,28 +5409,28 @@ fn cellUnite(parents: []u32, a: u32, b: u32) void {
 // Cell-level classes: open cells joined by orthogonal moves, diagonal moves through two open
 // orthogonal cells, and two-way links with both ends open.
 fn referenceCellParents(graph: *const NavGraph, world: *const WorldSystem) ![]u32 {
-    const cells = graph.width * graph.height;
+    const cells = graph.geometry.width * graph.geometry.height;
     const parents = try std.testing.allocator.alloc(u32, cells * graph.levelCount());
     for (parents, 0..) |*parent, index| parent.* = @intCast(index);
     for (0..graph.levelCount()) |level| {
         const grid = graph.grid(@intCast(level)).?;
         const base = level * cells;
-        for (0..graph.height) |y| for (0..graph.width) |x| {
+        for (0..graph.geometry.height) |y| for (0..graph.geometry.width) |x| {
             if (grid.isBlockedXY(x, y)) continue;
-            const here: u32 = @intCast(base + y * graph.width + x);
-            const east = x + 1 < graph.width and !grid.isBlockedXY(x + 1, y);
-            const south = y + 1 < graph.height and !grid.isBlockedXY(x, y + 1);
+            const here: u32 = @intCast(base + y * graph.geometry.width + x);
+            const east = x + 1 < graph.geometry.width and !grid.isBlockedXY(x + 1, y);
+            const south = y + 1 < graph.geometry.height and !grid.isBlockedXY(x, y + 1);
             if (east) cellUnite(parents, here, here + 1);
-            if (south) cellUnite(parents, here, @intCast(here + graph.width));
-            if (east and south and !grid.isBlockedXY(x + 1, y + 1)) cellUnite(parents, here, @intCast(here + graph.width + 1));
+            if (south) cellUnite(parents, here, @intCast(here + graph.geometry.width));
+            if (east and south and !grid.isBlockedXY(x + 1, y + 1)) cellUnite(parents, here, @intCast(here + graph.geometry.width + 1));
             const west = x > 0 and !grid.isBlockedXY(x - 1, y);
-            if (west and south and !grid.isBlockedXY(x - 1, y + 1)) cellUnite(parents, here, @intCast(here + graph.width - 1));
+            if (west and south and !grid.isBlockedXY(x - 1, y + 1)) cellUnite(parents, here, @intCast(here + graph.geometry.width - 1));
         };
     }
     for (world.levelLinks()) |link| {
         if (!link.bidirectional) continue;
-        const a = @as(usize, link.cell_a.y) * graph.width + link.cell_a.x;
-        const b = @as(usize, link.cell_b.y) * graph.width + link.cell_b.x;
+        const a = @as(usize, link.cell_a.y) * graph.geometry.width + link.cell_a.x;
+        const b = @as(usize, link.cell_b.y) * graph.geometry.width + link.cell_b.x;
         if (graph.grid(link.level_a).?.isBlockedIndex(a) or graph.grid(link.level_b).?.isBlockedIndex(b)) continue;
         cellUnite(parents, @intCast(link.level_a * cells + a), @intCast(link.level_b * cells + b));
     }
@@ -5504,13 +5443,13 @@ fn expectReachMatchesCells(graph: *const NavGraph, world: *const WorldSystem) !v
     const allocator = std.testing.allocator;
     const parents = try referenceCellParents(graph, world);
     defer allocator.free(parents);
-    const cells = graph.width * graph.height;
+    const cells = graph.geometry.width * graph.geometry.height;
     var edges: std.ArrayList([2]u32) = .empty;
     defer edges.deinit(allocator);
     for (world.levelLinks()) |link| {
         if (link.bidirectional) continue;
-        const a = @as(usize, link.cell_a.y) * graph.width + link.cell_a.x;
-        const b = @as(usize, link.cell_b.y) * graph.width + link.cell_b.x;
+        const a = @as(usize, link.cell_a.y) * graph.geometry.width + link.cell_a.x;
+        const b = @as(usize, link.cell_b.y) * graph.geometry.width + link.cell_b.x;
         if (graph.grid(link.level_a).?.isBlockedIndex(a) or graph.grid(link.level_b).?.isBlockedIndex(b)) continue;
         try edges.append(allocator, .{ cellFind(parents, @intCast(link.level_a * cells + a)), cellFind(parents, @intCast(link.level_b * cells + b)) });
     }
@@ -5593,7 +5532,7 @@ test "start and goal in one portal-less chunk label reach each other and nothing
     };
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    const chunk = system.graph.chunkOf(fixture.cell(5, 5));
+    const chunk = test_support.chunkOfCell(system.graph.geometry, fixture.cell(5, 5));
     try std.testing.expectEqual(no_node, system.graph.levelGraph(0).?.nodeOf(chunk, system.graph.grid(0).?.labelAt(fixture.cell(5, 5))));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(6, 6)) == .reaches);
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(1, 1)) != .reaches);
@@ -5702,7 +5641,8 @@ fn expectSameColumns(a: *const NavGraph, b: *const NavGraph) !void {
     try t.expectEqual(closure_a.dead_words, closure_b.dead_words);
     try t.expectEqualSlices(u32, closure_a.oneway_of_link.items, closure_b.oneway_of_link.items);
     inline for (.{ .root, .hcomp, .index, .slot }) |field| try t.expectEqualSlices(u32, @field(closure_a.term, @tagName(field)), @field(closure_b.term, @tagName(field)));
-    inline for (.{ .block, .k_cap, .k_high, .k_live, .index_free, .link_head, .link_tail, .link_count }) |field| try t.expectEqualSlices(u32, @field(closure_a.hcomp, @tagName(field)), @field(closure_b.hcomp, @tagName(field)));
+    try t.expectEqualSlices(usize, closure_a.hcomp.block, closure_b.hcomp.block);
+    inline for (.{ .k_cap, .k_high, .k_live, .index_free, .link_head, .link_tail, .link_count }) |field| try t.expectEqualSlices(u32, @field(closure_a.hcomp, @tagName(field)), @field(closure_b.hcomp, @tagName(field)));
     inline for (.{ .link, .hcomp, .next, .src_term, .dst_term }) |field| try t.expectEqualSlices(u32, closure_a.oneway.items(field), closure_b.oneway.items(field));
     try t.expectEqualSlices(u32, closure_a.term_free.items, closure_b.term_free.items);
     try t.expectEqualSlices(u32, closure_a.hcomp_free.items, closure_b.hcomp_free.items);
@@ -5829,18 +5769,7 @@ test "the post-commit nav reaction runs the connectivity stages on workers and r
 fn forcedNavThreads(system: *PathfindingSystem, threads: *ThreadSystem) NavUpdateThreads {
     return .{
         .thread_system = threads,
-        .plan_tuner = &system.nav_plan_tuner,
-        .remask_tuner = &system.nav_remask_tuner,
-        .patch_tuner = &system.nav_patch_tuner,
-        .conn_seed_tuner = &system.nav_conn_seed_tuner,
-        .conn_gather_tuner = &system.nav_conn_gather_tuner,
-        .conn_flood_tuner = &system.nav_conn_flood_tuner,
-        .conn_candidates_tuner = &system.nav_conn_candidates_tuner,
-        .conn_closure_resolve_tuner = &system.nav_conn_closure_resolve_tuner,
-        .conn_closure_mask_tuner = &system.nav_conn_closure_mask_tuner,
-        .conn_closure_plan_tuner = &system.nav_conn_closure_plan_tuner,
-        .conn_closure_rows_tuner = &system.nav_conn_closure_rows_tuner,
-        .conn_closure_compact_tuner = &system.nav_conn_closure_compact_tuner,
+        .tuners = &system.nav_tuners,
         .controls = .{ .adaptive = false, .items_per_range = 1 },
     };
 }
@@ -6584,7 +6513,7 @@ test "a flooding reaction reaches its adaptive tuner as one sample at the batch'
         defer system.deinit();
         try std.testing.expect(system.nav_controls.adaptive and system.nav_controls.items_per_range == null);
         narrowFloodWindow(&system);
-        const tuner = &system.nav_conn_flood_tuner;
+        const tuner = system.nav_tuners.getPtr(.conn_flood);
         if (settled) {
             tuner.phase = .settled;
             tuner.has_threaded_profile = true;
@@ -6852,7 +6781,7 @@ fn roomTerm(system: *const PathfindingSystem, fixture: *const TestWorld, chunks:
     const cell = fixture.cell(room[0], room[1]);
     const graph = &system.graph;
     const grid = graph.grid(level).?;
-    const row = graph.levelGraph(level).?.nodeOf(grid.chunkOfCell(cell), grid.labelAt(cell));
+    const row = graph.levelGraph(level).?.nodeOf(test_support.chunkOfCell(grid.geometry, cell), grid.labelAt(cell));
     std.debug.assert(row != no_node);
     return graph.connectivity.root_term[graph.connectivity.comp_root[graph.levelGraph(level).?.node_comp[row]]];
 }
@@ -6922,7 +6851,7 @@ test "a dig touching no one-way system runs no closure item and writes no arena 
     const wall = latticeWall(chunks, 60);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(stats.conn_candidates_batch.item_count != 0);
+    try std.testing.expect(stats.conn_closure_candidates_batch.item_count != 0);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_resolve_batch.item_count);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_mask_batch.item_count);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_plan_batch.item_count);
@@ -6937,7 +6866,7 @@ test "a dig touching no one-way system runs no closure item and writes no arena 
     defer plain_system.deinit();
     try plain.setCell(&plain_system, 0, wall[0], wall[1], plain.grass);
     const plain_stats = try plain_system.applyBufferedNavUpdates(no_colliders, &plain.world, null);
-    try std.testing.expectEqual(@as(usize, 0), plain_stats.conn_candidates_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), plain_stats.conn_closure_candidates_batch.item_count);
     try std.testing.expect(!plain_system.graph.connectivity.closure.active);
 }
 
@@ -6982,7 +6911,7 @@ const ClosureStagesOnWorkers = struct {
     compact: bool = false,
 
     fn add(self: *ClosureStagesOnWorkers, stats: NavUpdateStats) void {
-        self.candidates = self.candidates or onWorkers(stats.conn_candidates_batch);
+        self.candidates = self.candidates or onWorkers(stats.conn_closure_candidates_batch);
         self.resolve = self.resolve or onWorkers(stats.conn_closure_resolve_batch);
         self.mask = self.mask or onWorkers(stats.conn_closure_mask_batch);
         self.plan = self.plan or onWorkers(stats.conn_closure_plan_batch);
@@ -7022,6 +6951,7 @@ test "threaded closure stages equal the inline ones word for word across worker 
             try expectSameColumns(&inline_system.graph, &threaded.graph);
             const systems = [_]*PathfindingSystem{ &inline_system, &threaded };
             var on_workers = ClosureStagesOnWorkers{};
+            var compactions: usize = 0;
             // Every tail closed, then reopened; chain A wholly closed (its block dies); B's
             // tail closed (the arena compacts first); B's tail reopened while D loses all but
             // 24 rooms (its block narrows).
@@ -7040,6 +6970,7 @@ test "threaded closure stages equal the inline ones word for word across worker 
                 try expectWithinBounds(&inline_system.graph.connectivity.closure, serial);
                 try expectWithinBounds(&threaded.graph.connectivity.closure, stats);
                 on_workers.add(stats);
+                compactions += stats.closure_compactions;
                 try std.testing.expectEqual(serial.closure_shrinks, stats.closure_shrinks);
                 if (step == 4) {
                     try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
@@ -7051,7 +6982,7 @@ test "threaded closure stages equal the inline ones word for word across worker 
                 try expectSameColumns(&inline_system.graph, &threaded.graph);
                 try fixture.expectMatchesRebuild(&threaded);
             }
-            try std.testing.expect(threaded.graph.connectivity.closure.compactions != 0);
+            try std.testing.expect(compactions != 0);
             if (workers == 4 and items_per_range == 1) {
                 try std.testing.expect(on_workers.candidates and on_workers.resolve and on_workers.mask);
                 try std.testing.expect(on_workers.plan and on_workers.rows and on_workers.compact);
@@ -7162,12 +7093,11 @@ test "a one-way system that loses most of its terminals narrows its block, and t
     try std.testing.expectEqual(blockWords(64), closure.live_words);
     try fixture.expectMatchesRebuild(&system);
     // A dig far from every endpoint touches no component, yet reclaims the dead block.
-    const compactions = closure.compactions;
     const wall = latticeWall(chunks, 40);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const far = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 0), far.closure_links);
-    try std.testing.expectEqual(compactions + 1, closure.compactions);
+    try std.testing.expectEqual(@as(usize, 1), far.closure_compactions);
     try std.testing.expectEqual(closure.live_words, closure.words.items.len);
     try std.testing.expectEqual(@as(usize, 0), closure.dead_words);
     try std.testing.expect(closure.arena_limit <= closure.live_words + closure.live_words / 2);
@@ -7192,7 +7122,7 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
     const id = roomHComp(&system, &fixture, chunks, narrow_tail);
     const narrowed = .{ closure.hcomp.k_cap[id], closure.hcomp.k_high[id], closure.live_words };
     // The first toggle's prepare compacts the dead block away; the block stays put after.
-    var block: ?u32 = null;
+    var block: ?usize = null;
     for (0..8) |toggle| {
         try setRoom(&fixture, &system, chunks, 0, narrow_tail, if (toggle % 2 == 0) fixture.tree else fixture.grass);
         const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
@@ -7451,8 +7381,8 @@ fn runCappedNavScenario(scenario: CappedNavScenario, threads: *ThreadSystem, cap
     try fixture.expectMatchesRebuild(&system);
     return .{
         .stats = stats,
-        .plan_batch = system.graph.last_plan_batch,
-        .patch_batch = system.graph.last_patch_batch,
+        .plan_batch = stats.plan_batch,
+        .patch_batch = stats.patch_batch,
         .mark_batch = system.last_mark_batch,
     };
 }
@@ -7467,7 +7397,7 @@ test "a nav worker cap of zero keeps every graph, connectivity, and closure stag
         const capped = try runCappedNavScenario(scenario, &threads, 0);
         // The fixed partition runs these stages on workers unless the cap holds them inline.
         const on_workers: []const []const u8 = switch (scenario) {
-            .closure => &.{ "plan", "patch", "remask_batch", "conn_seed_batch", "conn_gather_batch", "conn_candidates_batch", "conn_closure_compact_batch", "conn_closure_resolve_batch", "conn_closure_mask_batch", "conn_closure_plan_batch", "conn_closure_rows_batch" },
+            .closure => &.{ "plan", "patch", "remask_batch", "conn_seed_batch", "conn_gather_batch", "conn_closure_candidates_batch", "conn_closure_compact_batch", "conn_closure_resolve_batch", "conn_closure_mask_batch", "conn_closure_plan_batch", "conn_closure_rows_batch" },
             .flood => &.{ "conn_seed_batch", "conn_gather_batch", "conn_flood_batch" },
         };
         var matched: usize = 0;
@@ -7842,4 +7772,56 @@ test "a world build of disjoint one-way links reserves one H-component id per li
     const closure = &system.graph.connectivity.closure;
     try std.testing.expectEqual(@as(usize, 5), closure.hcompCount());
     try std.testing.expectEqual(@as(usize, 5), closure.hcomps.len);
+}
+
+test "a pool grows to exactly its need from empty, then to twice its capacity, its free list exactly; past its sentinel it fails and keeps its ids" {
+    const allocator = std.testing.allocator;
+    var rows: std.MultiArrayList(CompRow) = .{};
+    defer rows.deinit(allocator);
+    var free: std.ArrayList(u32) = .empty;
+    defer free.deinit(allocator);
+    const empty = CompRow{ .root = no_root, .size = 0, .prev = no_comp, .next = no_comp, .set = no_set };
+    var grows: u64 = 0;
+    try growPool(CompRow, allocator, &rows, &free, 3, empty, no_comp, &grows);
+    try std.testing.expectEqual(@as(usize, 3), rows.capacity);
+    try std.testing.expectEqual(@as(usize, 3), free.capacity);
+    try std.testing.expectEqual(@as(u64, 1), grows);
+    // Pops hand out ascending ids.
+    try std.testing.expectEqual(@as(?u32, 0), free.pop());
+    try std.testing.expectEqual(@as(?u32, 1), free.pop());
+    // A need past the capacity by one doubles it; the free list covers the pool exactly.
+    try growPool(CompRow, allocator, &rows, &free, 3, empty, no_comp, &grows);
+    try std.testing.expectEqual(@as(usize, 6), rows.capacity);
+    try std.testing.expectEqual(@as(usize, 6), free.capacity);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqual(@as(u64, 2), grows);
+    // Already covered: nothing grows.
+    try growPool(CompRow, allocator, &rows, &free, 3, empty, no_comp, &grows);
+    try std.testing.expectEqual(@as(u64, 2), grows);
+    // Ids past the sentinel fail loudly; the pool keeps its rows and ids.
+    try std.testing.expectError(error.NavConnectivityOverflow, growPool(CompRow, allocator, &rows, &free, 10, empty, 8, &grows));
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqual(@as(usize, 3), free.items.len);
+}
+
+test "a marks batch reserves a key's node rows up to its chunk's label bound, however many link endpoints the chunk holds" {
+    var fixture = try TestWorld.init(4, 1);
+    defer fixture.deinit();
+    // Twelve two-way links from chunk (1, 1) to chunk (3, 3): twelve endpoints in a chunk of
+    // at most eight labels.
+    for (0..12) |link| {
+        const near: u16 = @intCast(4 + link % 4);
+        try fixture.world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = near, .y = @intCast(4 + link / 4) }, .level_b = 0, .cell_b = .{ .x = 13, .y = 13 }, .traversal_cost = 1, .bidirectional = true });
+    }
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const level_graph = system.graph.levelGraph(0).?;
+    const rows_before = level_graph.nodes.len;
+    try std.testing.expectEqual(rows_before, level_graph.nodeCount());
+    // A dig inside chunk (1, 1): five patch keys, each reserving at most the label bound.
+    try fixture.setCell(&system, 0, 5, 7, fixture.tree);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
+    try std.testing.expect(level_graph.nodes.len <= rows_before + 5 * maxChunkLabels(test_chunk));
+    try fixture.expectMatchesRebuild(&system);
 }
