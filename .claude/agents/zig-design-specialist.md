@@ -113,7 +113,9 @@ section with nothing new is omitted.
   threaded bitwise parity across range sizes and worker counts, the
   `FailingAllocator` proof on a real multi-worker `ThreadSystem`, and a
   pipeline-level test that proves the stage ran on workers, not inline. Its
-  bench reports the threaded case's main-thread share. Name each change
+  bench reports the threaded case's main-thread share. The landing A/B names
+  only groups whose code the change touches, one size each, plus each scaling
+  bench's sizes. Name each change
   path's cost-driver stage, the one that gets a `runtime_perf_log` entry
   (`threading.md`).
 - **Files**: every file the implementation touches, with its estimated lines

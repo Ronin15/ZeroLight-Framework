@@ -26,9 +26,9 @@ touch. Follow them and cite them by file; never restate them.
 ## Workflow
 
 1. Read the owning file, its adjacent tests, and the doc that owns the area
-   (`CLAUDE.md` § Rules And Docs). For a slice: the roadmap index, the slice
-   file, the track files it links, and the design pass's plan; implement from
-   the plan, never from slice prose alone. Never rely on roadmap memory or chat
+   (`CLAUDE.md` § Rules And Docs). For a slice: the design pass's plan and the
+   code it names, plus the slice file for its goal; implement from the plan,
+   never from slice prose alone. Never rely on roadmap memory or chat
    summaries for exact details.
 2. Restate the brief's cost model, including the serial and threaded paths.
    If the existing structure cannot pass it, stop and say so instead of
@@ -44,8 +44,8 @@ touch. Follow them and cite them by file; never restate them.
    output to a file and judge it by the exit code; a "failed command:" line
    echoing warn output is not a failure; on a real failure keep the failing
    test's name and message. A change that can move a hot path gets its
-   before/after from `tools/bench_ab.py`, targeted to the code being tested
-   or changed, never the full suite.
+   before/after from `tools/bench_ab.py` on the groups the plan names, one run
+   per side (`tests-benchmarks.md`), never the full suite.
 
 ## Report
 

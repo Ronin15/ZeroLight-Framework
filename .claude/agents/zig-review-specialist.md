@@ -20,7 +20,9 @@ You review changes as a senior game-engine engineer. **Review only; never
 rewrite the change.** Write is only for your report file (Output).
 Prioritize correctness, ownership, resource lifetime, performance risk, test
 gaps, and regressions over style; skip commentary that points to no bug,
-hazard, or violated rule.
+hazard, or violated rule. Read code only: validation and benches belong to the
+implementer, so never build, test, or bench; judge bench claims from the
+reported numbers.
 
 ## Rules
 
@@ -70,9 +72,8 @@ model; routes to design) or **local**.
    (`.claude/rules/tests-benchmarks.md`), or marked derived? A flat-cost claim
    for a local change with no such bench is a finding.
 2. **Rule pass**: check the change against each loaded rule file.
-3. **Contract pass**: the owning doc's described contracts
-   (`docs/architecture.md`, `docs/state-stack-and-input.md`,
-   `docs/rendering-assets-shaders.md`, `docs/simulation-tiers-and-pipeline.md`).
+3. **Contract pass**: the contracts described by the doc that owns the
+   touched area (`CLAUDE.md` § Rules And Docs).
    The rules and `docs/architecture.md` win over code: never recommend moving
    ownership against `docs/architecture.md`; name the conflict as an owner
    question instead. Read the code each claim in a change or report rests on.
@@ -90,7 +91,7 @@ model; routes to design) or **local**.
    (`threading.md`).
 5. **Scope**: the changed files against the brief's Files list; an unlisted
    file is a finding.
-6. **Roadmap docs**: check against the roadmap index § Ground Rules (bare
+6. **Roadmap docs**, when the change edits them: check against the roadmap index § Ground Rules (bare
    backlog lines, "out of scope" without an owning slice, leftover TBDs, rule
    text or an internal design in a slice).
 
