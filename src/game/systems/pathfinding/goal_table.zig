@@ -18,11 +18,14 @@ const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ElementMap = @import("connectivity.zig").ElementMap;
 const types = @import("types.zig");
-const GridCell = types.GridCell;
-const TraversalClass = types.TraversalClass;
-const traversalOf = types.traversalOf;
-const no_cell = types.no_cell;
-const default_goal_projection_radius = types.default_goal_projection_radius;
+const GridCell = @import("types.zig").GridCell;
+const TraversalClass = @import("types.zig").TraversalClass;
+const traversalOf = @import("types.zig").traversalOf;
+const no_cell = @import("types.zig").no_cell;
+const default_goal_projection_radius = @import("types.zig").default_goal_projection_radius;
+// The blocked goal refs one scan range saw recently, so a repeat writes no second window
+// entry; the merge dedupes a ref the fixed table forgot.
+const RecentRefs = @import("types.zig").RecentKeys(u64, void);
 
 /// `goal_scan` range alignment: every range's window of u64 goal refs starts on a cache
 /// line.
@@ -60,7 +63,7 @@ fn refCell(ref: u64) u32 {
 
 /// One `goal_scan` range's count of distinct refs in its window and of blocked intents,
 /// on its own cache line.
-pub const ScanTally = struct {
+const ScanTally = struct {
     count: usize align(thread_shared_record_alignment) = 0,
     blocked: usize = 0,
 };
@@ -165,61 +168,33 @@ pub const GoalTable = struct {
     }
 };
 
-// The goal ref of each recently seen blocked goal in one scan range, so a repeat writes no
-// second window entry. A ref evicted from this fixed table opens a new entry on its next
-// occurrence; the merge dedupes, so the table stays exact.
-const RecentRefs = struct {
-    const slot_count = 8;
-
-    refs: [slot_count]u64 = undefined,
-    len: usize = 0,
-    next_replace: usize = 0,
-
-    fn contains(self: *const RecentRefs, ref: u64) bool {
-        for (self.refs[0..self.len]) |recent| {
-            if (recent == ref) return true;
-        }
-        return false;
-    }
-
-    fn remember(self: *RecentRefs, ref: u64) void {
-        if (self.len < slot_count) {
-            self.refs[self.len] = ref;
-            self.len += 1;
-        } else {
-            self.refs[self.next_replace] = ref;
-            self.next_replace = (self.next_replace + 1) % slot_count;
-        }
-    }
-};
-
-/// The goal cell of each intent, four intents per vector (goal positions packed from the
-/// AoS intents) with a scalar tail; bit-identical to `worldToCellClamped`. Every level
-/// shares one extent, so one grid converts all of them.
-// SIMD verdict: the conversion is uniform float math over packed lanes; the gather from
-// AoS intents is a fixed four-field copy per lane.
-pub fn goalCells(comptime Intent: type, grid: *const NavGrid, intents: []const Intent, out: []GridCell) void {
-    std.debug.assert(out.len == intents.len);
+/// The cell of each item's `field` position (a `math.Vec2`), four items per vector
+/// (positions packed from the AoS items) with a scalar tail; bit-identical to
+/// `worldToCellClamped`. Every level shares one extent, so one grid converts all of them.
+// SIMD verdict: the conversion is uniform float math over packed lanes; the gather from AoS
+// items is a fixed two-field copy per lane.
+pub fn positionCells(comptime Item: type, comptime field: []const u8, grid: *const NavGrid, items: []const Item, out: []GridCell) void {
+    std.debug.assert(out.len == items.len);
     std.debug.assert(grid.geometry.width != 0 and grid.geometry.height != 0);
     const cell_size = simd.splatFloat4(grid.cell_size);
     const min_cell = simd.splatInt4(0);
     // Grid dimensions fit i32, as in worldToCellClamped.
     const max_x = simd.splatInt4(@intCast(grid.geometry.width - 1));
     const max_y = simd.splatInt4(@intCast(grid.geometry.height - 1));
-    const vector_end = simd.vectorizedEnd(intents.len);
+    const vector_end = simd.vectorizedEnd(items.len);
     var index: usize = 0;
     while (index < vector_end) : (index += simd.lane_count) {
-        var goal_x: [simd.lane_count]f32 = undefined;
-        var goal_y: [simd.lane_count]f32 = undefined;
+        var position_x: [simd.lane_count]f32 = undefined;
+        var position_y: [simd.lane_count]f32 = undefined;
         inline for (0..simd.lane_count) |lane| {
-            goal_x[lane] = intents[index + lane].goal.x;
-            goal_y[lane] = intents[index + lane].goal.y;
+            position_x[lane] = @field(items[index + lane], field).x;
+            position_y[lane] = @field(items[index + lane], field).y;
         }
-        const cell_x = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&goal_x), cell_size)), min_cell, max_x));
-        const cell_y = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&goal_y), cell_size)), min_cell, max_y));
+        const cell_x = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&position_x), cell_size)), min_cell, max_x));
+        const cell_y = simd.toIntArray(simd.clampInt4(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&position_y), cell_size)), min_cell, max_y));
         inline for (0..simd.lane_count) |lane| out[index + lane] = .{ .x = cell_x[lane], .y = cell_y[lane] };
     }
-    while (index < intents.len) : (index += 1) out[index] = grid.worldToCellClamped(intents[index].goal);
+    while (index < items.len) : (index += 1) out[index] = grid.worldToCellClamped(@field(items[index], field));
 }
 
 /// One `goal_scan` range over `Intent`s (any type with `agent_class`, `goal_level`, and a
@@ -238,7 +213,7 @@ pub fn ScanJob(comptime Intent: type) type {
         refs: []u64,
         tallies: []ScanTally,
 
-        // SIMD verdict: goal cells four-lane (`goalCells`); the blocked read is a directory
+        // SIMD verdict: goal cells four-lane (`positionCells`); the blocked read is a directory
         // and bit gather and the recent-ref probe a key compare, both scalar.
         pub fn run(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             const job: *Self = @ptrCast(@alignCast(context));
@@ -251,7 +226,7 @@ pub fn ScanJob(comptime Intent: type) type {
             while (block_start < range.end) : (block_start += simd.lane_count) {
                 const block = job.intents[block_start..@min(block_start + simd.lane_count, range.end)];
                 var cells: [simd.lane_count]GridCell = undefined;
-                goalCells(Intent, job.extent, block, cells[0..block.len]);
+                positionCells(Intent, "goal", job.extent, block, cells[0..block.len]);
                 for (block, cells[0..block.len]) |intent, cell| {
                     const traversal = traversalOf(intent.agent_class);
                     const grid = job.graphs.get(traversal).grid(intent.goal_level) orelse continue;
@@ -260,8 +235,8 @@ pub fn ScanJob(comptime Intent: type) type {
                     if (!grid.isBlockedIndex(index)) continue;
                     tally.blocked += 1;
                     const ref = goalRef(traversal, intent.goal_level, index);
-                    if (recent.contains(ref)) continue;
-                    recent.remember(ref);
+                    if (recent.find(ref) != null) continue;
+                    recent.remember(ref, {});
                     job.refs[range.start + tally.count] = ref;
                     tally.count += 1;
                 }
@@ -290,7 +265,7 @@ pub const ProjectJob = struct {
 };
 
 /// The nearest open cell to blocked goal `ref` within the projection radius, or `no_cell`.
-pub fn projectRef(graphs: Graphs, ref: u64) u32 {
+fn projectRef(graphs: Graphs, ref: u64) u32 {
     // A table ref names a built level of its traversal's graph.
     const grid = graphs.get(refTraversal(ref)).grid(refLevel(ref)).?;
     const cell = refCell(ref);
@@ -334,7 +309,7 @@ test "goal cells in four lanes equal the scalar conversion over lane bodies, tai
         var intents: [positions.len]TestIntent = undefined;
         for (&intents, positions) |*intent, position| intent.* = .{ .goal = position };
         var cells: [positions.len]GridCell = undefined;
-        goalCells(TestIntent, grid, intents[0..len], cells[0..len]);
+        positionCells(TestIntent, "goal", grid, intents[0..len], cells[0..len]);
         for (intents[0..len], cells[0..len]) |intent, cell| try std.testing.expectEqual(grid.worldToCellClamped(intent.goal), cell);
     }
 }
@@ -421,7 +396,6 @@ test "the goal table holds exactly the distinct blocked goals in first-seen orde
     try expectReferenceTable(&system, &intents);
     try std.testing.expectEqual(intents.len, stats.intents);
     try std.testing.expectEqual(system.goals.refs.items.len, stats.distinct);
-    try std.testing.expectEqual(stats.distinct, stats.projections);
     try std.testing.expect(stats.distinct > RecentRefs.slot_count);
     var blocked: usize = 0;
     for (intents) |intent| {
@@ -502,9 +476,9 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     try std.testing.expectEqual(@as(?u32, null), system.goals.lookup(system.goals.refs.items[0]));
     // The retry with memory grows, counted.
     system.allocator = std.testing.allocator;
-    const grows_before = system.goal_table_grows;
+    const grows_before = system.goal_table_growth.count;
     _ = try system.resolveGoals(TestIntent, &more, &threads, .{});
-    try std.testing.expectEqual(grows_before + 1, system.goal_table_grows);
+    try std.testing.expectEqual(grows_before + 1, system.goal_table_growth.count);
     try expectReferenceTable(&system, &more);
 }
 
@@ -538,9 +512,9 @@ test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, a
         // Open a cell of the block, so the projection moves to it.
         const changed = (try world.setDenseTile(obstacle, change[0], change[1], grass)).?;
         switch (change[2]) {
-            0 => _ = try system.applyNavUpdates(&test_support.no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }}),
+            0 => _ = try test_support.applyTileChange(&system, &test_support.no_colliders, &world, changed),
             1 => {
-                try system.markNavDirty(changed.level, changed.x, changed.y);
+                try test_support.recordTileChange(&system, &world, changed);
                 _ = try system.applyBufferedNavUpdates(&test_support.no_colliders, &world, null);
             },
             else => try system.rebuildStaticNavGridWithWorld(&data, &world, null),

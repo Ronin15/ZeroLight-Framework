@@ -953,7 +953,7 @@ test "a remasked chunk equals world bits OR static coverage, labels and chunkLab
                 try std.testing.expectEqual(label, grid.labelAt(index));
                 // The one-division chunk and label equal the chunk geometry's and the flood's,
                 // in the short border chunks too.
-                try std.testing.expectEqual(NavGrid.ChunkLabel{ .chunk = test_support.chunkOfCell(grid.geometry, index), .label = label }, grid.chunkLabelAt(index));
+                try std.testing.expectEqual(NavGrid.ChunkLabel{ .chunk = grid.geometry.chunkOfCell(index), .label = label }, grid.chunkLabelAt(index));
                 try std.testing.expectEqual(chunk, grid.chunkLabelAt(index).chunk);
             };
         }
@@ -989,7 +989,7 @@ test "OPEN and BLOCKED chunks hold no cell block after edits elsewhere on their 
     // and chunk (2,2) takes one.
     _ = try world.setDenseTile(obstacle, 5, 5, grass);
     _ = try world.setDenseTile(obstacle, 9, 9, grass);
-    _ = try system.applyNavUpdates(&test_support.no_colliders, &world, &.{ .{ .level = 0, .x = 5, .y = 5 }, .{ .level = 0, .x = 9, .y = 9 } });
+    _ = try test_support.applyTileEdits(&system, &test_support.no_colliders, &world, &.{ .{ .level = 0, .x = 5, .y = 5 }, .{ .level = 0, .x = 9, .y = 9 } });
     try std.testing.expectEqual(ChunkForm.mixed, grid.chunkForm(8));
     try std.testing.expect(grid.chunkForm(4) != .mixed);
     try expectBlocksOnlyInMixedChunks(grid, &world);

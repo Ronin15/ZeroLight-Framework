@@ -17,7 +17,7 @@ const ChunkGeometry = @import("types.zig").ChunkGeometry;
 const assets = @import("../../../assets/assets.zig");
 const manifest = @import("../../../assets/manifest.zig");
 const world_tileset_meta = @import("../../../assets/world_tileset_meta.zig");
-const WorldTilesetMeta = world_tileset_meta.WorldTilesetMeta;
+const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const TileId = @import("../../world_system.zig").TileId;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
 const demoWorldWithChunkSize = @import("../../world_test_support.zig").demoWorldWithChunkSize;
@@ -27,6 +27,8 @@ const NavGrid = @import("nav_grid.zig").NavGrid;
 const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
+const WorldTileChangedEvent = @import("../../simulation.zig").WorldTileChangedEvent;
+const NavUpdateStats = @import("types.zig").NavUpdateStats;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
@@ -93,13 +95,8 @@ pub fn requireTestTile(meta: *const WorldTilesetMeta, name: []const u8) !TileId 
 // several chunks (real portals), plus headroom for cross-level corridor storage.
 pub fn abstractCapacity() PathfindingCapacity {
     return .{
-        .max_frame_requests = 8,
-        .max_pending_requests = 8,
-        .max_cached_results = 16,
         .max_group_fields = 2,
         .worker_participant_count = 1,
-        .max_solved_requests_per_step = 8,
-        .max_fallback_requests_per_step = 8,
         .nav_chunk_tiles = 4,
         .max_stitched_path_cells = 256,
         .min_group_field_agents = 1,
@@ -151,6 +148,47 @@ pub fn recordTerrainEvents(system: *PathfindingSystem, events: []const Simulatio
     system.recordTerrainNavEvents(events, world, null);
 }
 
+/// One world tile a test changed, for a test that kept no writer event.
+pub const TileEdit = struct {
+    level: u16,
+    x: u16,
+    y: u16,
+};
+
+/// Records tile write `change` (a writer's event) through the production terrain record.
+pub fn recordTileChange(system: *PathfindingSystem, world: *const WorldSystem, change: WorldTileChangedEvent) !void {
+    try recordTerrainEvents(system, &.{.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = change } }}, world);
+}
+
+/// Records `edits` through the production terrain record as tile events whose blocking
+/// flipped: nav re-derives each touched chunk from the world, so only the tile matters.
+pub fn recordTileEdits(system: *PathfindingSystem, world: *const WorldSystem, edits: []const TileEdit) !void {
+    const events = try std.testing.allocator.alloc(SimulationEvent, edits.len);
+    defer std.testing.allocator.free(events);
+    for (events, edits) |*event, edit| event.* = .{ .stage = .structural_commit, .payload = .{ .world_tile_changed = .{
+        .level = edit.level,
+        .x = edit.x,
+        .y = edit.y,
+        .old_tile_id = 0,
+        .new_tile_id = 0,
+        .old_blocks_movement = false,
+        .new_blocks_movement = true,
+    } } };
+    try recordTerrainEvents(system, events, world);
+}
+
+/// `recordTileChange`, then applies every pending nav change serially.
+pub fn applyTileChange(system: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, change: WorldTileChangedEvent) !NavUpdateStats {
+    try recordTileChange(system, world, change);
+    return system.applyBufferedNavUpdates(colliders, world, null);
+}
+
+/// `recordTileEdits`, then applies every pending nav change serially.
+pub fn applyTileEdits(system: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, edits: []const TileEdit) !NavUpdateStats {
+    try recordTileEdits(system, world, edits);
+    return system.applyBufferedNavUpdates(colliders, world, null);
+}
+
 /// Sets `cells` ((x, y) pairs) of an all-open prepared `grid` blocked, through the same
 /// chunk writes a remask makes.
 pub fn setBlockedCells(allocator: std.mem.Allocator, grid: *NavGrid, cells: []const [2]usize) !void {
@@ -169,12 +207,6 @@ pub fn setBlockedCells(allocator: std.mem.Allocator, grid: *NavGrid, cells: []co
         grid.blocked_count += grid.writeChunk(chunk, slot, bits);
         if (grid.chunkBlock(chunk) != slot) grid.releaseBlock(slot);
     }
-}
-
-/// The chunk of in-level cell index `cell` (`y * width + x`) under `geometry`.
-pub fn chunkOfCell(geometry: ChunkGeometry, cell: usize) u32 {
-    const y = cell / geometry.width;
-    return geometry.chunkOf(cell - y * geometry.width, y);
 }
 
 /// The chunk-local index of in-level cell index `cell` under `geometry`.
@@ -264,7 +296,7 @@ fn connListsLink(portals: ChunkPortals, local: u8, link: u32) bool {
 // The node row at `cell` of `level`, which must be a node.
 fn connNodeAt(graph: *const NavGraph, level: u16, cell: usize) u32 {
     const grid = graph.grid(level).?;
-    const row = graph.levelGraph(level).?.nodeOf(chunkOfCell(grid.geometry, cell), grid.labelAt(cell));
+    const row = graph.levelGraph(level).?.nodeOf(grid.geometry.chunkOfCell(cell), grid.labelAt(cell));
     std.debug.assert(row != no_node);
     return row;
 }
@@ -297,7 +329,7 @@ fn connUniteRecordEdges(graph: *const NavGraph, index: *const ConnNodeIndex, par
         if (grid.labelAtLocal(chunk, link.local) != label) continue;
         const target = graph.grid(link.to_level) orelse continue;
         if (target.isBlockedIndex(link.to_cell)) continue;
-        const target_chunk = chunkOfCell(target.geometry, link.to_cell);
+        const target_chunk = target.geometry.chunkOfCell(link.to_cell);
         const x = link.to_cell % target.geometry.width;
         const y = link.to_cell / target.geometry.width;
         const local = target.geometry.localOf(x, y);
@@ -460,7 +492,7 @@ fn closureRootAt(graph: *const NavGraph, level: u16, cell: CellCoord) ?u32 {
     const grid = graph.grid(level) orelse return null;
     const index = @as(usize, cell.y) * grid.geometry.width + cell.x;
     if (grid.isBlockedIndex(index)) return null;
-    const row = graph.levelGraph(level).?.nodeOf(chunkOfCell(grid.geometry, index), grid.labelAt(index));
+    const row = graph.levelGraph(level).?.nodeOf(grid.geometry.chunkOfCell(index), grid.labelAt(index));
     std.debug.assert(row != no_node);
     return graph.connectivity.comp_root[graph.levelGraph(level).?.node_comp[row]];
 }

@@ -2153,7 +2153,7 @@ test "steering agent snapshot holds each steering row's previous position, and n
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     // Never rebuilt: no rows.
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
@@ -2194,7 +2194,7 @@ test "steering requests missing paths then follows available path results" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2231,7 +2231,7 @@ test "steering smooths a discrete target-direction flip over several steps inste
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2302,7 +2302,7 @@ test "steering sources path request start level from movement scope level" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGridWithWorld(&data, &world, null);
     var colliders = try worldColliders(&data, &world);
     defer colliders.deinit();
@@ -2354,7 +2354,7 @@ test "steering missing path requests respect replan cooldown" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2390,7 +2390,7 @@ test "steering reads an unreachable goal unavailable from status on the first st
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4, .nav_chunk_tiles = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1, .nav_chunk_tiles = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     const grid = pathfinding.graph.grid(0).?;
     try std.testing.expect(grid.isBlockedCell(.{ .x = 3, .y = 0 }) and !grid.isBlockedCell(.{ .x = 2, .y = 0 }) and !grid.isBlockedCell(.{ .x = 4, .y = 0 }));
@@ -2429,7 +2429,7 @@ test "steering reads a goal its start cannot reach unavailable from status every
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
     // One chunk holds the agent and the goal, on two of its labels.
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2461,7 +2461,7 @@ test "steering keeps highest priority navigation intent with stable tie order" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2497,7 +2497,7 @@ test "steering applies local agent and static obstacle avoidance" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2532,7 +2532,7 @@ test "steering local agent avoidance ignores XY overlap across different world_l
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2567,7 +2567,7 @@ test "steering static obstacle avoidance ignores XY overlap across different wor
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2634,7 +2634,7 @@ test "steering multi-level obstacle gate matches between serial and real threade
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_group_fields = 4, .worker_participant_count = 1, .max_solved_requests_per_step = 128 });
+    try pathfinding.reserve(.{ .max_group_fields = 4, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 16);
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
@@ -2701,7 +2701,7 @@ test "steering movement index cache rebuilds only after structural invalidate" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -2761,7 +2761,7 @@ test "steering pushes from a static's committed position the step after its move
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 640, 640, 32);
     var colliders = try testColliders(&pathfinding, &data, 640, 640, 32);
     defer colliders.deinit();
@@ -2827,7 +2827,7 @@ test "steering obstacle pushes equal a scalar push over the query's hits" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 16);
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
@@ -2941,7 +2941,7 @@ test "steering serial and real threaded workers produce identical movement inten
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_group_fields = 4, .worker_participant_count = 1, .max_solved_requests_per_step = 128 });
+    try pathfinding.reserve(.{ .max_group_fields = 4, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 16);
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
@@ -3026,7 +3026,7 @@ test "steering serial matches threaded intents across multiple range splits and 
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_group_fields = 4, .worker_participant_count = 1, .max_solved_requests_per_step = 128 });
+    try pathfinding.reserve(.{ .max_group_fields = 4, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 16);
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
@@ -3096,7 +3096,7 @@ test "steering update is allocation-free after reserves from the first step" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -3171,12 +3171,8 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
     try pathfinding.reserve(.{
-        .max_frame_requests = agents.len,
-        .max_pending_requests = agents.len,
-        .max_cached_results = agents.len * 2,
         .max_group_fields = 1,
         .worker_participant_count = 1,
-        .max_solved_requests_per_step = agents.len,
     });
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 16);
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
@@ -3264,7 +3260,7 @@ test "steering runtime rows go with destroyed entities within a one-agent reserv
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
     var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
     defer colliders.deinit();
@@ -3310,7 +3306,7 @@ test "steering bounds dense crowd candidate checks" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 256, 256, 32);
     var colliders = try testColliders(&pathfinding, &data, 256, 256, 32);
     defer colliders.deinit();
@@ -3341,7 +3337,7 @@ test "steering stops the obstacle walk at the hit cap among dense co-located sta
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 256, 256, 32);
     var colliders = try testColliders(&pathfinding, &data, 256, 256, 32);
     defer colliders.deinit();
@@ -3449,7 +3445,7 @@ test "steering threaded arbitration keeps the first appearance and the best inte
     // direct direction.
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 64, .max_pending_requests = 64, .max_cached_results = 64, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 64 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
 
@@ -3617,7 +3613,7 @@ test "steering claims stay correct across the claim stamp wrap" {
     for (&agents, 0..) |*agent, index| agent.* = try addSteeredEntity(&data, .{ .x = @floatFromInt(index * 200), .y = 0 });
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 8, .max_pending_requests = 8, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 8 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
 
@@ -3789,7 +3785,7 @@ test "steering claim band count does not follow the resolve partition" {
     }
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 64, .max_pending_requests = 64, .max_cached_results = 64, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 64 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
 
@@ -4161,7 +4157,7 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 256, .max_pending_requests = 256, .max_cached_results = 512, .max_group_fields = 4, .worker_participant_count = 1, .max_solved_requests_per_step = 256 });
+    try pathfinding.reserve(.{ .max_group_fields = 4, .worker_participant_count = 1 });
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 16);
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
@@ -4251,7 +4247,7 @@ fn runRekeyScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, churn
     }
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 64, .max_pending_requests = 64, .max_cached_results = 64, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 64 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     // Every path stays missing: no request is ever served.
     try pathfinding.rebuildStaticNavGrid(&data, 1700, 1100, 32);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
@@ -4408,7 +4404,7 @@ fn obstacleSamplesBehindFarEntries(far_count: usize) !usize {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
     var colliders = try testColliders(&pathfinding, &data, 640, 640, 32);
     defer colliders.deinit();
 

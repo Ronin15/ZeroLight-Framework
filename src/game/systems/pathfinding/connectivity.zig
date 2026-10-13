@@ -39,9 +39,9 @@ const NavLevelGraph = @import("nav_graph.zig").NavLevelGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const BatchLevels = @import("nav_graph.zig").BatchLevels;
 const PatchInfo = @import("nav_graph.zig").PatchInfo;
-const chunkKey = @import("nav_graph.zig").chunkKey;
-const keyLevel = @import("nav_graph.zig").keyLevel;
-const keyChunk = @import("nav_graph.zig").keyChunk;
+const chunkKey = @import("../chunk_list_map.zig").chunkKey;
+const keyLevel = @import("../chunk_list_map.zig").keyLevel;
+const keyChunk = @import("../chunk_list_map.zig").keyChunk;
 const LevelRuns = @import("nav_graph.zig").LevelRuns;
 const sortedContains = @import("nav_graph.zig").sortedContains;
 const LabelSet = @import("nav_graph.zig").LabelSet;
@@ -5134,7 +5134,7 @@ const TestWorld = struct {
 
     fn setCell(self: *TestWorld, system: ?*PathfindingSystem, level: u16, x: u16, y: u16, tile: TileId) !void {
         const changed = (try self.world.setDenseTile(self.obstacle[level], x, y, tile)) orelse return;
-        if (system) |nav| try nav.markNavDirty(changed.level, changed.x, changed.y);
+        if (system) |nav| try test_support.recordTileChange(nav, &self.world, changed);
     }
 
     fn build(self: *TestWorld, capacity: types.PathfindingCapacity) !PathfindingSystem {
@@ -5532,7 +5532,7 @@ test "start and goal in one portal-less chunk label reach each other and nothing
     };
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    const chunk = test_support.chunkOfCell(system.graph.geometry, fixture.cell(5, 5));
+    const chunk = system.graph.geometry.chunkOfCell(fixture.cell(5, 5));
     try std.testing.expectEqual(no_node, system.graph.levelGraph(0).?.nodeOf(chunk, system.graph.grid(0).?.labelAt(fixture.cell(5, 5))));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(6, 6)) == .reaches);
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(5, 5), 0, fixture.cell(1, 1)) != .reaches);
@@ -5663,7 +5663,7 @@ fn writeParityStep(run: *TestWorld, systems: []const *PathfindingSystem, tile: T
 
 fn markAll(run: *TestWorld, systems: []const *PathfindingSystem, level: u16, x: u16, y: u16, tile: TileId) !void {
     const changed = (try run.world.setDenseTile(run.obstacle[level], x, y, tile)) orelse return;
-    for (systems) |system| try system.markNavDirty(changed.level, changed.x, changed.y);
+    for (systems) |system| try test_support.recordTileChange(system, &run.world, changed);
 }
 
 test "threaded connectivity stages equal the inline ones column for column across worker counts and range sizes" {
@@ -5769,7 +5769,7 @@ test "the post-commit nav reaction runs the connectivity stages on workers and r
 fn forcedNavThreads(system: *PathfindingSystem, threads: *ThreadSystem) NavUpdateThreads {
     return .{
         .thread_system = threads,
-        .tuners = &system.nav_tuners,
+        .tuners = &system.tuners.nav,
         .controls = .{ .adaptive = false, .items_per_range = 1 },
     };
 }
@@ -6513,7 +6513,7 @@ test "a flooding reaction reaches its adaptive tuner as one sample at the batch'
         defer system.deinit();
         try std.testing.expect(system.nav_controls.adaptive and system.nav_controls.items_per_range == null);
         narrowFloodWindow(&system);
-        const tuner = system.nav_tuners.getPtr(.conn_flood);
+        const tuner = system.tuners.nav.getPtr(.conn_flood);
         if (settled) {
             tuner.phase = .settled;
             tuner.has_threaded_profile = true;
@@ -6781,7 +6781,7 @@ fn roomTerm(system: *const PathfindingSystem, fixture: *const TestWorld, chunks:
     const cell = fixture.cell(room[0], room[1]);
     const graph = &system.graph;
     const grid = graph.grid(level).?;
-    const row = graph.levelGraph(level).?.nodeOf(test_support.chunkOfCell(grid.geometry, cell), grid.labelAt(cell));
+    const row = graph.levelGraph(level).?.nodeOf(grid.geometry.chunkOfCell(cell), grid.labelAt(cell));
     std.debug.assert(row != no_node);
     return graph.connectivity.root_term[graph.connectivity.comp_root[graph.levelGraph(level).?.node_comp[row]]];
 }

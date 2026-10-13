@@ -16,6 +16,9 @@ const logging = @import("../../../core/logging.zig");
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
 const validateChunkGrid = @import("../../world_system.zig").validateChunkGrid;
 const ChunkGridError = @import("../../world_system.zig").ChunkGridError;
+const chunkKey = @import("../chunk_list_map.zig").chunkKey;
+const keyLevel = @import("../chunk_list_map.zig").keyLevel;
+const keyChunk = @import("../chunk_list_map.zig").keyChunk;
 const max_chunk_size_tiles = @import("../../world_system.zig").max_chunk_size_tiles;
 const LevelLink = @import("../../world_system.zig").LevelLink;
 const CellCoord = @import("../../world_system.zig").CellCoord;
@@ -485,19 +488,6 @@ fn closureThreads(threads: ?NavUpdateThreads) ClosureThreads {
         .rows = stageThreads(threads, .conn_closure_rows),
         .compact = stageThreads(threads, .conn_closure_compact),
     };
-}
-
-/// A batch key: the (level, chunk) pair, sorted level-major.
-pub fn chunkKey(level: u16, chunk: u32) u64 {
-    return (@as(u64, level) << 32) | chunk;
-}
-
-pub fn keyLevel(key: u64) u16 {
-    return @intCast(key >> 32);
-}
-
-pub fn keyChunk(key: u64) u32 {
-    return @truncate(key);
 }
 
 /// Whether ascending batch `keys` hold `key`. O(log keys).
@@ -2537,7 +2527,6 @@ const baselineCapacity = test_support.baselineCapacity;
 const addNavBody = test_support.addNavBody;
 const loadTestWorldMeta = test_support.loadTestWorldMeta;
 const requireTestTile = test_support.requireTestTile;
-const NavCellEdit = types.NavCellEdit;
 const PathStatus = types.PathStatus;
 const appendPathRequest = test_support.appendPathRequest;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
@@ -2603,7 +2592,7 @@ fn portalsEqual(a: []const NavPortal, b: []const NavPortal) bool {
 
 // Whether `cell` on `level` is a portal of its chunk's record.
 fn isPortal(graph: *const NavGraph, level: u16, cell: usize) bool {
-    return graph.chunkPortals(level, test_support.chunkOfCell(graph.geometry, cell)).find(test_support.localOfCell(graph.geometry, cell)) != null;
+    return graph.chunkPortals(level, graph.geometry.chunkOfCell(cell)).find(test_support.localOfCell(graph.geometry, cell)) != null;
 }
 
 // Links leaving a portal whose target cell is open (directed).
@@ -2661,12 +2650,12 @@ test "incremental nav update remask matches the composed world mask across level
     const floor0 = world.denseFloorLayerForLevel(0).?;
     _ = try world.setDenseTile(floor0, 2, 2, tree); // surface walkable -> blocked
 
-    const edits = [_]NavCellEdit{
+    const edits = [_]test_support.TileEdit{
         .{ .level = 1, .x = 3, .y = 3 },
         .{ .level = 1, .x = 4, .y = 3 },
         .{ .level = 0, .x = 2, .y = 2 },
     };
-    _ = try system.applyNavUpdates(no_colliders, &world, &edits);
+    _ = try test_support.applyTileEdits(&system, no_colliders, &world, &edits);
 
     // The incremental remask must equal the authoritative composed mask on every
     // level and cell, with a consistent blocked_count — i.e. identical to a full
@@ -2721,7 +2710,7 @@ test "threaded initial nav build matches a serial build across levels" {
     defer threaded.deinit();
     try threaded.reserve(cap);
     threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
-    const build_stats = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.nav_tuners, .controls = threaded.nav_controls });
+    const build_stats = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.tuners.nav, .controls = threaded.nav_controls });
     try std.testing.expect(!build_stats.remask_batch.ran_inline);
     try std.testing.expect(!build_stats.patch_batch.ran_inline);
 
@@ -2759,14 +2748,14 @@ test "incremental nav update splitting a chunk-local component matches a full re
 
     // Drop a full-height wall at x=5 inside chunk (1,1), bisecting its open region.
     const wall_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-    var edits = std.ArrayList(NavCellEdit).empty;
+    var edits = std.ArrayList(test_support.TileEdit).empty;
     defer edits.deinit(std.testing.allocator);
     var wy: u16 = 4;
     while (wy <= 7) : (wy += 1) {
         const changed = (try world.setDenseTile(wall_layer, 5, wy, tree)) orelse return error.TestExpectedEqual;
         try edits.append(std.testing.allocator, .{ .level = changed.level, .x = changed.x, .y = changed.y });
     }
-    _ = try system.applyNavUpdates(no_colliders, &world, edits.items);
+    _ = try test_support.applyTileEdits(&system, no_colliders, &world, edits.items);
 
     // After: the chunk-local component split into two distinct labels.
     try std.testing.expect(grid.labelAt(left) != 0 and grid.labelAt(right) != 0);
@@ -2815,7 +2804,7 @@ test "incremental nav update on a chunk border flips a neighbor chunk's portal" 
     // the NEIGHBOR chunk (1,1)'s portal at (4,5) flips off even though only chunk (0,1)
     // is relabeled.
     const changed = (try world.setDenseTile(isolation_layer, 3, 5, tree)) orelse return error.TestExpectedEqual;
-    _ = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try test_support.applyTileChange(&system, no_colliders, &world, changed);
 
     try std.testing.expect(!isPortal(&system.graph, 0, near));
     try std.testing.expect(!isPortal(&system.graph, 0, neighbor));
@@ -2885,7 +2874,7 @@ test "incremental nav update opening a ramp endpoint makes its two-way link live
     // Dig the ramp endpoint open: the endpoint's record gains its links.
     const changed = (try world.setDenseTile(level1_obstacle, 2, 2, grass)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
-    _ = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try test_support.applyTileChange(&system, no_colliders, &world, changed);
     // The bidirectional link is live both ways.
     try std.testing.expectEqual(@as(usize, 2), countLiveLinks(&system.graph));
 
@@ -2928,7 +2917,7 @@ test "incremental underground dig leaves the surface level's records byte-identi
     // Dig an UNDERGROUND-only cell open (level 1).
     const changed = (try world.setDenseTile(level1_obstacle, 5, 5, grass)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
-    const stats = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    const stats = try test_support.applyTileChange(&system, no_colliders, &world, changed);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 
     // The surface's cells and records are untouched, record ids included.
@@ -2966,7 +2955,7 @@ test "incremental dig keeps the changed level's records identical to a full rebu
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
 
     const changed = (try world.setDenseTile(level1_obstacle, 5, 5, grass)) orelse return error.TestExpectedEqual;
-    _ = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try test_support.applyTileChange(&system, no_colliders, &world, changed);
 
     var rebuilt = try fullRebuild(&data, &world, abstractCapacity());
     defer rebuilt.deinit();
@@ -2992,11 +2981,11 @@ test "incremental nav update applies the same edit batch deterministically" {
 
     // Apply a multi-cell straddling edit, snapshot the changed level, then rebuild from the
     // same start state and apply the same batch again: the result must be identical.
-    const edits = [_]NavCellEdit{ .{ .level = 0, .x = 5, .y = 5 }, .{ .level = 0, .x = 6, .y = 5 }, .{ .level = 0, .x = 5, .y = 6 } };
+    const edits = [_]test_support.TileEdit{ .{ .level = 0, .x = 5, .y = 5 }, .{ .level = 0, .x = 6, .y = 5 }, .{ .level = 0, .x = 5, .y = 6 } };
     _ = (try world.setDenseTile(obstacle, 5, 5, tree)) orelse return error.TestExpectedEqual;
     _ = (try world.setDenseTile(obstacle, 6, 5, tree)) orelse return error.TestExpectedEqual;
     _ = (try world.setDenseTile(obstacle, 5, 6, tree)) orelse return error.TestExpectedEqual;
-    _ = try system.applyNavUpdates(no_colliders, &world, &edits);
+    _ = try test_support.applyTileEdits(&system, no_colliders, &world, &edits);
 
     // The same post-edit world built twice and patched once all agree.
     var second = try fullRebuild(&data, &world, abstractCapacity());
@@ -3031,7 +3020,7 @@ test "incremental single-chunk dig patches a constant chunk set independent of w
 
         // Cell (5,5) sits in chunk (1,1) (4-tile chunks): interior for both worlds.
         const changed = (try world.setDenseTile(obstacle, 5, 5, tree)) orelse return error.TestExpectedEqual;
-        const stats = try system.applyNavUpdates(no_colliders, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+        const stats = try test_support.applyTileChange(&system, no_colliders, &world, changed);
         patched[i] = stats.chunks_patched;
     }
     try std.testing.expectEqual(@as(usize, 5), patched[0]);
@@ -3063,12 +3052,12 @@ test "incremental nav update across distant chunks in one batch matches a full r
     // missed a coalesced cell) would leave that chunk stale, so the incremental graph must equal
     // a fresh full rebuild against the same world.
     const cells = [_]struct { x: u16, y: u16 }{ .{ .x = 1, .y = 1 }, .{ .x = 13, .y = 13 } };
-    var edits: [cells.len]NavCellEdit = undefined;
+    var edits: [cells.len]test_support.TileEdit = undefined;
     for (cells, 0..) |cell, i| {
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         edits[i] = .{ .level = 0, .x = cell.x, .y = cell.y };
     }
-    _ = try system.applyNavUpdates(no_colliders, &world, &edits);
+    _ = try test_support.applyTileEdits(&system, no_colliders, &world, &edits);
 
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
     defer rebuilt.deinit();
@@ -3121,7 +3110,7 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
     };
     for (cells) |cell| {
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
-        try system.markNavDirty(0, cell.x, cell.y);
+        try test_support.recordTileEdits(&system, &world, &.{.{ .level = 0, .x = cell.x, .y = cell.y }});
     }
     const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
 
@@ -3172,7 +3161,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild"
     };
     for (cells) |cell| {
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
-        try system.markNavDirty(0, cell.x, cell.y);
+        try test_support.recordTileEdits(&system, &world, &.{.{ .level = 0, .x = cell.x, .y = cell.y }});
     }
     _ = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
 
@@ -3474,7 +3463,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild 
     };
     for (cells) |cell| {
         _ = (try nav.world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
-        try nav.system.markNavDirty(0, cell.x, cell.y);
+        try test_support.recordTileEdits(&nav.system, &nav.world, &.{.{ .level = 0, .x = cell.x, .y = cell.y }});
     }
     const stats = try nav.system.applyBufferedNavUpdates(&nav.colliders, &nav.world, &threads);
     try std.testing.expect(!stats.remask_batch.ran_inline);
@@ -3563,7 +3552,7 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     for ([_]@TypeOf(tree){ tree, grass }) |tile| {
         for (warm_cells) |cell| {
             _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tile)) orelse return error.TestExpectedEqual;
-            try system.markNavDirty(0, cell.x, cell.y);
+            try test_support.recordTileEdits(&system, &world, &.{.{ .level = 0, .x = cell.x, .y = cell.y }});
         }
         const warm_stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
         try std.testing.expectEqual(@as(usize, 1), warm_stats.incremental_rebuilds);
@@ -3578,7 +3567,7 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
 
     for (proof_cells) |cell| {
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
-        try system.markNavDirty(0, cell.x, cell.y);
+        try test_support.recordTileEdits(&system, &world, &.{.{ .level = 0, .x = cell.x, .y = cell.y }});
     }
     const stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
@@ -3645,7 +3634,7 @@ test "a nav whose every chunk is mixed, with links in separate chunks, stays wit
     for (0..2 * ct) |y| for (0..2 * ct) |x| {
         const tile = if (world.denseTile(obstacle, @intCast(x), @intCast(y)) == tree) grass else tree;
         _ = try world.setDenseTile(obstacle, @intCast(x), @intCast(y), tile);
-        try system.markNavDirty(0, @intCast(x), @intCast(y));
+        try test_support.recordTileEdits(&system, &world, &.{.{ .level = 0, .x = @intCast(x), .y = @intCast(y) }});
         flipped += 1;
     };
     const stats = try system.applyBufferedNavUpdates(&colliders, &world, null);
@@ -3707,7 +3696,7 @@ test "a nav over open and blocked levels is charged by the world's content and s
     // A dig on the blocked level: its chunk turns mixed, within the batch's charge.
     const dug = try world.setDenseTile(lower_floor, 5, 5, grass);
     try std.testing.expect(dug != null);
-    try system.markNavDirty(lower, 5, 5);
+    try test_support.recordTileEdits(&system, &world, &.{.{ .level = lower, .x = 5, .y = 5 }});
     _ = try system.applyBufferedNavUpdates(&colliders, &world, null);
     try std.testing.expect(system.graph.residentBytes() <= NavGraph.storageBytesBound(shape));
     shape.content = null;
@@ -3936,7 +3925,7 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
 
     // (5,5) lies in chunk (1,1) of the 3x3 chunk grid.
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)).?;
-    const stats = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    const stats = try test_support.applyTileChange(&system, no_colliders, &fixture.world, changed);
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_nodes);
     try std.testing.expectEqual(@as(usize, 0), stats.closure_links);
@@ -3987,12 +3976,12 @@ test "a batch touching ten levels applies incrementally and never changes nav_ve
     defer system.deinit();
     const version = system.graph.version;
 
-    var edits: [obstacles.len]NavCellEdit = undefined;
+    var edits: [obstacles.len]test_support.TileEdit = undefined;
     for (obstacles, 0..) |layer, level| {
         const changed = (try world.setDenseTile(layer, 3, @intCast(level % 8), tree)).?;
         edits[level] = .{ .level = changed.level, .x = changed.x, .y = changed.y };
     }
-    const stats = try system.applyNavUpdates(no_colliders, &world, &edits);
+    const stats = try test_support.applyTileEdits(&system, no_colliders, &world, &edits);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 0), stats.levels_built);
     try std.testing.expectEqual(version, system.graph.version);
@@ -4047,17 +4036,17 @@ fn applyOomEdit(edit: OomEdit, system: *PathfindingSystem, data: *DataSystem, co
     switch (edit) {
         .dig => {
             const changed = (try world.setDenseTile(oomObstacle(world, 0), 6, 6, tree)).?;
-            try system.markNavDirty(changed.level, changed.x, changed.y);
+            try test_support.recordTileChange(system, world, changed);
         },
         .cave_in => for (0..3) |level| {
             for (3..6) |y| for (3..6) |x| {
                 const changed = (try world.setDenseTile(oomObstacle(world, @intCast(level)), @intCast(x), @intCast(y), tree)) orelse continue;
-                try system.markNavDirty(changed.level, changed.x, changed.y);
+                try test_support.recordTileChange(system, world, changed);
             };
         },
         .ramp => {
             const changed = (try world.setDenseTile(oomObstacle(world, 1), 5, 5, grass)).?;
-            try system.markNavDirty(changed.level, changed.x, changed.y);
+            try test_support.recordTileChange(system, world, changed);
             try world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 5, .y = 5 }, .level_b = 0, .cell_b = .{ .x = 5, .y = 5 }, .traversal_cost = 1, .bidirectional = true });
         },
         .static_add => {
@@ -4078,7 +4067,7 @@ fn applyOomEdit(edit: OomEdit, system: *PathfindingSystem, data: *DataSystem, co
         // A one-way endpoint closed and a new one-way link joining another system.
         .oneway => {
             const changed = (try world.setDenseTile(oomObstacle(world, 1), 10, 10, tree)).?;
-            try system.markNavDirty(changed.level, changed.x, changed.y);
+            try test_support.recordTileChange(system, world, changed);
             try world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 11, .y = 0 }, .level_b = 1, .cell_b = .{ .x = 0, .y = 11 }, .traversal_cost = 1, .bidirectional = false });
         },
     }
@@ -4185,7 +4174,7 @@ test "a ramp into a blocked partner goes live when the partner opens, in that st
     try std.testing.expect(!try routes(&system, &data, &fixture.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
 
     const opened = (try fixture.world.setDenseTile(fixture.obstacle[0], 6, 6, fixture.grass)).?;
-    _ = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = opened.level, .x = opened.x, .y = opened.y }});
+    _ = try test_support.applyTileChange(&system, no_colliders, &fixture.world, opened);
     try std.testing.expect(try routes(&system, &data, &fixture.world, 1, .{ 1, 1 }, 0, .{ 10, 10 }));
 }
 
@@ -4363,11 +4352,11 @@ test "a patch reads only its chunk's link endpoints" {
     var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer system.deinit();
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[1], 6, 5, fixture.tree)).?;
-    _ = try system.applyNavUpdates(no_colliders, &fixture.world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    _ = try test_support.applyTileChange(&system, no_colliders, &fixture.world, changed);
 
     // The patched record holds exactly its level-local link: the batch planned one endpoint,
     // and the patch asserts its appends stay within the planned count.
-    const chunk = test_support.chunkOfCell(system.graph.geometry, 5 * system.graph.geometry.width + 5);
+    const chunk = system.graph.geometry.chunkOfCell(5 * system.graph.geometry.width + 5);
     const portals = system.graph.chunkPortals(1, chunk);
     try std.testing.expectEqual(@as(usize, 1), portals.links.len);
     try std.testing.expectEqual(@as(u16, 0), portals.links[0].to_level);
@@ -4391,14 +4380,14 @@ test "a chunk gaining a link per batch grows its link slot geometrically, each g
     defer fixture.world.deinit();
     var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer system.deinit();
-    const chunk = test_support.chunkOfCell(system.graph.geometry, 6 * system.graph.geometry.width + 6);
+    const chunk = system.graph.geometry.chunkOfCell(6 * system.graph.geometry.width + 6);
     var capacity: usize = 0;
     var growths: u64 = 0;
     const batches = 32;
     for (0..batches) |_| {
         try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 6, .y = 6 }, .level_b = 0, .cell_b = .{ .x = 6, .y = 7 }, .traversal_cost = 1, .bidirectional = false });
         const pool_grows = system.graph.pool_grows;
-        _ = try system.applyNavUpdates(no_colliders, &fixture.world, &.{});
+        _ = try test_support.applyTileEdits(&system, no_colliders, &fixture.world, &.{});
         const level_graph = system.graph.levelGraph(0).?;
         const slot = level_graph.record_link_slot[level_graph.record_dir.items[chunk]];
         if (level_graph.slot_links[slot].capacity != capacity) {
@@ -4432,7 +4421,7 @@ test "an aborted prepared batch leaves the graph and its pending work unchanged,
     defer before.deinit();
 
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[1], 5, 5, fixture.tree)).?;
-    try system.markNavDirty(changed.level, changed.x, changed.y);
+    try test_support.recordTileChange(&system, &fixture.world, changed);
     try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 1, .cell_a = .{ .x = 9, .y = 9 }, .level_b = 0, .cell_b = .{ .x = 9, .y = 9 }, .traversal_cost = 1, .bidirectional = true });
     const links_applied = system.graph.links_applied;
     var stats = NavUpdateStats{};
@@ -4485,21 +4474,21 @@ test "the remask changed mask equals old XOR new bits per changed key across ope
     // level 1 chunk (2, 2) whose cell keeps its tile changes nothing.
     for (0..4) |y| for (0..4) |x| {
         const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], @intCast(x), @intCast(y), fixture.tree)).?;
-        try system.markNavDirty(changed.level, changed.x, changed.y);
+        try test_support.recordTileChange(&system, &fixture.world, changed);
     };
     const mixed = (try fixture.world.setDenseTile(fixture.obstacle[1], 5, 5, fixture.tree)).?;
-    try system.markNavDirty(mixed.level, mixed.x, mixed.y);
-    try system.markNavDirty(1, 9, 9);
+    try test_support.recordTileChange(&system, &fixture.world, mixed);
+    try test_support.recordTileEdits(&system, &fixture.world, &.{.{ .level = 1, .x = 9, .y = 9 }});
     try std.testing.expectEqual(@as(usize, 2), try expectChangedMasksAreFlips(&system, &fixture.world));
     try std.testing.expect(system.graph.grid(0).?.chunkForm(0) == .blocked);
 
     // Level 0 chunk (0, 0) blocked -> mixed; level 1 chunk (1, 1) mixed -> blocked.
     const opened = (try fixture.world.setDenseTile(fixture.obstacle[0], 1, 1, fixture.grass)).?;
-    try system.markNavDirty(opened.level, opened.x, opened.y);
+    try test_support.recordTileChange(&system, &fixture.world, opened);
     for (4..8) |y| for (4..8) |x| {
         if (x == 5 and y == 5) continue;
         const changed = (try fixture.world.setDenseTile(fixture.obstacle[1], @intCast(x), @intCast(y), fixture.tree)).?;
-        try system.markNavDirty(changed.level, changed.x, changed.y);
+        try test_support.recordTileChange(&system, &fixture.world, changed);
     };
     try std.testing.expectEqual(@as(usize, 2), try expectChangedMasksAreFlips(&system, &fixture.world));
     try std.testing.expect(system.graph.grid(0).?.chunkForm(0) == .mixed);
@@ -4554,7 +4543,7 @@ test "a world build folds its authored links into the link bounds" {
     try std.testing.expect(std.meta.eql(bounds.*, refolded));
     // The folded cost is the edge cost the ramp's record holds.
     const ramp_cell = 5 * system.graph.geometry.width + 5;
-    const ramp_links = system.graph.chunkPortals(1, test_support.chunkOfCell(system.graph.geometry, ramp_cell)).linksAt(test_support.localOfCell(system.graph.geometry, ramp_cell));
+    const ramp_links = system.graph.chunkPortals(1, system.graph.geometry.chunkOfCell(ramp_cell)).linksAt(test_support.localOfCell(system.graph.geometry, ramp_cell));
     try std.testing.expectEqual(bounds.short_cost, ramp_links[0].cost);
 }
 
@@ -4835,7 +4824,7 @@ test "border portals never exceed 4 * ceil(E / 2) and random digs match a full r
             const x: u16 = random.uintLessThan(u16, world.width);
             const y: u16 = random.uintLessThan(u16, world.height);
             const changed = (try world.setDenseTile(obstacle, x, y, if (random.boolean()) tree else grass)) orelse continue;
-            try system.markNavDirty(changed.level, changed.x, changed.y);
+            try test_support.recordTileChange(&system, &world, changed);
         }
         _ = try system.applyBufferedNavUpdates(no_colliders, &world, null);
         const bound = 4 * ((@as(usize, edge) + 1) / 2);
@@ -4901,7 +4890,7 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
         const x: u16 = @intCast((cell * 7) % 12);
         const y: u16 = @intCast((cell * 5) % 12);
         const changed = (try fixture.world.setDenseTile(fixture.obstacle[level], x, y, fixture.tree)) orelse continue;
-        for (&systems) |*system| try system.markNavDirty(changed.level, changed.x, changed.y);
+        for (&systems) |*system| try test_support.recordTileChange(system, &fixture.world, changed);
     }
     const obstacle_rect = SimulationEvent{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{ .level = 0, .min_x = 2, .min_y = 2, .max_x_exclusive = 11, .max_y_exclusive = 5 } } };
     for (&systems) |*system| try test_support.recordTerrainEvents(system, &.{obstacle_rect}, &fixture.world);
@@ -4913,7 +4902,7 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
         var union_keys: std.ArrayList(u64) = .empty;
         defer union_keys.deinit(std.testing.allocator);
         try union_keys.appendSlice(std.testing.allocator, graph.changed_keys.items);
-        const ramp_chunk = test_support.chunkOfCell(graph.geometry, 2 * graph.geometry.width + 9);
+        const ramp_chunk = graph.geometry.chunkOfCell(2 * graph.geometry.width + 9);
         try union_keys.append(std.testing.allocator, chunkKey(1, ramp_chunk));
         try union_keys.append(std.testing.allocator, chunkKey(0, ramp_chunk));
         union_keys.items.len = sortUnique(union_keys.items);
@@ -5114,7 +5103,7 @@ test "the threaded key plan equals the inline plan on 65 levels across the plan 
         try world.addLevelLink(.{ .kind = .ramp, .level_a = shape.link_levels[0], .cell_a = .{ .x = 3, .y = 3 }, .level_b = shape.link_levels[1], .cell_b = .{ .x = 3, .y = 3 }, .traversal_cost = 1, .bidirectional = true });
         for (shape.cells) |cell| {
             const changed = (try world.setDenseTile(obstacles[cell.level], cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
-            for (&systems) |*system| try system.markNavDirty(changed.level, changed.x, changed.y);
+            for (&systems) |*system| try test_support.recordTileChange(system, &world, changed);
         }
         _ = try systems[0].applyBufferedNavUpdates(no_colliders, &world, null);
         const inline_graph = &systems[0].graph;
@@ -5168,7 +5157,7 @@ test "a threaded plan, a level replace, a level append, and a world rebuild each
     // A multi-range plan over both levels.
     for ([_][3]u16{ .{ 0, 1, 1 }, .{ 1, 10, 10 }, .{ 0, 5, 9 } }) |cell| {
         const changed = (try fixture.world.setDenseTile(fixture.obstacle[cell[0]], cell[1], cell[2], fixture.tree)) orelse return error.TestExpectedEqual;
-        try system.markNavDirty(changed.level, changed.x, changed.y);
+        try test_support.recordTileChange(&system, &fixture.world, changed);
     }
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     try std.testing.expect(system.graph.plan_tallies.items.len > 1);
@@ -5279,7 +5268,7 @@ test "the key plan equals the plan by definition for multi-chunk marks at level 
     }
     for (&systems, [_]?*ThreadSystem{ null, &threads }) |*system, thread_system| {
         var stats = NavUpdateStats{};
-        const threads_for: ?NavUpdateThreads = if (thread_system) |ts| .{ .thread_system = ts, .tuners = &system.nav_tuners, .controls = system.nav_controls } else null;
+        const threads_for: ?NavUpdateThreads = if (thread_system) |ts| .{ .thread_system = ts, .tuners = &system.tuners.nav, .controls = system.nav_controls } else null;
         const prepared = (try system.graph.prepareMarks(&world, no_colliders.view(), &marks, threads_for, &stats)).?;
         defer system.graph.abortMarks(prepared);
         if (thread_system != null) try std.testing.expect(system.graph.plan_tallies.items.len > 1);
@@ -5299,7 +5288,7 @@ test "a step's stats fold the plan, remask, and patch stages of its level build 
     // One step: a level appended and one cell dug on level 0.
     _ = try fixture.world.addLevel(-32);
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)) orelse return error.TestExpectedEqual;
-    try system.markNavDirty(changed.level, changed.x, changed.y);
+    try test_support.recordTileChange(&system, &fixture.world, changed);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     const chunks = system.graph.chunkCount();
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);

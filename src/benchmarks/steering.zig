@@ -134,12 +134,8 @@ fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fi
     var pathfinding = PathfindingSystem.init(allocator);
     errdefer pathfinding.deinit();
     try pathfinding.reserve(.{
-        .max_frame_requests = count,
-        .max_pending_requests = count,
-        .max_cached_results = count * 2,
         .max_group_fields = 4,
         .worker_participant_count = 1,
-        .max_solved_requests_per_step = count,
     });
     var agents = std.ArrayList(EntityId).empty;
     errdefer agents.deinit(allocator);
@@ -509,12 +505,8 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
     var pathfinding = PathfindingSystem.init(allocator);
     errdefer pathfinding.deinit();
     try pathfinding.reserve(.{
-        .max_frame_requests = agent_count,
-        .max_pending_requests = agent_count,
-        .max_cached_results = agent_count * 2,
         .max_group_fields = 4,
         .worker_participant_count = 1,
-        .max_solved_requests_per_step = agent_count,
     });
     var agents = std.ArrayList(EntityId).empty;
     errdefer agents.deinit(allocator);
@@ -679,12 +671,8 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
     var pathfinding = PathfindingSystem.init(allocator);
     errdefer pathfinding.deinit();
     try pathfinding.reserve(.{
-        .max_frame_requests = agent_count,
-        .max_pending_requests = agent_count,
-        .max_cached_results = agent_count * 2,
         .max_group_fields = 4,
         .worker_participant_count = 1,
-        .max_solved_requests_per_step = agent_count,
     });
     var agents = std.ArrayList(EntityId).empty;
     errdefer agents.deinit(allocator);

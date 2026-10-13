@@ -44,6 +44,16 @@ pub fn chunkKey(level: u16, chunk: u32) u64 {
     return (@as(u64, level) << 32) | chunk;
 }
 
+/// The level of chunk key `key`.
+pub fn keyLevel(key: u64) u16 {
+    return @intCast(key >> 32);
+}
+
+/// The level-local chunk index of chunk key `key`.
+pub fn keyChunk(key: u64) u32 {
+    return @truncate(key);
+}
+
 const Entry = struct {
     key: u64,
     owner: u32,

@@ -82,12 +82,11 @@ pub const Metric = enum {
     path_duplicate_requests,
     path_pending_requests,
     path_solved_requests,
-    path_fallback_requests,
+    path_solve_admissions,
     path_available_results,
     path_unavailable_results,
     path_dropped_requests,
-    path_deferred_requests,
-    path_fallback_deferred_requests,
+    path_admission_deferred_requests,
     path_cache_hits,
     path_cache_evictions,
     path_budget_exhausted,
@@ -100,6 +99,7 @@ pub const Metric = enum {
     path_group_field_samples,
     path_max_stitch_segments,
     path_max_distinct_group_keys,
+    path_group_field_evictions,
     nav_dirty_chunks,
     nav_incremental_rebuilds,
     nav_chunks_patched,
@@ -223,7 +223,7 @@ pub const BatchStage = enum {
     ai_separation,
     ai_intent,
     steering,
-    path_fallback,
+    path_solve,
     path_intake,
     // The pathfinding update's registry flush, shrinks included; not the eviction flush.
     path_registry_flush,
@@ -556,7 +556,7 @@ const EnabledRuntimePerfLog = struct {
         const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
         const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
         log.debug(
-            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={}",
+            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={} group_evictions={}",
             .{
                 elapsed_s,
                 millis(pathfinding_accept_timing.averageNs()),
@@ -573,6 +573,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.path_group_field_rebuild_throttled),
                 self.metricValue(.path_group_field_samples),
                 self.metricValue(.path_max_distinct_group_keys),
+                self.metricValue(.path_group_field_evictions),
             },
         );
         const steering_select_timing = self.timingValue(.steering_select);
@@ -711,19 +712,18 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} fallback={} available={} unavailable={} dropped={} deferred={} fallback_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
+            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} solve_admissions={} available={} unavailable={} dropped={} admission_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
             .{
                 elapsed_s,
                 self.metricValue(.path_accepted_requests),
                 self.metricValue(.path_duplicate_requests),
                 self.metricValue(.path_pending_requests),
                 self.metricValue(.path_solved_requests),
-                self.metricValue(.path_fallback_requests),
+                self.metricValue(.path_solve_admissions),
                 self.metricValue(.path_available_results),
                 self.metricValue(.path_unavailable_results),
                 self.metricValue(.path_dropped_requests),
-                self.metricValue(.path_deferred_requests),
-                self.metricValue(.path_fallback_deferred_requests),
+                self.metricValue(.path_admission_deferred_requests),
                 self.metricValue(.path_cache_hits),
                 self.metricValue(.path_cache_evictions),
                 self.metricValue(.path_budget_exhausted),

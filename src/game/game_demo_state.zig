@@ -89,8 +89,8 @@ const battle_scale_demo_mover_count: usize = 2048;
 const obstacle_count = 4;
 
 /// Every mover-count-dependent capacity this demo needs, derived from a single runtime
-/// population — mirrors pathfinding's own `deriveCapacity(base, agent_count)` pattern
-/// (one source value, everything else computed from it) rather than a scattered set of
+/// population — mirrors pathfinding's limits derived from its agent count (one source
+/// value, everything else computed from it) rather than a scattered set of
 /// independent constants that can drift out of sync with each other or with whichever
 /// mover count a given init path actually uses.
 const DemoPopulationCapacity = struct {
@@ -1725,7 +1725,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
     const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
 
     // A multi-cell obstacle rect: the post-commit reaction expands it to cells, forwards them
-    // to the pathfinding system's dirty buffer, and applyNavUpdates blocks every covered cell.
+    // to the pathfinding system's dirty buffer, and the nav update blocks every covered cell.
     // This is the play-state reaction check (world stays consistent); the engine's no-drop and
     // whole-chunk remask behavior is covered by the pathfinding system tests.
     const obstacle_layer = try demo.world.addDenseLayer(0, 0, .obstacle, grass);
@@ -2257,7 +2257,7 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     frame.beginStep();
     const nav = &demo.pipeline.pathfinding;
     // Twice the reserved mark bound outruns any rounded-up physical capacity.
-    const tile_event_count = 2 * nav.capacity.max_frame_requests;
+    const tile_event_count = 2 * nav.limits.frame_requests;
     try frame.events.ensureCanAppend(tile_event_count);
     for (0..tile_event_count) |index| {
         try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = .{

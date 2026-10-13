@@ -20,7 +20,6 @@ const PathfindingCapacity = @import("../game/systems/pathfinding.zig").Pathfindi
 const PathfindingStats = @import("../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
-const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const PathQueryKey = @import("../game/systems/pathfinding/types.zig").PathQueryKey;
@@ -510,7 +509,7 @@ const Workload = enum {
 const MeasurementMode = enum {
     // Warm cache: measures the cache-hit probe (no solve runs).
     hot_cache,
-    // Cold per-cell A* fallback (heavy-obstacle field); serviced = fallback_requests.
+    // Cold per-cell A* fallback (heavy-obstacle field); serviced = solve_admissions.
     cold_fallback,
     // Cold mixed solve (abstract + fallback) on a representative map; serviced = solves.
     cold_solve,
@@ -675,30 +674,30 @@ pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     });
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
-    system.clearRuntimeState();
+    resetPathState(&system, .drop_fields);
     _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
     for (0..coldWarmup(options)) |_| {
-        system.clearTransientRequestsRetainingFields();
+        resetPathState(&system, .keep_fields);
         _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
-        while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearTransientRequestsRetainingFields();
+        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            resetPathState(&system, .keep_fields);
             _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
         }
     }
-    const solve_settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
+    const solve_settled_before_measurement = if (case.adaptive) system.tuners.solve.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     for (0..coldIterations(options)) |_| {
-        system.clearTransientRequestsRetainingFields();
+        resetPathState(&system, .keep_fields);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
     }
 
     var stats = accumulator.finish();
@@ -713,7 +712,7 @@ pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), solve_settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), solve_settled_before_measurement);
     }
     return stats;
 }
@@ -739,8 +738,12 @@ pub fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, optio
     return runWorkloadCase(allocator, io, options, case, hard_fallback_budget_group.name, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
 }
 
+// Admissions per step of the hard-fallback case: a window narrower than its solve window,
+// so the admission limit defers the rest.
+const hard_fallback_admissions: usize = 128;
+
 fn hardFallbackBudget(item_count: usize) usize {
-    return @min(item_count, default_max_fallback_requests_per_step);
+    return @min(item_count, hard_fallback_admissions);
 }
 
 fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
@@ -776,7 +779,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     });
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
-    system.clearRuntimeState();
+    resetPathState(&system, .drop_fields);
     _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
     if (mode == .hot_cache) try warmHotCache(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, options, case, item_count);
 
@@ -785,36 +788,36 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const warmup_count = if (mode.isCold()) coldWarmup(options) else options.warmup_iterations;
     const measure_count = if (mode.isCold()) coldIterations(options) else options.iterations;
     for (0..warmup_count) |_| {
-        if (mode.isCold()) system.clearRuntimeState();
+        if (mode.isCold()) resetPathState(&system, .drop_fields);
         _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
     }
     if (case.adaptive and mode.isCold()) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
-        while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
+        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            resetPathState(&system, .drop_fields);
             _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
         }
     }
-    const settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) system.tuners.solve.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
     for (0..measure_count) |_| {
-        if (mode.isCold()) system.clearRuntimeState();
+        if (mode.isCold()) resetPathState(&system, .drop_fields);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
         stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
     stage_report.print(options, group_name, item_count, case);
 
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
-    stats.deferred_count = last_stats.deferred_requests;
-    stats.fallback_deferred_count = last_stats.fallback_deferred_requests;
+    stats.deferred_count = last_stats.pending_requests;
+    stats.fallback_deferred_count = last_stats.admission_deferred_requests;
     stats.cache_evictions = last_stats.cache_evictions;
 
     // Throughput must reflect items actually serviced this step, not the requested count.
@@ -826,8 +829,8 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // abstract+fallback solves when cold-solve. All three equal item_count when nothing is
     // deferred, so honest rows match.
     const serviced: usize = switch (mode) {
-        .hot_cache => last_stats.cache_hits + last_stats.reach_unavailable,
-        .cold_fallback => last_stats.fallback_requests,
+        .hot_cache => last_stats.cache_hits + last_stats.unavailable_results,
+        .cold_fallback => last_stats.solve_admissions,
         .cold_solve => stats.output_count,
     };
     stats.candidate_pairs = serviced;
@@ -845,7 +848,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
     }
     if (case.adaptive and mode.isCold()) {
-        stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled_before_measurement);
     }
     return stats;
 }
@@ -922,7 +925,7 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
             const start_ns = suite.nowNs(io);
             last_stats = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
             const end_ns = suite.nowNs(io);
-            accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+            accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
             stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
             if (system.pending.len >= before) break; // no progress: refill next cycle
         }
@@ -932,7 +935,7 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
     stats.candidate_pairs = last_stats.solved_requests;
-    stats.deferred_count = last_stats.deferred_requests;
+    stats.deferred_count = last_stats.pending_requests;
     // Steady per-frame solver throughput: solves serviced in a drain frame, which stays flat
     // at the ceiling regardless of how deep the carried queue is — that flat per-frame solve
     // count while `pending` drains is the amortization (per-frame wall cost tracks grid size,
@@ -941,7 +944,7 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), false);
+        stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), false);
     }
     return stats;
 }
@@ -949,7 +952,7 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 // Resets the result/pending state and accepts all N distinct goals in one frame, so the next
 // frames drain the carried remainder. The accept frame itself solves the first ceiling.
 fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
-    system.clearTransientRequestsRetainingFields();
+    resetPathState(system, .keep_fields);
     _ = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
 }
 
@@ -963,9 +966,9 @@ fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathReq
     while (true) {
         const stats = try runColdOnce(system, requests, thread_system, case, item_count, item_count, item_count);
         steps += 1;
-        const all_hits = stats.cache_hits + stats.reach_unavailable == item_count;
+        const all_hits = stats.cache_hits + stats.unavailable_results == item_count;
         if (!all_hits and steps > fill_limit) return error.HotCacheNotWarm;
-        const tuner_ready = !case.adaptive or system.intake_tuner.isSettled() or steps >= settle_limit;
+        const tuner_ready = !case.adaptive or system.tuners.intake.isSettled() or steps >= settle_limit;
         if (all_hits and tuner_ready) return;
     }
 }
@@ -974,7 +977,7 @@ fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequ
     if (!case.usesThreadSystem()) {
         return try system.updateSerial(requests, agent_count, .{
             .max_solved_requests_per_step = solve_budget,
-            .max_fallback_requests_per_step = fallback_budget,
+            .max_solve_admissions_per_step = fallback_budget,
         });
     }
     return try system.update(requests, agent_count, thread_system.?, .{
@@ -982,22 +985,71 @@ fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequ
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .max_solved_requests_per_step = solve_budget,
-        .max_fallback_requests_per_step = fallback_budget,
+        .max_solve_admissions_per_step = fallback_budget,
     });
 }
 
-// Gives every pathfinding update stage this case's tuner, as `fallback_tuner` gets its own.
+// Gives every pathfinding update stage this case's tuner, as the solve batch gets its own.
 fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.fallback_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, intake_range_alignment_items)) |tuner| system.intake_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_begin_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.group_field_stall_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.publish_copy_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.registry_flush_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.resize_copy_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, goal_scan_range_alignment_items)) |tuner| system.goal_scan_tuner = tuner;
-    if (suite.adaptiveTunerForCase(case, goal_project_range_alignment_items)) |tuner| system.goal_project_tuner = tuner;
+    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.tuners.solve = tuner;
+    if (suite.adaptiveTunerForCase(case, intake_range_alignment_items)) |tuner| system.tuners.intake = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field_begin = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field_stall = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.publish_copy = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.registry_flush = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.resize_copy = tuner;
+    if (suite.adaptiveTunerForCase(case, goal_scan_range_alignment_items)) |tuner| system.tuners.goal_scan = tuner;
+    if (suite.adaptiveTunerForCase(case, goal_project_range_alignment_items)) |tuner| system.tuners.goal_project = tuner;
+}
+
+// Cold-iteration fixture reset: the private `PathfindingSystem.clearRuntimeState` done from
+// outside (the production API has no reset), keeping the graph, the reserved pools, and the
+// tuners; `.keep_fields` also keeps the group fields. A fresh system per reset would rebuild
+// nav over the fixture's level (up to 2048^2 cells per cold iteration), retrain no tuner, and
+// lose the fields a `.keep_fields` case measures against. Asserts the result equals a fresh
+// system's runtime state, so a table `clearRuntimeState` gains and this misses fails loudly.
+fn resetPathState(system: *PathfindingSystem, fields: enum { keep_fields, drop_fields }) void {
+    system.completed.clear();
+    for (&system.path_index) |*shard| shard.clear();
+    system.publish_ranges = 0;
+    // std.Deque has no clear.
+    system.pending.head = 0;
+    system.pending.len = 0;
+    system.pending_keys.clear();
+    system.solve_results.clearRetainingCapacity();
+    system.solve_indices.clearRetainingCapacity();
+    system.solve_tier1_slot.clearRetainingCapacity();
+    system.solved_paths.clearRetainingCapacity();
+    system.group_requests.clearRetainingCapacity();
+    system.group_key_map.clear();
+    if (fields == .drop_fields) {
+        for (system.group_fields.items) |*field| field.state = .empty;
+        system.group_field_keys.clear();
+    }
+    assertFreshRuntimeState(system, fields == .keep_fields);
+}
+
+// Every runtime table of `system` holds what a freshly constructed system's does (its group
+// fields aside when `kept_fields`).
+fn assertFreshRuntimeState(system: *const PathfindingSystem, kept_fields: bool) void {
+    var fresh = PathfindingSystem.init(system.allocator);
+    defer fresh.deinit();
+    std.debug.assert(system.completed.count() == fresh.completed.count());
+    std.debug.assert(system.completed.core.ownerLog().len == fresh.completed.core.ownerLog().len);
+    for (&system.path_index, &fresh.path_index) |*shard, *fresh_shard| std.debug.assert(shard.live_keys == fresh_shard.live_keys);
+    std.debug.assert(system.publish_ranges == fresh.publish_ranges);
+    std.debug.assert(system.pending.len == fresh.pending.len);
+    std.debug.assert(system.pending_keys.table.len == fresh.pending_keys.table.len);
+    std.debug.assert(system.solve_results.items.len == fresh.solve_results.items.len);
+    std.debug.assert(system.solve_indices.items.len == fresh.solve_indices.items.len);
+    std.debug.assert(system.solve_tier1_slot.items.len == fresh.solve_tier1_slot.items.len);
+    std.debug.assert(system.solved_paths.items.len == fresh.solved_paths.items.len);
+    std.debug.assert(system.group_requests.items.len == fresh.group_requests.items.len);
+    std.debug.assert(system.group_key_map.table.len == fresh.group_key_map.table.len);
+    if (kept_fields) return;
+    for (system.group_fields.items) |field| std.debug.assert(field.state == .empty);
+    std.debug.assert(system.group_field_keys.table.len == fresh.group_field_keys.table.len);
 }
 
 // The case's goal resolve over `intents`, as the pipeline's `path_goal_resolve` stage.
@@ -1012,7 +1064,7 @@ fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thr
 
 // An update's stage batches, in `StageReport` order.
 fn updateBatches(stats: PathfindingStats) [update_stage_count]BatchStats {
-    return .{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.fallback_batch, stats.publish_copy_batch, stats.registry_flush_batch, stats.resize_copy_batch };
+    return .{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.solve_batch, stats.publish_copy_batch, stats.registry_flush_batch, stats.resize_copy_batch };
 }
 
 const update_stage_count = 7;
@@ -1049,7 +1101,7 @@ const StageReport = struct {
     registrations_removed: usize = 0,
     // Requests and solves the timed updates answered unavailable from reach, and blocked
     // goals intake projected itself.
-    reach_unavailable: usize = 0,
+    unavailable: usize = 0,
     goal_fallbacks: usize = 0,
 
     fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
@@ -1058,11 +1110,11 @@ const StageReport = struct {
         self.main_ns += elapsed_ns -| offMainStageNs(stats);
         self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
         self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.group_field_batch) + offMainNs(stats.group_field_begin_batch));
-        self.solve_main_ns += stats.solve_ns -| offMainNs(stats.fallback_batch);
+        self.solve_main_ns += stats.solve_ns -| offMainNs(stats.solve_batch);
         self.publish_ns += stats.publish_ns -| offMainNs(stats.publish_copy_batch);
         self.registrations_added += stats.registrations_added;
         self.registrations_removed += stats.registrations_removed;
-        self.reach_unavailable += stats.reach_unavailable;
+        self.unavailable += stats.unavailable_results;
         self.goal_fallbacks += stats.goal_fallbacks;
         for (updateBatches(stats), &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
             if (batch.item_count == 0) continue;
@@ -1103,9 +1155,9 @@ const StageReport = struct {
         });
         if (self.routes) |routes| std.debug.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
         std.debug.print(" registrations +{}/-{} per update", .{ self.registrations_added / self.samples, self.registrations_removed / self.samples });
-        if (self.reach_unavailable + self.goal_fallbacks != 0) {
-            std.debug.print(" reach_unavailable={} goal_fallbacks={} per update", .{
-                self.reach_unavailable / self.samples,
+        if (self.unavailable + self.goal_fallbacks != 0) {
+            std.debug.print(" unavailable={} goal_fallbacks={} per update", .{
+                self.unavailable / self.samples,
                 self.goal_fallbacks / self.samples,
             });
         }
@@ -1352,7 +1404,7 @@ pub fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options:
     // after the first) and exhausts at the tiny tier-0 cap, promoting to tier 1.
     const promoteToTier1 = struct {
         fn run(sys: *PathfindingSystem, fixture_requests: *RangeOutputStream(PathRequest), threads_ptr: ?*ThreadSystem, bench_case: suite.BenchmarkCase) !void {
-            sys.clearRuntimeState();
+            resetPathState(sys, .drop_fields);
             const setup_stats = try runColdOnce(sys, fixture_requests, threads_ptr, bench_case, 1, 1, 1);
             std.debug.assert(setup_stats.budget_exhausted == 1);
             std.debug.assert(sys.pending.len == 1);
@@ -1372,7 +1424,7 @@ pub fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options:
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &empty, thread_ptr, case, 1, 1, 1);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
     }
 
     // The fixed tier-1 budget resolves this grid size's detour; a second
@@ -1494,7 +1546,7 @@ pub fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
         stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
     stage_report.print(options, group_field_detour_group.name, item_count, case);
@@ -1691,7 +1743,7 @@ pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, o
             const stats = try runColdOnce(&system, &requests, thread_ptr, case, item_count, item_count, item_count);
             const end_ns = suite.nowNs(io);
             if (measured) {
-                accumulator.record(suite.elapsedNs(start_ns, end_ns), stats.solveBatch());
+                accumulator.record(suite.elapsedNs(start_ns, end_ns), stats.solve_batch);
                 stage_report.add(suite.elapsedNs(start_ns, end_ns), stats);
                 escalated_total += stats.escalated_solves;
                 throttled_total += stats.group_field_rebuild_throttled;
@@ -1811,7 +1863,7 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
         const stats = try runColdOnce(&system, &requests, thread_ptr, case, item_count, item_count, item_count);
         const end_ns = suite.nowNs(io);
         if (measured) {
-            accumulator.record(suite.elapsedNs(start_ns, end_ns), stats.solveBatch());
+            accumulator.record(suite.elapsedNs(start_ns, end_ns), stats.solve_batch);
             escalated_total += stats.escalated_solves;
             throttled_total += stats.group_field_rebuild_throttled;
             built_total += stats.group_fields_built;
@@ -2568,7 +2620,7 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
     if (stats.unavailable_results != 0) return error.RouteUnavailable;
     if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
     std.debug.assert(stats.available_results <= count);
-    if (unsolved_routes == .fail and (stats.available_results != count or stats.deferred_requests != 0)) return error.RouteUnsolved;
+    if (unsolved_routes == .fail and (stats.available_results != count or stats.pending_requests != 0)) return error.RouteUnsolved;
     return stats;
 }
 
@@ -2578,29 +2630,29 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     const system = &fixture.system;
     setPathStageTuners(system, case);
     for (0..options.warmup_iterations) |_| {
-        system.clearRuntimeState();
+        resetPathState(system, .drop_fields);
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
-        while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
+        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            resetPathState(system, .drop_fields);
             _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         }
     }
-    const settled = if (case.adaptive) system.fallback_tuner.isSettled() else false;
+    const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     var abstract_nodes: usize = 0;
     var stage_report = StageReport{};
     for (0..options.iterations) |_| {
-        system.clearRuntimeState();
+        resetPathState(system, .drop_fields);
         const start_ns = suite.nowNs(io);
         last_stats = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        accumulator.record(elapsed_ns, last_stats.solveBatch());
+        accumulator.record(elapsed_ns, last_stats.solve_batch);
         stage_report.add(elapsed_ns, last_stats);
         abstract_nodes = lastAbstractNodesUsed(system);
     }
@@ -2610,7 +2662,7 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     stats.output_count = last_stats.available_results;
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), settled);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled);
     return stats;
 }
 
@@ -2929,7 +2981,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
     report.print(options, evict_group.name, item_count, case);
     // The size config charges no long block.
-    if (fixture.system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
+    if (fixture.system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
     try suite.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = evicted;
@@ -2945,41 +2997,13 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 // Gives the nav reaction's stages this case's tuners.
 fn setNavReactionTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
-        system.nav_tuners = .initFill(tuner);
-        system.nav_mark_tuner = tuner;
-        system.nav_evict_count_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
-        system.nav_evict_tuner = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
-        system.evict_flush_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        system.tuners.nav = .initFill(tuner);
+        system.tuners.nav_mark = tuner;
+        system.tuners.nav_evict_count = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
+        system.tuners.nav_evict = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
+        system.tuners.evict_flush = suite.adaptiveTunerForCase(case, 1).?;
     }
 }
-
-// The tuners `setNavReactionTuners` sets, by value: an untimed reaction restores them after
-// it runs, so it never trains the timed reactions' stages.
-const NavReactionTuners = struct {
-    nav_tuners: @FieldType(PathfindingSystem, "nav_tuners"),
-    nav_mark_tuner: @FieldType(PathfindingSystem, "nav_mark_tuner"),
-    nav_evict_count_tuner: @FieldType(PathfindingSystem, "nav_evict_count_tuner"),
-    nav_evict_tuner: @FieldType(PathfindingSystem, "nav_evict_tuner"),
-    evict_flush_tuner: @FieldType(PathfindingSystem, "evict_flush_tuner"),
-
-    fn capture(system: *const PathfindingSystem) NavReactionTuners {
-        return .{
-            .nav_tuners = system.nav_tuners,
-            .nav_mark_tuner = system.nav_mark_tuner,
-            .nav_evict_count_tuner = system.nav_evict_count_tuner,
-            .nav_evict_tuner = system.nav_evict_tuner,
-            .evict_flush_tuner = system.evict_flush_tuner,
-        };
-    }
-
-    fn restore(self: *const NavReactionTuners, system: *PathfindingSystem) void {
-        system.nav_tuners = self.nav_tuners;
-        system.nav_mark_tuner = self.nav_mark_tuner;
-        system.nav_evict_count_tuner = self.nav_evict_count_tuner;
-        system.nav_evict_tuner = self.nav_evict_tuner;
-        system.evict_flush_tuner = self.evict_flush_tuner;
-    }
-};
 
 const group_field_pack_agents: usize = 24;
 
@@ -3101,8 +3125,8 @@ fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: 
         blocks / fields,
         resident / fields,
         resident / @max(@as(usize, 1), covered),
-        system.group_field_pool_grows,
-        system.group_field_pool_failures,
+        system.group_field_pool_growth.count,
+        system.group_field_pool_failure.count,
     });
 }
 
@@ -3156,7 +3180,7 @@ fn writeTunnelRequests(requests: *RangeOutputStream(PathRequest), entities: []co
 
 // Rebuilds the four fields from scratch (pools kept) until all are ready; times the steps.
 fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !struct { elapsed_ns: u64, batch: BatchStats } {
-    system.clearRuntimeState();
+    resetPathState(system, .drop_fields);
     var elapsed_ns: u64 = 0;
     var batch = BatchStats{};
     for (0..group_field_tunnel_build_guard) |_| {
@@ -3275,7 +3299,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         accumulator.record(last.elapsed_ns, last.busiest_solve_batch);
     }
     // The size config charges no long block.
-    if (system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
+    if (system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
     try suite.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
     stats.output_count = last.solves;
@@ -3290,7 +3314,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 // steps until every agent's result is cached. Times the pathfinding updates only.
 fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSystem, capacity: PathfindingCapacity, stream: *RangeOutputStream(PathRequest), requests: []const PathRequest, thread_system: ?*ThreadSystem) !ElasticRamp {
     try system.reserve(capacity);
-    system.clearRuntimeState();
+    resetPathState(system, .drop_fields);
     const agent_total = requests.len;
     const step_limit = elastic_ramp_steps + 4 * suite.rangeCount(agent_total, default_max_solves_per_frame) + elastic_ramp_steps;
     var ramp = ElasticRamp{};
@@ -3303,7 +3327,7 @@ fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSys
         // Every goal is reachable, so each solve caches one result.
         if (step_stats.unavailable_results != 0) return error.ElasticRampUnreachableGoal;
         ramp.solves += step_stats.solved_requests;
-        if (step_stats.fallback_batch.item_count > ramp.busiest_solve_batch.item_count) ramp.busiest_solve_batch = step_stats.fallback_batch;
+        if (step_stats.solve_batch.item_count > ramp.busiest_solve_batch.item_count) ramp.busiest_solve_batch = step_stats.solve_batch;
         if (live == agent_total and step_stats.cache_hits == agent_total) return ramp;
     }
     return error.ElasticRampStalled;
@@ -3428,7 +3452,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     stage_report.print(options, elastic_shrink_group.name, item_count, case);
     shrink_report.print(options, elastic_shrink_group.name, item_count, case);
     // The size config charges no long block.
-    if (system.long_block_grows != 0) return error.ShortRouteTookLongBlock;
+    if (system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
 
     try suite.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
@@ -3548,11 +3572,11 @@ fn runColdUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
-        while (!system.intake_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+        while (!system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
         }
     }
-    const settled_before_measurement = if (case.adaptive) system.intake_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) system.tuners.intake.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -3568,10 +3592,10 @@ fn runColdUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     var stats = accumulator.finish();
     stats.output_count = last_stats.unavailable_results;
     stats.candidate_pairs = last_stats.solved_requests;
-    stats.deferred_count = last_stats.deferred_requests;
+    stats.deferred_count = last_stats.pending_requests;
     stats.cache_evictions = last_stats.cache_evictions;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requests.len, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.intake_tuner.report(), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.intake.report(), settled_before_measurement);
     return stats;
 }
 
@@ -3597,13 +3621,13 @@ fn runColdUnreachableStep(
     }
     next_goal.* = (next_goal.* + requests.len) % goal_cells;
     try writeRequests(stream, requests);
-    system.clearRuntimeState();
+    resetPathState(system, .drop_fields);
     const start_ns = suite.nowNs(io);
     const stats = try runColdOnce(system, stream, thread_system, case, requests.len, requests.len, requests.len);
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.cache_hits != 0) return error.ColdUnreachableCacheHit;
     if (stats.solved_requests != 0 or stats.accepted_requests != 0) return error.ColdUnreachableSearched;
-    if (stats.unavailable_results != requests.len or stats.reach_unavailable != requests.len) return error.ColdUnreachableNotAnsweredAtIntake;
+    if (stats.unavailable_results != requests.len) return error.ColdUnreachableNotAnsweredAtIntake;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
 }
 
@@ -3723,7 +3747,7 @@ fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.available_results != 0) return error.PocketGoalReached;
     if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.PocketRequestDropped;
-    if (stats.unavailable_results + stats.budget_exhausted + stats.escalated_deferred + stats.fallback_deferred_requests != count) return error.PocketRequestUnaccounted;
+    if (stats.unavailable_results + stats.budget_exhausted + stats.escalated_deferred + stats.admission_deferred_requests != count) return error.PocketRequestUnaccounted;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
 }
 
@@ -3734,7 +3758,7 @@ fn runNegativeSteadyStep(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictF
     const count = fixture.requests.len;
     if (step.stats.cache_hits != 0) return error.NegativeSteadyCacheHit;
     if (step.stats.solved_requests != 0 or step.stats.accepted_requests != 0) return error.NegativeSteadySearched;
-    if (step.stats.unavailable_results != count or step.stats.reach_unavailable != count) return error.NegativeSteadyNotAnsweredAtIntake;
+    if (step.stats.unavailable_results != count) return error.NegativeSteadyNotAnsweredAtIntake;
     if (step.stats.cache_evictions != 0) return error.NegativeSteadyEvicted;
     return step;
 }
@@ -3763,12 +3787,12 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.intake_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, pool_step * item_count);
             pool_step = (pool_step + 1) % negative_steady_pool_steps;
         }
     }
-    const settled_before_measurement = if (case.adaptive) fixture.system.intake_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -3788,7 +3812,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     stats.cache_evictions = last_stats.cache_evictions;
     stats.candidate_pairs = last_stats.cache_hits;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.intake_tuner.report(), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
     return stats;
 }
 
@@ -3827,9 +3851,9 @@ const NegativeDigReport = struct {
             @as(u64, @intCast(self.react_ns / samples)),
             @as(u64, @intCast(self.update_ns / samples)),
             stageShape(&remask_buffer, self.remask_busiest, self.remask_threaded, self.remask_dispatched),
-            self.last.reach_unavailable,
+            self.last.unavailable_results,
             self.last.solved_requests,
-            self.last.deferred_requests,
+            self.last.pending_requests,
         });
     }
 };
@@ -3837,7 +3861,7 @@ const NegativeDigReport = struct {
 // Fails unless intake answered every request unavailable from reach, with no solve.
 fn expectAnsweredAtIntake(stats: PathfindingStats, count: usize) !void {
     if (stats.solved_requests != 0 or stats.accepted_requests != 0) return error.NegativeDigSearched;
-    if (stats.unavailable_results != count or stats.reach_unavailable != count) return error.NegativeDigNotAnsweredAtIntake;
+    if (stats.unavailable_results != count) return error.NegativeDigNotAnsweredAtIntake;
 }
 
 // The negative-dig step: toggles the far cell's blocking and runs the nav reaction (its
@@ -3887,11 +3911,11 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.intake_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try dig.step(io, case, &fixture, thread_ptr);
         }
     }
-    const settled_before_measurement = if (case.adaptive) fixture.system.intake_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The update's stages and the reaction's eviction stages, each over its own span.
@@ -3911,11 +3935,11 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     try suite.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = report.last.solved_requests;
-    stats.candidate_pairs = report.last.reach_unavailable;
+    stats.candidate_pairs = report.last.unavailable_results;
     stats.sample_count = report.last.budget_exhausted;
-    stats.deferred_count = report.last.deferred_requests;
+    stats.deferred_count = report.last.pending_requests;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.intake_tuner.report(), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
     return stats;
 }
 
@@ -4135,7 +4159,7 @@ const BurstOutcome = struct {
 // nothing pending, and every status reads unavailable after it.
 fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixture: *EvictFixture, thread_system: ?*ThreadSystem, stage_report: ?*StageReport) !BurstOutcome {
     const count = fixture.requests.len;
-    fixture.system.clearRuntimeState();
+    resetPathState(&fixture.system, .drop_fields);
     try writeRequests(&fixture.stream, fixture.requests);
     const step_limit = suite.rangeCount(count, default_max_solves_per_frame) + 1;
     var outcome = BurstOutcome{};
@@ -4146,7 +4170,7 @@ fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixtur
         const resolve = try runResolveGoals(&fixture.system, fixture.requests, thread_system, case);
         const stats = try runColdOnce(&fixture.system, stream, thread_system, case, count, count, count);
         var elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        outcome.projections += resolve.projections;
+        outcome.projections += resolve.distinct;
         outcome.fallbacks += stats.goal_fallbacks;
         if (outcome.steps == 0) outcome.first_resolve = resolve;
         if (stats.available_results != 0) return error.NegativeBurstGoalReached;
@@ -4166,7 +4190,7 @@ fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixtur
         if (outcome.status_steps == 0 and all_unavailable) outcome.status_steps = outcome.steps;
         if (stats.pending_requests == 0) break;
     }
-    if (outcome.unavailable != count or outcome.first.reach_unavailable != count) return error.NegativeBurstUnanswered;
+    if (outcome.unavailable != count) return error.NegativeBurstUnanswered;
     if (outcome.steps != 1 or outcome.searches != 0) return error.NegativeBurstSearched;
     if (outcome.status_steps != 1) return error.NegativeBurstStatusNotUnavailable;
     // One projection per distinct blocked goal, shared: four for the blocked crowd.
@@ -4196,11 +4220,11 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.intake_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runBurst(io, case, config.variant, &fixture, thread_ptr, null);
         }
     }
-    const settled_before_measurement = if (case.adaptive) fixture.system.intake_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};
@@ -4226,7 +4250,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     if (accumulator.iterations != 0) stats.max_step_ns = @intCast(max_step_total / accumulator.iterations);
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
     resolve_report.print(options, item_count, case);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.intake_tuner.report(), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
     return stats;
 }
 
@@ -4488,7 +4512,7 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
         if (ballast) |chain| chain.addSample(sample);
     }
     if (case.adaptive and thread_system != null) {
-        const tuner = fixture.system.nav_tuners.getPtrConst(.conn_flood).report();
+        const tuner = fixture.system.tuners.nav.getPtrConst(.conn_flood).report();
         report.flood_tuner_workers = if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
     }
     report.print(options, group_name, item_count, case);
@@ -5016,10 +5040,11 @@ const OnewayBallast = struct {
         self.close = try untimedReaction(io, fixture, self.cells, fixture.open.blocking, thread_system);
     }
 
-    // Sets the ballast's rooms to `tile` in one reaction, leaving every nav tuner as it was.
+    // Sets the ballast's rooms to `tile` in one reaction, leaving every tuner as it was, so
+    // it never trains the timed reactions' stages.
     fn untimedReaction(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
-        const tuners = NavReactionTuners.capture(&fixture.system);
-        defer tuners.restore(&fixture.system);
+        const tuners = fixture.system.tuners;
+        defer fixture.system.tuners = tuners;
         return fixture.changeLevelAndReact(io, ballast_level, cells, tile, thread_system);
     }
 

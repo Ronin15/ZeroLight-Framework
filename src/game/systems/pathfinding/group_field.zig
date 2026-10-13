@@ -14,22 +14,22 @@ const testBit = @import("nav_grid.zig").testBit;
 const setBit = @import("nav_grid.zig").setBit;
 const clearBit = @import("nav_grid.zig").clearBit;
 const world_terrain = @import("../../world_terrain.zig");
-const ChunkBits = world_terrain.ChunkBits;
-const max_chunk_cells = world_terrain.max_chunk_cells;
+const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
+const max_chunk_cells = @import("../../world_terrain.zig").max_chunk_cells;
 const types = @import("types.zig");
-const diagonal_cost = types.diagonal_cost;
-const cardinal_cost = types.cardinal_cost;
-const unreachable_cost = types.unreachable_cost;
-const no_slot = types.no_slot;
-const max_stamp_generation = types.max_stamp_generation;
-const neighbor_dirs = types.neighbor_dirs;
-const oppositeDirIndex = types.oppositeDirIndex;
-const fibonacciSlot = types.fibonacciSlot;
-const hashTableSlots = types.hashTableSlots;
-const hashTableShift = types.hashTableShift;
-const GridCell = types.GridCell;
-const PathQueryKey = types.PathQueryKey;
-const emptyKey = types.emptyKey;
+const diagonal_cost = @import("types.zig").diagonal_cost;
+const cardinal_cost = @import("types.zig").cardinal_cost;
+const unreachable_cost = @import("types.zig").unreachable_cost;
+const no_slot = @import("types.zig").no_slot;
+const max_stamp_generation = @import("types.zig").max_stamp_generation;
+const neighbor_dirs = @import("types.zig").neighbor_dirs;
+const oppositeDirIndex = @import("types.zig").oppositeDirIndex;
+const fibonacciSlot = @import("types.zig").fibonacciSlot;
+const hashTableSlots = @import("types.zig").hashTableSlots;
+const hashTableShift = @import("types.zig").hashTableShift;
+const GridCell = @import("types.zig").GridCell;
+const PathQueryKey = @import("types.zig").PathQueryKey;
+const emptyKey = @import("types.zig").emptyKey;
 
 // Reverse-Dijkstra managed shared-goal flow field. Built lazily and budgeted
 // across frames; an agent samples the flow direction at its current cell.
@@ -42,7 +42,7 @@ pub const GroupFieldState = enum {
 // Bucket count for the integration's monotone bucket queue (Dial's algorithm). Step
 // costs are octile {cardinal_cost, diagonal_cost}, so a (current_distance % B) bucket
 // holds only cells at exactly current_distance when B > max step cost.
-pub const group_field_buckets: u32 = diagonal_cost + 1;
+const group_field_buckets: u32 = diagonal_cost + 1;
 
 /// Exclusive upper bound on a field's cell cap: a field holds at most one block per
 /// covered cell, and a bucket link packs `block << 8 | local` into a u32 below `no_slot`.
@@ -57,7 +57,7 @@ comptime {
 /// queued, their integration cost to the goal, flow direction (index into
 /// `neighbor_dirs`, or `GroupField.no_flow`), and intrusive bucket links (slot ids).
 /// Cell data is valid only where `costed` is set.
-pub const FieldBlock = struct {
+const FieldBlock = struct {
     chunk: u32,
     origin_x: u32,
     origin_y: u32,
@@ -70,7 +70,7 @@ pub const FieldBlock = struct {
 };
 
 /// Bytes one pooled `FieldBlock` holds across its columns.
-pub const field_block_bytes: usize = blk: {
+const field_block_bytes: usize = blk: {
     var bytes: usize = 0;
     for (@typeInfo(FieldBlock).@"struct".field_types) |T| bytes += @sizeOf(T);
     break :blk bytes;
@@ -78,7 +78,7 @@ pub const field_block_bytes: usize = blk: {
 
 /// One chunk directory row: the chunk's block this build when `stamp` is the field's
 /// generation (stamp 0 is untouched).
-pub const DirEntry = extern struct {
+const DirEntry = extern struct {
     chunk: u32,
     stamp: u32,
     block: u32,
@@ -89,13 +89,13 @@ pub const DirEntry = extern struct {
 };
 
 /// One costed field cell as `GroupField.lookup` reads it.
-pub const FieldCell = struct {
+const FieldCell = struct {
     cost: u32,
     flow_dir: u8,
 };
 
 /// What ended one `GroupField.expand` call.
-pub const Progress = enum {
+const Progress = enum {
     /// The call's budget ran out with cells still queued.
     budget_spent,
     /// The field finished: the queue drained or the cell cap stopped the flood.
@@ -192,7 +192,7 @@ pub const GroupField = struct {
     directory: []DirEntry = &.{},
     dir_shift: u6 = 0,
 
-    pub const no_flow: u8 = 0xff;
+    const no_flow: u8 = 0xff;
 
     pub fn deinit(self: *GroupField, allocator: std.mem.Allocator) void {
         allocator.free(self.directory);
@@ -383,6 +383,8 @@ pub const GroupField = struct {
     /// cells for this build, regardless of how much of the grid is still reachable. The
     /// distance cursor advances only forward, so the build resumes correctly across calls.
     /// Writes only this field's header (once) and its own pool and directory.
+    // SIMD verdict: scalar. Dial's frontier: each pop relaxes from the costs earlier pops set,
+    // and one table lookup already gives all eight moves.
     pub fn expand(self: *GroupField, grid: *const NavGrid, budget: *usize) Progress {
         std.debug.assert(budget.* != 0); // a zero budget makes no progress and never reaches .ready
         std.debug.assert(self.state == .building);
@@ -517,12 +519,9 @@ pub const GroupField = struct {
     }
 
     /// Samples the flow direction at `cell_index`, returning the stepped waypoint. Answers
-    /// for a `.building` field too (not just `.ready`): Dial's monotone integration costs
-    /// cells in non-decreasing distance order, so an already-costed cell's flow direction
-    /// is final the moment it is set, even mid-build — a provisional-but-correct partial
-    /// answer, never a stale or cyclic one. Both current production callers happen to gate
-    /// on `.ready` first (a conservative choice, not a requirement this function imposes),
-    /// so `.building` is reachable only by a future caller choosing to sample early.
+    /// for a `.building` field too: Dial's monotone integration costs cells in
+    /// non-decreasing distance order, so a costed cell's flow direction is final once set,
+    /// mid-build included.
     pub fn sample(self: *const GroupField, grid: *const NavGrid, cell_index: usize) ?math.Vec2 {
         if (self.state != .ready and self.state != .building) return null;
         const cell = self.lookup(grid, cell_index) orelse return null;
@@ -593,11 +592,11 @@ fn popNext(columns: Columns, buckets: *[group_field_buckets]u32, distance: *u32)
 // Tests
 // ----------------------------------------------------------------------------
 
-const OpenNode = types.OpenNode;
-const popHeap = types.popHeap;
-const siftUp = types.siftUp;
-const default_cell_size = types.default_cell_size;
-const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
+const OpenNode = @import("types.zig").OpenNode;
+const popHeap = @import("types.zig").popHeap;
+const siftUp = @import("types.zig").siftUp;
+const default_cell_size = @import("types.zig").default_cell_size;
+const default_nav_chunk_tiles = @import("types.zig").default_nav_chunk_tiles;
 const setBlockedCells = @import("test_support.zig").setBlockedCells;
 
 // Reference reverse-Dijkstra integration field over a NavGrid using a binary heap with

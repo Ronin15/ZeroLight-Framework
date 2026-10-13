@@ -584,12 +584,11 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
         perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
         perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
-        perf.recordMetric(.path_fallback_requests, metric(pathfinding_stats.fallback_requests));
+        perf.recordMetric(.path_solve_admissions, metric(pathfinding_stats.solve_admissions));
         perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
         perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
         perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.dropped_requests));
-        perf.recordMetric(.path_deferred_requests, metric(pathfinding_stats.deferred_requests));
-        perf.recordMetric(.path_fallback_deferred_requests, metric(pathfinding_stats.fallback_deferred_requests));
+        perf.recordMetric(.path_admission_deferred_requests, metric(pathfinding_stats.admission_deferred_requests));
         perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
         perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
         perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
@@ -601,7 +600,9 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
         perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
         perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.max_stitch_segments_observed));
-        perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
+        perf.recordMetricMax(.path_max_distinct_group_keys, metric(pathfinding_stats.distinct_group_keys));
+        perf.recordMetric(.path_group_field_evictions, metric(pathfinding_stats.group_field_evictions));
+        perf.recordBatch(.path_solve, pathfinding_stats.solve_batch);
         perf.recordBatch(.path_intake, pathfinding_stats.intake_batch);
         perf.recordBatch(.path_registry_flush, pathfinding_stats.registry_flush_batch);
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
@@ -1666,13 +1667,8 @@ test "pipeline updates full active player-only state through serial path" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1753,13 +1749,8 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
         .dig = dig_config,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1867,13 +1858,8 @@ test "pipeline update after reserve allocates nothing on frame streams with dig,
         .dig = dig_config,
         .movement_body_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1941,13 +1927,8 @@ test "eventCapacitySum equals capacity_limit after reserve" {
         .movement_body_capacity = 8,
         .structural_headroom = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1987,13 +1968,8 @@ test "pipeline resamples AI wander direction across fixed steps" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2098,13 +2074,8 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2180,13 +2151,8 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2260,13 +2226,8 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2345,13 +2306,8 @@ test "pipeline fear selects flee before movement, not only a positive drive" {
         .contact_capacity = 4,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2419,13 +2375,8 @@ test "pipeline perception acquire refreshes memory last_known the same step" {
         .contact_capacity = 4,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2498,13 +2449,8 @@ test "chunk_derive matches the pose after a contact push crosses a chunk boundar
         .contact_capacity = 4,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2583,13 +2529,8 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2741,13 +2682,8 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .dig = dig_config,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2872,13 +2808,8 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2987,13 +2918,8 @@ fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 512, .{
         .contact_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 4,
-            .max_pending_requests = 4,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 4,
-            .max_fallback_requests_per_step = 4,
         },
     });
     defer pipeline.deinit();
@@ -3138,13 +3064,8 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3181,13 +3102,8 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
 }
 
 const share_test_pathfinding: PathfindingCapacity = .{
-    .max_frame_requests = 2,
-    .max_pending_requests = 2,
-    .max_cached_results = 4,
     .max_group_fields = 1,
     .worker_participant_count = 1,
-    .max_solved_requests_per_step = 2,
-    .max_fallback_requests_per_step = 2,
 };
 
 fn addShareTestAgent(data: *DataSystem, x: f32, faction: Faction, observer: bool) !EntityId {
@@ -3492,13 +3408,8 @@ test "pipeline commits the dig stage's world edit before the tile gate reads wal
         .dig = dig_config,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3586,13 +3497,8 @@ test "pipeline tile gate after collision response rejects contact push into soli
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3682,13 +3588,8 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3750,13 +3651,8 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
         .nav_cell_size = tile_size / 4,
         .navigation_world = &world,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
             .nav_chunk_tiles = 16,
         },
     });
@@ -3789,7 +3685,7 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
     const nav_grid = pipeline.pathfinding.graph.grid(0).?;
     const nav_cell = nav_grid.indexForCell(nav_grid.worldToCellClamped(body.position)).?;
     const world_chunk_index: u32 = @intCast(world_chunk.y * @as(i32, world.chunksX()) + world_chunk.x);
-    try std.testing.expectEqual(world_chunk_index, nav_test_support.chunkOfCell(nav_grid.geometry, nav_cell));
+    try std.testing.expectEqual(world_chunk_index, nav_grid.geometry.chunkOfCell(nav_cell));
 }
 
 test "pipeline plane traversal batches fall landing tile events into one range" {
@@ -3852,13 +3748,8 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
         .dig = dig_config,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4166,13 +4057,8 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
         .dig = dig_config,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4237,13 +4123,8 @@ test "pipeline promotes deferred impacts before perception on the following step
         .contact_capacity = 4,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4334,13 +4215,8 @@ test "pipeline defers player collision impacts until the next step" {
         .contact_capacity = 8,
         .movement_body_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4428,13 +4304,8 @@ test "head-on player impact enqueues even after collision response zeroes approa
         .contact_capacity = 8,
         .movement_body_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4507,13 +4378,8 @@ test "pipeline emits player footstep stimulus before perception in the same step
         .contact_capacity = 4,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4578,13 +4444,8 @@ test "deferred impact enqueue drops newest when deferred buffer is full" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -4627,13 +4488,8 @@ test "dig stage reserves its world edit before promoting, so a failed reserve ke
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
         .dig = try DigConfig.fromMeta(&meta),
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -4705,13 +4561,8 @@ test "promote drops deferred impacts when live bus is already full" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -4807,13 +4658,8 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -4893,13 +4739,8 @@ test "captureActionIntent appends interact on rising edge only and does not dual
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -4946,13 +4787,8 @@ test "captureActionIntent stamps faced cell matching dig targeting" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -5001,13 +4837,8 @@ test "captureActionIntent keeps latch open when tryAppend soft-drops" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -5048,13 +4879,8 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -5098,13 +4924,8 @@ test "captureActionIntent soft-drop recovers after beginStep while held" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -5147,13 +4968,8 @@ test "pipeline.update reports action_intents_dropped after capture soft-drop" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -5215,13 +5031,8 @@ test "standing player collision does not enqueue deferred impact without motion"
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -5312,13 +5123,8 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
         .dig = dig_config,
         .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -5533,8 +5339,8 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.steering.directions_tuner,
         &pipeline.steering.grid_bucket_tuner,
         &pipeline.steering.grid_sort_tuner,
-        &pipeline.pathfinding.fallback_tuner,
-        &pipeline.pathfinding.nav_mark_tuner,
+        &pipeline.pathfinding.tuners.solve,
+        &pipeline.pathfinding.tuners.nav_mark,
         &pipeline.scope.chunk_derive_tuner,
         &pipeline.scope.collision_gather_tuner,
         &pipeline.scope.ai_gather_tuner,
@@ -5546,7 +5352,7 @@ fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveW
         &pipeline.plane_entry.tuner,
     };
     for (tuners) |tuner| pinThreadedProfile(tuner, profile);
-    for (&pipeline.pathfinding.nav_tuners.values) |*tuner| pinThreadedProfile(tuner, profile);
+    for (&pipeline.pathfinding.tuners.nav.values) |*tuner| pinThreadedProfile(tuner, profile);
 }
 
 /// Pins one tuner as `pinPipelineThreadedProfiles` does. Test-only local fixture.
@@ -6669,7 +6475,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
         .tiles_per_side = 16,
         .worker_threads = 2,
         .structural_headroom = 128,
-        .pathfinding = .{ .max_frame_requests = 4, .max_group_fields = 1, .worker_participant_count = 1 },
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1 },
     });
     defer fixture.deinit();
     const pathfinding = &fixture.pipeline.pathfinding;
@@ -7050,13 +6856,15 @@ test "a static move's collider splice reaches the perf log, and a seam with no s
     try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
 }
 
-test "pipeline stats record the path intake and registry flush batches under their own perf stages" {
+test "pipeline stats record the path intake and registry flush batches under their own perf stages, the most distinct group keys, and the group-field evictions" {
     if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var perf = runtime_perf_log.RuntimePerfLog.init(0);
     const stats = SimulationPipelineStats{ .pathfinding = .{
-        .fallback_batch = .{ .item_count = 3 },
+        .solve_batch = .{ .item_count = 3 },
         .intake_batch = .{ .item_count = 5 },
         .registry_flush_batch = .{ .item_count = 7 },
+        .distinct_group_keys = 6,
+        .group_field_evictions = 2,
     } };
     stats.recordTo(runtime_perf_log.Context.bind(&perf));
     const intake = perf.batches[@backingInt(runtime_perf_log.BatchStage.path_intake)];
@@ -7065,6 +6873,8 @@ test "pipeline stats record the path intake and registry flush batches under the
     try std.testing.expectEqual(@as(u64, 5), intake.items);
     try std.testing.expectEqual(@as(u64, 1), flush.calls);
     try std.testing.expectEqual(@as(u64, 7), flush.items);
+    try std.testing.expectEqual(@as(u64, 6), perf.metrics[@backingInt(runtime_perf_log.Metric.path_max_distinct_group_keys)]);
+    try std.testing.expectEqual(@as(u64, 2), perf.metrics[@backingInt(runtime_perf_log.Metric.path_group_field_evictions)]);
 }
 
 const StructuralBurstOutcome = struct {
@@ -7298,7 +7108,6 @@ test "a crowd pursuing a blocked goal whose projection is sealed reads it unavai
     try std.testing.expectEqual(@as(usize, crowd), frame.navigation_intents.mergedItems().len);
     try std.testing.expectEqual(@as(usize, crowd), stats.path_goals.blocked);
     try std.testing.expectEqual(@as(usize, 1), stats.path_goals.distinct);
-    try std.testing.expectEqual(@as(usize, 1), stats.path_goals.projections);
     try std.testing.expectEqual(@as(usize, crowd), stats.steering.path_unavailable_count);
     try std.testing.expectEqual(@as(usize, 0), stats.steering.path_request_count);
     try std.testing.expectEqual(@as(usize, 0), stats.pathfinding.goal_fallbacks + stats.pathfinding.accepted_requests);

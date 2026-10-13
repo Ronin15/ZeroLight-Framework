@@ -16,6 +16,7 @@ const NavGrid = @import("nav_grid.zig").NavGrid;
 const allowed_moves = @import("nav_grid.zig").allowed_moves;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavPortal = @import("nav_graph.zig").NavPortal;
+const ChunkGeometry = @import("types.zig").ChunkGeometry;
 const LinkBounds = @import("nav_graph.zig").LinkBounds;
 const LinkPairs = @import("nav_graph.zig").LinkPairs;
 const CrossingRates = @import("nav_graph.zig").CrossingRates;
@@ -25,33 +26,33 @@ const AbstractSlot = @import("scratch.zig").AbstractSlot;
 const CorridorScratch = @import("scratch.zig").CorridorScratch;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const chunk_list_map = @import("../chunk_list_map.zig");
-const chunkKey = chunk_list_map.chunkKey;
+const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const types = @import("types.zig");
-const GridCell = types.GridCell;
-const PathSolveResult = types.PathSolveResult;
-const CellCursor = types.CellCursor;
-const registry_shard_count = types.registry_shard_count;
-const registryShard = types.registryShard;
-const PendingRequest = types.PendingRequest;
-const PathQueryKey = types.PathQueryKey;
-const StitchedCell = types.StitchedCell;
-const OpenNode = types.OpenNode;
-const no_parent = types.no_parent;
-const no_slot = types.no_slot;
-const unreachable_cost = types.unreachable_cost;
-const long_link_pairs = types.long_link_pairs;
-const long_lane_cap = types.long_lane_cap;
-const diagonal_cost = types.diagonal_cost;
-const cardinal_cost = types.cardinal_cost;
-const packRef = types.packRef;
-const refLevel = types.refLevel;
-const refLocal = types.refLocal;
-const octileXY = types.octileXY;
-const octileU32 = types.octileU32;
-const siftUp = types.siftUp;
-const popHeap = types.popHeap;
-const neighbor_dirs = types.neighbor_dirs;
-const default_goal_projection_radius = types.default_goal_projection_radius;
+const GridCell = @import("types.zig").GridCell;
+const PathSolveResult = @import("types.zig").PathSolveResult;
+const CellCursor = @import("types.zig").CellCursor;
+const registry_shard_count = @import("types.zig").registry_shard_count;
+const registryShard = @import("types.zig").registryShard;
+const PendingRequest = @import("types.zig").PendingRequest;
+const PathQueryKey = @import("types.zig").PathQueryKey;
+const StitchedCell = @import("types.zig").StitchedCell;
+const OpenNode = @import("types.zig").OpenNode;
+const no_parent = @import("types.zig").no_parent;
+const no_slot = @import("types.zig").no_slot;
+const unreachable_cost = @import("types.zig").unreachable_cost;
+const long_link_pairs = @import("types.zig").long_link_pairs;
+const long_lane_cap = @import("types.zig").long_lane_cap;
+const diagonal_cost = @import("types.zig").diagonal_cost;
+const cardinal_cost = @import("types.zig").cardinal_cost;
+const packRef = @import("types.zig").packRef;
+const refLevel = @import("types.zig").refLevel;
+const refLocal = @import("types.zig").refLocal;
+const octileXY = @import("types.zig").octileXY;
+const octileU32 = @import("types.zig").octileU32;
+const siftUp = @import("types.zig").siftUp;
+const popHeap = @import("types.zig").popHeap;
+const neighbor_dirs = @import("types.zig").neighbor_dirs;
+const default_goal_projection_radius = @import("types.zig").default_goal_projection_radius;
 
 pub const SolveJobContext = struct {
     system: *PathfindingSystem,
@@ -62,20 +63,20 @@ pub const SolveJobContext = struct {
 
 // Fallback workers share the system for read-only graph/pending access but use
 // worker-indexed scratch. Every output (result, solved path, path stripe) sits at the
-// request's fallback ordinal, so a range writes only its own `[start, end)` window; a
+// request's solve ordinal, so a range writes only its own `[start, end)` window; a
 // tier-1 solve also writes the tier-1 pool entry of its escalated admission index, which
 // no other ordinal of the step holds.
-pub fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
+pub fn solveJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *SolveJobContext = @ptrCast(@alignCast(context));
     const system = job.system;
     // Dual worker asserts: range.index vs dispatched range count AND range.end vs
     // the fallback-index buffer this job walks and the ordinal windows it writes.
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= system.fallback_indices.items.len);
+    std.debug.assert(range.end <= system.solve_indices.items.len);
     std.debug.assert(range.end <= system.solve_results.items.len);
     std.debug.assert(range.end <= system.solved_paths.items.len);
-    std.debug.assert(range.end <= system.fallback_tier1_slot.items.len);
+    std.debug.assert(range.end <= system.solve_tier1_slot.items.len);
     // scratch_slots is never resized during the parallel region (only in applyDerivedCapacity,
     // which runs in beginUpdate before parallelForWithOptions), so this pointer stays valid.
     // Guards the reserve-before-dispatch invariant: applyDerivedCapacity sized scratch_slots to
@@ -83,7 +84,7 @@ pub fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: Wo
     std.debug.assert(worker_id.index < system.scratch_slots.items.len);
     const scratch = &system.scratch_slots.items[worker_id.index];
     for (range.start..range.end) |ordinal| {
-        const pending_index = system.fallback_indices.items[ordinal];
+        const pending_index = system.solve_indices.items[ordinal];
         system.solve_results.items[ordinal] = solveOne(system, pending_index, scratch, ordinal);
     }
 }
@@ -100,7 +101,7 @@ const LocalSolve = enum { found, budget_exhausted, none };
 // (see default_max_stitch_segments) — not just one, since a corridor can cross many
 // portals — each capped at the per-segment local budget, independent of total cells.
 /// Solves logical pending entry `pending_index`, writing its solved path at `ordinal`
-/// (its fallback ordinal: result slot, solved-path slot, and path stripe). The live goal and
+/// (its solve ordinal: result slot, solved-path slot, and path stripe). The live goal and
 /// reach come before any search: a goal no open start reaches is `.unavailable` with no
 /// search, and once reach holds no search ends without a path.
 pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *SearchScratch, ordinal: usize) PathSolveResult {
@@ -133,14 +134,14 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
     const same_level = request.start_level == request.key.goal_level;
     if (same_level) {
         if (start_index == goal_index) {
-            recordPath(system, ordinal, request.key, &.{@intCast(goal_index)}, request.start_level);
+            recordPath(system, ordinal, &.{@intCast(goal_index)}, request.start_level);
             return .{ .available = request.key };
         }
         // Same component: a short hop the local A* can usually finish.
         if (start_grid.connected(start_index, goal_index)) {
             switch (localAStar(start_grid, scratch, start_index, goal_index)) {
                 .found => {
-                    recordPath(system, ordinal, request.key, scratch.path_scratch.items, request.start_level);
+                    recordPath(system, ordinal, scratch.path_scratch.items, request.start_level);
                     return .{ .available = request.key };
                 },
                 // Budget spill on a short same-component hop is a transient: keep
@@ -178,7 +179,7 @@ fn reachContractBreak(key: PathQueryKey) PathSolveResult {
 
 // The tier-1 pool entry `prepareSolvePhase` assigned to the escalated solve at `ordinal`.
 fn tier1Corridor(system: *PathfindingSystem, ordinal: usize) *CorridorScratch {
-    const tier1_slot = system.fallback_tier1_slot.items[ordinal];
+    const tier1_slot = system.solve_tier1_slot.items[ordinal];
     std.debug.assert(tier1_slot < system.tier1_scratch.items.len);
     return &system.tier1_scratch.items[tier1_slot].corridor;
 }
@@ -229,7 +230,7 @@ fn solveAbstract(
 
     const stitched = corridor_scratch.stitched.items;
     if (stitched.len == 0) return reachContractBreak(request.key);
-    recordStitched(system, ordinal, request.key, stitched, request.start_level);
+    recordStitched(system, ordinal, stitched, request.start_level);
     const solved = &system.solved_paths.items[ordinal];
     solved.via_abstract = true;
     solved.cross_level = corridor.crosses_level;
@@ -246,6 +247,8 @@ fn solveAbstract(
 // budget_exhausted on any segment node-budget spill, stitched-buffer overflow, or
 // segment-count spill (segment_cap, see default_max_stitch_segments — bounds total
 // local-search work independent of how many portals the chosen corridor crosses).
+// SIMD verdict: scalar. Segments run in corridor order, each a local A* from the previous
+// segment's end.
 fn stitchCorridor(
     system: *PathfindingSystem,
     scratch: *SearchScratch,
@@ -280,16 +283,12 @@ fn stitchCorridor(
             if (stitched.items.len >= cap) return .budget_exhausted;
             stitched.appendAssumeCapacity(.{ .level = portal.level, .cell = portal.cell });
         } else {
-            // prev_level indexes a live level by construction (it came from the corridor
-            // we just built); spill rather than panic if a malformed graph ever violates that.
+            // The corridor names only built levels; a miss breaks the reach contract (the
+            // caller's reachContractBreak).
             const grid = graph.grid(prev_level) orelse return .none;
             // appendSegment no-ops (no localAStar call) when prev_cell already equals the
             // portal cell, so only a genuine local search counts against segment_cap.
-            if (prev_cell != portal.cell) {
-                if (segments_used >= segment_cap) return .budget_exhausted;
-                segments_used += 1;
-                if (segments_used > scratch.max_stitch_segments_used) scratch.max_stitch_segments_used = segments_used;
-            }
+            if (prev_cell != portal.cell and !countSegment(scratch, &segments_used, segment_cap)) return .budget_exhausted;
             switch (appendSegment(scratch, stitched, grid, prev_level, prev_cell, portal.cell, cap)) {
                 .found => {},
                 else => |r| return r,
@@ -298,20 +297,24 @@ fn stitchCorridor(
         prev_level = portal.level;
         prev_cell = portal.cell;
     }
-    // Final span: last corridor cell -> goal cell, a walkable same-level segment.
-    // abstractCorridor only returns .found after buildCorridor validates the corridor ends
-    // on goal_level, so prev_level == goal_level here. Dead-code defensive guard.
-    if (prev_level != request.key.goal_level) return .none;
-    if (prev_cell != goal_index) {
-        if (segments_used >= segment_cap) return .budget_exhausted;
-        segments_used += 1;
-        if (segments_used > scratch.max_stitch_segments_used) scratch.max_stitch_segments_used = segments_used;
-    }
+    // Final span: last corridor cell -> goal cell, a walkable same-level segment. A found
+    // corridor ends at a goal-level portal (abstractCorridor's goal test).
+    std.debug.assert(prev_level == request.key.goal_level);
+    if (prev_cell != goal_index and !countSegment(scratch, &segments_used, segment_cap)) return .budget_exhausted;
     switch (appendSegment(scratch, stitched, goal_grid, prev_level, prev_cell, @intCast(goal_index), cap)) {
         .found => {},
         else => |r| return r,
     }
     return .found;
+}
+
+// Counts one segment search against `segment_cap`, recording the participant's per-step
+// high-water; false when the cap is spent.
+fn countSegment(scratch: *SearchScratch, segments_used: *usize, segment_cap: usize) bool {
+    if (segments_used.* >= segment_cap) return false;
+    segments_used.* += 1;
+    scratch.max_stitch_segments_used = @max(scratch.max_stitch_segments_used, segments_used.*);
+    return true;
 }
 
 // Runs local A* from `from` to `to` on `grid` and appends the resulting cells
@@ -537,6 +540,8 @@ const CrossLevelHeuristic = struct {
 // the abstract node budget; seeding scans only the start chunk's record. A node's
 // coordinates are cached at claim, and its portal when the claiming expansion held it, so a
 // pop derives its chunk by shifts and looks a portal up only for a mirror or link target.
+// SIMD verdict: scalar frontier (each pop relaxes from the costs earlier pops set, over a
+// data-dependent portal list); the long-link heuristic terms are four-lane (`preparePairs`).
 fn abstractCorridor(
     graph: *const NavGraph,
     abstract: *AbstractScratch,
@@ -555,12 +560,11 @@ fn abstractCorridor(
     const slots = abstract.slots;
 
     // Chunk geometry once per query: a cell's chunk and chunk-local index are shifts and
-    // masks of its coordinates. Sides and chunk counts of a validated level fit u32.
+    // masks of its coordinates. Sides of a validated level fit u32.
     const geometry = graph.chunkGeometry();
     const width: u32 = @intCast(geometry.width);
     const shift: u5 = geometry.shift;
     const mask: u32 = @as(u32, geometry.chunk_tiles) - 1;
-    const chunks_x: u32 = @intCast(geometry.chunksX());
     // Coordinates and indices stay unsigned: a validated level's cell index can pass 2^31.
     const goal: u32 = @intCast(goal_index);
     const goal_y = goal / width;
@@ -574,7 +578,7 @@ fn abstractCorridor(
     const start_cell: u32 = @intCast(start_index);
     const start_y = start_cell / width;
     const start_x = start_cell - start_y * width;
-    const start_portals = graph.chunkPortals(start_level, (start_y >> shift) * chunks_x + (start_x >> shift));
+    const start_portals = graph.chunkPortals(start_level, geometry.chunkOf(start_x, start_y));
     const start_terms = heuristic.levelTerms(start_level);
     var seeded: usize = 0;
     for ([_][]const NavPortal{ start_portals.border, start_portals.extra }) |portals| {
@@ -602,7 +606,7 @@ fn abstractCorridor(
     if (seeded == 0) return .none;
 
     const goal_label = goal_grid.labelAt(goal_index);
-    const goal_chunk = (goal_y >> shift) * chunks_x + (goal_x >> shift);
+    const goal_chunk = geometry.chunkOf(goal_x, goal_y);
 
     while (abstract.open.items.len != 0) {
         const current = popHeap(&abstract.open);
@@ -618,8 +622,8 @@ fn abstractCorridor(
         const cell = refLocal(current_ref);
         const x = current_node.x;
         const y = current_node.y;
-        const chunk = (y >> shift) * chunks_x + (x >> shift);
-        const local: u8 = @intCast(((y & mask) << shift) | (x & mask));
+        const chunk = geometry.chunkOf(x, y);
+        const local = geometry.localOf(x, y);
         // The record's slices: the peer scan and the link lookup read them.
         const portals = graph.chunkPortals(level, chunk);
         // Every relaxed node is a portal of its chunk's record (mirror runs are symmetric and
@@ -763,6 +767,8 @@ fn buildCorridor(abstract: *AbstractScratch, goal_slot: u32, start_level: u16) C
 // Budget-bounded heap A* over one level's grid. Fills scratch.path_scratch with
 // the reconstructed start-to-goal cells on success. The node budget keeps explored
 // count bounded; exhausting it spills the request to a later frame.
+// SIMD verdict: scalar. A heap frontier: each pop's neighbours relax from the costs the
+// previous pops set, and one table lookup already gives all eight moves.
 fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize, goal_index: usize) LocalSolve {
     if (start_index == goal_index) {
         scratch.path_scratch.clearRetainingCapacity();
@@ -844,23 +850,22 @@ fn reconstructLocalPath(scratch: *SearchScratch, goal_slot: u32) void {
     std.mem.reverse(u32, scratch.path_scratch.items);
 }
 
-// Writes a plain path whole into this request's output stripe at its fallback ordinal,
+// Writes a plain path whole into this request's output stripe at its solve ordinal,
 // with its registry runs. The local solve bounds a path at one cell per explored node,
 // which the stripe holds.
-fn recordPath(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, path: []const u32, path_level: u16) void {
-    const stripe_words = types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells);
+fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, path_level: u16) void {
+    const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(path.len <= stripe_words);
     @memcpy(system.worker_path_pool.items[offset .. offset + path.len], path);
     var solved = PathfindingSystem.SolvedPath{
-        .key = key,
         .offset = offset,
         .len = path.len,
         .path_level = path_level,
         .end = .{ .level = path_level, .cell = path[path.len - 1] },
     };
     const starts = system.worker_run_starts.items[offset..][0..stripe_words];
-    solved.run_count = splitRuns(RunGeometry.of(&system.graph), path, null, path_level, starts, &solved.shard_counts);
+    solved.run_count = splitRuns(system.graph.chunkGeometry(), path, null, path_level, starts, &solved.shard_counts);
     system.solved_paths.items[ordinal] = solved;
 }
 
@@ -868,15 +873,14 @@ fn recordPath(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, pat
 // stripe as its cells, then its levels, with its registry runs; `path_level` is the start
 // level. stitchCorridor's cap (at most max_stitched_path_cells) bounds it at the stripe,
 // asserted so a drift fails loud instead of truncating the corridor.
-fn recordStitched(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey, stitched: []const StitchedCell, start_level: u16) void {
-    const stripe_words = types.resultBlockWords(system.capacity.max_explored_nodes, system.capacity.max_stitched_path_cells);
+fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell, start_level: u16) void {
+    const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(types.stitchedWords(stitched.len) <= stripe_words);
     const stripe = system.worker_path_pool.items[offset .. offset + stripe_words];
     types.writeStitched(stripe, stitched);
     const view = types.stitchedView(stripe, stitched.len);
     var solved = PathfindingSystem.SolvedPath{
-        .key = key,
         .offset = offset,
         .len = 0,
         .stitched_len = stitched.len,
@@ -884,33 +888,9 @@ fn recordStitched(system: *PathfindingSystem, ordinal: usize, key: PathQueryKey,
         .end = stitched[stitched.len - 1],
     };
     const starts = system.worker_run_starts.items[offset..][0..stripe_words];
-    solved.run_count = splitRuns(RunGeometry.of(&system.graph), view.cells, view.levels, start_level, starts, &solved.shard_counts);
+    solved.run_count = splitRuns(system.graph.chunkGeometry(), view.cells, view.levels, start_level, starts, &solved.shard_counts);
     system.solved_paths.items[ordinal] = solved;
 }
-
-/// How stored cells map to path-registry keys: a run's key is its (level, chunk).
-pub const RunGeometry = struct {
-    width: usize,
-    chunk_shift: u6,
-    chunks_x: usize,
-
-    pub fn of(graph: *const NavGraph) RunGeometry {
-        const geometry = graph.chunkGeometry();
-        return .{ .width = geometry.width, .chunk_shift = geometry.shift, .chunks_x = geometry.chunksX() };
-    }
-
-    /// The key of the chunk holding (x, y) on `level`.
-    pub fn keyAt(self: RunGeometry, level: u16, x: usize, y: usize) u64 {
-        // A level's chunk count stays below 2^31.
-        return chunkKey(level, @intCast((y >> self.chunk_shift) * self.chunks_x + (x >> self.chunk_shift)));
-    }
-
-    /// The key of the chunk holding `cell` on `level`: one division.
-    pub fn key(self: RunGeometry, level: u16, cell: u32) u64 {
-        const y = cell / self.width;
-        return self.keyAt(level, cell - y * self.width, y);
-    }
-};
 
 /// Splits a stored path into registry runs, maximal stretches of consecutive cells on one
 /// level in one chunk (a path re-entering a chunk starts a new run each time): writes each
@@ -920,7 +900,7 @@ pub const RunGeometry = struct {
 /// at a level change, or after a step to a cell that is not a neighbour.
 // SIMD verdict: scalar. Run boundaries are data-dependent and each step updates the
 // coordinates of the previous one.
-pub fn splitRuns(geometry: RunGeometry, cells: []const u32, levels: ?[]const u16, path_level: u16, starts: []u16, shard_counts: *[registry_shard_count]u32) u32 {
+pub fn splitRuns(geometry: ChunkGeometry, cells: []const u32, levels: ?[]const u16, path_level: u16, starts: []u16, shard_counts: *[registry_shard_count]u32) u32 {
     std.debug.assert(cells.len <= starts.len);
     var run_count: u32 = 0;
     var cursor: CellCursor = undefined;
@@ -931,13 +911,13 @@ pub fn splitRuns(geometry: RunGeometry, cells: []const u32, levels: ?[]const u16
         const level = if (levels) |column| column[index] else path_level;
         const level_changed = index == 0 or level != run_level;
         if (level_changed) cursor = .init(geometry.width, cell) else cursor.moveTo(cell);
-        const chunk_x = cursor.x >> geometry.chunk_shift;
-        const chunk_y = cursor.y >> geometry.chunk_shift;
+        const chunk_x = cursor.x >> geometry.shift;
+        const chunk_y = cursor.y >> geometry.shift;
         if (!level_changed and chunk_x == run_chunk_x and chunk_y == run_chunk_y) continue;
         // A run start indexes the stripe, whose width the reserve keeps within u16.
         starts[run_count] = @intCast(index);
         run_count += 1;
-        shard_counts[registryShard(geometry.keyAt(level, cursor.x, cursor.y))] += 1;
+        shard_counts[registryShard(chunkKey(level, geometry.chunkOf(cursor.x, cursor.y)))] += 1;
         run_level = level;
         run_chunk_x = chunk_x;
         run_chunk_y = chunk_y;
@@ -1525,7 +1505,7 @@ test "abstract expansion visits only same-label peers, border mirrors, and live 
         // Cached coordinates are the node's own.
         try std.testing.expectEqual(cell % grid.geometry.width, slot.x);
         try std.testing.expectEqual(cell / grid.geometry.width, slot.y);
-        try std.testing.expect(graph.chunkPortals(0, test_support.chunkOfCell(graph.geometry, cell)).find(test_support.localOfCell(graph.geometry, cell)) != null);
+        try std.testing.expect(graph.chunkPortals(0, graph.geometry.chunkOfCell(cell)).find(test_support.localOfCell(graph.geometry, cell)) != null);
         if (cell == grid.indexForCell(.{ .x = 9, .y = 9 }).?) reached_link_source = true;
     }
     try std.testing.expect(touched > 1);
@@ -1761,7 +1741,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
             const goal_x = goal % width;
             const goal_y = goal / width;
             const goal_label = goal_grid.labelAt(goal);
-            const goal_chunk = test_support.chunkOfCell(graph.geometry, goal);
+            const goal_chunk = graph.geometry.chunkOfCell(goal);
             var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
             for (0..levels) |level_index| {
                 const level: u16 = @intCast(level_index);
@@ -2411,11 +2391,11 @@ test "same-level abstract searches in worlds without long links equal the goal-l
 
 // Run starts and keys by one division per cell: a new run wherever the level or chunk
 // differs from the previous cell's.
-fn referenceRuns(geometry: RunGeometry, cells: []const u32, levels: ?[]const u16, path_level: u16, starts: *std.ArrayList(u16), keys: *std.ArrayList(u64)) !void {
+fn referenceRuns(geometry: ChunkGeometry, cells: []const u32, levels: ?[]const u16, path_level: u16, starts: *std.ArrayList(u16), keys: *std.ArrayList(u64)) !void {
     starts.clearRetainingCapacity();
     keys.clearRetainingCapacity();
     for (cells, 0..) |cell, index| {
-        const run_key = geometry.key(if (levels) |column| column[index] else path_level, cell);
+        const run_key = chunkKey(if (levels) |column| column[index] else path_level, geometry.chunkOfCell(cell));
         if (index != 0 and keys.items[keys.items.len - 1] == run_key) continue;
         try starts.append(std.testing.allocator, @intCast(index));
         try keys.append(std.testing.allocator, run_key);
@@ -2424,7 +2404,7 @@ fn referenceRuns(geometry: RunGeometry, cells: []const u32, levels: ?[]const u16
 
 // Splits `stitched` (or a plain path when every level is `path_level`) and checks the
 // starts and shard counts against `referenceRuns`.
-fn expectRunsMatchReference(geometry: RunGeometry, stitched: []const StitchedCell, plain: bool) !void {
+fn expectRunsMatchReference(geometry: ChunkGeometry, stitched: []const StitchedCell, plain: bool) !void {
     var words: [64]u32 = undefined;
     var cells: [32]u32 = undefined;
     for (stitched, cells[0..stitched.len]) |cell, *plain_cell| plain_cell.* = cell.cell;
@@ -2446,7 +2426,7 @@ fn expectRunsMatchReference(geometry: RunGeometry, stitched: []const StitchedCel
 }
 
 // 20 x 12 cells in 4-cell chunks: five chunks per row.
-const test_run_geometry = RunGeometry{ .width = 20, .chunk_shift = 2, .chunks_x = 5 };
+const test_run_geometry = ChunkGeometry.init(20, 12, 4);
 
 fn testCell(x: u32, y: u32) u32 {
     return y * 20 + x;

@@ -13,16 +13,16 @@ const simd = @import("../../../core/simd.zig");
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const types = @import("types.zig");
-const PathQueryKey = types.PathQueryKey;
-const StitchedCell = types.StitchedCell;
-const StitchedView = types.StitchedView;
-const PathResult = types.PathResult;
-const PathfindingStats = types.PathfindingStats;
-const ListResize = types.ListResize;
-const OwnerOp = types.OwnerOp;
-const no_owner = types.no_owner;
-const hashPathKey = types.hashPathKey;
-const emptyKey = types.emptyKey;
+const PathQueryKey = @import("types.zig").PathQueryKey;
+const StitchedCell = @import("types.zig").StitchedCell;
+const StitchedView = @import("types.zig").StitchedView;
+const PathResult = @import("types.zig").PathResult;
+const PathfindingStats = @import("types.zig").PathfindingStats;
+const ListResize = @import("types.zig").ListResize;
+const OwnerOp = @import("types.zig").OwnerOp;
+const no_owner = @import("types.zig").no_owner;
+const hashPathKey = @import("types.zig").hashPathKey;
+const emptyKey = @import("types.zig").emptyKey;
 
 // Forward window probed around a per-agent waypoint hint before falling back to a full
 // path scan. Agents walk a shared goal-keyed path monotonically (~1 cell/step), so the
@@ -32,11 +32,9 @@ const waypoint_hint_window: usize = 8;
 
 // Generic fixed-capacity, open-addressed (linear-probe) table keyed by PathQueryKey with
 // back-shift deletion. Full tables drop new inserts instead of allocating during the
-// fixed-step update. Backs both the pending KeySet (Payload = void) and the
-// group-key -> requests-index map (Payload = u16). CacheCore below re-implements this
-// same probe-walk/back-shift shape rather than composing over this table, because its
-// entries also carry owner ids, claim marks, and owner-log ops ProbeTable has no notion
-// of; the two copies are kept in sync by hand, not shared code.
+// fixed-step update. Backs both the pending KeySet (Payload = void) and the goal-key ->
+// index maps (Payload = u32). CacheCore shares its probe walk and back-shift removal
+// (`probeFind`, `probeRemoveAt`).
 //
 // The physical slot array is 2x the LOGICAL capacity (inserts stop at logical), so
 // occupancy never exceeds 50% and every probe chain — hit or miss — terminates at an
@@ -90,18 +88,7 @@ fn ProbeTable(comptime Payload: type) type {
         }
 
         fn findIndex(self: *const Self, key: PathQueryKey) ?usize {
-            const capacity = self.slots.items.len;
-            if (capacity == 0) return null;
-            const start = hashPathKey(key) % capacity;
-            for (0..capacity) |probe| {
-                const index = (start + probe) % capacity;
-                const slot = self.slots.items[index];
-                if (slot.occupied and std.meta.eql(slot.key, key)) return index;
-                // Chains are contiguous (back-shift deletion) and the table is never
-                // more than half full, so the first empty slot ends this key's chain.
-                if (!slot.occupied) return null;
-            }
-            return null;
+            return probeFind(Slot, self.slots.items, key);
         }
 
         fn payloadOf(self: *const Self, key: PathQueryKey) ?Payload {
@@ -138,39 +125,10 @@ fn ProbeTable(comptime Payload: type) type {
             self.slots.items[index].payload = payload;
         }
 
-        // Removes a key using back-shift deletion so probe chains stay contiguous (an
-        // ordinary clear-and-leave-empty would strand later entries behind the gap).
         fn remove(self: *Self, key: PathQueryKey) void {
-            const capacity = self.slots.items.len;
-            if (capacity == 0) return;
-            const start = hashPathKey(key) % capacity;
-            var hole: usize = capacity; // sentinel: not found
-            for (0..capacity) |probe| {
-                const index = (start + probe) % capacity;
-                const slot = self.slots.items[index];
-                if (!slot.occupied) return; // chain end; key not present
-                if (std.meta.eql(slot.key, key)) {
-                    hole = index;
-                    break;
-                }
-            }
-            if (hole == capacity) return;
-            self.slots.items[hole].occupied = false;
+            const index = self.findIndex(key) orelse return;
+            probeRemoveAt(Slot, self.slots.items, index);
             self.len -= 1;
-            // Pull up subsequent entries that can fill the gap without becoming unreachable.
-            const initial_hole = hole;
-            var probe: usize = initial_hole;
-            while (true) {
-                probe = (probe + 1) % capacity;
-                if (probe == initial_hole) break;
-                const slot = self.slots.items[probe];
-                if (!slot.occupied) break;
-                const home = hashPathKey(slot.key) % capacity;
-                if (inCyclicRange(hole, probe, home)) continue;
-                self.slots.items[hole] = slot;
-                self.slots.items[probe].occupied = false;
-                hole = probe;
-            }
         }
     };
 }
@@ -207,12 +165,11 @@ pub const KeySet = struct {
     }
 };
 
-// Fixed-capacity linear-probe map from goal key to group_requests slot index.
-// Enables O(1) lookup in recordGroupRequest instead of an O(N) linear scan. Maps a key to
-// the dense ArrayList index in group_requests, stable until a swapRemove touches it (see
-// updateIndex).
+/// Fixed-capacity linear-probe map from goal key to a dense index (a group tally's, or a
+/// group field's slot): O(1) lookup instead of a linear scan. An index stays valid until
+/// its owner moves the entry (`updateIndex`) or drops it (`remove`).
 pub const GroupKeyMap = struct {
-    table: ProbeTable(u16) = .{},
+    table: ProbeTable(u32) = .{},
 
     pub fn deinit(self: *GroupKeyMap, allocator: std.mem.Allocator) void {
         self.table.deinit(allocator);
@@ -226,23 +183,21 @@ pub const GroupKeyMap = struct {
         self.table.clear();
     }
 
-    // Returns the stored group_requests index for this key, or null if absent.
+    /// The index stored for `key`, or null if absent.
     pub fn find(self: *const GroupKeyMap, key: PathQueryKey) ?usize {
-        const group_index = self.table.payloadOf(key) orelse return null;
-        return group_index;
+        const index = self.table.payloadOf(key) orelse return null;
+        return index;
     }
 
-    // Maps key → group_requests index. Returns false when the map is full. group_index
-    // fits u16: group_requests is capped at max_solved_requests_per_step, itself clamped
-    // to default_max_solves_per_frame (512), far under u16's range.
-    pub fn insert(self: *GroupKeyMap, key: PathQueryKey, group_index: usize) bool {
-        return self.table.put(key, @intCast(group_index));
+    /// Maps `key` to `index`; false when the map is full and `key` absent. Indices are
+    /// below the owner's list length, which a reserve keeps far under 2^32.
+    pub fn insert(self: *GroupKeyMap, key: PathQueryKey, index: usize) bool {
+        return self.table.put(key, @intCast(index));
     }
 
-    // Updates the stored index for a key that moved due to a swapRemove. See insert for
-    // why new_group_index always fits u16.
-    pub fn updateIndex(self: *GroupKeyMap, key: PathQueryKey, new_group_index: usize) void {
-        self.table.update(key, @intCast(new_group_index));
+    /// Updates the index of a key whose entry moved (a swapRemove).
+    pub fn updateIndex(self: *GroupKeyMap, key: PathQueryKey, index: usize) void {
+        self.table.update(key, @intCast(index));
     }
 
     pub fn remove(self: *GroupKeyMap, key: PathQueryKey) void {
@@ -294,7 +249,7 @@ fn CacheCore(comptime Extra: type) type {
         };
 
         /// A resize's storage, allocated before any entry moves.
-        pub const Resize = struct {
+        const Resize = struct {
             capacity: usize,
             slots: std.ArrayList(ProbeSlot) = .empty,
             records: ListResize(Record) = .{},
@@ -334,18 +289,7 @@ fn CacheCore(comptime Extra: type) type {
         }
 
         pub fn slotIndex(self: *const Self, key: PathQueryKey) ?usize {
-            const capacity = self.slots.items.len;
-            if (capacity == 0) return null;
-            const start = hashPathKey(key) % capacity;
-            for (0..capacity) |probe| {
-                const index = (start + probe) % capacity;
-                const slot = self.slots.items[index];
-                if (slot.occupied and std.meta.eql(slot.key, key)) return index;
-                // Chains are contiguous (back-shift deletion) and the table is at most half
-                // full, so the first empty slot ends this key's chain.
-                if (!slot.occupied) return null;
-            }
-            return null;
+            return probeFind(ProbeSlot, self.slots.items, key);
         }
 
         /// The owner id of `key`'s entry, or null.
@@ -443,28 +387,13 @@ fn CacheCore(comptime Extra: type) type {
         /// deletion keeps every probe chain contiguous; only probe slots move. The record's
         /// `extra` is left for the owner to release.
         pub fn removeAt(self: *Self, index: usize) void {
-            const capacity = self.slots.items.len;
             const owner = self.slots.items[index].payload_index;
             self.records.items[owner].live = false;
             std.debug.assert(self.free.items.len < self.free.capacity);
             self.free.appendAssumeCapacity(owner);
             self.logOp(.{ .old = owner, .new = no_owner });
-            self.slots.items[index].occupied = false;
+            probeRemoveAt(ProbeSlot, self.slots.items, index);
             self.len -= 1;
-            var hole = index;
-            var probe = index;
-            while (true) {
-                probe = (probe + 1) % capacity;
-                if (probe == index) break;
-                const slot = self.slots.items[probe];
-                if (!slot.occupied) break;
-                const home = hashPathKey(slot.key) % capacity;
-                // An entry whose home lies cyclically within (hole, probe] stays.
-                if (inCyclicRange(hole, probe, home)) continue;
-                self.slots.items[hole] = slot;
-                self.slots.items[probe].occupied = false;
-                hole = probe;
-            }
         }
 
         /// Empties the cache and its owner log, keeping storage. O(capacity).
@@ -492,7 +421,7 @@ fn CacheCore(comptime Extra: type) type {
 
         /// Allocates a resize to `capacity` (probe table, records, free list, owner log)
         /// without moving any entry. Undo with `abortResize`.
-        pub fn prepareResize(self: *Self, allocator: std.mem.Allocator, capacity: usize) !Resize {
+        fn prepareResize(self: *Self, allocator: std.mem.Allocator, capacity: usize) !Resize {
             var resize = Resize{ .capacity = capacity };
             try resize.slots.ensureTotalCapacityPrecise(allocator, capacity *| 2);
             errdefer resize.slots.deinit(allocator);
@@ -513,7 +442,7 @@ fn CacheCore(comptime Extra: type) type {
             return resize;
         }
 
-        pub fn abortResize(_: *Self, allocator: std.mem.Allocator, resize: *Resize) void {
+        fn abortResize(_: *Self, allocator: std.mem.Allocator, resize: *Resize) void {
             if (resize.log_replacement) |*replacement| replacement.deinit(allocator);
             resize.free.abort(allocator);
             resize.keys.abort(allocator);
@@ -527,7 +456,7 @@ fn CacheCore(comptime Extra: type) type {
         /// `capacity` into the lowest free record below it, renaming the owner (calling
         /// `context.moveRecord(from, to)`). Then the free list and probe table are rebuilt
         /// from the records. O(old capacity + new capacity), no sort.
-        pub fn commitResize(self: *Self, allocator: std.mem.Allocator, resize: *Resize, step: u32, context: anytype) void {
+        fn commitResize(self: *Self, allocator: std.mem.Allocator, resize: *Resize, step: u32, context: anytype) void {
             const old_capacity = self.logical_capacity;
             const capacity = resize.capacity;
             if (capacity < old_capacity) {
@@ -637,7 +566,7 @@ const EvictThreshold = struct {
 
 /// Whether a resize kept the cache's entries or rebuilt it empty (a stripe width change
 /// or the first reserve).
-pub const ReserveOutcome = enum { kept, rebuilt };
+const ReserveOutcome = enum { kept, rebuilt };
 
 /// One stored path a shrink moves from a record or long block past the new capacity into
 /// one below it. Distinct moves touch distinct sources and destinations.
@@ -1080,6 +1009,43 @@ const SlotPayload = struct {
 
 comptime {
     std.debug.assert(@sizeOf(SlotPayload) == 20);
+}
+
+// The slot of `key` in an open-addressed table at load <= 1/2 with back-shift deletion
+// (`ProbeTable`, `CacheCore`), or null: chains are contiguous, so the first empty slot ends
+// the key's chain.
+fn probeFind(comptime Slot: type, slots: []const Slot, key: PathQueryKey) ?usize {
+    const capacity = slots.len;
+    if (capacity == 0) return null;
+    const start = hashPathKey(key) % capacity;
+    for (0..capacity) |probe| {
+        const index = (start + probe) % capacity;
+        const slot = slots[index];
+        if (slot.occupied and std.meta.eql(slot.key, key)) return index;
+        if (!slot.occupied) return null;
+    }
+    return null;
+}
+
+// Empties occupied slot `index` with back-shift deletion: later entries of its chain whose
+// home does not lie cyclically within (hole, probe] move into the gap, so every chain stays
+// contiguous (a plain clear would strand them behind it).
+fn probeRemoveAt(comptime Slot: type, slots: []Slot, index: usize) void {
+    const capacity = slots.len;
+    slots[index].occupied = false;
+    var hole = index;
+    var probe = index;
+    while (true) {
+        probe = (probe + 1) % capacity;
+        if (probe == index) break;
+        const slot = slots[probe];
+        if (!slot.occupied) break;
+        const home = hashPathKey(slot.key) % capacity;
+        if (inCyclicRange(hole, probe, home)) continue;
+        slots[hole] = slot;
+        slots[probe].occupied = false;
+        hole = probe;
+    }
 }
 
 // Inserts a live slot into a rebuilt probe table at the first empty slot of its chain.

@@ -1355,7 +1355,7 @@ fn navSizeConfig(side: u16, levels: usize, participant_count: usize, batch: suit
 // The connectivity and one-way closure blocks of one nav reaction's stats, with the flood
 // tuner's policy when the case runs it adaptive.
 fn navConnSummary(stats: NavUpdateStats, system: *const PathfindingSystem, case: suite.BenchmarkCase) suite.NavConnSummary {
-    const tuner = system.nav_tuners.getPtrConst(.conn_flood).report();
+    const tuner = system.tuners.nav.getPtrConst(.conn_flood).report();
     var summary = suite.NavConnSummary{
         .seed = suite.batchSummaryFromBatch(stats.conn_seed_batch),
         .gather = suite.batchSummaryFromBatch(stats.conn_gather_batch),
@@ -1399,17 +1399,17 @@ fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, ca
 // config; nav stage items are independent, one per range for the fixed controls.
 fn setNavStageControls(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
     const tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    system.nav_mark_tuner = tuner;
-    system.nav_tuners = .initFill(tuner);
+    system.tuners.nav_mark = tuner;
+    system.tuners.nav = .initFill(tuner);
     system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1 };
 }
 
 // `reaction`: the workload runs the post-commit reaction, so its mark stage dispatches too.
 fn navStageTunersSettled(system: *const PathfindingSystem, reaction: bool) bool {
-    return (!reaction or system.nav_mark_tuner.isSettled()) and system.nav_tuners.getPtrConst(.plan).isSettled() and
-        system.nav_tuners.getPtrConst(.remask).isSettled() and system.nav_tuners.getPtrConst(.patch).isSettled() and
-        system.nav_tuners.getPtrConst(.conn_seed).isSettled() and system.nav_tuners.getPtrConst(.conn_gather).isSettled() and
-        (system.nav_tuners.getPtrConst(.conn_flood).isSettled() or system.graph.connectivity.last_flood_batch.item_count == 0);
+    return (!reaction or system.tuners.nav_mark.isSettled()) and system.tuners.nav.getPtrConst(.plan).isSettled() and
+        system.tuners.nav.getPtrConst(.remask).isSettled() and system.tuners.nav.getPtrConst(.patch).isSettled() and
+        system.tuners.nav.getPtrConst(.conn_seed).isSettled() and system.tuners.nav.getPtrConst(.conn_gather).isSettled() and
+        (system.tuners.nav.getPtrConst(.conn_flood).isSettled() or system.graph.connectivity.last_flood_batch.item_count == 0);
 }
 
 fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
@@ -1477,8 +1477,8 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
             if (workload == .ramp) try resetNavRamps(&nav);
         }
     }
-    const remask_settled = if (case.adaptive) nav.system.nav_tuners.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) nav.system.nav_tuners.getPtrConst(.patch).isSettled() else false;
+    const remask_settled = if (case.adaptive) nav.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
+    const patch_settled = if (case.adaptive) nav.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
     var accumulator = suite.StatsAccumulator.init(item_count);
     var cells_changed: usize = 0;
     // The last timed reaction, read before the ramp reset's reaction replaces it.
@@ -1502,8 +1502,8 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.nav_plan_batch = suite.batchSummaryFromBatch(timed_stats.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(timed_stats.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(nav.system.nav_tuners.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(nav.system.nav_tuners.getPtrConst(.patch).report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(nav.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(nav.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
     }
     return stats;
 }
@@ -1774,8 +1774,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
             _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &unused_timing);
         }
     }
-    const remask_settled = if (case.adaptive) system.nav_tuners.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) system.nav_tuners.getPtrConst(.patch).isSettled() else false;
+    const remask_settled = if (case.adaptive) system.tuners.nav.getPtrConst(.remask).isSettled() else false;
+    const patch_settled = if (case.adaptive) system.tuners.nav.getPtrConst(.patch).isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var plan_total: u128 = 0;
@@ -1823,8 +1823,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.nav_tuners.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(system.nav_tuners.getPtrConst(.patch).report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
     }
     return stats;
 }

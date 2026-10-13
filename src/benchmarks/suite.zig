@@ -1067,7 +1067,7 @@ fn printValidationSummary(
             );
         } else if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
             std.debug.print(
-                "workload fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}. ",
+                "workload solve_admissions={} admission_deferred={} deferred={} results={} evictions={}. ",
                 .{ best.stats.candidate_pairs, best.stats.fallback_deferred_count, best.stats.deferred_count, best.stats.output_count, best.stats.cache_evictions },
             );
         } else if (std.mem.startsWith(u8, group_name, "collision-response")) {
@@ -1408,7 +1408,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
         return std.fmt.bufPrint(
             buffer,
-            "fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}",
+            "solve_admissions={} admission_deferred={} deferred={} results={} evictions={}",
             .{ stats.candidate_pairs, stats.fallback_deferred_count, stats.deferred_count, stats.output_count, stats.cache_evictions },
         ) catch "workload";
     }
@@ -2174,7 +2174,7 @@ test "benchmark table formatters keep compact text" {
         }),
     );
     try std.testing.expectEqualStrings(
-        "fallback_requests=4 fallback_deferred=2 deferred=2 results=4 evictions=1",
+        "solve_admissions=4 admission_deferred=2 deferred=2 results=4 evictions=1",
         formatWorkloadInto(&range_buffer, "pathfinding-hard-fallback-budget", .{
             .candidate_pairs = 4,
             .fallback_deferred_count = 2,

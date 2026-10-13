@@ -12,17 +12,70 @@ const std = @import("std");
 const types = @import("types.zig");
 const PortalFlags = @import("nav_graph.zig").PortalFlags;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
-const OpenNode = types.OpenNode;
-const StitchedCell = types.StitchedCell;
-const unreachable_cost = types.unreachable_cost;
-const no_slot = types.no_slot;
-const max_stamp_generation = types.max_stamp_generation;
-const openHeapLimit = types.openHeapLimit;
-const fibonacciSlot = types.fibonacciSlot;
-const hashTableSlots = types.hashTableSlots;
-const hashTableShift = types.hashTableShift;
+const OpenNode = @import("types.zig").OpenNode;
+const StitchedCell = @import("types.zig").StitchedCell;
+const unreachable_cost = @import("types.zig").unreachable_cost;
+const no_slot = @import("types.zig").no_slot;
+const max_stamp_generation = @import("types.zig").max_stamp_generation;
+const openHeapLimit = @import("types.zig").openHeapLimit;
+const fibonacciSlot = @import("types.zig").fibonacciSlot;
+const hashTableSlots = @import("types.zig").hashTableSlots;
+const hashTableShift = @import("types.zig").hashTableShift;
 
-pub const AbstractSlotFlags = packed struct(u8) {
+// The generation-stamped open-addressed table both search scratches keep: a slot is live
+// this generation when `stamp >> 1 == generation` (bit 0 marks it closed), so a reset is
+// O(1) outside the wraparound. Linear probe at load <= 1/2 (`hashTableSlots`), so every
+// chain ends at a slot of another generation.
+fn StampedTable(comptime Slot: type, comptime key_field: []const u8) type {
+    const Key = @FieldType(Slot, key_field);
+    return struct {
+        const Claim = struct {
+            slot: u32,
+            fresh: bool,
+        };
+
+        // A zeroed table for `limit` keys and its probe shift; allocates before the caller
+        // replaces anything.
+        fn alloc(allocator: std.mem.Allocator, limit: usize) error{OutOfMemory}!struct { slots: []Slot, shift: u6 } {
+            const slot_count = try hashTableSlots(limit);
+            const slots = try allocator.alloc(Slot, slot_count);
+            @memset(std.mem.sliceAsBytes(slots), 0);
+            return .{ .slots = slots, .shift = hashTableShift(slot_count) };
+        }
+
+        // Moves to the next generation, clearing every stamp on the wrap.
+        fn advance(slots: []Slot, generation: *u32) void {
+            if (generation.* == max_stamp_generation) {
+                @memset(std.mem.sliceAsBytes(slots), 0);
+                generation.* = 1;
+            } else {
+                generation.* += 1;
+            }
+        }
+
+        // The slot of `key` this generation, claiming it (`init(key, stamp)`) on first touch
+        // while `used` is below `budget`; null when a claim would pass the budget. A touched
+        // key always resolves. Scalar probe: about 1.5 slots per hit and 2.5 per miss at load
+        // <= 1/2, and `budget <= slots.len / 2` leaves a free slot on every chain.
+        inline fn claim(slots: []Slot, shift: u6, generation: u32, used: *usize, budget: usize, key: Key, comptime init: fn (Key, u32) Slot) ?Claim {
+            const slot_mask = slots.len - 1;
+            var index = fibonacciSlot(key, shift);
+            while (true) : (index = (index + 1) & slot_mask) {
+                const slot = &slots[index];
+                if (slot.stamp >> 1 == generation) {
+                    if (@field(slot, key_field) == key) return .{ .slot = @intCast(index), .fresh = false };
+                    continue;
+                }
+                if (used.* >= budget) return null;
+                used.* += 1;
+                slot.* = init(key, generation << 1);
+                return .{ .slot = @intCast(index), .fresh = true };
+            }
+        }
+    };
+}
+
+const AbstractSlotFlags = packed struct(u8) {
     // The slot's best parent edge is a cross-level or teleport link.
     via_link: bool = false,
     // `portal_label`/`portal_flags` hold the node's chunk portal.
@@ -50,11 +103,14 @@ pub const AbstractSlot = extern struct {
     }
 };
 
+const AbstractTable = StampedTable(AbstractSlot, "node");
+
 /// A `slotFor` result: the node's slot and whether this call claimed it.
-pub const AbstractClaim = struct {
-    slot: u32,
-    fresh: bool,
-};
+const AbstractClaim = AbstractTable.Claim;
+
+fn freshAbstractSlot(node: usize, stamp: u32) AbstractSlot {
+    return .{ .node = node, .stamp = stamp, .g = unreachable_cost, .parent = no_slot, .x = 0, .y = 0, .portal_label = 0, .portal_flags = .{}, .flags = .{} };
+}
 
 // Budget-bounded A* over abstract portal nodes keyed by a packed (level << 32) | cell ref,
 // in an open-addressed table of `hashTableSlots(node_limit)` rows, so memory follows the
@@ -94,23 +150,21 @@ pub const AbstractScratch = struct {
     /// Sizes the table and lists for `max_abstract_nodes`. A no-op at the reserved size;
     /// otherwise the new table is allocated before anything changes, so an out-of-memory
     /// leaves the scratch as it was.
-    pub fn reserve(self: *AbstractScratch, allocator: std.mem.Allocator, max_abstract_nodes: usize) !void {
-        const slot_count = try hashTableSlots(max_abstract_nodes);
-        if (self.slots.len == slot_count and self.node_limit == max_abstract_nodes) return;
+    pub fn reserve(self: *AbstractScratch, allocator: std.mem.Allocator, max_abstract_nodes: usize) error{OutOfMemory}!void {
+        if (self.slots.len == try hashTableSlots(max_abstract_nodes) and self.node_limit == max_abstract_nodes) return;
         // Headroom above the distinct-node budget: relaxAbstractNode pushes a fresh entry
         // on every g-improvement, so the live heap holds stale duplicates the slot table
         // does not. Sizing it past the budget keeps a sub-budget search from
         // false-saturating on a full heap.
         const open_limit = openHeapLimit(max_abstract_nodes);
-        const slots = try allocator.alloc(AbstractSlot, slot_count);
-        errdefer allocator.free(slots);
+        const table = try AbstractTable.alloc(allocator, max_abstract_nodes);
+        errdefer allocator.free(table.slots);
         try self.open.ensureTotalCapacity(allocator, open_limit);
         try self.corridor.ensureTotalCapacity(allocator, max_abstract_nodes);
         try self.corridor_link.ensureTotalCapacity(allocator, max_abstract_nodes);
         allocator.free(self.slots);
-        self.slots = slots;
-        @memset(std.mem.sliceAsBytes(self.slots), 0);
-        self.slot_shift = hashTableShift(slot_count);
+        self.slots = table.slots;
+        self.slot_shift = table.shift;
         self.generation = 1;
         self.nodes_used = 0;
         // Physical list capacity is grow-only, so a smaller re-reserve lowers the limits
@@ -133,12 +187,7 @@ pub const AbstractScratch = struct {
         self.corridor.clearRetainingCapacity();
         self.corridor_link.clearRetainingCapacity();
         self.nodes_used = 0;
-        if (self.generation == max_stamp_generation) {
-            @memset(std.mem.sliceAsBytes(self.slots), 0);
-            self.generation = 1;
-        } else {
-            self.generation += 1;
-        }
+        AbstractTable.advance(self.slots, &self.generation);
     }
 
     /// The slot of `node`, claiming it on first touch this generation (cost unreachable, no
@@ -146,32 +195,7 @@ pub const AbstractScratch = struct {
     /// `node_budget`; a touched node always resolves.
     pub fn slotFor(self: *AbstractScratch, node: usize) ?AbstractClaim {
         std.debug.assert(self.slots.len != 0 and self.node_budget <= self.node_limit);
-        const slots = self.slots;
-        const slot_mask = slots.len - 1;
-        // Scalar probe: about 1.5 slots per hit and 2.5 per miss at load <= 1/2, and
-        // `node_budget <= node_limit <= slots.len / 2` leaves a free slot on every chain.
-        var index = fibonacciSlot(node, self.slot_shift);
-        while (true) : (index = (index + 1) & slot_mask) {
-            const slot = &slots[index];
-            if (slot.stamp >> 1 == self.generation) {
-                if (slot.node == node) return .{ .slot = @intCast(index), .fresh = false };
-                continue;
-            }
-            if (self.nodes_used >= self.node_budget) return null;
-            self.nodes_used += 1;
-            slot.* = .{
-                .node = node,
-                .stamp = self.generation << 1,
-                .g = unreachable_cost,
-                .parent = no_slot,
-                .x = 0,
-                .y = 0,
-                .portal_label = 0,
-                .portal_flags = .{},
-                .flags = .{},
-            };
-            return .{ .slot = @intCast(index), .fresh = true };
-        }
+        return AbstractTable.claim(self.slots, self.slot_shift, self.generation, &self.nodes_used, self.node_budget, node, freshAbstractSlot);
     }
 };
 
@@ -232,6 +256,12 @@ pub const SearchSlot = extern struct {
     }
 };
 
+const SearchTable = StampedTable(SearchSlot, "cell");
+
+fn freshSearchSlot(cell: u32, stamp: u32) SearchSlot {
+    return .{ .cell = cell, .stamp = stamp, .g = unreachable_cost, .parent = no_slot };
+}
+
 pub const SearchScratch = struct {
     // One scratch slot per ThreadSystem participant. The local A* node state lives in an
     // open-addressed table of `hashTableSlots(max_explored_nodes)` rows keyed by cell, so
@@ -242,11 +272,7 @@ pub const SearchScratch = struct {
     // Aligned to `thread_shared_record_alignment` (and so padded to whole 64 B lines): the
     // per-participant slots sit contiguously in `PathfindingSystem.scratch_slots` and each
     // worker writes its own slot's counters (generation, explored, open/path lengths,
-    // abstract counters) on every node. Unaligned, adjacent slots' hot fields share a line
-    // and false-share across workers, so threaded solve throughput swung with this struct's
-    // size. 64, not `std.atomic.cache_line` (128 on x86_64): the ReleaseFast
-    // `pathfinding --items 512` bench measured no gain from 128, matching the engine-wide
-    // per-slot rule.
+    // abstract counters) on every node, so unaligned adjacent slots would false-share.
     generation: u32 align(thread_shared_record_alignment) = 1,
     // Per-solve count of distinct cells claimed this generation, bounded by the node
     // budget so a long-range solve spills instead of fully exploring the grid.
@@ -290,24 +316,22 @@ pub const SearchScratch = struct {
     /// abstract and stitched caps. A no-op at the reserved sizes; otherwise each table is
     /// allocated before it replaces the old one, so an out-of-memory leaves every table
     /// consistent with its own logical limits.
-    pub fn reserve(self: *SearchScratch, allocator: std.mem.Allocator, max_explored_nodes: usize, max_abstract_nodes: usize, max_stitched_path_cells: usize) !void {
+    pub fn reserve(self: *SearchScratch, allocator: std.mem.Allocator, max_explored_nodes: usize, max_abstract_nodes: usize, max_stitched_path_cells: usize) error{OutOfMemory}!void {
         try self.corridor.reserve(allocator, max_abstract_nodes, max_stitched_path_cells);
-        const slot_count = try hashTableSlots(max_explored_nodes);
-        if (self.slots.len == slot_count and self.explored_limit == max_explored_nodes) return;
+        if (self.slots.len == try hashTableSlots(max_explored_nodes) and self.explored_limit == max_explored_nodes) return;
         // Open-heap headroom over the distinct-cell budget (see open_heap_headroom_factor):
         // localAStar pushes a fresh entry per g-improvement and removes the superseded one
         // only lazily on pop, so the heap must hold more than the distinct-cell count or a
         // sub-budget search false-spills on a full heap. explored_limit stays the cap.
         const open_limit = openHeapLimit(max_explored_nodes);
-        const slots = try allocator.alloc(SearchSlot, slot_count);
-        errdefer allocator.free(slots);
+        const table = try SearchTable.alloc(allocator, max_explored_nodes);
+        errdefer allocator.free(table.slots);
         try self.open.ensureTotalCapacity(allocator, open_limit);
         // A parent chain holds at most one cell per claimed node; a start == goal path one.
         try self.path_scratch.ensureTotalCapacity(allocator, @max(@as(usize, 1), max_explored_nodes));
         allocator.free(self.slots);
-        self.slots = slots;
-        @memset(std.mem.sliceAsBytes(self.slots), 0);
-        self.slot_shift = hashTableShift(slot_count);
+        self.slots = table.slots;
+        self.slot_shift = table.shift;
         self.generation = 1;
         self.explored = 0;
         self.explored_limit = max_explored_nodes;
@@ -321,37 +345,17 @@ pub const SearchScratch = struct {
     pub fn reset(self: *SearchScratch) void {
         self.open.clearRetainingCapacity();
         self.explored = 0;
-        if (self.generation == max_stamp_generation) {
-            @memset(std.mem.sliceAsBytes(self.slots), 0);
-            self.generation = 1;
-        } else {
-            self.generation += 1;
-        }
+        SearchTable.advance(self.slots, &self.generation);
     }
 
     /// The slot of `cell`, claiming it on first touch this generation (cost unreachable,
     /// open, no parent). Null only when claiming a new cell would pass the node budget (the
     /// spill cap); a touched cell always resolves, so reopening a cell never spills.
     pub fn slotFor(self: *SearchScratch, cell: usize) ?u32 {
-        std.debug.assert(self.slots.len != 0);
+        std.debug.assert(self.slots.len != 0 and self.explored_budget <= self.explored_limit);
         // A validated level's cell indices are below maxInt(u32).
-        const key: u32 = @intCast(cell);
-        const slots = self.slots;
-        const slot_mask = slots.len - 1;
-        // Scalar probe: about 1.5 slots per hit and 2.5 per miss at load <= 1/2, and
-        // `explored_budget <= slots.len / 2` leaves a free slot on every chain.
-        var index = fibonacciSlot(key, self.slot_shift);
-        while (true) : (index = (index + 1) & slot_mask) {
-            const slot = &slots[index];
-            if (slot.stamp >> 1 == self.generation) {
-                if (slot.cell == key) return @intCast(index);
-                continue;
-            }
-            if (self.explored >= self.explored_budget) return null;
-            self.explored += 1;
-            slot.* = .{ .cell = key, .stamp = self.generation << 1, .g = unreachable_cost, .parent = no_slot };
-            return @intCast(index);
-        }
+        const claimed = SearchTable.claim(self.slots, self.slot_shift, self.generation, &self.explored, self.explored_budget, @intCast(cell), freshSearchSlot) orelse return null;
+        return claimed.slot;
     }
 };
 
