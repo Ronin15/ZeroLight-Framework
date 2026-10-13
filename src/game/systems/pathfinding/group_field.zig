@@ -10,9 +10,9 @@ const std = @import("std");
 const math = @import("../../../core/math.zig");
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const allowed_moves = @import("nav_grid.zig").allowed_moves;
-const testBit = @import("nav_grid.zig").testBit;
-const setBit = @import("nav_grid.zig").setBit;
-const clearBit = @import("nav_grid.zig").clearBit;
+const bitIsSet = @import("../../world_terrain.zig").bitIsSet;
+const setBit = @import("../../world_terrain.zig").setBit;
+const clearBit = @import("../../world_terrain.zig").clearBit;
 const world_terrain = @import("../../world_terrain.zig");
 const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
 const max_chunk_cells = @import("../../world_terrain.zig").max_chunk_cells;
@@ -21,12 +21,12 @@ const diagonal_cost = @import("types.zig").diagonal_cost;
 const cardinal_cost = @import("types.zig").cardinal_cost;
 const unreachable_cost = @import("types.zig").unreachable_cost;
 const no_slot = @import("types.zig").no_slot;
-const max_stamp_generation = @import("types.zig").max_stamp_generation;
+const max_stamp_generation = @import("../../stamped_table.zig").max_stamp_generation;
 const neighbor_dirs = @import("types.zig").neighbor_dirs;
 const oppositeDirIndex = @import("types.zig").oppositeDirIndex;
-const fibonacciSlot = @import("types.zig").fibonacciSlot;
-const hashTableSlots = @import("types.zig").hashTableSlots;
-const hashTableShift = @import("types.zig").hashTableShift;
+const fibonacciSlot = @import("../../stamped_table.zig").fibonacciSlot;
+const hashTableSlots = @import("../../stamped_table.zig").hashTableSlots;
+const hashTableShift = @import("../../stamped_table.zig").hashTableShift;
 const GridCell = @import("types.zig").GridCell;
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const emptyKey = @import("types.zig").emptyKey;
@@ -296,7 +296,7 @@ pub const GroupField = struct {
         if (!probe.found) return null;
         const block = self.directory[probe.row].block;
         const local = grid.geometry.localOf(x, y);
-        if (!testBit(&self.columns.costed[block], local)) return null;
+        if (!bitIsSet(&self.columns.costed[block], local)) return null;
         return .{ .cost = self.columns.cost[block][local], .flow_dir = self.columns.flow[block][local] };
     }
 
@@ -462,11 +462,11 @@ pub const GroupField = struct {
                 }
                 const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;
                 const candidate = current_cost + step_cost;
-                if (free_row == null and testBit(&columns.costed[next_block], next_local)) {
+                if (free_row == null and bitIsSet(&columns.costed[next_block], next_local)) {
                     const next_slot = slotId(next_block, next_local);
                     const existing = columns.cost[next_block][next_local];
                     if (candidate < existing) {
-                        if (testBit(&columns.queued[next_block], next_local)) bucketUnlink(columns, &buckets, next_slot, existing);
+                        if (bitIsSet(&columns.queued[next_block], next_local)) bucketUnlink(columns, &buckets, next_slot, existing);
                         columns.cost[next_block][next_local] = candidate;
                         columns.flow[next_block][next_local] = oppositeDirIndex(dir_index);
                         bucketPush(columns, &buckets, next_slot, candidate);

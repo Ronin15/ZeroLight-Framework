@@ -153,6 +153,8 @@ fn smokeTransferGrowth(renderer: *Renderer, app_config: config.AppConfig, alloca
     const store = try renderer.createTileStore(.{
         .element_capacity = larger_elements,
         .params = smokeTileParams(),
+        .chunk_shift = smoke_chunk_shift,
+        .side = smoke_directory_side,
     });
     const grows_before = renderer.tile_upload_transfer_grows;
     const bytes_before = renderer.tile_upload_transfer_byte_size;
@@ -189,7 +191,7 @@ fn submitSmokeUploadFrame(
     const count: u32 = @intCast(values.len);
     const spans = [_]TileStoreSpan{.{ .dst_element = 0, .count = count }};
     try renderer.reserveTileStoreUploads(store, count, spans.len, values.len);
-    try renderer.queueTileStoreUploads(store, &spans, values);
+    renderer.queueTileStoreUploads(store, &spans, values);
     try submitSmokeFrame(renderer, app_config, label);
 }
 
@@ -223,11 +225,13 @@ fn smokeTileUploadOom(
     const store = try renderer.createTileStore(.{
         .element_capacity = smoke_directory_elements,
         .params = smokeTileParams(),
+        .chunk_shift = smoke_chunk_shift,
+        .side = smoke_directory_side,
     });
     const batch = smokeTileBatch();
     // A carried batch no frame recorded, so the next reserve also sizes the merge.
     try renderer.reserveTileStoreUploads(store, smoke_directory_elements, 1, smoke_directory_elements);
-    try renderer.queueTileStoreUploads(store, batch.spans[0..1], batch.values[0..smoke_directory_elements]);
+    renderer.queueTileStoreUploads(store, batch.spans[0..1], batch.values[0..smoke_directory_elements]);
 
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
@@ -247,7 +251,7 @@ fn smokeTileUploadOom(
             else => return err,
         };
         const allocations = failing.allocations;
-        try renderer.queueTileStoreUploads(store, &batch.spans, &batch.values);
+        renderer.queueTileStoreUploads(store, &batch.spans, &batch.values);
         if (failing.allocations != allocations) {
             log.err("SDL_GPU smoke tile upload queue allocated after its reserve", .{});
             return error.TileUploadQueueAllocated;
@@ -283,9 +287,11 @@ fn createSmokeTileStore(renderer: *Renderer) !TileDataId {
     const tile_store = try renderer.createTileStore(.{
         .element_capacity = smoke_directory_elements,
         .params = smokeTileParams(),
+        .chunk_shift = smoke_chunk_shift,
+        .side = smoke_directory_side,
     });
     try renderer.reserveTileStoreUploads(tile_store, smoke_block + smoke_block_elements, batch.spans.len, batch.values.len);
-    try renderer.queueTileStoreUploads(tile_store, &batch.spans, &batch.values);
+    renderer.queueTileStoreUploads(tile_store, &batch.spans, &batch.values);
     return tile_store;
 }
 
@@ -321,15 +327,16 @@ fn smokeTileBatch() SmokeTileBatch {
 }
 
 fn smokeTileParams() TilemapParams {
-    var tile_params = TilemapParams{
+    return .{
         .grid = .{ 16.0, 3.0, 1.0, @floatFromInt(smoke_invalid_tile_id) },
         .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
         .window = .{ 0, 0, 1, 1 },
     };
-    tile_params.layer_meta[2] = @ctz(smoke_chunk_edge);
-    tile_params.layer_meta[3] = 1;
-    return tile_params;
 }
+
+// The smoke store layout: 4-cell chunks in a directory of side 1.
+const smoke_chunk_shift: u4 = @ctz(smoke_chunk_edge);
+const smoke_directory_side: u32 = 1;
 
 // A 12x4 grid in three 4x4-cell chunks, one layer in a directory of side 2 at 0
 // with the window over chunks 1 and 2: chunk 1 at word 1 is uniform, chunk 2 wraps
@@ -353,19 +360,19 @@ fn createSmokeWrapTileStore(renderer: *Renderer) !TileDataId {
         .{ .dst_element = 0, .count = 5 },
         .{ .dst_element = block, .count = block_elements },
     };
-    var tile_params = TilemapParams{
+    const tile_params = TilemapParams{
         .grid = .{ 16.0, 12.0, 4.0, @floatFromInt(invalid_tile_id) },
         .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
         .window = .{ 1, 0, 3, 1 },
     };
-    tile_params.layer_meta[2] = @ctz(chunk_edge);
-    tile_params.layer_meta[3] = 2;
     const tile_store = try renderer.createTileStore(.{
         .element_capacity = block + block_elements,
         .params = tile_params,
+        .chunk_shift = @ctz(chunk_edge),
+        .side = 2,
     });
     try renderer.reserveTileStoreUploads(tile_store, block + block_elements, spans.len, values.len);
-    try renderer.queueTileStoreUploads(tile_store, &spans, &values);
+    renderer.queueTileStoreUploads(tile_store, &spans, &values);
     return tile_store;
 }
 

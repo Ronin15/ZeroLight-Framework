@@ -8,6 +8,7 @@
 //! publish pipeline (serial and threaded), delegating solves to solve.zig.
 
 const std = @import("std");
+const stamped_table = @import("../../stamped_table.zig");
 const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
@@ -47,7 +48,7 @@ const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavStageTuners = @import("nav_graph.zig").NavStageTuners;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const dilateChanged3x3 = @import("nav_grid.zig").dilateChanged3x3;
-const testBit = @import("nav_grid.zig").testBit;
+const bitIsSet = @import("../../world_terrain.zig").bitIsSet;
 const NavBatchResult = @import("nav_graph.zig").NavBatchResult;
 const keyLevel = @import("../chunk_list_map.zig").keyLevel;
 const keyChunk = @import("../chunk_list_map.zig").keyChunk;
@@ -2938,7 +2939,7 @@ fn runHits(cache: *const ResultCache, geometry: ChunkGeometry, owner: u32, start
             if (column[index] != level) return false;
         }
         if (cursor.x >> geometry.shift != chunk_x or cursor.y >> geometry.shift != chunk_y) return false;
-        if (testBit(dilated, geometry.localOf(cursor.x, cursor.y))) return true;
+        if (bitIsSet(dilated, geometry.localOf(cursor.x, cursor.y))) return true;
         index += 1;
         if (index == cells.len) return false;
         cursor.moveTo(cells[index]);
@@ -5173,7 +5174,7 @@ test "nav over a world takes the world's chunk edge and tile size; a world-less 
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     // World chunk 8 and a deliberately different config: nav chunk 16, cell size 8.
-    var world = try @import("../../world_test_support.zig").demoWorldWithChunkSize(std.testing.allocator, &meta, 512, 256, 8);
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, 512, 256, 8);
     defer world.deinit();
     var capacity = baselineCapacity();
     capacity.nav_chunk_tiles = 16;
@@ -7721,7 +7722,7 @@ test "the same path explores the same nodes at 64² and 256²" {
             // Start and goal share the first 16-cell chunk: one local A* search.
             step_stats.* = try solveStep(&system, requester, tileCenter(1, 1), tileCenter(14, 13));
             step_explored.* = system.scratch_slots.items[0].explored;
-            try std.testing.expectEqual(try types.hashTableSlots(budget), system.scratch_slots.items[0].slots.len);
+            try std.testing.expectEqual(try stamped_table.hashTableSlots(budget), system.scratch_slots.items[0].slots.len);
         }
         try std.testing.expectEqual(stats[0].available_results, stats[1].available_results);
         try std.testing.expectEqual(stats[0].budget_exhausted, stats[1].budget_exhausted);
@@ -7751,12 +7752,12 @@ test "tier-1 scratch is sized per escalated solve, not per participant" {
     try std.testing.expect(tier0_nodes < capacity.max_abstract_nodes);
     for (system.scratch_slots.items) |*scratch| {
         try std.testing.expectEqual(tier0_nodes, scratch.corridor.abstract.node_limit);
-        try std.testing.expectEqual(try types.hashTableSlots(tier0_nodes), scratch.corridor.abstract.slots.len);
+        try std.testing.expectEqual(try stamped_table.hashTableSlots(tier0_nodes), scratch.corridor.abstract.slots.len);
         try std.testing.expectEqual(tier0_cells, scratch.corridor.stitched_limit);
     }
     for (system.tier1_scratch.items) |*entry| {
         try std.testing.expectEqual(capacity.max_abstract_nodes, entry.corridor.abstract.node_limit);
-        try std.testing.expectEqual(try types.hashTableSlots(capacity.max_abstract_nodes), entry.corridor.abstract.slots.len);
+        try std.testing.expectEqual(try stamped_table.hashTableSlots(capacity.max_abstract_nodes), entry.corridor.abstract.slots.len);
         try std.testing.expectEqual(capacity.max_stitched_path_cells, entry.corridor.stitched_limit);
     }
 }
@@ -9287,7 +9288,7 @@ test "keys of one shard spread over its table (bounded probe length for a dense 
     var total: usize = 0;
     var longest: usize = 0;
     for (keys.items) |key| {
-        const home = types.fibonacciSlot(key, reader.shift);
+        const home = stamped_table.fibonacciSlot(key, reader.shift);
         var distance: usize = 0;
         while (reader.keys[(home + distance) & mask] != key) distance += 1;
         total += distance;

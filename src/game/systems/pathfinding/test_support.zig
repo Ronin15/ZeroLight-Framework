@@ -20,7 +20,6 @@ const world_tileset_meta = @import("../../../assets/world_tileset_meta.zig");
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const TileId = @import("../../world_system.zig").TileId;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
-const demoWorldWithChunkSize = @import("../../world_test_support.zig").demoWorldWithChunkSize;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const NavExtent = @import("nav_graph.zig").NavExtent;
 const NavGrid = @import("nav_grid.zig").NavGrid;
@@ -107,7 +106,7 @@ pub fn abstractCapacity() PathfindingCapacity {
 // Demo-painted world whose chunk edge is `abstractCapacity`'s nav chunk, so a world-backed
 // abstract test and a world-less one share the same small multi-chunk geometry.
 pub fn abstractTestWorld(meta: *const WorldTilesetMeta, bounds_width: f32, bounds_height: f32) !WorldSystem {
-    return demoWorldWithChunkSize(std.testing.allocator, meta, bounds_width, bounds_height, abstractCapacity().nav_chunk_tiles);
+    return WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, meta, bounds_width, bounds_height, abstractCapacity().nav_chunk_tiles);
 }
 
 /// No static colliders: for applies on a nav whose levels hold no static body.

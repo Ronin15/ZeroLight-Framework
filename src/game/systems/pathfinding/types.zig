@@ -174,9 +174,6 @@ pub const unreachable_cost: u32 = std.math.maxInt(u32);
 /// Sentinel slot id of the open-addressed search and field tables: no parent, no bucket
 /// link. `hashTableSlots` keeps every real slot id below it.
 pub const no_slot: u32 = std.math.maxInt(u32);
-/// Largest generation of a table stamp `generation << 1 | flag`; the next one wraps to 1
-/// after clearing every stamp.
-pub const max_stamp_generation: u32 = std.math.maxInt(u32) >> 1;
 
 comptime {
     // The abstract search identifies a node by a packed (level << 32) | cell ref
@@ -185,7 +182,8 @@ comptime {
 }
 
 // Packs an abstract node identity: a portal cell on a level. A packed ref's top 16 bits are
-// always 0 (level is a u16), so no real packed ref equals no_parent (maxInt).
+// always 0 (level is a u16), so no real packed ref equals no_parent (maxInt). Not
+// `chunkKey`: a ref is a usize search value over a level's cells, not a chunk-tier key.
 pub fn packRef(level: u16, local: u32) usize {
     return (@as(usize, level) << 32) | local;
 }
@@ -1102,27 +1100,6 @@ pub fn hashPathKey(key: PathQueryKey) usize {
         h *%= fnv_prime;
     }
     return @intCast(h);
-}
-
-/// Home slot of `key` in a power-of-two table of `2^(64 - shift)` slots (Fibonacci
-/// hashing: the multiply spreads adjacent keys over the table).
-pub fn fibonacciSlot(key: u64, shift: u6) usize {
-    return @intCast((key *% 0x9E3779B97F4A7C15) >> shift);
-}
-
-/// Slot count of an open-addressed table holding at most `max_keys` keys at load <= 1/2:
-/// `ceilPow2(max(16, 2 * max_keys))`. Fails as out of memory when the count overflows or
-/// a slot id would not fit `u32`.
-pub fn hashTableSlots(max_keys: usize) error{OutOfMemory}!usize {
-    const slots = std.math.ceilPowerOfTwo(usize, @max(@as(usize, 16), max_keys *| 2)) catch return error.OutOfMemory;
-    if (slots > std.math.maxInt(u32)) return error.OutOfMemory;
-    return slots;
-}
-
-/// The `fibonacciSlot` shift of a power-of-two table of `slot_count` slots.
-pub fn hashTableShift(slot_count: usize) u6 {
-    std.debug.assert(std.math.isPowerOfTwo(slot_count) and slot_count >= 2);
-    return @intCast(@as(usize, 64) - std.math.log2_int(usize, slot_count));
 }
 
 pub fn emptyKey(nav_version: u32) PathQueryKey {

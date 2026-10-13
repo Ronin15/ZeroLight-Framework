@@ -100,6 +100,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     plane_traversal.group,
     plane_traversal.falls_group,
     plane_traversal.dense_falls_group,
+    plane_traversal.banded_falls_group,
     spatial_index.group,
     perception.group,
     perception.los_dense_group,

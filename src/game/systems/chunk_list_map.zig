@@ -12,7 +12,8 @@
 //! staged entry in its list's order, the sorted placement threaded per key. Outside a batch,
 //! `add` appends at a list's tail and `removeOwner`/`renameOwner` touch one owner's entries.
 //! Only the reserves allocate. Reads never mutate, so workers read lists while nothing
-//! writes.
+//! writes. `OrderedIndexSet` beside it is the one ordered set chunk-key users (nav's plan
+//! merge, the world's batch grouping) drain chunk and level indices through in order.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,7 +33,7 @@ const thread_shared_record_alignment = @import("../../app/thread_system.zig").th
 pub const no_entry: u32 = std.math.maxInt(u32);
 /// A key's value when none is set, and the value of an absent key.
 pub const no_value: u32 = std.math.maxInt(u32);
-// No valid key sets both tier bits (62-63), so all-ones marks an empty table slot.
+// No valid key sets both of bits 62-63, so all-ones marks an empty table slot.
 const empty_key: u64 = std.math.maxInt(u64);
 const min_slot_count: usize = 16;
 // `slot_touch` value of a slot no batch has touched since the table was built.
@@ -52,6 +53,125 @@ pub fn keyLevel(key: u64) u16 {
 /// The level-local chunk index of chunk key `key`.
 pub fn keyChunk(key: u64) u32 {
     return @truncate(key);
+}
+
+/// A set of indices below its capacity, popped in ascending order: one std bit set per tier,
+/// each bit of a tier set exactly when its word in the tier below is nonzero, and a top tier
+/// of one word. Insert and `popMin` cost O(tiers); `isEmpty` reads the top word. std's
+/// `PriorityQueue` costs O(log n) per key and keeps repeats, and a std bit set's first-set
+/// and iterator scan from word 0, so a drain would cost a local change O(capacity / 64).
+pub const OrderedIndexSet = struct {
+    pub const Word = std.bit_set.Dynamic.MaskInt;
+    const word_bits = @bitSizeOf(Word);
+    const word_shift = std.math.log2(word_bits);
+    // Each tier divides the index width by `word_bits`, so any usize capacity summarizes to
+    // one word within this many tiers.
+    const max_tiers = (@bitSizeOf(usize) + word_shift - 1) / word_shift;
+
+    tiers: [max_tiers]std.bit_set.Dynamic = @splat(.{}),
+    tier_count: usize = 0,
+
+    // Mask words of a std bit set of `bits` bits.
+    pub fn maskCount(bits: usize) usize {
+        return (bits + word_bits - 1) / word_bits;
+    }
+
+    pub fn deinit(self: *OrderedIndexSet, allocator: std.mem.Allocator) void {
+        for (self.tiers[0..self.tier_count]) |*tier| tier.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn capacity(self: *const OrderedIndexSet) usize {
+        return self.tiers[0].capacity();
+    }
+
+    pub fn isEmpty(self: *const OrderedIndexSet) bool {
+        return self.tier_count == 0 or self.tiers[self.tier_count - 1].masks[0] == 0;
+    }
+
+    // Grows an empty set to hold indices below `needed`, geometrically; true when it grew.
+    // Builds every tier fresh and swaps them in: a tier-by-tier `resize` that failed past
+    // the first tier would leave tiers that no longer summarize each other. An error leaves
+    // the set as it was.
+    pub fn reserve(self: *OrderedIndexSet, allocator: std.mem.Allocator, needed: usize) error{OutOfMemory}!bool {
+        if (needed <= self.capacity()) return false;
+        std.debug.assert(self.isEmpty());
+        var fresh: OrderedIndexSet = .{};
+        errdefer fresh.deinit(allocator);
+        var tier_bits = @max(needed, 2 * self.capacity());
+        while (true) {
+            fresh.tiers[fresh.tier_count] = try .initEmpty(allocator, tier_bits);
+            fresh.tier_count += 1;
+            if (tier_bits <= word_bits) break;
+            tier_bits = maskCount(tier_bits);
+        }
+        self.deinit(allocator);
+        self.* = fresh;
+        return true;
+    }
+
+    pub fn insert(self: *OrderedIndexSet, index: usize) void {
+        std.debug.assert(index < self.capacity());
+        var position = index;
+        for (self.tiers[0..self.tier_count]) |*tier| {
+            const word_was_empty = tier.masks[position >> word_shift] == 0;
+            tier.set(position);
+            // A nonempty word's summary bit is already set in every tier above.
+            if (!word_was_empty) return;
+            position >>= word_shift;
+        }
+    }
+
+    // Removes and returns the smallest index, or null when empty.
+    pub fn popMin(self: *OrderedIndexSet) ?usize {
+        if (self.isEmpty()) return null;
+        // Descend from the top word along each tier's lowest set bit.
+        var position: usize = 0;
+        var tier_index = self.tier_count;
+        while (tier_index != 0) {
+            tier_index -= 1;
+            const word = self.tiers[tier_index].masks[position];
+            std.debug.assert(word != 0);
+            position = (position << word_shift) | @ctz(word);
+        }
+        const index = position;
+        for (self.tiers[0..self.tier_count]) |*tier| {
+            tier.unset(position);
+            if (tier.masks[position >> word_shift] != 0) break;
+            position >>= word_shift;
+        }
+        return index;
+    }
+
+    pub fn residentBytes(self: *const OrderedIndexSet) usize {
+        var bytes: usize = 0;
+        for (self.tiers[0..self.tier_count]) |tier| bytes += bitSetBytes(tier);
+        return bytes;
+    }
+
+    // `residentBytes` of a set reserved for indices below `bits`: its tiers as `reserve`
+    // builds them.
+    pub fn storageBytesBound(bits: usize) usize {
+        var bytes: usize = 0;
+        var tier_bits = bits;
+        while (true) {
+            bytes +|= bitSetBytesFor(tier_bits);
+            if (tier_bits <= word_bits) break;
+            tier_bits = maskCount(tier_bits);
+        }
+        return bytes;
+    }
+};
+
+/// Bytes of a std bit set: its masks and the length word before them, none when empty.
+pub fn bitSetBytes(set: std.bit_set.Dynamic) usize {
+    return bitSetBytesFor(set.capacity());
+}
+
+/// `bitSetBytes` of a set of `bits` bits.
+pub fn bitSetBytesFor(bits: usize) usize {
+    if (bits == 0) return 0;
+    return (OrderedIndexSet.maskCount(bits) + 1) * @sizeOf(OrderedIndexSet.Word);
 }
 
 const Entry = struct {
@@ -88,12 +208,15 @@ const SpliceRecord = struct {
 /// window padding), and each range's record window starts on a cache line, so no two
 /// ranges write one line.
 pub const splice_range_alignment_items: usize = 8;
-const SpliceRecordList = std.ArrayListAligned(SpliceRecord, .fromByteUnits(thread_shared_record_alignment));
+const SpliceRecordList = std.array_list.Aligned(SpliceRecord, .fromByteUnits(thread_shared_record_alignment));
 
 comptime {
     std.debug.assert(@sizeOf(SpliceRecord) * splice_range_alignment_items == thread_shared_record_alignment);
 }
 
+/// The key table is open-addressed by hand, not `std.HashMapUnmanaged`: it deletes by
+/// backward shift (no tombstones under churn) and keeps its slots as columns that
+/// `Reader`s probe lock-free while nothing writes, which std's map exposes neither of.
 pub const ChunkListMap = struct {
     /// Bytes one pooled entry takes: its key, owner, order, and three links, and its free
     /// id.
@@ -1569,4 +1692,82 @@ test "a prepared owner truncation keeps every lookup, installs without allocatin
     try map.reserve(1, 1, 64);
     map.add(63, chunkKey(2, 0), 0);
     try std.testing.expectEqual(@as(usize, 1), map.removeOwner(63));
+}
+
+// The tier counts the set reserves at each capacity: one word, past one word, a full and past
+// a full second tier, and four tiers.
+const ordered_set_capacities = [_]struct { bits: usize, tiers: usize }{
+    .{ .bits = 1, .tiers = 1 },
+    .{ .bits = 64, .tiers = 1 },
+    .{ .bits = 65, .tiers = 2 },
+    .{ .bits = 4096, .tiers = 2 },
+    .{ .bits = 4097, .tiers = 3 },
+    .{ .bits = 300_000, .tiers = 4 },
+};
+
+test "the ordered index set pops each inserted index once in ascending order across word and tier boundaries, and is reusable once drained" {
+    const allocator = std.testing.allocator;
+    for (ordered_set_capacities) |shape| {
+        var set: OrderedIndexSet = .{};
+        defer set.deinit(allocator);
+        try std.testing.expect(set.isEmpty());
+        try std.testing.expect(try set.reserve(allocator, shape.bits));
+        try std.testing.expectEqual(shape.tiers, set.tier_count);
+        try std.testing.expect(!try set.reserve(allocator, shape.bits));
+        var reference: std.ArrayList(u64) = .empty;
+        defer reference.deinit(allocator);
+        var prng = std.Random.DefaultPrng.init(shape.bits);
+        const random = prng.random();
+        for (0..2) |_| {
+            try std.testing.expect(set.isEmpty());
+            try std.testing.expectEqual(@as(?usize, null), set.popMin());
+            reference.clearRetainingCapacity();
+            // Indices at each word and tier edge, then random ones with repeats.
+            for ([_]usize{ shape.bits - 1, 0, 63, 64, 4095, 4096, 262_143, 262_144 }) |index| {
+                if (index >= shape.bits) continue;
+                set.insert(index);
+                try reference.append(allocator, index);
+            }
+            for (0..@min(2 * shape.bits, 4000)) |_| {
+                const index = random.uintLessThan(usize, shape.bits);
+                set.insert(index);
+                try reference.append(allocator, index);
+            }
+            std.sort.pdq(u64, reference.items, {}, std.sort.asc(u64));
+            var unique: usize = 0;
+            for (reference.items) |key| {
+                if (unique != 0 and reference.items[unique - 1] == key) continue;
+                reference.items[unique] = key;
+                unique += 1;
+            }
+            reference.items.len = unique;
+            for (reference.items) |expected| try std.testing.expectEqual(@as(?usize, @intCast(expected)), set.popMin());
+            try std.testing.expect(set.isEmpty());
+        }
+    }
+}
+
+test "an ordered index set reserve grows geometrically onto valid tiers, and one out of memory leaves the set as it was" {
+    const allocator = std.testing.allocator;
+    var set: OrderedIndexSet = .{};
+    defer set.deinit(allocator);
+    try std.testing.expect(try set.reserve(allocator, 64));
+    set.insert(5);
+    try std.testing.expectEqual(@as(?usize, 5), set.popMin());
+
+    // A tier past the first fails: the earlier tiers free and the set keeps its one word.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, set.reserve(failing.allocator(), 4097));
+    try std.testing.expectEqual(@as(usize, 64), set.capacity());
+    try std.testing.expectEqual(@as(usize, 1), set.tier_count);
+    set.insert(63);
+    try std.testing.expectEqual(@as(?usize, 63), set.popMin());
+
+    // Doubling covers the next 64-bit request with room to spare.
+    try std.testing.expect(try set.reserve(allocator, 65));
+    try std.testing.expectEqual(@as(usize, 128), set.capacity());
+    try std.testing.expect(!try set.reserve(allocator, 128));
+    for ([_]usize{ 127, 0, 64, 63 }) |index| set.insert(index);
+    for ([_]usize{ 0, 63, 64, 127 }) |expected| try std.testing.expectEqual(@as(?usize, expected), set.popMin());
+    try std.testing.expect(set.isEmpty());
 }

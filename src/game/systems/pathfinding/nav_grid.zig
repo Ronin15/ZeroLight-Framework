@@ -13,6 +13,9 @@ const math = @import("../../../core/math.zig");
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
 const world_terrain = @import("../../world_terrain.zig");
 const ChunkBits = world_terrain.ChunkBits;
+const bitIsSet = @import("../../world_terrain.zig").bitIsSet;
+const setBit = @import("../../world_terrain.zig").setBit;
+const clearBit = @import("../../world_terrain.zig").clearBit;
 const ChunkForm = world_terrain.ChunkForm;
 const max_chunk_cells = world_terrain.max_chunk_cells;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
@@ -57,21 +60,6 @@ const empty_block = NavCellBlock{ .bits = @splat(0), .labels = @splat(0), .block
 
 // One pooled block's columns.
 const cell_block_bytes = @sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8);
-
-/// Chunk-local cell bit tests on `ChunkBits` words, shared by the nav cell kernels. Not
-/// std.bit_set: per-cell tests in the remask flood measured about 3x the serial reaction with
-/// std's per-bit methods, in Debug, on nav-update-scattered at 256 digs.
-pub inline fn testBit(words: *const ChunkBits, local: usize) bool {
-    return (words[local >> 6] >> @intCast(local & 63)) & 1 != 0;
-}
-
-pub inline fn setBit(words: *ChunkBits, local: usize) void {
-    words[local >> 6] |= @as(u64, 1) << @intCast(local & 63);
-}
-
-pub inline fn clearBit(words: *ChunkBits, local: usize) void {
-    words[local >> 6] &= ~(@as(u64, 1) << @intCast(local & 63));
-}
 
 // Bit of cell (x + dx, y + dy) in a 3x3 `neighborhood` mask.
 fn neighborhoodBit(dx: i32, dy: i32) u4 {
@@ -383,13 +371,13 @@ pub const NavGrid = struct {
                     .{ .ok = south, .local = current +% edge },
                     .{ .ok = west, .local = current -% 1 },
                     .{ .ok = north, .local = current -% edge },
-                    .{ .ok = south and east and testBit(&open, current +% 1) and testBit(&open, current +% edge), .local = current +% edge +% 1 },
-                    .{ .ok = south and west and testBit(&open, current -% 1) and testBit(&open, current +% edge), .local = current +% edge -% 1 },
-                    .{ .ok = north and west and testBit(&open, current -% 1) and testBit(&open, current -% edge), .local = current -% edge -% 1 },
-                    .{ .ok = north and east and testBit(&open, current +% 1) and testBit(&open, current -% edge), .local = current -% edge +% 1 },
+                    .{ .ok = south and east and bitIsSet(&open, current +% 1) and bitIsSet(&open, current +% edge), .local = current +% edge +% 1 },
+                    .{ .ok = south and west and bitIsSet(&open, current -% 1) and bitIsSet(&open, current +% edge), .local = current +% edge -% 1 },
+                    .{ .ok = north and west and bitIsSet(&open, current -% 1) and bitIsSet(&open, current -% edge), .local = current -% edge -% 1 },
+                    .{ .ok = north and east and bitIsSet(&open, current +% 1) and bitIsSet(&open, current -% edge), .local = current -% edge +% 1 },
                 };
                 inline for (steps) |step| {
-                    if (step.ok and testBit(&unvisited, step.local)) {
+                    if (step.ok and bitIsSet(&unvisited, step.local)) {
                         clearBit(&unvisited, step.local);
                         labels[step.local] = label;
                         queue[queue_len] = @intCast(step.local);
@@ -462,7 +450,7 @@ pub const NavGrid = struct {
         return switch (self.dir.items[self.geometry.chunkOf(x, y)]) {
             open_entry => false,
             blocked_entry => true,
-            else => |slot| testBit(&self.block_bits[slot], self.geometry.localOf(x, y)),
+            else => |slot| bitIsSet(&self.block_bits[slot], self.geometry.localOf(x, y)),
         };
     }
 
@@ -588,7 +576,7 @@ pub const NavGrid = struct {
                 const col: usize = if (side == .west) 0 else cols - 1;
                 var result: u16 = 0;
                 for (0..rows) |row| {
-                    if (testBit(bits, (row << shift) | col)) result |= @as(u16, 1) << @intCast(row);
+                    if (bitIsSet(bits, (row << shift) | col)) result |= @as(u16, 1) << @intCast(row);
                 }
                 return result;
             },
@@ -826,7 +814,7 @@ test "a cell-aligned static past 32768 world units blocks only its own nav cell"
     _ = try addNavBody(&data, .{ .x = 35_296, .y = 35_296 }, .{ .x = 32, .y = 32 }, true);
     var colliders = static_colliders.StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, .{ .cell_size = 32, .width = 2048, .height = 2048, .chunk_tiles = 16 });
+    try colliders.rebuild(&data, .init(32, 2048, 2048, 16));
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 2048, 2048, 32, 16);
@@ -916,7 +904,7 @@ test "a remasked chunk equals world bits OR static coverage, labels and chunkLab
         const side: f32 = @as(f32, @floatFromInt(side_tiles)) * meta.tileSize();
         var data = DataSystem.init(std.testing.allocator);
         defer data.deinit();
-        var world = try @import("../../world_test_support.zig").demoWorldWithChunkSize(std.testing.allocator, &meta, side, side, edge);
+        var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, side, side, edge);
         defer world.deinit();
         const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
         for (0..world.height) |y| for (0..world.width) |x| {
@@ -1021,7 +1009,7 @@ test "neighborhood equals eight isBlocked reads at chunk corners and level edges
         const side: f32 = @as(f32, @floatFromInt(side_tiles)) * meta.tileSize();
         var data = DataSystem.init(std.testing.allocator);
         defer data.deinit();
-        var world = try @import("../../world_test_support.zig").demoWorldWithChunkSize(std.testing.allocator, &meta, side, side, edge);
+        var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, side, side, edge);
         defer world.deinit();
         const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
         for (0..world.height) |y| for (0..world.width) |x| {
@@ -1086,7 +1074,7 @@ test "word-parallel projection returns the same cell as the per-cell ring scan" 
         const side: f32 = @as(f32, @floatFromInt(side_tiles)) * meta.tileSize();
         var data = DataSystem.init(std.testing.allocator);
         defer data.deinit();
-        var world = try @import("../../world_test_support.zig").demoWorldWithChunkSize(std.testing.allocator, &meta, side, side, edge);
+        var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, side, side, edge);
         defer world.deinit();
         const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
         // Mostly blocked, so rings run several cells before an open one.
@@ -1120,7 +1108,7 @@ fn aroundBit(around: *const [9]ChunkBits, edge: usize, x: isize, y: isize) bool 
     const chunk_x: usize = @intCast(@divFloor(x, span) + 1);
     const chunk_y: usize = @intCast(@divFloor(y, span) + 1);
     const local: usize = @intCast(@mod(y, span) * span + @mod(x, span));
-    return testBit(&around[chunk_y * 3 + chunk_x], local);
+    return bitIsSet(&around[chunk_y * 3 + chunk_x], local);
 }
 
 test "the dilated changed mask equals the per-cell 3x3 reference across chunk edges and corners at chunk edges 4, 8, 16" {
@@ -1150,11 +1138,11 @@ test "the dilated changed mask equals the per-cell 3x3 reference across chunk ed
                 for ([_]isize{ -1, 0, 1 }) |dy| for ([_]isize{ -1, 0, 1 }) |dx| {
                     if (aroundBit(&around, cells, @as(isize, @intCast(x)) + dx, @as(isize, @intCast(y)) + dy)) expected = true;
                 };
-                try std.testing.expectEqual(expected, testBit(&dilated, y * cells + x));
+                try std.testing.expectEqual(expected, bitIsSet(&dilated, y * cells + x));
             };
             if (round == 0) {
                 // The corners reach exactly the center chunk's two corner cells.
-                try std.testing.expect(testBit(&dilated, 0) and testBit(&dilated, cells * cells - 1));
+                try std.testing.expect(bitIsSet(&dilated, 0) and bitIsSet(&dilated, cells * cells - 1));
             }
         }
     }

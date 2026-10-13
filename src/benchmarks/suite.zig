@@ -20,7 +20,7 @@ const AbstractSlot = @import("../game/systems/pathfinding/scratch.zig").Abstract
 const SearchSlot = @import("../game/systems/pathfinding/scratch.zig").SearchSlot;
 const OpenNode = @import("../game/systems/pathfinding/types.zig").OpenNode;
 const StitchedCell = @import("../game/systems/pathfinding/types.zig").StitchedCell;
-const hashTableSlots = @import("../game/systems/pathfinding/types.zig").hashTableSlots;
+const hashTableSlots = @import("../game/stamped_table.zig").hashTableSlots;
 const default_tier1_abstract_node_cap = @import("../game/systems/pathfinding/types.zig").default_tier1_abstract_node_cap;
 const resultBlockWords = @import("../game/systems/pathfinding/types.zig").resultBlockWords;
 const registry_shard_count = @import("../game/systems/pathfinding/types.zig").registry_shard_count;
@@ -820,6 +820,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
     if (std.mem.eql(u8, group_name, "ai-memory")) return "AI agents";
     if (std.mem.eql(u8, group_name, "ai-affect")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "plane-traversal-dense-falls-banded")) return "landing-level bands (4096 AI agents)";
     if (std.mem.startsWith(u8, group_name, "plane-traversal")) return "AI agents";
     if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) return "perception agents";
     if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
@@ -1313,10 +1314,12 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         var gather_buffer: [32]u8 = undefined;
         const phases = stats.terrain_edit_phases orelse TerrainEditPhaseSummary{};
         const main_percent = if (stats.mean_ns == 0) 0 else phases.main_ns * 100 / stats.mean_ns;
+        const banded = std.mem.eql(u8, group_name, "plane-traversal-dense-falls-banded");
+        const per_entry_ns = if (stats.output_count == 0) 0 else phases.main_ns / stats.output_count;
         return std.fmt.bufPrint(
             buffer,
-            "agents={} entries={} gather={s} main={f} ({}%)",
-            .{ stats.item_count, stats.output_count, formatStageShapeInto(&gather_buffer, stats.batch), formatDuration(phases.main_ns), main_percent },
+            "{s}={} entries={} gather={s} main={f} ({}%) main_per_entry={f}",
+            .{ if (banded) "bands" else "agents", stats.item_count, stats.output_count, formatStageShapeInto(&gather_buffer, stats.batch), formatDuration(phases.main_ns), main_percent, formatDuration(per_entry_ns) },
         ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) {

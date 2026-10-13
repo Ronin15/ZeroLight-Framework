@@ -1260,12 +1260,14 @@ fn colliderRowLevelForTest(colliders: *const StaticColliderSystem, index: u32) ?
     return colliders.row_level[row];
 }
 
-// The player's cell-entry plane traversal; its landing carve is not published.
+const denseTileBlocksMovement = @import("world_test_support.zig").denseTileBlocksMovement;
+
+// The player's cell-entry plane traversal through the plane stage with no NPC entries;
+// its landing carve publishes into the demo's frame.
 fn traversePlaneForTest(demo: *GameDemoState) !void {
-    const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
-    var carves_buffer: [1]WorldTileChangedEvent = undefined;
-    var carves = std.ArrayList(WorldTileChangedEvent).initBuffer(&carves_buffer);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &carves);
+    const dig = &demo.pipeline.dig;
+    const reservation = try dig.reservePlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, &.{}, null);
+    try dig.commitPlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, reservation, null);
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
@@ -1620,7 +1622,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     // The solid-dirt landing cell is carved walkable so the fall does not bury
     // the player in rock.
     const floor1 = demo.world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!demo.world.denseTileBlocksMovement(floor1, 4, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&demo.world, floor1, 4, 3));
 
     // Standing put: no second fall.
     try traversePlaneForTest(&demo);
@@ -1711,7 +1713,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 
     // The void-plane landing cell is carved walkable so the player is not buried.
     const floor2 = demo.world.denseFloorLayerForLevel(2).?;
-    try std.testing.expect(!demo.world.denseTileBlocksMovement(floor2, 5, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&demo.world, floor2, 5, 3));
 }
 
 test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {

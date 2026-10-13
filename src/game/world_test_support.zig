@@ -12,63 +12,15 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const WorldSystem = @import("world_system.zig").WorldSystem;
 const TileId = @import("world_system.zig").TileId;
+const DenseCellWrite = @import("world_system.zig").DenseCellWrite;
+const DenseChunkWrites = @import("world_system.zig").DenseChunkWrites;
+const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 const default_chunk_size_tiles = @import("world_system.zig").default_chunk_size_tiles;
 const ChunkGeometry = @import("world_terrain.zig").ChunkGeometry;
 const ChunkWindow = @import("world_gpu_tiles.zig").ChunkWindow;
 const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
 const tile_store_no_link = @import("../render/renderer.zig").tile_store_no_link;
 const tile_store_uniform_bit = @import("../render/renderer.zig").tile_store_uniform_bit;
-
-/// The demo surface `WorldSystem.initDemoFromMeta` paints, cut into
-/// `chunk_size_tiles` chunks, so multi-chunk tests shrink the chunk rather than grow
-/// the world. Builds no render params; `chunk_size_tiles` must pass
-/// `validateChunkGrid`.
-pub fn demoWorldWithChunkSize(
-    allocator: std.mem.Allocator,
-    meta: *const WorldTilesetMeta,
-    bounds_width: f32,
-    bounds_height: f32,
-    chunk_size_tiles: u16,
-) !WorldSystem {
-    const tile_size = meta.tileSize();
-    const width: u16 = @intFromFloat(@max(@ceil(bounds_width / tile_size), 1));
-    const height: u16 = @intFromFloat(@max(@ceil(bounds_height / tile_size), 1));
-    var world = WorldSystem{
-        .allocator = allocator,
-        .width = width,
-        .height = height,
-        .tile_size = tile_size,
-        .chunk_size_tiles = chunk_size_tiles,
-    };
-    errdefer world.deinit();
-    try world.buildCatalog(meta);
-    const level = try world.addLevel(0);
-    const grass = try world.requireTileByName(meta, "grass");
-    const grass_patchy = try world.requireTileByName(meta, "grass_patchy");
-    const path = try world.requireTileByName(meta, "path_0");
-    const stone = try world.requireTileByName(meta, "stone_floor");
-    const deco = try world.requireTileByName(meta, "deco_0");
-
-    const ground_layer = try world.addDenseLayer(level, 0, .floor, grass);
-    const mid_y = height / 2;
-    const mid_x = width / 2;
-    for (0..height) |y| {
-        for (0..width) |x| {
-            const tile: TileId = if (x == mid_x or y == mid_y)
-                path
-            else if ((x + y) % 11 == 0)
-                grass_patchy
-            else if ((x * 3 + y) % 17 == 0)
-                stone
-            else
-                grass;
-            _ = try world.setDenseTile(ground_layer, @intCast(x), @intCast(y), tile);
-        }
-    }
-    _ = try world.addSparseTile(level, width / 4, height / 3, deco, 0, .obstacle);
-    _ = try world.addSparseTile(level, (width * 3) / 4, (height * 2) / 3, deco, 0, .obstacle);
-    return world;
-}
 
 /// CPU copy of a GPU tile store: applies upload batches as the frame copy pass does
 /// and reads tiles back the way `tilemap.frag.glsl` does, so tests assert what a
@@ -121,26 +73,45 @@ pub const TestGpuStore = struct {
     }
 };
 
-/// Takes and releases the tile block and composed-bits slot a landing carve into
-/// `cell` on `level` needs, so a later carve in that chunk reuses them: the terrain
-/// pools are warm, like the frame and data allocators the zero-allocation proofs warm.
+/// Whether dense `layer`'s tile at (x, y) blocks movement on its own (out-of-range cells
+/// and layers block), apart from the level's composed bits.
+pub fn denseTileBlocksMovement(world: *const WorldSystem, layer: usize, x: u16, y: u16) bool {
+    if (layer >= world.denseLayerCount() or x >= world.width or y >= world.height) return true;
+    const tile: usize = world.denseTile(layer, x, y);
+    const flags = world.catalog_flags.items;
+    return tile < flags.len and flags[tile].blocks_movement;
+}
+
+/// Runs a landing carve into `cell` on `level` through the batched dense edit and undoes
+/// it, so a later carve batch in that chunk reuses the batch scratch, tile block, and
+/// composed-bits slot: the terrain is warm, like the frame and data allocators the
+/// zero-allocation proofs warm.
 pub fn warmLandingTerrain(world: *WorldSystem, tunnel_tile: TileId, level: u16, cell: [2]u16) !void {
     const floor = world.denseFloorLayerForLevel(level).?;
     const original = world.denseTile(floor, cell[0], cell[1]);
-    world.beginDenseCellWriteReserve();
-    try world.reserveDenseCellWrite(floor, cell[0], cell[1], tunnel_tile);
-    _ = try world.setDenseTile(floor, cell[0], cell[1], tunnel_tile);
-    _ = try world.setDenseTile(floor, cell[0], cell[1], original);
-    world.beginDenseCellWriteReserve();
+    var buffer: [1]WorldTileChangedEvent = undefined;
+    var events = std.ArrayList(WorldTileChangedEvent).initBuffer(&buffer);
+    for ([_]TileId{ tunnel_tile, original }) |tile| {
+        events.clearRetainingCapacity();
+        const writes = [_]DenseCellWrite{.{ .layer = @intCast(floor), .x = cell[0], .y = cell[1], .tile = tile }};
+        const chunks = [_]DenseChunkWrites{.{
+            .level = level,
+            .chunk_x = cell[0] / world.chunk_size_tiles,
+            .chunk_y = cell[1] / world.chunk_size_tiles,
+            .writes = &writes,
+        }};
+        try world.applyDenseCellWrites(&chunks, null, &events);
+    }
 }
 
-test "the chunk-sized demo world at the default edge matches initDemoFromMeta" {
+test "the demo world paints the same tiles at every chunk edge" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
     const bounds = meta.tileSize() * 24 + 5;
-    var fixture = try demoWorldWithChunkSize(std.testing.allocator, &meta, bounds, bounds, default_chunk_size_tiles);
+    var fixture = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, bounds, bounds, 4);
     defer fixture.deinit();
+    try std.testing.expect(fixture.chunk_size_tiles != default_chunk_size_tiles);
     var demo = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, bounds, bounds);
     defer demo.deinit();
 

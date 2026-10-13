@@ -572,7 +572,7 @@ const Fixture = struct {
     // grows it (growth would create a GPU buffer), laid out for the render window
     // already set, so no sync creates a store either.
     fn attachHeadlessTileStore(self: *Fixture, allocator: std.mem.Allocator) !void {
-        std.debug.assert(self.world.visible_window_set);
+        std.debug.assert(self.world.visible != null);
         self.renderer = Renderer{
             .allocator = allocator,
             .device = undefined,

@@ -517,6 +517,9 @@ pub const LevelRuns = struct {
 };
 
 // Batch key lists. Plan windows start on cache lines, so the staging lists are aligned.
+const OrderedIndexSet = @import("../chunk_list_map.zig").OrderedIndexSet;
+const bitSetBytes = @import("../chunk_list_map.zig").bitSetBytes;
+const bitSetBytesFor = @import("../chunk_list_map.zig").bitSetBytesFor;
 const KeyList = std.array_list.Aligned(u64, .fromByteUnits(thread_shared_record_alignment));
 const PlanTallyList = std.array_list.Aligned(PlanTally, .fromByteUnits(thread_shared_record_alignment));
 const key_window_alignment: usize = thread_shared_record_alignment / @sizeOf(u64);
@@ -567,124 +570,6 @@ const PlanTally = struct {
 
 comptime {
     std.debug.assert(@sizeOf(PlanTally) % thread_shared_record_alignment == 0);
-}
-
-// A set of indices below its capacity, popped in ascending order: one std bit set per tier,
-// each bit of a tier set exactly when its word in the tier below is nonzero, and a top tier
-// of one word. Insert and `popMin` cost O(tiers); `isEmpty` reads the top word. std's
-// `PriorityQueue` costs O(log n) per key and keeps repeats, and a std bit set's first-set
-// and iterator scan from word 0, so a drain would cost a local change O(capacity / 64).
-const OrderedIndexSet = struct {
-    const Word = std.bit_set.Dynamic.MaskInt;
-    const word_bits = @bitSizeOf(Word);
-    const word_shift = std.math.log2(word_bits);
-    // Each tier divides the index width by `word_bits`, so any usize capacity summarizes to
-    // one word within this many tiers.
-    const max_tiers = (@bitSizeOf(usize) + word_shift - 1) / word_shift;
-
-    tiers: [max_tiers]std.bit_set.Dynamic = @splat(.{}),
-    tier_count: usize = 0,
-
-    // Mask words of a std bit set of `bits` bits.
-    fn maskCount(bits: usize) usize {
-        return (bits + word_bits - 1) / word_bits;
-    }
-
-    fn deinit(self: *OrderedIndexSet, allocator: std.mem.Allocator) void {
-        for (self.tiers[0..self.tier_count]) |*tier| tier.deinit(allocator);
-        self.* = .{};
-    }
-
-    fn capacity(self: *const OrderedIndexSet) usize {
-        return self.tiers[0].capacity();
-    }
-
-    fn isEmpty(self: *const OrderedIndexSet) bool {
-        return self.tier_count == 0 or self.tiers[self.tier_count - 1].masks[0] == 0;
-    }
-
-    // Grows an empty set to hold indices below `needed`, geometrically; true when it grew.
-    // Builds every tier fresh and swaps them in: a tier-by-tier `resize` that failed past
-    // the first tier would leave tiers that no longer summarize each other. An error leaves
-    // the set as it was.
-    fn reserve(self: *OrderedIndexSet, allocator: std.mem.Allocator, needed: usize) !bool {
-        if (needed <= self.capacity()) return false;
-        std.debug.assert(self.isEmpty());
-        var fresh: OrderedIndexSet = .{};
-        errdefer fresh.deinit(allocator);
-        var tier_bits = @max(needed, 2 * self.capacity());
-        while (true) {
-            fresh.tiers[fresh.tier_count] = try .initEmpty(allocator, tier_bits);
-            fresh.tier_count += 1;
-            if (tier_bits <= word_bits) break;
-            tier_bits = maskCount(tier_bits);
-        }
-        self.deinit(allocator);
-        self.* = fresh;
-        return true;
-    }
-
-    fn insert(self: *OrderedIndexSet, index: usize) void {
-        std.debug.assert(index < self.capacity());
-        var position = index;
-        for (self.tiers[0..self.tier_count]) |*tier| {
-            const word_was_empty = tier.masks[position >> word_shift] == 0;
-            tier.set(position);
-            // A nonempty word's summary bit is already set in every tier above.
-            if (!word_was_empty) return;
-            position >>= word_shift;
-        }
-    }
-
-    // Removes and returns the smallest index, or null when empty.
-    fn popMin(self: *OrderedIndexSet) ?usize {
-        if (self.isEmpty()) return null;
-        // Descend from the top word along each tier's lowest set bit.
-        var position: usize = 0;
-        var tier_index = self.tier_count;
-        while (tier_index != 0) {
-            tier_index -= 1;
-            const word = self.tiers[tier_index].masks[position];
-            std.debug.assert(word != 0);
-            position = (position << word_shift) | @ctz(word);
-        }
-        const index = position;
-        for (self.tiers[0..self.tier_count]) |*tier| {
-            tier.unset(position);
-            if (tier.masks[position >> word_shift] != 0) break;
-            position >>= word_shift;
-        }
-        return index;
-    }
-
-    fn residentBytes(self: *const OrderedIndexSet) usize {
-        var bytes: usize = 0;
-        for (self.tiers[0..self.tier_count]) |tier| bytes += bitSetBytes(tier);
-        return bytes;
-    }
-
-    // `residentBytes` of a set reserved for indices below `bits`: its tiers as `reserve`
-    // builds them.
-    fn storageBytesBound(bits: usize) usize {
-        var bytes: usize = 0;
-        var tier_bits = bits;
-        while (true) {
-            bytes +|= bitSetBytesFor(tier_bits);
-            if (tier_bits <= word_bits) break;
-            tier_bits = maskCount(tier_bits);
-        }
-        return bytes;
-    }
-};
-
-// Bytes of a std bit set: its masks and the length word before them, none when empty.
-fn bitSetBytes(set: std.bit_set.Dynamic) usize {
-    return bitSetBytesFor(set.capacity());
-}
-
-fn bitSetBytesFor(bits: usize) usize {
-    if (bits == 0) return 0;
-    return (OrderedIndexSet.maskCount(bits) + 1) * @sizeOf(OrderedIndexSet.Word);
 }
 
 // One level's share of the threaded plan merge (`NavGraph.mergePlanWindows`): its patch
@@ -948,7 +833,7 @@ pub const NavExtent = union(enum) {
         const cells = self.cellGrid();
         try validateChunkGrid(cells.width, cells.height, cells.chunk_tiles);
         // `validateChunkGrid` keeps the cell count below 2^32, so each side fits u32.
-        return .{ .cell_size = cells.cell_size, .width = @intCast(cells.width), .height = @intCast(cells.height), .chunk_tiles = cells.chunk_tiles };
+        return ColliderGeometry.init(cells.cell_size, @intCast(cells.width), @intCast(cells.height), cells.chunk_tiles);
     }
 
     const CellGrid = struct { cell_size: f32, width: usize, height: usize, chunk_tiles: u16 };
@@ -1611,8 +1496,8 @@ pub const NavGraph = struct {
         // dimension is stored or array sized.
         try validateChunkGrid(width, height, chunk_tiles);
         if (colliders.geometry) |geometry| {
-            std.debug.assert(geometry.cell_size == safe_cell_size and geometry.width == width and
-                geometry.height == height and geometry.chunk_tiles == chunk_tiles);
+            std.debug.assert(geometry.cell_size == safe_cell_size and geometry.grid.width == width and
+                geometry.grid.height == height and geometry.grid.chunk_tiles == chunk_tiles);
         }
 
         var version = self.version +% 1;
@@ -4810,7 +4695,7 @@ test "border portals never exceed 4 * ceil(E / 2) and random digs match a full r
         var data = DataSystem.init(std.testing.allocator);
         defer data.deinit();
         const side: f32 = @as(f32, @floatFromInt(@as(u32, edge) * 3)) * meta.tileSize();
-        var world = try @import("../../world_test_support.zig").demoWorldWithChunkSize(std.testing.allocator, &meta, side, side, edge);
+        var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, side, side, edge);
         defer world.deinit();
         const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
         for (0..world.height) |y| for (0..world.width) |x| {
@@ -4919,77 +4804,6 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
         try std.testing.expectEqualSlices(u64, systems[0].graph.dirty_keys.items, system.graph.dirty_keys.items);
         try expectGraphsEquivalent(&systems[0].graph, &system.graph);
     }
-}
-
-// The tier counts the set reserves at each capacity: one word, past one word, a full and past
-// a full second tier, and four tiers.
-const ordered_set_capacities = [_]struct { bits: usize, tiers: usize }{
-    .{ .bits = 1, .tiers = 1 },
-    .{ .bits = 64, .tiers = 1 },
-    .{ .bits = 65, .tiers = 2 },
-    .{ .bits = 4096, .tiers = 2 },
-    .{ .bits = 4097, .tiers = 3 },
-    .{ .bits = 300_000, .tiers = 4 },
-};
-
-test "the ordered index set pops each inserted index once in ascending order across word and tier boundaries, and is reusable once drained" {
-    const allocator = std.testing.allocator;
-    for (ordered_set_capacities) |shape| {
-        var set: OrderedIndexSet = .{};
-        defer set.deinit(allocator);
-        try std.testing.expect(set.isEmpty());
-        try std.testing.expect(try set.reserve(allocator, shape.bits));
-        try std.testing.expectEqual(shape.tiers, set.tier_count);
-        try std.testing.expect(!try set.reserve(allocator, shape.bits));
-        var reference: std.ArrayList(u64) = .empty;
-        defer reference.deinit(allocator);
-        var prng = std.Random.DefaultPrng.init(shape.bits);
-        const random = prng.random();
-        for (0..2) |_| {
-            try std.testing.expect(set.isEmpty());
-            try std.testing.expectEqual(@as(?usize, null), set.popMin());
-            reference.clearRetainingCapacity();
-            // Indices at each word and tier edge, then random ones with repeats.
-            for ([_]usize{ shape.bits - 1, 0, 63, 64, 4095, 4096, 262_143, 262_144 }) |index| {
-                if (index >= shape.bits) continue;
-                set.insert(index);
-                try reference.append(allocator, index);
-            }
-            for (0..@min(2 * shape.bits, 4000)) |_| {
-                const index = random.uintLessThan(usize, shape.bits);
-                set.insert(index);
-                try reference.append(allocator, index);
-            }
-            reference.items.len = sortUnique(reference.items);
-            for (reference.items) |expected| try std.testing.expectEqual(@as(?usize, @intCast(expected)), set.popMin());
-            try std.testing.expect(set.isEmpty());
-        }
-    }
-}
-
-test "an ordered index set reserve grows geometrically onto valid tiers, and one out of memory leaves the set as it was" {
-    const allocator = std.testing.allocator;
-    var set: OrderedIndexSet = .{};
-    defer set.deinit(allocator);
-    try std.testing.expect(try set.reserve(allocator, 64));
-    set.insert(5);
-    try std.testing.expectEqual(@as(?usize, 5), set.popMin());
-
-    // A tier past the first fails: the earlier tiers free and the set keeps its one word.
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, set.reserve(failing.allocator(), 4097));
-    try std.testing.expectEqual(@as(usize, 64), set.capacity());
-    try std.testing.expectEqual(@as(usize, 1), set.tier_count);
-    set.insert(63);
-    try std.testing.expectEqual(@as(?usize, 63), set.popMin());
-
-    // Doubling covers the next 64-bit request with room to spare.
-    try std.testing.expect(try set.reserve(allocator, 65));
-    try std.testing.expectEqual(@as(usize, 128), set.capacity());
-    try std.testing.expect(!try set.reserve(allocator, 128));
-    for ([_]usize{ 127, 0, 64, 63 }) |index| set.insert(index);
-    for ([_]usize{ 0, 63, 64, 127 }) |expected| try std.testing.expectEqual(@as(?usize, expected), set.popMin());
-    try std.testing.expect(set.isEmpty());
 }
 
 test "the threaded plan merge equals the sorted unique keys of every stream for any partition of range windows" {

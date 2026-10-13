@@ -160,27 +160,27 @@ pub fn createStorageBuffer(device: *c.SDL_GPUDevice, element_capacity: u32) !*c.
     };
 }
 
-/// Checks one upload batch before it is staged: spans nonempty, strictly increasing
-/// and non-overlapping, inside `element_capacity`, with counts summing to
-/// `value_count`.
-pub fn validateStorageSpans(spans: []const StorageSpan, value_count: usize, element_capacity: u32) error{GpuUploadOutOfBounds}!void {
+/// Whether one upload batch is well formed: spans nonempty, strictly increasing and
+/// non-overlapping, inside `element_capacity`, with counts summing to `value_count`.
+/// The tile store checks every batch with it before staging.
+pub fn storageSpansValid(spans: []const StorageSpan, value_count: usize, element_capacity: u32) bool {
     var total: u64 = 0;
     var previous_end: u64 = 0;
     for (spans, 0..) |span, index| {
-        if (span.count == 0) return error.GpuUploadOutOfBounds;
-        if (index > 0 and span.dst_element < previous_end) return error.GpuUploadOutOfBounds;
-        if (span.end() > element_capacity) return error.GpuUploadOutOfBounds;
+        if (span.count == 0) return false;
+        if (index > 0 and span.dst_element < previous_end) return false;
+        if (span.end() > element_capacity) return false;
         previous_end = span.end();
         total += span.count;
     }
-    if (total != value_count) return error.GpuUploadOutOfBounds;
+    return total == value_count;
 }
 
 /// Records `spans` into an open copy pass, reading their values from
 /// `transfer_buffer` starting at element `transfer_first_element`. Always
-/// `cycle=false`: the destination is a retained, partially written tile store.
-/// Records nothing when a span leaves the buffer or the staged values overrun
-/// the transfer.
+/// `cycle=false`: the destination is a retained, partially written tile store. The
+/// spans were validated when queued (`storageSpansValid`) and the transfer was sized
+/// for every staged value, so both bounds are asserted here, not re-checked.
 pub fn recordStorageSpansInPass(
     copy_pass: *c.SDL_GPUCopyPass,
     transfer_buffer: *c.SDL_GPUTransferBuffer,
@@ -189,14 +189,15 @@ pub fn recordStorageSpansInPass(
     buffer: *c.SDL_GPUBuffer,
     element_capacity: u32,
     spans: []const StorageSpan,
-) !void {
-    // Bounds are checked for the whole batch before the first upload is recorded.
-    var staged_elements: usize = transfer_first_element;
-    for (spans) |span| {
-        if (span.end() > element_capacity) return error.GpuUploadOutOfBounds;
-        staged_elements += span.count;
+) error{GpuBufferTooLarge}!void {
+    if (std.debug.runtime_safety) {
+        var staged_elements: u64 = transfer_first_element;
+        for (spans) |span| {
+            std.debug.assert(span.end() <= element_capacity);
+            staged_elements += span.count;
+        }
+        std.debug.assert(staged_elements * @sizeOf(StorageElement) <= transfer_byte_size);
     }
-    if (try storageByteSize(staged_elements) > transfer_byte_size) return error.GpuUploadOutOfBounds;
 
     var source_element: usize = transfer_first_element;
     for (spans) |span| {
@@ -276,22 +277,6 @@ test "vertex upload validation rejects oversized staging slices" {
     try validateUploadBytes(512, 1024);
 }
 
-test "storage span in-pass recording rejects spans past the transfer staging" {
-    const spans = [_]StorageSpan{
-        .{ .dst_element = 0, .count = 1 },
-        .{ .dst_element = 4, .count = 2 },
-    };
-    // Three staged values need 12 bytes; an 8-byte transfer fails before any upload.
-    try std.testing.expectError(
-        error.GpuUploadOutOfBounds,
-        recordStorageSpansInPass(@ptrFromInt(1), @ptrFromInt(2), 2 * @sizeOf(StorageElement), 0, @ptrFromInt(3), 8, &spans),
-    );
-    try std.testing.expectError(
-        error.GpuUploadOutOfBounds,
-        recordStorageSpansInPass(@ptrFromInt(1), @ptrFromInt(2), 64, 0, @ptrFromInt(3), 5, &spans),
-    );
-}
-
 test "vertex upload in-pass validation rejects oversized transfer staging" {
     const bytes: [16]u8 = @splat(0);
     try std.testing.expectError(
@@ -306,19 +291,19 @@ test "storage span validation requires sorted disjoint in-bounds spans matching 
         .{ .dst_element = 4, .count = 1 },
         .{ .dst_element = 7, .count = 1 },
     };
-    try validateStorageSpans(&ok, 6, 8);
-    try std.testing.expectError(error.GpuUploadOutOfBounds, validateStorageSpans(&ok, 5, 8));
-    try std.testing.expectError(error.GpuUploadOutOfBounds, validateStorageSpans(&ok, 6, 7));
+    try std.testing.expect(storageSpansValid(&ok, 6, 8));
+    try std.testing.expect(!storageSpansValid(&ok, 5, 8));
+    try std.testing.expect(!storageSpansValid(&ok, 6, 7));
     const overlapping = [_]StorageSpan{
         .{ .dst_element = 0, .count = 4 },
         .{ .dst_element = 3, .count = 1 },
     };
-    try std.testing.expectError(error.GpuUploadOutOfBounds, validateStorageSpans(&overlapping, 5, 8));
+    try std.testing.expect(!storageSpansValid(&overlapping, 5, 8));
     const unsorted = [_]StorageSpan{
         .{ .dst_element = 4, .count = 1 },
         .{ .dst_element = 0, .count = 1 },
     };
-    try std.testing.expectError(error.GpuUploadOutOfBounds, validateStorageSpans(&unsorted, 2, 8));
+    try std.testing.expect(!storageSpansValid(&unsorted, 2, 8));
     const empty_span = [_]StorageSpan{.{ .dst_element = 0, .count = 0 }};
-    try std.testing.expectError(error.GpuUploadOutOfBounds, validateStorageSpans(&empty_span, 0, 8));
+    try std.testing.expect(!storageSpansValid(&empty_span, 0, 8));
 }

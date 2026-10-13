@@ -2097,7 +2097,7 @@ test "with no links the heuristic is octile on the goal level and saturates off 
 fn pocketRequeueWorld(meta: *const WorldTilesetMeta) !WorldSystem {
     const grass = try test_support.requireTestTile(meta, "grass");
     const tree = try test_support.requireTestTile(meta, "tree_0");
-    var world = try @import("../../world_test_support.zig").demoWorldWithChunkSize(std.testing.allocator, meta, 1024, 1024, 16);
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, meta, 1024, 1024, 16);
     errdefer world.deinit();
     const walls = try world.addDenseLayer(0, 0, .obstacle, grass);
     for (16..32) |index| {

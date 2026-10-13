@@ -584,11 +584,14 @@ fn collectDenseInterleaveDepths(scene: GameplayScene, prep: *const DynamicSceneP
 /// `depth` cannot cut any boundary — at or below the deepest resident layer,
 /// nothing sits beneath it to sandwich against.
 fn interleaveGapIndex(layer_depths: []const i32, depth: i32) ?usize {
-    var i: usize = 1;
-    while (i < layer_depths.len) : (i += 1) {
-        if (depth > layer_depths[i - 1] and depth <= layer_depths[i]) return i - 1;
-    }
-    return null;
+    // The first layer at or above `depth`; every earlier one lies below it.
+    const first_at_or_above = std.sort.lowerBound(i32, layer_depths, depth, orderDepth);
+    if (first_at_or_above == 0 or first_at_or_above == layer_depths.len) return null;
+    return first_at_or_above - 1;
+}
+
+fn orderDepth(depth: i32, layer_depth: i32) std.math.Order {
+    return std.math.order(depth, layer_depth);
 }
 
 /// The depth of the window's sparse range `range_index` (ascending, one range
@@ -856,6 +859,32 @@ test "layered world merge interleaves a dynamic span between differing sparse de
     try std.testing.expectEqual(@as(i32, 10), emitted[3].depth);
 }
 
+test "interleave gap search matches the partition's boundary rule on ascending depths with repeats" {
+    var prng = std.Random.DefaultPrng.init(0x6a90_11e5);
+    const random = prng.random();
+    var depths: [12]i32 = undefined;
+    for (0..200) |_| {
+        const count = random.uintAtMost(usize, depths.len);
+        var depth: i32 = -40;
+        for (depths[0..count]) |*slot| {
+            depth += random.intRangeAtMost(i32, 0, 6);
+            slot.* = depth;
+        }
+        for (0..60) |_| {
+            const probe = random.intRangeAtMost(i32, -45, depth + 5);
+            // The rule `partitionDenseCompositeBuckets` cuts on: depths[i - 1] < probe <= depths[i].
+            var want: ?usize = null;
+            for (1..@max(count, 1)) |index| {
+                if (probe > depths[index - 1] and probe <= depths[index]) {
+                    want = index - 1;
+                    break;
+                }
+            }
+            try std.testing.expectEqual(want, interleaveGapIndex(depths[0..count], probe));
+        }
+    }
+}
+
 test "dynamic record capacity counts visuals player marker and particles" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1079,8 +1108,8 @@ test "collect dynamic records includes an entity that fell to a level within the
         .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
     });
 
-    // Entity fell through a dug hole: DigController's applyEntityPlaneTraversal
-    // moves it to level 1 via setWorldLevel while the player stays at level 0.
+    // Entity fell through a dug hole: the plane stage moved it to level 1 through
+    // setWorldLevel while the player stays at level 0.
     const fallen_entity = try data.createEntity();
     try data.setMovementBody(fallen_entity, .{ .position = .{}, .previous_position = .{} });
     try data.setPrimitiveVisual(fallen_entity, .{
@@ -1346,7 +1375,7 @@ test "visible world rect uses half-open point containment" {
 // validates and queues uploads without touching SDL. The capacity covers any test
 // world, so no sync grows it.
 fn fakeTileStoreForTest(renderer: *Renderer, world: *WorldSystem) !void {
-    std.debug.assert(world.visible_window_set);
+    std.debug.assert(world.visible != null);
     try renderer.tile_stores.append(renderer.allocator, .{
         .buffer = @ptrFromInt(0x1000),
         .element_capacity = 1 << 20,

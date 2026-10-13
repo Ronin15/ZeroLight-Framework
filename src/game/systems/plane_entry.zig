@@ -4,12 +4,14 @@
 
 //! Plane traversal's per-agent cell-entry gather. One pass over the AI rows finds each
 //! agent that entered a new cell this step and either stands where it could change
-//! plane (a ramp-link cell, or a hole with a level below) or lacks `world_level`. The
-//! player is never an entry, even when it is also an AI agent: the dig controller
-//! traverses it on its own path. The dig controller's reserve and commit then visit
-//! only those entries. Each range writes
-//! at most one entry per row into its own window of one item-capacity buffer; the main
-//! thread compacts the windows in range order, which is AI row order.
+//! plane (a ramp-link cell, or a hole with a level below) or lacks `world_level`, and
+//! classifies that cell on the worker: the ramp's other level or the fall's target, the
+//! landing floor layer, and whether the landing needs a carve. The player is never an
+//! entry, even when it is also an AI agent: the dig controller classifies it on its own
+//! path. The dig controller's reserve and commit then visit only those entries, at O(1)
+//! each. Each range writes at most one entry per row into its own window of one
+//! item-capacity buffer; the main thread compacts the windows in range order, which is
+//! AI row order.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,21 +32,64 @@ const movement_range_alignment_items = @import("../data_system.zig").movement_ra
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const WorldSystem = @import("../world_system.zig").WorldSystem;
 const CellCoord = @import("../world_system.zig").CellCoord;
+const TileId = @import("../world_system.zig").TileId;
 
 /// Range alignment of the gather: every range's window starts on a cache line.
 pub const plane_entry_range_alignment_items: usize = movement_range_alignment_items;
 
+/// What entering a cell does to an agent's plane, judged against the step's pre-commit
+/// world: nothing (`attach`: only a missing `world_level` is attached), follow a ramp
+/// link, or fall one level through a hole.
+pub const PlaneAction = enum(u8) { attach, ramp, fall };
+
+/// `PlaneTarget.landing_layer` of a fall whose target level has no floor band.
+pub const no_landing_layer: u32 = std.math.maxInt(u32);
+
+/// One entered cell's plane traversal against the pre-commit world (`planeTarget`).
+pub const PlaneTarget = struct {
+    action: PlaneAction,
+    /// The ramp's other level, the fall's level below, or the entry's own level.
+    target_level: u16,
+    /// A fall's landing floor layer, or `no_landing_layer`.
+    landing_layer: u32 = no_landing_layer,
+    /// A fall whose landing cell is not yet the walkable tunnel tile.
+    carve: bool = false,
+};
+
+/// What entering `cell` on `level` does: follow the oldest ramp link there, else fall one
+/// level through a hole when a level lies below, carving the landing when it is not
+/// already `tunnel_tile`, else nothing. Reads only; O(link endpoints in the cell's chunk).
+pub fn planeTarget(world: *const WorldSystem, level: u16, cell: CellCoord, tunnel_tile: TileId) PlaneTarget {
+    if (world.rampLinkOtherLevel(level, cell)) |other| return .{ .action = .ramp, .target_level = other };
+    const below = @as(usize, level) + 1;
+    if (below >= world.levelCount() or !world.denseFloorIsEmpty(level, cell.x, cell.y)) {
+        return .{ .action = .attach, .target_level = level };
+    }
+    // Below the level count, which fits u16.
+    const below_level: u16 = @intCast(below);
+    const layer = world.denseFloorLayerForLevel(below_level) orelse return .{ .action = .fall, .target_level = below_level };
+    return .{
+        .action = .fall,
+        .target_level = below_level,
+        // Layer indices fit u32 (`addDenseLayer`).
+        .landing_layer = @intCast(layer),
+        .carve = world.denseTile(layer, cell.x, cell.y) != tunnel_tile,
+    };
+}
+
 /// One AI agent that entered `cell` this step on `level` (its `world_level`, or its
-/// scope level when it has none) where plane traversal may act.
+/// scope level when it has none) where plane traversal may act, with that cell's
+/// traversal against the pre-commit world.
 pub const PlaneEntry = struct {
     entity: EntityId,
-    level: u16,
+    target: PlaneTarget,
     cell: CellCoord,
+    level: u16,
     needs_world_level: bool,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(PlaneEntry) == 16);
+    std.debug.assert(@sizeOf(PlaneEntry) == 24);
     std.debug.assert((plane_entry_range_alignment_items * @sizeOf(PlaneEntry)) % thread_shared_record_alignment == 0);
     std.debug.assert(plane_entry_range_alignment_items % simd.lane_count == 0);
 }
@@ -97,7 +142,7 @@ pub const PlaneEntrySystem = struct {
     /// Sizes the windows to `capacity` AI rows and the tallies to every partition of
     /// them, so a gather within it allocates nothing. Grow-only; the pipeline's
     /// population seam re-runs it.
-    pub fn reserve(self: *PlaneEntrySystem, capacity: usize) !void {
+    pub fn reserve(self: *PlaneEntrySystem, capacity: usize) error{OutOfMemory}!void {
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
         try self.tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, plane_entry_range_alignment_items));
         self.reserved_items = @max(self.reserved_items, capacity);
@@ -105,7 +150,8 @@ pub const PlaneEntrySystem = struct {
     }
 
     /// This step's entries in AI row order, read from `data` and `world` without
-    /// writing either; `player` is never an entry. Serial when `thread_system` is null;
+    /// writing either, each classified by `planeTarget` with `tunnel_tile` as the
+    /// landing floor; `player` is never an entry. Serial when `thread_system` is null;
     /// otherwise dispatched per `config` with the system's tuner. Valid until the next
     /// `gather`. An AI row count past the reservation grows the windows first
     /// (counted); an OOM there returns before anything is written.
@@ -114,8 +160,9 @@ pub const PlaneEntrySystem = struct {
         data: *const DataSystem,
         world: *const WorldSystem,
         player: EntityId,
+        tunnel_tile: TileId,
         thread_system: ?*ThreadSystem,
-    ) ![]const PlaneEntry {
+    ) error{OutOfMemory}![]const PlaneEntry {
         self.last_batch = .{};
         self.entries.clearRetainingCapacity();
         const ai = data.aiAgentSliceConst();
@@ -142,6 +189,7 @@ pub const PlaneEntrySystem = struct {
                 .tier = scope.tier,
                 .scope_level = scope.level,
                 .grid = CellGrid.of(world),
+                .tunnel_tile = tunnel_tile,
             },
             .entries = undefined,
             .tallies = undefined,
@@ -171,7 +219,7 @@ pub const PlaneEntrySystem = struct {
     // Main thread, before any dispatch: grows the windows and tallies 1.5x past
     // `needed` rows and counts the shortfall. The first warns once (release-visible,
     // compiled out of tests).
-    fn growWindows(self: *PlaneEntrySystem, needed: usize) !void {
+    fn growWindows(self: *PlaneEntrySystem, needed: usize) error{OutOfMemory}!void {
         @branchHint(.cold);
         const target = needed + needed / 2;
         try self.entries.ensureTotalCapacity(self.allocator, target);
@@ -197,7 +245,7 @@ fn compactWindows(entries: *EntryList, tallies: []const PlaneEntryTally, items_p
         const src = range_index * items_per_range;
         std.debug.assert(dst <= src);
         if (dst != src and tally.count != 0) {
-            std.mem.copyForwards(PlaneEntry, entries.items[dst..][0..tally.count], entries.items[src..][0..tally.count]);
+            @memmove(entries.items[dst..][0..tally.count], entries.items[src..][0..tally.count]);
         }
         dst += tally.count;
     }
@@ -230,6 +278,7 @@ const GatherInput = struct {
     tier: []const SimulationTier,
     scope_level: []const u16,
     grid: CellGrid,
+    tunnel_tile: TileId,
 };
 
 const PlaneEntryJob = struct {
@@ -387,19 +436,18 @@ fn gatherRangeScalar(input: *const GatherInput, start: usize, end: usize, window
 }
 
 // An entered cell becomes an entry when plane traversal could act there (a ramp link,
-// or a hole with a level below) or the agent lacks `world_level`; other entries are
-// exact no-ops in the commit. Judged against the step's pre-commit world: the commit
-// adds no links and never empties a floor, so this is a superset of its traversals.
-// The player traverses on its own path, so it is never an entry.
+// or a hole with a level below) or the agent lacks `world_level`; other cells are exact
+// no-ops in the commit. Judged against the step's pre-commit world: the commit adds no
+// links and never empties a floor, so this is a superset of its traversals, and the
+// commit re-judges only an entry whose cell or landing an earlier carve this step
+// touched. The player traverses on its own path, so it is never an entry.
 fn classify(input: *const GatherInput, entity: EntityId, movement_row: usize, cell: CellCoord) ?PlaneEntry {
     if (entity.eql(input.player)) return null;
     const world_level = input.data.worldLevelConst(entity);
     const level = world_level orelse input.scope_level[movement_row];
-    const world = input.world;
-    const potential = world.rampLinkOtherLevel(level, cell) != null or
-        (@as(usize, level) + 1 < world.levelCount() and world.denseFloorIsEmpty(level, cell.x, cell.y));
-    if (!potential and world_level != null) return null;
-    return .{ .entity = entity, .level = level, .cell = cell, .needs_world_level = world_level == null };
+    const target = planeTarget(input.world, level, cell, input.tunnel_tile);
+    if (target.action == .attach and world_level != null) return null;
+    return .{ .entity = entity, .target = target, .cell = cell, .level = level, .needs_world_level = world_level == null };
 }
 
 // ---- Tests ------------------------------------------------------------------
@@ -411,9 +459,13 @@ const DigConfig = @import("../dig_controller.zig").DigConfig;
 const DigController = @import("../dig_controller.zig").DigController;
 const Player = @import("../player.zig").Player;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
-const TileId = @import("../world_system.zig").TileId;
 
 const test_tile: f32 = 32;
+
+// The walkable floor a fall carves, from the world's own tileset meta.
+fn testTunnelTile(world: *const WorldSystem) !TileId {
+    return (try DigConfig.fromMeta(world.tilesetMeta().?)).tunnel_tile;
+}
 const test_side: u16 = 8;
 const test_levels: usize = 3;
 
@@ -582,7 +634,8 @@ const StageOutcome = struct {
 };
 
 // Gathers with `thread_system` and `config`, checks the entries against `want` when
-// given, then runs the plane stage's reserve and commit on them.
+// given, then runs the plane stage's reserve and commit (its carve batch on
+// `thread_system` too) on them.
 fn runParityStage(population: usize, thread_system: ?*ThreadSystem, config: PlaneEntryConfig, want: ?[]const PlaneEntry) !StageOutcome {
     var fixture: TestFixture = undefined;
     try fixture.init(population);
@@ -591,7 +644,7 @@ fn runParityStage(population: usize, thread_system: ?*ThreadSystem, config: Plan
     defer system.deinit();
     system.config = config;
     try system.reserve(population);
-    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, thread_system);
+    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), thread_system);
     if (want) |expected| try std.testing.expectEqualSlices(PlaneEntry, expected, entries);
 
     var dig = try fixture.digController();
@@ -600,8 +653,8 @@ fn runParityStage(population: usize, thread_system: ?*ThreadSystem, config: Plan
     defer frame.deinit();
     try frame.reserveStreams(4, population + 1, 0, 0, 0, 0);
     frame.beginStep();
-    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &frame, entries);
-    try dig.commitPlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &frame, reservation);
+    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &frame, entries, thread_system);
+    try dig.commitPlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &frame, reservation, thread_system);
     return StageOutcome.capture(&fixture, &frame, reservation.carves);
 }
 
@@ -616,7 +669,7 @@ test "plane entry gather: serial, inline, and threaded entries and stage results
     defer serial_fixture.deinit();
     var serial_system = PlaneEntrySystem.init(allocator);
     defer serial_system.deinit();
-    const serial_entries = try serial_system.gather(&serial_fixture.data, &serial_fixture.world, serial_fixture.player.entity, null);
+    const serial_entries = try serial_system.gather(&serial_fixture.data, &serial_fixture.world, serial_fixture.player.entity, try testTunnelTile(&serial_fixture.world), null);
     try std.testing.expectEqual(entries_per_kind_set * (population / agent_kind_count), serial_entries.len);
     for (serial_entries, 0..) |entry, index| {
         // AI row order: kinds 2, 4, 7, 8 of each set.
@@ -740,6 +793,7 @@ test "plane entry SIMD blocks match the scalar entry test" {
         .tier = scope.tier,
         .scope_level = scope.level,
         .grid = CellGrid.of(&fixture.world),
+        .tunnel_tile = try testTunnelTile(&fixture.world),
     };
     var simd_window: [population]PlaneEntry = undefined;
     var scalar_window: [population]PlaneEntry = undefined;
@@ -781,7 +835,7 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
 
     var system = PlaneEntrySystem.init(std.testing.allocator);
     defer system.deinit();
-    const entries = try system.gather(data, &fixture.world, player, null);
+    const entries = try system.gather(data, &fixture.world, player, try testTunnelTile(&fixture.world), null);
     try std.testing.expectEqual(fixture.agents.items.len, entries.len);
     for (entries, fixture.agents.items) |entry, npc| try std.testing.expect(entry.entity.eql(npc));
 
@@ -791,8 +845,8 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
     defer frame.deinit();
     try frame.reserveStreams(4, entries.len + 1, 0, 0, 0, 0);
     frame.beginStep();
-    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, entries);
-    try dig.commitPlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, reservation);
+    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, entries, null);
+    try dig.commitPlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, reservation, null);
     // One fall each: the player's landing at (4,1) and the NPCs' shared one at (4,0).
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(player));
     try std.testing.expectEqual(@as(u16, 1), fixture.player.current_level);
@@ -811,7 +865,7 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
 
     var serial = PlaneEntrySystem.init(allocator);
     defer serial.deinit();
-    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, null));
+    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), null));
     defer allocator.free(want);
     try std.testing.expect(want.len > 0);
 
@@ -832,7 +886,7 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
     }
     for ([_]usize{ 32, 16 }) |items_per_range| {
         system.config = .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false };
-        const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, &threads);
+        const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads);
         try std.testing.expect(!system.last_batch.ran_inline);
         try std.testing.expectEqual((population + items_per_range - 1) / items_per_range, system.last_batch.range_count);
         try std.testing.expectEqualSlices(PlaneEntry, want, entries);
@@ -849,7 +903,7 @@ test "plane entry gather past its reservation grows once before dispatch; OOM re
     defer fixture.deinit();
     var serial = PlaneEntrySystem.init(allocator);
     defer serial.deinit();
-    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, null));
+    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), null));
     defer allocator.free(want);
     try std.testing.expect(want.len > 0);
 
@@ -865,7 +919,7 @@ test "plane entry gather past its reservation grows once before dispatch; OOM re
     const landing_before = fixture.world.denseTile(floor1, 4, 0);
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing.allocator();
-    try std.testing.expectError(error.OutOfMemory, system.gather(&fixture.data, &fixture.world, fixture.player.entity, &threads));
+    try std.testing.expectError(error.OutOfMemory, system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads));
     system.allocator = allocator;
     try std.testing.expectEqual(@as(u64, 0), system.windows_grown);
     try std.testing.expectEqual(@as(usize, 0), system.entries.items.len);
@@ -874,11 +928,11 @@ test "plane entry gather past its reservation grows once before dispatch; OOM re
         try std.testing.expectEqual(parityAgent(index).world_level, fixture.data.worldLevelConst(npc));
     }
 
-    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, &threads);
+    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads);
     try std.testing.expectEqual(@as(u64, 1), system.windows_grown);
     try std.testing.expect(system.reserved_items >= population);
     try std.testing.expectEqualSlices(PlaneEntry, want, entries);
     // A second gather of the same rows fits the grown windows.
-    _ = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, &threads);
+    _ = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads);
     try std.testing.expectEqual(@as(u64, 1), system.windows_grown);
 }

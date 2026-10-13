@@ -16,64 +16,11 @@ const OpenNode = @import("types.zig").OpenNode;
 const StitchedCell = @import("types.zig").StitchedCell;
 const unreachable_cost = @import("types.zig").unreachable_cost;
 const no_slot = @import("types.zig").no_slot;
-const max_stamp_generation = @import("types.zig").max_stamp_generation;
+const max_stamp_generation = @import("../../stamped_table.zig").max_stamp_generation;
+const StampedTable = @import("../../stamped_table.zig").StampedTable;
 const openHeapLimit = @import("types.zig").openHeapLimit;
-const fibonacciSlot = @import("types.zig").fibonacciSlot;
-const hashTableSlots = @import("types.zig").hashTableSlots;
-const hashTableShift = @import("types.zig").hashTableShift;
-
-// The generation-stamped open-addressed table both search scratches keep: a slot is live
-// this generation when `stamp >> 1 == generation` (bit 0 marks it closed), so a reset is
-// O(1) outside the wraparound. Linear probe at load <= 1/2 (`hashTableSlots`), so every
-// chain ends at a slot of another generation.
-fn StampedTable(comptime Slot: type, comptime key_field: []const u8) type {
-    const Key = @FieldType(Slot, key_field);
-    return struct {
-        const Claim = struct {
-            slot: u32,
-            fresh: bool,
-        };
-
-        // A zeroed table for `limit` keys and its probe shift; allocates before the caller
-        // replaces anything.
-        fn alloc(allocator: std.mem.Allocator, limit: usize) error{OutOfMemory}!struct { slots: []Slot, shift: u6 } {
-            const slot_count = try hashTableSlots(limit);
-            const slots = try allocator.alloc(Slot, slot_count);
-            @memset(std.mem.sliceAsBytes(slots), 0);
-            return .{ .slots = slots, .shift = hashTableShift(slot_count) };
-        }
-
-        // Moves to the next generation, clearing every stamp on the wrap.
-        fn advance(slots: []Slot, generation: *u32) void {
-            if (generation.* == max_stamp_generation) {
-                @memset(std.mem.sliceAsBytes(slots), 0);
-                generation.* = 1;
-            } else {
-                generation.* += 1;
-            }
-        }
-
-        // The slot of `key` this generation, claiming it (`init(key, stamp)`) on first touch
-        // while `used` is below `budget`; null when a claim would pass the budget. A touched
-        // key always resolves. Scalar probe: about 1.5 slots per hit and 2.5 per miss at load
-        // <= 1/2, and `budget <= slots.len / 2` leaves a free slot on every chain.
-        inline fn claim(slots: []Slot, shift: u6, generation: u32, used: *usize, budget: usize, key: Key, comptime init: fn (Key, u32) Slot) ?Claim {
-            const slot_mask = slots.len - 1;
-            var index = fibonacciSlot(key, shift);
-            while (true) : (index = (index + 1) & slot_mask) {
-                const slot = &slots[index];
-                if (slot.stamp >> 1 == generation) {
-                    if (@field(slot, key_field) == key) return .{ .slot = @intCast(index), .fresh = false };
-                    continue;
-                }
-                if (used.* >= budget) return null;
-                used.* += 1;
-                slot.* = init(key, generation << 1);
-                return .{ .slot = @intCast(index), .fresh = true };
-            }
-        }
-    };
-}
+const hashTableSlots = @import("../../stamped_table.zig").hashTableSlots;
+const fibonacciSlot = @import("../../stamped_table.zig").fibonacciSlot;
 
 const AbstractSlotFlags = packed struct(u8) {
     // The slot's best parent edge is a cross-level or teleport link.

@@ -22,11 +22,9 @@ const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const Rect = @import("../render/renderer.zig").Rect;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
+const TileStoreError = @import("../render/renderer.zig").TileStoreError;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
-const TileDataId = @import("../render/renderer.zig").TileDataId;
-const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
-const tile_store_uniform_bit = @import("../render/renderer.zig").tile_store_uniform_bit;
 const tile_store_max_side = @import("../render/renderer.zig").tile_store_max_side;
 const Sprite = @import("../render/renderer.zig").Sprite;
 const sprite_batch = @import("../render/sprite_batch.zig");
@@ -66,15 +64,24 @@ const max_chunk_cells = @import("world_terrain.zig").max_chunk_cells;
 const LevelTerrain = @import("world_terrain.zig").LevelTerrain;
 const OwnedBlock = @import("world_terrain.zig").OwnedBlock;
 const no_link_endpoint = @import("world_terrain.zig").no_link_endpoint;
+const no_sparse_tile = @import("world_terrain.zig").no_sparse_tile;
+const no_edit_write = @import("world_terrain.zig").no_edit_write;
+const OrderedIndexSet = @import("systems/chunk_list_map.zig").OrderedIndexSet;
 
-pub const TileId = u16;
+pub const TileId = @import("world_terrain.zig").TileId;
 pub const invalid_tile_id: TileId = std.math.maxInt(TileId);
 pub const default_chunk_size_tiles: u16 = 16;
 /// Largest chunk edge. Terrain, nav, and scope share one edge: a power of two in
-/// [1, max_chunk_size_tiles].
-pub const max_chunk_size_tiles: u16 = 16;
+/// [1, max_chunk_size_tiles]. The terrain's bit and tile blocks are sized from it.
+pub const max_chunk_size_tiles: u16 = world_terrain.max_chunk_edge;
 
 pub const ChunkGridError = error{ InvalidChunkSize, LevelCellIndexOverflow, ChunkLabelOverflow };
+/// What adding a level can fail with: a grid past its index widths, a level index past
+/// `u16`, or allocator OOM (nothing added).
+pub const LevelAddError = ChunkGridError || error{ WorldLevelOverflow, OutOfMemory };
+/// What a terrain write can fail with: an invalid level, layer, cell, or tile, or
+/// allocator OOM; each leaves the world unchanged.
+pub const WorldEditError = error{ InvalidWorldLevel, InvalidWorldLayer, InvalidWorldCell, InvalidWorldTile, OutOfMemory };
 
 // Cell indices and chunk-local labels are u32 with maxInt as the "none" sentinel.
 const chunk_grid_index_sentinel: u64 = std.math.maxInt(u32);
@@ -143,6 +150,42 @@ pub const DenseLayerRenderWindow = struct {
         );
         return @as(u32, world_level) <= deep_limit;
     }
+};
+
+// The render window's levels around an active level: what the sparse list, the GPU
+// residency, and the static submit each record they last built against.
+const RenderLevels = struct {
+    active_level: u16,
+    window: DenseLayerRenderWindow,
+
+    fn eql(self: RenderLevels, other: ?RenderLevels) bool {
+        return if (other) |levels| std.meta.eql(self, levels) else false;
+    }
+};
+
+// Half-open tile bounds of a world rect, clamped to the level.
+const TileBounds = struct {
+    min_x: u16,
+    min_y: u16,
+    max_x: u16,
+    max_y: u16,
+
+    fn contains(self: TileBounds, x: u32, y: u32) bool {
+        return x >= self.min_x and x < self.max_x and y >= self.min_y and y < self.max_y;
+    }
+};
+
+// A world rect's render window: its tile bounds, and the chunks of those tiles widened by
+// the overscan and clamped to the chunk grid (both half-open).
+const ViewWindow = struct {
+    tiles: TileBounds,
+    chunks: world_gpu_tiles.ChunkWindow,
+};
+
+// One visibility update: its window and the levels its sparse list holds.
+const VisibleView = struct {
+    window: ViewWindow,
+    levels: RenderLevels,
 };
 
 pub const WorldBuildConfig = struct {
@@ -293,7 +336,8 @@ pub const TerrainEditThreads = struct {
 const DenseEditStatus = enum { ok, invalid_layer, invalid_cell, invalid_tile };
 
 // One bit per band of a level over a caller-owned window of words: a group's
-// written or claimed bands in `DenseEditScratch.masks`.
+// written or claimed bands in `DenseEditScratch.masks`. Not `std.bit_set`: std's bit
+// sets own their words, and these are windows of one shared, reserved scratch buffer.
 const BandBits = struct {
     words: []u64,
 
@@ -371,6 +415,29 @@ const DenseEditScratch = struct {
     }
 };
 
+// The batched edit's per-group and per-participant scratch strides for a level of
+// `bands` bands: whole cache lines per participant, so no two share a writable line.
+const DenseEditStrides = struct {
+    bands: usize,
+    mask_words: usize,
+    finals: usize,
+    touched: usize,
+    owned: usize,
+    written_bands: usize,
+
+    fn of(bands: usize) DenseEditStrides {
+        comptime std.debug.assert(max_chunk_cells * @sizeOf(TileId) % thread_shared_record_alignment == 0);
+        return .{
+            .bands = bands,
+            .mask_words = @max(1, (bands + 63) / 64),
+            .finals = bands * max_chunk_cells,
+            .touched = std.mem.alignForward(usize, bands * @sizeOf(ChunkBits), thread_shared_record_alignment) / @sizeOf(ChunkBits),
+            .owned = std.mem.alignForward(usize, bands, thread_shared_record_alignment / std.math.gcd(@sizeOf(?OwnedBlock), thread_shared_record_alignment)),
+            .written_bands = std.mem.alignForward(usize, bands, thread_shared_record_alignment / @sizeOf(u32)),
+        };
+    }
+};
+
 // Group `group_index`'s written bands (`claims` false) or claimed bands in `masks`.
 fn groupBandBits(masks: []u64, mask_words: usize, group_index: usize, claims: bool) BandBits {
     return .{ .words = masks[(2 * group_index + @intFromBool(claims)) * mask_words ..][0..mask_words] };
@@ -416,7 +483,7 @@ const DenseEditWriteJob = struct {
     catalog_flags: []const TileFlags,
     sparse_cells: []const u32,
     sparse_flags: []const TileFlags,
-    sparse_level_chunk_tiles: []const std.ArrayList(std.ArrayList(u32)),
+    sparse_next: []const u32,
     range_count: usize,
 };
 
@@ -462,10 +529,12 @@ const SparseTileRow = struct {
     tile_id: TileId,
     depth_value: i32,
     flags: TileFlags,
-    // The row's position in its level list (`sparse_level_tiles`) and its chunk list
-    // (`sparse_level_chunk_tiles`), so a removal fixes both lists in O(1).
-    level_pos: u32,
-    chunk_pos: u32,
+    // The row's neighbours in its chunk's list (`LevelTerrain.sparse_heads`), newest
+    // first, or `no_sparse_tile`, so an add or a removal relinks it in O(1). Row-index
+    // links, not `std.DoublyLinkedList`: std links node pointers, and a swap-remove moves
+    // rows of this MultiArrayList.
+    chunk_next: u32,
+    chunk_prev: u32,
 };
 
 pub const WorldSystem = struct {
@@ -504,9 +573,6 @@ pub const WorldSystem = struct {
     // Intrusive per-(level, chunk) endpoint lists over `level_links`, headed by
     // `LevelTerrain.link_heads`; entry `e` is the next endpoint after `e`.
     link_endpoint_next: std.ArrayList(u32) = .empty,
-    // Per level, per chunk: the link endpoints in that chunk's `link_heads` list. Parallel
-    // to `level_terrain`; directory-shaped like `link_heads`.
-    link_endpoint_counts: std.ArrayList([]u32) = .empty,
     // Advances with every level's `content_revision`, so a reader checks one value per
     // step and walks levels only when it moved.
     content_revision: u32 = 0,
@@ -517,6 +583,17 @@ pub const WorldSystem = struct {
     // reserve scope; the next scope returns the ones no write used to uniform.
     dense_reserved_chunks: std.ArrayList(ReservedChunk) = .empty,
     dense_edit: DenseEditScratch = .{},
+    // Grouping scratch of a batch of writes given in any order (`groupDenseCellWrites`),
+    // empty between batches: the levels holding a write (popped in order), each level's
+    // write chain (first and last write, per level), and one world-wide pair of chunk
+    // chain ends reused level by level (every level shares one chunk grid). Grown at
+    // level add. The chains link write indices into the caller's `next` slice, not
+    // `std.SinglyLinkedList` nodes: the writes are a borrowed slice with no node to embed.
+    edit_levels: OrderedIndexSet = .{},
+    edit_level_heads: std.ArrayList(u32) = .empty,
+    edit_level_tails: std.ArrayList(u32) = .empty,
+    edit_chunk_heads: []u32 = &.{},
+    edit_chunk_tails: []u32 = &.{},
     // The batched edit's per-stage tuners and last batches (`applyDenseCellWrites`).
     terrain_edit_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     terrain_edit_write_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -526,66 +603,32 @@ pub const WorldSystem = struct {
     // geometrically at their reserve seams; the first growth logs once.
     terrain_pool_grows: u64 = 0,
     terrain_pool_growth_logged: bool = false,
+    // Telemetry: reserves that grew the batched edit's scratch; the first logs once.
+    dense_edit_scratch_grows: u64 = 0,
+    dense_edit_scratch_growth_logged: bool = false,
     // Mirror of the renderer-owned GPU tile store holding the render window's dense
     // layers by chunk; `syncDenseTileStore` uploads what changed. Edits hold no GPU
     // memory: a change on a resident layer sets the layer's `render_changed` and
     // this flag, and the next sync scans that layer's window chunks for blocks
     // marked changed (`BlockFill.changed`). Render-only; never read by simulation.
     gpu_tiles: GpuTileMirror = .{},
-    gpu_edits_pending: bool = false,
+    resident_layers_changed: bool = false,
     // The GPU directory side for the last visibility rect: a power of two covering
     // any chunk window a rect of that size can touch, so a pan keeps the layout.
     render_side: u32 = 0,
     dense_render: DenseRenderScratch = .{},
-    // Residency inputs of the last GPU sync; a change re-derives the resident layers.
-    gpu_resident_level: u16 = std.math.maxInt(u16),
-    gpu_resident_window: DenseLayerRenderWindow = .{},
+    // The levels the last GPU sync laid out; a change re-derives the resident layers.
+    gpu_resident_levels: ?RenderLevels = null,
     gpu_residency_dirty: bool = true,
 
+    // Each row is linked into its (level, chunk) list (`LevelTerrain.sparse_heads`).
     sparse_tiles: std.MultiArrayList(SparseTileRow) = .{},
-
-    // Reverse per-level index over `sparse_tiles`: one growable list of indices
-    // per level, indexed by level, in no order. Maintained eagerly by
-    // `addSparseTile` (the sole inserter, which never changes a tile's level after
-    // insertion) and `removeSparseTile` (a swap-remove through the row's stored
-    // positions), so this needs no dirty flag or deferred rebuild. That matters
-    // because gameplay consumers (nav rebuild after a dig) read it within the same
-    // fixed-step tick a tile is placed, well before the next render window update would run; a
-    // lazily-rebuilt index keyed off a render dirty flag would be stale for
-    // them. A future bulk sparse-tile insert path must maintain this the same
-    // way. Lets per-level consumers walk only one level's tiles instead of
-    // scanning every sparse tile in the world and filtering by level. Grown lazily up to `level_index + 1`
-    // entries the first time a level gets a sparse tile; a level with no
-    // sparse tiles yet simply has no entry (the accessor treats that the same
-    // as an out-of-range level: an empty slice).
-    sparse_level_tiles: std.ArrayList(std.ArrayList(u32)) = .empty,
-
-    // Finer sibling of sparse_level_tiles: outer by level_index, middle by the
-    // level-local chunk index (chunkY*chunksX+chunkX, see
-    // `localChunkIndexForCell`), inner the sparse_tiles indices in that chunk.
-    // Same eager-maintenance contract as sparse_level_tiles (see above).
-    sparse_level_chunk_tiles: std.ArrayList(std.ArrayList(std.ArrayList(u32))) = .empty,
-
     sparse_window: SparseWindow = .{},
-
-    visible_min_tile_x: u16 = 0,
-    visible_min_tile_y: u16 = 0,
-    visible_max_tile_x_exclusive: u16 = 0,
-    visible_max_tile_y_exclusive: u16 = 0,
-    // Whether the visible_*/last_* window has been set. Until then nothing renders:
-    // the GPU store holds no layer and the sparse window holds no tile. The window
-    // changes only when the camera crosses a tile edge, so a still camera or a
-    // sub-tile pan leaves it and the sparse window as they are.
-    visible_window_set: bool = false,
-    // Active level of the last visibility update; sparse tiles draw only on the
-    // render window's levels around it.
-    visible_active_level: u16 = 0,
-    // `render_window` as of the last window update: the levels the sparse list holds.
-    visible_render_window: DenseLayerRenderWindow = .{},
-    last_min_chunk_x: u16 = 0,
-    last_min_chunk_y: u16 = 0,
-    last_max_chunk_x: u16 = 0,
-    last_max_chunk_y: u16 = 0,
+    // The last visibility update's window and levels, null until the first. Until
+    // then nothing renders: the GPU store holds no layer and the sparse window holds
+    // no tile. The window changes only when the camera crosses a tile edge, so a
+    // still camera or a sub-tile pan leaves it and the sparse window as they are.
+    visible: ?VisibleView = null,
 
     // World atlas dimensions captured at init: source of truth for the tilemap
     // atlas params and the safe-build runtime-texture-match assert.
@@ -599,10 +642,9 @@ pub const WorldSystem = struct {
     // set by a pan: the quads are full-world, the camera lives in the shader, and
     // the chunk window is a store uniform.
     dense_quads_dirty: bool = true,
-    // Last dense static submit anchor and window fingerprint. A change forces a
-    // re-submit even without a structural edit. Sentinel forces the first submit.
-    submitted_active_level: u16 = std.math.maxInt(u16),
-    submitted_window: DenseLayerRenderWindow = .{},
+    // The levels the last dense static submit drew; a change forces a re-submit even
+    // without a structural edit. Null forces the first submit.
+    submitted_levels: ?RenderLevels = null,
     render_window: DenseLayerRenderWindow = .{},
 
     interest_markers: world_interest.InterestMarkerStore = .{},
@@ -678,6 +720,19 @@ pub const WorldSystem = struct {
         bounds_width: f32,
         bounds_height: f32,
     ) !WorldSystem {
+        return initDemoFromMetaWithChunkSize(allocator, meta, bounds_width, bounds_height, default_chunk_size_tiles);
+    }
+
+    /// The demo surface covering `bounds_width` x `bounds_height`, cut into
+    /// `chunk_size_tiles` chunks (`validateChunkGrid`): one walkable floor band with
+    /// path cross lines and accent tiles, and two obstacle sparse tiles.
+    pub fn initDemoFromMetaWithChunkSize(
+        allocator: std.mem.Allocator,
+        meta: *const WorldTilesetMeta,
+        bounds_width: f32,
+        bounds_height: f32,
+        chunk_size_tiles: u16,
+    ) !WorldSystem {
         const tile_size = meta.tileSize();
         const width = ceilTiles(bounds_width, tile_size);
         const height = ceilTiles(bounds_height, tile_size);
@@ -686,7 +741,7 @@ pub const WorldSystem = struct {
             .width = width,
             .height = height,
             .tile_size = tile_size,
-            .chunk_size_tiles = default_chunk_size_tiles,
+            .chunk_size_tiles = chunk_size_tiles,
             .atlas_texture = atlasTextureDesc(meta),
         };
         try validateChunkGrid(world.width, world.height, world.chunk_size_tiles);
@@ -696,9 +751,7 @@ pub const WorldSystem = struct {
         const level = try world.addLevel(0);
 
         const grass = try world.requireTileByName(meta, "grass");
-        // Surface accent: grass_patchy stands in for the old `dirt` accent now that
-        // `dirt` is a solid underground material (blocks_movement), keeping level 0
-        // fully walkable and coherent with the player tile-collision gate.
+        // Walkable accents only, so the surface stays fully walkable.
         const grass_patchy = try world.requireTileByName(meta, "grass_patchy");
         const path = try world.requireTileByName(meta, "path_0");
         const stone = try world.requireTileByName(meta, "stone_floor");
@@ -762,25 +815,21 @@ pub const WorldSystem = struct {
         self.sparse_window.deinit(self.allocator);
 
         self.sparse_tiles.deinit(self.allocator);
-        for (self.sparse_level_tiles.items) |*bucket| bucket.deinit(self.allocator);
-        self.sparse_level_tiles.deinit(self.allocator);
-        for (self.sparse_level_chunk_tiles.items) |*level_chunks| {
-            for (level_chunks.items) |*bucket| bucket.deinit(self.allocator);
-            level_chunks.deinit(self.allocator);
-        }
-        self.sparse_level_chunk_tiles.deinit(self.allocator);
 
         self.gpu_tiles.deinit(self.allocator);
         self.dense_render.deinit(self.allocator);
         self.dense_reserved_chunks.deinit(self.allocator);
         self.dense_edit.deinit(self.allocator);
+        self.edit_levels.deinit(self.allocator);
+        self.edit_level_heads.deinit(self.allocator);
+        self.edit_level_tails.deinit(self.allocator);
+        self.allocator.free(self.edit_chunk_heads);
+        self.allocator.free(self.edit_chunk_tails);
         for (self.dense_layers.items(.store)) |*store| store.deinit(self.allocator);
         self.dense_layers.deinit(self.allocator);
 
         self.link_endpoint_next.deinit(self.allocator);
         self.level_links.deinit(self.allocator);
-        for (self.link_endpoint_counts.items) |counts| self.allocator.free(counts);
-        self.link_endpoint_counts.deinit(self.allocator);
         for (self.level_terrain.items) |*terrain| terrain.deinit(self.allocator);
         self.level_terrain.deinit(self.allocator);
         self.level_base_z.deinit(self.allocator);
@@ -802,10 +851,9 @@ pub const WorldSystem = struct {
         return self.interest_markers.addMarker(spec);
     }
 
-    /// Dynamic sprite-command budget the world contributes per frame. Dense tiles
-    /// render from the retained static buffer and no longer stream through the
-    /// dynamic sprite batch, so only the window's sparse tiles count here. Read
-    /// after `setVisibleChunksForWorldRect`.
+    /// Dynamic sprite-command budget the world contributes per frame: the window's
+    /// sparse tiles (dense tiles draw from the retained static buffer). Read after
+    /// `setVisibleChunksForWorldRect`.
     pub fn reserveRenderRecords(self: *const WorldSystem) usize {
         return self.sparse_window.tiles.items.len;
     }
@@ -817,42 +865,28 @@ pub const WorldSystem = struct {
         return self.dense_render.layers.items.len;
     }
 
-    /// Inclusive tile and chunk bounds of a world rect; see `chunkWindowForWorldRect`.
-    const ChunkWindow = struct {
-        min_tile_x: u16,
-        min_tile_y: u16,
-        max_tile_x: u16,
-        max_tile_y: u16,
-        min_chunk_x: u16,
-        min_chunk_y: u16,
-        max_chunk_x: u16,
-        max_chunk_y: u16,
-    };
-
     /// Tile bounds of `rect` clamped to the world, and chunk bounds widened by
     /// `overscan_chunks` and clamped to the chunk grid. The one chunk-math source
     /// shared by the render visibility window (`setVisibleChunksForWorldRect`)
     /// and the pure simulation scope region (`chunkRegionForWorldRect`), so the
     /// two cannot drift apart. Requires at least one chunk.
-    fn chunkWindowForWorldRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16) ChunkWindow {
+    fn viewWindowForWorldRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16) ViewWindow {
         std.debug.assert(self.levelCount() > 0);
-        const chunks_x = self.chunksX();
-        const chunks_y = self.chunksY();
+        const geom = self.chunkGeometry();
         const tile_size = self.tile_size;
         const min_tile_x = floorTileClamped(rect.x, tile_size, self.width);
         const min_tile_y = floorTileClamped(rect.y, tile_size, self.height);
-        // Clamped below the u16 width/height.
-        const max_tile_x: u16 = @intCast(math.lastCellOfSpan(rect.x, rect.x + rect.w, tile_size, self.width));
-        const max_tile_y: u16 = @intCast(math.lastCellOfSpan(rect.y, rect.y + rect.h, tile_size, self.height));
+        // The last covered tile is below the u16 width/height, so one past it fits u16.
+        const max_tile_x: u16 = @intCast(math.lastCellOfSpan(rect.x, rect.x + rect.w, tile_size, self.width) + 1);
+        const max_tile_y: u16 = @intCast(math.lastCellOfSpan(rect.y, rect.y + rect.h, tile_size, self.height) + 1);
         return .{
-            .min_tile_x = min_tile_x,
-            .min_tile_y = min_tile_y,
-            .max_tile_x = max_tile_x,
-            .max_tile_y = max_tile_y,
-            .min_chunk_x = saturatingSubU16(min_tile_x / self.chunk_size_tiles, overscan_chunks),
-            .min_chunk_y = saturatingSubU16(min_tile_y / self.chunk_size_tiles, overscan_chunks),
-            .max_chunk_x = @min(chunks_x - 1, max_tile_x / self.chunk_size_tiles + overscan_chunks),
-            .max_chunk_y = @min(chunks_y - 1, max_tile_y / self.chunk_size_tiles + overscan_chunks),
+            .tiles = .{ .min_x = min_tile_x, .min_y = min_tile_y, .max_x = max_tile_x, .max_y = max_tile_y },
+            .chunks = .{
+                .min_x = (@as(u32, min_tile_x) >> geom.shift) -| overscan_chunks,
+                .min_y = (@as(u32, min_tile_y) >> geom.shift) -| overscan_chunks,
+                .max_x = @min(geom.chunks_x, ((@as(u32, max_tile_x) - 1) >> geom.shift) + 1 + overscan_chunks),
+                .max_y = @min(geom.chunks_y, ((@as(u32, max_tile_y) - 1) >> geom.shift) + 1 + overscan_chunks),
+            },
         };
     }
 
@@ -862,16 +896,7 @@ pub const WorldSystem = struct {
     /// rect. Returns null when the world has no chunks.
     pub fn chunkRegionForWorldRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16) ?ActiveRegion {
         if (self.levelCount() == 0) return null;
-        const window = self.chunkWindowForWorldRect(rect, overscan_chunks);
-        std.debug.assert(window.max_chunk_x >= window.min_chunk_x);
-        std.debug.assert(window.max_chunk_y >= window.min_chunk_y);
-        return .{
-            .min = .{ .x = @intCast(window.min_chunk_x), .y = @intCast(window.min_chunk_y) },
-            .max_exclusive = .{
-                .x = @as(i32, window.max_chunk_x) + 1,
-                .y = @as(i32, window.max_chunk_y) + 1,
-            },
-        };
+        return activeRegionOf(self.viewWindowForWorldRect(rect, overscan_chunks).chunks);
     }
 
     /// `chunkRegionForWorldRect(rect, overscan_chunks)` expanded by `halo` chunks
@@ -898,63 +923,57 @@ pub const WorldSystem = struct {
     pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16, active_level: u16) error{OutOfMemory}!void {
         if (self.levelCount() == 0) return;
         const render_side = self.renderSideForRect(rect, overscan_chunks);
-        const window = self.chunkWindowForWorldRect(rect, overscan_chunks);
-        if (self.visible_window_set and !self.sparse_window.dirty and active_level == self.visible_active_level and
-            windowsEqual(self.render_window, self.visible_render_window) and
-            window.min_tile_x == self.visible_min_tile_x and window.min_tile_y == self.visible_min_tile_y and
-            window.max_tile_x + 1 == self.visible_max_tile_x_exclusive and window.max_tile_y + 1 == self.visible_max_tile_y_exclusive and
-            window.min_chunk_x == self.last_min_chunk_x and window.min_chunk_y == self.last_min_chunk_y and
-            window.max_chunk_x == self.last_max_chunk_x and window.max_chunk_y == self.last_max_chunk_y)
-        {
+        const view = VisibleView{
+            .window = self.viewWindowForWorldRect(rect, overscan_chunks),
+            .levels = .{ .active_level = active_level, .window = self.render_window },
+        };
+        if (!self.sparse_window.dirty and self.visible != null and std.meta.eql(self.visible.?, view)) {
             self.render_side = render_side;
             return;
         }
 
         // Count, reserve, then commit: an allocation failure changes nothing.
-        const tile_count = self.walkWindowSparseTiles(window, active_level, null);
+        const tile_count = self.walkWindowSparseTiles(view, null);
         try self.sparse_window.tiles.ensureTotalCapacity(self.allocator, tile_count);
         try self.sparse_window.ranges.ensureTotalCapacity(self.allocator, tile_count);
 
         self.render_side = render_side;
-        self.visible_min_tile_x = window.min_tile_x;
-        self.visible_min_tile_y = window.min_tile_y;
-        self.visible_max_tile_x_exclusive = window.max_tile_x + 1;
-        self.visible_max_tile_y_exclusive = window.max_tile_y + 1;
-        self.last_min_chunk_x = window.min_chunk_x;
-        self.last_min_chunk_y = window.min_chunk_y;
-        self.last_max_chunk_x = window.max_chunk_x;
-        self.last_max_chunk_y = window.max_chunk_y;
-        self.visible_window_set = true;
-        self.visible_active_level = active_level;
-        self.visible_render_window = self.render_window;
-        self.fillWindowSparseTiles(window, active_level, tile_count);
+        self.visible = view;
+        self.fillWindowSparseTiles(view, tile_count);
         self.sparse_window.dirty = false;
     }
 
-    // Counts the sparse tiles on the render window's levels around `active_level`
-    // inside the window's tile bounds, appending each to `out` (reserved for them)
-    // when given. Walks only the chunks under the tile bounds, never the overscan
-    // ring: O(window levels × those chunks + their sparse tiles).
-    fn walkWindowSparseTiles(self: *const WorldSystem, window: ChunkWindow, active_level: u16, out: ?*std.ArrayList(u32)) usize {
-        const levels = self.renderWindowLevels(active_level) orelse return 0;
-        const sparse_cells = self.sparse_tiles.items(.cell_index);
-        const chunks_x = self.chunksX();
-        const min_cx = window.min_tile_x / self.chunk_size_tiles;
-        const max_cx = window.max_tile_x / self.chunk_size_tiles;
-        const min_cy = window.min_tile_y / self.chunk_size_tiles;
-        const max_cy = window.max_tile_y / self.chunk_size_tiles;
+    // Counts the sparse tiles on the view's levels inside its tile bounds, appending
+    // each to `out` (reserved for them) when given. Walks only the chunks under the
+    // tile bounds, never the overscan ring: O(window levels × those chunks + their
+    // sparse tiles).
+    // SIMD verdict: scalar. A linked-list walk per chunk with a bounds test per tile.
+    fn walkWindowSparseTiles(self: *const WorldSystem, view: VisibleView, out: ?*std.ArrayList(u32)) usize {
+        const levels = self.renderWindowLevels(view.levels.active_level) orelse return 0;
+        const geom = self.chunkGeometry();
+        const sparse = self.sparse_tiles.slice();
+        const sparse_cells = sparse.items(.cell_index);
+        const sparse_next = sparse.items(.chunk_next);
+        const tiles = view.window.tiles;
+        const width: u32 = self.width;
+        const min_cx = @as(u32, tiles.min_x) >> geom.shift;
+        const max_cx = (@as(u32, tiles.max_x) - 1) >> geom.shift;
+        const min_cy = @as(u32, tiles.min_y) >> geom.shift;
+        const max_cy = (@as(u32, tiles.max_y) - 1) >> geom.shift;
         var count: usize = 0;
         var level = levels.first;
         while (level <= levels.last) : (level += 1) {
-            if (!self.render_window.levelInWindow(active_level, @intCast(level), levels.max_level)) continue;
+            if (!view.levels.window.levelInWindow(view.levels.active_level, @intCast(level), levels.max_level)) continue;
+            const heads = self.level_terrain.items[level].sparse_heads;
             var cy = min_cy;
             while (cy <= max_cy) : (cy += 1) {
                 var cx = min_cx;
                 while (cx <= max_cx) : (cx += 1) {
-                    const chunk = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
-                    for (self.sparseTileIndicesForChunk(@intCast(level), chunk)) |sparse_index| {
-                        if (!self.cellInWindowTiles(sparse_cells[sparse_index], window)) continue;
-                        if (out) |tiles| tiles.appendAssumeCapacity(sparse_index);
+                    var row = heads[cy * geom.chunks_x + cx];
+                    while (row != no_sparse_tile) : (row = sparse_next[row]) {
+                        const cell = sparse_cells[row];
+                        if (!tiles.contains(cell % width, cell / width)) continue;
+                        if (out) |list| list.appendAssumeCapacity(row);
                         count += 1;
                     }
                 }
@@ -967,7 +986,7 @@ pub const WorldSystem = struct {
     // `walkWindowSparseTiles` counted, sorts them by (depth, cell, tile id), and
     // builds one range per distinct depth. Allocation-free; an empty window skips
     // the walk and sort.
-    fn fillWindowSparseTiles(self: *WorldSystem, window: ChunkWindow, active_level: u16, tile_count: usize) void {
+    fn fillWindowSparseTiles(self: *WorldSystem, view: VisibleView, tile_count: usize) void {
         const tiles = &self.sparse_window.tiles;
         const ranges = &self.sparse_window.ranges;
         std.debug.assert(tiles.capacity >= tile_count and ranges.capacity >= tile_count);
@@ -980,7 +999,7 @@ pub const WorldSystem = struct {
             .cells = sparse.items(.cell_index),
             .tile_ids = sparse.items(.tile_id),
         };
-        _ = self.walkWindowSparseTiles(window, active_level, tiles);
+        _ = self.walkWindowSparseTiles(view, tiles);
         std.debug.assert(tiles.items.len == tile_count);
         std.mem.sort(u32, tiles.items, order, SparseWindowOrder.lessThan);
 
@@ -1009,15 +1028,6 @@ pub const WorldSystem = struct {
         }
     };
 
-    // Whether `cell` is inside the window's tile bounds (the rect's tiles, without
-    // the chunk overscan).
-    fn cellInWindowTiles(self: *const WorldSystem, cell: u32, window: ChunkWindow) bool {
-        const x = cell % self.width;
-        const y = cell / self.width;
-        return x >= window.min_tile_x and x <= window.max_tile_x and
-            y >= window.min_tile_y and y <= window.max_tile_y;
-    }
-
     // A power-of-two side covering every chunk window a rect of this size touches:
     // its chunk span plus one for alignment and the overscan on both sides, clamped
     // to the level's chunk grid. Depends only on the rect size, so a pan keeps it.
@@ -1030,16 +1040,6 @@ pub const WorldSystem = struct {
         const grid_side = std.math.ceilPowerOfTwoAssert(u32, @max(geom.chunks_x, geom.chunks_y));
         const max_side = @min(grid_side, tile_store_max_side);
         return @min(std.math.ceilPowerOfTwo(u32, @max(span_x, span_y)) catch max_side, max_side);
-    }
-
-    // The render chunk window as the GPU mirror's half-open window. Requires a set window.
-    fn renderChunkWindow(self: *const WorldSystem) world_gpu_tiles.ChunkWindow {
-        return .{
-            .min_x = self.last_min_chunk_x,
-            .min_y = self.last_min_chunk_y,
-            .max_x = @as(u32, self.last_max_chunk_x) + 1,
-            .max_y = @as(u32, self.last_max_chunk_y) + 1,
-        };
     }
 
     pub fn worldWidthPixels(self: *const WorldSystem) f32 {
@@ -1087,10 +1087,9 @@ pub const WorldSystem = struct {
         return .{ .depths = scratch.interleave.items, .gap_filled = scratch.gap_filled.items };
     }
 
-    /// The render depth an actor standing on `active_level` draws at. Always
-    /// treated as an interleave point so the common case (no other sandwiched
-    /// content) still splits off a `ceiling_when_underground` plane exactly like
-    /// before this frame's dense stack was collapsed to composite draws.
+    /// The render depth an actor standing on `active_level` draws at. Always an
+    /// interleave point, so with nothing else sandwiched the stack still splits at
+    /// the actor and a `ceiling_when_underground` plane draws above it.
     pub fn activeLevelActorDepth(self: *const WorldSystem, active_level: u16) i32 {
         return self.worldZForLevel(active_level, 0, .actor);
     }
@@ -1115,11 +1114,11 @@ pub const WorldSystem = struct {
         runtime_assets: *const RuntimeAssets,
         active_level: u16,
         interleave_depths: []const i32,
-    ) !void {
+    ) error{ WorldTilesetTextureUnavailable, OutOfMemory, Overflow, StaticGeometryTooLarge }!void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
+        const levels = RenderLevels{ .active_level = active_level, .window = self.render_window };
         if (!self.dense_quads_dirty and
-            active_level == self.submitted_active_level and
-            windowsEqual(self.render_window, self.submitted_window) and
+            levels.eql(self.submitted_levels) and
             std.mem.eql(i32, self.dense_render.submitted_interleave.items, interleave_depths))
             return;
 
@@ -1177,8 +1176,7 @@ pub const WorldSystem = struct {
         }
 
         self.dense_quads_dirty = false;
-        self.submitted_active_level = active_level;
-        self.submitted_window = self.render_window;
+        self.submitted_levels = levels;
         self.dense_render.submitted_interleave.clearRetainingCapacity();
         self.dense_render.submitted_interleave.appendSliceAssumeCapacity(interleave_depths);
     }
@@ -1291,25 +1289,30 @@ pub const WorldSystem = struct {
     /// the main thread before `submitStaticDenseGeometry` and swapchain acquisition.
     /// O(1) when nothing changed; O(window chunks) per resident layer changed since the
     /// last sync; O(resident layers × window chunks) when the window, level, or layer
-    /// set moves; never depends on chunks or levels outside the window. An error
-    /// leaves residency and change marks for a retry. Claims the
+    /// set moves; never depends on chunks or levels outside the window. Every
+    /// fallible step (plan, store creation, upload reserve) precedes the mirror
+    /// commit, and the queue after it cannot fail, so an error leaves residency and
+    /// change marks for a retry. Claims the
     /// store for this frame; the renderer retires it the first frame this is not
     /// called, and the next call re-uploads the window into a new store.
-    pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16) !void {
+    pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16) TileStoreError!void {
         const mirror = &self.gpu_tiles;
         if (mirror.store.isValid() and !renderer.claimTileStore(mirror.store)) self.resetGpuResidency();
-        if (self.levelCount() == 0 or !self.visible_window_set) return;
+        if (self.levelCount() == 0 or self.visible == null) return;
         const sync_plan = try self.planDenseGpuSync(active_level);
         const old_store = mirror.store;
         if (sync_plan.span_count > 0 and (!old_store.isValid() or mirror.store_side != sync_plan.side)) {
             var params = self.tilemap_params;
-            params.layer_meta[2] = self.chunkGeometry().shift;
-            params.layer_meta[3] = @intCast(sync_plan.side);
             params.window = sync_plan.window.uniform();
             // Held from creation: a retry after a failed reserve reuses this empty
             // store instead of creating another. It holds no resident layer yet, and
             // the retry's plan still enters every window layer.
-            mirror.store = try renderer.createTileStore(.{ .element_capacity = @max(1, sync_plan.required_elements), .params = params });
+            mirror.store = try renderer.createTileStore(.{
+                .element_capacity = @max(1, sync_plan.required_elements),
+                .params = params,
+                .chunk_shift = self.chunkGeometry().shift,
+                .side = sync_plan.side,
+            });
             mirror.store_side = sync_plan.side;
         }
         if (sync_plan.span_count > 0) {
@@ -1322,7 +1325,7 @@ pub const WorldSystem = struct {
             mirror.store_side = 0;
         }
         if (sync_plan.layers_changed or !std.meta.eql(old_store, mirror.store)) self.dense_quads_dirty = true;
-        if (sync_plan.span_count > 0) try renderer.queueTileStoreUploads(mirror.store, mirror.spans.items, mirror.values.items);
+        if (sync_plan.span_count > 0) renderer.queueTileStoreUploads(mirror.store, mirror.spans.items, mirror.values.items);
         if (sync_plan.residency_changed and mirror.store.isValid()) renderer.setTileStoreWindow(mirror.store, mirror.window.uniform());
         if (!mirror.resident_bytes_reported and mirror.store.isValid()) {
             mirror.resident_bytes_reported = true;
@@ -1338,7 +1341,7 @@ pub const WorldSystem = struct {
     // sync lays the window out anew and the draws re-submit. O(resident layers).
     fn resetGpuResidency(self: *WorldSystem) void {
         self.gpu_tiles.reset(self.dense_layers.items(.gpu_slot), self.dense_layers.items(.render_changed));
-        self.gpu_edits_pending = false;
+        self.resident_layers_changed = false;
         self.dense_render.layers.clearRetainingCapacity();
         self.dense_render.layer_depths.clearRetainingCapacity();
         self.gpu_residency_dirty = true;
@@ -1349,10 +1352,9 @@ pub const WorldSystem = struct {
     // render scratch included; re-derives the resident set only when the layer set,
     // active level, level window, chunk window, or directory side changed. Requires
     // a set render window.
-    fn planDenseGpuSync(self: *WorldSystem, active_level: u16) !world_gpu_tiles.SyncPlan {
-        std.debug.assert(self.visible_window_set);
+    fn planDenseGpuSync(self: *WorldSystem, active_level: u16) error{OutOfMemory}!world_gpu_tiles.SyncPlan {
+        const visible = self.visible.?.window.chunks;
         const geom = self.chunkGeometry();
-        const visible = self.renderChunkWindow();
         const fitted = world_gpu_tiles.fitWindow(self.render_side, visible);
         const window = fitted.window;
         if (!window.eql(visible) and !self.gpu_tiles.window_clip_reported) {
@@ -1360,14 +1362,14 @@ pub const WorldSystem = struct {
             self.gpu_tiles.window_clip_reported = true;
             log.warn("render chunk window clipped to {d}x{d} chunks; store width", .{ window.width(), window.height() });
         }
+        const levels = RenderLevels{ .active_level = active_level, .window = self.render_window };
         const rederive = self.gpu_residency_dirty or
-            active_level != self.gpu_resident_level or
-            !windowsEqual(self.render_window, self.gpu_resident_window) or
+            !levels.eql(self.gpu_resident_levels) or
             !window.eql(self.gpu_tiles.window) or
             fitted.side != self.gpu_tiles.side or
             !self.gpu_tiles.layoutMatchesStore();
         const rows = self.dense_layers.slice();
-        const layer_changed: ?[]const bool = if (self.gpu_edits_pending) rows.items(.render_changed) else null;
+        const layer_changed: ?[]const bool = if (self.resident_layers_changed) rows.items(.render_changed) else null;
         if (!rederive) {
             return self.gpu_tiles.plan(self.allocator, geom, rows.items(.store), rows.items(.gpu_slot), layer_changed, null);
         }
@@ -1399,9 +1401,8 @@ pub const WorldSystem = struct {
         const rows = self.dense_layers.slice();
         self.gpu_tiles.commit(sync_plan, self.chunkGeometry(), rows.items(.store), rows.items(.gpu_slot), rows.items(.render_changed));
         // The commit cleared every resident layer's flag; non-resident ones are never set.
-        if (sync_plan.edits) self.gpu_edits_pending = false;
-        self.gpu_resident_level = active_level;
-        self.gpu_resident_window = self.render_window;
+        if (sync_plan.edits) self.resident_layers_changed = false;
+        self.gpu_resident_levels = .{ .active_level = active_level, .window = self.render_window };
         self.gpu_residency_dirty = false;
         if (!sync_plan.residency_changed) return;
         const order = self.gpu_tiles.order.items;
@@ -1430,49 +1431,47 @@ pub const WorldSystem = struct {
         renderer: *Renderer,
         runtime_assets: *const RuntimeAssets,
         range_index: usize,
-    ) !void {
+    ) error{ WorldTilesetTextureUnavailable, MissingTileSourceRect, OutOfMemory }!void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
-        const range = self.sparse_window.ranges.items[range_index];
-        const sparse = self.sparse_tiles.slice();
-        const sparse_cells = sparse.items(.cell_index);
-        const sparse_tile_ids = sparse.items(.tile_id);
-        for (self.sparse_window.tiles.items[range.start..][0..range.count]) |index| {
-            const cell = sparse_cells[index];
-            const x: u16 = @intCast(cell % self.width);
-            const y: u16 = @intCast(cell / self.width);
-            try self.submitTile(renderer, prepared, sparse_tile_ids[index], x, y, RenderOrder.world(range.depth));
-        }
+        _ = try self.emitSparseRange(renderer, prepared.texture, range_index);
     }
 
-    /// CPU-only sparse submission for benchmarks and headless parity checks. Mirrors
-    /// `submitVisibleSparseRange` but writes ordered sprites into `batch` instead of
-    /// a live `Renderer`. Returns the sprites written.
+    /// `submitVisibleSparseRange` into a CPU sprite `batch` instead of a live
+    /// `Renderer`, for headless parity checks and benches. Returns the sprites written.
     pub fn submitVisibleSparseSprites(
         self: *const WorldSystem,
         batch: *sprite_batch.SpriteBatch,
         texture: TextureId,
         range_index: usize,
-    ) !usize {
+    ) error{ MissingTileSourceRect, OutOfMemory }!usize {
+        return self.emitSparseRange(batch, texture, range_index);
+    }
+
+    // Builds each window sparse sprite of range `range_index` once and hands it to
+    // `sink`, a `*Renderer` or a `*SpriteBatch`. Returns the sprites emitted.
+    fn emitSparseRange(self: *const WorldSystem, sink: anytype, texture: TextureId, range_index: usize) error{ MissingTileSourceRect, OutOfMemory }!usize {
         const range = self.sparse_window.ranges.items[range_index];
         const sparse = self.sparse_tiles.slice();
-        const sparse_cells = sparse.items(.cell_index);
-        const sparse_tile_ids = sparse.items(.tile_id);
+        const cells = sparse.items(.cell_index);
+        const tile_ids = sparse.items(.tile_id);
         for (self.sparse_window.tiles.items[range.start..][0..range.count]) |index| {
-            const cell = sparse_cells[index];
-            const x: u16 = @intCast(cell % self.width);
-            const y: u16 = @intCast(cell / self.width);
-            const source = self.sourceRect(sparse_tile_ids[index]) orelse return error.MissingTileSourceRect;
-            try batch.drawSprite(.{
+            const cell = cells[index];
+            const sprite = Sprite{
                 .texture = texture,
-                .source = source,
+                .source = self.sourceRect(tile_ids[index]) orelse return error.MissingTileSourceRect,
                 .dest = .{
-                    .x = @as(f32, @floatFromInt(x)) * self.tile_size,
-                    .y = @as(f32, @floatFromInt(y)) * self.tile_size,
+                    .x = @as(f32, @floatFromInt(cell % self.width)) * self.tile_size,
+                    .y = @as(f32, @floatFromInt(cell / self.width)) * self.tile_size,
                     .w = self.tile_size,
                     .h = self.tile_size,
                 },
                 .order = RenderOrder.world(range.depth),
-            });
+            };
+            switch (@TypeOf(sink)) {
+                *Renderer => try sink.submitOrderedSprite(sprite),
+                *sprite_batch.SpriteBatch => try sink.drawSprite(sprite),
+                else => @compileError("sparse sprites go to a Renderer or a SpriteBatch"),
+            }
         }
         return range.count;
     }
@@ -1498,7 +1497,7 @@ pub const WorldSystem = struct {
     /// after `reserveDenseCellWrite` for this cell it allocates nothing. O(1) plus a
     /// one-time O(edge²) block materialize, plus O(bands + sparse tiles in the chunk)
     /// to recompose the cell's movement-blocked bit.
-    pub fn setDenseTile(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
+    pub fn setDenseTile(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) WorldEditError!?WorldTileChangedEvent {
         try self.validateTileId(tile_id);
         return self.writeDenseTileCell(layer_index, x, y, tile_id);
     }
@@ -1507,7 +1506,7 @@ pub const WorldSystem = struct {
     /// the tilemap shader discards it, revealing the layer drawn below, and
     /// `flagsFor` treats it as non-blocking. This is how a dig punches a hole
     /// through one plane to expose the level beneath. Same costs as `setDenseTile`.
-    pub fn clearDenseTile(self: *WorldSystem, layer_index: usize, x: u16, y: u16) !?WorldTileChangedEvent {
+    pub fn clearDenseTile(self: *WorldSystem, layer_index: usize, x: u16, y: u16) WorldEditError!?WorldTileChangedEvent {
         return self.writeDenseTileCell(layer_index, x, y, invalid_tile_id);
     }
 
@@ -1529,7 +1528,7 @@ pub const WorldSystem = struct {
     /// scope (`beginDenseCellWriteReserve`) cover N writes however they share chunks.
     /// Reads are unchanged. O(bands + sparse tiles in the chunk), plus a one-time
     /// O(edge²) block and pool growth.
-    pub fn reserveDenseCellWrite(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !void {
+    pub fn reserveDenseCellWrite(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) WorldEditError!void {
         if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const geom = self.chunkGeometry();
@@ -1563,7 +1562,7 @@ pub const WorldSystem = struct {
     /// (`invalid_tile_id`) write is allowed here. Every growth (tile block, bits
     /// slot) is ensured before the first mutation, so an OOM leaves the world
     /// unchanged and retryable; the GPU side allocates nothing.
-    fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
+    fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) WorldEditError!?WorldTileChangedEvent {
         if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const geom = self.chunkGeometry();
@@ -1616,7 +1615,7 @@ pub const WorldSystem = struct {
         chunks: []const DenseChunkWrites,
         threads: ?TerrainEditThreads,
         events: *std.ArrayList(WorldTileChangedEvent),
-    ) !void {
+    ) (WorldEditError || error{UnorderedDenseChunkWrites})!void {
         self.last_terrain_edit_plan_batch = .{};
         self.last_terrain_edit_write_batch = .{};
         if (chunks.len == 0) return;
@@ -1630,7 +1629,7 @@ pub const WorldSystem = struct {
         const scratch = &self.dense_edit;
 
         // Groups in input order, which must be (level, chunk) order. O(k).
-        try scratch.groups.ensureTotalCapacity(self.allocator, chunks.len);
+        try self.ensureDenseEditCapacity(&scratch.groups, chunks.len);
         scratch.groups.clearRetainingCapacity();
         var write_count: usize = 0;
         var band_stride: usize = 0;
@@ -1656,18 +1655,13 @@ pub const WorldSystem = struct {
         // Reserve every growth both stages and the merge use, sized from the groups'
         // widest level, before either dispatch; nothing changes yet.
         const participant_count = if (stage_threads) |stage| stage.thread_system.participantSlotCount() else 1;
-        const mask_words = @max(1, (band_stride + 63) / 64);
-        const finals_stride = band_stride * max_chunk_cells;
-        const touched_stride = std.mem.alignForward(usize, band_stride * @sizeOf(ChunkBits), thread_shared_record_alignment) / @sizeOf(ChunkBits);
-        const owned_stride = std.mem.alignForward(usize, band_stride, thread_shared_record_alignment / std.math.gcd(@sizeOf(?OwnedBlock), thread_shared_record_alignment));
-        const written_bands_stride = std.mem.alignForward(usize, band_stride, thread_shared_record_alignment / @sizeOf(u32));
-        comptime std.debug.assert(max_chunk_cells * @sizeOf(TileId) % thread_shared_record_alignment == 0);
-        try scratch.masks.ensureTotalCapacity(self.allocator, groups.len * 2 * mask_words);
-        try scratch.finals.ensureTotalCapacity(self.allocator, participant_count * finals_stride);
-        try scratch.touched.ensureTotalCapacity(self.allocator, participant_count * touched_stride);
-        try scratch.owned.ensureTotalCapacity(self.allocator, participant_count * owned_stride);
-        try scratch.written_bands.ensureTotalCapacity(self.allocator, participant_count * written_bands_stride);
-        try scratch.band_counts.ensureTotalCapacity(self.allocator, band_stride);
+        const strides = DenseEditStrides.of(band_stride);
+        try self.reserveDenseEditScratch(groups.len, strides, participant_count);
+        const mask_words = strides.mask_words;
+        const finals_stride = strides.finals;
+        const touched_stride = strides.touched;
+        const owned_stride = strides.owned;
+        const written_bands_stride = strides.written_bands;
         scratch.masks.items.len = groups.len * 2 * mask_words;
         const masks = scratch.masks.items;
 
@@ -1770,7 +1764,7 @@ pub const WorldSystem = struct {
             .catalog_flags = self.catalog_flags.items,
             .sparse_cells = self.sparse_tiles.items(.cell_index),
             .sparse_flags = self.sparse_tiles.items(.flags),
-            .sparse_level_chunk_tiles = self.sparse_level_chunk_tiles.items,
+            .sparse_next = self.sparse_tiles.items(.chunk_next),
             .range_count = 1,
         };
         self.last_terrain_edit_write_batch = runStage(if (stage_threads) |stage| stage.write() else null, groups.len, 1, &write_job, &write_job.range_count, denseEditWriteJob);
@@ -1783,7 +1777,7 @@ pub const WorldSystem = struct {
         var merged: usize = 0;
         for (groups, 0..) |group, group_index| {
             const window = event_windows[group.start..][0..group.change_count];
-            if (merged != group.start) std.mem.copyForwards(WorldTileChangedEvent, event_windows[merged..][0..window.len], window);
+            if (merged != group.start) @memmove(event_windows[merged..][0..window.len], window);
             merged += window.len;
             if (group.change_count == 0) continue;
             const written = groupBandBits(masks, mask_words, group_index, false);
@@ -1800,13 +1794,139 @@ pub const WorldSystem = struct {
         }
     }
 
+    /// Groups dense cell writes given in any order into `applyDenseCellWrites` entries:
+    /// one per (level, chunk) touched, strictly increasing in (level, chunk), each holding
+    /// its chunk's writes in input order. `out_writes` receives the regrouped writes and
+    /// backs the entries; `next` is per-write chain scratch; each holds `writes.len`, and
+    /// `out_chunks` as many entries. Every write's layer and cell must be valid
+    /// (asserted). O(1) per write (a link into its level's chain, then into its chunk's,
+    /// and ordered-set marks) and per touched chunk and level (ordered pops), never a
+    /// level's chunk count; allocation-free, and leaves the grouping scratch empty.
+    // SIMD verdict: scalar. Per-write chain links and ordered-set inserts and pops.
+    pub fn groupDenseCellWrites(
+        self: *WorldSystem,
+        writes: []const DenseCellWrite,
+        next: []u32,
+        out_writes: []DenseCellWrite,
+        out_chunks: []DenseChunkWrites,
+    ) []DenseChunkWrites {
+        std.debug.assert(next.len >= writes.len and out_writes.len >= writes.len and out_chunks.len >= writes.len);
+        if (writes.len == 0) return out_chunks[0..0];
+        const geom = self.chunkGeometry();
+        const layer_levels = self.dense_layers.items(.level_index);
+        const levels = self.level_terrain.items;
+        const level_heads = self.edit_level_heads.items;
+        const level_tails = self.edit_level_tails.items;
+        const chunk_heads = self.edit_chunk_heads;
+        const chunk_tails = self.edit_chunk_tails;
+        // Each level's writes, chained in input order.
+        for (writes, 0..) |write, index| {
+            std.debug.assert(write.layer < layer_levels.len and write.x < geom.width and write.y < geom.height);
+            const level = layer_levels[write.layer];
+            // Write indices stay below the batch length, which the caller's u32 chains bound.
+            const item: u32 = @intCast(index);
+            next[index] = no_edit_write;
+            if (level_heads[level] == no_edit_write) {
+                self.edit_levels.insert(level);
+                level_heads[level] = item;
+            } else {
+                next[level_tails[level]] = item;
+            }
+            level_tails[level] = item;
+        }
+        var chunk_count: usize = 0;
+        var written: usize = 0;
+        while (self.edit_levels.popMin()) |level_index| {
+            const terrain = &levels[level_index];
+            // Relink the level's chain into per-chunk chains through the shared chunk ends;
+            // each write's next is read before it is relinked.
+            var item = level_heads[level_index];
+            level_heads[level_index] = no_edit_write;
+            while (item != no_edit_write) {
+                const following = next[item];
+                const write = writes[item];
+                const chunk = geom.chunkOf(write.x, write.y);
+                next[item] = no_edit_write;
+                if (chunk_heads[chunk] == no_edit_write) {
+                    terrain.edit_chunks.insert(chunk);
+                    chunk_heads[chunk] = item;
+                } else {
+                    next[chunk_tails[chunk]] = item;
+                }
+                chunk_tails[chunk] = item;
+                item = following;
+            }
+            while (terrain.edit_chunks.popMin()) |chunk_index| {
+                // Below the level's chunk count, which fits u32.
+                const chunk: u32 = @intCast(chunk_index);
+                const start = written;
+                var chained = chunk_heads[chunk];
+                while (chained != no_edit_write) : (chained = next[chained]) {
+                    out_writes[written] = writes[chained];
+                    written += 1;
+                }
+                chunk_heads[chunk] = no_edit_write;
+                out_chunks[chunk_count] = .{
+                    // Below the level count and the u16-wide chunk grid.
+                    .level = @intCast(level_index),
+                    .chunk_x = @intCast(chunk % geom.chunks_x),
+                    .chunk_y = @intCast(chunk / geom.chunks_x),
+                    .writes = out_writes[start..written],
+                };
+                chunk_count += 1;
+            }
+        }
+        std.debug.assert(written == writes.len);
+        return out_chunks[0..chunk_count];
+    }
+
+    /// Reserves the scratch `applyDenseCellWrites(chunks, threads, _)` uses (its groups,
+    /// band masks, and per-participant write buffers), so a caller can take the batch's
+    /// scratch growth at its own reserve seam; the batch's pool growth stays at its own
+    /// reserve. Counted; changes no terrain. O(chunks).
+    pub fn reserveDenseCellWrites(self: *WorldSystem, chunks: []const DenseChunkWrites, threads: ?TerrainEditThreads) error{ InvalidWorldLevel, OutOfMemory }!void {
+        if (chunks.len == 0) return;
+        const levels = self.level_terrain.items;
+        var band_stride: usize = 0;
+        for (chunks) |entry| {
+            if (entry.level >= levels.len) return error.InvalidWorldLevel;
+            band_stride = @max(band_stride, levels[entry.level].bandLayers().len);
+        }
+        try self.ensureDenseEditCapacity(&self.dense_edit.groups, chunks.len);
+        const stage_threads: ?TerrainEditThreads = if (chunks.len > 1) threads else null;
+        const participant_count = if (stage_threads) |stage| stage.thread_system.participantSlotCount() else 1;
+        try self.reserveDenseEditScratch(chunks.len, DenseEditStrides.of(band_stride), participant_count);
+    }
+
+    // The batched edit's scratch for `group_count` groups whose widest level has the
+    // strides' bands, over `participant_count` participants.
+    fn reserveDenseEditScratch(self: *WorldSystem, group_count: usize, strides: DenseEditStrides, participant_count: usize) error{OutOfMemory}!void {
+        const scratch = &self.dense_edit;
+        try self.ensureDenseEditCapacity(&scratch.masks, group_count * 2 * strides.mask_words);
+        try self.ensureDenseEditCapacity(&scratch.finals, participant_count * strides.finals);
+        try self.ensureDenseEditCapacity(&scratch.touched, participant_count * strides.touched);
+        try self.ensureDenseEditCapacity(&scratch.owned, participant_count * strides.owned);
+        try self.ensureDenseEditCapacity(&scratch.written_bands, participant_count * strides.written_bands);
+        try self.ensureDenseEditCapacity(&scratch.band_counts, strides.bands);
+    }
+
+    // One batched-edit scratch list's growth seam: geometric, and counted once grown.
+    fn ensureDenseEditCapacity(self: *WorldSystem, list: anytype, needed: usize) error{OutOfMemory}!void {
+        if (list.capacity >= needed) return;
+        try list.ensureTotalCapacity(self.allocator, needed);
+        self.dense_edit_scratch_grows += 1;
+        if (self.dense_edit_scratch_growth_logged) return;
+        self.dense_edit_scratch_growth_logged = true;
+        if (comptime logging.enabled(.info) and !builtin.is_test) log.info("batched terrain edit scratch grew to {d}", .{list.capacity});
+    }
+
     // Flags resident `layer_index` (columns `gpu_slots`, `render_changed`) for the
     // next GPU sync after one of its cells changed; a layer outside the render window
     // uploads whole when it enters. O(1).
     fn markRenderChanged(self: *WorldSystem, gpu_slots: []const u32, render_changed: []bool, layer_index: usize) void {
         if (gpu_slots[layer_index] == world_gpu_tiles.no_slot) return;
         render_changed[layer_index] = true;
-        self.gpu_edits_pending = true;
+        self.resident_layers_changed = true;
     }
 
     // The terrain pools' reserve seams: each counts a reserve that grew its pool.
@@ -1843,10 +1963,13 @@ pub const WorldSystem = struct {
     }
 
     fn sparseBlocksCell(self: *const WorldSystem, level: u16, chunk: u32, cell: u32) bool {
-        const sparse_cells = self.sparse_tiles.items(.cell_index);
-        const sparse_flags = self.sparse_tiles.items(.flags);
-        for (self.sparseTileIndicesForChunk(level, chunk)) |sparse_index| {
-            if (sparse_cells[sparse_index] == cell and sparse_flags[sparse_index].blocks_movement) return true;
+        const sparse = self.sparse_tiles.slice();
+        const sparse_cells = sparse.items(.cell_index);
+        const sparse_flags = sparse.items(.flags);
+        const sparse_next = sparse.items(.chunk_next);
+        var row = self.sparseChunkHead(level, chunk);
+        while (row != no_sparse_tile) : (row = sparse_next[row]) {
+            if (sparse_cells[row] == cell and sparse_flags[row].blocks_movement) return true;
         }
         return false;
     }
@@ -1855,14 +1978,7 @@ pub const WorldSystem = struct {
         return self.dense_layers.len;
     }
 
-    pub fn denseTileBlocksMovement(self: *const WorldSystem, layer_index: usize, x: u16, y: u16) bool {
-        if (layer_index >= self.dense_layers.len) return true;
-        if (x >= self.width or y >= self.height) return true;
-        return self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement;
-    }
-
-    /// Level a dense band belongs to. Lets navigation iterate the dense bands of a
-    /// single level directly instead of polling per cell across all levels.
+    /// The level a dense layer is a band of.
     pub fn denseLayerLevel(self: *const WorldSystem, layer_index: usize) u16 {
         return self.dense_layers.items(.level_index)[layer_index];
     }
@@ -1877,89 +1993,13 @@ pub const WorldSystem = struct {
         };
     }
 
-    /// Indices into `sparse_tiles` for every sparse tile on `level_index`, in no
-    /// particular order. Empty for an out-of-range level and for a level that
-    /// has no sparse tiles yet — callers do not need to distinguish the two.
-    /// Backed by `sparse_level_tiles`, maintained eagerly by `addSparseTile` (see
-    /// that field's doc comment), so this is always current with no rebuild step.
-    /// The slice and its indices are valid only until the next sparse tile add or
-    /// removal.
-    pub fn sparseTileIndicesForLevel(self: *const WorldSystem, level_index: u16) []const u32 {
-        if (level_index >= self.sparse_level_tiles.items.len) return &.{};
-        return self.sparse_level_tiles.items[level_index].items;
-    }
-
-    /// Indices into `sparse_tiles` for every sparse tile in `chunk_index` (a
-    /// level-local chunk offset, `chunkY*chunksX+chunkX` — see
-    /// `localChunkIndexForCell`) on `level_index`, in no particular order.
-    /// Empty for an out-of-range level or chunk. Backed by
-    /// `sparse_level_chunk_tiles`, maintained the same way as
-    /// `sparse_level_tiles` (see that field's comment) so this is always
-    /// current with no rebuild step. Finer-grained than
-    /// `sparseTileIndicesForLevel` for consumers that only need one chunk's
-    /// worth of sparse tiles. The slice and its indices are valid only until the
-    /// next sparse tile add or removal.
-    pub fn sparseTileIndicesForChunk(self: *const WorldSystem, level_index: u16, chunk_index: u32) []const u32 {
-        return chunkSparseTiles(self.sparse_level_chunk_tiles.items, level_index, chunk_index);
-    }
-
-    // Reserves capacity for one more entry in level_index's sparse_level_tiles
-    // bucket, growing the outer list with empty buckets up to level_index
-    // first if needed. Mutates no already-committed data — only capacity.
-    // Paired with commitSparseLevelIndexEntry so addSparseTile can reserve
-    // every sparse structure before committing to any of them (see
-    // addSparseTile): either every reservation for a tile succeeds and every
-    // commit is then guaranteed to succeed, or the whole call fails with
-    // nothing observably changed.
-    fn reserveSparseLevelIndexEntry(self: *WorldSystem, level_index: u16) !void {
-        const needed_buckets = @as(usize, level_index) + 1;
-        if (self.sparse_level_tiles.items.len < needed_buckets) {
-            try self.sparse_level_tiles.ensureTotalCapacity(self.allocator, needed_buckets);
-            while (self.sparse_level_tiles.items.len < needed_buckets) {
-                self.sparse_level_tiles.appendAssumeCapacity(.empty);
-            }
-        }
-        const bucket = &self.sparse_level_tiles.items[level_index];
-        try bucket.ensureTotalCapacity(self.allocator, bucket.items.len + 1);
-    }
-
-    // Infallible append into level_index's sparse_level_tiles bucket. Call
-    // only after reserveSparseLevelIndexEntry(level_index) has succeeded.
-    fn commitSparseLevelIndexEntry(self: *WorldSystem, level_index: u16, sparse_index: u32) void {
-        self.sparse_level_tiles.items[level_index].appendAssumeCapacity(sparse_index);
-    }
-
-    // Reserves capacity for one more entry in (level_index, chunk_index)'s
-    // sparse_level_chunk_tiles bucket: grows the outer per-level list, then
-    // that level's per-chunk list to chunkCountPerLevel() buckets on first
-    // touch, then the target chunk's bucket. Mutates no already-committed
-    // data — only capacity and empty placeholder buckets. See
-    // reserveSparseLevelIndexEntry for why this is split from its commit.
-    fn reserveSparseChunkIndexEntry(self: *WorldSystem, level_index: u16, chunk_index: u32) !void {
-        const needed_levels = @as(usize, level_index) + 1;
-        if (self.sparse_level_chunk_tiles.items.len < needed_levels) {
-            try self.sparse_level_chunk_tiles.ensureTotalCapacity(self.allocator, needed_levels);
-            while (self.sparse_level_chunk_tiles.items.len < needed_levels) {
-                self.sparse_level_chunk_tiles.appendAssumeCapacity(.empty);
-            }
-        }
-        const level_chunks = &self.sparse_level_chunk_tiles.items[level_index];
-        const needed_chunks = self.chunkCountPerLevel();
-        if (level_chunks.items.len < needed_chunks) {
-            try level_chunks.ensureTotalCapacity(self.allocator, needed_chunks);
-            while (level_chunks.items.len < needed_chunks) {
-                level_chunks.appendAssumeCapacity(.empty);
-            }
-        }
-        const bucket = &level_chunks.items[chunk_index];
-        try bucket.ensureTotalCapacity(self.allocator, bucket.items.len + 1);
-    }
-
-    // Infallible append into (level_index, chunk_index)'s
-    // sparse_level_chunk_tiles bucket. Call only after
-    // reserveSparseChunkIndexEntry(level_index, chunk_index) has succeeded.
-    fn commitSparseChunkIndexEntry(self: *WorldSystem, level_index: u16, chunk_index: u32, sparse_index: u32) void {
-        self.sparse_level_chunk_tiles.items[level_index].items[chunk_index].appendAssumeCapacity(sparse_index);
+    // The newest sparse tile row in `chunk_index` (level-local) on `level_index`; its
+    // list continues through the rows' `chunk_next`. `no_sparse_tile` for an empty,
+    // invalid, or out-of-range chunk.
+    fn sparseChunkHead(self: *const WorldSystem, level_index: u16, chunk_index: u32) u32 {
+        if (@as(usize, level_index) >= self.level_terrain.items.len) return no_sparse_tile;
+        const heads = self.level_terrain.items[level_index].sparse_heads;
+        return if (chunk_index < heads.len) heads[chunk_index] else no_sparse_tile;
     }
 
     pub fn levelCount(self: *const WorldSystem) usize {
@@ -1979,14 +2019,11 @@ pub const WorldSystem = struct {
     }
 
     /// The dense floor layer for a level (first `.floor` band on it), or null if
-    /// the level has none. O(bands on the level).
+    /// the level has none. O(1): the level records it when the band is added.
     pub fn denseFloorLayerForLevel(self: *const WorldSystem, level_index: u16) ?usize {
         if (@as(usize, level_index) >= self.level_terrain.items.len) return null;
-        const dense_depth_bands = self.dense_layers.items(.depth_band);
-        for (self.level_terrain.items[level_index].bandLayers()) |layer_index| {
-            if (dense_depth_bands[layer_index] == .floor) return layer_index;
-        }
-        return null;
+        const layer = self.level_terrain.items[level_index].floorLayer() orelse return null;
+        return layer;
     }
 
     /// Whether a level's floor cell is an empty (dug-through) hole. False when the
@@ -2073,14 +2110,14 @@ pub const WorldSystem = struct {
     /// The number of link endpoints `levelChunkLinkEndpoints(level_index, chunk)` yields;
     /// 0 for an invalid level or chunk. O(1).
     pub fn levelChunkLinkEndpointCount(self: *const WorldSystem, level_index: u16, chunk: u32) u32 {
-        if (@as(usize, level_index) >= self.link_endpoint_counts.items.len) return 0;
-        const counts = self.link_endpoint_counts.items[level_index];
+        if (@as(usize, level_index) >= self.level_terrain.items.len) return 0;
+        const counts = self.level_terrain.items[level_index].link_counts;
         return if (chunk < counts.len) counts[chunk] else 0;
     }
 
     /// Per-level composed navigability: whether any dense band on the level or any
     /// sparse obstacle on it blocks the cell. Out-of-range x/y returns blocked,
-    /// matching denseTileBlocksMovement; an invalid level also returns blocked
+    /// as an out-of-range dense tile does; an invalid level also returns blocked
     /// (fail-closed) so a bad index can never expose phantom open cells to the
     /// pathfinder. O(1): the chunk's composed-bits entry plus one bit.
     pub fn levelBlocksMovement(self: *const WorldSystem, level_index: u16, x: u16, y: u16) bool {
@@ -2156,16 +2193,16 @@ pub const WorldSystem = struct {
         const geom = self.chunkGeometry();
         const endpoint_a: u32 = @intCast(self.level_links.items.len * 2);
         self.level_links.appendAssumeCapacity(link);
-        const heads_a = self.level_terrain.items[link.level_a].link_heads;
+        const terrain_a = &self.level_terrain.items[link.level_a];
         const chunk_a = geom.chunkOf(link.cell_a.x, link.cell_a.y);
-        self.link_endpoint_next.appendAssumeCapacity(heads_a[chunk_a]);
-        heads_a[chunk_a] = endpoint_a;
-        self.link_endpoint_counts.items[link.level_a][chunk_a] += 1;
-        const heads_b = self.level_terrain.items[link.level_b].link_heads;
+        self.link_endpoint_next.appendAssumeCapacity(terrain_a.link_heads[chunk_a]);
+        terrain_a.link_heads[chunk_a] = endpoint_a;
+        terrain_a.link_counts[chunk_a] += 1;
+        const terrain_b = &self.level_terrain.items[link.level_b];
         const chunk_b = geom.chunkOf(link.cell_b.x, link.cell_b.y);
-        self.link_endpoint_next.appendAssumeCapacity(heads_b[chunk_b]);
-        heads_b[chunk_b] = endpoint_a + 1;
-        self.link_endpoint_counts.items[link.level_b][chunk_b] += 1;
+        self.link_endpoint_next.appendAssumeCapacity(terrain_b.link_heads[chunk_b]);
+        terrain_b.link_heads[chunk_b] = endpoint_a + 1;
+        terrain_b.link_counts[chunk_b] += 1;
     }
 
     fn validateLevelLink(self: *const WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell }!void {
@@ -2189,15 +2226,6 @@ pub const WorldSystem = struct {
         return self.sparse_tiles.items(.flags)[index].blocks_movement;
     }
 
-    /// A sparse index is valid only until the next sparse tile removal.
-    pub fn sparseTileRect(self: *const WorldSystem, index: usize) ?Rect {
-        if (index >= self.sparse_tiles.len) return null;
-        const cell = self.sparse_tiles.items(.cell_index)[index];
-        const x: u16 = @intCast(cell % self.width);
-        const y: u16 = @intCast(cell / self.width);
-        return self.cellRect(x, y);
-    }
-
     pub fn cellRect(self: *const WorldSystem, x: u16, y: u16) ?Rect {
         if (x >= self.width or y >= self.height) return null;
         return .{
@@ -2218,11 +2246,10 @@ pub const WorldSystem = struct {
         return .{ .x = @intCast(cell_x), .y = @intCast(cell_y) };
     }
 
+    /// The chunk holding cell (x, y). Pure arithmetic on the chunk edge, so it needs no
+    /// level.
     pub fn chunkCoordForCell(self: *const WorldSystem, x: u16, y: u16) struct { x: i32, y: i32 } {
-        return .{
-            .x = @intCast(x / self.chunk_size_tiles),
-            .y = @intCast(y / self.chunk_size_tiles),
-        };
+        return .{ .x = x / self.chunk_size_tiles, .y = y / self.chunk_size_tiles };
     }
 
     /// Canonical world-space float position → chunk coordinate, clamped to world
@@ -2241,28 +2268,21 @@ pub const WorldSystem = struct {
     /// simulation path may read it — fixed-step scope uses
     /// `chunkRegionForWorldRect` / `cognitionRegionForWorldRect` instead.
     pub fn visibleChunkRegion(self: *const WorldSystem) ?ActiveRegion {
-        if (!self.visible_window_set or self.levelCount() == 0) return null;
-        std.debug.assert(self.last_max_chunk_x >= self.last_min_chunk_x);
-        std.debug.assert(self.last_max_chunk_y >= self.last_min_chunk_y);
-        return .{
-            .min = .{ .x = @intCast(self.last_min_chunk_x), .y = @intCast(self.last_min_chunk_y) },
-            .max_exclusive = .{
-                .x = @as(i32, self.last_max_chunk_x) + 1,
-                .y = @as(i32, self.last_max_chunk_y) + 1,
-            },
-        };
+        const view = self.visible orelse return null;
+        if (self.levelCount() == 0) return null;
+        return activeRegionOf(view.window.chunks);
     }
 
     /// Adds an empty level (no bands, every chunk open, no link endpoints). Touches
     /// only its own directories: O(chunks per level), whatever the depth.
-    pub fn addLevel(self: *WorldSystem, base_z: i32) !u16 {
+    pub fn addLevel(self: *WorldSystem, base_z: i32) LevelAddError!u16 {
         return self.appendLevelBaseZ(base_z);
     }
 
     // Every level of a world, whether built, literal-constructed, or added in play,
     // enters here, so the loud index-width checks run before anything is sized
     // from them. All growth precedes the commit, so an OOM adds no level.
-    fn appendLevelBaseZ(self: *WorldSystem, base_z: i32) !u16 {
+    fn appendLevelBaseZ(self: *WorldSystem, base_z: i32) LevelAddError!u16 {
         try validateChunkGrid(self.width, self.height, self.chunk_size_tiles);
         const index = self.level_base_z.items.len;
         if (index > std.math.maxInt(u16)) return error.WorldLevelOverflow;
@@ -2271,14 +2291,24 @@ pub const WorldSystem = struct {
         self.chunk_geom = geom;
         try self.level_base_z.ensureUnusedCapacity(self.allocator, 1);
         try self.level_terrain.ensureUnusedCapacity(self.allocator, 1);
-        try self.link_endpoint_counts.ensureUnusedCapacity(self.allocator, 1);
-        const endpoint_counts = try self.allocator.alloc(u32, self.chunkCountPerLevel());
-        errdefer self.allocator.free(endpoint_counts);
-        @memset(endpoint_counts, 0);
-        const terrain = try LevelTerrain.init(self.allocator, self.chunkCountPerLevel());
+        _ = try self.edit_levels.reserve(self.allocator, index + 1);
+        try self.edit_level_heads.ensureUnusedCapacity(self.allocator, 1);
+        try self.edit_level_tails.ensureUnusedCapacity(self.allocator, 1);
+        if (self.edit_chunk_heads.len < geom.chunkCount()) {
+            const heads = try self.allocator.alloc(u32, geom.chunkCount());
+            errdefer self.allocator.free(heads);
+            const tails = try self.allocator.alloc(u32, geom.chunkCount());
+            @memset(heads, no_edit_write);
+            self.allocator.free(self.edit_chunk_heads);
+            self.allocator.free(self.edit_chunk_tails);
+            self.edit_chunk_heads = heads;
+            self.edit_chunk_tails = tails;
+        }
+        const terrain = try LevelTerrain.init(self.allocator, geom.chunkCount());
         self.level_terrain.appendAssumeCapacity(terrain);
-        self.link_endpoint_counts.appendAssumeCapacity(endpoint_counts);
         self.level_base_z.appendAssumeCapacity(base_z);
+        self.edit_level_heads.appendAssumeCapacity(no_edit_write);
+        self.edit_level_tails.appendAssumeCapacity(no_edit_write);
         // The deepest level bounds the render window's dense submit and GPU
         // residency. The visible sparse count is unchanged: the new level is empty.
         self.dense_quads_dirty = true;
@@ -2294,7 +2324,7 @@ pub const WorldSystem = struct {
     ///
     /// Every growth is reserved before the band list, layer row, and composed bits
     /// are written, so an OOM leaves them retryable.
-    pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) !usize {
+    pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) error{ InvalidWorldLevel, InvalidWorldTile, WorldLayerOverflow, OutOfMemory }!usize {
         try self.validateLevelIndex(level_index);
         try self.validateTileId(fill_tile);
 
@@ -2318,6 +2348,7 @@ pub const WorldSystem = struct {
             .render_changed = false,
         });
         terrain.bands.appendAssumeCapacity(@intCast(layer_index));
+        if (depth == .floor and terrain.floor_layer == world_terrain.no_floor_layer) terrain.floor_layer = @intCast(layer_index);
         if (self.flagsFor(fill_tile).blocks_movement) {
             for (0..terrain.blocked.dir.len) |chunk| terrain.blocked.setChunk(@intCast(chunk), true);
             terrain.content_revision +%= 1;
@@ -2350,8 +2381,8 @@ pub const WorldSystem = struct {
 
     /// Adds the two solid underground planes beneath the surface (level 0): a dirt
     /// floor one step down, a dark floor two steps down. Digging a hole in a plane
-    /// reveals the one below. Thin wrapper over `addUndergroundLevelStack` for the
-    /// legacy three-level demo world.
+    /// reveals the one below. The demo world's two-plane stack
+    /// (`addUndergroundLevelStack`).
     pub fn addUndergroundLevels(self: *WorldSystem, meta: *const WorldTilesetMeta) !void {
         try self.addUndergroundLevelStack(meta, 2);
     }
@@ -2364,48 +2395,43 @@ pub const WorldSystem = struct {
         tile_id: TileId,
         base_z: i32,
         depth: WorldDepth,
-    ) !?WorldObstacleChangedEvent {
+    ) WorldEditError!?WorldObstacleChangedEvent {
         try self.validateLevelIndex(level_index);
         try self.validateTileId(tile_id);
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const cell = self.cellIndex(x, y);
-        const local_chunk_index = self.localChunkIndexForCell(x, y);
         const flags = self.flagsFor(tile_id);
         const world_z = self.worldZForLevel(level_index, base_z, depth);
 
-        // Reserve capacity in sparse_tiles, sparse_level_tiles,
-        // sparse_level_chunk_tiles, and the level's composed bits before
-        // committing to any of them: an OOM partway through would otherwise leave
-        // a tile in one structure but invisible to the lookups the others back
-        // (nav rebuild, levelBlocksMovement and the LOS that reads it). Either
-        // every reservation succeeds and the commits below are then infallible,
-        // or the call fails here with none of the structures changed.
+        // Reserve the row and the level's composed bits before committing either: an
+        // OOM leaves the tile in no structure, so every lookup (nav rebuild,
+        // levelBlocksMovement and the LOS that reads it) agrees.
         const geom = self.chunkGeometry();
+        const chunk = geom.chunkOf(x, y);
         const local_cell = geom.localOf(x, y);
-        const blocked = &self.level_terrain.items[level_index].blocked;
-        try self.sparse_tiles.ensureTotalCapacity(self.allocator, self.sparse_tiles.len + 1);
-        try self.reserveSparseLevelIndexEntry(level_index);
-        try self.reserveSparseChunkIndexEntry(level_index, local_chunk_index);
-        if (flags.blocks_movement and blocked.setNeedsSlot(local_chunk_index, local_cell, true)) {
+        const terrain = &self.level_terrain.items[level_index];
+        const blocked = &terrain.blocked;
+        try self.sparse_tiles.ensureUnusedCapacity(self.allocator, 1);
+        if (flags.blocks_movement and blocked.setNeedsSlot(chunk, local_cell, true)) {
             try self.ensureBlockedSlots(blocked, 1);
         }
 
+        // Row indices stay below the list sentinel (u32).
         const new_index: u32 = @intCast(self.sparse_tiles.len);
-        // Each list holds at most every row, so its positions fit u32 like the index.
-        const level_pos: u32 = @intCast(self.sparse_level_tiles.items[level_index].items.len);
-        const chunk_pos: u32 = @intCast(self.sparse_level_chunk_tiles.items[level_index].items[local_chunk_index].items.len);
+        std.debug.assert(new_index != no_sparse_tile);
+        const head = terrain.sparse_heads[chunk];
         self.sparse_tiles.appendAssumeCapacity(.{
             .level_index = level_index,
             .cell_index = cell,
             .tile_id = tile_id,
             .depth_value = world_z,
             .flags = flags,
-            .level_pos = level_pos,
-            .chunk_pos = chunk_pos,
+            .chunk_next = head,
+            .chunk_prev = no_sparse_tile,
         });
-        self.commitSparseLevelIndexEntry(level_index, new_index);
-        self.commitSparseChunkIndexEntry(level_index, local_chunk_index, new_index);
-        if (flags.blocks_movement) blocked.set(geom, local_chunk_index, local_cell, true);
+        if (head != no_sparse_tile) self.sparse_tiles.items(.chunk_prev)[head] = new_index;
+        terrain.sparse_heads[chunk] = new_index;
+        if (flags.blocks_movement) blocked.set(geom, chunk, local_cell, true);
         // Only a tile the current window draws rebuilds its sparse list.
         if (self.sparseTileInWindow(level_index, x, y)) self.sparse_window.dirty = true;
         if (!flags.blocks_movement) return null;
@@ -2424,7 +2450,7 @@ pub const WorldSystem = struct {
     /// when the cell is blocked in a uniform chunk. Reads are unchanged; an OOM
     /// leaves the world's contents as they were. O(bands + sparse tiles in the chunk),
     /// plus a one-time O(edge²) block per band and pool growth.
-    pub fn reserveClearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y: u16, floor_tile: TileId) !void {
+    pub fn reserveClearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y: u16, floor_tile: TileId) WorldEditError!void {
         try self.validateLevelIndex(level_index);
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         try self.validateTileId(floor_tile);
@@ -2467,7 +2493,7 @@ pub const WorldSystem = struct {
     /// changed, else null. Reserves first, so an OOM changes nothing; allocation-free
     /// after `reserveClearCellBlocking` for this cell. O(bands + sparse tiles in the
     /// chunk).
-    pub fn clearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y: u16, floor_tile: TileId) !?WorldObstacleChangedEvent {
+    pub fn clearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y: u16, floor_tile: TileId) WorldEditError!?WorldObstacleChangedEvent {
         try self.reserveClearCellBlocking(level_index, x, y, floor_tile);
         const geom = self.chunkGeometry();
         const chunk = geom.chunkOf(x, y);
@@ -2484,18 +2510,25 @@ pub const WorldSystem = struct {
             changed = true;
         }
 
-        // Backwards, so each swap-remove moves into the visited position only an
-        // entry already visited.
+        // A removal moves the last row into the removed row's index; the walk's next
+        // row follows it when it was that last row.
         const cell = self.cellIndex(x, y);
-        const sparse_cells = self.sparse_tiles.items(.cell_index);
-        const sparse_flags = self.sparse_tiles.items(.flags);
-        var position = self.sparseTileIndicesForChunk(level_index, chunk).len;
-        while (position > 0) {
-            position -= 1;
-            const sparse_index = self.sparseTileIndicesForChunk(level_index, chunk)[position];
-            if (sparse_cells[sparse_index] != cell or !sparse_flags[sparse_index].blocks_movement) continue;
-            self.removeSparseTile(sparse_index);
+        // Removal swap-removes in place, so the columns stay put; only the length shrinks.
+        const sparse = self.sparse_tiles.slice();
+        const sparse_next = sparse.items(.chunk_next);
+        const sparse_cells = sparse.items(.cell_index);
+        const sparse_flags = sparse.items(.flags);
+        var row = self.level_terrain.items[level_index].sparse_heads[chunk];
+        while (row != no_sparse_tile) {
+            var next = sparse_next[row];
+            if (sparse_cells[row] != cell or !sparse_flags[row].blocks_movement) {
+                row = next;
+                continue;
+            }
+            if (next == self.sparse_tiles.len - 1) next = row;
+            self.removeSparseTile(row);
             changed = true;
+            row = next;
         }
         if (!changed) return null;
 
@@ -2518,40 +2551,32 @@ pub const WorldSystem = struct {
         return if (floor == layer) floor_tile else invalid_tile_id;
     }
 
-    // Removes sparse row `index` from its level list, its chunk list, and the rows,
-    // each by swap-remove: the entry moved into a freed list position, and the last
-    // row's two entries, are repointed through the rows' stored positions. The window
-    // list rebuilds at the next window update when it may hold the removed or the
-    // moved row. The caller recomposes the cell's blocked bit. O(1), allocation-free.
+    // Removes sparse row `index` from its chunk list and the rows by swap-remove: the
+    // last row moves into `index` and its neighbours (or its chunk head) are
+    // repointed. The window list rebuilds at the next window update when it may hold
+    // the removed or the moved row. The caller recomposes the cell's blocked bit. O(1),
+    // allocation-free.
     fn removeSparseTile(self: *WorldSystem, index: u32) void {
         const geom = self.chunkGeometry();
         const rows = self.sparse_tiles.slice();
         const levels = rows.items(.level_index);
         const cells = rows.items(.cell_index);
-        const level_positions = rows.items(.level_pos);
-        const chunk_positions = rows.items(.chunk_pos);
+        const next = rows.items(.chunk_next);
+        const prev = rows.items(.chunk_prev);
         const last: u32 = @intCast(self.sparse_tiles.len - 1);
 
-        const level = levels[index];
         const coord = self.cellCoordOf(cells[index]);
-        const level_list = &self.sparse_level_tiles.items[level];
-        const level_pos = level_positions[index];
-        std.debug.assert(level_list.items[level_pos] == index);
-        _ = level_list.swapRemove(level_pos);
-        if (level_pos < level_list.items.len) level_positions[level_list.items[level_pos]] = level_pos;
-        const chunk_list = &self.sparse_level_chunk_tiles.items[level].items[geom.chunkOf(coord.x, coord.y)];
-        const chunk_pos = chunk_positions[index];
-        std.debug.assert(chunk_list.items[chunk_pos] == index);
-        _ = chunk_list.swapRemove(chunk_pos);
-        if (chunk_pos < chunk_list.items.len) chunk_positions[chunk_list.items[chunk_pos]] = chunk_pos;
-        if (self.sparseTileInWindow(level, coord.x, coord.y)) self.sparse_window.dirty = true;
+        const heads = self.level_terrain.items[levels[index]].sparse_heads;
+        if (prev[index] != no_sparse_tile) next[prev[index]] = next[index] else heads[geom.chunkOf(coord.x, coord.y)] = next[index];
+        if (next[index] != no_sparse_tile) prev[next[index]] = prev[index];
+        if (self.sparseTileInWindow(levels[index], coord.x, coord.y)) self.sparse_window.dirty = true;
 
         if (index != last) {
-            const moved_level = levels[last];
             const moved = self.cellCoordOf(cells[last]);
-            self.sparse_level_tiles.items[moved_level].items[level_positions[last]] = index;
-            self.sparse_level_chunk_tiles.items[moved_level].items[geom.chunkOf(moved.x, moved.y)].items[chunk_positions[last]] = index;
-            if (self.sparseTileInWindow(moved_level, moved.x, moved.y)) self.sparse_window.dirty = true;
+            const moved_heads = self.level_terrain.items[levels[last]].sparse_heads;
+            if (prev[last] != no_sparse_tile) next[prev[last]] = index else moved_heads[geom.chunkOf(moved.x, moved.y)] = index;
+            if (next[last] != no_sparse_tile) prev[next[last]] = index;
+            if (self.sparseTileInWindow(levels[last], moved.x, moved.y)) self.sparse_window.dirty = true;
         }
         self.sparse_tiles.swapRemove(index);
     }
@@ -2570,29 +2595,6 @@ pub const WorldSystem = struct {
     // Tile-cell coordinate of a cell index (below width * height, so both fit u16).
     fn cellCoordOf(self: *const WorldSystem, cell: u32) CellCoord {
         return .{ .x = @intCast(cell % self.width), .y = @intCast(cell / self.width) };
-    }
-
-    fn submitTile(
-        self: *const WorldSystem,
-        renderer: *Renderer,
-        prepared: PreparedSprite,
-        tile_id: TileId,
-        x: u16,
-        y: u16,
-        order: RenderOrder,
-    ) !void {
-        const source = self.sourceRect(tile_id) orelse return error.MissingTileSourceRect;
-        try renderer.submitOrderedSprite(.{
-            .texture = prepared.texture,
-            .source = source,
-            .dest = .{
-                .x = @as(f32, @floatFromInt(x)) * self.tile_size,
-                .y = @as(f32, @floatFromInt(y)) * self.tile_size,
-                .w = self.tile_size,
-                .h = self.tile_size,
-            },
-            .order = order,
-        });
     }
 
     /// Builds the tile catalog of a directly constructed world, before its first
@@ -2672,17 +2674,16 @@ pub const WorldSystem = struct {
     // the level is in the window around its active level and the cell is inside
     // its tile bounds. False before a window is set.
     fn sparseTileInWindow(self: *const WorldSystem, level: u16, x: u16, y: u16) bool {
-        if (!self.visible_window_set) return false;
-        if (!self.visible_render_window.levelInWindow(self.visible_active_level, level, self.maxLevelIndex())) return false;
-        return x >= self.visible_min_tile_x and x < self.visible_max_tile_x_exclusive and
-            y >= self.visible_min_tile_y and y < self.visible_max_tile_y_exclusive;
+        const view = self.visible orelse return false;
+        if (!view.levels.window.levelInWindow(view.levels.active_level, level, self.maxLevelIndex())) return false;
+        return view.window.tiles.contains(x, y);
     }
 
-    fn validateLevelIndex(self: *const WorldSystem, level_index: u16) !void {
+    fn validateLevelIndex(self: *const WorldSystem, level_index: u16) error{InvalidWorldLevel}!void {
         if (@as(usize, level_index) >= self.level_base_z.items.len) return error.InvalidWorldLevel;
     }
 
-    fn validateTileId(self: *const WorldSystem, tile_id: TileId) !void {
+    fn validateTileId(self: *const WorldSystem, tile_id: TileId) error{InvalidWorldTile}!void {
         if (!self.isValidTileId(tile_id)) return error.InvalidWorldTile;
     }
 
@@ -2715,34 +2716,20 @@ pub const WorldSystem = struct {
         return a < b;
     }
 
-    // Flat level-local chunk offset for a cell (chunkY*chunksX+chunkX),
-    // identical for every level since width/height/chunk_size_tiles are
-    // world-wide, not per-level. Backs sparse_level_chunk_tiles' middle
-    // dimension.
-    fn localChunkIndexForCell(self: *const WorldSystem, x: u16, y: u16) u32 {
-        const chunks_x = self.chunksX();
-        const chunk_x = x / self.chunk_size_tiles;
-        const chunk_y = y / self.chunk_size_tiles;
-        return @as(u32, chunk_y) * @as(u32, chunks_x) + @as(u32, chunk_x);
-    }
-
-    /// Level-local chunk grid width (world-wide, identical for every level —
-    /// see `localChunkIndexForCell`). Exposed for callers that walk chunks by
-    /// index (nav's world-obstacle mark, chunk benches) without duplicating this
-    /// grid-shape arithmetic.
+    /// Level-local chunk grid width (every level shares one grid). Requires a level.
     pub fn chunksX(self: *const WorldSystem) u16 {
-        return ceilDiv(self.width, self.chunk_size_tiles);
+        // At most the u16 width.
+        return @intCast(self.chunkGeometry().chunks_x);
     }
 
     /// Level-local chunk grid height. See `chunksX`.
     pub fn chunksY(self: *const WorldSystem) u16 {
-        return ceilDiv(self.height, self.chunk_size_tiles);
+        return @intCast(self.chunkGeometry().chunks_y);
     }
 
-    /// Chunks per level (`chunksX() * chunksY()`), the length of every per-level
-    /// chunk directory.
+    /// Chunks per level, the length of every per-level chunk directory. Requires a level.
     pub fn chunkCountPerLevel(self: *const WorldSystem) usize {
-        return @as(usize, self.chunksX()) * @as(usize, self.chunksY());
+        return self.chunkGeometry().chunkCount();
     }
 
     // Fills one level's only dense band and its composed bits chunk by chunk on the
@@ -2752,7 +2739,8 @@ pub const WorldSystem = struct {
         const geom = self.chunkGeometry();
         const terrain = &self.level_terrain.items[level];
         std.debug.assert(terrain.bandLayers().len == 1 and terrain.bandLayers()[0] == layer_index);
-        std.debug.assert(self.sparseTileIndicesForLevel(level).len == 0);
+        // The fill composes from the band alone: the level holds no sparse tile yet.
+        std.debug.assert(std.mem.allEqual(u32, terrain.sparse_heads, no_sparse_tile));
         const store = &self.dense_layers.items(.store)[layer_index];
         try store.reserveEveryChunk(self.allocator, geom);
         try terrain.blocked.reserveEveryChunk(self.allocator, geom);
@@ -2781,18 +2769,16 @@ pub const WorldSystem = struct {
     }
 
     fn addProceduralSparseTiles(self: *WorldSystem, level: u16, ids: ProceduralTiles, seed: u64) !void {
-        const chunks_x = self.chunksX();
-        const chunks_y = self.chunksY();
+        const geom = self.chunkGeometry();
         var added_blocking = false;
-        for (0..chunks_y) |cy| {
-            for (0..chunks_x) |cx| {
+        for (0..geom.chunks_y) |cy| {
+            for (0..geom.chunks_x) |cx| {
                 const h = hash2(seed ^ 0x9e37_79b9, cx, cy);
-                const min_x: u16 = @intCast(cx * self.chunk_size_tiles);
-                const min_y: u16 = @intCast(cy * self.chunk_size_tiles);
-                const max_x = @min(self.width, min_x + self.chunk_size_tiles);
-                const max_y = @min(self.height, min_y + self.chunk_size_tiles);
-                const span_x = @max(max_x - min_x, 1);
-                const span_y = @max(max_y - min_y, 1);
+                const extent = geom.extent(@intCast(cy * geom.chunks_x + cx));
+                const min_x = extent.min_x;
+                const min_y = extent.min_y;
+                const span_x = extent.cols;
+                const span_y = extent.rows;
                 const x: u16 = min_x + @as(u16, @intCast((h >> 8) % span_x));
                 const y: u16 = min_y + @as(u16, @intCast((h >> 24) % span_y));
                 const center_x = @abs(@as(i32, @intCast(x)) - @as(i32, self.width / 2));
@@ -2843,7 +2829,7 @@ fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) 
                 const local = (row << geom.shift) | col;
                 cells[local] = tile;
                 if (catalogFlags(build.catalog_flags, tile).blocks_movement) {
-                    bits[local / 64] |= @as(u64, 1) << @intCast(local % 64);
+                    world_terrain.setBit(&bits, @intCast(local));
                     blocked_count += 1;
                 }
             }
@@ -2867,6 +2853,8 @@ fn denseEditPlanJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
 
 // Validates one group's writes and derives its plan and band bits; read-only over
 // the world. O(writes + mask words).
+// SIMD verdict: scalar. Branchy per-write validation with an early break and per-run
+// directory lookups.
 fn planDenseEditGroup(job: *const DenseEditPlanJob, group_index: usize) void {
     const geom = job.geom;
     const group = &job.groups[group_index];
@@ -2967,11 +2955,12 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group_index: usize, partic
     var blocked = terrain.blocked.ownSlot(chunk);
     if (plan.slot_form != .mixed) blocked.fillUniform(geom, chunk, plan.slot_form == .blocked);
 
+    // SIMD verdict: scalar. Scattered per-write stores into the band's finals and bits.
     for (group.writes) |write| {
         const band = job.layer_bands[write.layer];
         const local = geom.localOf(write.x, write.y);
         finals[@as(usize, band) * max_chunk_cells + local] = write.tile;
-        touched[band][local / 64] |= @as(u64, 1) << @intCast(local % 64);
+        world_terrain.setBit(&touched[band], local);
     }
     var any_touched: ChunkBits = @splat(0);
     for (written_list) |band| {
@@ -2981,6 +2970,8 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group_index: usize, partic
     const events = job.events[group.start..][0..group.writes.len];
     var change_count: usize = 0;
     const edge_mask: u32 = geom.edge - 1;
+    // SIMD verdict: scalar. Set-bit iteration over touched cells with a branchy
+    // per-band compare and event write per changed cell.
     for (any_touched, 0..) |touched_word, word_index| {
         var word = touched_word;
         while (word != 0) : (word &= word - 1) {
@@ -3033,27 +3024,20 @@ fn composedBlockedCell(job: *const DenseEditWriteJob, bands: []const u32, chunk:
 // The chunk-local cells of `level`'s `chunk` that hold a movement-blocking sparse
 // tile, built once per group so each changed cell tests one bit. O(sparse tiles in
 // the chunk).
+// SIMD verdict: scalar. A linked-list walk with one bit set per blocking tile.
 fn sparseBlockedBits(job: *const DenseEditWriteJob, geom: ChunkGeometry, level: u16, chunk: u32) ChunkBits {
     var bits: ChunkBits = @splat(0);
-    for (chunkSparseTiles(job.sparse_level_chunk_tiles, level, chunk)) |sparse_index| {
-        if (!job.sparse_flags[sparse_index].blocks_movement) continue;
-        const cell = job.sparse_cells[sparse_index];
+    var row = job.levels[level].sparse_heads[chunk];
+    while (row != no_sparse_tile) : (row = job.sparse_next[row]) {
+        if (!job.sparse_flags[row].blocks_movement) continue;
+        const cell = job.sparse_cells[row];
         // A cell index is below width * height, so both coordinates fit u16.
         const x: u16 = @intCast(cell % job.width);
         const y: u16 = @intCast(cell / job.width);
         std.debug.assert(geom.chunkOf(x, y) == chunk);
-        const local = geom.localOf(x, y);
-        bits[local / 64] |= @as(u64, 1) << @intCast(local % 64);
+        world_terrain.setBit(&bits, geom.localOf(x, y));
     }
     return bits;
-}
-
-// Indices into the sparse tile rows of `level`'s tiles in `chunk`.
-fn chunkSparseTiles(level_chunk_tiles: []const std.ArrayList(std.ArrayList(u32)), level: u16, chunk: u32) []const u32 {
-    if (level >= level_chunk_tiles.len) return &.{};
-    const level_chunks = level_chunk_tiles[level].items;
-    if (chunk >= level_chunks.len) return &.{};
-    return level_chunks[chunk].items;
 }
 
 fn proceduralGroundTile(build: ProceduralBuildContext, x: u16, y: u16) TileId {
@@ -3072,7 +3056,7 @@ fn proceduralGroundTile(build: ProceduralBuildContext, x: u16, y: u16) TileId {
 
     const h = hash2(build.seed, x, y);
     if ((h & 31) == 0) return build.ids.stone;
-    // `dirt` is a solid underground material now; the surface accent is grass_patchy.
+    // The surface accent is walkable, keeping the surface open.
     if ((h & 7) == 0) return build.ids.grass_patchy;
     return build.ids.grass;
 }
@@ -3086,10 +3070,6 @@ fn catalogFlags(catalog_flags: []const TileFlags, tile_id: TileId) TileFlags {
     const index: usize = tile_id;
     if (index >= catalog_flags.len) return .{};
     return catalog_flags[index];
-}
-
-fn windowsEqual(a: DenseLayerRenderWindow, b: DenseLayerRenderWindow) bool {
-    return a.levels_below == b.levels_below and a.ceiling_when_underground == b.ceiling_when_underground;
 }
 
 fn atlasTextureDesc(meta: *const WorldTilesetMeta) TextureDesc {
@@ -3134,10 +3114,6 @@ fn ceilTiles(value: f32, tile_size: f32) u16 {
     return @intFromFloat(@max(tiles, 1));
 }
 
-fn ceilDiv(value: u16, divisor: u16) u16 {
-    return (value + divisor - 1) / divisor;
-}
-
 fn floorTileClamped(value: f32, tile_size: f32, max_tiles: u16) u16 {
     return @intCast(math.worldPosToCell(value, tile_size, max_tiles));
 }
@@ -3150,10 +3126,18 @@ fn rectChunkSpan(extent: f32, chunk_px: f32, chunks: u32) u32 {
     return @intFromFloat(span);
 }
 
-fn saturatingSubU16(value: u16, amount: u16) u16 {
-    return if (value > amount) value - amount else 0;
+// The chunk window as a simulation-scope region (level 0).
+fn activeRegionOf(chunks: world_gpu_tiles.ChunkWindow) ActiveRegion {
+    std.debug.assert(chunks.max_x > chunks.min_x and chunks.max_y > chunks.min_y);
+    // Chunk indices are below the u16-wide grid, so they fit i32.
+    return .{
+        .min = .{ .x = @intCast(chunks.min_x), .y = @intCast(chunks.min_y) },
+        .max_exclusive = .{ .x = @intCast(chunks.max_x), .y = @intCast(chunks.max_y) },
+    };
 }
 
+// Worldgen's own fixed mix, not std's hashes, so a std hash change never moves a
+// generated world.
 fn hash2(seed: u64, x: anytype, y: anytype) u64 {
     var value = seed;
     value ^= @as(u64, @intCast(x)) *% 0x9e37_79b9_7f4a_7c15;
@@ -3166,6 +3150,9 @@ fn hash2(seed: u64, x: anytype, y: anytype) u64 {
     value ^= value >> 31;
     return value;
 }
+
+const TileDataId = @import("../render/renderer.zig").TileDataId;
+const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
 
 fn testWorldMeta() !WorldTilesetMeta {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
@@ -3197,7 +3184,7 @@ const TestGpuStore = @import("world_test_support.zig").TestGpuStore;
 // `world.gpu_tiles.spans`/`values`. A world with no render window set renders its
 // whole extent.
 fn testSyncGpuTiles(world: *WorldSystem, active_level: u16) !world_gpu_tiles.SyncPlan {
-    if (!world.visible_window_set) try testShowWholeWorld(world, active_level);
+    if (world.visible == null) try testShowWholeWorld(world, active_level);
     const sync_plan = try world.planDenseGpuSync(active_level);
     world.commitDenseGpuSync(&sync_plan, active_level);
     return sync_plan;
@@ -3924,6 +3911,61 @@ test "syncDenseTileStore claims its live store every frame and drops a retired o
     try std.testing.expect(world.dense_quads_dirty);
 }
 
+test "a sync whose upload reserve fails keeps residency and change marks, and the retry uploads the edit" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+        .render_window = .{ .levels_below = 0 },
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    try testShowWholeWorld(&world, 0);
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer deinitStaticTestRenderer(&renderer);
+    const store = try attachFakeTileStore(&renderer, &world);
+    try world.syncDenseTileStore(&renderer, 0);
+
+    // An edit on the resident layer, then a sync whose upload reserve cannot grow the
+    // carried batch: the mirror must not commit, so the edit stays marked.
+    _ = try world.setDenseTile(layer, 1, 1, water);
+    {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        renderer.allocator = failing.allocator();
+        defer renderer.allocator = allocator;
+        try std.testing.expectError(error.OutOfMemory, world.syncDenseTileStore(&renderer, 0));
+    }
+    try std.testing.expect(world.resident_layers_changed and world.dense_layers.items(.render_changed)[layer]);
+    try std.testing.expect(world.dense_layers.items(.store)[layer].blockChanged(0));
+
+    // The retry uploads it: the store's pending batch shows what the mirror holds.
+    try world.syncDenseTileStore(&renderer, 0);
+    try std.testing.expect(!world.resident_layers_changed);
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
+    try gpu.apply(store.pending_spans.items, store.pending_values.items);
+    try expectGpuStoreMatches(&world, &gpu);
+    try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, layer, 1, 1));
+}
+
 test "a new directory side with nothing resident lets the old store go and re-submits the draws" {
     const allocator = std.testing.allocator;
     var meta = try testWorldMeta();
@@ -4185,7 +4227,7 @@ test "writeDenseTileCell reserves its growth before mutating CPU tiles (FailingA
         try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
         try std.testing.expect(!world.levelBlocksMovement(level, 1, 1));
         try std.testing.expect(!world.dense_layers.items(.render_changed)[layer]);
-        try std.testing.expect(!world.gpu_edits_pending);
+        try std.testing.expect(!world.resident_layers_changed);
     }
 
     // Retry with a working allocator succeeds and is consistent.
@@ -4194,7 +4236,7 @@ test "writeDenseTileCell reserves its growth before mutating CPU tiles (FailingA
     try std.testing.expectEqual(water, world.denseTile(layer, 1, 1));
     try std.testing.expectEqual(@as(?TileId, null), world.dense_layers.items(.store)[layer].uniformTile(0));
     try std.testing.expect(world.levelBlocksMovement(level, 1, 1));
-    try std.testing.expect(world.dense_layers.items(.render_changed)[layer] and world.gpu_edits_pending);
+    try std.testing.expect(world.dense_layers.items(.render_changed)[layer] and world.resident_layers_changed);
 }
 
 test "world rejects invalid tile ids before render" {
@@ -4458,7 +4500,7 @@ test "level blocks movement is the OR of dense bands and sparse obstacles" {
     // An untouched open cell stays open.
     try std.testing.expect(!world.levelBlocksMovement(level, 0, 0));
     try std.testing.expect(!world.levelBlocksMovement(level, 4, 4));
-    // Out-of-range cells are blocked, matching denseTileBlocksMovement.
+    // Out-of-range cells are blocked.
     try std.testing.expect(world.levelBlocksMovement(level, world.width, 0));
     try std.testing.expect(world.levelBlocksMovement(level, 0, world.height));
     // An invalid level fails closed.
@@ -4508,41 +4550,29 @@ fn expectSparseIndexSetEqual(expected: []const u32, actual: []const u32) !void {
     try std.testing.expectEqualSlices(u32, expected_sorted, actual_sorted);
 }
 
-test "sparseTileIndicesForLevel returns exactly this level's sparse tile indices" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 8,
-        .height = 8,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 8,
-    };
-    defer world.deinit();
-    try world.buildCatalog(&meta);
-
-    const level0 = try world.addLevel(0);
-    const level1 = try world.addLevel(10);
-    const level2 = try world.addLevel(20); // added but never given a sparse tile
-    const deco = try world.requireTileByName(&meta, "deco_0");
-
-    // Interleave insertion order across levels so a level's grouping cannot be
-    // inferred from insertion order alone — only the level field decides it.
-    _ = try world.addSparseTile(level0, 1, 1, deco, 0, .obstacle); // sparse index 0
-    _ = try world.addSparseTile(level1, 2, 2, deco, 0, .obstacle); // sparse index 1
-    _ = try world.addSparseTile(level0, 3, 3, deco, 0, .obstacle); // sparse index 2
-    _ = try world.addSparseTile(level1, 4, 4, deco, 0, .obstacle); // sparse index 3
-    _ = try world.addSparseTile(level0, 5, 5, deco, 0, .obstacle); // sparse index 4
-
-    try expectSparseIndexSetEqual(&.{ 0, 2, 4 }, world.sparseTileIndicesForLevel(level0));
-    try expectSparseIndexSetEqual(&.{ 1, 3 }, world.sparseTileIndicesForLevel(level1));
-    // A real level with no sparse tiles placed on it yet.
-    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level2));
-    // An out-of-range level.
-    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(99));
+// The sparse rows on `level`, from a walk of every row, into `out`.
+fn testLevelSparseRows(world: *const WorldSystem, level: u16, out: []u32) []u32 {
+    var count: usize = 0;
+    for (world.sparse_tiles.items(.level_index), 0..) |row_level, row| {
+        if (row_level != level) continue;
+        out[count] = @intCast(row);
+        count += 1;
+    }
+    return out[0..count];
 }
 
-test "sparseTileIndicesForChunk returns exactly the chunk-scoped subset of sparseTileIndicesForLevel" {
+// The rows of (`level`, `chunk`)'s sparse list, newest first, into `out`.
+fn testChunkSparseRows(world: *const WorldSystem, level: u16, chunk: u32, out: []u32) []u32 {
+    var count: usize = 0;
+    var row = world.sparseChunkHead(level, chunk);
+    while (row != no_sparse_tile) : (row = world.sparse_tiles.items(.chunk_next)[row]) {
+        out[count] = row;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+test "each chunk's sparse list holds exactly the level's tiles in that chunk" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -4570,8 +4600,10 @@ test "sparseTileIndicesForChunk returns exactly the chunk-scoped subset of spars
     _ = try world.addSparseTile(level1, 0, 1, deco, 0, .obstacle); // level1 chunk0
 
     const chunks_x: u32 = 2;
+    var level_buffer: [8]u32 = undefined;
+    var chunk_buffer: [8]u32 = undefined;
     for ([_]u16{ level0, level1 }) |level| {
-        const level_indices = world.sparseTileIndicesForLevel(level);
+        const level_indices = testLevelSparseRows(&world, level, &level_buffer);
         var chunk: u32 = 0;
         while (chunk < 4) : (chunk += 1) {
             var expected: std.ArrayList(u32) = .empty;
@@ -4581,17 +4613,16 @@ test "sparseTileIndicesForChunk returns exactly the chunk-scoped subset of spars
                 const cell_chunk = @as(u32, cell.y / 2) * chunks_x + @as(u32, cell.x / 2);
                 if (cell_chunk == chunk) try expected.append(std.testing.allocator, sparse_index);
             }
-            try expectSparseIndexSetEqual(expected.items, world.sparseTileIndicesForChunk(level, chunk));
+            try expectSparseIndexSetEqual(expected.items, testChunkSparseRows(&world, level, chunk, &chunk_buffer));
         }
     }
 
-    // Out-of-range level and out-of-range chunk both return empty, matching
-    // sparseTileIndicesForLevel's out-of-range contract.
-    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(99, 0));
-    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 99));
+    // Out-of-range level and out-of-range chunk both yield nothing.
+    try expectSparseIndexSetEqual(&.{}, testChunkSparseRows(&world, 99, 0, &chunk_buffer));
+    try expectSparseIndexSetEqual(&.{}, testChunkSparseRows(&world, level0, 99, &chunk_buffer));
 }
 
-test "addSparseTile reserves sparse_tiles, sparse_level_tiles, and sparse_level_chunk_tiles before committing any of them (FailingAllocator)" {
+test "addSparseTile reserves its row before linking it, and a chunk list needs no allocation (FailingAllocator)" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -4605,10 +4636,10 @@ test "addSparseTile reserves sparse_tiles, sparse_level_tiles, and sparse_level_
     try world.buildCatalog(&meta);
     const level0 = try world.addLevel(0);
     const deco = try world.requireTileByName(&meta, "deco_0");
+    const marker = try world.requireTileByName(&meta, "grass_patchy");
+    var buffer: [4]u32 = undefined;
 
-    // Case 1: sparse_tiles' own reservation fails on the very first
-    // addSparseTile call ever, before sparse_level_tiles or
-    // sparse_level_chunk_tiles have any entries to compare against.
+    // The first add ever fails its row reservation: no row, nothing linked.
     {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
         world.allocator = failing.allocator();
@@ -4616,77 +4647,48 @@ test "addSparseTile reserves sparse_tiles, sparse_level_tiles, and sparse_level_
 
         try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level0, 0, 0, deco, 0, .obstacle));
         try std.testing.expectEqual(@as(usize, 0), world.sparse_tiles.len);
-        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level0));
-        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 0));
+        try std.testing.expectEqual(@as(usize, 0), testChunkSparseRows(&world, level0, 0, &buffer).len);
     }
 
-    // Warm up with one real insert (level0, chunk0) so the next two cases can
-    // isolate a single fresh reservation each, with every other structure
-    // already carrying spare capacity from this insert.
-    _ = try world.addSparseTile(level0, 0, 0, deco, 0, .obstacle); // sparse index 0
-    try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
-
-    // Case 2: a new level's sparse_level_tiles bucket needs its first-ever
-    // reservation. sparse_tiles has spare capacity from the warm-up insert
-    // and needs no allocation for this call.
+    // With row capacity spare, a walkable tile in a fresh chunk of a level added
+    // after the first tile allocates nothing: every chunk head exists from level add.
+    _ = try world.addSparseTile(level0, 0, 0, deco, 0, .obstacle);
     const level1 = try world.addLevel(10);
     {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
         world.allocator = failing.allocator();
         defer world.allocator = std.testing.allocator;
 
-        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level1, 0, 0, deco, 0, .obstacle));
-        try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
-        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level1));
-        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level1, 0));
+        try std.testing.expect((try world.addSparseTile(level1, 3, 3, marker, 0, .marker)) == null);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
-
-    // Case 3: a new chunk bucket on the already-warmed level0 needs its
-    // first-ever reservation. sparse_tiles and level0's sparse_level_tiles
-    // bucket both have spare capacity and need no allocation for this call.
-    {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-        world.allocator = failing.allocator();
-        defer world.allocator = std.testing.allocator;
-
-        // Cell (3,3) is level-local chunk 3 (chunkY=1*2+chunkX=1), untouched
-        // by the level0/chunk0 warm-up insert above.
-        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level0, 3, 3, deco, 0, .obstacle));
-        try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
-        try expectSparseIndexSetEqual(&.{0}, world.sparseTileIndicesForLevel(level0));
-        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 3));
-    }
+    try expectSparseIndexSetEqual(&.{1}, testChunkSparseRows(&world, level1, 3, &buffer));
+    try expectSparseIndexConsistent(&world);
 }
 
-// Every sparse row is listed exactly once in its level list and once in its chunk
-// list, at its stored positions, and the lists list nothing else.
+// Every sparse row is listed exactly once, in its own (level, chunk) list, linked both
+// ways, and the lists list nothing else.
 fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
     const rows = world.sparse_tiles.slice();
     const geom = world.chunkGeometry();
-    var level_total: usize = 0;
-    for (world.sparse_level_tiles.items, 0..) |list, level| {
-        level_total += list.items.len;
-        for (list.items, 0..) |row, position| {
-            try std.testing.expect(row < rows.len);
-            try std.testing.expectEqual(level, rows.items(.level_index)[row]);
-            try std.testing.expectEqual(position, rows.items(.level_pos)[row]);
-        }
-    }
-    try std.testing.expectEqual(rows.len, level_total);
-    var chunk_total: usize = 0;
-    for (world.sparse_level_chunk_tiles.items, 0..) |level_chunks, level| {
-        for (level_chunks.items, 0..) |list, chunk| {
-            chunk_total += list.items.len;
-            for (list.items, 0..) |row, position| {
+    var listed: usize = 0;
+    for (world.level_terrain.items, 0..) |terrain, level| {
+        for (terrain.sparse_heads, 0..) |head, chunk| {
+            var previous: u32 = no_sparse_tile;
+            var row = head;
+            while (row != no_sparse_tile) : (row = rows.items(.chunk_next)[row]) {
                 try std.testing.expect(row < rows.len);
                 try std.testing.expectEqual(level, rows.items(.level_index)[row]);
                 const coord = world.sparseTileCellCoord(row);
                 try std.testing.expectEqual(chunk, geom.chunkOf(coord.x, coord.y));
-                try std.testing.expectEqual(position, rows.items(.chunk_pos)[row]);
+                try std.testing.expectEqual(previous, rows.items(.chunk_prev)[row]);
+                previous = row;
+                listed += 1;
+                try std.testing.expect(listed <= rows.len);
             }
         }
     }
-    try std.testing.expectEqual(rows.len, chunk_total);
+    try std.testing.expectEqual(rows.len, listed);
 }
 
 // The sparse rows as sorted (level, cell, tile id) keys, into `out`.
@@ -4724,6 +4726,28 @@ fn testSparseRemovalWorld(meta: *const WorldTilesetMeta, level_count: u16) !Worl
     return world;
 }
 
+test "clearing a cell follows its chain's next row when a removal moves that row" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseRemovalWorld(&meta, 1);
+    defer world.deinit();
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    const tunnel = try world.requireTileByName(&meta, "cave_0");
+    // Y at (1, 1) is row 0; A then B at (6, 6), in another chunk, are rows 1 and 2.
+    _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
+    _ = try world.addSparseTile(0, 6, 6, deco, 0, .obstacle);
+    _ = try world.addSparseTile(0, 6, 6, deco, 0, .obstacle);
+    // Removing Y moves B into row 0, so (6, 6)'s chain walks row 0 then row 1, the
+    // last row: removing row 0 moves row 1 into it, and the walk must follow.
+    try std.testing.expect((try world.clearCellBlocking(0, 1, 1, tunnel)) != null);
+    try std.testing.expectEqual(@as(usize, 2), world.sparseTileCount());
+    try expectSparseIndexConsistent(&world);
+    try std.testing.expect((try world.clearCellBlocking(0, 6, 6, tunnel)) != null);
+    try std.testing.expectEqual(@as(usize, 0), world.sparseTileCount());
+    try std.testing.expect(!world.levelBlocksMovement(0, 6, 6));
+    try expectSparseIndexConsistent(&world);
+}
+
 test "removing sparse tiles at the first, middle, last, and sole list positions keeps every index consistent" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -4758,8 +4782,9 @@ test "removing sparse tiles at the first, middle, last, and sole list positions 
     };
     var before_buf: [placements.len]TestSparseRowKey = undefined;
     var after_buf: [placements.len]TestSparseRowKey = undefined;
+    var list_buf: [placements.len]u32 = undefined;
     for (removals, 0..) |removal, step| {
-        const list = world.sparseTileIndicesForChunk(removal.level, removal.chunk);
+        const list = testChunkSparseRows(&world, removal.level, removal.chunk, &list_buf);
         if (removal.at == .middle) try std.testing.expect(list.len >= 3);
         const position = switch (removal.at) {
             .first => 0,
@@ -4812,7 +4837,6 @@ test "repeated sparse add and clear cycles keep rows, lists, and composed bits a
     _ = try world.addSparseTile(0, 2, 2, stone, 0, .floor);
 
     var row_capacity: usize = 0;
-    var level_capacity: usize = 0;
     for (0..16) |cycle| {
         for (0..3) |_| _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
         _ = try world.addSparseTile(0, 6, 6, deco, 0, .obstacle);
@@ -4821,16 +4845,11 @@ test "repeated sparse add and clear cycles keep rows, lists, and composed bits a
         try std.testing.expect((try world.clearCellBlocking(0, 6, 6, tunnel)) != null);
 
         try std.testing.expectEqual(@as(usize, 1), world.sparseTileCount());
-        try std.testing.expectEqual(@as(usize, 1), world.sparseTileIndicesForLevel(0).len);
         try expectSparseIndexConsistent(&world);
         // No blocked cell remains, so the level holds no composed-bits slot.
         try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[0].blocked.liveSlotCount());
-        if (cycle == 0) {
-            row_capacity = world.sparse_tiles.capacity;
-            level_capacity = world.sparse_level_tiles.items[0].capacity;
-        }
+        if (cycle == 0) row_capacity = world.sparse_tiles.capacity;
         try std.testing.expectEqual(row_capacity, world.sparse_tiles.capacity);
-        try std.testing.expectEqual(level_capacity, world.sparse_level_tiles.items[0].capacity);
     }
 }
 
@@ -6018,7 +6037,7 @@ test "a rect ending exactly on a tile edge at large pixel coordinates excludes t
     try std.testing.expectEqual(ChunkCoord{ .x = 65, .y = 65 }, scope.max_exclusive);
     try world.setVisibleChunksForWorldRect(rect, 0, 0);
     try std.testing.expectEqual(scope, world.visibleChunkRegion().?);
-    try std.testing.expectEqual(@as(u16, 1040), world.visible_max_tile_x_exclusive);
+    try std.testing.expectEqual(@as(u16, 1040), world.visible.?.window.tiles.max_x);
     // A rect ending just past the edge takes the next tile; a tiny rect keeps its tile.
     const past = world.chunkRegionForWorldRect(.{ .x = 32_768, .y = 32_768, .w = 512.01, .h = 1 }, 0).?;
     try std.testing.expectEqual(@as(i32, 66), past.max_exclusive.x);
@@ -6118,7 +6137,8 @@ fn bruteForceLevelBlocked(world: *const WorldSystem, level: u16, x: u16, y: u16)
         if (world.denseLayerLevel(layer) != level) continue;
         if (world.flagsFor(world.denseTile(layer, x, y)).blocks_movement) return true;
     }
-    for (world.sparseTileIndicesForLevel(level)) |sparse_index| {
+    for (world.sparse_tiles.items(.level_index), 0..) |row_level, sparse_index| {
+        if (row_level != level) continue;
         const cell = world.sparseTileCellCoord(sparse_index);
         if (cell.x == x and cell.y == y and world.sparseTileBlocksMovement(sparse_index)) return true;
     }
@@ -6566,7 +6586,8 @@ test "addSparseTile reserves the composed-bits slot before committing (FailingAl
         defer world.allocator = std.testing.allocator;
         try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level, 1, 1, tiles.deco, 0, .obstacle));
         try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
-        try std.testing.expectEqual(@as(usize, 1), world.sparseTileIndicesForChunk(level, 0).len);
+        var buffer: [2]u32 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), testChunkSparseRows(&world, level, 0, &buffer).len);
         try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
         try std.testing.expect(!world.levelBlocksMovement(level, 1, 1));
     }
@@ -6611,9 +6632,10 @@ test "addLevel touches only its own directory and fails without a partial level 
         world.allocator = failing.allocator();
         defer world.allocator = std.testing.allocator;
         if (world.addLevel(-5 * level_z_step)) |level| {
-            // At most the two level lists' growth plus the new level's own directory
-            // and link heads.
-            try std.testing.expect(failing.allocations <= 4);
+            // At most the two level lists', the edit level set's, and its two chain-end
+            // lists' growth, plus the new level's own per-chunk directories: composed
+            // bits, link heads and counts, sparse heads, and the one-tier edit chunk set.
+            try std.testing.expect(failing.allocations <= 10);
             break level;
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expectEqual(@as(usize, 5), world.levelCount());
@@ -6889,7 +6911,7 @@ test "a blocking dense layer add and procedural fills advance the level's conten
         var world = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
         defer world.deinit();
         var blocking_sparse = false;
-        for (world.sparseTileIndicesForLevel(0)) |index| blocking_sparse = blocking_sparse or world.sparseTileBlocksMovement(index);
+        for (0..world.sparseTileCount()) |index| blocking_sparse = blocking_sparse or world.sparseTileBlocksMovement(index);
         seen_blocking_sparse[@intFromBool(blocking_sparse)] = true;
         try std.testing.expectEqual(@as(u32, 1) + @intFromBool(blocking_sparse), world.level_terrain.items[0].content_revision);
     }
@@ -7095,7 +7117,7 @@ fn appendTerrainBytes(out: *std.ArrayList(u8), world: *const WorldSystem) !void 
         try out.appendSlice(allocator, std.mem.sliceAsBytes(terrain.blocked.free.items));
     }
     for (world.dense_layers.items(.render_changed)) |changed| try out.append(allocator, @intFromBool(changed));
-    try out.append(allocator, @intFromBool(world.gpu_edits_pending));
+    try out.append(allocator, @intFromBool(world.resident_layers_changed));
 }
 
 fn expectTerrainBytesEqual(expected: *const WorldSystem, actual: *const WorldSystem) !void {
@@ -7583,7 +7605,7 @@ test "a batched dense edit marks resident layers identically inline and threaded
         try testApplySync(&threaded, &threaded_gpu);
         try expectGpuStoreMatches(&serial, &serial_gpu);
         try expectGpuStoreMatches(&threaded, &threaded_gpu);
-        try std.testing.expect(!serial.gpu_edits_pending and !threaded.gpu_edits_pending);
+        try std.testing.expect(!serial.resident_layers_changed and !threaded.resident_layers_changed);
     }
     try std.testing.expect(threaded_batches > 0);
 }
@@ -7624,7 +7646,7 @@ test "edits between syncs allocate nothing for the GPU, rendered or not (Failing
             try world.applyDenseCellWrites(&fill_chunks, null, &events);
             try std.testing.expectEqual(@as(usize, 0), failing.allocations);
         }
-        try std.testing.expectEqual(rendered, world.gpu_edits_pending);
+        try std.testing.expectEqual(rendered, world.resident_layers_changed);
         if (rendered) {
             _ = try testSyncGpuTiles(&world, 0);
             try testApplySync(&world, &gpu);
@@ -8130,13 +8152,85 @@ test "a batched carve and restore of one cell leaves its uniform chunk unchanged
     try std.testing.expectEqual(slots_before, world.level_terrain.items[1].blocked.liveSlotCount());
     try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(1, 1 * 4 + 1));
     // No cell changed, so no layer is flagged for the GPU sync.
-    try std.testing.expect(!world.gpu_edits_pending);
+    try std.testing.expect(!world.resident_layers_changed);
     try std.testing.expect(!world.dense_layers.items(.render_changed)[2]);
 }
 
 // Applies `chunks` threaded into `events` with exactly `event_capacity` spare
 // slots, expects `expected`, and checks the world, its render flags, and `events`
 // are untouched.
+test "unordered writes across levels and chunks group into (level, chunk) order, keep each chunk's input order, and apply like the writes one by one (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var grouped = try testBatchEditWorldSized(&meta, 16, 16);
+    defer grouped.deinit();
+    var sequential = try testBatchEditWorldSized(&meta, 16, 16);
+    defer sequential.deinit();
+    const tiles = try TerrainTestTiles.resolve(&grouped, &meta);
+    var prng = std.Random.DefaultPrng.init(0x9e0d_1e55);
+    const random = prng.random();
+    var writes_buffer: [96]DenseCellWrite = undefined;
+    var next: [96]u32 = undefined;
+    var out_writes: [96]DenseCellWrite = undefined;
+    var out_chunks: [96]DenseChunkWrites = undefined;
+    var events: std.ArrayList(WorldTileChangedEvent) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.ensureTotalCapacity(std.testing.allocator, writes_buffer.len);
+    // Repeated batches: each regroups from empty scratch, and the second warms nothing new.
+    for (0..6) |_| {
+        const writes = randomBatchWrites(random, tiles, &writes_buffer);
+        // Descending (level, chunk) input: the reverse of the order the batch needs.
+        std.mem.reverse(DenseCellWrite, writes);
+        const chunks = blk: {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+            grouped.allocator = failing.allocator();
+            defer grouped.allocator = std.testing.allocator;
+            const chunks = grouped.groupDenseCellWrites(writes, next[0..writes.len], out_writes[0..writes.len], out_chunks[0..writes.len]);
+            try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+            break :blk chunks;
+        };
+        var total: usize = 0;
+        for (chunks, 0..) |entry, index| {
+            const chunk = @as(u32, entry.chunk_y) * grouped.chunkGeometry().chunks_x + entry.chunk_x;
+            if (index > 0) {
+                const previous = chunks[index - 1];
+                const previous_chunk = @as(u32, previous.chunk_y) * grouped.chunkGeometry().chunks_x + previous.chunk_x;
+                try std.testing.expect(entry.level > previous.level or (entry.level == previous.level and chunk > previous_chunk));
+            }
+            // The chunk's writes, in the order they arrived.
+            var cursor: usize = 0;
+            for (writes) |write| {
+                if (grouped.denseLayerLevel(write.layer) != entry.level or grouped.chunkGeometry().chunkOf(write.x, write.y) != chunk) continue;
+                try std.testing.expectEqual(write, entry.writes[cursor]);
+                cursor += 1;
+            }
+            try std.testing.expectEqual(entry.writes.len, cursor);
+            total += cursor;
+        }
+        try std.testing.expectEqual(writes.len, total);
+        try std.testing.expect(grouped.edit_levels.isEmpty());
+        for (grouped.edit_level_heads.items) |head| try std.testing.expectEqual(no_edit_write, head);
+        for (grouped.edit_chunk_heads) |head| try std.testing.expectEqual(no_edit_write, head);
+        for (grouped.level_terrain.items) |terrain| try std.testing.expect(terrain.edit_chunks.isEmpty());
+
+        events.clearRetainingCapacity();
+        try grouped.applyDenseCellWrites(chunks, null, &events);
+        for (writes) |write| {
+            if (write.tile == invalid_tile_id) {
+                _ = try sequential.clearDenseTile(write.layer, write.x, write.y);
+            } else {
+                _ = try sequential.setDenseTile(write.layer, write.x, write.y, write.tile);
+            }
+        }
+        for (0..grouped.denseLayerCount()) |layer| for (0..16) |y| for (0..16) |x| {
+            try std.testing.expectEqual(sequential.denseTile(layer, @intCast(x), @intCast(y)), grouped.denseTile(layer, @intCast(x), @intCast(y)));
+        };
+        for (0..grouped.levelCount()) |level| for (0..16) |y| for (0..16) |x| {
+            try std.testing.expectEqual(sequential.levelBlocksMovement(@intCast(level), @intCast(x), @intCast(y)), grouped.levelBlocksMovement(@intCast(level), @intCast(x), @intCast(y)));
+        };
+    }
+}
+
 fn expectRejectedBatch(world: *WorldSystem, threads: *ThreadSystem, chunks: []const DenseChunkWrites, event_capacity: usize, expected: anyerror) !void {
     var before: std.ArrayList(u8) = .empty;
     defer before.deinit(std.testing.allocator);

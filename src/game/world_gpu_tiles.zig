@@ -123,10 +123,6 @@ pub const SyncPlan = struct {
     /// The plan scanned the window chunks of layers flagged changed; the commit
     /// uploads them and clears every resident layer's flag.
     edits: bool = false,
-    // Of those chunks, the ones that free a block or set a uniform word, and the
-    // ones that take or rewrite a block; the commit skips a pass with none.
-    edit_word_writes: usize = 0,
-    edit_block_writes: usize = 0,
     enter_count: usize = 0,
     evict_count: usize = 0,
     span_count: usize = 0,
@@ -151,6 +147,15 @@ const Region = struct {
 // CPU: a uniform tile changed, a block went uniform, a uniform chunk split, or a
 // block's cells changed (whole-block upload).
 const ChunkChange = enum { none, set_word, free_block, take_block, rewrite_block };
+
+// One changed chunk of a flagged staying layer, found once by the plan and applied by
+// the commit: `slot`'s toroidal `word` for level chunk `chunk`.
+const PlannedEdit = struct {
+    slot: u32,
+    word: u32,
+    chunk: u32,
+    change: ChunkChange,
+};
 
 pub const GpuTileMirror = struct {
     /// The renderer-owned store; `.invalid` until the first sync with uploads creates it.
@@ -179,6 +184,8 @@ pub const GpuTileMirror = struct {
     plan_enter: std.ArrayList(u32) = .empty,
     plan_order: std.ArrayList(u32) = .empty,
     plan_stays: std.ArrayList(bool) = .empty,
+    // The changed chunks of flagged staying layers, in slot then chunk order.
+    plan_edits: std.ArrayList(PlannedEdit) = .empty,
     regions: std.ArrayList(Region) = .empty,
     /// The last commit's upload batch for `Renderer.queueTileStoreUploads`.
     spans: std.ArrayList(TileStoreSpan) = .empty,
@@ -199,6 +206,7 @@ pub const GpuTileMirror = struct {
         self.plan_enter.deinit(allocator);
         self.plan_order.deinit(allocator);
         self.plan_stays.deinit(allocator);
+        self.plan_edits.deinit(allocator);
         self.regions.deinit(allocator);
         self.spans.deinit(allocator);
         self.values.deinit(allocator);
@@ -273,6 +281,7 @@ pub const GpuTileMirror = struct {
         self.plan_evict.clearRetainingCapacity();
         self.plan_enter.clearRetainingCapacity();
         self.plan_order.clearRetainingCapacity();
+        self.plan_edits.clearRetainingCapacity();
         try self.plan_stays.resize(allocator, self.slot_layer.items.len);
         const stays = self.plan_stays.items;
         if (desired) |d| {
@@ -301,7 +310,7 @@ pub const GpuTileMirror = struct {
                 self.plan_evict.appendAssumeCapacity(slot);
                 if (result.relayout) continue;
                 dir_frees += 1;
-                block_frees += self.countBlocks(geom, slot, self.window, .{});
+                block_frees += self.countBlocks(slot, self.window, .{});
             }
 
             const entering_values = directoryWords(d.side);
@@ -316,17 +325,21 @@ pub const GpuTileMirror = struct {
             }
 
             if (!result.relayout) {
-                for (self.order.items) |slot| {
-                    if (!stays[slot]) continue;
-                    // Chunks leaving free their blocks; chunks entering upload their word
-                    // and, when mixed, take and upload a block.
-                    block_frees += self.countBlocks(geom, slot, self.window, d.window);
-                    const store = &stores[self.slot_layer.items[slot]];
-                    const entering = d.window.count() - overlap(d.window, self.window);
-                    const mixed = countMixed(geom, store, d.window, self.window);
-                    block_takes += mixed;
-                    result.span_count += entering + mixed;
-                    result.value_count += entering + mixed * block_elements;
+                // An unchanged window moves no staying layer's chunks: a level or layer-set
+                // change costs only the layers entering and leaving.
+                if (!d.window.eql(self.window)) {
+                    for (self.order.items) |slot| {
+                        if (!stays[slot]) continue;
+                        // Chunks leaving free their blocks; chunks entering upload their word
+                        // and, when mixed, take and upload a block.
+                        block_frees += self.countBlocks(slot, self.window, d.window);
+                        const store = &stores[self.slot_layer.items[slot]];
+                        const entering = d.window.count() - overlap(d.window, self.window);
+                        const mixed = countMixed(geom, store, d.window, self.window);
+                        block_takes += mixed;
+                        result.span_count += entering + mixed;
+                        result.value_count += entering + mixed * block_elements;
+                    }
                 }
                 // A staying layer whose next deeper layer changed rewrites its link.
                 for (d.layers, 0..) |layer, index| {
@@ -351,32 +364,42 @@ pub const GpuTileMirror = struct {
             const edit_window = intersect(self.window, result.window);
             for (self.order.items) |slot| {
                 if (!stays[slot] or !changed[self.slot_layer.items[slot]]) continue;
+                // Room for every chunk of this layer's scan, so the scan appends without
+                // growing; the list keeps only the chunks that change.
+                try self.plan_edits.ensureUnusedCapacity(allocator, edit_window.count());
+                // SIMD verdict: scalar. A branchy per-chunk directory decode against the
+                // uploaded word.
                 var chunks = WindowChunks.init(edit_window);
-                while (chunks.next()) |chunk| switch (self.chunkChange(geom, stores, slot, chunk.x, chunk.y)) {
-                    .none => {},
-                    .set_word => {
-                        result.edit_word_writes += 1;
-                        result.span_count += 1;
-                        result.value_count += 1;
-                    },
-                    .free_block => {
-                        result.edit_word_writes += 1;
-                        block_frees += 1;
-                        result.span_count += 1;
-                        result.value_count += 1;
-                    },
-                    .take_block => {
-                        result.edit_block_writes += 1;
-                        block_takes += 1;
-                        result.span_count += 2;
-                        result.value_count += 1 + block_elements;
-                    },
-                    .rewrite_block => {
-                        result.edit_block_writes += 1;
-                        result.span_count += 1;
-                        result.value_count += block_elements;
-                    },
-                };
+                while (chunks.next()) |chunk| {
+                    const change = self.chunkChange(geom, stores, slot, chunk.x, chunk.y);
+                    switch (change) {
+                        .none => continue,
+                        .set_word => {
+                            result.span_count += 1;
+                            result.value_count += 1;
+                        },
+                        .free_block => {
+                            block_frees += 1;
+                            result.span_count += 1;
+                            result.value_count += 1;
+                        },
+                        .take_block => {
+                            block_takes += 1;
+                            result.span_count += 2;
+                            result.value_count += 1 + block_elements;
+                        },
+                        .rewrite_block => {
+                            result.span_count += 1;
+                            result.value_count += block_elements;
+                        },
+                    }
+                    self.plan_edits.appendAssumeCapacity(.{
+                        .slot = slot,
+                        .word = self.toroidalWord(chunk.x, chunk.y),
+                        .chunk = chunk.y * geom.chunks_x + chunk.x,
+                        .change = change,
+                    });
+                }
             }
         }
 
@@ -440,7 +463,7 @@ pub const GpuTileMirror = struct {
             self.side = sync_plan.side;
         } else if (sync_plan.residency_changed) {
             for (self.plan_evict.items) |slot| {
-                self.freeBlocks(geom, slot, old_window, .{});
+                self.freeBlocks(slot, old_window, .{});
                 self.freeDirectory(self.slot_dir.items[slot]);
                 layer_slots[self.slot_layer.items[slot]] = no_slot;
                 layer_changed[self.slot_layer.items[slot]] = false;
@@ -448,48 +471,32 @@ pub const GpuTileMirror = struct {
                 std.debug.assert(self.slot_free.items.len < self.slot_free.capacity);
                 self.slot_free.appendAssumeCapacity(slot);
             }
-            for (self.order.items) |slot| {
-                if (stays[slot]) self.freeBlocks(geom, slot, old_window, new_window);
+            if (!old_window.eql(new_window)) {
+                for (self.order.items) |slot| {
+                    if (stays[slot]) self.freeBlocks(slot, old_window, new_window);
+                }
             }
         }
 
-        // Changed chunks resident before and after: frees first, then takes. Other
-        // changes upload whole when their chunk or layer enters.
+        // The changed chunks the plan found, resident before and after: frees first,
+        // then takes. Other changes upload whole when their chunk or layer enters.
         if (sync_plan.edits) {
-            const edit_window = intersect(old_window, new_window);
-            for (self.order.items) |slot| {
-                if (sync_plan.edit_word_writes == 0) break;
-                if (!stays[slot] or !layer_changed[self.slot_layer.items[slot]]) continue;
-                var chunks = WindowChunks.init(edit_window);
-                while (chunks.next()) |chunk| {
-                    const change = self.chunkChange(geom, stores, slot, chunk.x, chunk.y);
-                    if (change != .set_word and change != .free_block) continue;
-                    const word = self.toroidalWord(chunk.x, chunk.y);
-                    const words = self.slotWordsMut(slot);
-                    if (change == .free_block) self.freeBlock(words[word]);
-                    words[word] = tileStoreUniformWord(stores[self.slot_layer.items[slot]].readUniformTile(chunk.y * geom.chunks_x + chunk.x).?);
-                    self.appendRegion(.directory_word, slot, word, 1);
-                }
+            for (self.plan_edits.items) |edit| {
+                if (edit.change != .set_word and edit.change != .free_block) continue;
+                const words = self.slotWordsMut(edit.slot);
+                if (edit.change == .free_block) self.freeBlock(words[edit.word]);
+                words[edit.word] = tileStoreUniformWord(stores[self.slot_layer.items[edit.slot]].readUniformTile(edit.chunk).?);
+                self.appendRegion(.directory_word, edit.slot, edit.word, 1);
             }
-            for (self.order.items) |slot| {
-                if (sync_plan.edit_block_writes == 0) break;
-                const layer = self.slot_layer.items[slot];
-                if (!stays[slot] or !layer_changed[layer]) continue;
-                var chunks = WindowChunks.init(edit_window);
-                while (chunks.next()) |chunk| {
-                    const word = self.toroidalWord(chunk.x, chunk.y);
-                    const level_chunk = chunk.y * geom.chunks_x + chunk.x;
-                    switch (self.chunkChange(geom, stores, slot, chunk.x, chunk.y)) {
-                        .take_block => {
-                            self.slotWordsMut(slot)[word] = self.takeBlock(block_elements);
-                            self.appendRegion(.directory_word, slot, word, 1);
-                            self.appendBlockRegion(slot, level_chunk, word, block_elements);
-                        },
-                        .rewrite_block => self.appendBlockRegion(slot, level_chunk, word, block_elements),
-                        .none, .set_word, .free_block => {},
-                    }
-                }
-            }
+            for (self.plan_edits.items) |edit| switch (edit.change) {
+                .take_block => {
+                    self.slotWordsMut(edit.slot)[edit.word] = self.takeBlock(block_elements);
+                    self.appendRegion(.directory_word, edit.slot, edit.word, 1);
+                    self.appendBlockRegion(edit.slot, edit.chunk, edit.word, block_elements);
+                },
+                .rewrite_block => self.appendBlockRegion(edit.slot, edit.chunk, edit.word, block_elements),
+                .none, .set_word, .free_block => {},
+            };
             // Flags of layers resident before this sync; evicted ones cleared above
             // and entering ones were never set.
             for (self.order.items) |slot| {
@@ -498,7 +505,7 @@ pub const GpuTileMirror = struct {
         }
 
         if (sync_plan.residency_changed) {
-            if (!sync_plan.relayout) {
+            if (!sync_plan.relayout and !old_window.eql(new_window)) {
                 for (self.order.items) |slot| {
                     if (stays[slot]) self.enterChunks(geom, stores, slot, new_window, old_window, block_elements, true);
                 }
@@ -569,6 +576,7 @@ pub const GpuTileMirror = struct {
     // Writes the directory words of `slot`'s chunks in `window` but not in `skip`,
     // taking a block for each mixed one; regions per word only for a staying layer
     // (an entering layer uploads its directory whole).
+    // SIMD verdict: scalar. A branchy per-chunk uniform/block decode and allocator take.
     fn enterChunks(
         self: *GpuTileMirror,
         geom: ChunkGeometry,
@@ -599,8 +607,8 @@ pub const GpuTileMirror = struct {
     }
 
     // Frees the blocks of `slot`'s chunks in `window` but not in `skip`.
-    fn freeBlocks(self: *GpuTileMirror, geom: ChunkGeometry, slot: u32, window: ChunkWindow, skip: ChunkWindow) void {
-        _ = geom;
+    // SIMD verdict: scalar. A toroidal word gather with a per-word free-list push.
+    fn freeBlocks(self: *GpuTileMirror, slot: u32, window: ChunkWindow, skip: ChunkWindow) void {
         var chunk_y = window.min_y;
         while (chunk_y < window.max_y) : (chunk_y += 1) {
             var chunk_x = window.min_x;
@@ -613,8 +621,9 @@ pub const GpuTileMirror = struct {
     }
 
     // Blocks `slot` holds for its chunks in `window` but not in `skip`.
-    fn countBlocks(self: *const GpuTileMirror, geom: ChunkGeometry, slot: u32, window: ChunkWindow, skip: ChunkWindow) usize {
-        _ = geom;
+    // SIMD verdict: scalar. The words are a toroidal gather (row wraps at `side`) with a
+    // skip-window test per chunk, and run only when the window moves or a layer leaves.
+    fn countBlocks(self: *const GpuTileMirror, slot: u32, window: ChunkWindow, skip: ChunkWindow) usize {
         var blocks: usize = 0;
         var chunk_y = window.min_y;
         while (chunk_y < window.max_y) : (chunk_y += 1) {
@@ -704,6 +713,7 @@ pub const GpuTileMirror = struct {
 };
 
 // Mixed chunks of `store` in `window` but not in `skip`.
+// SIMD verdict: scalar. A per-chunk directory decode with a skip-window test.
 fn countMixed(geom: ChunkGeometry, store: *const DenseLayerStore, window: ChunkWindow, skip: ChunkWindow) usize {
     var mixed: usize = 0;
     var chunk_y = window.min_y;

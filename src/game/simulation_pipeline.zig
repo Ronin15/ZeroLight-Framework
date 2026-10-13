@@ -1538,15 +1538,15 @@ pub const SimulationPipeline = struct {
         const context = step.context;
         const grown_before = self.dig.plane_scratch_grown;
         const windows_grown_before = self.plane_entry.windows_grown;
-        const entries = try self.plane_entry.gather(context.data, context.world, context.player.entity, context.thread_system);
+        const entries = try self.plane_entry.gather(context.data, context.world, context.player.entity, self.dig.tunnel_tile, context.thread_system);
         step.plane_entry = self.plane_entry.last_batch;
         step.plane_entry_windows_grown = @intCast(self.plane_entry.windows_grown - windows_grown_before);
-        const reservation = try self.dig.reservePlaneTraversalStage(context.world, context.data, context.player, context.frame, entries);
+        const reservation = try self.dig.reservePlaneTraversalStage(context.world, context.data, context.player, context.frame, entries, context.thread_system);
         // The record room follows the carves the preflight counted, which may exceed the
         // tracked population's budget until a failed population seam succeeds.
         if (reservation.carves != 0) try self.pathfinding.reserveTerrainNavRecord(reservation.carves);
         const first_event = context.frame.events.mergedItems().len;
-        const traversed = self.dig.commitPlaneTraversalStage(context.world, context.data, context.player, context.frame, reservation);
+        const traversed = self.dig.commitPlaneTraversalStage(context.world, context.data, context.player, context.frame, reservation, context.thread_system);
         // Earlier events keep their positions, so the tail is the stage's own events.
         self.pathfinding.recordTerrainNavEvents(context.frame.events.mergedItems()[first_event..], context.world, context.thread_system);
         try traversed;
@@ -1776,7 +1776,7 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
     // until next step and the NPC would not fall yet.
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
 }
 
 test "pipeline update after reserve allocates nothing on frame streams with dig, fall, and contact" {
@@ -2572,8 +2572,8 @@ const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfi
 const lane_count = @import("../core/simd.zig").lane_count;
 const plane_entry_range_alignment_items = @import("systems/plane_entry.zig").plane_entry_range_alignment_items;
 const DigIntent = @import("simulation.zig").DigIntent;
-const demoWorldWithChunkSize = @import("world_test_support.zig").demoWorldWithChunkSize;
 const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
+const denseTileBlocksMovement = @import("world_test_support.zig").denseTileBlocksMovement;
 const nav_test_support = @import("systems/pathfinding/test_support.zig");
 const AiAgent = @import("data_system.zig").AiAgent;
 const MovementBody = @import("data_system.zig").MovementBody;
@@ -2603,9 +2603,9 @@ fn gateTestWorld(meta: *const world_tileset_meta.WorldTilesetMeta, carve: []cons
 fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
     var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
     defer plane_entry.deinit();
-    const entries = try plane_entry.gather(data, world, player.entity, null);
-    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries);
-    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation);
+    const entries = try plane_entry.gather(data, world, player.entity, dig.tunnel_tile, null);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, null);
+    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, null);
 }
 
 fn placePlayerFlush(data: *DataSystem, player: Player, cell: [2]u16) void {
@@ -2765,7 +2765,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
     // hole cell, landed on level 1, and its landing cell was carved walkable.
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(active_npc));
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
 }
 
 test "pipeline runs the perception stage scoped to cognition-tier ai agents without perturbing movement/ai" {
@@ -3544,7 +3544,7 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     // 16 tiles wide × chunk_size 8 → two chunks on X. Surface (level 0)
     // is fully walkable so the tile gate cannot undo the contact push.
     const tile_size = meta.tileSize();
-    var world = try demoWorldWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 8);
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 8);
     defer world.deinit();
     try std.testing.expectEqual(@as(u16, 8), world.chunk_size_tiles);
 
@@ -3629,7 +3629,7 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
     defer meta.deinit();
     // 16 x 8 tiles in 4-tile chunks: a 4 x 2 chunk grid.
     const tile_size = meta.tileSize();
-    var world = try demoWorldWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 4);
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 4);
     defer world.deinit();
 
     var data = DataSystem.init(std.testing.allocator);
@@ -3785,8 +3785,8 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 4, 3));
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 4, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
 }
 
 test "plane traversal event capacity miss leaves landing tiles unchanged" {
@@ -3802,7 +3802,7 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
     _ = try world.clearDenseTile(floor0, 4, 3);
     const floor1 = world.denseFloorLayerForLevel(1).?;
     const landing_before = world.denseTile(floor1, 4, 3);
-    try std.testing.expect(world.denseTileBlocksMovement(floor1, 4, 3));
+    try std.testing.expect(denseTileBlocksMovement(&world, floor1, 4, 3));
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -3841,7 +3841,7 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
         testPlaneTraversalStage(&dig, &world, &data, &player, &frame),
     );
     try std.testing.expectEqual(landing_before, world.denseTile(floor1, 4, 3));
-    try std.testing.expect(world.denseTileBlocksMovement(floor1, 4, 3));
+    try std.testing.expect(denseTileBlocksMovement(&world, floor1, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
 }
 
@@ -3965,12 +3965,13 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
     var dig = DigController.init(dig_config);
     try dig.reservePlaneScratch(std.testing.allocator, 4);
     defer dig.deinit();
-    // The reserve covers the scratch, the events, every carve's world write, and the
-    // world_level rows; after it the commit allocates from none of them.
+    // The reserve covers the scratch, the events, and the world_level rows; with the
+    // landing chunk's batch scratch and pools warm, the commit allocates from none of them.
+    try warmLandingTerrain(&world, dig.tunnel_tile, 1, .{ 4, 3 });
     var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
     defer plane_entry.deinit();
-    const entries = try plane_entry.gather(&data, &world, player.entity, null);
-    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame, entries);
+    const entries = try plane_entry.gather(&data, &world, player.entity, dig.tunnel_tile, null);
+    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame, entries, null);
     try std.testing.expectEqual(@as(usize, 2), reservation.carves);
 
     const original_frame = frame.allocator;
@@ -3993,7 +3994,7 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
         dig.scratch_allocator = original_dig;
     }
 
-    try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation);
+    try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation, null);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
@@ -4002,8 +4003,8 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
     try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 1), frame.events.rangeCount());
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 4, 3));
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 4, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
 }
 
 test "pipeline commits the dig stage's stimulus before perception reads it in the same step" {
@@ -5707,7 +5708,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
         const position = data.movementBodyConst(npc).?.position;
         const cell = world.cellContaining(position.x + 16, position.y + 16).?;
-        try std.testing.expect(!world.denseTileBlocksMovement(floor1, cell.x, cell.y));
+        try std.testing.expect(!denseTileBlocksMovement(&world, floor1, cell.x, cell.y));
         out.positions[index] = .{ position.x, position.y };
     }
     try std.testing.expectEqual(@as(u64, 0), pipeline.dig.plane_scratch_grown);
@@ -6435,7 +6436,7 @@ test "a nav-mark reserve OOM before plane traversal leaves world and nav intact 
     try fixture.update(.hole);
     try fixture.seam();
     const floor1 = fixture.world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(fixture.world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(denseTileBlocksMovement(&fixture.world, floor1, 6, 3));
     try std.testing.expect(fixture.navBlocked(1, 6, 3));
 
     // Control: a quiet step allocates nothing from nav, so the next failure is the
@@ -6456,13 +6457,13 @@ test "a nav-mark reserve OOM before plane traversal leaves world and nav intact 
     try std.testing.expectError(error.OutOfMemory, failed);
     // No fall and no landing carve, and nav is as it was.
     try std.testing.expectEqual(@as(u16, 0), fixture.player.current_level);
-    try std.testing.expect(fixture.world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(denseTileBlocksMovement(&fixture.world, floor1, 6, 3));
     try std.testing.expect(fixture.navBlocked(1, 6, 3));
 
     // The retried step falls and carves the landing; the seam applies it.
     try fixture.update(.none);
     try std.testing.expectEqual(@as(u16, 1), fixture.player.current_level);
-    try std.testing.expect(!fixture.world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&fixture.world, floor1, 6, 3));
     try fixture.seam();
     try std.testing.expect(!fixture.navBlocked(1, 6, 3));
     try fixture.expectNavMatchesRebuild();
@@ -6496,7 +6497,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
         while (x < 16) : (x += 1) {
             if (landings.items.len == npc_count) break :fill;
             if (x == 5 and y == 3) continue; // the player's cell
-            try std.testing.expect(fixture.world.denseTileBlocksMovement(floor1, x, y));
+            try std.testing.expect(denseTileBlocksMovement(&fixture.world, floor1, x, y));
             _ = try fixture.world.clearDenseTile(floor0, x, y);
             try landings.append(std.testing.allocator, .{ .x = x, .y = y });
             const npc = try fixture.data.createEntity();
@@ -6549,7 +6550,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
     try std.testing.expect(step.plane_entry.range_count >= 2 and !step.plane_entry.ran_inline);
     try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 1), fixture.frame.events.range_stats.items.len);
-    for (landings.items) |cell| try std.testing.expect(!fixture.world.denseTileBlocksMovement(floor1, cell.x, cell.y));
+    for (landings.items) |cell| try std.testing.expect(!denseTileBlocksMovement(&fixture.world, floor1, cell.x, cell.y));
 
     // The retried seam grows, and nav applies every recorded carve.
     try fixture.seam();

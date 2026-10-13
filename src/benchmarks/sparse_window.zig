@@ -26,6 +26,7 @@ const WorldDepth = @import("../game/render_depth.zig").WorldDepth;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const TileId = @import("../game/world_system.zig").TileId;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
+const no_sparse_tile = @import("../game/world_terrain.zig").no_sparse_tile;
 const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
 const Rect = @import("../render/renderer.zig").Rect;
 const TextureId = @import("../render/resources.zig").TextureId;
@@ -149,16 +150,20 @@ const Fixture = struct {
     }
 
     // Drops the tile `addOutsideTile` appended, returning the world to `sparse_count`
-    // tiles: truncates `sparse_tiles` and the tile's level and chunk index lists. It
-    // invalidates nothing, as the add outside the window invalidated nothing.
+    // tiles: unlinks it from the head of its chunk list and truncates `sparse_tiles`.
+    // It invalidates nothing, as the add outside the window invalidated nothing.
     fn dropAddedTile(self: *Fixture) !void {
         const world = &self.world;
         if (world.sparseTileCount() != self.sparse_count + 1) return error.AddedTileCountMismatch;
         const added_index: u32 = @intCast(self.sparse_count);
         const chunk = world.chunkCoordForCell(added_tile_x, added_tile_y);
         const chunk_index: usize = @intCast(chunk.y * @as(i32, world.chunksX()) + chunk.x);
-        if (world.sparse_level_tiles.items[added_tile_level].pop() != added_index) return error.AddedTileIndexMismatch;
-        if (world.sparse_level_chunk_tiles.items[added_tile_level].items[chunk_index].pop() != added_index) return error.AddedTileIndexMismatch;
+        const heads = world.level_terrain.items[added_tile_level].sparse_heads;
+        if (heads[chunk_index] != added_index) return error.AddedTileIndexMismatch;
+        const rows = world.sparse_tiles.slice();
+        const next = rows.items(.chunk_next)[added_index];
+        heads[chunk_index] = next;
+        if (next != no_sparse_tile) rows.items(.chunk_prev)[next] = no_sparse_tile;
         world.sparse_tiles.shrinkRetainingCapacity(self.sparse_count);
         if (world.sparse_window.dirty) return error.OutsideAddDirtiedWindow;
     }

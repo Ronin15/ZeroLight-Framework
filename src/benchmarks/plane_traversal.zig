@@ -11,12 +11,19 @@
 //!     hole, so 64 falls and 64 landing carves per step. The 64 is a workload constant.
 //!   - `plane-traversal-dense-falls`: an explosion under the crowd. Every 4th agent
 //!     enters its own level-0 hole, so falls and landing carves scale with the agents.
+//!   - `plane-traversal-dense-falls-banded`: the dense falls' worst-case landing shape.
+//!     A fixed 4096 agents (1024 fallers) land on a level holding the item count of
+//!     dense bands (one floor, the rest walkable overlays) and as many walkable sparse
+//!     tiles per chunk. The item count is that band count, so the stage's main time
+//!     per entry against it shows whether a landing costs its level's bands and
+//!     sparse tiles.
 //! Timed: the plane stage's NPC cell-entry gather (`PlaneEntrySystem`, serial or on the
-//! case's threads), then the dig reserve and commit over its entries. The untimed reset
-//! after each iteration puts the fallers back on level 0, refills their landing cells,
-//! and begins the next frame step. The item count is the AI agent count. `--details`
-//! reports the gather's shape and the stage's main-thread time (everything but a
-//! dispatched gather) and share.
+//! case's threads), then the dig reserve and commit over its entries, the commit's carve
+//! batch on the same threads. The untimed reset after each iteration puts the fallers
+//! back on level 0, refills their landing cells, and begins the next frame step. The item
+//! count is the AI agent count. `--details` reports the gather's shape and the stage's
+//! main-thread time (everything but a dispatched gather or carve-batch stage), its share,
+//! and its time per entry.
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -46,24 +53,28 @@ const fixed_falls_per_step: usize = 64;
 const dense_agents_per_faller: usize = 4;
 
 const item_counts = [_]usize{ 1_024, 4_096, 16_384 };
+// The banded group's landing-level band counts, and its fixed agent count.
+const band_counts = [_]usize{ 4, 32, 256 };
+const banded_agent_count: usize = 4_096;
 
 const Workload = enum {
     no_falls,
     fixed_falls,
     dense_falls,
+    banded_falls,
 
     fn fallerCount(self: Workload, agent_count: usize) usize {
         return switch (self) {
             .no_falls => 0,
             .fixed_falls => @min(fixed_falls_per_step, agent_count),
-            .dense_falls => agent_count / dense_agents_per_faller,
+            .dense_falls, .banded_falls => agent_count / dense_agents_per_faller,
         };
     }
 
     // One world at every default size: the dense group's 4096 fallers take a quarter of
     // a 128-tile level. Doubles only when the fallers would fill over half the level.
     fn worldSide(self: Workload, faller_count: usize) u16 {
-        var side: usize = if (self == .dense_falls) 128 else 64;
+        var side: usize = if (self == .dense_falls or self == .banded_falls) 128 else 64;
         while (faller_count > side * side / 2) side *= 2;
         return @intCast(side);
     }
@@ -110,8 +121,18 @@ pub const dense_falls_group = suite.BenchmarkGroup{
     .runCase = runDenseFallsCase,
 };
 
+pub const banded_falls_group = suite.BenchmarkGroup{
+    .name = "plane-traversal-dense-falls-banded",
+    .defaultItemCounts = defaultBandCounts,
+    .runCase = runBandedFallsCase,
+};
+
 fn defaultItemCounts(_: suite.Profile) []const usize {
     return &item_counts;
+}
+
+fn defaultBandCounts(_: suite.Profile) []const usize {
+    return &band_counts;
 }
 
 const Faller = struct {
@@ -162,8 +183,9 @@ const Fixture = struct {
 
 // A grass surface over one solid dirt level, with one level-0 hole per faller. Agent
 // `index` crosses one cell boundary to the right; the first `faller_count` multiples of
-// `agent_count / faller_count` walk into their own hole instead.
-fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, workload: Workload) !Fixture {
+// `agent_count / faller_count` walk into their own hole instead. `landing_bands` is the
+// dirt level's band count (its floor first) and its walkable sparse tiles per chunk.
+fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, workload: Workload, landing_bands: usize) !Fixture {
     const faller_count = workload.fallerCount(agent_count);
     std.debug.assert(faller_count <= agent_count);
     const layout = Layout.of(workload.worldSide(faller_count), faller_count);
@@ -187,6 +209,20 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
         const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) grass else dirt);
         std.debug.assert(layer == level);
+    }
+    // The landing level's extra walkable bands and sparse tiles, every chunk alike.
+    std.debug.assert(landing_bands >= 1);
+    const overlay = try world.requireTileByName(&meta, "stone_floor");
+    for (1..landing_bands) |_| _ = try world.addDenseLayer(1, 0, .obstacle, overlay);
+    if (landing_bands > 1) {
+        const edge = world.chunk_size_tiles;
+        for (0..world.chunksY()) |chunk_y| for (0..world.chunksX()) |chunk_x| {
+            for (0..landing_bands) |tile| {
+                const x: u16 = @intCast(chunk_x * edge + tile % edge);
+                const y: u16 = @intCast(chunk_y * edge + tile / edge % edge);
+                std.debug.assert((try world.addSparseTile(1, x, y, overlay, 0, .floor)) == null);
+            }
+        };
     }
     world.adoptTilesetMeta(meta);
     meta_owned = false;
@@ -255,15 +291,19 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
 }
 
 fn runNoFallsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .no_falls);
+    return runCase(allocator, io, options, case, item_count, .no_falls, 1);
 }
 
 fn runFallsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .fixed_falls);
+    return runCase(allocator, io, options, case, item_count, .fixed_falls, 1);
 }
 
 fn runDenseFallsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .dense_falls);
+    return runCase(allocator, io, options, case, item_count, .dense_falls, 1);
+}
+
+fn runBandedFallsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, banded_agent_count, .banded_falls, item_count);
 }
 
 fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
@@ -276,21 +316,21 @@ fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.Benchma
 
 // One plane stage's gather and dig half, after `resetStep`. Returns the gathered entries.
 fn runStage(fixture: *Fixture, thread_system: ?*ThreadSystem) !usize {
-    const entries = try fixture.plane_entry.gather(&fixture.data, &fixture.world, fixture.player.entity, thread_system);
-    const reservation = try fixture.dig.reservePlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &fixture.frame, entries);
-    try fixture.dig.commitPlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &fixture.frame, reservation);
+    const entries = try fixture.plane_entry.gather(&fixture.data, &fixture.world, fixture.player.entity, fixture.dig.tunnel_tile, thread_system);
+    const reservation = try fixture.dig.reservePlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &fixture.frame, entries, thread_system);
+    try fixture.dig.commitPlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &fixture.frame, reservation, thread_system);
     std.debug.assert(reservation.carves == entries.len);
     return entries.len;
 }
 
-fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, landing_bands: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var threads = try initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
-    var fixture = try buildFixture(allocator, io, item_count, workload);
+    var fixture = try buildFixture(allocator, io, item_count, workload, landing_bands);
     defer fixture.deinit();
     const plane_entry = &fixture.plane_entry;
     plane_entry.tuner = suite.adaptiveTunerForCase(case, plane_entry_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
@@ -322,7 +362,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     }
     const settled_before_measurement = if (case.adaptive) plane_entry.tuner.isSettled() else false;
 
-    var accumulator = suite.StatsAccumulator.init(item_count);
+    // The banded group's size axis is its landing band count.
+    var accumulator = suite.StatsAccumulator.init(if (workload == .banded_falls) landing_bands else item_count);
     var main_total: u128 = 0;
     var entries: usize = 0;
     for (0..options.iterations) |_| {
@@ -332,8 +373,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const gather = plane_entry.last_batch;
         std.debug.assert(!expect_dispatch or (gather.range_count > 1 and !gather.ran_inline));
         accumulator.record(elapsed_ns, gather);
-        // Main is everything but a gather that ran on workers.
-        main_total += if (gather.ran_inline) elapsed_ns else elapsed_ns -| gather.batch_duration_ns;
+        // Main is everything but the stages that ran on workers: the gather and the
+        // carve batch's plan and write stages.
+        var off_main: u64 = 0;
+        for ([_]@TypeOf(gather){ gather, fixture.world.last_terrain_edit_plan_batch, fixture.world.last_terrain_edit_write_batch }) |batch| {
+            if (!batch.ran_inline) off_main += batch.batch_duration_ns;
+        }
+        main_total += elapsed_ns -| off_main;
         try fixture.resetStep();
     }
     std.debug.assert(entries == fixture.fallers.items.len);

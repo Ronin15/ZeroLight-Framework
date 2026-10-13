@@ -15,16 +15,28 @@
 
 const std = @import("std");
 const simd = @import("../core/simd.zig");
+const OrderedIndexSet = @import("systems/chunk_list_map.zig").OrderedIndexSet;
 
+/// A world tile id; the world's tile accessors re-export it.
 pub const TileId = u16;
 
-/// Largest chunk edge a bit block covers.
+/// Largest chunk edge: the one bound behind every chunk-sized structure (bit blocks,
+/// tile blocks, nav's per-chunk kernels). `WorldSystem.validateChunkGrid` enforces it.
 pub const max_chunk_edge: u16 = 16;
 pub const max_chunk_cells: usize = @as(usize, max_chunk_edge) * max_chunk_edge;
+/// One bit per chunk-local cell. Raw words, not `std.bit_set`: nav's per-cell kernels read
+/// these words and measured std's per-bit methods at about 3x the serial reaction (Debug,
+/// nav-update-scattered at 256 digs); `bitIsSet`/`setBit`/`clearBit` are the one bit access.
 pub const ChunkBits = [max_chunk_cells / 64]u64;
 
 /// Head/next sentinel of a level's link-endpoint lists.
 pub const no_link_endpoint: u32 = std.math.maxInt(u32);
+/// Head/next/prev sentinel of a level's per-chunk sparse tile lists.
+pub const no_sparse_tile: u32 = std.math.maxInt(u32);
+/// `LevelTerrain.floor_layer` of a level with no floor band.
+pub const no_floor_layer: u32 = std.math.maxInt(u32);
+/// Head/tail sentinel of the write chains while a batch is grouped.
+pub const no_edit_write: u32 = std.math.maxInt(u32);
 
 // A dense directory entry with this bit set holds a uniform tile in its low 16
 // bits; otherwise it is a block index. Block indices stay below it: a layer has at
@@ -469,12 +481,11 @@ pub const ChunkBitsStore = struct {
         self.dir[chunk] = slot;
         const words = &self.bits.items[slot];
         if (bitIsSet(words, local) == value) return;
-        const word_bit = @as(u64, 1) << @intCast(local % 64);
         if (value) {
-            words[local / 64] |= word_bit;
+            setBit(words, local);
             self.counts.items[slot] += 1;
         } else {
-            words[local / 64] &= ~word_bit;
+            clearBit(words, local);
             self.counts.items[slot] -= 1;
         }
         const count = self.counts.items[slot];
@@ -663,12 +674,11 @@ pub const OwnedBits = struct {
 
     pub fn set(self: *OwnedBits, local: u32, value: bool) void {
         if (bitIsSet(&self.bits, local) == value) return;
-        const word_bit = @as(u64, 1) << @intCast(local % 64);
         if (value) {
-            self.bits[local / 64] |= word_bit;
+            setBit(&self.bits, local);
             self.count += 1;
         } else {
-            self.bits[local / 64] &= ~word_bit;
+            clearBit(&self.bits, local);
             self.count -= 1;
         }
     }
@@ -708,16 +718,30 @@ pub fn rectMask(geom: ChunkGeometry, x0: u32, y0: u32, x1: u32, y1: u32) ChunkBi
     return words;
 }
 
-pub fn bitIsSet(words: *const ChunkBits, local: u32) bool {
-    return words[local / 64] & (@as(u64, 1) << @intCast(local % 64)) != 0;
+/// The one chunk-local bit access on `ChunkBits`, for terrain and nav's cell kernels.
+/// Inline: nav's per-cell flood calls these per neighbour.
+pub inline fn bitIsSet(words: *const ChunkBits, local: usize) bool {
+    return (words[local >> 6] >> @intCast(local & 63)) & 1 != 0;
 }
 
-/// One level's chunk-owned terrain: its dense band list, composed blocked bits, and
-/// link-endpoint heads.
+pub inline fn setBit(words: *ChunkBits, local: usize) void {
+    words[local >> 6] |= @as(u64, 1) << @intCast(local & 63);
+}
+
+pub inline fn clearBit(words: *ChunkBits, local: usize) void {
+    words[local >> 6] &= ~(@as(u64, 1) << @intCast(local & 63));
+}
+
+/// One level's chunk-owned terrain, every per-chunk directory sized when the level is
+/// created: its dense band list and floor band, composed blocked bits, link-endpoint
+/// heads and counts, and sparse tile heads.
 pub const LevelTerrain = struct {
     /// Dense layer indices of this level's bands in add order; a layer's position
     /// here is its `band`. Append-only.
     bands: std.ArrayList(u32) = .empty,
+    /// The dense layer of the level's first floor band, or `no_floor_layer`; set when
+    /// that band is added.
+    floor_layer: u32 = no_floor_layer,
     blocked: ChunkBitsStore = .{},
     // Advances (wrapping) whenever `blocked` changes through a path that emits no
     // per-cell event: a blocking band add, a procedural fill. Readers compare it
@@ -726,21 +750,53 @@ pub const LevelTerrain = struct {
     /// Per chunk, the newest link endpoint (`2 * link + side`) on this level, or
     /// `no_link_endpoint`.
     link_heads: []u32 = &.{},
+    /// Per chunk, the endpoints in its `link_heads` list.
+    link_counts: []u32 = &.{},
+    /// Per chunk, the newest sparse tile row in the chunk, or `no_sparse_tile`; the
+    /// world's sparse rows chain each chunk's tiles both ways.
+    sparse_heads: []u32 = &.{},
+    /// The chunks holding a write while a batch given in any order is grouped
+    /// (`WorldSystem.groupDenseCellWrites`), popped in order; empty between batches.
+    edit_chunks: OrderedIndexSet = .{},
 
-    /// Every chunk OPEN with no link endpoint. O(chunks).
+    /// Every chunk OPEN with no link endpoint, no sparse tile, and no grouped write.
+    /// O(chunks).
     pub fn init(allocator: std.mem.Allocator, chunk_count: usize) error{OutOfMemory}!LevelTerrain {
         var blocked = try ChunkBitsStore.init(allocator, chunk_count);
         errdefer blocked.deinit(allocator);
         const link_heads = try allocator.alloc(u32, chunk_count);
+        errdefer allocator.free(link_heads);
         @memset(link_heads, no_link_endpoint);
-        return .{ .blocked = blocked, .link_heads = link_heads };
+        const link_counts = try allocator.alloc(u32, chunk_count);
+        errdefer allocator.free(link_counts);
+        @memset(link_counts, 0);
+        const sparse_heads = try allocator.alloc(u32, chunk_count);
+        errdefer allocator.free(sparse_heads);
+        @memset(sparse_heads, no_sparse_tile);
+        var edit_chunks: OrderedIndexSet = .{};
+        _ = try edit_chunks.reserve(allocator, chunk_count);
+        return .{
+            .blocked = blocked,
+            .link_heads = link_heads,
+            .link_counts = link_counts,
+            .sparse_heads = sparse_heads,
+            .edit_chunks = edit_chunks,
+        };
     }
 
     pub fn deinit(self: *LevelTerrain, allocator: std.mem.Allocator) void {
         self.bands.deinit(allocator);
         self.blocked.deinit(allocator);
         allocator.free(self.link_heads);
+        allocator.free(self.link_counts);
+        allocator.free(self.sparse_heads);
+        self.edit_chunks.deinit(allocator);
         self.* = undefined;
+    }
+
+    /// The level's floor layer, or null when it has no floor band. O(1).
+    pub fn floorLayer(self: *const LevelTerrain) ?u32 {
+        return if (self.floor_layer == no_floor_layer) null else self.floor_layer;
     }
 
     pub fn bandLayers(self: *const LevelTerrain) []const u32 {
@@ -766,8 +822,7 @@ test "chunk geometry maps cells to chunk and local indices with short border chu
 fn rectMaskReference(geom: ChunkGeometry, x0: u32, y0: u32, x1: u32, y1: u32) ChunkBits {
     var words: ChunkBits = @splat(0);
     for (y0..y1) |row| for (x0..x1) |col| {
-        const local = (row << geom.shift) | col;
-        words[local / 64] |= @as(u64, 1) << @intCast(local % 64);
+        setBit(&words, @intCast((row << geom.shift) | col));
     };
     return words;
 }
