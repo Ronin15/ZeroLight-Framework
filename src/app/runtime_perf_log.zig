@@ -84,6 +84,7 @@ pub const Metric = enum {
     path_solved_requests,
     path_solve_admissions,
     path_available_results,
+    path_partial_results,
     path_unavailable_results,
     path_dropped_requests,
     path_admission_deferred_requests,
@@ -712,7 +713,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} solve_admissions={} available={} unavailable={} dropped={} admission_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
+            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} solve_admissions={} available={} partial={} unavailable={} dropped={} admission_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
             .{
                 elapsed_s,
                 self.metricValue(.path_accepted_requests),
@@ -721,6 +722,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.path_solved_requests),
                 self.metricValue(.path_solve_admissions),
                 self.metricValue(.path_available_results),
+                self.metricValue(.path_partial_results),
                 self.metricValue(.path_unavailable_results),
                 self.metricValue(.path_dropped_requests),
                 self.metricValue(.path_admission_deferred_requests),

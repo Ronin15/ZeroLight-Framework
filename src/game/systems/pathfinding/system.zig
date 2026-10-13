@@ -368,6 +368,8 @@ pub const PathfindingSystem = struct {
         path_level: u16 = 0,
         // The path's last cell (`PathResult.end`).
         end: types.StitchedCell = .{ .level = 0, .cell = 0 },
+        // The live goal cell the solve targeted (`PathResult.goal_cell`).
+        goal_cell: u32 = no_cell,
         // Set when the solve routed through the abstract chunk-portal/link graph.
         via_abstract: bool = false,
         // Set when the chosen corridor crosses at least one inter-level link.
@@ -1258,10 +1260,11 @@ pub const PathfindingSystem = struct {
     }
 
     // Group field first (when ready), then the live goal and, for an open start, reach,
-    // then the individual cache (served only while its path ends at the live goal), then
-    // pending. Missing means the caller may enqueue a request. The start cell is
-    // interpreted on `start_level`; cached corridors derive against the level their stored
-    // cells index into (start level for cross-level corridors).
+    // then the individual cache (served only while it was solved toward the live goal; a
+    // partial reads `.partial`), then pending. Missing means the caller may enqueue a
+    // request. The start cell is interpreted on `start_level`; cached corridors derive
+    // against the level their stored cells index into (start level for cross-level
+    // corridors).
     fn statusForKeyAndStart(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start_index: usize, waypoint_hint: ?*u32) PathView {
         if (self.groupFieldOf(key)) |field| {
             if (field.state == .ready and start_level == key.goal_level) {
@@ -1282,18 +1285,22 @@ pub const PathfindingSystem = struct {
         const goal_index = self.liveGoal(key, goal_grid).cell orelse return .{ .status = .unavailable };
         if (self.reaches(key.agent_class, start_level, start_index, key.goal_level, goal_index) == .unreachable_goal) return .{ .status = .unavailable };
         if (self.completed.freshSlotIndex(key, self.step_counter, types.default_cache_ttl_steps)) |slot| {
-            if (self.cachedView(slot, key.goal_level, goal_index, start_level, start_index, waypoint_hint)) |view| return view;
+            if (self.cachedView(slot, goal_index, start_level, start_index, waypoint_hint)) |view| return view;
         }
         if (self.pending_keys.contains(key)) return .{ .status = .pending };
         return .{ .status = .missing };
     }
 
     // The waypoint view of cached result `slot` for a start at `start_index` on
-    // `start_level`; null unless the result ends at `goal_index` on `goal_level`, so a result
-    // solved toward an older projection is not served.
-    fn cachedView(self: *const PathfindingSystem, slot: usize, goal_level: u16, goal_index: usize, start_level: u16, start_index: usize, waypoint_hint: ?*u32) ?PathView {
+    // `start_level`; null unless the result was solved toward `goal_index`, so a result
+    // solved toward an older projection is not served. A partial result reads `.partial`,
+    // with `refresh` set inside its end's refresh window.
+    fn cachedView(self: *const PathfindingSystem, slot: usize, goal_index: usize, start_level: u16, start_index: usize, waypoint_hint: ?*u32) ?PathView {
         const result = self.completed.resultAt(slot);
-        if (!endsAt(result.end, goal_level, goal_index)) return null;
+        if (result.goal_cell != goal_index) return null;
+        const partial = result.isPartial();
+        const status: PathStatus = if (partial) .partial else .available;
+        const refresh = partial and types.inPartialRefreshWindow(self.graph.chunkGeometry(), result.end, start_level, start_index);
         const path_grid = self.graph.grid(result.path_level) orelse return .{ .status = .unavailable };
         // Abstract chunk/cross-level corridor: a full obstacle-aware stitched
         // (level,cell) path. Walk the run on the agent's CURRENT level cell by
@@ -1302,22 +1309,22 @@ pub const PathfindingSystem = struct {
         if (result.stitched_len != 0) {
             const stitched = self.completed.stitchedSlice(slot, result.stitched_len);
             if (waypointFromStitched(&self.graph, stitched, start_level, start_index, waypoint_hint)) |waypoint| {
-                return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.stitched_len };
+                return .{ .status = status, .next_waypoint = waypoint, .path_len = result.stitched_len, .refresh = refresh };
             }
             // Agent's level is not yet covered by the corridor (e.g. it has not
             // reached the start-level run): steer toward the corridor's first cell.
             const first_grid = self.graph.grid(stitched.levels[0]) orelse return .{ .status = .unavailable };
-            return .{ .status = .available, .next_waypoint = first_grid.cellCenter(stitched.cells[0]), .path_len = result.stitched_len };
+            return .{ .status = status, .next_waypoint = first_grid.cellCenter(stitched.cells[0]), .path_len = result.stitched_len, .refresh = refresh };
         }
         const path = self.completed.pathSlice(slot, result.path_len);
         // Plain same-component local solve: derive a forward waypoint from the
         // agent's current cell against the stored path.
         if (result.path_level == start_level) {
             if (waypointFromPath(path_grid, path, start_index, waypoint_hint)) |waypoint| {
-                return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.path_len };
+                return .{ .status = status, .next_waypoint = waypoint, .path_len = result.path_len, .refresh = refresh };
             }
         }
-        return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .path_len = result.path_len };
+        return .{ .status = status, .next_waypoint = path_grid.cellCenter(path[0]), .path_len = result.path_len, .refresh = refresh };
     }
 
     /// A key's live goal on `goal_grid`, its goal level's grid: the key's cell when open,
@@ -1355,12 +1362,6 @@ pub const PathfindingSystem = struct {
         return switch (traversal) {
             .walk => &self.graph,
         };
-    }
-
-    // Whether a cached result ending at `end` ends at the live goal: a result solved toward
-    // an older projection is not served.
-    fn endsAt(end: types.StitchedCell, goal_level: u16, goal_index: usize) bool {
-        return end.level == goal_level and end.cell == goal_index;
     }
 
     /// Sizes the goal table for `intent_count` intents per step: the population seam's
@@ -1622,9 +1623,11 @@ pub const PathfindingSystem = struct {
 
     // How intake answers one request past its group field: unavailable when no open goal
     // cell lies within the projection radius or an open start cannot reach the live goal;
-    // a hit when a fresh cached result ends at the live goal; else a candidate (a cached
-    // result toward an older projection is replaced by the candidate's solve). A blocked
-    // start is a candidate, dropped at solve. O(1) with the step's goal table. Const.
+    // a hit when a fresh cached result was solved toward the live goal, unless it is
+    // partial and the start lies in its end's refresh window; else a candidate (a cached
+    // result toward an older projection, or a partial asked for its next hop, is replaced by
+    // the candidate's solve). A blocked start is a candidate, dropped at solve. O(1) with
+    // the step's goal table. Const.
     fn intakeAnswer(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start: GridCell, goal_grid: *const NavGrid, cached: ?ResultCache.SlotLookup) IntakeAnswer {
         const live = self.liveGoal(key, goal_grid);
         var answer = IntakeAnswer{ .projected = live.blocked, .fallback = live.fallback };
@@ -1639,7 +1642,11 @@ pub const PathfindingSystem = struct {
             return answer;
         }
         if (cached) |found| {
-            if (found.fresh and endsAt(found.end, key.goal_level, goal_index)) answer.kind = .hit;
+            if (found.fresh and found.goal_cell == goal_index) {
+                const refresh = types.isPartialEnd(found.end, key.goal_level, found.goal_cell) and
+                    types.inPartialRefreshWindow(self.graph.chunkGeometry(), found.end, start_level, start_index);
+                if (!refresh) answer.kind = .hit;
+            }
         }
         return answer;
     }
@@ -2159,7 +2166,10 @@ pub const PathfindingSystem = struct {
         var registrations: usize = 0;
         var shard_registrations: [registry_shard_count]usize = @splat(0);
         for (self.solve_results.items, 0..) |result, ordinal| {
-            if (result != .available) continue;
+            switch (result) {
+                .available, .partial => {},
+                else => continue,
+            }
             const solved = self.solved_paths.items[ordinal];
             if (types.storedPathWords(solved.len, solved.stitched_len) > self.completed.inline_words) long_results += 1;
             registrations += solved.run_count;
@@ -2222,13 +2232,13 @@ pub const PathfindingSystem = struct {
         for (self.solve_results.items, self.publish_records.items, 0..) |result, *record, ordinal| {
             record.* = null;
             switch (result) {
-                .available => |key| {
+                .available, .partial => |key| {
                     const solved = self.solved_paths.items[ordinal];
                     if (self.completed.canStore()) {
-                        record.* = self.completed.claim(key, solved.len, solved.stitched_len, solved.path_level, solved.end, self.step_counter, stats);
+                        record.* = self.completed.claim(key, solved.len, solved.stitched_len, solved.path_level, solved.end, solved.goal_cell, self.step_counter, stats);
                     }
                     stats.solved_requests += 1;
-                    stats.available_results += 1;
+                    if (result == .partial) stats.partial_results += 1 else stats.available_results += 1;
                     if (solved.via_abstract) stats.abstract_solves += 1;
                     if (solved.cross_level) stats.cross_level_solves += 1;
                 },
@@ -2424,10 +2434,10 @@ pub const PathfindingSystem = struct {
                     }
                 },
                 else => {
-                    // available/unavailable/start_invalid: removed from pending. An
+                    // available/partial/unavailable/start_invalid: removed from pending. An
                     // unavailable or start_invalid entry is never cached; the next status
                     // query answers it again from reach, or reads `.missing` and the caller
-                    // may re-request.
+                    // may re-request. A partial's next hop is a new tier-0 request.
                     self.pending_keys.remove(self.pending.at(pending_index).key);
                 },
             }
@@ -2640,7 +2650,7 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end and range.end <= system.publish_records.items.len and range.end <= system.solve_results.items.len);
     var counts: [flush_pair_count]u32 = @splat(0);
     for (range.start..range.end) |ordinal| {
-        // Only available results claim an entry.
+        // Only available and partial results claim an entry.
         const claimed = system.publish_records.items[ordinal] orelse continue;
         const solved = system.solved_paths.items[ordinal];
         const words = types.storedPathWords(solved.len, solved.stitched_len);
@@ -6358,8 +6368,9 @@ test "group-field threshold pin is clamped" {
 // shape of the reported water/lake FPS-collapse bug. Runs the SAME scenario at two
 // scales against the corrected fixed-budget two-tier ladder, asserting a DIFFERENT
 // expected outcome at each: the reported bug's exact scale must solve cleanly, and a
-// genuinely harder one must gracefully degrade — proving graceful degradation actually
-// triggers rather than the fixed tier-1 budget happening to be big enough for every case.
+// genuinely harder one must gracefully degrade (its tier-1 stitch past the cell cap publishes
+// a partial prefix) — proving graceful degradation actually triggers rather than the fixed
+// tier-1 budget happening to be big enough for every case.
 // Either way, never more than 2 solve attempts (never the old unbounded retry storm).
 fn runLakeDetourScenario(system: *PathfindingSystem, side: usize, gap_offset: usize) !PathfindingStats {
     var data = DataSystem.init(std.testing.allocator);
@@ -6387,7 +6398,7 @@ fn runLakeDetourScenario(system: *PathfindingSystem, side: usize, gap_offset: us
     while (frame < 5) : (frame += 1) {
         const stats = try system.updateSerial(if (frame == 0) &stream else &empty, 8, .{});
         total_attempts += stats.budget_exhausted;
-        if (stats.available_results != 0 or stats.escalated_dropped != 0) {
+        if (stats.available_results != 0 or stats.partial_results != 0 or stats.escalated_dropped != 0) {
             var result = stats;
             result.budget_exhausted = total_attempts;
             return result;
@@ -6419,16 +6430,18 @@ test "pathfinding lake detour: reported-bug scale solves, a harder scale degrade
     try harder_scale.reserve(harder_capacity);
     const harder = try runLakeDetourScenario(&harder_scale, 1024, 5);
     try std.testing.expectEqual(@as(usize, 0), harder.available_results);
-    try std.testing.expectEqual(@as(usize, 1), harder.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 1), harder.partial_results);
+    try std.testing.expectEqual(@as(usize, 0), harder.escalated_dropped);
     try std.testing.expect(harder.budget_exhausted <= 2);
 }
 
 // The reported-bug-scale detour above solves cleanly under the default segment cap
 // (its corridor needs more than one stitched segment, but comfortably under
 // default_max_stitch_segments). Forcing max_stitch_segments down to 1 must make that
-// SAME scale degrade the same graceful way the untouched harder (512) scale degrades
-// above — proving max_stitch_segments is a genuine, independently-enforced ceiling on
-// stitching work, not merely inferred from the abstract-node or stitched-cell budgets.
+// SAME scale degrade the same graceful way the harder scale degrades above (a partial
+// prefix of one segment) — proving max_stitch_segments is a genuine, independently-enforced
+// ceiling on stitching work, not merely inferred from the abstract-node or stitched-cell
+// budgets.
 test "pathfinding max_stitch_segments bounds stitching independent of corridor length" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -6438,7 +6451,406 @@ test "pathfinding max_stitch_segments bounds stitching independent of corridor l
     try system.reserve(capacity);
     const result = try runLakeDetourScenario(&system, 256, 5);
     try std.testing.expectEqual(@as(usize, 0), result.available_results);
-    try std.testing.expectEqual(@as(usize, 1), result.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 1), result.partial_results);
+    try std.testing.expectEqual(@as(usize, 0), result.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 1), result.max_stitch_segments_observed);
+}
+
+// ---- Partial results ---------------------------------------------------------------
+
+// An open one-level strip of 128 x 16 cells in 16-cell chunks: a route along it leaves its
+// start's chunk, so it stitches through the abstract search.
+const partial_strip_width: usize = 128;
+const partial_strip_height: usize = 16;
+const partial_start = tileCenter(1, 8);
+const partial_goal = tileCenter(120, 8);
+
+// Tier-0 and tier-1 stitched caps far below the strip's route: tier 0 promotes, tier 1
+// publishes a 32-cell prefix.
+fn partialCapacity() PathfindingCapacity {
+    var capacity = baselineCapacity();
+    capacity.tier0_stitched_cell_cap = 16;
+    capacity.max_stitched_path_cells = 32;
+    return capacity;
+}
+
+fn partialStripSystem(data: *DataSystem, capacity: PathfindingCapacity) !PathfindingSystem {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    const side: f32 = 32;
+    try system.rebuildStaticNavGrid(data, @as(f32, @floatFromInt(partial_strip_width)) * side, @as(f32, @floatFromInt(partial_strip_height)) * side, side);
+    return system;
+}
+
+// The cached result for `goal` on level 0.
+fn cachedResult(system: *const PathfindingSystem, goal: math.Vec2) ?types.PathResult {
+    const key = system.graph.keyForWorld(0, goal, .default) orelse return null;
+    const slot = system.completed.freshSlotIndex(key, system.step_counter, types.default_cache_ttl_steps) orelse return null;
+    return system.completed.resultAt(slot);
+}
+
+fn cellCenterOf(system: *const PathfindingSystem, cell: u32) math.Vec2 {
+    return system.graph.grid(0).?.cellCenter(cell);
+}
+
+// One request from `start` for `goal` (its tier-0 attempt), then a step without requests
+// (the tier-1 attempt when tier 0 promoted). Returns the second step's stats.
+fn solveHop(system: *PathfindingSystem, requester: EntityId, start: math.Vec2, goal: math.Vec2) !PathfindingStats {
+    const first = try solveStep(system, requester, start, goal);
+    if (first.budget_exhausted == 0) return first;
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    return system.updateSerial(&empty, 8, .{});
+}
+
+test "a tier-1 stitch past its cell cap publishes the uncapped stitch's prefix as partial" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var system = try partialStripSystem(&data, partialCapacity());
+    defer system.deinit();
+    var reference_capacity = baselineCapacity();
+    reference_capacity.max_stitched_path_cells = 256;
+    var reference = try partialStripSystem(&data, reference_capacity);
+    defer reference.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&reference, requester, partial_start, partial_goal)).available_results);
+    const full = cachedStitched(&reference, 0, partial_goal);
+    try std.testing.expect(full.len() > 32);
+
+    const first = try solveStep(&system, requester, partial_start, partial_goal);
+    try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
+    try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    const second = try system.updateSerial(&empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
+    try std.testing.expectEqual(@as(usize, 1), second.partial_results);
+    try std.testing.expectEqual(@as(usize, 0), second.available_results);
+    try std.testing.expectEqual(@as(usize, 0), second.budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 1), second.solved_requests);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expect(!system.pending_keys.contains(system.graph.keyForWorld(0, partial_goal, .default).?));
+
+    const prefix = cachedStitched(&system, 0, partial_goal);
+    try std.testing.expectEqual(@as(usize, 32), prefix.len());
+    try std.testing.expectEqualSlices(u32, full.cells[0..32], prefix.cells);
+    try std.testing.expectEqualSlices(u16, full.levels[0..32], prefix.levels);
+    const result = cachedResult(&system, partial_goal).?;
+    const goal_cell: u32 = @intCast(system.graph.grid(0).?.indexForCell(result.key.goal).?);
+    try std.testing.expectEqual(goal_cell, result.goal_cell);
+    try std.testing.expect(result.isPartial());
+    try std.testing.expect(!cachedResult(&reference, partial_goal).?.isPartial());
+}
+
+test "a partial answers no request from inside its end window" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var system = try partialStripSystem(&data, partialCapacity());
+    defer system.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try solveHop(&system, requester, partial_start, partial_goal)).partial_results);
+    const hop = cachedResult(&system, partial_goal).?;
+    const end_position = cellCenterOf(&system, hop.end.cell);
+
+    const at_start = system.statusForWorld(0, partial_start, 0, partial_goal, .default, null);
+    try std.testing.expectEqual(PathStatus.partial, at_start.status);
+    try std.testing.expect(!at_start.refresh);
+    const at_end = system.statusForWorld(0, end_position, 0, partial_goal, .default, null);
+    try std.testing.expectEqual(PathStatus.partial, at_end.status);
+    try std.testing.expect(at_end.refresh);
+
+    // From the start (outside the window): served by the partial.
+    const from_start = try solveStep(&system, requester, partial_start, partial_goal);
+    try std.testing.expectEqual(@as(usize, 1), from_start.cache_hits);
+    try std.testing.expectEqual(@as(usize, 0), from_start.accepted_requests);
+    try std.testing.expectEqual(@as(usize, 0), from_start.solve_admissions);
+
+    // From the end (inside the window): a new request, its tier-0 attempt promoting.
+    const from_end = try solveStep(&system, requester, end_position, partial_goal);
+    try std.testing.expectEqual(@as(usize, 1), from_end.accepted_requests);
+    try std.testing.expectEqual(@as(usize, 0), from_end.cache_hits);
+    try std.testing.expectEqual(@as(usize, 1), from_end.budget_exhausted);
+    // The old partial still serves while the hop solves.
+    try std.testing.expectEqual(PathStatus.partial, system.statusForWorld(0, end_position, 0, partial_goal, .default, null).status);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try system.updateSerial(&empty, 8, .{})).partial_results);
+
+    const next = cachedResult(&system, partial_goal).?;
+    try std.testing.expectEqual(hop.end, cachedStitched(&system, 0, partial_goal).at(0));
+    try std.testing.expect(!types.inPartialRefreshWindow(system.graph.chunkGeometry(), hop.end, next.end.level, next.end.cell));
+}
+
+test "an agent reaches the goal through partial hops" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var system = try partialStripSystem(&data, partialCapacity());
+    defer system.deinit();
+    const capacity = partialCapacity();
+    const window = system.graph.chunkGeometry().chunk_tiles;
+    // The route runs 119 cells along the strip; each hop advances past its start's window.
+    const route_cells: usize = 119;
+    const hop_bound = (route_cells + capacity.max_stitched_path_cells - window - 1) / (capacity.max_stitched_path_cells - window) + 1;
+    var position = partial_start;
+    var hops: usize = 0;
+    while (true) {
+        _ = try solveHop(&system, requester, position, partial_goal);
+        hops += 1;
+        const view = system.statusForWorld(0, position, 0, partial_goal, .default, null);
+        if (view.status == .available) break;
+        try std.testing.expectEqual(PathStatus.partial, view.status);
+        if (hops >= hop_bound) return error.TestUnexpectedResult;
+        position = cellCenterOf(&system, cachedResult(&system, partial_goal).?.end.cell);
+        try std.testing.expect(system.statusForWorld(0, position, 0, partial_goal, .default, null).refresh);
+    }
+    try std.testing.expect(hops > 2);
+    const last = cachedResult(&system, partial_goal).?;
+    try std.testing.expect(!last.isPartial());
+    try std.testing.expectEqual(last.goal_cell, last.end.cell);
+}
+
+test "a segment-cap prefix at tier 1 is partial; a segment node-budget spill still drops after two attempts" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var reference_capacity = baselineCapacity();
+    reference_capacity.max_stitched_path_cells = 256;
+    var reference = try partialStripSystem(&data, reference_capacity);
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&reference, requester, partial_start, partial_goal)).available_results);
+    const full = cachedStitched(&reference, 0, partial_goal);
+
+    // Four segment searches leave the start; the fifth is refused.
+    var segment_capacity = reference_capacity;
+    segment_capacity.max_stitch_segments = 4;
+    var segments = try partialStripSystem(&data, segment_capacity);
+    defer segments.deinit();
+    const capped = try solveHop(&segments, requester, partial_start, partial_goal);
+    try std.testing.expectEqual(@as(usize, 1), capped.partial_results);
+    try std.testing.expectEqual(@as(usize, 0), capped.escalated_dropped);
+    const prefix = cachedStitched(&segments, 0, partial_goal);
+    try std.testing.expect(prefix.len() > 1 and prefix.len() < full.len());
+    try std.testing.expectEqualSlices(u32, full.cells[0..prefix.len()], prefix.cells);
+    try std.testing.expect(cachedResult(&segments, partial_goal).?.isPartial());
+
+    // A wall across the third chunk, open only at its bottom row: the stitch reaches past the
+    // start's window before that chunk's segment search spends its node budget.
+    var walled_data = DataSystem.init(std.testing.allocator);
+    defer walled_data.deinit();
+    const walled_requester = try addNavBody(&walled_data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    for (0..partial_strip_height - 1) |y| {
+        _ = try addNavBody(&walled_data, .{ .x = 40 * 32, .y = @as(f32, @floatFromInt(y)) * 32 }, .{ .x = 32, .y = 32 }, true);
+    }
+    var spill_capacity = reference_capacity;
+    spill_capacity.max_explored_nodes = 64;
+    var spill = try partialStripSystem(&walled_data, spill_capacity);
+    defer spill.deinit();
+    const first = try solveStep(&spill, walled_requester, partial_start, partial_goal);
+    try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    const second = try spill.updateSerial(&empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 0), second.partial_results);
+    // The tier-1 stitch had left the start (and its window) when it spilled.
+    const spilled = spill.tier1_scratch.items[0].corridor.stitched.items;
+    const start_index = spill.graph.grid(0).?.indexForCell(spill.graph.grid(0).?.worldToCellClamped(partial_start)).?;
+    try std.testing.expect(!types.inPartialRefreshWindow(spill.graph.chunkGeometry(), spilled[spilled.len - 1], 0, start_index));
+    try std.testing.expectEqual(PathStatus.missing, spill.statusForWorld(0, partial_start, 0, partial_goal, .default, null).status);
+}
+
+test "a route folding back around a wall reaches its goal through a partial that ends near its start" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    // A one-cell wall on row 16 from x = 0 to 31 of a 48 x 33-cell level: start and goal sit
+    // on either side of it, two cells apart, and the route turns at its open end.
+    for (0..32) |x| {
+        _ = try addNavBody(&data, .{ .x = @as(f32, @floatFromInt(x)) * 32 + 1, .y = 16 * 32 + 1 }, .{ .x = 30, .y = 30 }, true);
+    }
+    var capacity = baselineCapacity();
+    capacity.tier0_stitched_cell_cap = 16;
+    capacity.max_stitched_path_cells = 64;
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 48 * 32, 33 * 32, 32);
+    const start = tileCenter(1, 15);
+    const goal = tileCenter(1, 17);
+    const grid = system.graph.grid(0).?;
+    const start_index = grid.indexForCell(grid.worldToCellClamped(start)).?;
+
+    try std.testing.expectEqual(@as(usize, 1), (try solveHop(&system, requester, start, goal)).partial_results);
+    const hop = cachedResult(&system, goal).?;
+    // The prefix advanced its whole cap yet ends back inside its start's window.
+    try std.testing.expectEqual(@as(u32, 64), hop.stitched_len);
+    try std.testing.expect(types.inPartialRefreshWindow(system.graph.chunkGeometry(), hop.end, 0, start_index));
+    var position = start;
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        const view = system.statusForWorld(0, position, 0, goal, .default, null);
+        if (view.status == .available) break;
+        try std.testing.expectEqual(PathStatus.partial, view.status);
+        if (hops == 4) return error.TestUnexpectedResult;
+        position = cellCenterOf(&system, cachedResult(&system, goal).?.end.cell);
+        _ = try solveHop(&system, requester, position, goal);
+    }
+    const last = cachedResult(&system, goal).?;
+    try std.testing.expect(!last.isPartial());
+}
+
+// One request from `start` on `start_level` for `goal` on `goal_level`, then a step without
+// requests. Returns the second step's stats, or the first's when it did not promote.
+fn solveLevelsHop(system: *PathfindingSystem, requester: EntityId, start_level: u16, start: math.Vec2, goal_level: u16, goal: math.Vec2) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester, .start_level = start_level, .goal_level = goal_level, .start = start, .goal = goal });
+    const first = try system.updateSerial(&stream, 8, .{});
+    if (first.budget_exhausted == 0) return first;
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    return system.updateSerial(&empty, 8, .{});
+}
+
+test "a partial capped at or just past a link refreshes only on its end's level, at status and intake alike" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    // Two open 16x16-cell levels in 4-cell chunks, joined by a stair beside the start.
+    var world = try test_support.abstractTestWorld(&meta, 512, 512);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    try world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 2, .y = 2 }, .level_b = 1, .cell_b = .{ .x = 2, .y = 2 }, .traversal_cost = 5, .bidirectional = true });
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const start = tileCenter(1, 1);
+    const goal = tileCenter(14, 14);
+
+    var reference = PathfindingSystem.init(std.testing.allocator);
+    defer reference.deinit();
+    try reference.reserve(abstractCapacity());
+    try reference.rebuildStaticNavGridWithWorld(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), (try solveLevelsHop(&reference, requester, 0, start, 1, goal)).available_results);
+    const full = cachedStitched(&reference, 1, goal);
+    // The jump: the first stored cell on level 1.
+    const jump = std.mem.indexOfScalar(u16, full.levels, 1).?;
+    try std.testing.expect(jump >= 2 and jump + 1 < full.len());
+
+    // A cap of `jump + 1` keeps the jump's far end; a cap of `jump` stops at the jump itself.
+    for ([_]usize{ jump + 1, jump }) |cap| {
+        var capacity = abstractCapacity();
+        capacity.tier0_stitched_cell_cap = cap;
+        capacity.max_stitched_path_cells = cap;
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+        try std.testing.expectEqual(@as(usize, 1), (try solveLevelsHop(&system, requester, 0, start, 1, goal)).partial_results);
+        const prefix = cachedStitched(&system, 1, goal);
+        try std.testing.expectEqual(cap, prefix.len());
+        try std.testing.expectEqualSlices(u32, full.cells[0..cap], prefix.cells);
+        try std.testing.expectEqualSlices(u16, full.levels[0..cap], prefix.levels);
+        const end = prefix.at(cap - 1);
+        const end_position = system.graph.grid(end.level).?.cellCenter(end.cell);
+        const past_jump = cap == jump + 1;
+        try std.testing.expectEqual(@as(u16, if (past_jump) 1 else 0), end.level);
+
+        // At the start, on level 0: a refresh only when the end lies on level 0.
+        const at_start = system.statusForWorld(0, start, 1, goal, .default, null);
+        try std.testing.expectEqual(PathStatus.partial, at_start.status);
+        try std.testing.expectEqual(!past_jump, at_start.refresh);
+        var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+        defer stream.deinit();
+        try appendPathRequest(&stream, .{ .entity = requester, .start_level = 0, .goal_level = 1, .start = start, .goal = goal });
+        const from_start = try system.updateSerial(&stream, 8, .{});
+        try std.testing.expectEqual(@as(usize, @intFromBool(at_start.refresh)), from_start.accepted_requests);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!at_start.refresh)), from_start.cache_hits);
+        if (!past_jump) continue;
+
+        // At the far end, on level 1: a refresh, and a request re-solves.
+        const at_end = system.statusForWorld(1, end_position, 1, goal, .default, null);
+        try std.testing.expectEqual(PathStatus.partial, at_end.status);
+        try std.testing.expect(at_end.refresh);
+        stream.clearRetainingCapacity();
+        try appendPathRequest(&stream, .{ .entity = requester, .start_level = 1, .goal_level = 1, .start = end_position, .goal = goal });
+        const from_end = try system.updateSerial(&stream, 8, .{});
+        try std.testing.expectEqual(@as(usize, 1), from_end.accepted_requests);
+        try std.testing.expectEqual(@as(usize, 0), from_end.cache_hits);
+    }
+}
+
+test "status refreshes a partial exactly where intake re-solves it: one chunk side from its end, not one past" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var system = try partialStripSystem(&data, partialCapacity());
+    defer system.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try solveHop(&system, requester, partial_start, partial_goal)).partial_results);
+    const end = cachedResult(&system, partial_goal).?.end;
+    const side = system.graph.chunkGeometry().chunk_tiles;
+    const end_x = end.cell % partial_strip_width;
+    const end_y = end.cell / partial_strip_width;
+    try std.testing.expect(end_x > side);
+    // One past the window first: its hit leaves the cache as it was.
+    for ([_]usize{ side + 1, side }) |distance| {
+        const position = tileCenter(@intCast(end_x - distance), @intCast(end_y));
+        const view = system.statusForWorld(0, position, 0, partial_goal, .default, null);
+        try std.testing.expectEqual(PathStatus.partial, view.status);
+        try std.testing.expectEqual(distance == side, view.refresh);
+        const stats = try solveStep(&system, requester, position, partial_goal);
+        try std.testing.expectEqual(@as(usize, @intFromBool(view.refresh)), stats.accepted_requests);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!view.refresh)), stats.cache_hits);
+    }
+}
+
+test "a partial solved toward an older goal projection is not served after the projection moves" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 48);
+    defer fixture.world.deinit();
+    // A 5x5 block around the goal key (20, 20): its projection is the ring-3 corner (17, 17).
+    for (18..23) |y| {
+        for (18..23) |x| _ = try fixture.world.setDenseTile(fixture.obstacle, @intCast(x), @intCast(y), fixture.tree);
+    }
+    const requester = try data.createEntity();
+    var capacity = abstractCapacity();
+    capacity.max_stitched_path_cells = 8;
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &fixture.world, null);
+    try system.growForAgentCount(16);
+    const start = tileCenter(2, 2);
+    const goal = tileCenter(20, 20);
+    const key = system.graph.keyForWorld(0, goal, .default).?;
+    const grid = system.graph.grid(0).?;
+
+    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, start, goal, .{})).budget_exhausted);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try system.updateSerial(&empty, 16, .{})).partial_results);
+    const hop = system.completed.resultAt(system.completed.slotIndex(key).?);
+    try std.testing.expect(hop.isPartial());
+    try std.testing.expectEqual(@as(u32, 17 * 48 + 17), hop.goal_cell);
+    try std.testing.expectEqual(PathStatus.partial, system.statusForWorld(0, start, 0, goal, .default, null).status);
+
+    // A notch to the key's neighbour (20, 19) moves the projection there; the partial stays.
+    try setRegistryCells(&system, &fixture, &.{ .{ 20, 18 }, .{ 20, 19 } }, fixture.grass);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expect(system.completed.slotIndex(key) != null);
+    try std.testing.expectEqual(@as(?usize, 19 * 48 + 20), system.liveGoal(key, grid).cell);
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
+    const again = try solveFrom(&system, requester, start, goal, .{});
+    try std.testing.expectEqual(@as(usize, 0), again.cache_hits);
+    try std.testing.expectEqual(@as(usize, 1), again.accepted_requests);
 }
 
 // ---- Request-side stages (path_intake, group_field_expand, pending ring) ----------
@@ -6533,7 +6945,7 @@ fn intakeScenarioSystem(data: *const DataSystem, requester: EntityId, participan
 // runs included, and flushes the registry.
 fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
     system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, step, stats);
+    const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, path[path.len - 1], step, stats);
     @memcpy(system.completed.destination(claimed)[0..path.len], path);
     _ = system.flushRegistry(null, null);
     const starts = try std.testing.allocator.alloc(u16, path.len);
@@ -7869,6 +8281,48 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
         try std.testing.expect(expected.len() > 1);
         try expectSameStitched(expected, cachedStitched(&threaded, 0, goal));
     }
+
+    // An 8-cell stitched cap: each tier-1 solve publishes its prefix as a partial, or drops
+    // when the prefix never leaves its start, and each tier-0 solve promotes. The
+    // threaded publish equals serial for any range size and worker count.
+    var partial_capacity = capacity;
+    partial_capacity.worker_participant_count = 1;
+    partial_capacity.max_stitched_path_cells = 8;
+    var partial_serial = PathfindingSystem.init(std.testing.allocator);
+    defer partial_serial.deinit();
+    try partial_serial.reserve(partial_capacity);
+    try partial_serial.rebuildStaticNavGridWithWorld(&data, &world, null);
+    try queueWithTiers(&partial_serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
+    const partial_stats = try partial_serial.updateSerial(&empty, 8, .{});
+    try std.testing.expect(partial_stats.partial_results != 0);
+    try std.testing.expectEqual(@as(usize, 4), partial_stats.partial_results + partial_stats.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 4) + partial_stats.escalated_dropped, partial_stats.budget_exhausted);
+    for ([_]usize{ 1, 3 }) |workers| {
+        var partial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
+        defer partial_threads.deinit();
+        if (partial_threads.workerThreadCount() == 0) return error.SkipZigTest;
+        for ([_]usize{ 1, 2, 3 }) |items_per_range| {
+            var threaded_capacity = partial_capacity;
+            threaded_capacity.worker_participant_count = partial_threads.participantSlotCount();
+            var partial_threaded = PathfindingSystem.init(std.testing.allocator);
+            defer partial_threaded.deinit();
+            try partial_threaded.reserve(threaded_capacity);
+            try partial_threaded.rebuildStaticNavGridWithWorld(&data, &world, null);
+            try queueWithTiers(&partial_threaded, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
+            const threaded_stats = try partial_threaded.update(&empty, 8, &partial_threads, .{ .adaptive = false, .items_per_range = items_per_range });
+            if (items_per_range == 1) try std.testing.expect(!threaded_stats.solve_batch.ran_inline and threaded_stats.solve_batch.range_count > 1);
+            try expectSameCache(&partial_serial, &partial_threaded);
+            try std.testing.expectEqual(partial_stats.partial_results, threaded_stats.partial_results);
+            try std.testing.expectEqual(partial_stats.available_results, threaded_stats.available_results);
+            try std.testing.expectEqual(partial_stats.budget_exhausted, threaded_stats.budget_exhausted);
+            try std.testing.expectEqual(partial_stats.escalated_dropped, threaded_stats.escalated_dropped);
+            try std.testing.expectEqual(partial_stats.escalated_solves, threaded_stats.escalated_solves);
+            try std.testing.expectEqual(partial_serial.pending.len, partial_threaded.pending.len);
+            for (0..partial_serial.pending.len) |index| {
+                try std.testing.expect(std.meta.eql(partial_serial.pending.at(index), partial_threaded.pending.at(index)));
+            }
+        }
+    }
 }
 
 test "threaded cross-level solves equal serial" {
@@ -7967,39 +8421,48 @@ test "a reserved threaded solve with escalations allocates nothing on a multi-wo
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    var capacity = abstractCapacity();
-    capacity.group_field_max_cells = 16;
-    capacity.max_escalated_solves_per_step = 4;
-    capacity.worker_participant_count = threads.participantSlotCount();
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    // The second pass's 8-cell stitched cap makes the escalated solves publish partials.
+    for ([_]usize{ abstractCapacity().max_stitched_path_cells, 8 }) |stitched_cells| {
+        var capacity = abstractCapacity();
+        capacity.group_field_max_cells = 16;
+        capacity.max_escalated_solves_per_step = 4;
+        capacity.max_stitched_path_cells = stitched_cells;
+        capacity.worker_participant_count = threads.participantSlotCount();
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&data, &world, null);
 
-    const tiers = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0 };
-    const config = PathfindingConfig{ .adaptive = false, .items_per_range = 1 };
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    try empty.reserve(1, 0);
-    // Every stitched result fits its inline stripe; one warm publish sizes the path
-    // registry, so after a cache clear nothing allocates.
-    try queueWithTiers(&system, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    _ = try system.update(&empty, 8, &threads, config);
-    _ = try system.update(&empty, 8, &threads, config);
-    system.clearRuntimeState();
-    const original = system.allocator;
-    system.allocator = std.testing.failing_allocator;
-    system.graph.allocator = std.testing.failing_allocator;
-    defer {
-        system.allocator = original;
-        system.graph.allocator = original;
+        const tiers = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0 };
+        const config = PathfindingConfig{ .adaptive = false, .items_per_range = 1 };
+        var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+        defer empty.deinit();
+        try empty.reserve(1, 0);
+        // Every stitched result fits its inline stripe; one warm publish sizes the path
+        // registry, so after a cache clear nothing allocates.
+        try queueWithTiers(&system, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
+        _ = try system.update(&empty, 8, &threads, config);
+        _ = try system.update(&empty, 8, &threads, config);
+        system.clearRuntimeState();
+        const original = system.allocator;
+        system.allocator = std.testing.failing_allocator;
+        system.graph.allocator = std.testing.failing_allocator;
+        defer {
+            system.allocator = original;
+            system.graph.allocator = original;
+        }
+        try queueWithTiers(&system, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
+        const stats = try system.update(&empty, 8, &threads, config);
+        try std.testing.expect(!stats.solve_batch.ran_inline);
+        try std.testing.expectEqual(@as(usize, 4), stats.escalated_solves);
+        if (stitched_cells == 8) {
+            try std.testing.expect(stats.partial_results != 0);
+            try std.testing.expectEqual(@as(usize, 4), stats.partial_results + stats.escalated_dropped);
+        } else {
+            try std.testing.expectEqual(escalation_goals.len, stats.available_results);
+        }
+        try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
     }
-    try queueWithTiers(&system, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    const stats = try system.update(&empty, 8, &threads, config);
-    try std.testing.expect(!stats.solve_batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 4), stats.escalated_solves);
-    try std.testing.expectEqual(escalation_goals.len, stats.available_results);
-    try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
 }
 
 test "a pool reserve out of memory clamps escalated admissions to the reserved pool (FailingAllocator)" {
@@ -8600,7 +9063,7 @@ test "a cached corridor is evicted only by a change on its own level's cells" {
 // runs included, and flushes the registry.
 fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const types.StitchedCell, step: u32, stats: *PathfindingStats) !void {
     system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, corridor[corridor.len - 1], step, stats);
+    const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, corridor[corridor.len - 1], corridor[corridor.len - 1].cell, step, stats);
     types.writeStitched(system.completed.destination(claimed), corridor);
     _ = system.flushRegistry(null, null);
     const view = types.stitchedView(system.completed.destination(claimed), corridor.len);
@@ -8711,7 +9174,7 @@ fn logEveryOpKind(system: *PathfindingSystem) !void {
     fresh[1].goal = .{ .x = 0, .y = 30 };
     fresh[2].goal = .{ .x = 1, .y = 30 };
     for (fresh) |key| {
-        const claimed = system.completed.claim(key, 1, 0, 0, .{ .level = 0, .cell = 0 }, system.step_counter, &stats);
+        const claimed = system.completed.claim(key, 1, 0, 0, .{ .level = 0, .cell = 0 }, 0, system.step_counter, &stats);
         system.completed.destination(claimed)[0] = 0;
     }
     try std.testing.expectEqual(@as(usize, 2), stats.cache_evictions);

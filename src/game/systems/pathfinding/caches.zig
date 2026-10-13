@@ -659,6 +659,7 @@ pub const ResultCache = struct {
             .path_level = payload.path_level,
             .stitched_len = payload.stitched_len,
             .end = .{ .level = payload.end_level, .cell = payload.end_cell },
+            .goal_cell = payload.goal_cell,
         };
     }
 
@@ -912,12 +913,14 @@ pub const ResultCache = struct {
     pub const SlotLookup = struct {
         slot: usize,
         fresh: bool,
-        // Where the result ends (`PathResult.end`).
+        // Where the result ends (`PathResult.end`), and the goal it was solved toward
+        // (`PathResult.goal_cell`).
         end: StitchedCell,
+        goal_cell: u32,
     };
 
-    /// The key's slot, whether its result is within `ttl` at `step`, and where it ends, from
-    /// one probe and its record; null when absent. ttl 0 disables expiry. Const: never evicts.
+    /// The key's slot, whether its result is within `ttl` at `step`, where it ends, and the
+    /// goal it was solved toward, from one probe and its record; null when absent. ttl 0 disables expiry. Const: never evicts.
     pub fn lookup(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?SlotLookup {
         const index = self.slotIndex(key) orelse return null;
         const record = &self.core.records.items[self.core.slots.items[index].payload_index];
@@ -925,6 +928,7 @@ pub const ResultCache = struct {
             .slot = index,
             .fresh = ttl == 0 or (step -% record.stamp) < ttl,
             .end = .{ .level = record.extra.end_level, .cell = record.extra.end_cell },
+            .goal_cell = record.extra.goal_cell,
         };
     }
 
@@ -947,12 +951,12 @@ pub const ResultCache = struct {
     };
 
     /// Claims `key`'s entry for a result of `path_len` plain or `stitched_len` stitched
-    /// cells ending at `end` at `step` (see `CacheCore.claim`) and records its shape and
-    /// end; the caller copies the
+    /// cells ending at `end`, solved toward `goal_cell`, at `step` (see `CacheCore.claim`)
+    /// and records its shape, end, and goal; the caller copies the
     /// path into `destination`. A result past the inline stripe takes a long block, which
     /// `reserveLongBlocks` made free; a re-put or a victim releases its block first. Opens
     /// no publish: call `core.beginPublish` first. Main thread; allocates nothing.
-    pub fn claim(self: *ResultCache, key: PathQueryKey, path_len: usize, stitched_len: usize, path_level: u16, end: StitchedCell, step: u32, stats: *PathfindingStats) Claimed {
+    pub fn claim(self: *ResultCache, key: PathQueryKey, path_len: usize, stitched_len: usize, path_level: u16, end: StitchedCell, goal_cell: u32, step: u32, stats: *PathfindingStats) Claimed {
         std.debug.assert(self.canStore());
         // A solve stores at least its goal cell, as a plain or a stitched path.
         std.debug.assert((path_len == 0) != (stitched_len == 0));
@@ -972,6 +976,7 @@ pub const ResultCache = struct {
             .stitched_len = @intCast(stitched_len), // bounded by max_stitched_path_cells
             .long_block = long_block,
             .end_cell = end.cell,
+            .goal_cell = goal_cell,
             .path_level = path_level,
             .end_level = end.level,
         };
@@ -995,7 +1000,7 @@ const ProbeSlot = struct {
     payload_index: u32 = 0,
 };
 
-// A cached result's shape and end: four u32s, then two u16s: 20 bytes.
+// A cached result's shape, end, and goal: five u32s, then two u16s: 24 bytes.
 const SlotPayload = struct {
     path_len: u32 = 0,
     stitched_len: u32 = 0,
@@ -1003,12 +1008,14 @@ const SlotPayload = struct {
     long_block: u32 = no_block,
     // Where the path ends (`PathResult.end`), so a goal check reads no path page.
     end_cell: u32 = 0,
+    // The live goal cell the solve targeted (`PathResult.goal_cell`).
+    goal_cell: u32 = 0,
     path_level: u16 = 0,
     end_level: u16 = 0,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(SlotPayload) == 20);
+    std.debug.assert(@sizeOf(SlotPayload) == 24);
 }
 
 // The slot of `key` in an open-addressed table at load <= 1/2 with back-shift deletion
@@ -1362,7 +1369,7 @@ fn testPut(cache: *ResultCache, key: PathQueryKey, path: []const u32, stitched: 
 
 fn testClaimAndCopy(cache: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, step: u32, stats: *PathfindingStats) void {
     const end: StitchedCell = if (stitched.len != 0) stitched[stitched.len - 1] else .{ .level = path_level, .cell = path[path.len - 1] };
-    const claimed = cache.claim(key, path.len, stitched.len, path_level, end, step, stats);
+    const claimed = cache.claim(key, path.len, stitched.len, path_level, end, end.cell, step, stats);
     const words = cache.destination(claimed);
     if (stitched.len != 0) types.writeStitched(words, stitched) else @memcpy(words[0..path.len], path);
 }

@@ -122,9 +122,10 @@ pub const inter_level_penalty: u32 = cardinal_cost * 4;
 pub const default_max_abstract_nodes: usize = 4096;
 // Cap on the stored stitched-path cells per cached cross-chunk/cross-level result.
 // An abstract corridor is refined into a single grid-adjacent (level,cell) path by
-// stitching local A* segments; this bounds that path. A stitched path that exceeds
-// the cap spills to a later frame (budget_exhausted) and is retried from the agent's
-// advanced position, so the cap is never a silent truncation. Tier-0 default; see
+// stitching local A* segments; this bounds that path. A tier-0 stitch past the cap
+// promotes to tier 1; a tier-1 stitch past it publishes its prefix as a partial result
+// (`PathStatus.partial`) when the prefix leaves its start cell, and drops otherwise; never
+// as complete. Tier-0 default; see
 // default_max_abstract_nodes's doc comment for why this stays fixed.
 const default_max_stitched_path_cells: usize = 512;
 // Tier-0 (first-attempt) abstract-search attempt caps, independently settable from
@@ -134,8 +135,10 @@ const default_tier0_abstract_node_attempt_cap: usize = default_max_abstract_node
 const default_tier0_stitched_attempt_cap: usize = default_max_stitched_path_cells;
 // Tier-1 (second, escalated attempt) caps: fixed constants, a flat multiple of the tier-0
 // defaults, never derived from the graph's portal count, level size, or any measured world
-// state. A request that still exhausts the tier-1 budget drops to `.missing` (retryable,
-// never `.unavailable`); see PendingRequest.tier and compactPendingAfterSolve.
+// state. A tier-1 abstract saturation or segment node-budget spill drops to `.missing`
+// (retryable, never `.unavailable`), as does a tier-1 stitch past its cell or segment cap
+// whose prefix never leaves its start cell; any other capped prefix publishes a partial
+// (`PathSolveResult.partial`). See PendingRequest.tier and compactPendingAfterSolve.
 pub const default_tier1_abstract_node_cap: usize = default_max_abstract_nodes * 4;
 pub const default_tier1_stitched_cell_cap: usize = default_max_stitched_path_cells * 4;
 /// Link pairs (entrance box, exit box, least cost) in a nav graph's long-link summary: a
@@ -158,9 +161,10 @@ comptime {
 // Per-query cap on segment searches (local A* runs) in one stitchCorridor call, so a
 // stitch's local-search work is at most this x max_explored_nodes. Each counted segment
 // stores at least one cell, so a tier-0 stitch at the default caps never reaches it;
-// tier 1 raises the abstract and stored-cell caps, never the segment searches. Past it the
-// stitch is budget_exhausted and follows the tier ladder (PendingRequest.tier), never
-// `.unavailable`. A fixed count, never derived from corridor length or graph size.
+// tier 1 raises the abstract and stored-cell caps, never the segment searches. Past it a
+// tier-0 stitch is budget_exhausted and promotes (PendingRequest.tier); a tier-1 stitch
+// publishes its prefix as a partial, or drops when the prefix never leaves its start cell. Never `.unavailable`. A fixed count, never derived from corridor length or graph
+// size.
 const default_max_stitch_segments: usize = default_tier0_stitched_attempt_cap;
 // Steps after which a cached result is re-solved when next requested, so an agent
 // picks up world changes that did not directly cross its path. 0 disables. ~5s at 60Hz.
@@ -207,13 +211,39 @@ pub const PathStatus = enum {
     pending,
     available,
     unavailable,
+    /// A cached path toward the live goal that ends short of it: follow it, and request the
+    /// next hop once `PathView.refresh` is set.
+    partial,
 };
 
 pub const PathView = struct {
     status: PathStatus = .missing,
     next_waypoint: math.Vec2 = .{},
     path_len: usize = 0,
+    /// `.partial` only: the start lies in the path end's refresh window
+    /// (`inPartialRefreshWindow`), where a request re-solves rather than hits the cache.
+    refresh: bool = false,
 };
+
+/// Whether `cell` on `level` lies in the refresh window of a partial path ending at `end`:
+/// on its level, within one nav chunk side of it (Chebyshev). Status and intake read this one
+/// predicate, so a start that status marks for refresh is one intake re-solves from. O(1).
+pub fn inPartialRefreshWindow(geometry: ChunkGeometry, end: StitchedCell, level: u16, cell: usize) bool {
+    if (level != end.level) return false;
+    const width = geometry.width;
+    const end_x = end.cell % width;
+    const end_y = end.cell / width;
+    const x = cell % width;
+    const y = cell / width;
+    const dx = @max(end_x, x) - @min(end_x, x);
+    const dy = @max(end_y, y) - @min(end_y, y);
+    return @max(dx, dy) <= geometry.chunk_tiles;
+}
+
+/// Whether a result solved toward `goal_cell` on `goal_level` and ending at `end` is partial.
+pub fn isPartialEnd(end: StitchedCell, goal_level: u16, goal_cell: u32) bool {
+    return end.level != goal_level or end.cell != goal_cell;
+}
 
 /// What one nav mark changed.
 pub const NavMarkKind = enum(u8) {
@@ -597,6 +627,8 @@ pub const PathfindingStats = struct {
     solve_admissions: usize = 0,
     available_results: usize = 0,
     unavailable_results: usize = 0,
+    // Published results that end short of their goal (`PathSolveResult.partial`).
+    partial_results: usize = 0,
     dropped_requests: usize = 0,
     // Solve-window entries past the admission limit, left pending.
     admission_deferred_requests: usize = 0,
@@ -782,7 +814,8 @@ pub const PendingRequest = struct {
     // rotates to the back of pending once. A budget_exhausted AT tier 1 drops the
     // request (not `.unavailable`: the goal is reachable, it just did not fit either fixed
     // budget) — worst case exactly two solve attempts per request. Reset implicitly: a
-    // solved or dropped entry leaves pending entirely.
+    // solved, partial, or dropped entry leaves pending entirely, so a partial's next hop is
+    // a new request at tier 0.
     tier: u8 = 0,
 };
 
@@ -959,11 +992,22 @@ pub const PathResult = struct {
     stitched_len: u32 = 0,
     // The path's last cell: its stitched path's, or its plain path's on `path_level`.
     end: StitchedCell,
+    // The live goal cell on `key.goal_level` the solve targeted: served only while it is
+    // still the live goal. A result whose end is not this cell is partial.
+    goal_cell: u32,
+
+    pub fn isPartial(self: PathResult) bool {
+        return isPartialEnd(self.end, self.key.goal_level, self.goal_cell);
+    }
 };
 
 pub const PathSolveResult = union(enum) {
     // Successful solve; its solved path sits at the same solve ordinal.
     available: PathQueryKey,
+    // A tier-1 stitch past its cell or segment cap: the stitched prefix (the first cells of
+    // the uncapped stitch) sits at the solve ordinal, published like `available` and served
+    // as `PathStatus.partial`.
+    partial: PathQueryKey,
     // The start cannot reach the goal, or no open goal cell lies within the projection
     // radius: answered for the request, never cached and never searched.
     unavailable: PathQueryKey,

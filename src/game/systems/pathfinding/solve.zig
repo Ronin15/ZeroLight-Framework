@@ -92,6 +92,13 @@ pub fn solveJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) 
 // Outcome of a budget-bounded local A* over one level's grid.
 const LocalSolve = enum { found, budget_exhausted, none };
 
+// Outcome of a corridor stitch. `capped`: the stitched-cell or segment-count cap stopped it,
+// and the cells appended are the first cells of the stitch an uncapped run returns (segments
+// run in corridor order and an append never changes earlier cells). `spilled`: a segment's
+// local search spent its node budget, or the cap was zero; a re-solve from the stitched end
+// would pick the same next portal and spill again, so no prefix is kept.
+const StitchOutcome = enum { found, capped, spilled, none };
+
 // Solves one request. Short same-component hops use the budget-bounded local A*
 // directly and store a plain path (no stitched corridor). Long-range or cross-level
 // queries route through the abstract chunk-portal/link graph to pick a corridor, then
@@ -134,14 +141,14 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
     const same_level = request.start_level == request.key.goal_level;
     if (same_level) {
         if (start_index == goal_index) {
-            recordPath(system, ordinal, &.{@intCast(goal_index)}, request.start_level);
+            recordPath(system, ordinal, &.{@intCast(goal_index)}, request.start_level, @intCast(goal_index));
             return .{ .available = request.key };
         }
         // Same component: a short hop the local A* can usually finish.
         if (start_grid.connected(start_index, goal_index)) {
             switch (localAStar(start_grid, scratch, start_index, goal_index)) {
                 .found => {
-                    recordPath(system, ordinal, scratch.path_scratch.items, request.start_level);
+                    recordPath(system, ordinal, scratch.path_scratch.items, request.start_level, @intCast(goal_index));
                     return .{ .available = request.key };
                 },
                 // Budget spill on a short same-component hop is a transient: keep
@@ -191,7 +198,10 @@ fn tier1Corridor(system: *PathfindingSystem, ordinal: usize) *CorridorScratch {
 // across an inter-level link. The query walks that path per-agent on its current
 // level, so every heading is to a traversable neighbor. Saturating the abstract
 // scratch or a segment's node budget spills to a later frame (budget_exhausted); reach
-// held before the search, so no search ends without a path.
+// held before the search, so no search ends without a path. A tier-1 stitch stopped by
+// its cell or segment cap publishes its prefix as `.partial` when the prefix leaves its start
+// cell, so each hop advances along the path even where it folds back near its start; a prefix
+// that never leaves the start, and a tier-0 cap, promote as a spill does.
 fn solveAbstract(
     system: *PathfindingSystem,
     scratch: *SearchScratch,
@@ -219,22 +229,28 @@ fn solveAbstract(
     };
 
     // Stitch the full obstacle-aware path across every corridor segment. A node-budget
-    // spill, a stitched-buffer overflow, or a segment-count spill (see
-    // default_max_stitch_segments) is a transient: retry next frame. A corridor reached
-    // the goal, so a stitch ending without a path breaks reach.
-    switch (stitchCorridor(system, scratch, corridor_scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap, segment_cap)) {
-        .found => {},
-        .budget_exhausted => return .{ .budget_exhausted = request.key },
+    // spill is a transient: retry next frame. A cap at tier 0 promotes; at tier 1 its prefix
+    // is the partial result. A corridor reached the goal, so a stitch ending without a path
+    // breaks reach.
+    const partial = switch (stitchCorridor(system, scratch, corridor_scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap, segment_cap)) {
+        .found => false,
+        .capped => true,
+        .spilled => return .{ .budget_exhausted = request.key },
         .none => return reachContractBreak(request.key),
-    }
+    };
 
     const stitched = corridor_scratch.stitched.items;
     if (stitched.len == 0) return reachContractBreak(request.key);
-    recordStitched(system, ordinal, stitched, request.start_level);
+    // A prefix ending on its start would answer its own next request unchanged.
+    if (partial) {
+        const end = stitched[stitched.len - 1];
+        if (request.tier == 0 or (end.level == request.start_level and end.cell == start_index)) return .{ .budget_exhausted = request.key };
+    }
+    recordStitched(system, ordinal, stitched, request.start_level, @intCast(goal_index));
     const solved = &system.solved_paths.items[ordinal];
     solved.via_abstract = true;
     solved.cross_level = corridor.crosses_level;
-    return .{ .available = request.key };
+    return if (partial) .{ .partial = request.key } else .{ .available = request.key };
 }
 
 // Stitches the chosen abstract corridor (corridor_scratch.abstract.corridor, ordered portal
@@ -244,9 +260,10 @@ fn solveAbstract(
 // consecutive portal cells; a LINK transition (corridor_link[i] == true) is a single
 // discrete jump (no intermediate cells), whether it crosses Z or is a same-level
 // teleport. The final span (last portal -> goal) is a same-level local A*. Returns
-// budget_exhausted on any segment node-budget spill, stitched-buffer overflow, or
-// segment-count spill (segment_cap, see default_max_stitch_segments — bounds total
-// local-search work independent of how many portals the chosen corridor crosses).
+// `capped` on a stitched-buffer overflow or a segment-count spill (segment_cap, see
+// default_max_stitch_segments — bounds total local-search work independent of how many
+// portals the chosen corridor crosses), with the cells stitched so far kept, and `spilled`
+// on a segment node-budget spill.
 // SIMD verdict: scalar. Segments run in corridor order, each a local A* from the previous
 // segment's end.
 fn stitchCorridor(
@@ -259,13 +276,13 @@ fn stitchCorridor(
     goal_index: usize,
     cap_requested: usize,
     segment_cap: usize,
-) LocalSolve {
+) StitchOutcome {
     const graph = &system.graph;
     const stitched = &corridor_scratch.stitched;
     const abstract = &corridor_scratch.abstract;
     stitched.clearRetainingCapacity();
     const cap = @min(cap_requested, corridor_scratch.stitched_limit);
-    if (cap == 0) return .budget_exhausted;
+    if (cap == 0) return .spilled;
     // Seed the path with the start cell on the start level.
     stitched.appendAssumeCapacity(.{ .level = request.start_level, .cell = @intCast(start_index) });
 
@@ -280,7 +297,7 @@ fn stitchCorridor(
         if (is_link) {
             // Discrete link jump: append the far endpoint cell with no intermediate
             // cells (the agent crosses the link rather than walking).
-            if (stitched.items.len >= cap) return .budget_exhausted;
+            if (stitched.items.len >= cap) return .capped;
             stitched.appendAssumeCapacity(.{ .level = portal.level, .cell = portal.cell });
         } else {
             // The corridor names only built levels; a miss breaks the reach contract (the
@@ -288,7 +305,7 @@ fn stitchCorridor(
             const grid = graph.grid(prev_level) orelse return .none;
             // appendSegment no-ops (no localAStar call) when prev_cell already equals the
             // portal cell, so only a genuine local search counts against segment_cap.
-            if (prev_cell != portal.cell and !countSegment(scratch, &segments_used, segment_cap)) return .budget_exhausted;
+            if (prev_cell != portal.cell and !countSegment(scratch, &segments_used, segment_cap)) return .capped;
             switch (appendSegment(scratch, stitched, grid, prev_level, prev_cell, portal.cell, cap)) {
                 .found => {},
                 else => |r| return r,
@@ -300,7 +317,7 @@ fn stitchCorridor(
     // Final span: last corridor cell -> goal cell, a walkable same-level segment. A found
     // corridor ends at a goal-level portal (abstractCorridor's goal test).
     std.debug.assert(prev_level == request.key.goal_level);
-    if (prev_cell != goal_index and !countSegment(scratch, &segments_used, segment_cap)) return .budget_exhausted;
+    if (prev_cell != goal_index and !countSegment(scratch, &segments_used, segment_cap)) return .capped;
     switch (appendSegment(scratch, stitched, goal_grid, prev_level, prev_cell, @intCast(goal_index), cap)) {
         .found => {},
         else => |r| return r,
@@ -319,13 +336,13 @@ fn countSegment(scratch: *SearchScratch, segments_used: *usize, segment_cap: usi
 
 // Runs local A* from `from` to `to` on `grid` and appends the resulting cells
 // (skipping the first, already present as the previous segment's tail) to the
-// stitched buffer, tagged with `level`. Returns the local A* outcome, or
-// budget_exhausted if appending would overflow the stitched cap.
-fn appendSegment(scratch: *SearchScratch, stitched: *std.ArrayList(StitchedCell), grid: *const NavGrid, level: u16, from: usize, to: usize, cap: usize) LocalSolve {
+// stitched buffer, tagged with `level`. Returns `spilled` on a local node-budget spill,
+// `capped` when appending would overflow the stitched cap (the cells that fit kept).
+fn appendSegment(scratch: *SearchScratch, stitched: *std.ArrayList(StitchedCell), grid: *const NavGrid, level: u16, from: usize, to: usize, cap: usize) StitchOutcome {
     if (from == to) return .found;
     switch (localAStar(grid, scratch, from, to)) {
         .found => {},
-        .budget_exhausted => return .budget_exhausted,
+        .budget_exhausted => return .spilled,
         .none => return .none,
     }
     // path_scratch is start->goal for this segment; its first cell equals `from`,
@@ -333,7 +350,7 @@ fn appendSegment(scratch: *SearchScratch, stitched: *std.ArrayList(StitchedCell)
     const seg = scratch.path_scratch.items;
     if (seg.len <= 1) return .found;
     for (seg[1..]) |cell| {
-        if (stitched.items.len >= cap) return .budget_exhausted;
+        if (stitched.items.len >= cap) return .capped;
         stitched.appendAssumeCapacity(.{ .level = level, .cell = cell });
     }
     return .found;
@@ -853,7 +870,7 @@ fn reconstructLocalPath(scratch: *SearchScratch, goal_slot: u32) void {
 // Writes a plain path whole into this request's output stripe at its solve ordinal,
 // with its registry runs. The local solve bounds a path at one cell per explored node,
 // which the stripe holds.
-fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, path_level: u16) void {
+fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, path_level: u16, goal_cell: u32) void {
     const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(path.len <= stripe_words);
@@ -863,17 +880,19 @@ fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, pat
         .len = path.len,
         .path_level = path_level,
         .end = .{ .level = path_level, .cell = path[path.len - 1] },
+        .goal_cell = goal_cell,
     };
     const starts = system.worker_run_starts.items[offset..][0..stripe_words];
     solved.run_count = splitRuns(system.graph.chunkGeometry(), path, null, path_level, starts, &solved.shard_counts);
     system.solved_paths.items[ordinal] = solved;
 }
 
-// Writes the full stitched (level,cell) corridor path whole into this request's output
-// stripe as its cells, then its levels, with its registry runs; `path_level` is the start
-// level. stitchCorridor's cap (at most max_stitched_path_cells) bounds it at the stripe,
-// asserted so a drift fails loud instead of truncating the corridor.
-fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell, start_level: u16) void {
+// Writes the full stitched (level,cell) corridor path, or a partial's prefix, whole into this
+// request's output stripe as its cells, then its levels, with its registry runs; `path_level`
+// is the start level and `goal_cell` the live goal it was solved toward. stitchCorridor's cap
+// (at most max_stitched_path_cells) bounds it at the stripe, asserted so a drift fails loud
+// instead of truncating the corridor.
+fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell, start_level: u16, goal_cell: u32) void {
     const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(types.stitchedWords(stitched.len) <= stripe_words);
@@ -886,6 +905,7 @@ fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const 
         .stitched_len = stitched.len,
         .path_level = start_level,
         .end = stitched[stitched.len - 1],
+        .goal_cell = goal_cell,
     };
     const starts = system.worker_run_starts.items[offset..][0..stripe_words];
     solved.run_count = splitRuns(system.graph.chunkGeometry(), view.cells, view.levels, start_level, starts, &solved.shard_counts);

@@ -123,6 +123,8 @@ pub const SteeringStats = struct {
     movement_intent_count: usize = 0,
     path_request_count: usize = 0,
     path_available_count: usize = 0,
+    /// Agents a partial path served (`PathStatus.partial`).
+    path_partial_count: usize = 0,
     path_pending_count: usize = 0,
     path_unavailable_count: usize = 0,
     replan_cooldown_count: usize = 0,
@@ -667,6 +669,7 @@ pub const SteeringSystem = struct {
             selected_count += tally.count;
             request_count += tally.requests;
             stats.path_available_count += tally.available;
+            stats.path_partial_count += tally.partial;
             stats.path_pending_count += tally.pending;
             stats.path_unavailable_count += tally.unavailable;
             stats.replan_cooldown_count += tally.cooldowns;
@@ -936,6 +939,7 @@ const DirectionsTally = struct {
     count: usize = 0,
     requests: usize = 0,
     available: usize = 0,
+    partial: usize = 0,
     pending: usize = 0,
     unavailable: usize = 0,
     cooldowns: usize = 0,
@@ -1524,23 +1528,31 @@ fn directionFromPathStatus(
     emit_request: *bool,
 ) PathDirection {
     // Missing paths request work, pending paths hold direction, unavailable
-    // paths enter backoff, and available paths steer toward the next waypoint.
+    // paths enter backoff, and available paths steer toward the next waypoint. Partial paths
+    // are followed like available ones; inside the end's refresh window they request the next
+    // hop, and at the end they hold as pending paths do.
     const goal_distance = distance(start, intent.goal);
     const view = pathfinding.statusForWorld(start_level, start, intent.goal_level, intent.goal, intent.agent_class, &runtime.waypoint_hint);
     switch (view.status) {
         .available => {
             tally.available += 1;
-            const to_waypoint = math.Vec2{
-                .x = view.next_waypoint.x - start.x,
-                .y = view.next_waypoint.y - start.y,
-            };
-            if (math.lengthSquared(to_waypoint) <= steering_agent.waypoint_tolerance * steering_agent.waypoint_tolerance) {
-                // At the waypoint: steer straight to the goal, so progress is goal distance.
-                return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(intent.goal.x - start.x, intent.goal.y - start.y, direction_epsilon), .status_allows_replan = true, .progress_distance = goal_distance };
+            return followWaypoint(view.next_waypoint, start, intent.goal, steering_agent.waypoint_tolerance, goal_distance);
+        },
+        .partial => {
+            tally.partial += 1;
+            if (view.refresh) {
+                if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
+                    emit_request.* = true;
+                    runtime.replan_cooldown = steering_agent.replan_cooldown_steps;
+                } else {
+                    tally.cooldowns += 1;
+                }
+                // At the end: the path goes no further, so wait for the next hop without a
+                // stuck replan.
+                const to_end = math.Vec2{ .x = view.next_waypoint.x - start.x, .y = view.next_waypoint.y - start.y };
+                if (math.lengthSquared(to_end) <= steering_agent.waypoint_tolerance * steering_agent.waypoint_tolerance) return .{ .progress_distance = goal_distance };
             }
-            // Following the path: progress is closing on the next waypoint, which a
-            // detour reduces even while straight-line goal distance grows.
-            return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(to_waypoint.x, to_waypoint.y, direction_epsilon), .status_allows_replan = true, .progress_distance = math.length(to_waypoint) };
+            return followWaypoint(view.next_waypoint, start, intent.goal, steering_agent.waypoint_tolerance, goal_distance);
         },
         .missing => {
             if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
@@ -1565,6 +1577,19 @@ fn directionFromPathStatus(
             return .{ .progress_distance = goal_distance };
         },
     }
+}
+
+// The direction along a path toward `waypoint`, or straight to `goal` once within
+// `tolerance` of it.
+fn followWaypoint(waypoint: math.Vec2, start: math.Vec2, goal: math.Vec2, tolerance: f32, goal_distance: f32) PathDirection {
+    const to_waypoint = math.Vec2{ .x = waypoint.x - start.x, .y = waypoint.y - start.y };
+    if (math.lengthSquared(to_waypoint) <= tolerance * tolerance) {
+        // At the waypoint: steer straight to the goal, so progress is goal distance.
+        return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(goal.x - start.x, goal.y - start.y, direction_epsilon), .status_allows_replan = true, .progress_distance = goal_distance };
+    }
+    // Following the path: progress is closing on the next waypoint, which a
+    // detour reduces even while straight-line goal distance grows.
+    return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(to_waypoint.x, to_waypoint.y, direction_epsilon), .status_allows_replan = true, .progress_distance = math.length(to_waypoint) };
 }
 
 fn updateProgress(
@@ -2142,6 +2167,7 @@ const loadTestWorldMeta = @import("pathfinding/test_support.zig").loadTestWorldM
 const worldColliders = @import("pathfinding/test_support.zig").worldColliders;
 const StructuralCommand = @import("../data_system.zig").StructuralCommand;
 const requireTestTile = @import("pathfinding/test_support.zig").requireTestTile;
+const default_cache_ttl_steps = @import("pathfinding/types.zig").default_cache_ttl_steps;
 
 test "steering agent snapshot holds each steering row's previous position, and no entity without a body" {
     var data = DataSystem.init(std.testing.allocator);
@@ -2221,6 +2247,113 @@ test "steering requests missing paths then follows available path results" {
     const available_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), available_stats.path_available_count);
     try std.testing.expectEqual(@as(usize, 0), available_stats.path_request_count);
+    try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
+}
+
+test "steering follows a partial path, requests the next hop inside its end window, and holds at its end without a stuck replan" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Cells (1, 8) and (120, 8) of a 128 x 16-cell open strip in 16-cell chunks.
+    const start = math.Vec2{ .x = 48, .y = 272 };
+    const goal = math.Vec2{ .x = 3856, .y = 272 };
+    const agent = try addSteeredEntity(&data, start);
+    const agent_view = SteeringAgentView{ .agent_radius = 8, .waypoint_tolerance = 4, .avoidance_radius = 48, .avoidance_weight = 1.5, .max_neighbor_samples = 8, .stuck_step_threshold = 3, .replan_cooldown_steps = 4, .unavailable_backoff_steps = 12 };
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    // Tier 0 promotes past 16 stitched cells; tier 1 publishes a 32-cell prefix.
+    try pathfinding.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .tier0_stitched_cell_cap = 16, .max_stitched_path_cells = 32 });
+    try pathfinding.rebuildStaticNavGrid(&data, 128 * 32, 16 * 32, 32);
+    var colliders = try testColliders(&pathfinding, &data, 128 * 32, 16 * 32, 32);
+    defer colliders.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(4);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    const intent = NavigationIntent{ .entity = agent, .goal = goal };
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, intent);
+    try std.testing.expectEqual(@as(usize, 1), (try steering.updateSerial(&data, &frame, &pathfinding, &colliders)).path_request_count);
+    _ = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
+    try std.testing.expectEqual(@as(usize, 1), (try pathfinding.updateSerial(&empty, 1, .{})).partial_results);
+    const key = pathfinding.graph.keyForWorld(0, goal, .default).?;
+    const slot = pathfinding.completed.freshSlotIndex(key, pathfinding.step_counter, default_cache_ttl_steps).?;
+    const result = pathfinding.completed.resultAt(slot);
+    const prefix = pathfinding.completed.stitchedSlice(slot, result.stitched_len);
+    const grid = pathfinding.graph.grid(0).?;
+    const end = grid.cellCenter(result.end.cell);
+    const near_end = grid.cellCenter(prefix.cells[prefix.len() - 5]);
+
+    // Outside the end's window: follow the prefix and request nothing, past the cooldown. The
+    // agent closes on its waypoint, so no step reads as stuck.
+    for (0..agent_view.replan_cooldown_steps + 1) |step| {
+        const position = math.Vec2{ .x = start.x + 4 * @as(f32, @floatFromInt(step)), .y = start.y };
+        try data.setMovementBody(agent, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 });
+        frame.beginStep();
+        try appendNavigationIntent(&frame, intent);
+        const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        try std.testing.expectEqual(@as(usize, 1), stats.path_partial_count);
+        try std.testing.expectEqual(@as(usize, 0), stats.path_request_count);
+        try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
+    }
+
+    // Inside it: keep following and request the next hop.
+    try data.setMovementBody(agent, .{ .position = near_end, .previous_position = near_end, .velocity = .{}, .speed = 32 });
+    frame.beginStep();
+    try appendNavigationIntent(&frame, intent);
+    const refresh_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    try std.testing.expectEqual(@as(usize, 1), refresh_stats.path_request_count);
+    try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
+
+    // At the end with the next hop late: hold, one request per cooldown, no stuck replan.
+    try data.setMovementBody(agent, .{ .position = end, .previous_position = end, .velocity = .{}, .speed = 32 });
+    var last_request: usize = 0;
+    var requests: usize = 0;
+    const held_steps: usize = 4 * agent_view.stuck_step_threshold;
+    for (1..held_steps + 1) |step| {
+        frame.beginStep();
+        try appendNavigationIntent(&frame, intent);
+        const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        try std.testing.expectEqual(@as(usize, 1), stats.path_partial_count);
+        try std.testing.expectEqual(@as(usize, 0), stats.stuck_replan_count);
+        if (stats.path_request_count == 0) continue;
+        try std.testing.expectEqual(@as(usize, 1), stats.path_request_count);
+        try std.testing.expectEqual(@as(usize, agent_view.replan_cooldown_steps), step - last_request);
+        last_request = step;
+        requests += 1;
+    }
+    try std.testing.expectEqual(held_steps / agent_view.replan_cooldown_steps, requests);
+
+    // The direction itself: a held agent has none and allows no replan; one outside the window
+    // follows the path and requests nothing.
+    var held = RuntimeRow{ .entity = agent };
+    var tally = DirectionsTally{};
+    var emit = false;
+    const at_end = directionFromPathStatus(&pathfinding, intent, end, 0, agent_view, &held, &tally, &emit);
+    try std.testing.expect(!at_end.has_direction and !at_end.status_allows_replan and emit);
+    var following = RuntimeRow{ .entity = agent };
+    emit = false;
+    const at_start = directionFromPathStatus(&pathfinding, intent, start, 0, agent_view, &following, &tally, &emit);
+    try std.testing.expect(at_start.has_direction and at_start.status_allows_replan and !emit);
+    try std.testing.expect(at_start.direction.x > 0);
+
+    // The last held step's request solves: the agent at the old end follows the next hop.
+    try std.testing.expectEqual(held_steps, last_request);
+    try std.testing.expectEqual(@as(usize, 1), frame.path_requests.mergedItems().len);
+    _ = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
+    try std.testing.expectEqual(@as(usize, 1), (try pathfinding.updateSerial(&empty, 1, .{})).partial_results);
+    frame.beginStep();
+    try appendNavigationIntent(&frame, intent);
+    const next_hop = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    try std.testing.expectEqual(@as(usize, 1), next_hop.path_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), next_hop.path_request_count);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 }
 

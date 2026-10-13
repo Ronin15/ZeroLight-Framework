@@ -265,14 +265,21 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 // uncapped order; a probe search that still saturates fails the case. Variant 2 checks the
 // fold of 32 requests for one goal (the first from the layout's start, the rest scattered)
 // into one pending entry and one solve per attempt; intake keeps the first start, so it
-// measures no sharing cost.
-// A sample is one request cycle from empty runtime state: the first attempt's step, the
+// measures no sharing cost. Variant 3 walks one agent from the open diagonal's or the cave's
+// start to its goal through partial hops, a sample being the whole walk: each step reads its
+// status, requests on `.missing` or a partial's refresh, advances up to `walk_cells_per_step`
+// waypoints (holding when pending or at a partial's end), then runs one timed step; the
+// sample's time is the steps' total. A walk past 4 x the route's cells + 64 steps stalled and
+// fails the case.
+// A caps, probe, or crowd sample is one request cycle from empty runtime state: the first attempt's step, the
 // escalated attempt's step when the first exhausted, then every agent's status. Claims must
 // repeat exactly across samples. Serial only: each step solves one request.
 // `--details` prints, per attempt, the abstract nodes claimed, the chosen corridor's nodes,
 // the stitched cells and segment searches when the stitch ran, the outcome, and the step
 // time, then the blocked cells on level 0 and the agents' statuses. `candidates` is the last attempt's claims and `outputs`
-// the agents a path serves.
+// the agents a path serves. A walk prints its steps, held steps, solves, partial and full
+// results, escalations, and total solve time; its `candidates` are its solves and `outputs`
+// its published results.
 pub const long_path_group = suite.BenchmarkGroup{
     .name = "pathfinding-long-path",
     .defaultItemCounts = longPathItemCounts,
@@ -2550,6 +2557,7 @@ const LongPathVariant = enum(u8) {
     caps,
     probe,
     crowd,
+    walk,
 };
 
 const LongPathConfig = struct {
@@ -2561,13 +2569,13 @@ const LongPathConfig = struct {
         return @as(usize, @backingInt(variant)) * long_path_variant_encoding + @as(usize, @backingInt(layout)) * long_path_layout_encoding + parameter;
     }
 
-    // An unknown digit, a parameter the layout cannot build, or a crowd off the serpentine and
-    // open diagonal is an error.
+    // An unknown digit, a parameter the layout cannot build, a crowd off the serpentine and
+    // open diagonal, or a walk off the open diagonal and cave is an error.
     fn decode(item_count: usize) !LongPathConfig {
         const variant_index = item_count / long_path_variant_encoding;
         const layout_index = item_count % long_path_variant_encoding / long_path_layout_encoding;
         const parameter = item_count % long_path_layout_encoding;
-        if (variant_index > @backingInt(LongPathVariant.crowd)) return error.LongPathUnknownVariant;
+        if (variant_index > @backingInt(LongPathVariant.walk)) return error.LongPathUnknownVariant;
         if (layout_index > @backingInt(LongPathLayout.cave)) return error.LongPathUnknownLayout;
         if (parameter == 0 or parameter > std.math.maxInt(u16)) return error.LongPathBadParameter;
         // In range: every digit is checked above.
@@ -2586,6 +2594,7 @@ const LongPathConfig = struct {
         };
         if (!buildable) return error.LongPathBadParameter;
         if (config.variant == .crowd and config.layout != .serpentine and config.layout != .open_diagonal) return error.LongPathCrowdLayout;
+        if (config.variant == .walk and config.layout != .open_diagonal and config.layout != .cave) return error.LongPathWalkLayout;
         return config;
     }
 
@@ -2632,7 +2641,8 @@ const LongPathConfig = struct {
     }
 };
 
-// The variant-0 curves, then the probe on the same routes, then the crowd at one route each.
+// The variant-0 curves, then the probe on the same routes, then the crowd at one route each,
+// then the walks.
 const long_path_item_counts = [_]usize{
     LongPathConfig.code(.caps, .serpentine, 1),
     LongPathConfig.code(.caps, .serpentine, 4),
@@ -2675,6 +2685,12 @@ const long_path_item_counts = [_]usize{
     LongPathConfig.code(.probe, .cave, 2032),
     LongPathConfig.code(.crowd, .serpentine, 1),
     LongPathConfig.code(.crowd, .open_diagonal, 1024),
+    LongPathConfig.code(.walk, .open_diagonal, 512),
+    LongPathConfig.code(.walk, .open_diagonal, 1024),
+    LongPathConfig.code(.walk, .open_diagonal, 2032),
+    LongPathConfig.code(.walk, .cave, 512),
+    LongPathConfig.code(.walk, .cave, 1024),
+    LongPathConfig.code(.walk, .cave, 2032),
 };
 
 fn longPathItemCounts(_: suite.Profile) []const usize {
@@ -2905,6 +2921,8 @@ fn buildLongPathWorld(allocator: std.mem.Allocator, io: std.Io, config: LongPath
 
 const LongPathOutcome = enum {
     available,
+    // A tier-1 stitch past its cell or segment cap published its prefix.
+    partial,
     // The abstract search hit its node cap or open-heap limit.
     abstract_saturated,
     // The stitch hit the attempt's stitched-cell cap.
@@ -2935,8 +2953,9 @@ const LongPathAttempt = struct {
 const LongPathCycle = struct {
     first: LongPathAttempt,
     escalated: ?LongPathAttempt,
-    // Agents whose status is available (a cached path serves them) and missing.
+    // Agents whose status is available (a cached path serves them), partial, and missing.
     available: usize,
+    partial: usize,
     missing: usize,
 
     fn ns(self: LongPathCycle) u64 {
@@ -2944,7 +2963,7 @@ const LongPathCycle = struct {
     }
 
     fn sameWork(self: LongPathCycle, other: LongPathCycle) bool {
-        if (!self.first.sameWork(other.first) or self.available != other.available or self.missing != other.missing) return false;
+        if (!self.first.sameWork(other.first) or self.available != other.available or self.partial != other.partial or self.missing != other.missing) return false;
         const escalated = self.escalated orelse return other.escalated == null;
         const other_escalated = other.escalated orelse return false;
         return escalated.sameWork(other_escalated);
@@ -2971,10 +2990,10 @@ fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const R
     const found = abstract.corridor.items.len != 0 and abstract.corridor.items.len < abstract.corridor_limit;
     const cells = if (found) corridor.stitched.items.len else 0;
     const segments = stats.max_stitch_segments_observed;
-    const outcome: LongPathOutcome = if (stats.available_results == 1) available: {
+    const outcome: LongPathOutcome = if (stats.available_results == 1 or stats.partial_results == 1) published: {
         // Every layout's route leaves its start's chunk, so the solve ran the abstract search.
         if (stats.abstract_solves != 1 or !found) return error.LongPathSolvedOffCorridor;
-        break :available .available;
+        break :published if (stats.partial_results == 1) .partial else .available;
     } else if (stats.budget_exhausted != 1)
         return error.LongPathUnexpectedOutcome
     else if (!found)
@@ -3008,15 +3027,116 @@ fn runLongPathCycle(io: std.Io, fixture: *RouteFixture, empty: *const RangeOutpu
         escalated = try runLongPathAttempt(io, system, empty, requests.len, 1);
     }
     if (system.pending.len != 0) return error.LongPathStillPending;
-    var cycle = LongPathCycle{ .first = first, .escalated = escalated, .available = 0, .missing = 0 };
+    var cycle = LongPathCycle{ .first = first, .escalated = escalated, .available = 0, .partial = 0, .missing = 0 };
     for (requests) |request| {
         switch (system.statusForWorld(request.start_level, request.start, request.goal_level, request.goal, request.agent_class, null).status) {
             .available => cycle.available += 1,
+            .partial => cycle.partial += 1,
             .missing => cycle.missing += 1,
             .pending, .unavailable => return error.LongPathUnexpectedStatus,
         }
     }
     return cycle;
+}
+
+// Waypoints a walker advances per step: a hop of the tier-1 stitched cap ends well inside
+// the result's TTL, so a walk measures refresh hops rather than TTL re-solves.
+const walk_cells_per_step: usize = 16;
+
+// One walk's counts and its timed steps' total.
+const LongPathWalk = struct {
+    steps: usize = 0,
+    // Steps the walker advanced no waypoint.
+    held_steps: usize = 0,
+    solves: usize = 0,
+    partial_results: usize = 0,
+    full_results: usize = 0,
+    escalations: usize = 0,
+    solve_ns: u64 = 0,
+
+    fn sameWork(self: LongPathWalk, other: LongPathWalk) bool {
+        return self.steps == other.steps and self.held_steps == other.held_steps and self.solves == other.solves and
+            self.partial_results == other.partial_results and self.full_results == other.full_results and self.escalations == other.escalations;
+    }
+};
+
+// Walks `request`'s agent from empty runtime state to its goal (see the group comment).
+fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
+    const system = &fixture.system;
+    resetPathState(system, .drop_fields);
+    const grid = system.graph.grid(request.start_level) orelse return error.RouteUnavailable;
+    const goal_cell = grid.worldToCellClamped(request.goal);
+    var position = request.start;
+    var hint: u32 = 0;
+    var walk = LongPathWalk{};
+    while (!std.meta.eql(grid.worldToCellClamped(position), goal_cell)) {
+        if (walk.steps == step_limit) return error.LongPathWalkStalled;
+        walk.steps += 1;
+        const view = system.statusForWorld(request.start_level, position, request.goal_level, request.goal, request.agent_class, &hint);
+        if (view.status == .unavailable) return error.RouteUnavailable;
+        const wants_hop = view.status == .missing or (view.status == .partial and view.refresh);
+        var hop = request;
+        hop.start = position;
+        try writeRequests(stream, if (wants_hop) &.{hop} else &.{});
+        var moved: usize = 0;
+        while (moved < walk_cells_per_step) : (moved += 1) {
+            const next = system.statusForWorld(request.start_level, position, request.goal_level, request.goal, request.agent_class, &hint);
+            if (next.status != .available and next.status != .partial) break;
+            if (std.meta.eql(grid.worldToCellClamped(next.next_waypoint), grid.worldToCellClamped(position))) break;
+            position = next.next_waypoint;
+        }
+        if (moved == 0) walk.held_steps += 1;
+        const start_ns = suite.nowNs(io);
+        const stats = try system.updateSerial(stream, 1, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+        walk.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+        if (stats.unavailable_results != 0) return error.RouteUnavailable;
+        if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+        walk.solves += stats.solve_admissions;
+        walk.partial_results += stats.partial_results;
+        walk.full_results += stats.available_results - stats.cache_hits;
+        walk.escalations += stats.escalated_solves;
+    }
+    return walk;
+}
+
+fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest, blocked: usize) !suite.RunStats {
+    var stream = RangeOutputStream(PathRequest).init(allocator);
+    defer stream.deinit();
+    const step_limit = 4 * config.routeCells() + 64;
+    for (0..coldWarmup(options)) |_| _ = try runLongPathWalk(io, fixture, &stream, request, step_limit);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var reference: ?LongPathWalk = null;
+    for (0..coldIterations(options)) |_| {
+        const walk = try runLongPathWalk(io, fixture, &stream, request, step_limit);
+        if (reference) |kept| {
+            if (!kept.sameWork(walk)) return error.LongPathWorkVaried;
+        } else reference = walk;
+        accumulator.record(walk.solve_ns, inlineBatch(1, pathfinding_range_alignment_items));
+    }
+    var stats = accumulator.finish();
+    const walk = reference orelse return stats;
+    if (options.details) {
+        std.debug.print("  {s} {} {s}: {s} walk parameter={} route~{} cells | steps={} held={} solves={} partial={} full={} escalations={} solve={}us | blocked={}\n", .{
+            long_path_group.name,
+            item_count,
+            case.name,
+            @tagName(config.layout),
+            config.parameter,
+            config.routeCells(),
+            walk.steps,
+            walk.held_steps,
+            walk.solves,
+            walk.partial_results,
+            walk.full_results,
+            walk.escalations,
+            stats.mean_ns / std.time.ns_per_us,
+            blocked,
+        });
+    }
+    stats.candidate_pairs = walk.solves;
+    stats.output_count = walk.partial_results + walk.full_results;
+    stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
+    return stats;
 }
 
 fn printLongPathAttempt(label: []const u8, attempt: LongPathAttempt, mean_ns: u64) void {
@@ -3065,6 +3185,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
     const agents = requests[0..agent_count];
+    if (config.variant == .walk) return runLongPathWalkCase(allocator, io, options, case, item_count, config, &fixture, agents[0], built.blocked);
 
     for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &fixture, &empty, agents);
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -3099,7 +3220,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         });
         printLongPathAttempt("first", cycle.first, first_ns / samples);
         if (cycle.escalated) |escalated| printLongPathAttempt("escalated", escalated, escalated_ns / samples);
-        std.debug.print(" | blocked={} status available={} missing={}\n", .{ built.blocked, cycle.available, cycle.missing });
+        std.debug.print(" | blocked={} status available={} partial={} missing={}\n", .{ built.blocked, cycle.available, cycle.partial, cycle.missing });
     }
     stats.candidate_pairs = (cycle.escalated orelse cycle.first).nodes;
     stats.output_count = cycle.available;
