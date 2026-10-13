@@ -19,10 +19,12 @@ const SimulationEvent = @import("../game/simulation.zig").SimulationEvent;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const PathQueryKey = @import("../game/systems/pathfinding/types.zig").PathQueryKey;
+const default_tier1_abstract_node_cap = @import("../game/systems/pathfinding/types.zig").default_tier1_abstract_node_cap;
 const cached_results_per_agent = @import("../game/systems/pathfinding/types.zig").cached_results_per_agent;
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const intake_range_alignment_items = @import("../game/systems/pathfinding/types.zig").intake_range_alignment_items;
@@ -241,6 +243,40 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-shaft",
     .defaultItemCounts = crossLevelItemCounts,
     .runCase = runCrossLevelShaftCase,
+};
+
+// One far goal per route length D on the flat chunk-portal search (item code variant * 10^7 +
+// layout * 10^6 + parameter). Layouts:
+//   - 0, serpentine: a 2048² level with a wall every 128 rows, each open by an 8-cell gap at
+//     alternating ends; start and goal sit on the center column, the parameter walls apart.
+//   - 1, open diagonal: an open 2048² level; start (8, 8), goal the parameter cells further
+//     along the diagonal.
+//   - 2, descent: 128 levels of 256² joined by one ramp per pair at alternating corners; the
+//     goal is the parameter levels below the start, so the route crosses every level it
+//     passes corner to corner.
+//   - 3, depth: layout 2's 4-level descent on stacks of the parameter's levels.
+//   - 4, wide descent: layout 2's ramps on 3 levels of the parameter's side; the goal is 2
+//     levels below the start.
+//   - 5, cave: layout 1's route through seeded blob caves (blocking disks of radius 3 to 24
+//     over about 40% of the level, from one fixed seed), its ends moved to the nearest cells
+//     of the main cave.
+// Variant 0 runs the library caps. Variant 1 raises only the escalated attempt's abstract node
+// cap past every node a layout holds, so that search runs to its goal and its claims show the
+// uncapped order; a probe search that still saturates fails the case. Variant 2 checks the
+// fold of 32 requests for one goal (the first from the layout's start, the rest scattered)
+// into one pending entry and one solve per attempt; intake keeps the first start, so it
+// measures no sharing cost.
+// A sample is one request cycle from empty runtime state: the first attempt's step, the
+// escalated attempt's step when the first exhausted, then every agent's status. Claims must
+// repeat exactly across samples. Serial only: each step solves one request.
+// `--details` prints, per attempt, the abstract nodes claimed, the chosen corridor's nodes,
+// the stitched cells and segment searches when the stitch ran, the outcome, and the step
+// time, then the blocked cells on level 0 and the agents' statuses. `candidates` is the last attempt's claims and `outputs`
+// the agents a path serves.
+pub const long_path_group = suite.BenchmarkGroup{
+    .name = "pathfinding-long-path",
+    .defaultItemCounts = longPathItemCounts,
+    .runCase = runLongPathCase,
 };
 
 // A 512² world of 8 walkable levels holding random pads: bidirectional teleports from level 0
@@ -2034,12 +2070,13 @@ fn connectivityOnewayItemCounts(_: suite.Profile) []const usize {
 }
 
 /// The capacity a nav scaling config's nav reserves; library defaults elsewhere.
-/// `suite.navStorageBytes` charges exactly these three fields.
+/// `suite.navStorageBytes` charges exactly these four fields.
 pub fn navSizeCapacity(config: suite.NavSizeConfig) PathfindingCapacity {
     return .{
         .worker_participant_count = config.participant_count,
         .max_agent_budget = config.agent_budget,
         .max_group_fields = config.group_fields,
+        .max_abstract_nodes = config.tier1_abstract_nodes,
     };
 }
 
@@ -2470,6 +2507,603 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     try suite.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
     const stats = try runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
     try suite.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
+    return stats;
+}
+
+// Long-path item codes: the variant digit above the layout digit above the parameter.
+const long_path_variant_encoding: usize = 10_000_000;
+const long_path_layout_encoding: usize = 1_000_000;
+const long_path_side: u16 = 2048;
+// Serpentine rows per wall, and the open cells at one end of each wall.
+const serpentine_pitch: u16 = 128;
+const serpentine_gap: u16 = 8;
+const serpentine_walls: u16 = long_path_side / serpentine_pitch - 1;
+// The open diagonal's start on both axes.
+const open_diagonal_origin: u16 = 8;
+const stack_side: u16 = 256;
+const descent_levels: u16 = 128;
+// Ramps sit this far in from a level's corners on both axes.
+const stack_corner_inset: u16 = 8;
+const depth_descent: u16 = 4;
+const wide_descent_levels: u16 = 3;
+const long_path_crowd: usize = 32;
+// Cave blobs: the seed, the blob count (expected cover 1 - e^-0.51, about 40%, at the mean
+// disk area of radii 3 to 24), and the radius range.
+const cave_seed: u64 = 0x0064_ca7e;
+const cave_blobs: usize = 3100;
+const cave_min_radius: u32 = 3;
+const cave_max_radius: u32 = 24;
+// Past the abstract nodes every long-path layout holds; a probe search that saturates fails
+// the case.
+const long_path_probe_nodes: usize = 1 << 18;
+
+const LongPathLayout = enum(u8) {
+    serpentine,
+    open_diagonal,
+    descent,
+    depth,
+    wide_descent,
+    cave,
+};
+
+const LongPathVariant = enum(u8) {
+    caps,
+    probe,
+    crowd,
+};
+
+const LongPathConfig = struct {
+    variant: LongPathVariant,
+    layout: LongPathLayout,
+    parameter: u16,
+
+    fn code(variant: LongPathVariant, layout: LongPathLayout, parameter: u16) usize {
+        return @as(usize, @backingInt(variant)) * long_path_variant_encoding + @as(usize, @backingInt(layout)) * long_path_layout_encoding + parameter;
+    }
+
+    // An unknown digit, a parameter the layout cannot build, or a crowd off the serpentine and
+    // open diagonal is an error.
+    fn decode(item_count: usize) !LongPathConfig {
+        const variant_index = item_count / long_path_variant_encoding;
+        const layout_index = item_count % long_path_variant_encoding / long_path_layout_encoding;
+        const parameter = item_count % long_path_layout_encoding;
+        if (variant_index > @backingInt(LongPathVariant.crowd)) return error.LongPathUnknownVariant;
+        if (layout_index > @backingInt(LongPathLayout.cave)) return error.LongPathUnknownLayout;
+        if (parameter == 0 or parameter > std.math.maxInt(u16)) return error.LongPathBadParameter;
+        // In range: every digit is checked above.
+        const config = LongPathConfig{
+            .variant = @fromBackingInt(@as(u8, @intCast(variant_index))),
+            .layout = @fromBackingInt(@as(u8, @intCast(layout_index))),
+            .parameter = @intCast(parameter),
+        };
+        const buildable = switch (config.layout) {
+            .serpentine => parameter <= serpentine_walls,
+            .open_diagonal, .cave => open_diagonal_origin + parameter < long_path_side,
+            .descent => parameter < descent_levels,
+            .depth => parameter > depth_descent,
+            // Whole chunks, with room for both ramp corners.
+            .wide_descent => parameter % default_chunk_size_tiles == 0 and parameter > 4 * stack_corner_inset,
+        };
+        if (!buildable) return error.LongPathBadParameter;
+        if (config.variant == .crowd and config.layout != .serpentine and config.layout != .open_diagonal) return error.LongPathCrowdLayout;
+        return config;
+    }
+
+    fn levels(self: LongPathConfig) u16 {
+        return switch (self.layout) {
+            .serpentine, .open_diagonal, .cave => 1,
+            .descent => descent_levels,
+            .depth => self.parameter,
+            .wide_descent => wide_descent_levels,
+        };
+    }
+
+    fn side(self: LongPathConfig) u16 {
+        return switch (self.layout) {
+            .serpentine, .open_diagonal, .cave => long_path_side,
+            .descent, .depth => stack_side,
+            .wide_descent => self.parameter,
+        };
+    }
+
+    // Levels the route descends.
+    fn descent(self: LongPathConfig) u16 {
+        return switch (self.layout) {
+            .serpentine, .open_diagonal, .cave => 0,
+            .descent => self.parameter,
+            .depth => depth_descent,
+            .wide_descent => wide_descent_levels - 1,
+        };
+    }
+
+    fn agents(self: LongPathConfig) usize {
+        return if (self.variant == .crowd) long_path_crowd else 1;
+    }
+
+    // The route's length in cells, derived from the layout's geometry; the cave's is its
+    // diagonal's, a lower bound.
+    fn routeCells(self: LongPathConfig) usize {
+        const stack_crossing: usize = self.side() - 2 * stack_corner_inset - 1;
+        return switch (self.layout) {
+            .serpentine => @as(usize, long_path_side - serpentine_gap) * self.parameter,
+            .open_diagonal, .cave => self.parameter,
+            .descent, .depth, .wide_descent => stack_crossing * (@as(usize, self.descent()) + 1),
+        };
+    }
+};
+
+// The variant-0 curves, then the probe on the same routes, then the crowd at one route each.
+const long_path_item_counts = [_]usize{
+    LongPathConfig.code(.caps, .serpentine, 1),
+    LongPathConfig.code(.caps, .serpentine, 4),
+    LongPathConfig.code(.caps, .serpentine, 15),
+    LongPathConfig.code(.caps, .open_diagonal, 256),
+    LongPathConfig.code(.caps, .open_diagonal, 512),
+    LongPathConfig.code(.caps, .open_diagonal, 1024),
+    LongPathConfig.code(.caps, .open_diagonal, 2032),
+    LongPathConfig.code(.caps, .descent, 4),
+    LongPathConfig.code(.caps, .descent, 16),
+    LongPathConfig.code(.caps, .descent, 64),
+    LongPathConfig.code(.caps, .descent, 127),
+    LongPathConfig.code(.caps, .depth, 8),
+    LongPathConfig.code(.caps, .depth, 32),
+    LongPathConfig.code(.caps, .depth, 128),
+    LongPathConfig.code(.caps, .wide_descent, 256),
+    LongPathConfig.code(.caps, .wide_descent, 1024),
+    LongPathConfig.code(.caps, .wide_descent, 2048),
+    LongPathConfig.code(.caps, .cave, 256),
+    LongPathConfig.code(.caps, .cave, 512),
+    LongPathConfig.code(.caps, .cave, 1024),
+    LongPathConfig.code(.caps, .cave, 2032),
+    LongPathConfig.code(.probe, .serpentine, 1),
+    LongPathConfig.code(.probe, .serpentine, 4),
+    LongPathConfig.code(.probe, .serpentine, 15),
+    LongPathConfig.code(.probe, .open_diagonal, 256),
+    LongPathConfig.code(.probe, .open_diagonal, 512),
+    LongPathConfig.code(.probe, .open_diagonal, 1024),
+    LongPathConfig.code(.probe, .open_diagonal, 2032),
+    LongPathConfig.code(.probe, .descent, 4),
+    LongPathConfig.code(.probe, .descent, 16),
+    LongPathConfig.code(.probe, .descent, 64),
+    LongPathConfig.code(.probe, .descent, 127),
+    LongPathConfig.code(.probe, .wide_descent, 256),
+    LongPathConfig.code(.probe, .wide_descent, 1024),
+    LongPathConfig.code(.probe, .wide_descent, 2048),
+    LongPathConfig.code(.probe, .cave, 256),
+    LongPathConfig.code(.probe, .cave, 512),
+    LongPathConfig.code(.probe, .cave, 1024),
+    LongPathConfig.code(.probe, .cave, 2032),
+    LongPathConfig.code(.crowd, .serpentine, 1),
+    LongPathConfig.code(.crowd, .open_diagonal, 1024),
+};
+
+fn longPathItemCounts(_: suite.Profile) []const usize {
+    return &long_path_item_counts;
+}
+
+// Walls on every `serpentine_pitch`-th row, odd walls open at the east end and even walls at
+// the west end; returns the cells blocked.
+fn addSerpentineWalls(allocator: std.mem.Allocator, open: *OpenWorld) !usize {
+    const wall_cells = long_path_side - serpentine_gap;
+    const cells = try allocator.alloc(CellCoord, @as(usize, serpentine_walls) * wall_cells);
+    defer allocator.free(cells);
+    var len: usize = 0;
+    for (1..serpentine_walls + 1) |wall| {
+        const first: u16 = if (wall % 2 == 1) 0 else serpentine_gap;
+        for (first..first + wall_cells) |x| {
+            // In range: x < long_path_side and wall * serpentine_pitch < long_path_side.
+            cells[len] = .{ .x = @intCast(x), .y = @intCast(wall * serpentine_pitch) };
+            len += 1;
+        }
+    }
+    try writeLevelZeroCells(open, cells[0..len], open.blocking);
+    return len;
+}
+
+// Sets (`value` true) or clears every cell of `cells` (a `long_path_side`² level, row-major)
+// within `radius` of (center_x, center_y).
+fn setDisk(cells: *std.DynamicBitSetUnmanaged, center_x: u32, center_y: u32, radius: u32, value: bool) void {
+    const side: i64 = long_path_side;
+    const reach: i64 = radius;
+    const cx: i64 = center_x;
+    const cy: i64 = center_y;
+    const min_y = @max(0, cy - reach);
+    const max_y = @min(side - 1, cy + reach);
+    const min_x = @max(0, cx - reach);
+    const max_x = @min(side - 1, cx + reach);
+    var y = min_y;
+    while (y <= max_y) : (y += 1) {
+        var x = min_x;
+        while (x <= max_x) : (x += 1) {
+            const dx = x - cx;
+            const dy = y - cy;
+            if (dx * dx + dy * dy > reach * reach) continue;
+            // In range: 0 <= x, y < side.
+            cells.setValue(@intCast(y * side + x), value);
+        }
+    }
+}
+
+// Seeded blob caves over level 0: `cave_blobs` blocking disks at uniform centers and radii.
+// The route's ends move to the cells of the main cave (the 4-connected open component of the
+// open cell nearest the level center) nearest their targets, so the route exists; returns
+// the cells blocked.
+fn addCaveBlobs(allocator: std.mem.Allocator, open: *OpenWorld, route: *PlanarRoute) !usize {
+    const side: u32 = long_path_side;
+    var blocked = try std.DynamicBitSetUnmanaged.initEmpty(allocator, side * side);
+    defer blocked.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(cave_seed);
+    const random = prng.random();
+    for (0..cave_blobs) |_| {
+        const center_x = random.uintLessThan(u32, side);
+        const center_y = random.uintLessThan(u32, side);
+        setDisk(&blocked, center_x, center_y, random.intRangeAtMost(u32, cave_min_radius, cave_max_radius), true);
+    }
+    const blocked_count = blocked.count();
+
+    // The main cave: a breadth-first flood from the open cell nearest the center.
+    const center = CellCoord{ .x = long_path_side / 2, .y = long_path_side / 2 };
+    const seed = nearestCell(&blocked, false, center) orelse return error.LongPathCaveSolid;
+    var main_cave = try std.DynamicBitSetUnmanaged.initEmpty(allocator, side * side);
+    defer main_cave.deinit(allocator);
+    var queue = try std.ArrayList(u32).initCapacity(allocator, side * side - blocked_count);
+    defer queue.deinit(allocator);
+    const seed_index = @as(u32, seed.y) * side + seed.x;
+    main_cave.set(seed_index);
+    queue.appendAssumeCapacity(seed_index);
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cell = queue.items[head];
+        const x = cell % side;
+        const y = cell / side;
+        const neighbours = [_]?u32{
+            if (x > 0) cell - 1 else null,
+            if (x + 1 < side) cell + 1 else null,
+            if (y > 0) cell - side else null,
+            if (y + 1 < side) cell + side else null,
+        };
+        for (neighbours) |maybe_neighbour| {
+            const neighbour = maybe_neighbour orelse continue;
+            if (blocked.isSet(neighbour) or main_cave.isSet(neighbour)) continue;
+            main_cave.set(neighbour);
+            queue.appendAssumeCapacity(neighbour);
+        }
+    }
+    route.start = nearestCell(&main_cave, true, route.start) orelse return error.LongPathCaveSolid;
+    route.goal = nearestCell(&main_cave, true, route.goal) orelse return error.LongPathCaveSolid;
+
+    const cells = try allocator.alloc(CellCoord, blocked_count);
+    defer allocator.free(cells);
+    var iterator = blocked.iterator(.{});
+    var len: usize = 0;
+    while (iterator.next()) |index| : (len += 1) {
+        // In range: index < side * side.
+        cells[len] = .{ .x = @intCast(index % side), .y = @intCast(index / side) };
+    }
+    try writeLevelZeroCells(open, cells, open.blocking);
+    return blocked_count;
+}
+
+// The cell of a `long_path_side`² level whose bit in `cells` equals `value` nearest `target`
+// (Chebyshev, then row-major order); null when none does.
+fn nearestCell(cells: *const std.DynamicBitSetUnmanaged, value: bool, target: CellCoord) ?CellCoord {
+    var best: ?CellCoord = null;
+    var best_distance: u32 = std.math.maxInt(u32);
+    for (0..long_path_side) |y| {
+        for (0..long_path_side) |x| {
+            if (cells.isSet(y * long_path_side + x) != value) continue;
+            // In range: x, y < long_path_side.
+            const cell = CellCoord{ .x = @intCast(x), .y = @intCast(y) };
+            const distance = @max(@max(cell.x, target.x) - @min(cell.x, target.x), @max(cell.y, target.y) - @min(cell.y, target.y));
+            if (distance >= best_distance) continue;
+            best_distance = distance;
+            best = cell;
+        }
+    }
+    return best;
+}
+
+const PlanarRoute = struct {
+    start: CellCoord,
+    goal: CellCoord,
+};
+
+// A planar layout's start and goal cells.
+fn planarRoute(config: LongPathConfig) PlanarRoute {
+    return switch (config.layout) {
+        .serpentine => .{
+            .start = .{ .x = long_path_side / 2, .y = serpentine_pitch / 2 },
+            .goal = .{ .x = long_path_side / 2, .y = config.parameter * serpentine_pitch + serpentine_pitch / 2 },
+        },
+        .open_diagonal, .descent, .depth, .wide_descent, .cave => .{
+            .start = .{ .x = open_diagonal_origin, .y = open_diagonal_origin },
+            .goal = .{ .x = open_diagonal_origin + config.parameter, .y = open_diagonal_origin + config.parameter },
+        },
+    };
+}
+
+// Crowd member `index`'s start: the route's start for the first; the rest spread over the
+// serpentine's first band, or an 8 x 4 block of the open diagonal's corner.
+fn crowdStart(layout: LongPathLayout, start: CellCoord, index: usize) CellCoord {
+    if (index == 0) return start;
+    // In range: index < long_path_crowd keeps every coordinate below 2048.
+    std.debug.assert(index < long_path_crowd);
+    return switch (layout) {
+        .serpentine => .{ .x = @intCast(128 + 56 * index), .y = @intCast(16 + 32 * (index % 4)) },
+        .open_diagonal, .descent, .depth, .wide_descent, .cave => .{
+            .x = @intCast(open_diagonal_origin + 32 * (index % 8)),
+            .y = @intCast(open_diagonal_origin + 32 * (index / 8)),
+        },
+    };
+}
+
+// The ramp from `upper` to the level below on levels of `side`: the far corner under even
+// levels, the near one under odd levels.
+fn stackRampCell(side: u16, upper: u16) CellCoord {
+    const coord: u16 = if (upper % 2 == 0) side - 1 - stack_corner_inset else stack_corner_inset;
+    return .{ .x = coord, .y = coord };
+}
+
+// A descent's goal: two cells inside the goal level's ramp corner, so the route crosses the
+// goal level corner to corner like every level above it.
+fn stackGoalCell(side: u16, goal_level: u16) CellCoord {
+    const ramp = stackRampCell(side, goal_level);
+    const coord: u16 = if (ramp.x == stack_corner_inset) ramp.x + 2 else ramp.x - 2;
+    return .{ .x = coord, .y = coord };
+}
+
+const LongPathWorld = struct {
+    open: OpenWorld,
+    // Cells blocked on level 0.
+    blocked: usize,
+};
+
+// Builds `config`'s world and writes its `config.agents()` requests, the layout's start first.
+fn buildLongPathWorld(allocator: std.mem.Allocator, io: std.Io, config: LongPathConfig, requests: *[long_path_crowd]PathRequest) !LongPathWorld {
+    const levels = config.levels();
+    if (levels == 1) {
+        var open = try buildOpenWorld(allocator, io, long_path_side, 1);
+        errdefer open.world.deinit();
+        var route = planarRoute(config);
+        const blocked = switch (config.layout) {
+            .serpentine => try addSerpentineWalls(allocator, &open),
+            .cave => try addCaveBlobs(allocator, &open, &route),
+            .open_diagonal, .descent, .depth, .wide_descent => 0,
+        };
+        for (requests[0..config.agents()], 0..) |*request, index| {
+            request.* = .{ .entity = undefined, .start = open.cellCenter(crowdStart(config.layout, route.start, index)), .goal = open.cellCenter(route.goal) };
+        }
+        return .{ .open = open, .blocked = blocked };
+    }
+    const side = config.side();
+    var open = try buildOpenWorld(allocator, io, side, levels);
+    errdefer open.world.deinit();
+    for (0..levels - 1) |upper_index| {
+        // In range: below the u16 level count.
+        const upper: u16 = @intCast(upper_index);
+        const cell = stackRampCell(side, upper);
+        try open.world.addLevelLink(.{
+            .kind = .ramp,
+            .level_a = upper,
+            .cell_a = cell,
+            .level_b = upper + 1,
+            .cell_b = cell,
+            .traversal_cost = 1,
+            .bidirectional = true,
+        });
+    }
+    const goal_level = config.descent();
+    requests[0] = .{
+        .entity = undefined,
+        .start_level = 0,
+        .goal_level = goal_level,
+        .start = open.cellCenter(.{ .x = stack_corner_inset, .y = stack_corner_inset }),
+        .goal = open.cellCenter(stackGoalCell(side, goal_level)),
+    };
+    return .{ .open = open, .blocked = 0 };
+}
+
+const LongPathOutcome = enum {
+    available,
+    // The abstract search hit its node cap or open-heap limit.
+    abstract_saturated,
+    // The stitch hit the attempt's stitched-cell cap.
+    stitch_cells,
+    // The stitch hit the segment-search cap.
+    stitch_segments,
+    // One segment's local search hit its node budget.
+    stitch_segment_budget,
+};
+
+// One solve attempt's search, read from the scratch it ran in, and its step's time.
+const LongPathAttempt = struct {
+    nodes: usize,
+    // The chosen corridor's nodes; zero when the search did not reach the goal.
+    corridor: usize,
+    // Stitched cells and segment searches; zero when the stitch did not run.
+    cells: usize,
+    segments: usize,
+    outcome: LongPathOutcome,
+    ns: u64,
+
+    fn sameWork(self: LongPathAttempt, other: LongPathAttempt) bool {
+        return self.nodes == other.nodes and self.corridor == other.corridor and self.cells == other.cells and
+            self.segments == other.segments and self.outcome == other.outcome;
+    }
+};
+
+const LongPathCycle = struct {
+    first: LongPathAttempt,
+    escalated: ?LongPathAttempt,
+    // Agents whose status is available (a cached path serves them) and missing.
+    available: usize,
+    missing: usize,
+
+    fn ns(self: LongPathCycle) u64 {
+        return self.first.ns + if (self.escalated) |escalated| escalated.ns else 0;
+    }
+
+    fn sameWork(self: LongPathCycle, other: LongPathCycle) bool {
+        if (!self.first.sameWork(other.first) or self.available != other.available or self.missing != other.missing) return false;
+        const escalated = self.escalated orelse return other.escalated == null;
+        const other_escalated = other.escalated orelse return false;
+        return escalated.sameWork(other_escalated);
+    }
+};
+
+// Times one serial step that must solve exactly one request, at `tier`, and reads that solve
+// from its scratch: the participant's corridor for a first attempt, the first tier-1 pool
+// entry (the step's only escalated admission) for an escalated one.
+fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, tier: u8) !LongPathAttempt {
+    const start_ns = suite.nowNs(io);
+    const stats = try system.updateSerial(requests, agent_count, .{
+        .max_solved_requests_per_step = agent_count,
+        .max_solve_admissions_per_step = agent_count,
+    });
+    const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+    if (stats.unavailable_results != 0) return error.RouteUnavailable;
+    if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+    if (stats.solve_admissions != 1 or stats.escalated_solves != @intFromBool(tier != 0)) return error.LongPathNotOneSolve;
+    const corridor = if (tier == 0) &system.scratch_slots.items[0].corridor else &system.tier1_scratch.items[0].corridor;
+    const abstract = &corridor.abstract;
+    // A search that reached its goal leaves its corridor; a saturated one leaves it empty, or
+    // cut at the corridor limit.
+    const found = abstract.corridor.items.len != 0 and abstract.corridor.items.len < abstract.corridor_limit;
+    const cells = if (found) corridor.stitched.items.len else 0;
+    const segments = stats.max_stitch_segments_observed;
+    const outcome: LongPathOutcome = if (stats.available_results == 1) available: {
+        // Every layout's route leaves its start's chunk, so the solve ran the abstract search.
+        if (stats.abstract_solves != 1 or !found) return error.LongPathSolvedOffCorridor;
+        break :available .available;
+    } else if (stats.budget_exhausted != 1)
+        return error.LongPathUnexpectedOutcome
+    else if (!found)
+        .abstract_saturated
+    else if (cells >= corridor.stitched_limit)
+        .stitch_cells
+    else if (segments >= system.capacity.max_stitch_segments)
+        .stitch_segments
+    else
+        .stitch_segment_budget;
+    return .{
+        .nodes = abstract.nodes_used,
+        .corridor = if (found) abstract.corridor.items.len else 0,
+        .cells = cells,
+        .segments = segments,
+        .outcome = outcome,
+        .ns = elapsed_ns,
+    };
+}
+
+// One request cycle from empty runtime state: the first attempt, the escalated attempt when
+// the first exhausted, then every agent's status. No request stays pending after the second
+// attempt: it solves or drops.
+fn runLongPathCycle(io: std.Io, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
+    const system = &fixture.system;
+    resetPathState(system, .drop_fields);
+    const first = try runLongPathAttempt(io, system, &fixture.requests, requests.len, 0);
+    var escalated: ?LongPathAttempt = null;
+    if (first.outcome != .available) {
+        if (system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
+        escalated = try runLongPathAttempt(io, system, empty, requests.len, 1);
+    }
+    if (system.pending.len != 0) return error.LongPathStillPending;
+    var cycle = LongPathCycle{ .first = first, .escalated = escalated, .available = 0, .missing = 0 };
+    for (requests) |request| {
+        switch (system.statusForWorld(request.start_level, request.start, request.goal_level, request.goal, request.agent_class, null).status) {
+            .available => cycle.available += 1,
+            .missing => cycle.missing += 1,
+            .pending, .unavailable => return error.LongPathUnexpectedStatus,
+        }
+    }
+    return cycle;
+}
+
+fn printLongPathAttempt(label: []const u8, attempt: LongPathAttempt, mean_ns: u64) void {
+    std.debug.print(" | {s}: nodes={} corridor={} cells={} segments={} outcome={s} {}us", .{
+        label,
+        attempt.nodes,
+        attempt.corridor,
+        attempt.cells,
+        attempt.segments,
+        @tagName(attempt.outcome),
+        mean_ns / std.time.ns_per_us,
+    });
+}
+
+fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (case.usesThreadSystem()) return suite.RunStats.skipped("each step solves one request: a one-item solve batch");
+    const config = try LongPathConfig.decode(item_count);
+    const levels = config.levels();
+    const agent_count = config.agents();
+    var requests: [long_path_crowd]PathRequest = undefined;
+    // The world first: its content sizes the nav.
+    const built = try buildLongPathWorld(allocator, io, config, &requests);
+    var open = built.open;
+    var open_owned = true;
+    defer if (open_owned) open.world.deinit();
+    const size_config = suite.NavSizeConfig{
+        .side = config.side(),
+        .levels = levels,
+        .links = levels - 1,
+        // Every ramp is bidirectional.
+        .oneway_links = 0,
+        .participant_count = 1,
+        .agent_budget = agent_count,
+        .group_fields = 1,
+        .batch = suite.NavBatch.none,
+        .content = NavGraph.storageContentOf(&open.world),
+        .tier1_abstract_nodes = if (config.variant == .probe) long_path_probe_nodes else default_tier1_abstract_node_cap,
+    };
+    if (suite.navSizeSkip(long_path_group.name, item_count, case, size_config)) |skip| return skip;
+
+    const capacity = navSizeCapacity(size_config);
+    open_owned = false;
+    var fixture = try initRouteFixture(allocator, open, requests[0..agent_count], capacity, null);
+    defer fixture.deinit();
+    try suite.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
+    var empty = RangeOutputStream(PathRequest).init(allocator);
+    defer empty.deinit();
+    const agents = requests[0..agent_count];
+
+    for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &fixture, &empty, agents);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var reference: ?LongPathCycle = null;
+    var first_ns: u64 = 0;
+    var escalated_ns: u64 = 0;
+    for (0..coldIterations(options)) |_| {
+        const cycle = try runLongPathCycle(io, &fixture, &empty, agents);
+        if (reference) |kept| {
+            if (!kept.sameWork(cycle)) return error.LongPathWorkVaried;
+        } else reference = cycle;
+        if (config.variant == .probe) {
+            if (cycle.escalated) |escalated| if (escalated.outcome == .abstract_saturated) return error.LongPathProbeSaturated;
+        }
+        first_ns += cycle.first.ns;
+        if (cycle.escalated) |escalated| escalated_ns += escalated.ns;
+        accumulator.record(cycle.ns(), inlineBatch(1, pathfinding_range_alignment_items));
+    }
+    var stats = accumulator.finish();
+    const cycle = reference orelse return stats;
+    if (options.details) {
+        const samples: u64 = stats.iterations;
+        std.debug.print("  {s} {} {s}: {s} {s} parameter={} route~{} cells agents={}", .{
+            long_path_group.name,
+            item_count,
+            case.name,
+            @tagName(config.layout),
+            @tagName(config.variant),
+            config.parameter,
+            config.routeCells(),
+            agent_count,
+        });
+        printLongPathAttempt("first", cycle.first, first_ns / samples);
+        if (cycle.escalated) |escalated| printLongPathAttempt("escalated", escalated, escalated_ns / samples);
+        std.debug.print(" | blocked={} status available={} missing={}\n", .{ built.blocked, cycle.available, cycle.missing });
+    }
+    stats.candidate_pairs = (cycle.escalated orelse cycle.first).nodes;
+    stats.output_count = cycle.available;
+    stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     return stats;
 }
 

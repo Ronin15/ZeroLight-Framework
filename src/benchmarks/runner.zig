@@ -59,6 +59,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.cross_level_depth_group,
     pathfinding.cross_level_teleport_group,
     pathfinding.cross_level_shaft_group,
+    pathfinding.long_path_group,
     pathfinding.link_fold_group,
     pathfinding.evict_group,
     pathfinding.elastic_ramp_group,

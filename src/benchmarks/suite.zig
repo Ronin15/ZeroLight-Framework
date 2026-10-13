@@ -21,6 +21,7 @@ const SearchSlot = @import("../game/systems/pathfinding/scratch.zig").SearchSlot
 const OpenNode = @import("../game/systems/pathfinding/types.zig").OpenNode;
 const StitchedCell = @import("../game/systems/pathfinding/types.zig").StitchedCell;
 const hashTableSlots = @import("../game/systems/pathfinding/types.zig").hashTableSlots;
+const default_tier1_abstract_node_cap = @import("../game/systems/pathfinding/types.zig").default_tier1_abstract_node_cap;
 const resultBlockWords = @import("../game/systems/pathfinding/types.zig").resultBlockWords;
 const registry_shard_count = @import("../game/systems/pathfinding/types.zig").registry_shard_count;
 const RegRecord = @import("../game/systems/pathfinding/types.zig").RegRecord;
@@ -849,6 +850,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "chunk-scale-gpu-sync-level-enter")) return "(resident layers * 10^9 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "chunk-scale-nav-level-add")) return "(replace case * 10^7 + level side * 1000 + levels)";
     if (std.mem.eql(u8, group_name, "pathfinding-cross-level-teleport")) return "(layout * 10^12 + teleports * 10^7 + level side * 1000 + levels)";
+    if (std.mem.eql(u8, group_name, "pathfinding-long-path")) return "(variant * 10^7 + layout * 10^6 + walls, diagonal cells, levels, or level side)";
     if (std.mem.eql(u8, group_name, "pathfinding-link-fold")) return "(axis * 10^9 + probe preload per chunk * 10^6 + random pads before the run)";
     if (std.mem.eql(u8, group_name, "pathfinding-level-size") or std.mem.startsWith(u8, group_name, "pathfinding-cross-level-")) return "(level side * 1000 + levels)";
     if (std.mem.startsWith(u8, group_name, "chunk-scale-")) return "(level side * 1000 + levels)";
@@ -1824,6 +1826,9 @@ pub const NavSizeConfig = struct {
     oneway_system_terminals: usize = std.math.maxInt(usize),
     /// The largest marks batch the workload runs; the default charges the worst.
     batch: NavBatch = .{},
+    /// The escalated search's abstract node cap (`PathfindingCapacity.max_abstract_nodes`),
+    /// which sizes each tier-1 corridor scratch; the library default unless a probe raises it.
+    tier1_abstract_nodes: usize = default_tier1_abstract_node_cap,
     /// The built world's chunk forms and link endpoints (`NavGraph.storageContentOf`), plus
     /// what the workload adds; null charges every chunk mixed.
     content: ?NavGraph.StorageContent = null,
@@ -1869,14 +1874,13 @@ pub fn navStorageBytes(config: NavSizeConfig) usize {
 
 // `navStorageBytes` split by what reports it at run time.
 fn navStorageParts(config: NavSizeConfig) NavStorageParts {
-    // Library capacity defaults: explored nodes, stored path cells, the tier-0 and tier-1
-    // abstract node and stitched cell caps, escalated solves per step, group field cells,
-    // results cached per agent, and the per-step solve ceiling.
+    // Library capacity defaults: explored nodes, stored path cells, the tier-0 abstract node
+    // and stitched cell caps, the tier-1 stitched cell cap, escalated solves per step, group
+    // field cells, results cached per agent, and the per-step solve ceiling.
     const explored_nodes: usize = 4096;
     const stored_path_cells: usize = 512;
     const tier0_abstract_nodes: usize = 4096;
     const tier0_stitched_cells: usize = 512;
-    const abstract_nodes: usize = 16384;
     const stitched_path_cells: usize = 2048;
     const escalated_solves: usize = 1;
     const group_field_cells: usize = 131072;
@@ -1895,9 +1899,11 @@ fn navStorageParts(config: NavSizeConfig) NavStorageParts {
     // buffer, and the tier-0 corridor scratch.
     const explored_heap_entries: usize = @max(16, explored_nodes * 4);
     const search = participants * (tableRows(explored_nodes) * @sizeOf(SearchSlot) + explored_heap_entries * @sizeOf(OpenNode) +
-        explored_nodes * @sizeOf(u32) + corridorBytes(tier0_abstract_nodes, tier0_stitched_cells));
-    // Per escalated solve a step admits: one tier-1 corridor scratch.
-    const tier1_pool = escalated_solves * corridorBytes(abstract_nodes, stitched_path_cells);
+        explored_nodes * @sizeOf(u32) + corridorBytes(tableRows(tier0_abstract_nodes), tier0_abstract_nodes, tier0_stitched_cells));
+    // Per escalated solve a step admits: one tier-1 corridor scratch. A cap whose table
+    // cannot be built charges past every limit.
+    const tier1_rows = hashTableSlots(config.tier1_abstract_nodes) catch std.math.maxInt(usize);
+    const tier1_pool = escalated_solves *| corridorBytes(tier1_rows, config.tier1_abstract_nodes, stitched_path_cells);
     // Result cache, per entry: its probe slots, record, free index, owner-log room, and
     // inline stripe. A block holds the longest plain or stitched path: per solve slot one
     // worker stripe, its run-start window (2 B per block word), its solved-path record, and
@@ -1953,12 +1959,13 @@ fn tableRows(comptime keys: usize) usize {
     return comptime hashTableSlots(keys) catch @compileError("nav table too wide");
 }
 
-// One corridor scratch: the abstract table, open heap, corridor refs and link flags, claim
-// list, and the stitched path (one spare cell).
-fn corridorBytes(comptime abstract_nodes: usize, comptime stitched_cells: usize) usize {
-    const heap_entries: usize = @max(16, abstract_nodes * 4);
-    return tableRows(abstract_nodes) * @sizeOf(AbstractSlot) + heap_entries * @sizeOf(OpenNode) +
-        abstract_nodes * (@sizeOf(usize) + @sizeOf(bool) + @sizeOf(u32)) + (stitched_cells + 1) * @sizeOf(StitchedCell);
+// One corridor scratch over a `table_rows`-row abstract table: the table, open heap,
+// corridor refs and link flags, claim list, and the stitched path (one spare cell).
+// Saturates.
+fn corridorBytes(table_rows: usize, abstract_nodes: usize, stitched_cells: usize) usize {
+    const heap_entries: usize = @max(16, abstract_nodes *| 4);
+    return table_rows *| @sizeOf(AbstractSlot) +| heap_entries *| @sizeOf(OpenNode) +|
+        abstract_nodes *| (@sizeOf(usize) + @sizeOf(bool) + @sizeOf(u32)) +| (stitched_cells + 1) * @sizeOf(StitchedCell);
 }
 
 fn ceilMib(bytes: usize) usize {
