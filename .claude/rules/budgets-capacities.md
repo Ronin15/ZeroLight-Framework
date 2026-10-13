@@ -32,7 +32,10 @@
   layouts) proven unreachable for everything the world can grow to (growth
   paths included, not only initial sizes) and failing loudly when the world is
   created or loaded, and presentation-only pools no simulation reads
-  (particles, text labels) with deterministic overflow drop.
+  (particles, text labels) with deterministic overflow drop. A pool's row
+  index may be `u32` when exhausting it requires 2^32 live rows of that pool;
+  exhaustion fails at the growth seam as `OutOfMemory`, never as a refusal or
+  a distinct error.
 - Platform resource checks (GPU bytes, nav memory) never refuse a world,
   level, or terrain change, whether loaded or created in play, and never run
   per step; they report. Only allocator OOM fails, as above.
