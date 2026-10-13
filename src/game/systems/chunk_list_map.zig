@@ -393,9 +393,9 @@ pub const ChunkListMap = struct {
         if (self.entry_free.items.len >= needed) return;
         const added = needed - self.entry_free.items.len;
         const total = self.entries.len + added;
-        // Entry ids stay below `no_entry`: at 28 B per entry, 2^32 entries are 112 GiB, so
-        // the allocator fails long before an id could reach it.
-        std.debug.assert(total < no_entry);
+        // Entry ids stay below `no_entry`: exhausting them needs 2^32 - 1 live entries, so it
+        // fails as the allocator does.
+        if (total >= no_entry) return error.OutOfMemory;
         if (total > self.entries.capacity) {
             try self.entries.ensureTotalCapacity(self.allocator, @max(total, self.entries.capacity *| 2));
             // The pool moved: the column views follow it before anything else can fail.
@@ -1770,4 +1770,23 @@ test "an ordered index set reserve grows geometrically onto valid tiers, and one
     for ([_]usize{ 127, 0, 64, 63 }) |index| set.insert(index);
     for ([_]usize{ 0, 63, 64, 127 }) |expected| try std.testing.expectEqual(@as(?usize, expected), set.popMin());
     try std.testing.expect(set.isEmpty());
+}
+
+test "an entry reserve fails as OutOfMemory at 2^32 - 1 entries before asking the allocator, and one entry short of it reaches the allocator" {
+    var map = ChunkListMap.init(std.testing.allocator, "test");
+    defer map.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    map.allocator = failing.allocator();
+    defer map.allocator = std.testing.allocator;
+    // The pool reads `no_entry - 1` entries with no free id: the reserve checks only its
+    // length before growing, so no entry memory backs the count. Restored before deinit.
+    defer map.entries.len = 0;
+    map.entries.len = no_entry - 1;
+    try std.testing.expectError(error.OutOfMemory, map.reserve(0, 1, 0));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, no_entry - 1), map.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), map.entry_free.items.len);
+    map.entries.len = no_entry - 2;
+    try std.testing.expectError(error.OutOfMemory, map.reserve(0, 1, 0));
+    try std.testing.expect(failing.has_induced_failure);
 }

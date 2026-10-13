@@ -49,7 +49,8 @@ const collision_response_range_alignment_items: usize = hot_soa_column_alignment
 // An intent whose entity has no movement body; the apply skips it.
 const no_row: u32 = std.math.maxInt(u32);
 // Contact and intent indices are u32: a step's contacts must leave room for two intents
-// each. Unreachable in practice: the contact stream alone would need 2^31 records.
+// each. Exhausting them needs 2^31 live contacts in one step, so `beginStep` fails it as the
+// allocator does.
 const max_step_intents: usize = std.math.maxInt(u32);
 // Partition width of the band apply, not a capacity: results are independent of the band
 // count, and a gather range's band histogram stays on the worker stack.
@@ -236,12 +237,12 @@ pub const CollisionResponseSystem = struct {
         observer: EntityId,
         thread_system: *ThreadSystem,
         config: CollisionResponseConfig,
-    ) !CollisionResponseStats {
+    ) error{OutOfMemory}!CollisionResponseStats {
         return self.run(data, frame, observer, .{ .thread_system = thread_system, .config = config });
     }
 
     /// `update` with both stages inline on the calling thread.
-    pub fn updateSerial(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId) !CollisionResponseStats {
+    pub fn updateSerial(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId) error{OutOfMemory}!CollisionResponseStats {
         return self.run(data, frame, observer, null);
     }
 
@@ -331,12 +332,14 @@ pub const CollisionResponseSystem = struct {
     fn beginStep(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId) !?ResponseStep {
         const contacts = frame.contacts.mergedItems();
         const contact_count = contacts.len;
+        // Checked before any output clears, so this failure leaves them as they were; a
+        // reserve's OOM below clears them first.
+        if (contact_count > max_step_intents / 2) return error.OutOfMemory;
         frame.collision_triggers.clearRetainingCapacity();
         self.observer_staging.clearRetainingCapacity();
         self.observer = observer;
         self.observer_source_contacts = contact_count;
         if (contact_count == 0) return null;
-        std.debug.assert(contact_count <= max_step_intents / 2);
 
         // Every reserve, sized from this step's contacts, lands before any dispatch.
         try self.ensureContactCapacity(contact_count);
@@ -1629,4 +1632,39 @@ test "contacts past the reserve grow on main before dispatch and match serial" {
     try std.testing.expect(!threaded.stats.gather_batch.ran_inline);
     try std.testing.expect(!threaded.stats.apply_batch.ran_inline);
     try expectRingResultsEqual(serial, threaded);
+}
+
+test "a step of over 2^31 - 1 contacts fails as OutOfMemory before clearing outputs or asking the allocator; 2^31 - 1 reaches the allocator" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var system = CollisionResponseSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing.allocator();
+    defer system.allocator = std.testing.allocator;
+    // The merged stream reads `count` contacts: the step checks only the count before its
+    // reserves, so no contact memory backs it. Restored before deinit.
+    var spare: [1]CollisionContact = undefined;
+    const real_values = frame.contacts.values;
+    defer {
+        frame.contacts.values = real_values;
+        frame.contacts.merged_len = 0;
+        frame.contacts.prefix_ready = false;
+    }
+    const limit = max_step_intents / 2;
+    for ([_]usize{ limit + 1, limit }) |count| {
+        frame.contacts.values.items = (&spare).ptr[0..count];
+        frame.contacts.merged_len = count;
+        frame.contacts.prefix_ready = true;
+        system.observer_source_contacts = 7;
+        try std.testing.expectError(error.OutOfMemory, system.updateSerial(&data, &frame, EntityId.invalid));
+        if (count > limit) {
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 7), system.observer_source_contacts);
+        } else {
+            try std.testing.expect(failing.has_induced_failure);
+        }
+    }
 }

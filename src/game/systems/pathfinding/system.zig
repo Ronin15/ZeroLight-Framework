@@ -123,10 +123,10 @@ const traversalOf = @import("types.zig").traversalOf;
 const GoalResolveStats = @import("types.zig").GoalResolveStats;
 const no_cell = @import("types.zig").no_cell;
 
-// A nav build's failures: memory, a budget or level grid past its index widths, or
-// connectivity past its id widths. A nav apply's: memory, or connectivity past its widths.
-const NavBuildError = error{ OutOfMemory, NavConnectivityOverflow } || types.BudgetError || ChunkGridError;
-const NavApplyError = error{ OutOfMemory, NavConnectivityOverflow };
+// A nav build's failures: memory (an exhausted id pool included), or a budget or level grid
+// past its index widths. A nav apply's: memory, an exhausted id pool included.
+const NavBuildError = error{OutOfMemory} || types.BudgetError || ChunkGridError;
+const NavApplyError = error{OutOfMemory};
 
 // `solve_tier1_slot` entry of a tier-0 admission.
 const no_tier1_slot: u32 = std.math.maxInt(u32);
@@ -1365,7 +1365,7 @@ pub const PathfindingSystem = struct {
 
     /// Sizes the goal table for `intent_count` intents per step: the population seam's
     /// reserve. Grow-only and failure-atomic at the old size.
-    pub fn reserveGoals(self: *PathfindingSystem, intent_count: usize) error{ OutOfMemory, NavConnectivityOverflow }!void {
+    pub fn reserveGoals(self: *PathfindingSystem, intent_count: usize) error{OutOfMemory}!void {
         try self.goals.reserve(self.allocator, intent_count);
     }
 
@@ -1379,7 +1379,7 @@ pub const PathfindingSystem = struct {
     /// system. Intents past the reserved limit grow the table here, before any table write,
     /// geometrically and counted; on error the table is invalid and its storage intact. The
     /// table is valid until the next grid change. Equal for any partition.
-    pub fn resolveGoals(self: *PathfindingSystem, comptime Intent: type, intents: []const Intent, thread_system: ?*ThreadSystem, config: PathfindingConfig) error{ OutOfMemory, NavConnectivityOverflow }!GoalResolveStats {
+    pub fn resolveGoals(self: *PathfindingSystem, comptime Intent: type, intents: []const Intent, thread_system: ?*ThreadSystem, config: PathfindingConfig) error{OutOfMemory}!GoalResolveStats {
         var stats = GoalResolveStats{ .intents = intents.len };
         self.goals.invalidate();
         if (intents.len > self.goals.limit) {

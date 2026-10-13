@@ -1548,7 +1548,7 @@ pub const NavGraph = struct {
     /// stages thread over its chunks (the flood over its searches). Never touches
     /// `links_applied`. The batch staging grows to the level, its needs kept out of the release
     /// window; the step's `finishStagingStep` frees it.
-    pub fn buildLevel(self: *NavGraph, colliders: ColliderView, world: ?*const WorldSystem, level_index: u16, threads: ?NavUpdateThreads, stats: *NavUpdateStats) !void {
+    pub fn buildLevel(self: *NavGraph, colliders: ColliderView, world: ?*const WorldSystem, level_index: u16, threads: ?NavUpdateThreads, stats: *NavUpdateStats) error{OutOfMemory}!void {
         self.beginBuild();
         defer self.endBuild();
         std.debug.assert(@as(usize, level_index) <= self.levels.items.len);
@@ -1717,7 +1717,7 @@ pub const NavGraph = struct {
         marks: []const NavMark,
         threads: ?NavUpdateThreads,
         stats: *NavUpdateStats,
-    ) !?PreparedMarks {
+    ) error{OutOfMemory}!?PreparedMarks {
         std.debug.assert(!self.batch_prepared);
         if (!self.valid()) return null;
         const new_links = self.newLinks(world);

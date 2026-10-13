@@ -399,12 +399,13 @@ fn ElementMapAt(comptime load: SlotLoad) type {
 
         // The slots for `limit` keys: a power of two holding them at `load` or less. Lookups are
         // exact and nothing iterates the slots, so the count never changes a result.
-        fn slotCount(limit: usize) error{NavConnectivityOverflow}!usize {
+        fn slotCount(limit: usize) error{OutOfMemory}!usize {
             const least = switch (load) {
                 .half => 2 *| limit,
                 .three_quarters => limit +| limit / 3 +| 1,
             };
-            return std.math.ceilPowerOfTwo(usize, @max(least, 16)) catch error.NavConnectivityOverflow;
+            // Overflowing usize needs over 2^62 live keys, so it fails as the allocator does.
+            return std.math.ceilPowerOfTwo(usize, @max(least, 16)) catch error.OutOfMemory;
         }
 
         /// Grows the slots to hold `limit` keys, emptying the map when they grow; never shrinks.
@@ -879,9 +880,11 @@ const BoundSums = struct {
 };
 
 // The power-of-two block cap holding `terms` indices; it stays below `free_end`.
-fn boundCap(terms: usize) !u32 {
-    const cap = std.math.ceilPowerOfTwo(usize, terms) catch return error.NavConnectivityOverflow;
-    if (cap >= free_end) return error.NavConnectivityOverflow;
+fn boundCap(terms: usize) error{OutOfMemory}!u32 {
+    // Reaching `free_end` needs over 2^30 live terminals in one block, so it fails as the
+    // allocator does.
+    const cap = std.math.ceilPowerOfTwo(usize, terms) catch return error.OutOfMemory;
+    if (cap >= free_end) return error.OutOfMemory;
     return @intCast(cap);
 }
 
@@ -956,7 +959,8 @@ pub const Closure = struct {
     apos: std.MultiArrayList(APosRow) = .{},
     copy_items: std.ArrayList(CopyItem) = .empty,
     round_items: std.ArrayList(RowsItem) = .empty,
-    round_starts: std.ArrayList(u32) = .empty,
+    // Usize: a batch's round items sum spans over every SCC and may pass u32.
+    round_starts: std.ArrayList(usize) = .empty,
     compact_blocks: std.ArrayList(CompactBlock) = .empty,
     // Stage shapes of the most recent batch (stats and benches).
     last_resolve_batch: BatchStats = .{},
@@ -1046,7 +1050,8 @@ pub const Closure = struct {
     fn ensureFreeIds(self: *Closure, allocator: std.mem.Allocator, terms: usize, hcomps: usize, pool_grows: *u64) !void {
         // The pools may move before a later step fails: the views follow them either way.
         defer self.refreshColumns();
-        // Ids stay below `free_end`, so a terminal id never reads as a free index-map entry.
+        // Ids stay below `free_end`, so a terminal id never reads as a free index-map entry;
+        // exhausting either pool needs 2^31 - 1 live rows of it (`growPool`: OutOfMemory).
         try growPool(TermRow, allocator, &self.terms, &self.term_free, terms, .{ .root = no_root, .hcomp = no_hcomp, .index = no_index, .slot = no_slot }, free_end, pool_grows);
         try growPool(HCompRow, allocator, &self.hcomps, &self.hcomp_free, hcomps, emptyHComp(), free_end, pool_grows);
     }
@@ -1062,12 +1067,11 @@ pub const Closure = struct {
     }
 
     fn stagingBytes(self: *const Closure) usize {
-        return (self.cand_starts.capacity + self.ow_starts.capacity) * @sizeOf(usize) +
+        return (self.cand_starts.capacity + self.ow_starts.capacity + self.round_starts.capacity) * @sizeOf(usize) +
             self.cand_tallies.capacity * @sizeOf(CandTally) +
             (self.cand_counts.capacity + self.cand_hcomps.capacity + self.ow_counts.capacity +
                 self.freed_terms.capacity + self.s_words.capacity + self.s_list.capacity + self.loose.capacity +
-                self.resolve_items.capacity + self.targets.capacity + self.leaving.capacity + self.plan_items.capacity +
-                self.round_starts.capacity) * @sizeOf(u32) +
+                self.resolve_items.capacity + self.targets.capacity + self.leaving.capacity + self.plan_items.capacity) * @sizeOf(u32) +
             self.ow_entries.capacity * @sizeOf(OneWayEntry) +
             self.touched.capacity * @sizeOf(TouchRow) +
             self.resolve_out.capacity * @sizeOf(ResolveOut) +
@@ -1090,9 +1094,9 @@ fn emptyHComp() HCompRow {
 /// `empty` and pushed in descending order so pops hand out ascending ids. The pool grows to
 /// exactly the larger of its need and twice its capacity (an empty pool to its need), counted
 /// once in `pool_grows`; the free list covers the pool exactly, so a release never allocates.
-/// Ids stay below `id_end`, the pool's sentinel: `NavConnectivityOverflow` past it. The
-/// caller refreshes its column views after the call, success or not (the pool may have
-/// moved). On error the pool keeps its rows and ids.
+/// Ids stay below `id_end`, the pool's sentinel: a need reaching it fails as `OutOfMemory`, like
+/// the allocator. The caller refreshes its column views after the call, success or not (the
+/// pool may have moved). On error the pool keeps its rows and ids.
 pub fn growPool(
     comptime Row: type,
     allocator: std.mem.Allocator,
@@ -1102,11 +1106,12 @@ pub fn growPool(
     empty: Row,
     id_end: u32,
     pool_grows: *u64,
-) error{ OutOfMemory, NavConnectivityOverflow }!void {
+) error{OutOfMemory}!void {
     if (free.items.len >= needed) return;
     const added = needed - free.items.len;
     const total = rows.len + added;
-    if (total >= id_end) return error.NavConnectivityOverflow;
+    // Exhausting the ids needs `id_end` live rows of the pool, so it fails as the allocator does.
+    if (total >= id_end) return error.OutOfMemory;
     if (total > rows.capacity) {
         try rows.setCapacity(allocator, @max(total, rows.capacity *| 2));
         pool_grows.* += 1;
@@ -1454,7 +1459,7 @@ fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usize {
         2 *| listBytesBound(u32, terminals) +| listBytesBound(FreedIndex, terminals) +| listBytesBound(MaskItem, terminals) +|
         rowsBytesBound(APosRow, 2 *| terminals) +|
         listBytesBound(CopyItem, 6 *| terminals *| spans) +| listBytesBound(RowsItem, 3 *| terminals *| spans) +|
-        listBytesBound(u32, 2 *| terminals +| 2) +| listBytesBound(CompactBlock, terminals);
+        listBytesBound(usize, 2 *| terminals +| 2) +| listBytesBound(CompactBlock, terminals);
     return registry +| pools +| arena +| staging;
 }
 
@@ -1733,7 +1738,7 @@ pub const Connectivity = struct {
 
     // Grows the free comp and root lists to at least `needed` ids each, so that many claims
     // pop without allocating. Pool growth is geometric and counted in `pool_grows`; ids stay
-    // below their sentinels.
+    // below their sentinels. Exhausting either needs 2^32 - 1 live rows of it: OutOfMemory.
     fn ensureFreeIds(self: *Connectivity, allocator: std.mem.Allocator, needed: usize, pool_grows: *u64) !void {
         // The pools may move before a later step fails: the views follow them either way.
         defer self.refreshColumns();
@@ -1745,7 +1750,9 @@ pub const Connectivity = struct {
     // sets, families, groups, and their lists) and `fresh` free comps and roots: fresh ids go
     // one pair per set or rootless unit, at most one per unit.
     fn reserveMerge(self: *Connectivity, allocator: std.mem.Allocator, limit: usize, fresh: usize, pool_grows: *u64) !void {
-        if (limit >= no_unit) return error.NavConnectivityOverflow;
+        // Reaching `no_unit` needs 2^32 - 1 merge elements in one batch, so it fails as the
+        // allocator does.
+        if (limit >= no_unit) return error.OutOfMemory;
         self.staging_window.note(.elements, limit);
         try types.growList(&self.elements, allocator, limit, pool_grows);
         // Elements plus the roots of kept elements share the map.
@@ -1831,7 +1838,7 @@ pub const Connectivity = struct {
         closure_threads: ClosureThreads,
         pool_grows: *u64,
         stats: *NavUpdateStats,
-    ) !void {
+    ) error{OutOfMemory}!void {
         std.debug.assert(patch_info.len == patch_keys.len and patch_keys.len != 0);
         var section = StageTimer.begin();
         const new_link_count = new_links.len;
@@ -1984,7 +1991,7 @@ pub const Connectivity = struct {
         closure_threads: ClosureThreads,
         pool_grows: *u64,
         stats: *NavUpdateStats,
-    ) !ConnectivityCounters {
+    ) error{OutOfMemory}!ConnectivityCounters {
         const fresh = levels.fresh.?;
         const level_graph = fresh.graph;
         const seeding = replaced != null;
@@ -2893,13 +2900,13 @@ pub const Connectivity = struct {
     /// Reserves the registry rows of `new_links`, the world links past the registry's cursor
     /// that the next commit registers: a link-map entry each and a row per one-way link.
     /// Growth is geometric and counted in `pool_grows`. O(1) per link; registers nothing.
-    pub fn reserveRegistry(self: *Connectivity, allocator: std.mem.Allocator, new_links: []const LevelLink, pool_grows: *u64) !void {
+    pub fn reserveRegistry(self: *Connectivity, allocator: std.mem.Allocator, new_links: []const LevelLink, pool_grows: *u64) error{OutOfMemory}!void {
         const closure = &self.closure;
         const oneway_total = closure.oneway.len + countOneWay(new_links);
         const link_total = closure.oneway_cursor + new_links.len;
-        // One row per world link at most, and the world holds at most `no_link_endpoint / 2`
-        // (2^31 - 1) links (two u32 endpoint entries each, `WorldSystem.reserveLevelLink`),
-        // so rows stay below `no_oneway` (2^32 - 1).
+        // One row per world link at most, and `WorldSystem.reserveLevelLink` fails as
+        // OutOfMemory at `no_link_endpoint / 2` (2^31 - 1) links (two u32 endpoint entries
+        // each), so rows stay below `no_oneway` (2^32 - 1).
         std.debug.assert(oneway_total <= link_total and link_total <= no_link_endpoint / 2);
         try types.growList(&closure.oneway_of_link, allocator, link_total, pool_grows);
         try types.growList(&closure.oneway, allocator, oneway_total, pool_grows);
@@ -2929,7 +2936,7 @@ pub const Connectivity = struct {
     /// Allocates; on error the caller discards the graph. Resolution
     /// O(links) threaded, Tarjan O(terminals + links) per component, rows
     /// O((terminals + links) * row words) threaded.
-    pub fn buildClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: BatchLevels, world: ?*const WorldSystem, threads: ClosureThreads, pool_grows: *u64, stats: *NavUpdateStats) !ClosureCounters {
+    pub fn buildClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: BatchLevels, world: ?*const WorldSystem, threads: ClosureThreads, pool_grows: *u64, stats: *NavUpdateStats) error{OutOfMemory}!ClosureCounters {
         const world_system = world orelse return .{};
         const new_links = world_system.levelLinks()[self.closure.oneway_cursor..];
         try self.reserveRegistry(allocator, new_links, pool_grows);
@@ -7774,7 +7781,7 @@ test "a world build of disjoint one-way links reserves one H-component id per li
     try std.testing.expectEqual(@as(usize, 5), closure.hcomps.len);
 }
 
-test "a pool grows to exactly its need from empty, then to twice its capacity, its free list exactly; past its sentinel it fails and keeps its ids" {
+test "a pool grows to exactly its need from empty, then to twice its capacity, its free list exactly; past its sentinel it fails as OutOfMemory and keeps its ids" {
     const allocator = std.testing.allocator;
     var rows: std.MultiArrayList(CompRow) = .{};
     defer rows.deinit(allocator);
@@ -7798,10 +7805,140 @@ test "a pool grows to exactly its need from empty, then to twice its capacity, i
     // Already covered: nothing grows.
     try growPool(CompRow, allocator, &rows, &free, 3, empty, no_comp, &grows);
     try std.testing.expectEqual(@as(u64, 2), grows);
-    // Ids past the sentinel fail loudly; the pool keeps its rows and ids.
-    try std.testing.expectError(error.NavConnectivityOverflow, growPool(CompRow, allocator, &rows, &free, 10, empty, 8, &grows));
+    // A need reaching the sentinel fails as the allocator would, before asking it; the pool
+    // keeps its rows, ids, and capacity.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, growPool(CompRow, failing.allocator(), &rows, &free, 6, empty, 8, &grows));
+    try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqual(@as(usize, 6), rows.capacity);
     try std.testing.expectEqual(@as(usize, 3), free.items.len);
+    try std.testing.expectEqual(@as(u64, 2), grows);
+    // One id short of the sentinel still grows: ids 5 and 6 are below 8.
+    try growPool(CompRow, allocator, &rows, &free, 5, empty, 8, &grows);
+    try std.testing.expectEqual(@as(usize, 7), rows.len);
+    try std.testing.expectEqual(@as(?u32, 5), free.pop());
+}
+
+test "a block cap, a map's slot count, and a merge's element limit past their index widths fail as OutOfMemory" {
+    try std.testing.expectEqual(@as(u32, 1 << 30), try boundCap(1 << 30));
+    try std.testing.expectError(error.OutOfMemory, boundCap((1 << 30) + 1));
+    try std.testing.expectError(error.OutOfMemory, boundCap(std.math.maxInt(usize)));
+    try std.testing.expectError(error.OutOfMemory, MergeMap.slotCount(std.math.maxInt(usize)));
+    // The element limit is checked before any reserve: nothing is asked of the allocator and
+    // the stored limit stays.
+    var conn = Connectivity{};
+    defer conn.deinit(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var grows: u64 = 0;
+    try std.testing.expectError(error.OutOfMemory, conn.reserveMerge(failing.allocator(), no_unit, 0, &grows));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), conn.element_limit);
+    try std.testing.expectEqual(@as(u64, 0), grows);
+}
+
+// The id pool a batch test exhausts.
+const ExhaustedPool = enum { comps, terms };
+
+// Applies `system`'s pending change with `pool` reading one row short of its id sentinel and
+// holding no free id: growth checks only the pool's length, so no row memory backs the count,
+// and both are restored before any reader walks the rows. The batch fails as OutOfMemory;
+// with `arm`, on an allocator failing every request, so the id check, not an allocation, is
+// what failed (a warmed batch asks nothing before its id growth). The graph stays as
+// `before` with the change pending, and the retry with the rows freed equals a rebuild.
+fn expectExhaustedPoolBatch(fixture: *TestWorld, system: *PathfindingSystem, before: *const PathfindingSystem, pool: ExhaustedPool, arm: bool) !void {
+    const conn = &system.graph.connectivity;
+    const closure = &conn.closure;
+    const len = switch (pool) {
+        .comps => &conn.comps.len,
+        .terms => &closure.terms.len,
+    };
+    const free = switch (pool) {
+        .comps => &conn.comp_free,
+        .terms => &closure.term_free,
+    };
+    const sentinel: usize = switch (pool) {
+        .comps => no_comp,
+        .terms => free_end,
+    };
+    const live_rows = len.*;
+    const free_ids = try std.testing.allocator.dupe(u32, free.items);
+    defer std.testing.allocator.free(free_ids);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    if (arm) {
+        system.allocator = failing.allocator();
+        system.graph.allocator = failing.allocator();
+    }
+    len.* = sentinel - 1;
+    free.items.len = 0;
+    const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    system.allocator = std.testing.allocator;
+    system.graph.allocator = std.testing.allocator;
+    len.* = live_rows;
+    free.items.len = free_ids.len;
+    conn.refreshColumns();
+    closure.refreshColumns();
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqualSlices(u32, free_ids, free.items);
+    try test_support.expectConnectivityConsistent(&system.graph);
+    try test_support.expectSameConnectivityPartition(&system.graph, &before.graph);
+    try test_support.expectSameClosure(&system.graph, &before.graph);
+    try std.testing.expect(system.hasPendingNavUpdates(&fixture.world));
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try fixture.expectMatchesRebuild(system);
+}
+
+// A long release window, so a warmed batch's staging stays held.
+const exhausted_pool_window: u32 = 1 << 16;
+
+test "a marks batch reaching an exhausted comp id pool fails as OutOfMemory without asking the allocator, keeps the graph and its change pending, and the retry equals a rebuild" {
+    var fixture = try TestWorld.init(4, 1);
+    defer fixture.deinit();
+    var system = try fixture.build(windowCapacity(exhausted_pool_window));
+    defer system.deinit();
+    // A wall across the level splits it: the batch needs fresh comps. Placed, removed, and
+    // placed again, so the last batch's staging is warm.
+    for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
+        for (0..16) |y| try fixture.setCell(&system, 0, 7, @intCast(y), tile);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    }
+    var before = try fixture.build(test_support.abstractCapacity());
+    defer before.deinit();
+    for (0..16) |y| try fixture.setCell(&system, 0, 7, @intCast(y), fixture.tree);
+    try expectExhaustedPoolBatch(&fixture, &system, &before, .comps, true);
+}
+
+test "a closure batch reaching an exhausted terminal id pool fails as OutOfMemory without asking the allocator, keeps the closure and its change pending, and the retry equals a rebuild" {
+    const chunks: u16 = 4;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    try addChain(&fixture, chunks, 0, 0, 8);
+    var system = try fixture.build(windowCapacity(exhausted_pool_window));
+    defer system.deinit();
+    // Reopening the tail's room creates its terminal. Closed, reopened, and closed again, so
+    // the last reopening's staging is warm.
+    for ([_]TileId{ fixture.tree, fixture.grass, fixture.tree }) |tile| {
+        try setRoom(&fixture, &system, chunks, 0, 7, tile);
+        _ = try applyWithinBounds(&fixture, &system);
+    }
+    var before = try fixture.build(test_support.abstractCapacity());
+    defer before.deinit();
+    try setRoom(&fixture, &system, chunks, 0, 7, fixture.grass);
+    try expectExhaustedPoolBatch(&fixture, &system, &before, .terms, true);
+}
+
+test "a level build reaching an exhausted comp id pool fails as OutOfMemory, keeps the built levels and the new level pending, and the retry equals a rebuild" {
+    var fixture = try TestWorld.init(4, 1);
+    defer fixture.deinit();
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    var before = try fixture.build(test_support.abstractCapacity());
+    defer before.deinit();
+    const level = try fixture.world.addLevel(-16);
+    _ = try fixture.world.addDenseLayer(level, 0, .floor, fixture.grass);
+    // Unarmed: a level build allocates its fresh storage before its id growth.
+    try expectExhaustedPoolBatch(&fixture, &system, &before, .comps, false);
 }
 
 test "a marks batch reserves a key's node rows up to its chunk's label bound, however many link endpoints the chunk holds" {

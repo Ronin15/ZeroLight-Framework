@@ -2175,12 +2175,14 @@ pub const WorldSystem = struct {
 
     /// Reserves everything `addLevelLink(link)` needs without committing it: the
     /// link row and its two endpoint entries (each level holds its chunk heads from
-    /// create). Validates the link first. O(1) amortized. Call before a world mutate
-    /// that must pair with `addLevelLink`.
-    pub fn reserveLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, LevelLinkIndexOverflow, OutOfMemory }!void {
+    /// create). Validates the link first; at 2^31 - 1 links it fails as `OutOfMemory`, like
+    /// the allocator. O(1) amortized. Call before a world mutate that must pair with
+    /// `addLevelLink`.
+    pub fn reserveLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, OutOfMemory }!void {
         try self.validateLevelLink(link);
-        // Two endpoint entries per link must stay below the u32 list sentinel.
-        if (self.level_links.items.len >= no_link_endpoint / 2) return error.LevelLinkIndexOverflow;
+        // Two endpoint entries per link stay below the u32 list sentinel: exhausting it needs
+        // 2^32 - 2 live endpoint entries, so it fails as the allocator does.
+        if (self.level_links.items.len >= no_link_endpoint / 2) return error.OutOfMemory;
         try self.level_links.ensureUnusedCapacity(self.allocator, 1);
         try self.link_endpoint_next.ensureUnusedCapacity(self.allocator, 2);
     }
@@ -2188,7 +2190,7 @@ pub const WorldSystem = struct {
     /// Appends a persistent inter-level link and indexes both endpoints by chunk.
     /// Allocation-free after `reserveLevelLink(link)`; otherwise it reserves first, so
     /// an OOM adds nothing. O(1) after the reserve.
-    pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, LevelLinkIndexOverflow, OutOfMemory }!void {
+    pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, OutOfMemory }!void {
         try self.reserveLevelLink(link);
         const geom = self.chunkGeometry();
         const endpoint_a: u32 = @intCast(self.level_links.items.len * 2);
@@ -2324,13 +2326,15 @@ pub const WorldSystem = struct {
     ///
     /// Every growth is reserved before the band list, layer row, and composed bits
     /// are written, so an OOM leaves them retryable.
-    pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) error{ InvalidWorldLevel, InvalidWorldTile, WorldLayerOverflow, OutOfMemory }!usize {
+    pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) error{ InvalidWorldLevel, InvalidWorldTile, OutOfMemory }!usize {
         try self.validateLevelIndex(level_index);
         try self.validateTileId(fill_tile);
 
         const terrain = &self.level_terrain.items[level_index];
         const layer_index = self.dense_layers.len;
-        if (layer_index > std.math.maxInt(u32)) return error.WorldLayerOverflow;
+        // Layer indices stay below `no_floor_layer`: exhausting them needs 2^32 - 1 live layers,
+        // so it fails as the allocator does.
+        if (layer_index >= world_terrain.no_floor_layer) return error.OutOfMemory;
         try self.dense_layers.ensureUnusedCapacity(self.allocator, 1);
         try terrain.bands.ensureUnusedCapacity(self.allocator, 1);
         var store = try DenseLayerStore.init(self.allocator, self.chunkCountPerLevel(), fill_tile);
@@ -2339,7 +2343,8 @@ pub const WorldSystem = struct {
         // Commit: band list, layer row, and composed bits are all infallible from here.
         self.dense_layers.appendAssumeCapacity(.{
             .level_index = level_index,
-            // At most one band per dense layer, and layer indices fit u32 (checked above).
+            // At most one band per dense layer, and layer indices are below `no_floor_layer`
+            // (checked above).
             .band = @intCast(terrain.bands.items.len),
             .base_z = base_z,
             .depth_band = depth,
@@ -2411,14 +2416,16 @@ pub const WorldSystem = struct {
         const local_cell = geom.localOf(x, y);
         const terrain = &self.level_terrain.items[level_index];
         const blocked = &terrain.blocked;
+        // Row indices stay below the u32 list sentinel: exhausting them needs 2^32 - 1 live
+        // sparse rows, so it fails as the allocator does.
+        if (self.sparse_tiles.len >= no_sparse_tile) return error.OutOfMemory;
         try self.sparse_tiles.ensureUnusedCapacity(self.allocator, 1);
         if (flags.blocks_movement and blocked.setNeedsSlot(chunk, local_cell, true)) {
             try self.ensureBlockedSlots(blocked, 1);
         }
 
-        // Row indices stay below the list sentinel (u32).
+        // Below `no_sparse_tile`: checked before the reserve.
         const new_index: u32 = @intCast(self.sparse_tiles.len);
-        std.debug.assert(new_index != no_sparse_tile);
         const head = terrain.sparse_heads[chunk];
         self.sparse_tiles.appendAssumeCapacity(.{
             .level_index = level_index,
@@ -6850,6 +6857,125 @@ test "reserveLevelLink makes addLevelLink allocation-free and a failed add chang
     try std.testing.expectEqual(@as(?u16, 0), world.rampLinkOtherLevel(1, .{ .x = 2, .y = 2 }));
     try std.testing.expectEqual(@as(?u16, 1), world.rampLinkOtherLevel(2, .{ .x = 6, .y = 6 }));
     try std.testing.expectEqual(@as(?u16, 2), world.rampLinkOtherLevel(1, .{ .x = 6, .y = 6 }));
+}
+
+test "reserveLevelLink fails as OutOfMemory at 2^31 - 1 links held, adding nothing, and reserves one link short of it" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    _ = try world.addLevel(0);
+    _ = try world.addLevel(-level_z_step);
+    const link = rampLinkForTest(1, .{ .x = 2, .y = 2 }, 0, .{ .x = 2, .y = 2 });
+    // The link list reads `held` rows with room for one more: the reserve reads only its
+    // length and capacity, so no row memory backs the count. Restored before deinit.
+    var spare: [1]LevelLink = undefined;
+    const real_links = world.level_links;
+    defer world.level_links = real_links;
+    const limit: usize = no_link_endpoint / 2;
+    for ([_]usize{ limit, limit - 1 }) |held| {
+        world.level_links.items = (&spare).ptr[0..held];
+        world.level_links.capacity = held + 1;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+        if (held == limit) {
+            // Fails before asking the allocator: no endpoint entry reserved, no head moved.
+            try std.testing.expectError(error.OutOfMemory, world.reserveLevelLink(link));
+            try std.testing.expectError(error.OutOfMemory, world.addLevelLink(link));
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 0), world.link_endpoint_next.capacity);
+            try std.testing.expectEqual(no_link_endpoint, world.level_terrain.items[0].link_heads[0]);
+            try std.testing.expectEqual(no_link_endpoint, world.level_terrain.items[1].link_heads[0]);
+        } else {
+            // One short of the limit, only the endpoint entries need memory.
+            try std.testing.expectError(error.OutOfMemory, world.reserveLevelLink(link));
+            try std.testing.expect(failing.has_induced_failure);
+            world.allocator = std.testing.allocator;
+            try world.reserveLevelLink(link);
+            try std.testing.expect(world.link_endpoint_next.capacity >= 2);
+        }
+        try std.testing.expectEqual(held, world.levelLinks().len);
+    }
+}
+
+test "addSparseTile fails as OutOfMemory at 2^32 - 1 rows held, before any reserve, linking and blocking nothing; one row short reaches the allocator" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const level = try world.addLevel(0);
+    _ = try world.addSparseTile(level, 0, 0, tiles.grass, 0, .floor);
+    const live_rows = world.sparse_tiles.len;
+    // The rows read `held` rows: the add checks only the length before its reserves, so no
+    // row memory backs the count. Restored before any reader walks the rows.
+    for ([_]usize{ no_sparse_tile, no_sparse_tile - 1 }) |held| {
+        world.sparse_tiles.len = held;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        const result = world.addSparseTile(level, 1, 1, tiles.deco, 0, .obstacle);
+        world.allocator = std.testing.allocator;
+        world.sparse_tiles.len = live_rows;
+        try std.testing.expectError(error.OutOfMemory, result);
+        // At the sentinel nothing is asked of the allocator; one row short, the row reserve is.
+        try std.testing.expectEqual(held == no_sparse_tile - 1, failing.has_induced_failure);
+        var buffer: [2]u32 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), testChunkSparseRows(&world, level, 0, &buffer).len);
+        try std.testing.expect(!world.levelBlocksMovement(level, 1, 1));
+    }
+    // With the rows below the sentinel, the same add commits.
+    _ = try world.addSparseTile(level, 1, 1, tiles.deco, 0, .obstacle);
+    try std.testing.expect(world.levelBlocksMovement(level, 1, 1));
+}
+
+test "addDenseLayer fails as OutOfMemory at 2^32 - 1 layers held, before any reserve, adding no band; one layer short reaches the allocator" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const tiles = try TerrainTestTiles.resolve(&world, &meta);
+    const level = try world.addLevel(0);
+    const live_layers = world.dense_layers.len;
+    // The layers read `held` rows: the add checks only the length before its reserves, so
+    // no layer memory backs the count. Restored before any reader walks the layers.
+    for ([_]usize{ world_terrain.no_floor_layer, world_terrain.no_floor_layer - 1 }) |held| {
+        world.dense_layers.len = held;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        const result = world.addDenseLayer(level, 0, .floor, tiles.grass);
+        world.allocator = std.testing.allocator;
+        world.dense_layers.len = live_layers;
+        try std.testing.expectError(error.OutOfMemory, result);
+        // At the sentinel nothing is asked of the allocator; one layer short, the row
+        // reserve is.
+        try std.testing.expectEqual(held == world_terrain.no_floor_layer - 1, failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[level].bands.items.len);
+        try std.testing.expectEqual(world_terrain.no_floor_layer, world.level_terrain.items[level].floor_layer);
+    }
+    // Below the sentinel the same add commits.
+    try std.testing.expectEqual(live_layers, try world.addDenseLayer(level, 0, .floor, tiles.grass));
 }
 
 const procedural_test_config = WorldBuildConfig{

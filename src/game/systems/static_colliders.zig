@@ -797,10 +797,9 @@ pub const StaticColliderSystem = struct {
         if (self.anchor_free.items.len >= needed) return;
         const added = needed - self.anchor_free.items.len;
         const total = self.anchor_blocks.items.len + added;
-        // The pool holds at most the live blocks plus one sync's claims; at 56 B per block,
-        // 2^32 blocks are 224 GiB, so the allocator fails long before an id reaches
-        // `no_value`.
-        std.debug.assert(total < no_value);
+        // Block ids stay below `no_value`: exhausting them needs 2^32 - 1 live blocks, so it
+        // fails as the allocator does.
+        if (total >= no_value) return error.OutOfMemory;
         if (total > self.anchor_blocks.capacity) {
             try self.anchor_blocks.ensureTotalCapacity(self.allocator, @max(total, self.anchor_blocks.capacity *| 2));
             self.countAnchorGrowth();
@@ -2515,5 +2514,28 @@ test "a static whose clamped min corner sits in a level's last partial chunk is 
         try expectQueryMatchesBruteForce(&fixture.colliders, 0, box, &expected, hits);
         try std.testing.expect(expected.items.len != 0);
         try expectQueryMatchesBruteForce(&rebuilt, 0, box, &expected, hits);
+    }
+}
+
+test "an anchor-block reserve fails as OutOfMemory at 2^32 - 1 blocks before asking the allocator, and one block short of it reaches the allocator" {
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    colliders.allocator = failing.allocator();
+    defer colliders.allocator = std.testing.allocator;
+    // The pool reads `held` blocks with room for them all and no free id: the reserve reads
+    // only its length and capacity, so no block memory backs the count. Restored before
+    // deinit.
+    var spare: [1]AnchorBlock = undefined;
+    const real_blocks = colliders.anchor_blocks;
+    defer colliders.anchor_blocks = real_blocks;
+    for ([_]usize{ no_value - 1, no_value - 2 }) |held| {
+        colliders.anchor_blocks.items = (&spare).ptr[0..held];
+        colliders.anchor_blocks.capacity = no_value - 1;
+        try std.testing.expectError(error.OutOfMemory, colliders.ensureFreeAnchorBlocks(1));
+        try std.testing.expectEqual(held, colliders.anchor_blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 0), colliders.anchor_free.items.len);
+        // At the limit nothing is asked of the allocator; one short, the free list's growth is.
+        try std.testing.expectEqual(held == no_value - 2, failing.has_induced_failure);
     }
 }

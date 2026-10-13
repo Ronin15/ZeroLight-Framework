@@ -86,7 +86,6 @@ pub const DigConfig = struct {
 /// What a dig's reserve and commit can fail with; each leaves the world unchanged.
 pub const DigEditError = WorldEditError || error{
     UnresolvedDigTiles,
-    LevelLinkIndexOverflow,
     StimulusCapacityExceeded,
     EventCapacityExceeded,
 };
