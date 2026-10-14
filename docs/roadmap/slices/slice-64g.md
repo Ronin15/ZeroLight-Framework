@@ -383,6 +383,17 @@ a design open for this slice):
       (`e2b9b2c`: descent 64 at caps 29.75 → 26.54 ms, its hop chain
       239.2 → 207.5 ms, `pathfinding` 1024 serial 41.7 → 31.4 ms, cross-level depth
       256032 serial 24.8 → 20.9 ms).
+- [x] Pipeline init sizes pathfinding's elastic pools for the committed crowd,
+      so the first update after load grows nothing (`4c247e7`; found in the
+      owner's ReleaseSafe demo at about 2,000 entities: a one-off 5.51 ms
+      pathfinding stage, 6.6 ms Debug at 1,792 agents, linear in agents). The
+      update's resize is timed in the perf log (`resize_avg_ms`/`resize_max_ms`,
+      `path_resize_copy`).
+- [x] Pathfinding's per-step gates (frame, pending, group tallies) follow the
+      live agent count, never capacity history, and a shrink never drops live
+      pending work or tallies (`78f4f90`); a grown and a freshly sized system
+      admit and defer identically. The result cache's history dependence stays
+      open below.
 - [x] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
       every allocation leaves state intact and the retry equals a rebuild; one
       chunk's change leaves every other chunk untouched; a multi-level cave-in
