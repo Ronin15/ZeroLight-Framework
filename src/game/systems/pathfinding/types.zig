@@ -45,6 +45,16 @@ pub const open_heap_headroom_factor: usize = 4;
 pub fn openHeapLimit(node_budget: usize) usize {
     return @max(@as(usize, 16), node_budget *| open_heap_headroom_factor);
 }
+
+/// Crossing boxes the cross-level heuristic may touch in one search whose node budget is
+/// `node_budget`, so its settles stay a fixed fraction of the search's claims. A settle scans
+/// the arrival window of the box's level (the source levels whose short links land there)
+/// plus one sift. Past the budget the crossing search freezes into a weaker, still consistent
+/// bound.
+pub fn crossingBoxBudget(node_budget: usize) usize {
+    return node_budget / crossing_box_cost_nodes;
+}
+const crossing_box_cost_nodes: usize = 4;
 // Words of the inline path stripe each cached result owns: a plain path of up to this
 // many cells, or a stitched path of half as many, is stored inline; a longer result is
 // stored whole in a long block (`resultBlockWords`).
@@ -669,6 +679,11 @@ pub const PathfindingStats = struct {
     // fixed max_stitch_segments cap is what's bounding solve cost" (this stays pinned at
     // or near the cap every spike) from "some other cost dominates" (this stays low).
     max_stitch_segments_observed: usize = 0,
+    // Diagnostic only: crossing boxes the cross-level heuristic settled over this step's
+    // solves, and the solves whose crossing search its budget froze, summed across workers in
+    // finishUpdate (SearchScratch.crossing_boxes_settled).
+    crossing_boxes_settled: usize = 0,
+    crossing_budget_frozen: usize = 0,
     // Diagnostic only: distinct group keys tallied this step; held near or above
     // max_group_fields it shows goals waiting for a field slot.
     distinct_group_keys: usize = 0,

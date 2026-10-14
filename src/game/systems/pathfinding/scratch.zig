@@ -21,6 +21,7 @@ const StampedTable = @import("../../stamped_table.zig").StampedTable;
 const openHeapLimit = @import("types.zig").openHeapLimit;
 const hashTableSlots = @import("../../stamped_table.zig").hashTableSlots;
 const fibonacciSlot = @import("../../stamped_table.zig").fibonacciSlot;
+const crossingBoxBudget = @import("types.zig").crossingBoxBudget;
 
 const AbstractSlotFlags = packed struct(u8) {
     // The slot's best parent edge is a cross-level or teleport link.
@@ -59,6 +60,151 @@ fn freshAbstractSlot(node: usize, stamp: u32) AbstractSlot {
     return .{ .node = node, .stamp = stamp, .g = unreachable_cost, .parent = no_slot, .x = 0, .y = 0, .portal_label = 0, .portal_flags = .{}, .flags = .{} };
 }
 
+/// One box the cross-level heuristic's crossing search touched: its `level << 4 | slot` ref
+/// (`crossingBoxRef`), `generation << 1 | settled`, and best distance to the goal.
+pub const CrossingBoxSlot = extern struct {
+    box: u32,
+    stamp: u32,
+    d: u32,
+};
+
+/// One level holding a settled crossing box: how many of its boxes settled and the least
+/// distance among them.
+pub const CrossingLevelSlot = extern struct {
+    level: u32,
+    stamp: u32,
+    settled: u32,
+    d_min: u32,
+};
+
+const CrossingBoxTable = StampedTable(CrossingBoxSlot, "box");
+const CrossingLevelTable = StampedTable(CrossingLevelSlot, "level");
+
+/// The box ref of a level's crossing slot; below 2^20 for a `u16` level.
+pub fn crossingBoxRef(level: u16, slot: usize) u32 {
+    std.debug.assert(slot < types.long_link_pairs);
+    // In range: slot < 16.
+    return @as(u32, level) << 4 | @as(u32, @intCast(slot));
+}
+
+fn freshCrossingBox(box: u32, stamp: u32) CrossingBoxSlot {
+    return .{ .box = box, .stamp = stamp, .d = unreachable_cost };
+}
+
+fn freshCrossingLevel(level: u32, stamp: u32) CrossingLevelSlot {
+    return .{ .level = level, .stamp = stamp, .settled = 0, .d_min = unreachable_cost };
+}
+
+/// The cross-level heuristic's per-query crossing search: a Dijkstra from the goal over the
+/// level crossings' boxes, in open-addressed box and level tables of `hashTableSlots(box_limit)`
+/// rows and a heap of `openHeapLimit(box_limit)` entries, so memory follows the search's node
+/// budget, never the level or link count. A `begin` is O(1) (generation stamps).
+pub const CrossingScratch = struct {
+    box_generation: u32 = 1,
+    level_generation: u32 = 1,
+    boxes_used: usize = 0,
+    levels_used: usize = 0,
+    /// Logical box cap set by `reserve`: the most distinct boxes (and so settles and levels)
+    /// one query may touch; a query budget never exceeds it.
+    box_limit: usize = 0,
+    /// This query's box budget, at most `box_limit`; set by `begin`.
+    budget: usize = 0,
+    box_slots: []CrossingBoxSlot = &.{},
+    box_shift: u6 = 0,
+    level_slots: []CrossingLevelSlot = &.{},
+    level_shift: u6 = 0,
+    open: std.ArrayList(OpenNode) = .empty,
+    /// Logical open-heap cap, `openHeapLimit` of the query budget (set by `begin`); the search
+    /// gates compare against this, so a freeze never depends on reserved capacity.
+    open_limit: usize = 0,
+    /// This query's settled boxes and whether its budget froze it.
+    settles: usize = 0,
+    frozen: bool = false,
+
+    pub fn deinit(self: *CrossingScratch, allocator: std.mem.Allocator) void {
+        allocator.free(self.level_slots);
+        allocator.free(self.box_slots);
+        self.open.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Sizes the tables for `box_limit` boxes. A no-op at the reserved size; otherwise every
+    /// table is allocated before anything changes, so an out-of-memory leaves the scratch as
+    /// it was.
+    pub fn reserve(self: *CrossingScratch, allocator: std.mem.Allocator, box_limit: usize) error{OutOfMemory}!void {
+        if (self.box_slots.len == try hashTableSlots(box_limit) and self.box_limit == box_limit) return;
+        const open_limit = openHeapLimit(box_limit);
+        const boxes = try CrossingBoxTable.alloc(allocator, box_limit);
+        errdefer allocator.free(boxes.slots);
+        const levels = try CrossingLevelTable.alloc(allocator, box_limit);
+        errdefer allocator.free(levels.slots);
+        try self.open.ensureTotalCapacity(allocator, open_limit);
+        allocator.free(self.box_slots);
+        allocator.free(self.level_slots);
+        self.box_slots = boxes.slots;
+        self.box_shift = boxes.shift;
+        self.level_slots = levels.slots;
+        self.level_shift = levels.shift;
+        self.box_generation = 1;
+        self.level_generation = 1;
+        self.boxes_used = 0;
+        self.levels_used = 0;
+        self.box_limit = box_limit;
+        self.budget = box_limit;
+        self.open_limit = open_limit;
+        std.debug.assert(self.box_limit * 2 <= self.box_slots.len and self.box_limit * 2 <= self.level_slots.len);
+        std.debug.assert(self.open.capacity >= self.open_limit);
+        self.open.clearRetainingCapacity();
+        self.settles = 0;
+        self.frozen = false;
+    }
+
+    /// Starts a query whose box budget is `budget`, clamped to `box_limit`. O(1).
+    pub fn begin(self: *CrossingScratch, budget: usize) void {
+        std.debug.assert(self.box_slots.len != 0);
+        self.open.clearRetainingCapacity();
+        self.boxes_used = 0;
+        self.levels_used = 0;
+        self.budget = @min(budget, self.box_limit);
+        // Within the reserved heap: budget <= box_limit.
+        self.open_limit = openHeapLimit(self.budget);
+        std.debug.assert(self.open.capacity >= self.open_limit);
+        self.settles = 0;
+        self.frozen = false;
+        CrossingBoxTable.advance(self.box_slots, &self.box_generation);
+        CrossingLevelTable.advance(self.level_slots, &self.level_generation);
+    }
+
+    /// The slot of `box`, claiming it on first touch this query (distance unreachable, open);
+    /// null only when a claim would pass `budget`.
+    pub fn boxFor(self: *CrossingScratch, box: u32) ?*CrossingBoxSlot {
+        const claim = CrossingBoxTable.claim(self.box_slots, self.box_shift, self.box_generation, &self.boxes_used, self.budget, box, freshCrossingBox) orelse return null;
+        return &self.box_slots[claim.slot];
+    }
+
+    /// The slot of `box` when this query touched it; claims nothing.
+    pub fn findBox(self: *CrossingScratch, box: u32) ?*const CrossingBoxSlot {
+        // A budget equal to the claims made claims nothing new.
+        const claim = CrossingBoxTable.claim(self.box_slots, self.box_shift, self.box_generation, &self.boxes_used, self.boxes_used, box, freshCrossingBox) orelse return null;
+        return &self.box_slots[claim.slot];
+    }
+
+    /// The slot of `level`, claiming it on its first settled box. Never null: a level is
+    /// claimed only by a settle, and settles never pass the box claims.
+    pub fn levelFor(self: *CrossingScratch, level: u16) *CrossingLevelSlot {
+        std.debug.assert(self.levels_used < self.boxes_used);
+        // Budget `boxes_used`: each level claim follows a distinct settled box.
+        const claim = CrossingLevelTable.claim(self.level_slots, self.level_shift, self.level_generation, &self.levels_used, self.boxes_used, level, freshCrossingLevel) orelse unreachable; // lint:allow catch-unreachable: levels claimed <= boxes settled < boxes claimed, inside the table's limit
+        return &self.level_slots[claim.slot];
+    }
+
+    /// The slot of `level` when one of its boxes settled this query; claims nothing.
+    pub fn findLevel(self: *CrossingScratch, level: u16) ?*const CrossingLevelSlot {
+        const claim = CrossingLevelTable.claim(self.level_slots, self.level_shift, self.level_generation, &self.levels_used, self.levels_used, level, freshCrossingLevel) orelse return null;
+        return &self.level_slots[claim.slot];
+    }
+};
+
 // Budget-bounded A* over abstract portal nodes keyed by a packed (level << 32) | cell ref,
 // in an open-addressed table of `hashTableSlots(node_limit)` rows, so memory follows the
 // node budget, never the portal count. `corridor` holds the ordered refs of the chosen
@@ -85,8 +231,11 @@ pub const AbstractScratch = struct {
     /// Logical corridor cap set by `reserve` (`max_abstract_nodes`); the search gates
     /// compare against this, never `corridor.capacity`.
     corridor_limit: usize = 0,
+    /// The search's cross-level heuristic crossing scratch, at `crossingBoxBudget(node_limit)`.
+    crossing: CrossingScratch = .{},
 
     pub fn deinit(self: *AbstractScratch, allocator: std.mem.Allocator) void {
+        self.crossing.deinit(allocator);
         self.corridor_link.deinit(allocator);
         self.corridor.deinit(allocator);
         allocator.free(self.slots);
@@ -109,6 +258,7 @@ pub const AbstractScratch = struct {
         try self.open.ensureTotalCapacity(allocator, open_limit);
         try self.corridor.ensureTotalCapacity(allocator, max_abstract_nodes);
         try self.corridor_link.ensureTotalCapacity(allocator, max_abstract_nodes);
+        try self.crossing.reserve(allocator, crossingBoxBudget(max_abstract_nodes));
         allocator.free(self.slots);
         self.slots = table.slots;
         self.slot_shift = table.shift;
@@ -135,6 +285,9 @@ pub const AbstractScratch = struct {
         self.corridor_link.clearRetainingCapacity();
         self.nodes_used = 0;
         AbstractTable.advance(self.slots, &self.generation);
+        // The crossing search begins lazily, on the search's first cross-level estimate.
+        self.crossing.settles = 0;
+        self.crossing.frozen = false;
     }
 
     /// The slot of `node`, claiming it on first touch this generation (cost unreachable, no
@@ -245,6 +398,10 @@ pub const SearchScratch = struct {
     // PathfindingSystem aggregates and clears it once per step in finishUpdate, so
     // it reflects one step's true worst case rather than a single solve's.
     max_stitch_segments_used: usize = 0,
+    // Diagnostic only: crossing boxes the heuristic settled, and solves whose crossing search
+    // its budget froze, in this worker's solves since the last aggregation (finishUpdate).
+    crossing_boxes_settled: usize = 0,
+    crossing_budget_frozen: usize = 0,
 
     comptime {
         std.debug.assert(@alignOf(SearchScratch) == thread_shared_record_alignment);
@@ -475,6 +632,56 @@ test "a reserve at unchanged budgets allocates nothing and keeps the table (Fail
     try std.testing.expectError(error.OutOfMemory, scratch.reserve(std.testing.failing_allocator, 128, 32, 16));
     try std.testing.expectEqual(search_slots, scratch.slots.ptr);
     try std.testing.expectEqual(@as(usize, 64), scratch.explored_limit);
+}
+
+test "a crossing scratch claims boxes to its query budget, finds only what it claimed, and a warmed reserve and query allocate nothing (FailingAllocator)" {
+    const allocator = std.testing.allocator;
+    var scratch = CrossingScratch{};
+    defer scratch.deinit(allocator);
+    try scratch.reserve(allocator, 8);
+    try std.testing.expectEqual(@as(usize, 16), scratch.box_slots.len);
+    try std.testing.expectEqual(openHeapLimit(8), scratch.open_limit);
+    const box_slots = scratch.box_slots.ptr;
+    // At the reserved size a reserve is a no-op, and a whole query allocates nothing.
+    try scratch.reserve(std.testing.failing_allocator, 8);
+    try std.testing.expectEqual(box_slots, scratch.box_slots.ptr);
+    for (0..2) |_| {
+        scratch.begin(5);
+        try std.testing.expectEqual(@as(usize, 5), scratch.budget);
+        try std.testing.expectEqual(openHeapLimit(5), scratch.open_limit);
+        for (0..5) |slot| {
+            const box = scratch.boxFor(crossingBoxRef(@intCast(slot), slot)).?;
+            try std.testing.expectEqual(unreachable_cost, box.d);
+            box.d = @intCast(slot);
+        }
+        try std.testing.expect(scratch.boxFor(crossingBoxRef(9, 9)) == null);
+        try std.testing.expect(scratch.findBox(crossingBoxRef(9, 9)) == null);
+        try std.testing.expectEqual(@as(u32, 3), scratch.findBox(crossingBoxRef(3, 3)).?.d);
+        try std.testing.expectEqual(@as(usize, 5), scratch.boxes_used);
+        // A level claims on its first settle and resolves after.
+        try std.testing.expect(scratch.findLevel(3) == null);
+        scratch.levelFor(3).settled += 1;
+        try std.testing.expectEqual(@as(u32, 1), scratch.findLevel(3).?.settled);
+        for (0..scratch.open_limit) |index| scratch.open.appendAssumeCapacity(.{ .index = index, .f = 0, .h = 0 });
+    }
+    // A budget past the limit clamps to it.
+    scratch.begin(100);
+    try std.testing.expectEqual(@as(usize, 8), scratch.budget);
+    try std.testing.expect(scratch.findBox(crossingBoxRef(3, 3)) == null);
+    // A changed size under the failing allocator fails and leaves the old tables.
+    try std.testing.expectError(error.OutOfMemory, scratch.reserve(std.testing.failing_allocator, 64));
+    try std.testing.expectEqual(box_slots, scratch.box_slots.ptr);
+    try std.testing.expectEqual(@as(usize, 8), scratch.box_limit);
+}
+
+test "an abstract scratch sizes its crossing scratch to its node limit's crossing budget" {
+    const allocator = std.testing.allocator;
+    var abstract = AbstractScratch{};
+    defer abstract.deinit(allocator);
+    for ([_]usize{ 4096, 16384, 64 }) |nodes| {
+        try abstract.reserve(allocator, nodes);
+        try std.testing.expectEqual(crossingBoxBudget(nodes), abstract.crossing.box_limit);
+    }
 }
 
 test "SearchScratch participant slots never share a cache line" {

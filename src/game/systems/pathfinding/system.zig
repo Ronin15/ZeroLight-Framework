@@ -1485,6 +1485,10 @@ pub const PathfindingSystem = struct {
                 stats.max_stitch_segments_observed = scratch.max_stitch_segments_used;
             }
             scratch.max_stitch_segments_used = 0;
+            stats.crossing_boxes_settled += scratch.crossing_boxes_settled;
+            stats.crossing_budget_frozen += scratch.crossing_budget_frozen;
+            scratch.crossing_boxes_settled = 0;
+            scratch.crossing_budget_frozen = 0;
         }
     }
 
@@ -8325,7 +8329,19 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     }
 }
 
-test "threaded cross-level solves equal serial" {
+// Queues one request per goal from (1, 1) on level 0 to `goal_level` without solving, then
+// sets the pending tiers.
+fn queueCrossLevelWithTiers(system: *PathfindingSystem, requesters: []const EntityId, goal_level: u16, goals: []const math.Vec2, tiers: []const u8) !void {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(goals.len, goals.len);
+    for (requesters[0..goals.len], goals) |requester, goal| try appendPathRequest(&stream, .{ .entity = requester, .start_level = 0, .goal_level = goal_level, .start = tileCenter(1, 1), .goal = goal });
+    _ = try system.updateSerial(&stream, goals.len, .{ .max_solve_admissions_per_step = 0 });
+    try std.testing.expectEqual(goals.len, system.pending.len);
+    for (tiers, 0..) |tier, index| system.pending.atPtr(index).tier = tier;
+}
+
+test "threaded cross-level solves equal serial, at tier 0 and through the tier-1 pool, their crossing searches included" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -8351,6 +8367,7 @@ test "threaded cross-level solves equal serial" {
 
     var capacity = abstractCapacity();
     capacity.group_field_max_cells = 16;
+    capacity.max_escalated_solves_per_step = 4;
     var serial = PathfindingSystem.init(std.testing.allocator);
     defer serial.deinit();
     try serial.reserve(capacity);
@@ -8390,6 +8407,30 @@ test "threaded cross-level solves equal serial" {
         if (jumps_two_levels) via_teleport += 1 else via_ramps += 1;
     }
     try std.testing.expect(via_teleport > 0 and via_ramps > 0);
+    // The heuristic's crossing searches ran, and their work sums alike across workers.
+    try std.testing.expect(serial_stats.crossing_boxes_settled != 0);
+    try std.testing.expectEqual(serial_stats.crossing_boxes_settled, stats.crossing_boxes_settled);
+    try std.testing.expectEqual(serial_stats.crossing_budget_frozen, stats.crossing_budget_frozen);
+
+    // Half the requests through the tier-1 pool, whose entries run their own crossing search.
+    const tiers = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0 };
+    serial.clearRuntimeState();
+    threaded.clearRuntimeState();
+    try queueCrossLevelWithTiers(&serial, &requesters, 2, &goals, &tiers);
+    try queueCrossLevelWithTiers(&threaded, &requesters, 2, &goals, &tiers);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    try empty.reserve(1, 0);
+    const serial_tiered = try serial.updateSerial(&empty, 8, .{});
+    const tiered = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
+    try std.testing.expect(!tiered.solve_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 4), tiered.escalated_solves);
+    try std.testing.expectEqual(goals.len, serial_tiered.available_results);
+    try std.testing.expectEqual(goals.len, tiered.available_results);
+    try std.testing.expectEqual(serial_tiered.crossing_boxes_settled, tiered.crossing_boxes_settled);
+    // Every pool entry the step used ran its own crossing search.
+    for (threaded.tier1_scratch.items[0..tiered.escalated_solves]) |*entry| try std.testing.expect(entry.corridor.abstract.crossing.settles != 0);
+    for (goals) |goal| try expectSameStitched(cachedStitched(&serial, 2, goal), cachedStitched(&threaded, 2, goal));
 
     // The warmed threaded re-solve, heuristic and box scans included, allocates nothing.
     const original = threaded.allocator;
@@ -8404,6 +8445,13 @@ test "threaded cross-level solves equal serial" {
     try std.testing.expect(!warmed.solve_batch.ran_inline);
     try std.testing.expectEqual(goals.len, warmed.available_results);
     for (goals) |goal| try expectSameStitched(cachedStitched(&serial, 2, goal), cachedStitched(&threaded, 2, goal));
+    // And so does a warmed tier-1 re-solve through the pool.
+    threaded.clearRuntimeState();
+    try queueCrossLevelWithTiers(&threaded, &requesters, 2, &goals, &tiers);
+    const warmed_tiered = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
+    try std.testing.expectEqual(@as(usize, 4), warmed_tiered.escalated_solves);
+    try std.testing.expectEqual(goals.len, warmed_tiered.available_results);
+    try std.testing.expectEqual(serial_tiered.crossing_boxes_settled, warmed_tiered.crossing_boxes_settled);
 }
 
 test "a reserved threaded solve with escalations allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {

@@ -18,6 +18,10 @@ const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfi
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const AbstractSlot = @import("../game/systems/pathfinding/scratch.zig").AbstractSlot;
 const SearchSlot = @import("../game/systems/pathfinding/scratch.zig").SearchSlot;
+const CrossingBoxSlot = @import("../game/systems/pathfinding/scratch.zig").CrossingBoxSlot;
+const CrossingLevelSlot = @import("../game/systems/pathfinding/scratch.zig").CrossingLevelSlot;
+const crossingBoxBudget = @import("../game/systems/pathfinding/types.zig").crossingBoxBudget;
+const openHeapLimit = @import("../game/systems/pathfinding/types.zig").openHeapLimit;
 const OpenNode = @import("../game/systems/pathfinding/types.zig").OpenNode;
 const StitchedCell = @import("../game/systems/pathfinding/types.zig").StitchedCell;
 const hashTableSlots = @import("../game/stamped_table.zig").hashTableSlots;
@@ -1967,8 +1971,12 @@ fn tableRows(comptime keys: usize) usize {
 // Saturates.
 fn corridorBytes(table_rows: usize, abstract_nodes: usize, stitched_cells: usize) usize {
     const heap_entries: usize = @max(16, abstract_nodes *| 4);
+    // The heuristic's crossing scratch: box and level tables and a heap at its box budget.
+    const crossing_boxes = crossingBoxBudget(abstract_nodes);
+    const crossing_rows = hashTableSlots(crossing_boxes) catch std.math.maxInt(usize);
+    const crossing = crossing_rows *| (@sizeOf(CrossingBoxSlot) + @sizeOf(CrossingLevelSlot)) +| openHeapLimit(crossing_boxes) *| @sizeOf(OpenNode);
     return table_rows *| @sizeOf(AbstractSlot) +| heap_entries *| @sizeOf(OpenNode) +|
-        abstract_nodes *| (@sizeOf(usize) + @sizeOf(bool) + @sizeOf(u32)) +| (stitched_cells + 1) * @sizeOf(StitchedCell);
+        abstract_nodes *| (@sizeOf(usize) + @sizeOf(bool) + @sizeOf(u32)) +| (stitched_cells + 1) * @sizeOf(StitchedCell) +| crossing;
 }
 
 fn ceilMib(bytes: usize) usize {

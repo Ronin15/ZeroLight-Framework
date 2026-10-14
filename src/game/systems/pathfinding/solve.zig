@@ -19,6 +19,12 @@ const NavPortal = @import("nav_graph.zig").NavPortal;
 const ChunkGeometry = @import("types.zig").ChunkGeometry;
 const LinkBounds = @import("nav_graph.zig").LinkBounds;
 const LinkPairs = @import("nav_graph.zig").LinkPairs;
+const PairChains = @import("nav_graph.zig").PairChains;
+const LinkBox = @import("nav_graph.zig").LinkBox;
+const LevelCrossings = @import("nav_graph.zig").LevelCrossings;
+const CrossingScratch = @import("scratch.zig").CrossingScratch;
+const crossingBoxRef = @import("scratch.zig").crossingBoxRef;
+const crossingBoxBudget = @import("types.zig").crossingBoxBudget;
 const CrossingRates = @import("nav_graph.zig").CrossingRates;
 const max_link_box_coord = @import("nav_graph.zig").max_link_box_coord;
 const AbstractScratch = @import("scratch.zig").AbstractScratch;
@@ -218,7 +224,10 @@ fn solveAbstract(
 ) PathSolveResult {
     const graph = &system.graph;
     const abstract = &corridor_scratch.abstract;
-    const corridor = switch (abstractCorridor(graph, abstract, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap)) {
+    const searched = abstractCorridor(graph, abstract, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap);
+    scratch.crossing_boxes_settled += abstract.crossing.settles;
+    scratch.crossing_budget_frozen += @intFromBool(abstract.crossing.frozen);
+    const corridor = switch (searched) {
         .found => |c| c,
         // Abstract scratch saturated: a reachable goal past the attempt's cap, retried on
         // the two-tier ladder.
@@ -427,15 +436,26 @@ fn relaxAbstractNode(
 // from the graph's link bounds: the least of a short and a long term. With D the planar
 // octile to the goal and K the fewest level-crossing short links that close the node's level
 // gap, a path using only short links costs at least D + K * short_excess and K * short_cost.
-// A path whose first long link lies in pair p costs at least the short-link bound from the
-// node to p's entrance box, plus p's cost, plus p's chain bound: the least, over pairs r its
-// exit box chains to, of the chain cost plus the short-link bound from r's exit box to the
-// goal. Box bounds charge a level gap at per-level crossing rates, so an entrance on a far
-// level cuts nothing nearby. The long term is at least `long_floor` (the cheapest link plus
-// the nearest exit box's bound) and `pair_floor` (the least pair offset), so a push scans
-// entrance boxes only past both; the offsets are built on the first push past `long_floor`.
-// On the goal level with no long link the estimate is octile. Short terms saturate; long
-// lanes clamp at `long_lane_cap`.
+// Off the goal level it also costs at least the node's crossing distance (`CrossingSearch`),
+// and the short term is the larger of the two. A path whose first long link lies in pair p
+// costs at least the short-link bound from the node to p's entrance box, plus p's cost, plus
+// p's chain bound: the least, over pairs r its exit box chains to, of the chain cost plus the
+// short-link bound from r's exit box to the goal. Box bounds charge a level gap at per-level
+// crossing rates, so an entrance on a far level cuts nothing nearby. The long term is at least
+// `long_floor` (the cheapest link plus the nearest exit box's bound) and `pair_floor` (the
+// least pair offset), so a push scans entrance boxes only past both; the offsets are built on
+// the first push past `long_floor`. On the goal level with no long link the estimate is
+// octile. Short terms saturate; long lanes clamp at `long_lane_cap`.
+//
+// The crossing distance is the exact distance to the goal in a relaxed graph: free octile
+// movement within each level, levels joined only through each level's departing crossing
+// boxes (`LevelCrossings`) at the box's least cost. It holds a cheaper copy of every short
+// edge, so it is a consistent lower bound on every short-only path. A Dijkstra from the goal
+// over the boxes computes it lazily: the first estimate on a level settles boxes in distance
+// order until that level's distances are final, and gathers its box distances once. Past the
+// crossing scratch's budget the search freezes at the distance F of the settle it stopped in:
+// an unsettled box then counts F, which adds edges to the relaxed graph, so the bound stays
+// consistent and is a pure function of graph, goal, and budget, whatever the evaluation order.
 const CrossLevelHeuristic = struct {
     goal_x: u32,
     goal_y: u32,
@@ -445,6 +465,7 @@ const CrossLevelHeuristic = struct {
     short_excess: u32,
     rates: CrossingRates,
     pairs: *const LinkPairs,
+    chains: *const PairChains,
     // Per pair, the box bound from its exit box to the goal.
     exit_terms: [long_link_pairs]i32,
     long_floor: u32,
@@ -452,6 +473,7 @@ const CrossLevelHeuristic = struct {
     offsets: [long_link_pairs]i32,
     pair_floor: u32,
     pair_ready: bool,
+    crossing: CrossingSearch,
 
     // The level-dependent part of the short term, shared by every node on one level.
     const LevelTerms = struct {
@@ -459,14 +481,23 @@ const CrossLevelHeuristic = struct {
         floor: u32,
     };
 
-    // One exit-box scan, once per query.
-    fn init(graph: *const NavGraph, goal_level: u16, goal_x: u32, goal_y: u32) CrossLevelHeuristic {
+    // One exit-box scan, once per query. `crossing` null (or a graph with no crossings)
+    // leaves out the crossing distance; `crossing_budget` caps the boxes its search touches.
+    fn init(graph: *const NavGraph, goal_level: u16, goal_x: u32, goal_y: u32, crossing: ?*CrossingScratch, crossing_budget: usize) CrossLevelHeuristic {
         const bounds = &graph.link_bounds;
         // Links exist only on world-backed graphs, whose u16 sides keep box lanes in i32.
-        if (bounds.pairs.count != 0) {
+        if (bounds.pairs.count != 0 or bounds.short_span != 0) {
             std.debug.assert(graph.world_backed and graph.geometry.width <= max_link_box_coord + 1 and graph.geometry.height <= max_link_box_coord + 1);
         }
-        return fromBounds(bounds, goal_level, goal_x, goal_y);
+        var heuristic = fromBounds(bounds, goal_level, goal_x, goal_y);
+        // Every level-crossing short link folds into the crossings, and only those set the span.
+        if (bounds.short_span != 0) {
+            if (crossing) |scratch| {
+                std.debug.assert(graph.level_crossings.items.len == graph.levels.items.len);
+                heuristic.crossing = CrossingSearch.init(graph.level_crossings.items, scratch, crossing_budget, goal_level, goal_x, goal_y, graph.geometry);
+            }
+        }
+        return heuristic;
     }
 
     fn fromBounds(bounds: *const LinkBounds, goal_level: u16, goal_x: u32, goal_y: u32) CrossLevelHeuristic {
@@ -480,11 +511,13 @@ const CrossLevelHeuristic = struct {
             .short_excess = bounds.short_excess,
             .rates = rates,
             .pairs = &bounds.pairs,
+            .chains = &bounds.chains,
             .exit_terms = @splat(0),
             .long_floor = unreachable_cost,
             .offsets = @splat(0),
             .pair_floor = unreachable_cost,
             .pair_ready = false,
+            .crossing = .{},
         };
         // With no long link every short term passes the unreachable floor.
         if (bounds.pairs.count == 0) return heuristic;
@@ -498,7 +531,7 @@ const CrossLevelHeuristic = struct {
     }
 
     // Per pair offset = min(cost + min(chain bound, cap), cap), the chain bound being the least
-    // over pairs r of chain_to[r] + exit_terms[r]: one `Int4` step per r and lane group.
+    // over pairs r of chains.to[r] + exit_terms[r]: one `Int4` step per r and lane group.
     fn preparePairs(self: *CrossLevelHeuristic) void {
         const pairs = self.pairs;
         const lane_groups = long_link_pairs / simd.lane_count;
@@ -507,7 +540,7 @@ const CrossLevelHeuristic = struct {
             const exit_term = simd.splatInt4(self.exit_terms[exit_pair]);
             for (&chain_bound, 0..) |*bound, group| {
                 // At most 2 * long_lane_cap, inside an i32.
-                bound.* = simd.minInt4(bound.*, simd.addInt4(simd.loadInt4(pairs.chain_to[exit_pair][group * simd.lane_count ..]), exit_term));
+                bound.* = simd.minInt4(bound.*, simd.addInt4(simd.loadInt4(self.chains.to[exit_pair][group * simd.lane_count ..]), exit_term));
             }
         }
         const cap = simd.splatInt4(long_lane_cap);
@@ -534,15 +567,175 @@ const CrossLevelHeuristic = struct {
         return .{ .add = crossings *| self.short_excess, .floor = crossings *| self.short_cost };
     }
 
-    // `terms` are `level`'s. Mutable only to build the pair offsets on first use, a pure
-    // function of the graph and goal.
+    // `terms` are `level`'s. Mutable only to build the pair offsets and run the crossing
+    // search on first use, both pure functions of the graph, goal, and budget.
     fn estimate(self: *CrossLevelHeuristic, terms: LevelTerms, level: u16, x: u32, y: u32) u32 {
         const planar = octileU32(x, y, self.goal_x, self.goal_y);
-        const short = @max(planar +| terms.add, terms.floor);
+        var short = @max(planar +| terms.add, terms.floor);
+        if (level != self.goal_level and self.crossing.enabled()) short = @max(short, self.crossing.bound(level, x, y, self.rates));
         if (short <= self.long_floor) return short;
         if (!self.pair_ready) self.preparePairs();
         if (short <= self.pair_floor) return short;
         return @min(short, self.pairs.entrances.offsetLowerBound(&self.offsets, self.pairs.count, x, y, level, self.rates));
+    }
+};
+
+// The heuristic's crossing distance (see `CrossLevelHeuristic`): a lazy Dijkstra from the goal
+// over the level crossings' boxes, run in a participant's `CrossingScratch`. The goal seeds it
+// as a settled point box on the goal level at distance 0. Settling a box on level l relaxes,
+// for every source level in l's arrival window, each departing box whose exit range covers l,
+// at its cost plus the planar octile from its exit box to the settled box's entrance
+// (`LinkBoxes.coveringTerms`, one `Int4` step per four slots). Ties pop by box ref, so the
+// settle order is a pure function of the crossings and the goal. Allocation-free.
+// SIMD verdict: scalar frontier (each pop relaxes from the distances earlier pops set); the
+// covering terms and the per-estimate offset scan are four-lane.
+const CrossingSearch = struct {
+    crossings: []const LevelCrossings = &.{},
+    scratch: ?*CrossingScratch = null,
+    budget: usize = 0,
+    goal_level: u16 = 0,
+    goal_x: u32 = 0,
+    goal_y: u32 = 0,
+    // The octile across a level: no point of a level is farther from another.
+    diameter: u32 = 0,
+    seeded: bool = false,
+    // Set once the heap drains: every reachable box is settled.
+    drained: bool = false,
+    // Set when the budget stops the search; unsettled boxes then count `frozen_at`.
+    frozen_at: ?u32 = null,
+    // Gathered levels' box distances, direct-mapped by level, so a search whose frontier spans
+    // up to `gathered_levels` levels gathers each once.
+    gathered: [gathered_levels]GatheredLevel = @splat(.{}),
+
+    const gathered_levels: usize = 16;
+
+    // A level's box distances, slots past its departing count copying slot 0; valid once
+    // `level` is set, and final for the query (a gathered level is resolved).
+    const GatheredLevel = struct {
+        level: u32 = std.math.maxInt(u32),
+        lanes: [long_link_pairs]i32 = @splat(long_lane_cap),
+    };
+
+    fn init(crossings: []const LevelCrossings, scratch: *CrossingScratch, budget: usize, goal_level: u16, goal_x: u32, goal_y: u32, geometry: ChunkGeometry) CrossingSearch {
+        // Sides of a world-backed graph fit u16, so the diameter stays below 2^21.
+        const width: u32 = @intCast(geometry.width);
+        const height: u32 = @intCast(geometry.height);
+        return .{
+            .crossings = crossings,
+            .scratch = scratch,
+            .budget = budget,
+            .goal_level = goal_level,
+            .goal_x = goal_x,
+            .goal_y = goal_y,
+            .diameter = octileU32(0, 0, width -| 1, height -| 1),
+        };
+    }
+
+    fn enabled(self: *const CrossingSearch) bool {
+        return self.scratch != null;
+    }
+
+    // The crossing distance from (x, y) on `level`, not the goal level, clamped to
+    // `long_lane_cap`; `long_lane_cap` when the level has no departing box.
+    fn bound(self: *CrossingSearch, level: u16, x: u32, y: u32, rates: CrossingRates) u32 {
+        std.debug.assert(level < self.crossings.len and level != self.goal_level);
+        const departing = &self.crossings[level].departing;
+        if (departing.count == 0) return long_lane_cap;
+        const gathered = &self.gathered[level % gathered_levels];
+        if (gathered.level != level) self.gather(level, gathered);
+        // Entrance boxes lie on `level`, so the box term charges no level gap. A lane sum
+        // reaches 2 * long_lane_cap; clamping only lowers a lower bound.
+        return @min(departing.entrances.offsetLowerBound(&gathered.lanes, departing.count, x, y, level, rates), @as(u32, long_lane_cap));
+    }
+
+    // Settles until `level`'s box distances are final, then gathers them into `gathered`.
+    fn gather(self: *CrossingSearch, level: u16, gathered: *GatheredLevel) void {
+        const scratch = self.scratch.?;
+        if (!self.seeded) self.seed(scratch);
+        while (!self.resolved(scratch, level)) self.settleNext(scratch);
+        const departing = &self.crossings[level].departing;
+        // An unsettled box lies past every point's nearest settled one on a resolved level, so
+        // it counts the cap, or the frozen distance once the budget stopped the search.
+        const unsettled: u32 = self.frozen_at orelse long_lane_cap;
+        for (0..departing.count) |slot| {
+            const box = scratch.findBox(crossingBoxRef(level, slot));
+            const distance = if (box != null and box.?.stamp & 1 != 0) box.?.d else unsettled;
+            // In [0, long_lane_cap]: relaxes skip candidates past the cap.
+            gathered.lanes[slot] = @intCast(distance);
+        }
+        for (departing.count..long_link_pairs) |pad| gathered.lanes[pad] = gathered.lanes[0];
+        gathered.level = level;
+    }
+
+    // Whether no further settle can lower a distance on `level`: the search froze or drained,
+    // every box of the level settled, or the least open distance passes the level's least
+    // settled distance plus its diameter, so no unsettled box is the nearest to any point.
+    fn resolved(self: *const CrossingSearch, scratch: *CrossingScratch, level: u16) bool {
+        if (self.frozen_at != null or self.drained) return true;
+        const settled = scratch.findLevel(level) orelse return false;
+        if (settled.settled == self.crossings[level].departing.count) return true;
+        // Never empty here: a drained heap sets `drained`.
+        return scratch.open.items[0].f >= settled.d_min +| self.diameter;
+    }
+
+    fn seed(self: *CrossingSearch, scratch: *CrossingScratch) void {
+        scratch.begin(self.budget);
+        self.seeded = true;
+        // In range: goal coordinates of a world-backed level fit u16.
+        self.relaxFrom(scratch, LinkBox.point(@intCast(self.goal_x), @intCast(self.goal_y), self.goal_level), self.goal_level, 0);
+        if (self.frozen_at == null and scratch.open.items.len == 0) self.drained = true;
+    }
+
+    // Pops the nearest open box, skipping superseded entries, and settles it.
+    fn settleNext(self: *CrossingSearch, scratch: *CrossingScratch) void {
+        while (scratch.open.items.len != 0) {
+            const next = popHeap(&scratch.open);
+            // In range: heap indices are box refs below 2^20.
+            const ref: u32 = @intCast(next.index);
+            const box = scratch.boxFor(ref).?;
+            if (box.stamp & 1 != 0 or next.f > box.d) continue;
+            box.stamp |= 1;
+            scratch.settles += 1;
+            const level: u16 = @intCast(ref >> 4);
+            const entry = scratch.levelFor(level);
+            entry.settled += 1;
+            entry.d_min = @min(entry.d_min, box.d);
+            self.relaxFrom(scratch, self.crossings[level].departing.entrances.boxAt(ref & 0xf), level, box.d);
+            break;
+        }
+        if (self.frozen_at == null and scratch.open.items.len == 0) self.drained = true;
+    }
+
+    // Relaxes every departing box landing on `level` toward the settled box `entrance` there
+    // at `distance`. A claim or push past the budget freezes the search at `distance`: every
+    // unsettled box lies at least that far.
+    fn relaxFrom(self: *CrossingSearch, scratch: *CrossingScratch, entrance: LinkBox, level: u16, distance: u32) void {
+        const arrivals = &self.crossings[level];
+        if (arrivals.arrival_lo > arrivals.arrival_hi) return;
+        for (arrivals.arrival_lo..@as(usize, arrivals.arrival_hi) + 1) |source_index| {
+            // In range: a window spans folded source levels.
+            const source: u16 = @intCast(source_index);
+            const departing = &self.crossings[source].departing;
+            if (departing.count == 0) continue;
+            const terms = departing.exits.coveringTerms(entrance, level);
+            for (0..departing.count) |slot| {
+                if (terms[slot] >= long_lane_cap) continue;
+                // Below 2^32: three lanes of at most long_lane_cap.
+                const candidate = @as(u64, distance) + @as(u64, @intCast(departing.cost[slot])) + @as(u64, @intCast(terms[slot]));
+                if (candidate >= long_lane_cap) continue;
+                const box = scratch.boxFor(crossingBoxRef(source, slot)) orelse return self.freeze(scratch, distance);
+                if (box.stamp & 1 != 0 or candidate >= box.d) continue;
+                if (scratch.open.items.len >= scratch.open_limit) return self.freeze(scratch, distance);
+                box.d = @intCast(candidate);
+                scratch.open.appendAssumeCapacity(.{ .index = crossingBoxRef(source, slot), .f = box.d, .h = 0 });
+                siftUp(scratch.open.items, scratch.open.items.len - 1);
+            }
+        }
+    }
+
+    fn freeze(self: *CrossingSearch, scratch: *CrossingScratch, distance: u32) void {
+        self.frozen_at = distance;
+        scratch.frozen = true;
     }
 };
 
@@ -586,7 +779,7 @@ fn abstractCorridor(
     const goal: u32 = @intCast(goal_index);
     const goal_y = goal / width;
     const goal_x = goal - goal_y * width;
-    var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
+    var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &abstract.crossing, crossingBoxBudget(abstract.node_budget));
 
     // Seed the open set with the start chunk's portals sharing the start cell's label,
     // costed by octile distance from the start.
@@ -1245,6 +1438,9 @@ const ReferenceAbstract = struct {
     corridor_limit: usize,
     // `goal_level_octile` is octile on the goal level and 0 off it.
     estimate: enum { cross_level, goal_level_octile } = .cross_level,
+    // The cross-level estimate's crossing scratch, at `crossingBoxBudget(budget)`; null leaves
+    // the crossing distance out.
+    crossing: ?*CrossingScratch = null,
 
     fn deinit(self: *ReferenceAbstract) void {
         const allocator = self.nodes.allocator;
@@ -1289,7 +1485,7 @@ const ReferenceAbstract = struct {
         const goal: u32 = @intCast(goal_index);
         const goal_x = goal % width;
         const goal_y = goal / width;
-        var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
+        var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, self.crossing, crossingBoxBudget(self.budget));
         const start_label = start_grid.labelAt(start_index);
         if (start_label == 0) return .unseedable;
         const start: u32 = @intCast(start_index);
@@ -1447,6 +1643,9 @@ test "abstract corridors with cached slot coordinates equal an uncached referenc
         var abstract = AbstractScratch{};
         defer abstract.deinit(allocator);
         try abstract.reserve(allocator, 4096);
+        var reference_crossing = CrossingScratch{};
+        defer reference_crossing.deinit(allocator);
+        try reference_crossing.reserve(allocator, crossingBoxBudget(4096));
         for (0..24) |query| {
             const start_level: u16 = random.uintLessThan(u16, 2);
             const goal_level: u16 = random.uintLessThan(u16, 2);
@@ -1462,6 +1661,7 @@ test "abstract corridors with cached slot coordinates equal an uncached referenc
                 .budget = budget,
                 .open_limit = abstract.open_limit,
                 .corridor_limit = abstract.corridor_limit,
+                .crossing = &reference_crossing,
             };
             defer reference.deinit();
             const expected = try reference.search(graph, start_grid, goal_grid, start_level, goal_level, start, goal);
@@ -1588,7 +1788,7 @@ fn heuristicTestLinks(random: std.Random, levels: u16) [9]LevelLink {
 
 // `heuristicTestLinks`, plus with `merged` 24 random long teleports from the west columns to the
 // east ones, so the long links outnumber the pair summary's width.
-fn heuristicTestLinkSet(random: std.Random, levels: u16, merged: bool, buffer: *[9 + 24]LevelLink) []const LevelLink {
+fn heuristicTestLinkSet(random: std.Random, levels: u16, merged: bool, buffer: *[9 + 24]LevelLink) []LevelLink {
     buffer[0..9].* = heuristicTestLinks(random, levels);
     if (!merged) return buffer[0..9];
     for (buffer[9..]) |*link| {
@@ -1705,11 +1905,16 @@ fn foundObjective(abstract: *AbstractScratch, width: usize, goal_index: usize) u
     return g +| octileU32(@intCast(cell % width), @intCast(cell / width), @intCast(goal_index % width), @intCast(goal_index / width));
 }
 
-test "the cross-level heuristic is consistent along every abstract edge and at most a goal portal's octile" {
+test "the cross-level heuristic is consistent along every abstract edge and at most a goal portal's octile, with its crossing search exact or frozen" {
     const allocator = std.testing.allocator;
     const DataSystem = @import("../../data_system.zig").DataSystem;
     var meta = try test_support.loadTestWorldMeta(allocator);
     defer meta.deinit();
+    var crossing = CrossingScratch{};
+    defer crossing.deinit(allocator);
+    try crossing.reserve(allocator, crossingBoxBudget(4096));
+    var frozen: usize = 0;
+    var raised: usize = 0;
     var edges: usize = 0;
     var goal_portals: usize = 0;
     var long_sources: usize = 0;
@@ -1723,8 +1928,17 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
         defer data.deinit();
         var world = try heuristicTestWorld(&meta, random, levels);
         defer world.deinit();
-        var link_buffer: [9 + 24]LevelLink = undefined;
-        const links = heuristicTestLinkSet(random, levels, seed >= 6, &link_buffer);
+        var link_buffer: [9 + 24 + 48]LevelLink = undefined;
+        const set = heuristicTestLinkSet(random, levels, seed >= 6, link_buffer[0 .. 9 + 24]);
+        // Seeds 6 and 7 also hold more level-crossing short links per level than a level's
+        // crossings width, so their boxes merge.
+        const ramps: usize = if (seed >= 6) 48 else 0;
+        for (link_buffer[set.len..][0..ramps]) |*ramp| {
+            const upper = random.uintLessThan(u16, levels - 1);
+            const cell = randomCell(random, 0, 16);
+            ramp.* = .{ .kind = .ramp, .level_a = upper, .cell_a = cell, .level_b = upper + 1, .cell_b = cell, .traversal_cost = random.uintLessThan(u32, 6), .bidirectional = random.boolean() };
+        }
+        const links = link_buffer[0 .. set.len + ramps];
         for (links) |link| try world.addLevelLink(link);
         var system = PathfindingSystem.init(allocator);
         defer system.deinit();
@@ -1739,6 +1953,11 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
         try std.testing.expectEqual(levels - 1, bounds.short_span);
         try std.testing.expect(bounds.short_cost < 100 and bounds.long_cost <= 43 and bounds.pairs.count > 0);
         if (seed >= 6) try std.testing.expectEqual(@as(u32, long_link_pairs), bounds.pairs.count);
+        if (seed >= 6) {
+            var full_levels: usize = 0;
+            for (graph.level_crossings.items) |crossings| full_levels += @intFromBool(crossings.departing.count == long_link_pairs);
+            try std.testing.expect(full_levels > 0);
+        }
         const width: u32 = @intCast(graph.geometry.width);
         // Random goals, then the first open cell on the wide teleport's exit row beyond its
         // exit: there a path through the teleport saves exactly its planar span.
@@ -1762,63 +1981,75 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
             const goal_y = goal / width;
             const goal_label = goal_grid.labelAt(goal);
             const goal_chunk = graph.geometry.chunkOfCell(goal);
-            var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y);
-            for (0..levels) |level_index| {
-                const level: u16 = @intCast(level_index);
-                for (0..graph.chunkCount()) |chunk_index| {
-                    const chunk: u32 = @intCast(chunk_index);
-                    const portals = graph.chunkPortals(level, chunk);
-                    for ([_][]const NavPortal{ portals.border, portals.extra }) |list| {
-                        for (list) |portal| {
-                            const cell = test_support.cellOfLocal(graph.geometry, chunk, portal.local);
-                            const x = cell % width;
-                            const y = cell / width;
-                            const h = heuristicAt(&heuristic, level, x, y);
-                            if (level == goal_level and goal_label != 0 and chunk == goal_chunk and portal.label == goal_label) {
-                                try std.testing.expect(h <= octileU32(x, y, goal_x, goal_y));
-                                goal_portals += 1;
-                            }
-                            for ([_][]const NavPortal{ portals.border, portals.extra }) |peers| {
-                                for (peers) |peer| {
-                                    if (peer.local == portal.local or peer.label != portal.label) continue;
-                                    const peer_cell = test_support.cellOfLocal(graph.geometry, chunk, peer.local);
-                                    const px = peer_cell % width;
-                                    const py = peer_cell / width;
-                                    try std.testing.expect(h <= octileU32(x, y, px, py) +| heuristicAt(&heuristic, level, px, py));
+            // The full budget, and budgets the crossing search outgrows.
+            for ([_]usize{ crossingBoxBudget(4096), 1, 3 }) |crossing_budget| {
+                var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &crossing, crossing_budget);
+                var plain = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, null, 0);
+                for (0..levels) |level_index| {
+                    const level: u16 = @intCast(level_index);
+                    for (0..graph.chunkCount()) |chunk_index| {
+                        const chunk: u32 = @intCast(chunk_index);
+                        const portals = graph.chunkPortals(level, chunk);
+                        for ([_][]const NavPortal{ portals.border, portals.extra }) |list| {
+                            for (list) |portal| {
+                                const cell = test_support.cellOfLocal(graph.geometry, chunk, portal.local);
+                                const x = cell % width;
+                                const y = cell / width;
+                                const h = heuristicAt(&heuristic, level, x, y);
+                                const plain_h = heuristicAt(&plain, level, x, y);
+                                // The crossing distance only raises the estimate, and never on the goal level.
+                                try std.testing.expect(h >= plain_h);
+                                if (level == goal_level) try std.testing.expectEqual(plain_h, h);
+                                raised += @intFromBool(h > plain_h);
+                                if (level == goal_level and goal_label != 0 and chunk == goal_chunk and portal.label == goal_label) {
+                                    try std.testing.expect(h <= octileU32(x, y, goal_x, goal_y));
+                                    goal_portals += 1;
+                                }
+                                for ([_][]const NavPortal{ portals.border, portals.extra }) |peers| {
+                                    for (peers) |peer| {
+                                        if (peer.local == portal.local or peer.label != portal.label) continue;
+                                        const peer_cell = test_support.cellOfLocal(graph.geometry, chunk, peer.local);
+                                        const px = peer_cell % width;
+                                        const py = peer_cell / width;
+                                        try std.testing.expect(h <= octileU32(x, y, px, py) +| heuristicAt(&heuristic, level, px, py));
+                                        edges += 1;
+                                    }
+                                }
+                                const mirrors = [_]struct { present: bool, x: u32, y: u32 }{
+                                    .{ .present = portal.flags.west, .x = x -% 1, .y = y },
+                                    .{ .present = portal.flags.east, .x = x + 1, .y = y },
+                                    .{ .present = portal.flags.north, .x = x, .y = y -% 1 },
+                                    .{ .present = portal.flags.south, .x = x, .y = y + 1 },
+                                };
+                                for (mirrors) |mirror| {
+                                    if (!mirror.present) continue;
+                                    try std.testing.expect(h <= cardinal_cost +| heuristicAt(&heuristic, level, mirror.x, mirror.y));
                                     edges += 1;
                                 }
-                            }
-                            const mirrors = [_]struct { present: bool, x: u32, y: u32 }{
-                                .{ .present = portal.flags.west, .x = x -% 1, .y = y },
-                                .{ .present = portal.flags.east, .x = x + 1, .y = y },
-                                .{ .present = portal.flags.north, .x = x, .y = y -% 1 },
-                                .{ .present = portal.flags.south, .x = x, .y = y + 1 },
-                            };
-                            for (mirrors) |mirror| {
-                                if (!mirror.present) continue;
-                                try std.testing.expect(h <= cardinal_cost +| heuristicAt(&heuristic, level, mirror.x, mirror.y));
-                                edges += 1;
-                            }
-                            for (portals.linksAt(portal.local)) |link| {
-                                const target_grid = graph.grid(link.to_level) orelse continue;
-                                if (target_grid.isBlockedIndex(link.to_cell)) continue;
-                                const to_x = link.to_cell % width;
-                                const to_y = link.to_cell / width;
-                                try std.testing.expect(h <= link.cost +| heuristicAt(&heuristic, link.to_level, to_x, to_y));
-                                edges += 1;
-                                // A long link lies in a pair: its source in the entrance box, its
-                                // target in the exit box, at no less than the pair's cost.
-                                if (octileU32(x, y, to_x, to_y) > link.cost) {
-                                    try std.testing.expect(pairHoldsLink(&bounds.pairs, bounds.crossingRates(), .{ level, x, y }, .{ link.to_level, to_x, to_y }, link.cost));
-                                    long_sources += 1;
+                                for (portals.linksAt(portal.local)) |link| {
+                                    const target_grid = graph.grid(link.to_level) orelse continue;
+                                    if (target_grid.isBlockedIndex(link.to_cell)) continue;
+                                    const to_x = link.to_cell % width;
+                                    const to_y = link.to_cell / width;
+                                    try std.testing.expect(h <= link.cost +| heuristicAt(&heuristic, link.to_level, to_x, to_y));
+                                    edges += 1;
+                                    // A long link lies in a pair: its source in the entrance box, its
+                                    // target in the exit box, at no less than the pair's cost.
+                                    if (octileU32(x, y, to_x, to_y) > link.cost) {
+                                        try std.testing.expect(pairHoldsLink(&bounds.pairs, bounds.crossingRates(), .{ level, x, y }, .{ link.to_level, to_x, to_y }, link.cost));
+                                        long_sources += 1;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                frozen += @intFromBool(crossing.frozen);
             }
         }
     }
+    try std.testing.expect(frozen > 0);
+    try std.testing.expect(raised > 0);
     try std.testing.expect(edges > 1000);
     try std.testing.expect(goal_portals > 0);
     try std.testing.expect(long_sources > 0);
@@ -1872,6 +2103,7 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
         for (links[first_apply..]) |link| try marked_world.addLevelLink(link);
         _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
         try std.testing.expect(std.meta.eql(whole.graph.link_bounds, marked.graph.link_bounds));
+        for (whole.graph.level_crossings.items, marked.graph.level_crossings.items) |a, b| try std.testing.expect(std.meta.eql(a, b));
 
         var abstract = AbstractScratch{};
         defer abstract.deinit(allocator);
@@ -1946,15 +2178,16 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
     }
 }
 
-test "a cross-level solve claims the same abstract nodes at 6 and 18 levels" {
+test "a cross-level solve claims the same abstract nodes at 6, 18, and 40 levels, and settles the same crossing boxes once the stack passes the route's reach" {
     const allocator = std.testing.allocator;
     const DataSystem = @import("../../data_system.zig").DataSystem;
     var meta = try test_support.loadTestWorldMeta(allocator);
     defer meta.deinit();
     const grass = try test_support.requireTestTile(&meta, "grass");
-    var nodes: [2]usize = undefined;
-    var corridor_len: [2]usize = undefined;
-    for ([_]u16{ 6, 18 }, &nodes, &corridor_len) |levels, *level_nodes, *level_corridor_len| {
+    var nodes: [3]usize = undefined;
+    var corridor_len: [3]usize = undefined;
+    var settles: [3]usize = undefined;
+    for ([_]u16{ 6, 18, 40 }, &nodes, &corridor_len, &settles) |levels, *level_nodes, *level_corridor_len, *level_settles| {
         var data = DataSystem.init(allocator);
         defer data.deinit();
         // Open 16x16 levels; a ramp shaft at (1, 1) joins every consecutive pair.
@@ -1982,9 +2215,14 @@ test "a cross-level solve claims the same abstract nodes at 6 and 18 levels" {
         try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 0, 4, start, goal, 4096) == .found);
         level_nodes.* = abstract.nodes_used;
         level_corridor_len.* = abstract.corridor.items.len;
+        level_settles.* = abstract.crossing.settles;
     }
     try std.testing.expectEqual(nodes[0], nodes[1]);
+    try std.testing.expectEqual(nodes[0], nodes[2]);
     try std.testing.expectEqual(corridor_len[0], corridor_len[1]);
+    try std.testing.expectEqual(corridor_len[0], corridor_len[2]);
+    // The crossing search settles boxes below the goal only within the route's own reach.
+    try std.testing.expectEqual(settles[1], settles[2]);
 }
 
 test "a long teleport far from the goal leaves same-level abstract nodes and corridor equal to a world without it" {
@@ -2024,6 +2262,366 @@ test "a long teleport far from the goal leaves same-level abstract nodes and cor
     }
     try std.testing.expectEqual(nodes[0], nodes[1]);
     try std.testing.expectEqualSlices(usize, corridors[0], corridors[1]);
+}
+
+// `levels` open 32x32 levels in 4-tile chunks.
+fn openStackWorld(meta: *const WorldTilesetMeta, levels: u16) !WorldSystem {
+    const grass = try test_support.requireTestTile(meta, "grass");
+    var world = try test_support.abstractTestWorld(meta, 1024, 1024);
+    errdefer world.deinit();
+    for (1..levels) |level| {
+        _ = try world.addLevel(-16 * @as(i32, @intCast(level)));
+        _ = try world.addDenseLayer(@intCast(level), 0, .floor, grass);
+    }
+    return world;
+}
+
+// Random level-crossing short links on a 32x32 stack: ramps between adjacent levels, stairs
+// two levels apart, and short teleports across the whole stack.
+fn randomShortCrossings(random: std.Random, levels: u16, links: []LevelLink) void {
+    for (links) |*link| {
+        const cell = @import("../../world_system.zig").CellCoord{ .x = random.uintLessThan(u16, 32), .y = random.uintLessThan(u16, 32) };
+        const upper = random.uintLessThan(u16, levels - 1);
+        link.* = switch (random.uintLessThan(u32, 4)) {
+            0, 1 => .{ .kind = .ramp, .level_a = upper, .cell_a = cell, .level_b = upper + 1, .cell_b = cell, .traversal_cost = random.uintLessThan(u32, 8), .bidirectional = random.boolean() },
+            2 => .{ .kind = .stair, .level_a = upper, .cell_a = cell, .level_b = @min(levels - 1, upper + 2), .cell_b = .{ .x = cell.x ^ 1, .y = cell.y }, .traversal_cost = 3, .bidirectional = random.boolean() },
+            // Planar span at most 14 * 31, under its cost: short.
+            else => .{ .kind = .teleport, .level_a = 0, .cell_a = cell, .level_b = levels - 1, .cell_b = .{ .x = random.uintLessThan(u16, 32), .y = random.uintLessThan(u16, 32) }, .traversal_cost = 14 * 31, .bidirectional = random.boolean() },
+        };
+    }
+}
+
+// The relaxed graph's distance from (x, y) on `level` to the goal over unclustered links: free
+// octile movement within a level, each directed link's source to its target at its edge cost.
+// By Bellman-Ford over the directed links, clamped to `long_lane_cap`.
+fn referenceCrossingDistance(allocator: std.mem.Allocator, links: []const LevelLink, goal_level: u16, goal_x: u32, goal_y: u32, level: u16, x: u32, y: u32) !u32 {
+    const Directed = struct { from_level: u16, fx: u32, fy: u32, to_level: u16, tx: u32, ty: u32, cost: u64 };
+    var directed: std.ArrayList(Directed) = .empty;
+    defer directed.deinit(allocator);
+    for (links) |link| {
+        const cost: u64 = link.traversal_cost +| types.inter_level_penalty;
+        try directed.append(allocator, .{ .from_level = link.level_a, .fx = link.cell_a.x, .fy = link.cell_a.y, .to_level = link.level_b, .tx = link.cell_b.x, .ty = link.cell_b.y, .cost = cost });
+        if (link.bidirectional) try directed.append(allocator, .{ .from_level = link.level_b, .fx = link.cell_b.x, .fy = link.cell_b.y, .to_level = link.level_a, .tx = link.cell_a.x, .ty = link.cell_a.y, .cost = cost });
+    }
+    const unreachable_distance = std.math.maxInt(u64);
+    // Per directed link, the least cost from its source to the goal through it.
+    const through = try allocator.alloc(u64, directed.items.len);
+    defer allocator.free(through);
+    @memset(through, unreachable_distance);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (directed.items, through) |link, *best| {
+            var landing: u64 = if (link.to_level == goal_level) octileU32(link.tx, link.ty, goal_x, goal_y) else unreachable_distance;
+            for (directed.items, through) |next, next_best| {
+                if (next.from_level != link.to_level or next_best == unreachable_distance) continue;
+                landing = @min(landing, octileU32(link.tx, link.ty, next.fx, next.fy) + next_best);
+            }
+            if (landing == unreachable_distance or link.cost + landing >= best.*) continue;
+            best.* = link.cost + landing;
+            changed = true;
+        }
+    }
+    var distance: u64 = unreachable_distance;
+    for (directed.items, through) |link, best| {
+        if (link.from_level != level or best == unreachable_distance) continue;
+        distance = @min(distance, octileU32(x, y, link.fx, link.fy) + best);
+    }
+    return @intCast(@min(distance, @as(u64, long_lane_cap)));
+}
+
+// Directed level-crossing short links leaving `level`.
+fn departingLinks(links: []const LevelLink, level: u16) usize {
+    var count: usize = 0;
+    for (links) |link| count += @as(usize, @intFromBool(link.level_a == level)) + @intFromBool(link.bidirectional and link.level_b == level);
+    return count;
+}
+
+test "the crossing distance equals a Dijkstra over every link endpoint while each level's links fit its crossings, and stays at most it once boxes merge" {
+    const allocator = std.testing.allocator;
+    const DataSystem = @import("../../data_system.zig").DataSystem;
+    var meta = try test_support.loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    var scratch = CrossingScratch{};
+    defer scratch.deinit(allocator);
+    try scratch.reserve(allocator, 1024);
+    var exact_checks: usize = 0;
+    var merged_checks: usize = 0;
+    var below: usize = 0;
+    for (0..12) |seed| {
+        var prng = std.Random.DefaultPrng.init(0x6e6c_0000 + seed);
+        const random = prng.random();
+        const levels: u16 = 3 + random.uintLessThan(u16, 4);
+        const merged = seed % 3 == 2;
+        var link_buffer: [96]LevelLink = undefined;
+        const links = link_buffer[0..if (merged) 96 else 2 + random.uintLessThan(usize, 10)];
+        randomShortCrossings(random, levels, links);
+        var data = DataSystem.init(allocator);
+        defer data.deinit();
+        var world = try openStackWorld(&meta, levels);
+        defer world.deinit();
+        for (links) |link| try world.addLevelLink(link);
+        var system = PathfindingSystem.init(allocator);
+        defer system.deinit();
+        try system.reserve(test_support.abstractCapacity());
+        try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+        const graph = &system.graph;
+        var fits = true;
+        for (0..levels) |level| fits = fits and departingLinks(links, @intCast(level)) <= long_link_pairs;
+        for (0..6) |_| {
+            const goal_level = random.uintLessThan(u16, levels);
+            const goal_x = random.uintLessThan(u32, 32);
+            const goal_y = random.uintLessThan(u32, 32);
+            var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &scratch, 1024);
+            for (0..24) |_| {
+                const level = random.uintLessThan(u16, levels);
+                if (level == goal_level) continue;
+                const x = random.uintLessThan(u32, 32);
+                const y = random.uintLessThan(u32, 32);
+                const expected = try referenceCrossingDistance(allocator, links, goal_level, goal_x, goal_y, level, x, y);
+                const actual = heuristic.crossing.bound(level, x, y, heuristic.rates);
+                if (fits) {
+                    try std.testing.expectEqual(expected, actual);
+                    exact_checks += 1;
+                } else {
+                    try std.testing.expect(actual <= expected);
+                    below += @intFromBool(actual < expected);
+                    merged_checks += 1;
+                }
+            }
+            try std.testing.expect(!scratch.frozen);
+        }
+    }
+    try std.testing.expect(exact_checks > 100);
+    try std.testing.expect(merged_checks > 50);
+    try std.testing.expect(below > 0);
+}
+
+test "a frozen crossing search gives one consistent bound per goal and budget, whatever the evaluation order, at most the unfrozen bound" {
+    const allocator = std.testing.allocator;
+    const DataSystem = @import("../../data_system.zig").DataSystem;
+    var meta = try test_support.loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    var scratches: [3]CrossingScratch = @splat(.{});
+    defer for (&scratches) |*scratch| scratch.deinit(allocator);
+    for (&scratches) |*scratch| try scratch.reserve(allocator, 1024);
+    var frozen: usize = 0;
+    var raised: usize = 0;
+    for (0..6) |seed| {
+        var prng = std.Random.DefaultPrng.init(0x6e6d_0000 + seed);
+        const random = prng.random();
+        const levels: u16 = 4 + random.uintLessThan(u16, 3);
+        var links: [40]LevelLink = undefined;
+        randomShortCrossings(random, levels, &links);
+        var data = DataSystem.init(allocator);
+        defer data.deinit();
+        var world = try openStackWorld(&meta, levels);
+        defer world.deinit();
+        for (links) |link| try world.addLevelLink(link);
+        var system = PathfindingSystem.init(allocator);
+        defer system.deinit();
+        try system.reserve(test_support.abstractCapacity());
+        try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+        const graph = &system.graph;
+        for (0..4) |_| {
+            const goal_level = random.uintLessThan(u16, levels);
+            const goal_x = random.uintLessThan(u32, 32);
+            const goal_y = random.uintLessThan(u32, 32);
+            for ([_]usize{ 0, 1, 2, 4, 8 }) |budget| {
+                // Two searches at the budget visiting levels in opposite orders, and one unfrozen.
+                var forward = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &scratches[0], budget);
+                var backward = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &scratches[1], budget);
+                var exact = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &scratches[2], 1024);
+                var bounds: [8][32][32]u32 = undefined;
+                for (0..levels) |level_index| {
+                    const level: u16 = @intCast(level_index);
+                    if (level == goal_level) continue;
+                    for (0..32) |y| {
+                        for (0..32) |x| bounds[level][y][x] = forward.crossing.bound(level, @intCast(x), @intCast(y), forward.rates);
+                    }
+                }
+                var level_index: usize = levels;
+                while (level_index > 0) {
+                    level_index -= 1;
+                    const level: u16 = @intCast(level_index);
+                    if (level == goal_level) continue;
+                    for (0..32) |y_index| {
+                        const y = 31 - y_index;
+                        for (0..32) |x| {
+                            const bound = backward.crossing.bound(level, @intCast(x), @intCast(y), backward.rates);
+                            try std.testing.expectEqual(bounds[level][y][x], bound);
+                            const unfrozen = exact.crossing.bound(level, @intCast(x), @intCast(y), exact.rates);
+                            try std.testing.expect(bound <= unfrozen);
+                            raised += @intFromBool(bound > octileU32(@intCast(x), @intCast(y), goal_x, goal_y));
+                        }
+                    }
+                }
+                frozen += @intFromBool(scratches[0].frozen);
+                try std.testing.expectEqual(scratches[0].frozen, scratches[1].frozen);
+                try std.testing.expect(!scratches[2].frozen);
+                // Consistent along every step on a level and every directed link; the goal
+                // level counts its octile, which bounds the relaxed distance there.
+                const at = struct {
+                    fn value(table: *const [8][32][32]u32, goal: [3]u32, level: u16, x: u32, y: u32) u32 {
+                        return if (level == goal[0]) octileU32(x, y, goal[1], goal[2]) else table[level][y][x];
+                    }
+                }.value;
+                const goal = [3]u32{ goal_level, goal_x, goal_y };
+                for (0..levels) |level_index_2| {
+                    const level: u16 = @intCast(level_index_2);
+                    if (level == goal_level) continue;
+                    for (0..32) |y| {
+                        for (0..32) |x| {
+                            const here = bounds[level][y][x];
+                            if (x + 1 < 32) try std.testing.expect(here <= cardinal_cost + bounds[level][y][x + 1] and bounds[level][y][x + 1] <= cardinal_cost + here);
+                            if (y + 1 < 32) try std.testing.expect(here <= cardinal_cost + bounds[level][y + 1][x] and bounds[level][y + 1][x] <= cardinal_cost + here);
+                        }
+                    }
+                }
+                for (links) |link| {
+                    const cost = link.traversal_cost +| types.inter_level_penalty;
+                    if (link.level_a != goal_level) try std.testing.expect(at(&bounds, goal, link.level_a, link.cell_a.x, link.cell_a.y) <= cost + at(&bounds, goal, link.level_b, link.cell_b.x, link.cell_b.y));
+                    if (link.bidirectional and link.level_b != goal_level) try std.testing.expect(at(&bounds, goal, link.level_b, link.cell_b.x, link.cell_b.y) <= cost + at(&bounds, goal, link.level_a, link.cell_a.x, link.cell_a.y));
+                }
+            }
+        }
+    }
+    try std.testing.expect(frozen > 10);
+    try std.testing.expect(raised > 1000);
+}
+
+// The crossing distance at (x, y) on `level` from a gather made for this call alone, outside
+// the gathered-level cache.
+fn freshGatherBound(search: *CrossingSearch, level: u16, x: u32, y: u32, rates: CrossingRates) u32 {
+    var gathered = CrossingSearch.GatheredLevel{};
+    search.gather(level, &gathered);
+    const departing = &search.crossings[level].departing;
+    return @min(departing.entrances.offsetLowerBound(&gathered.lanes, departing.count, x, y, level, rates), @as(u32, long_lane_cap));
+}
+
+// Level `level`'s departing boxes the search has not settled, each checked to count
+// `unsettled` in the level's gathered lanes.
+fn expectUnsettledLanes(search: *const CrossingSearch, scratch: *CrossingScratch, level: u16, unsettled: i32) !usize {
+    const gathered = &search.gathered[level % CrossingSearch.gathered_levels];
+    try std.testing.expectEqual(@as(u32, level), gathered.level);
+    var count: usize = 0;
+    for (0..search.crossings[level].departing.count) |slot| {
+        const box = scratch.findBox(crossingBoxRef(level, slot));
+        if (box != null and box.?.stamp & 1 != 0) {
+            try std.testing.expectEqual(@as(i32, @intCast(box.?.d)), gathered.lanes[slot]);
+            continue;
+        }
+        try std.testing.expectEqual(unsettled, gathered.lanes[slot]);
+        count += 1;
+    }
+    return count;
+}
+
+test "a level evicted from the gathered-level cache gathers again to the same bounds, before and after the crossing search freezes, its unsettled boxes counting the cap and then the frozen distance" {
+    const allocator = std.testing.allocator;
+    const DataSystem = @import("../../data_system.zig").DataSystem;
+    var meta = try test_support.loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    const levels: u16 = 20;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    var world = try openStackWorld(&meta, levels);
+    defer world.deinit();
+    // One ramp per level pair at alternating corners.
+    for (0..levels - 1) |upper_index| {
+        const upper: u16 = @intCast(upper_index);
+        const coord: u16 = if (upper % 2 == 0) 29 else 2;
+        try world.addLevelLink(.{ .kind = .ramp, .level_a = upper, .cell_a = .{ .x = coord, .y = coord }, .level_b = upper + 1, .cell_b = .{ .x = coord, .y = coord }, .traversal_cost = 1, .bidirectional = true });
+    }
+    // Costly short links from level 1 to the bottom: departing boxes far past level 1's
+    // nearest box plus its diameter, so level 1 resolves with them unsettled.
+    for ([_]u16{ 8, 16, 24 }) |coord| {
+        try world.addLevelLink(.{ .kind = .teleport, .level_a = 1, .cell_a = .{ .x = coord, .y = 31 - coord }, .level_b = levels - 1, .cell_b = .{ .x = coord, .y = 31 - coord }, .traversal_cost = 4000, .bidirectional = false });
+    }
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    try system.reserve(test_support.abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    var scratch = CrossingScratch{};
+    defer scratch.deinit(allocator);
+    try scratch.reserve(allocator, 1024);
+    // Level 1 resolves within the budget; level 17, sharing its cache slot, needs more boxes
+    // than the budget holds.
+    const near: u16 = 1;
+    const far: u16 = near + CrossingSearch.gathered_levels;
+    var heuristic = CrossLevelHeuristic.init(&system.graph, 0, 4, 4, &scratch, 12);
+    const search = &heuristic.crossing;
+    try std.testing.expect(system.graph.level_crossings.items[near].departing.count >= 5);
+    var first: [32][32]u32 = undefined;
+    for (0..32) |y| {
+        for (0..32) |x| {
+            first[y][x] = search.bound(near, @intCast(x), @intCast(y), heuristic.rates);
+            try std.testing.expectEqual(freshGatherBound(search, near, @intCast(x), @intCast(y), heuristic.rates), first[y][x]);
+        }
+    }
+    // Resolved by the diameter rule, not a freeze or a drain: some boxes stay unsettled and
+    // count the cap.
+    try std.testing.expect(!scratch.frozen and !search.drained);
+    try std.testing.expect(try expectUnsettledLanes(search, &scratch, near, long_lane_cap) > 0);
+    for (0..32) |y| {
+        for (0..32) |x| {
+            const bound = search.bound(far, @intCast(x), @intCast(y), heuristic.rates);
+            try std.testing.expectEqual(freshGatherBound(search, far, @intCast(x), @intCast(y), heuristic.rates), bound);
+        }
+    }
+    try std.testing.expect(scratch.frozen);
+    // Level 17 evicted level 1; its regather after the freeze counts the frozen distance for
+    // its unsettled boxes and gives every bound unchanged.
+    try std.testing.expectEqual(@as(u32, far), search.gathered[near % CrossingSearch.gathered_levels].level);
+    for (0..32) |y| {
+        for (0..32) |x| {
+            const bound = search.bound(near, @intCast(x), @intCast(y), heuristic.rates);
+            try std.testing.expectEqual(first[y][x], bound);
+            try std.testing.expectEqual(freshGatherBound(search, near, @intCast(x), @intCast(y), heuristic.rates), bound);
+        }
+    }
+    const frozen_at: i32 = @intCast(search.frozen_at.?);
+    try std.testing.expect(frozen_at < long_lane_cap);
+    try std.testing.expect(try expectUnsettledLanes(search, &scratch, near, frozen_at) > 0);
+}
+
+test "a same-level abstract search settles no crossing box; a corner-to-corner descent settles at most two per level crossed" {
+    const allocator = std.testing.allocator;
+    const DataSystem = @import("../../data_system.zig").DataSystem;
+    var meta = try test_support.loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    const levels: u16 = 4;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    var world = try openStackWorld(&meta, levels);
+    defer world.deinit();
+    // One ramp per level pair at alternating corners, inset 2.
+    for (0..levels - 1) |upper_index| {
+        const upper: u16 = @intCast(upper_index);
+        const coord: u16 = if (upper % 2 == 0) 29 else 2;
+        try world.addLevelLink(.{ .kind = .ramp, .level_a = upper, .cell_a = .{ .x = coord, .y = coord }, .level_b = upper + 1, .cell_b = .{ .x = coord, .y = coord }, .traversal_cost = 1, .bidirectional = true });
+    }
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    try system.reserve(test_support.abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    const graph = &system.graph;
+    var abstract = AbstractScratch{};
+    defer abstract.deinit(allocator);
+    try abstract.reserve(allocator, 4096);
+    const top = graph.grid(0).?;
+    const start = top.indexForCell(.{ .x = 2, .y = 2 }).?;
+    // Same level, across the level.
+    try std.testing.expect(abstractCorridor(graph, &abstract, top, top, 0, 0, start, top.indexForCell(.{ .x = 30, .y = 30 }).?, 4096) == .found);
+    try std.testing.expectEqual(@as(usize, 0), abstract.crossing.settles);
+    // To the bottom level's far corner: the route crosses every level corner to corner.
+    const bottom = graph.grid(levels - 1).?;
+    const goal = bottom.indexForCell(.{ .x = 29, .y = 29 }).?;
+    try std.testing.expect(abstractCorridor(graph, &abstract, top, bottom, 0, levels - 1, start, goal, 4096) == .found);
+    try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, top, bottom, 0, levels - 1, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
+    try std.testing.expect(!abstract.crossing.frozen);
+    // At least the one box per level crossed the route takes, at most two per level crossed.
+    try std.testing.expect(abstract.crossing.settles >= levels - 1 and abstract.crossing.settles <= 2 * (levels - 1));
 }
 
 test "with no links the heuristic is octile on the goal level and saturates off it, at any level gap" {
@@ -2075,7 +2673,7 @@ test "with no links the heuristic is octile on the goal level and saturates off 
         bounds.pairs.exits.x0[slot] = exit_x[pair];
         bounds.pairs.exits.x1[slot] = exit_x[pair];
         bounds.pairs.cost[slot] = costs[pair];
-        for (0..long_link_pairs) |to| bounds.pairs.chain_to[to][slot] = chain[pair][if (to == 1) 1 else 0];
+        for (0..long_link_pairs) |to| bounds.chains.to[to][slot] = chain[pair][if (to == 1) 1 else 0];
     }
     var gated = CrossLevelHeuristic.fromBounds(&bounds, 0, 0, 0);
     try std.testing.expectEqual(@as(u32, 60), gated.long_floor);
@@ -2160,7 +2758,7 @@ test "a goal portal whose estimate the long floor cut is re-queued before it end
     const start = grid.indexForCell(pocket_start).?;
     const goal = grid.indexForCell(pocket_goal).?;
     // The far gap's estimate is cut to 40 + 30 below its octile 192.
-    var heuristic = CrossLevelHeuristic.init(graph, 0, @intCast(pocket_goal.x), @intCast(pocket_goal.y));
+    var heuristic = CrossLevelHeuristic.init(graph, 0, @intCast(pocket_goal.x), @intCast(pocket_goal.y), null, 0);
     try std.testing.expectEqual(@as(u32, 70), heuristicAt(&heuristic, 0, 16, 17));
     try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
     // The near gap: g 84 + octile 140, against g 74 + octile 192 through the far one.
@@ -2255,7 +2853,7 @@ test "a long link's estimate pairs its entrance with its own exit and chains thr
     // At A's entrance: A (41), L2 (60, 32) -> (60, 2) (300), B (41), L0 (40, 60) -> goal (20).
     // Short-only it is octile 500; A then the short climb from L2 is 41 + 380 + 2 * 41 + 41 =
     // 503 against no chain; independent summaries pair A's entrance with B's exit at 41 + 20.
-    var heuristic = CrossLevelHeuristic.init(graph, 0, 40, 62);
+    var heuristic = CrossLevelHeuristic.init(graph, 0, 40, 62, null, 0);
     try std.testing.expectEqual(@as(u32, 402), heuristicAt(&heuristic, 0, 2, 32));
     const grid = graph.grid(0).?;
     const start = grid.indexForCell(.{ .x = 2, .y = 32 }).?;
