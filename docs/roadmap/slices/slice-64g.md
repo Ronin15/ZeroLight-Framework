@@ -440,7 +440,11 @@ a design open for this slice):
       256 / 1024 / 2032 cells; tier 1 4,248 → 15,724 for 2× length), since graph
       distance runs above octile; the region layer that would remove it is
       shelved.
-- [ ] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
+- [x] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
+      At `407a879`: full Debug test 1741/1741 (verify passed at `f7e46df`;
+      only pathfinding and docs changed since, with the full test re-run);
+      ReleaseFast 1731 passed, 10 skipped by design (perf-log and
+      reservation-drift diagnostics compile out), 0 failed; gpu-smoke passed.
 - [x] Manual (display, Debug): digs and ramps in the demo; NPCs route over
       the changes. The in-demo cave-in check is Slice 76's. Owner 2026-10-14
       at `b83dd86`: dug one layer deep and built ramps up; entities used the
