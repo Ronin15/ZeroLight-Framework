@@ -20,7 +20,7 @@ How the pipeline works: `docs/atlas-asset-workflow.md`,
   resolve to numeric IDs at setup. Missing IDs or names return null and never
   guess grid positions.
 - Cache lookup and retain/release are setup-time only; lease holders release
-  through `AssetCache.releaseTexture` before renderer teardown.
+  through `AssetCache.releaseTextureWithContext` before renderer teardown.
 - Every registered metadata sidecar parses at startup, even when its texture
   falls back. Missing world atlas data is an error, never a fallback.
 - Missing declared content is logged and marked unavailable; fatal preload

@@ -31,7 +31,9 @@ paths:
   - `std.ArrayList` (unmanaged, `.empty`), never `std.ArrayListUnmanaged` or
     managed constructors.
   - `@backingInt`/`@fromBackingInt`, not `@intFromEnum`/`@enumFromInt`.
-  - `@splat(x)`, not `**`; `@memcpy`/`@memset`, not `std.mem.copy`/`set`.
+  - `@splat(x)`, not `**`; `@memcpy`/`@memset`, not `std.mem.copy`/`set`;
+    `@memmove`, not `std.mem.copyForwards`/`copyBackwards`.
+  - `std.array_list.Aligned`, never `std.ArrayListAligned`.
   - `@typeInfo(T).<kind>.field_names`/`field_types` or `std.meta.tags(E)`, not
     `std.meta.fields`.
   - `dupeSentinel(u8, bytes, 0)`, not `dupeZ`; `std.builtin.Optimize`, not

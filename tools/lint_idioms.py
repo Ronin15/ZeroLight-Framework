@@ -154,6 +154,14 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "std.mem.copy/set are removed; use @memcpy/@memset",
     ),
     (
+        re.compile(r"\bstd\.ArrayListAligned(?:Unmanaged)?\b"),
+        "std.ArrayListAligned/ArrayListAlignedUnmanaged are deprecated in Zig 0.17; use std.array_list.Aligned",
+    ),
+    (
+        re.compile(r"\bstd\.mem\.copy(?:Forwards|Backwards)\s*\("),
+        "std.mem.copyForwards/copyBackwards are deprecated in Zig 0.17; use @memmove",
+    ),
+    (
         re.compile(r"\bstd\.BoundedArray\b"),
         "std.BoundedArray is removed; use a fixed array + len or std.ArrayList",
     ),
