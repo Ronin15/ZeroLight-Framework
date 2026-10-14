@@ -163,7 +163,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**64B**](roadmap/slices/slice-64b.md) | Not started | Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74 |
 | [**64C**](roadmap/slices/slice-64c.md) | Not started | Session Descriptor And New Game Seed Flow — after 49, 53B, 74 |
 | [**64D**](roadmap/slices/slice-64d.md) | Gated: first simulation `atan2` consumer | Deterministic Vector `atan2` — after 52D |
-| [**64G**](roadmap/slices/slice-64g.md) | In progress | Chunk-Owned Terrain And Nav — seal gate remaining |
+| [**64G**](roadmap/slices/slice-64g.md) | Sealed | Chunk-Owned Terrain And Nav — three follow-ups open |
 | [**65**](roadmap/slices/slice-65.md) | Not started (umbrella) | Threading Layout Cleanup And Background-Lane Heavy Consumers — after 50, 51 |
 | [**65A**](roadmap/slices/slice-65a.md) | Not started | Thread-Shared Layout Consolidation And Background-Lane OS Priority — after 50, 51 |
 | [**65B**](roadmap/slices/slice-65b.md) | Not started | Deferred Nav Rebuild On The Background Lane — after 51, 65A, 64G, 49, 64B |
@@ -253,12 +253,12 @@ The rest of the engine gets the same pass, one area per branch, in this order.
 The owner merges each sealed branch to main before the next starts. Normal
 roadmap flow (Suggested Order) resumes after the AI branch.
 
-1. **Pathfinding (`slice-64g-seal`):** finish [64G](roadmap/slices/slice-64g.md).
+1. **Pathfinding (`engine_scale`, sealed 2026-10-14):** [64G](roadmap/slices/slice-64g.md).
    Landed: maintained reachability (connectivity IDs and the one-way closure:
    O(1) per request, never a failed search), the dense-dig main-thread split,
    the cross-level heuristic at scale with partial hops for far goals, and the
-   combined review since the 2026-10-07 branch review. Remaining: the seal
-   gate. Then [81](roadmap/slices/slice-81.md) splits the pathfinding module and
+   combined review since the 2026-10-07 branch review; every acceptance check
+   passes, with three follow-ups open in the slice. Then [81](roadmap/slices/slice-81.md) splits the pathfinding module and
    [82](roadmap/slices/slice-82.md) the world module.
 2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
    2026-10-12), so the branch's threaded rework runs under the race

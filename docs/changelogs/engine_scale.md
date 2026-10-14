@@ -1,18 +1,19 @@
-# AI Update 3 Changelog
+# Engine Scale Changelog
 
-Branch: `ai_update3`
+Branch: `engine_scale` (renamed from `ai_update3`)
 
-Range: `main..ai_update3`
+Range: `main..engine_scale`
 
 Base: `b39a46f` (`Merge pull request #10 from Ronin15/ai_update2`)
 
-Tip: in progress; Slice 64G programming landed, its seal gate remains
+Tip: sealed; Slice 64G landed and passed its seal gate (verify, ReleaseFast test,
+gpu-smoke, acceptance benches, owner demo)
 
 ## Summary
 
-`ai_update3` finishes the post-`ai_update2` cleanup slices, moves the toolchain
-to Zig 0.17, and then shifts focus from new gameplay features to making the
-engine scale correctly:
+`engine_scale` (formerly `ai_update3`) finishes the post-`ai_update2` cleanup
+slices, moves the toolchain to Zig 0.17, and then shifts focus from new gameplay
+features to making the engine scale correctly:
 
 - **Capacity:** a best-practice capacity model replaces fixed sizes. Each world
   instance is right-sized at load, and runtime-growing stores grow only at the

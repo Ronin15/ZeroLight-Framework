@@ -2,9 +2,11 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md), [Slice 76](slice-76.md), [Slice 77](slice-77.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** Programming landed through `e2b9b2c`; the seal gate
-(verify, ReleaseFast test, gpu-smoke, the acceptance benches, the owner demo)
-remains. Kept as one slice by owner decision (2026-10-08).
+**Status: sealed (2026-10-14, branch `engine_scale`).** Every acceptance check
+passes (verify, ReleaseFast test, gpu-smoke, the acceptance benches, the owner
+demo). Three follow-ups stay open below: partial-path followers (gated on a crowd
+walk), the measured level-build staging peak, and the result cache's
+capacity-history dependence. Kept as one slice by owner decision (2026-10-08).
 
 Goal: terrain and nav storage and work owned per chunk `(level, cx, cy)`, so a
 dig, ramp, cave-in, or explosion costs work only in the chunks it touches,
