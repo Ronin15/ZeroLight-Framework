@@ -206,7 +206,8 @@ other stage is bench-only (`--details`):
   level-build remasks included), `nav_connect` (the connectivity flood, its rounds
   summed), `nav_closure` (the one-way closure rows), `nav_evict` (the path-cache
   eviction halo walk), `static_collider_splice` (the commit seam's collider
-  chunk-list splice).
+  chunk-list splice);
+- capacity resize: `path_resize_copy` (the pathfinding update's shrink copy).
 
 Movement-intent apply, plane-entry gather, and collision-response gather/apply
 are bench-only. Pathfinding metrics include `path_solved_requests` (searches that
@@ -215,7 +216,11 @@ ended in a result; an `.unavailable` answered at solve is not one),
 `path_goal_projected` (accepted requests whose goal cell was blocked),
 `path_group_field_evictions`, and `path_max_distinct_group_keys`. Pipeline timings include `path_goals` (`pipeline_path_goals`, the
 goal resolve), and the `steering_setup` line reports select, snapshot, directions,
-and the agent grid (`steering_grid`) separately.
+and the agent grid (`steering_grid`) separately. The `pathfinding` line's
+`resize_avg_ms`/`resize_max_ms` time the update's own elastic resize (a shrink, or a
+grow after a failed population seam), recorded only on steps that resized; pipeline
+init and the population seam do the grows, and a seam grow shows in
+`gameplay_structural`.
 
 Debug logs can include detailed startup and fallback context, but warning and
 error logs should stay rare and actionable. Override the level when you need a

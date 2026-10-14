@@ -204,6 +204,9 @@ Long paths:
   crossing-aware heuristic `41afa5f` (cross-level depth -57.5% serial), least-h
   partial `ac48f66`: every walk and hop chain arrives, hops linear in route
   length. Heap sift `e2b9b2c`: sifts move a hole (pathfinding 1024 -24.9%).
+- Init sizing `4c247e7`: pipeline init sizes pathfinding's elastic pools for the
+  committed crowd, so the first update after load grows nothing (the demo's one-off
+  5.5 ms ReleaseSafe spike at 2,000 entities).
 
 
 ## Rendering And Build
@@ -575,3 +578,8 @@ Long paths:
 - `0c85293` Bench cohesion: production-read memory estimate checked whole, per-group labels and formatters, one item code and fixture set, single-axis right-sized sweeps, world-backed request-load groups
 - `e21c5ce` tests-benchmarks: tests and benches drive production sequences and rules; benches read production values, check estimates whole, fail rather than skip, share one harness, sweep one axis
 - `e2b9b2c` Open-heap sifts move a hole instead of swapping; every pathfinding search's heap work drops
+- `75be288` build.zig LTO comment back on ltoSupportedForTarget; teleport bench states the random-pad limit
+- `f7e46df` Slice 64G docs: write the landings' doc notes from the code as landed; checklist, limits, core-systems items, Slice 81
+- `b83dd86` Slice 64G acceptance: chunk-scale and path-cost checks pass; the cave clause becomes arrival within the node caps
+- `feeabd0` Slice 64G acceptance: the manual demo check passes
+- `4c247e7` Pipeline init sizes pathfinding's elastic pools for the committed steering agents; the first update after load grows nothing

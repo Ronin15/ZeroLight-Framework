@@ -977,8 +977,12 @@ open crowd, 113–130 B in tunnels, `10bbbc7`). An active goal's field is never
 taken: a new goal takes an empty slot, else the least-demanded inactive goal's
 (lowest slot on a tie), else waits on individual solves.
 
-Capacity is elastic: the population seam grows the pools at least 2× for the live
-agent count (`growForAgentCount`), never refused (`raiseAgentBudget`); a count below
+Capacity is elastic: `SimulationPipeline.init` sizes the pools for the committed
+steering agents through the same helper the population seam uses
+(`growPathfindingForAgents`), so the first update after load has nothing to grow;
+after that the seam grows them at least 2× for the live agent count
+(`growForAgentCount`), never refused (`raiseAgentBudget`), and the update's own
+resize remains for shrinks and as the fallback after a failed seam. A count below
 half capacity for `capacity_shrink_window` (120) steps shrinks them, keeping cached
 results that fit. Every reserve is failure-atomic, and on OOM each table-sizing
 budget falls back to min(committed, requested). A budget whose indices cannot hold a
