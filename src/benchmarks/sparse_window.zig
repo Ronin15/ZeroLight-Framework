@@ -19,9 +19,6 @@
 //! the serial case only.
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const WorldDepth = @import("../game/render_depth.zig").WorldDepth;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const TileId = @import("../game/world_system.zig").TileId;
@@ -32,6 +29,7 @@ const Rect = @import("../render/renderer.zig").Rect;
 const TextureId = @import("../render/resources.zig").TextureId;
 const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const world_side: u16 = 2048;
@@ -68,20 +66,26 @@ const sparse_tile_counts = [_]usize{ 1_000, 16_000, 256_000 };
 
 pub const frame_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-frame",
+    .item_label = "sparse tiles in the world",
     .defaultItemCounts = sparseTileCounts,
     .runCase = runFrameCase,
+    .write_workload = writeSparseWorkload,
 };
 
 pub const pan_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-pan",
+    .item_label = "sparse tiles in the world",
     .defaultItemCounts = sparseTileCounts,
     .runCase = runPanCase,
+    .write_workload = writeSparseWorkload,
 };
 
 pub const add_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-add",
+    .item_label = "sparse tiles in the world",
     .defaultItemCounts = sparseTileCounts,
     .runCase = runAddCase,
+    .write_workload = writeSparseWorkload,
 };
 
 fn sparseTileCounts(_: suite.Profile) []const usize {
@@ -173,8 +177,7 @@ const Fixture = struct {
 // never the local `buildCatalog` borrowed.
 fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, sparse_count: usize) !void {
     std.debug.assert(sparse_count >= window_tile_count);
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    var meta = try fixtures.loadTilesetMeta(allocator, io);
     var meta_owned = true;
     defer if (meta_owned) meta.deinit();
     fixture.* = .{
@@ -253,7 +256,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // The item count is the world's sparse tile count, so report throughput over the
     // sprites submitted.
     stats.output_count = submitted;
-    stats.items_per_second = if (stats.mean_ns == 0) 0 else @intCast(@as(u128, submitted) * std.time.ns_per_s / stats.mean_ns);
+    stats.items_per_second = suite.itemsPerSecond(submitted, stats.mean_ns);
     return stats;
 }
 
@@ -267,4 +270,8 @@ fn runIteration(fixture: *Fixture, workload: Workload) !usize {
             break :blk fixture.frame(0);
         },
     };
+}
+
+fn writeSparseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("submitted={}", .{stats.output_count});
 }

@@ -2,9 +2,11 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Chunk-owned terrain scaling: one fixed-size terrain change per timed iteration
-//! on worlds of every level size and depth. The change is the same at every level
-//! size and depth, so the cost model expects each group flat across both axes:
+//! Chunk-owned terrain scaling: one fixed-size terrain change per timed iteration on
+//! worlds along two scale axes, each at three sizes with the other fixed: level side
+//! 256, 1024, and 2048 at 8 levels, and 8, 32, and 128 levels at side 256. The change is
+//! the same at every level size and depth, so the cost model expects each group flat
+//! across both axes:
 //!   - `chunk-scale-dig`: 64 single-cell digs and refills, each in its own chunk.
 //!   - `chunk-scale-ramp`: 64 ramp digs, each in its own chunk on the deepest level
 //!     and linked to the level above, the way `DigController` digs a ramp: the
@@ -13,20 +15,20 @@
 //!     Links are append-only, so each iteration's reset (untimed) refills the cells
 //!     and exits, leaving their links dead, and the next iteration re-digs the same
 //!     cells, reviving those links: only the first iteration adds links. Flat.
-//!   - `chunk-scale-cave-in`: a chunk-aligned tunnel region of 4, 64, or 256 chunks,
-//!     a quarter on each of four stacked levels, collapses to solid and is carved
-//!     back, each one batched edit (`applyDenseCellWrites`). Linear in region chunks.
+//!   - `chunk-scale-cave-in`: a chunk-aligned tunnel region of 4, 64, or 256 chunks
+//!     at 256² and 8 levels (the scale axes at 64 chunks), a quarter on each of four
+//!     stacked levels, collapses to solid and is carved back, each one batched edit
+//!     (`applyDenseCellWrites`). Linear in region chunks.
 //!   - `chunk-scale-explosion-fill`: a disk inscribed in a 4-, 64-, or 256-chunk
 //!     square on the deepest level (touching fewer chunks than the square) is blown
 //!     open and filled back, each one batched edit. Linear in region chunks. One
-//!     extra case (item prefix `1 * 10^10`, 64 chunks at 256² and 8 levels) first
+//!     extra case (the sparse-props field set, 64 chunks at 256² and 8 levels) first
 //!     places 32 blocking sparse props in every chunk of the square, so each changed
 //!     cell's composed blocked bit also reads its chunk's sparse tiles.
 //!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the
 //!     digs and after the refills (64 blocks taken, then freed). Flat. An edit sync scans
 //!     the window once per pass for each flagged resident layer, so two axes vary those
-//!     terms at 256² (item code `variant * 10^11 + resident layers * 10^9 + window edge
-//!     chunks * 10^7 + level side * 1000 + levels`): the window-edge axis (variant 0) digs
+//!     terms at 256² (`GpuSyncDigCode`): the window-edge axis (variant 0) digs
 //!     and refills the 4 cells of the center 2x2 chunks under a 2-, 6-, or 14-chunk window
 //!     at 8 levels, the same edits at every edge (linear in window chunks); the batched
 //!     axis (variant 1) times the syncs after an explosion disk inscribed in the fixed
@@ -36,23 +38,22 @@
 //!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
 //!     and back, each step one level entering (its window directory and 64 mixed
 //!     blocks) and one leaving. Flat across level size and depth.
-//!   - `chunk-scale-gpu-sync-pan`: a square window of 2, 6, or 14 chunks over the
-//!     two deepest levels pans one chunk across and back, with a visibility update
-//!     and a GPU sync after each step; the window and the column it pans into are
-//!     all mixed chunks. Each step scans O(layers x e²) window chunks and uploads
-//!     the entering column, O(layers x e). Passes when flat across level size and
-//!     depth at every edge, and the edge and resident-layer axes match those
-//!     orders.
+//!   - `chunk-scale-gpu-sync-pan`: a square window of 2, 6, or 14 chunks (at the
+//!     smallest scale; the scale axes at 6) over the two deepest levels pans one chunk
+//!     across and back, with a visibility update and a GPU sync after each step; the
+//!     window and the column it pans into are all mixed chunks. Each step scans
+//!     O(layers x e²) window chunks and uploads the entering column, O(layers x e).
+//!     Passes when flat across level size and depth, and the edge and resident-layer
+//!     axes match those orders.
 //! The pan and level-enter groups also run 8 and 32 resident layers at 256² and
-//! 128 levels (item prefix `layers * 10^9`); every other case renders 2.
+//! 128 levels (`WindowCode`); every other case renders 2.
 //! The GPU sync and batched groups render a fixed 8x8-chunk window over the dig
 //! cells (the pan group its own window), so their GPU work follows the window,
 //! never the level.
 //! Single-cell writes go through the step's reserve seam (`reserveDenseCellWrite`)
 //! first. Changes sit on the deepest levels at the level center; each iteration ends
-//! at its start state. The item count encodes the case as `level side * 1000 +
-//! levels`, plus `region chunks * 10^7` for the two batched groups or `window edge
-//! chunks * 10^7` for the pan group. Fixtures and the batches' write lists build
+//! at its start state. Each group's item code (`suite.ItemCode`) holds `level side * 1000 +
+//! levels` at its bottom and the group's own fields above it. Fixtures and the batches' write lists build
 //! once per case outside the timed loop. The batched groups run serial,
 //! fixed-thread, and adaptive, with the two deepest levels GPU resident so the
 //! merge's render flags are timed; they report each stage's time and the main
@@ -66,10 +67,9 @@
 //! The `chunk-scale-nav-*` groups add the nav reaction to these changes, with nav built
 //! over every level of the same fixture (no render window): each step's change events
 //! whose movement blocking flipped are marked dirty and applied as one buffered nav
-//! update, as the post-commit reaction does. A config whose nav storage exceeds the
-//! bench's nav-size limit is skipped with its figure. `--details` counts the timed
-//! reactions that fell back to whole-level work, and its stage shapes are the nav remask
-//! and patch of the last level the reaction touched.
+//! update, as the post-commit reaction does. A listed config whose nav storage exceeds the
+//! bench's nav-size limit fails with its figure. `--details` prints the reaction's stage
+//! shapes, its connectivity and closure block, and its main-thread split.
 //!   - `chunk-scale-nav-dig`: the dig workload's 64 cells dug in one step and refilled in
 //!     the next, each step followed by the dig writers' nav records and the reaction. Flat.
 //!   - `chunk-scale-nav-ramp`: the ramp workload plus the reaction (each exit's obstacle
@@ -90,7 +90,7 @@
 //!     mouth (linear in L, flat in level side). The connectivity flood runs in threaded
 //!     rounds.
 //!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav
-//!     updated for it. Its replace case (item prefix `1 * 10^7`) first adds a level with a
+//!     updated for it. Its replace case (`LevelAddCode`'s replace field) first adds a level with a
 //!     walkable floor and updates nav (untimed), then times a blocking band added to that
 //!     newest level and nav's update. Depth grows by one per iteration (warmup included),
 //!     so A/B runs use the same `--warmup` and `--iterations`.
@@ -130,60 +130,71 @@ const PathfindingCapacity = @import("../game/systems/pathfinding.zig").Pathfindi
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const default_max_group_fields = @import("../game/systems/pathfinding/types.zig").default_max_group_fields;
-const navSizeCapacity = @import("pathfinding.zig").navSizeCapacity;
 const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
-const buildBandedWorld = @import("pathfinding.zig").buildBandedWorld;
-const squareBatchKeys = @import("pathfinding.zig").squareBatchKeys;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
+// Item codes: the level side and count at the bottom, each group's fields above them.
+const ScaleCode = suite.ItemCode(struct { level_side: u16, levels: u16 }, &.{3});
+const RegionCode = suite.ItemCode(struct { sparse_props: bool, region_chunks: usize, level_side: u16, levels: u16 }, &.{ 3, 4, 3 });
+const GpuSyncDigCode = suite.ItemCode(struct { variant: GpuSyncDigVariant, resident_layers: u16, window_edge: u16, level_side: u16, levels: u16 }, &.{ 2, 2, 4, 3 });
+// Pan and level-enter configs; 0 resident layers is the default two, and level-enter's window
+// edge is 0 (the fixed dig window).
+const WindowCode = suite.ItemCode(struct { resident_layers: u16, window_edge: u16, level_side: u16, levels: u16 }, &.{ 2, 4, 3 });
+const LevelAddCode = suite.ItemCode(struct { replace: bool, level_side: u16, levels: u16 }, &.{ 4, 3 });
+const EncloseCode = suite.ItemCode(struct { variant: EncloseVariant, count: u16, level_side: u16, levels: u16 }, &.{ 3, 4, 3 });
+
+// The scale axes: level side at the shallowest depth, then depth at the smallest side.
 const level_sides = [_]u16{ 256, 1024, 2048 };
 const level_counts = [_]u16{ 8, 32, 128 };
-const case_encoding: usize = 1000;
-// Encodes the batched groups' region chunks and the pan group's window edge above
-// the level side and count.
-const case_prefix_encoding: usize = 10_000_000;
+const scale_axes_len = level_sides.len + level_counts.len - 1;
+
+const scale_axes: [scale_axes_len][2]u16 = blk: {
+    var axes: [scale_axes_len][2]u16 = undefined;
+    for (level_sides, 0..) |side, index| axes[index] = .{ side, level_counts[0] };
+    for (level_counts[1..], level_sides.len..) |levels, index| axes[index] = .{ level_sides[0], levels };
+    break :blk axes;
+};
 
 const scale_item_counts = blk: {
-    var counts: [level_sides.len * level_counts.len]usize = undefined;
-    for (level_sides, 0..) |side, side_index| {
-        for (level_counts, 0..) |levels, level_index| {
-            counts[side_index * level_counts.len + level_index] = @as(usize, side) * case_encoding + levels;
-        }
-    }
+    var counts: [scale_axes_len]usize = undefined;
+    for (scale_axes, &counts) |axis, *count| count.* = ScaleCode.of(.{ .level_side = axis[0], .levels = axis[1] });
     break :blk counts;
 };
 
-// Region sizes of the batched groups, in chunks touched by one edit.
+// Region sizes of the batched groups, in chunks touched by one edit: the region axis at the
+// smallest scale, then the scale axes at the middle region.
 const region_chunk_counts = [_]usize{ 4, 64, 256 };
+const scale_axis_region: usize = 64;
 
 const region_item_counts = blk: {
-    var counts: [region_chunk_counts.len * scale_item_counts.len]usize = undefined;
-    for (region_chunk_counts, 0..) |region, region_index| {
-        for (scale_item_counts, 0..) |scale, scale_index| {
-            counts[region_index * scale_item_counts.len + scale_index] = region * case_prefix_encoding + scale;
-        }
+    var counts: [region_chunk_counts.len + scale_axes_len - 1]usize = undefined;
+    for (region_chunk_counts, 0..) |region, index| {
+        counts[index] = RegionCode.of(.{ .sparse_props = false, .region_chunks = region, .level_side = level_sides[0], .levels = level_counts[0] });
+    }
+    for (scale_axes[1..], region_chunk_counts.len..) |axis, index| {
+        counts[index] = RegionCode.of(.{ .sparse_props = false, .region_chunks = scale_axis_region, .level_side = axis[0], .levels = axis[1] });
     }
     break :blk counts;
 };
 
-// Encodes the explosion group's sparse-props case above the region chunks.
-const sparse_props_encoding: usize = 10_000_000_000;
 // Blocking sparse props per chunk of the sparse-props case: every cell whose
 // (3 * x + 5 * y) % 8 is zero, 32 of a 16x16 chunk's cells.
 const sparse_props_stride: u16 = 8;
-// The sparse-props case's one config: 64 region chunks at 256² and 8 levels.
-const sparse_props_item_count: usize = sparse_props_encoding + 64 * case_prefix_encoding + 256 * case_encoding + 8;
 
 const explosion_item_counts = blk: {
     var counts: [region_item_counts.len + 1]usize = undefined;
     @memcpy(counts[0..region_item_counts.len], &region_item_counts);
-    counts[region_item_counts.len] = sparse_props_item_count;
+    // The sparse-props case's one config: the middle region at the smallest scale.
+    counts[region_item_counts.len] = RegionCode.of(.{ .sparse_props = true, .region_chunks = scale_axis_region, .level_side = level_sides[0], .levels = level_counts[0] });
     break :blk counts;
 };
 
 // Pan group window edges, in chunks; each window and the column it pans into fit
 // the smallest level.
 const pan_window_edges = [_]u16{ 2, 6, 14 };
+// The edge the scale and resident-layer axes pan at.
+const pan_axis_edge: u16 = 6;
 
 // The pan region's columns: the window and the column it pans into.
 fn panRegionColumns(window_edge: u16) u16 {
@@ -192,34 +203,30 @@ fn panRegionColumns(window_edge: u16) u16 {
 
 // The GPU sync groups' resident layers by default: `active_level` and the one below.
 const default_resident_layers: u16 = 2;
-// The pan and level-enter groups' resident-layer axis, measured at one level size
-// and depth deep enough to hold it; the size and depth axes run at the default.
+// The pan and level-enter groups' resident-layer axis past the default, at the smallest side
+// and deepest depth, which holds them.
 const resident_layer_axis = [_]u16{ 8, 32 };
-const resident_layer_axis_scale: usize = @as(usize, level_sides[0]) * case_encoding + level_counts[level_counts.len - 1];
-// Encodes a non-default resident-layer count above every other case field.
-const resident_layer_encoding: usize = 1_000_000_000;
 
 const pan_item_counts = blk: {
-    const scale_cases = pan_window_edges.len * scale_item_counts.len;
-    var counts: [scale_cases + pan_window_edges.len * resident_layer_axis.len]usize = undefined;
-    for (pan_window_edges, 0..) |edge, edge_index| {
+    var counts: [pan_window_edges.len + scale_axes_len - 1 + resident_layer_axis.len]usize = undefined;
+    for (pan_window_edges, 0..) |edge, index| {
         std.debug.assert(panRegionColumns(edge) <= level_sides[0] / default_chunk_size_tiles);
-        for (scale_item_counts, 0..) |scale, scale_index| {
-            counts[edge_index * scale_item_counts.len + scale_index] = @as(usize, edge) * case_prefix_encoding + scale;
-        }
-        for (resident_layer_axis, 0..) |layers, layer_index| {
-            counts[scale_cases + edge_index * resident_layer_axis.len + layer_index] =
-                @as(usize, layers) * resident_layer_encoding + @as(usize, edge) * case_prefix_encoding + resident_layer_axis_scale;
-        }
+        counts[index] = WindowCode.of(.{ .resident_layers = 0, .window_edge = edge, .level_side = level_sides[0], .levels = level_counts[0] });
+    }
+    for (scale_axes[1..], pan_window_edges.len..) |axis, index| {
+        counts[index] = WindowCode.of(.{ .resident_layers = 0, .window_edge = pan_axis_edge, .level_side = axis[0], .levels = axis[1] });
+    }
+    for (resident_layer_axis, pan_window_edges.len + scale_axes_len - 1..) |layers, index| {
+        counts[index] = WindowCode.of(.{ .resident_layers = layers, .window_edge = pan_axis_edge, .level_side = level_sides[0], .levels = level_counts[level_counts.len - 1] });
     }
     break :blk counts;
 };
 
 const level_enter_item_counts = blk: {
-    var counts: [scale_item_counts.len + resident_layer_axis.len]usize = undefined;
-    @memcpy(counts[0..scale_item_counts.len], &scale_item_counts);
-    for (resident_layer_axis, scale_item_counts.len..) |layers, index| {
-        counts[index] = @as(usize, layers) * resident_layer_encoding + resident_layer_axis_scale;
+    var counts: [scale_axes_len + resident_layer_axis.len]usize = undefined;
+    @memcpy(counts[0..scale_axes_len], &scale_item_counts);
+    for (resident_layer_axis, scale_axes_len..) |layers, index| {
+        counts[index] = WindowCode.of(.{ .resident_layers = layers, .window_edge = 0, .level_side = level_sides[0], .levels = level_counts[level_counts.len - 1] });
     }
     break :blk counts;
 };
@@ -243,109 +250,180 @@ const dig_window_chunks: u16 = 8;
 
 pub const dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-dig",
+    .item_label = ScaleCode.label,
     .defaultItemCounts = scaleItemCounts,
     .runCase = runDigCase,
+    .write_workload = writeCellsWorkload,
 };
 
 pub const ramp_group = suite.BenchmarkGroup{
     .name = "chunk-scale-ramp",
+    .item_label = ScaleCode.label,
     .defaultItemCounts = scaleItemCounts,
     .runCase = runRampCase,
+    .write_workload = writeCellsWorkload,
 };
 
 pub const cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-cave-in",
+    .item_label = RegionCode.label,
     .defaultItemCounts = regionItemCounts,
     .runCase = runCaveInCase,
+    .write_workload = writeBatchWorkload,
 };
 
 pub const explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-explosion-fill",
+    .item_label = RegionCode.label,
     .defaultItemCounts = explosionItemCounts,
     .runCase = runExplosionFillCase,
+    .write_workload = writeBatchWorkload,
 };
 
 pub const gpu_sync_dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-dig",
+    .item_label = GpuSyncDigCode.label,
     .defaultItemCounts = gpuSyncDigItemCounts,
     .runCase = runGpuSyncDigCase,
+    .write_workload = writeUploadsWorkload,
 };
 
 pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-level-enter",
+    .item_label = WindowCode.label,
     .defaultItemCounts = levelEnterItemCounts,
     .runCase = runGpuSyncLevelEnterCase,
+    .write_workload = writeUploadsWorkload,
 };
 
 pub const gpu_sync_pan_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-pan",
+    .item_label = WindowCode.label,
     .defaultItemCounts = panItemCounts,
     .runCase = runGpuSyncPanCase,
+    .write_workload = writeUploadsWorkload,
 };
 
 pub const nav_dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-dig",
+    .item_label = ScaleCode.label,
     .defaultItemCounts = scaleItemCounts,
     .runCase = runNavDigCase,
+    .write_workload = writeNavCellsWorkload,
 };
 
 pub const nav_ramp_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-ramp",
+    .item_label = ScaleCode.label,
     .defaultItemCounts = scaleItemCounts,
     .runCase = runNavRampCase,
+    .write_workload = writeNavCellsWorkload,
 };
 
 pub const nav_cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-cave-in",
+    .item_label = RegionCode.label,
     .defaultItemCounts = regionItemCounts,
     .runCase = runNavCaveInCase,
+    .write_workload = writeNavBatchWorkload,
 };
 
 pub const nav_explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-explosion-fill",
+    .item_label = RegionCode.label,
     .defaultItemCounts = regionItemCounts,
     .runCase = runNavExplosionFillCase,
+    .write_workload = writeNavBatchWorkload,
 };
 
 pub const nav_enclose_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-enclose",
+    .item_label = EncloseCode.label,
     .defaultItemCounts = encloseItemCounts,
     .runCase = runNavEncloseCase,
+    .write_workload = writeNavBatchWorkload,
 };
 
 pub const nav_level_add_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-level-add",
+    .item_label = LevelAddCode.label,
     .defaultItemCounts = levelAddItemCounts,
     .runCase = runNavLevelAddCase,
+    .write_workload = writeLevelAddWorkload,
 };
 
-// The level-add group's replace case, encoded above the level side and count.
-const level_add_replace_case: usize = 1;
+// The cells a single-cell group wrote.
+fn writeCellsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cells={}", .{stats.output_count});
+}
+
+// The elements a GPU sync group uploaded.
+fn writeUploadsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("uploaded={}", .{stats.output_count});
+}
+
+// A batched edit's cells and chunks; under --details its plan and write stages, their
+// times, and the main thread's share.
+fn writeBatchWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cells={} chunks={}", .{ stats.output_count, stats.batch.item_count });
+    if (view == .summary) return;
+    const phases = stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{};
+    try writer.writeAll(" plan=");
+    try suite.writeStageShape(writer, stats.secondary_batch orelse .{});
+    try writer.writeAll(" write=");
+    try suite.writeStageShape(writer, stats.batch);
+    try writer.print(" plan_t={f} write_t={f}", .{ suite.formatDuration(phases.plan_ns), suite.formatDuration(phases.write_ns) });
+    try suite.writeShare(writer, "main", phases.main_ns, stats.mean_ns);
+}
+
+// A nav group's cells changed; under --details its nav reaction's stages.
+fn writeNavCellsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cells={}", .{stats.output_count});
+    if (view == .summary) return;
+    try writer.writeByte(' ');
+    try suite.writeNavStages(writer, stats);
+}
+
+// A batched nav group's cells; under --details its nav stages, the terrain and nav
+// reaction times, and the main thread's share.
+fn writeNavBatchWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cells={}", .{stats.output_count});
+    if (view == .summary) return;
+    try writer.writeByte(' ');
+    try suite.writeNavStages(writer, stats);
+    const phases = stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{};
+    try writer.print(" plan_t={f} write_t={f} nav_t={f}", .{ suite.formatDuration(phases.plan_ns), suite.formatDuration(phases.write_ns), suite.formatDuration(phases.nav_ns) });
+    try suite.writeShare(writer, "main", phases.main_ns, stats.mean_ns);
+}
+
+fn writeLevelAddWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("levels={}", .{stats.output_count});
+    if (view == .summary) return;
+    try writer.writeByte(' ');
+    try suite.writeNavStages(writer, stats);
+}
 
 const level_add_item_counts = blk: {
-    var counts: [2 * scale_item_counts.len]usize = undefined;
-    @memcpy(counts[0..scale_item_counts.len], &scale_item_counts);
-    for (scale_item_counts, scale_item_counts.len..) |scale, index| {
-        counts[index] = level_add_replace_case * case_prefix_encoding + scale;
+    var counts: [2 * scale_axes_len]usize = undefined;
+    for (scale_axes, 0..) |axis, index| {
+        counts[index] = LevelAddCode.of(.{ .replace = false, .level_side = axis[0], .levels = axis[1] });
+        counts[scale_axes_len + index] = LevelAddCode.of(.{ .replace = true, .level_side = axis[0], .levels = axis[1] });
     }
     break :blk counts;
 };
 
-// The enclose group's variants above their pocket count, pocket edge, or tunnel length, on one
-// level.
-const enclose_variant_encoding: usize = 10_000_000_000;
 const enclose_pocket_edge: u16 = 4;
 const enclose_tunnel_row: u16 = 8;
 const enclose_item_counts = [_]usize{
-    0 * enclose_variant_encoding + 16 * case_prefix_encoding + 1024 * case_encoding + 1,
-    0 * enclose_variant_encoding + 64 * case_prefix_encoding + 1024 * case_encoding + 1,
-    0 * enclose_variant_encoding + 196 * case_prefix_encoding + 2048 * case_encoding + 1,
-    1 * enclose_variant_encoding + 8 * case_prefix_encoding + 1024 * case_encoding + 1,
-    1 * enclose_variant_encoding + 16 * case_prefix_encoding + 1024 * case_encoding + 1,
-    1 * enclose_variant_encoding + 32 * case_prefix_encoding + 1024 * case_encoding + 1,
-    2 * enclose_variant_encoding + 8 * case_prefix_encoding + 1024 * case_encoding + 1,
-    2 * enclose_variant_encoding + 32 * case_prefix_encoding + 1024 * case_encoding + 1,
-    2 * enclose_variant_encoding + 62 * case_prefix_encoding + 1024 * case_encoding + 1,
+    EncloseCode.of(.{ .variant = .pockets, .count = 16, .level_side = 1024, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .pockets, .count = 64, .level_side = 1024, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .pockets, .count = 196, .level_side = 2048, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .pocket_edge, .count = 8, .level_side = 1024, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .pocket_edge, .count = 16, .level_side = 1024, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .pocket_edge, .count = 32, .level_side = 1024, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .tunnel, .count = 8, .level_side = 1024, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .tunnel, .count = 32, .level_side = 1024, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .tunnel, .count = 62, .level_side = 1024, .levels = 1 }),
 };
 
 fn encloseItemCounts(_: suite.Profile) []const usize {
@@ -383,11 +461,11 @@ const BatchWorkload = enum { cave_in, explosion_fill };
 const NavBatchWorkload = enum { cave_in, explosion_fill, enclose };
 
 fn runDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .dig, CaseShape.decode(item_count, .dig));
+    return runCase(allocator, io, options, case, item_count, .dig, try CaseShape.decodeScale(item_count));
 }
 
 fn runRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .ramp, CaseShape.decode(item_count, .ramp));
+    return runCase(allocator, io, options, case, item_count, .ramp, try CaseShape.decodeScale(item_count));
 }
 
 fn runCaveInCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -411,11 +489,11 @@ fn runGpuSyncDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
 }
 
 fn runGpuSyncLevelEnterCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .gpu_sync_level_enter, CaseShape.decode(item_count, .gpu_sync_level_enter));
+    return runCase(allocator, io, options, case, item_count, .gpu_sync_level_enter, try CaseShape.decodeWindow(item_count, false));
 }
 
 fn runGpuSyncPanCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .gpu_sync_pan, CaseShape.decode(item_count, .gpu_sync_pan));
+    return runCase(allocator, io, options, case, item_count, .gpu_sync_pan, try CaseShape.decodeWindow(item_count, true));
 }
 
 // A single-cell or GPU sync case's world and render window.
@@ -427,35 +505,35 @@ const CaseShape = struct {
     // the fixed dig window.
     window_edge: u16 = 0,
 
-    // The dig, ramp, level-enter, and pan groups' item codes.
-    fn decode(item_count: usize, workload: Workload) CaseShape {
-        std.debug.assert(workload != .gpu_sync_dig);
-        const encoded_layers = item_count / resident_layer_encoding;
-        const window_edge: u16 = @intCast(item_count % resident_layer_encoding / case_prefix_encoding);
-        const scale = item_count % case_prefix_encoding;
-        std.debug.assert((workload == .gpu_sync_pan) == (window_edge > 0));
-        std.debug.assert(encoded_layers == 0 or workload == .gpu_sync_pan or workload == .gpu_sync_level_enter);
+    // The dig and ramp groups' codes.
+    fn decodeScale(item_count: usize) !CaseShape {
+        const code = try ScaleCode.decode(item_count);
+        return .{ .side = code.level_side, .levels = code.levels };
+    }
+
+    // The pan group's codes (`pan`: a window edge) and level-enter's (no edge).
+    fn decodeWindow(item_count: usize, pan: bool) !CaseShape {
+        const code = try WindowCode.decode(item_count);
+        if (pan != (code.window_edge != 0)) return error.ChunkScaleWindowEdgeMismatch;
         return .{
-            .side = @intCast(scale / case_encoding),
-            .levels = @intCast(scale % case_encoding),
-            .resident_layers = if (encoded_layers == 0) default_resident_layers else @intCast(encoded_layers),
-            .window_edge = window_edge,
+            .side = code.level_side,
+            .levels = code.levels,
+            .resident_layers = if (code.resident_layers == 0) default_resident_layers else code.resident_layers,
+            .window_edge = code.window_edge,
         };
     }
 };
 
-// The gpu-sync-dig group's variants, encoded above the resident layers: the dig workload
-// with a sync after the digs and after the refills, or one batched change over every
-// resident layer with a sync after it and after its reversal.
-const GpuSyncDigVariant = enum { digs, batched };
-const gpu_sync_variant_encoding: usize = 100_000_000_000;
+// The gpu-sync-dig group's variants: the dig workload with a sync after the digs and after
+// the refills, or one batched change over every resident layer with a sync after it and
+// after its reversal.
+const GpuSyncDigVariant = enum(u8) { digs, batched };
 // The dig variant's window-edge axis: the window edges of the pan group over the digs of
-// the fixed dig square's center 2x2 chunks, the same edits at every edge, at one level size
-// and depth.
+// the fixed dig square's center 2x2 chunks, the same edits at every edge, at the smallest
+// scale.
 const gpu_sync_edge_dig_square: u16 = 2;
-const gpu_sync_edge_axis_scale: usize = @as(usize, level_sides[0]) * case_encoding + level_counts[0];
-// The batched variant's written resident layers, at one level size and depth deep enough to
-// hold them.
+// The batched variant's written resident layers, at the smallest side and deepest depth,
+// which holds them.
 const gpu_sync_batch_layers = [_]u16{ 2, 8, 32 };
 
 const GpuSyncDigConfig = struct {
@@ -466,51 +544,33 @@ const GpuSyncDigConfig = struct {
     // The dig variant's window edge; 0 is the fixed dig window over the 64-cell dig square.
     window_edge: u16,
 
-    fn itemCode(variant: GpuSyncDigVariant, resident_layers: u16, window_edge: u16, scale: usize) usize {
-        const variant_code: usize = switch (variant) {
-            .digs => 0,
-            .batched => 1,
-        };
-        return variant_code * gpu_sync_variant_encoding + @as(usize, resident_layers) * resident_layer_encoding +
-            @as(usize, window_edge) * case_prefix_encoding + scale;
-    }
-
     // Each config has one code: the dig variant leaves the layers field 0 (it renders the
     // default two) and the batched variant the edge field 0 (it renders the fixed dig window).
     fn decode(item_count: usize) !GpuSyncDigConfig {
-        const variant: GpuSyncDigVariant = switch (item_count / gpu_sync_variant_encoding) {
-            0 => .digs,
-            1 => .batched,
-            else => return error.GpuSyncDigUnknownVariant,
-        };
-        const layers_field = item_count % gpu_sync_variant_encoding / resident_layer_encoding;
-        const edge_field = item_count % resident_layer_encoding / case_prefix_encoding;
-        const scale = item_count % case_prefix_encoding;
-        const side = scale / case_encoding;
-        const levels = scale % case_encoding;
-        if (std.mem.indexOfScalar(u16, &level_sides, std.math.cast(u16, side) orelse 0) == null) return error.GpuSyncDigBadLevelSide;
-        if (std.mem.indexOfScalar(u16, &level_counts, std.math.cast(u16, levels) orelse 0) == null) return error.GpuSyncDigBadLevelCount;
+        const code = try GpuSyncDigCode.decode(item_count);
+        if (std.mem.indexOfScalar(u16, &level_sides, code.level_side) == null) return error.GpuSyncDigBadLevelSide;
+        if (std.mem.indexOfScalar(u16, &level_counts, code.levels) == null) return error.GpuSyncDigBadLevelCount;
         var config = GpuSyncDigConfig{
-            .variant = variant,
-            .side = @intCast(side),
-            .levels = @intCast(levels),
+            .variant = code.variant,
+            .side = code.level_side,
+            .levels = code.levels,
             .resident_layers = default_resident_layers,
             .window_edge = 0,
         };
-        switch (variant) {
+        switch (code.variant) {
             .digs => {
-                if (layers_field != 0) return error.GpuSyncDigLayersOnDigs;
-                if (edge_field != 0) {
-                    if (std.mem.indexOfScalar(u16, &pan_window_edges, @intCast(edge_field)) == null) return error.GpuSyncDigBadWindowEdge;
-                    if (scale != gpu_sync_edge_axis_scale) return error.GpuSyncDigBadEdgeAxisScale;
-                    config.window_edge = @intCast(edge_field);
+                if (code.resident_layers != 0) return error.GpuSyncDigLayersOnDigs;
+                if (code.window_edge != 0) {
+                    if (std.mem.indexOfScalar(u16, &pan_window_edges, code.window_edge) == null) return error.GpuSyncDigBadWindowEdge;
+                    if (code.level_side != level_sides[0] or code.levels != level_counts[0]) return error.GpuSyncDigBadEdgeAxisScale;
+                    config.window_edge = code.window_edge;
                 }
             },
             .batched => {
-                if (edge_field != 0) return error.GpuSyncDigEdgeOnBatched;
-                if (std.mem.indexOfScalar(u16, &gpu_sync_batch_layers, std.math.cast(u16, layers_field) orelse 0) == null) return error.GpuSyncDigBadBatchLayers;
-                if (scale != resident_layer_axis_scale) return error.GpuSyncDigBadBatchScale;
-                config.resident_layers = @intCast(layers_field);
+                if (code.window_edge != 0) return error.GpuSyncDigEdgeOnBatched;
+                if (std.mem.indexOfScalar(u16, &gpu_sync_batch_layers, code.resident_layers) == null) return error.GpuSyncDigBadBatchLayers;
+                if (code.level_side != level_sides[0] or code.levels != level_counts[level_counts.len - 1]) return error.GpuSyncDigBadBatchScale;
+                config.resident_layers = code.resident_layers;
             },
         }
         return config;
@@ -518,13 +578,15 @@ const GpuSyncDigConfig = struct {
 };
 
 const gpu_sync_dig_item_counts = blk: {
-    var counts: [scale_item_counts.len + pan_window_edges.len + gpu_sync_batch_layers.len]usize = undefined;
-    @memcpy(counts[0..scale_item_counts.len], &scale_item_counts);
-    for (pan_window_edges, scale_item_counts.len..) |edge, index| {
-        counts[index] = GpuSyncDigConfig.itemCode(.digs, 0, edge, gpu_sync_edge_axis_scale);
+    var counts: [scale_axes_len + pan_window_edges.len + gpu_sync_batch_layers.len]usize = undefined;
+    for (scale_axes, 0..) |axis, index| {
+        counts[index] = GpuSyncDigCode.of(.{ .variant = .digs, .resident_layers = 0, .window_edge = 0, .level_side = axis[0], .levels = axis[1] });
     }
-    for (gpu_sync_batch_layers, scale_item_counts.len + pan_window_edges.len..) |layers, index| {
-        counts[index] = GpuSyncDigConfig.itemCode(.batched, layers, 0, resident_layer_axis_scale);
+    for (pan_window_edges, scale_axes_len..) |edge, index| {
+        counts[index] = GpuSyncDigCode.of(.{ .variant = .digs, .resident_layers = 0, .window_edge = edge, .level_side = level_sides[0], .levels = level_counts[0] });
+    }
+    for (gpu_sync_batch_layers, scale_axes_len + pan_window_edges.len..) |layers, index| {
+        counts[index] = GpuSyncDigCode.of(.{ .variant = .batched, .resident_layers = layers, .window_edge = 0, .level_side = level_sides[0], .levels = level_counts[level_counts.len - 1] });
     }
     break :blk counts;
 };
@@ -655,7 +717,7 @@ const Fixture = struct {
 
 // A walkable surface over `levels - 1` solid levels, each one uniform dense band.
 fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16) !Fixture {
-    var world = try buildBandedWorld(allocator, io, side, levels, "grass", "dirt");
+    var world = try fixtures.buildBandedWorld(allocator, io, side, levels, "grass", "dirt");
     errdefer world.deinit();
     const meta = world.tilesetMeta().?;
     const dirt = try world.requireTileByName(meta, "dirt");
@@ -728,7 +790,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // The item count is a case code, so report throughput over the cells written
     // (elements uploaded for the GPU sync groups).
     stats.output_count = cells_changed;
-    stats.items_per_second = if (stats.mean_ns == 0) 0 else @intCast(@as(u128, cells_changed) * std.time.ns_per_s / stats.mean_ns);
+    stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
     return stats;
 }
 
@@ -1089,21 +1151,15 @@ fn tunersSettled(world: *const WorldSystem) bool {
 
 fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const sparse_props = item_count / sparse_props_encoding != 0;
-    std.debug.assert(!sparse_props or workload == .explosion_fill);
-    const region_chunks = item_count % sparse_props_encoding / case_prefix_encoding;
-    const scale = item_count % case_prefix_encoding;
-    const side: u16 = @intCast(scale / case_encoding);
-    const levels: u16 = @intCast(scale % case_encoding);
-    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+    const code = try RegionCode.decode(item_count);
+    const sparse_props = code.sparse_props;
+    if (sparse_props and workload != .explosion_fill) return error.ChunkScaleSparsePropsOffExplosion;
+    const region_chunks = code.region_chunks;
+    const side = code.level_side;
+    const levels = code.levels;
+    if (levels < cave_in_levels + 1 or side < 256) return error.ChunkScaleWorldTooSmall;
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     var fixture = try buildFixture(allocator, io, side, levels);
@@ -1172,7 +1228,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // The item count is a case code, so report throughput over the cells written; the
     // batches' item count is the chunks one edit touched.
     stats.output_count = cells_changed;
-    stats.items_per_second = if (stats.mean_ns == 0) 0 else @intCast(@as(u128, cells_changed) * std.time.ns_per_s / stats.mean_ns);
+    stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(world.last_terrain_edit_write_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(world.last_terrain_edit_plan_batch);
     if (stats.iterations > 0) {
@@ -1352,32 +1408,6 @@ fn navSizeConfig(side: u16, levels: usize, participant_count: usize, batch: suit
     };
 }
 
-// The connectivity and one-way closure blocks of one nav reaction's stats, with the flood
-// tuner's policy when the case runs it adaptive.
-fn navConnSummary(stats: NavUpdateStats, system: *const PathfindingSystem, case: suite.BenchmarkCase) suite.NavConnSummary {
-    const tuner = system.tuners.nav.getPtrConst(.conn_flood).report();
-    var summary = suite.NavConnSummary{
-        .seed = suite.batchSummaryFromBatch(stats.conn_seed_batch),
-        .gather = suite.batchSummaryFromBatch(stats.conn_gather_batch),
-        .flood = suite.batchSummaryFromBatch(stats.conn_flood_batch),
-        .families = stats.conn_families,
-        .rounds = stats.conn_rounds,
-        .round_items_min = stats.conn_round_items_min,
-        .round_items_max = stats.conn_round_items_max,
-        .build_visits = stats.conn_build_visits,
-        .flood_nodes = stats.conn_flood_nodes,
-        .splits = stats.conn_splits,
-        .merges = stats.conn_merges,
-        .flood_off_main_ns = stats.conn_flood_off_main_ns,
-        .flood_tuner_workers = if (case.adaptive and case.usesThreadSystem())
-            (if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0)
-        else
-            null,
-    };
-    suite.fillClosureSummary(&summary, stats);
-    return summary;
-}
-
 // Builds nav over `fixture`'s world, taking ownership of it.
 fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !NavFixture {
     var base = fixture;
@@ -1395,29 +1425,12 @@ fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, ca
     return .{ .base = base, .colliders = colliders, .system = system, .changes = .{ .allocator = allocator }, .io = io };
 }
 
-// Gives the nav reaction's mark stage and every nav batch stage this case's tuners and control
-// config; nav stage items are independent, one per range for the fixed controls.
-fn setNavStageControls(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
-    const tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    system.tuners.nav_mark = tuner;
-    system.tuners.nav = .initFill(tuner);
-    system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1 };
-}
-
 // `reaction`: the workload runs the post-commit reaction, so its mark stage dispatches too.
 fn navStageTunersSettled(system: *const PathfindingSystem, reaction: bool) bool {
     return (!reaction or system.tuners.nav_mark.isSettled()) and system.tuners.nav.getPtrConst(.plan).isSettled() and
         system.tuners.nav.getPtrConst(.remask).isSettled() and system.tuners.nav.getPtrConst(.patch).isSettled() and
         system.tuners.nav.getPtrConst(.conn_seed).isSettled() and system.tuners.nav.getPtrConst(.conn_gather).isSettled() and
         (system.tuners.nav.getPtrConst(.conn_flood).isSettled() or system.graph.connectivity.last_flood_batch.item_count == 0);
-}
-
-fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
-    if (!case.usesThreadSystem()) return null;
-    return try ThreadSystem.init(allocator, io, .{
-        .max_worker_threads = case.maxWorkerThreads(),
-        .items_per_range = suite.default_items_per_range,
-    });
 }
 
 const NavWorkload = enum { dig, ramp };
@@ -1432,19 +1445,19 @@ fn runNavRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
 
 fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: NavWorkload) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    std.debug.assert(item_count < case_prefix_encoding);
-    const side: u16 = @intCast(item_count / case_encoding);
-    const levels: u16 = @intCast(item_count % case_encoding);
-    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
-    var threads = try initCaseThreads(allocator, io, case);
+    const code = try ScaleCode.decode(item_count);
+    const side = code.level_side;
+    const levels = code.levels;
+    if (levels < cave_in_levels + 1 or side < 256) return error.ChunkScaleWorldTooSmall;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     // The dig square's cells on the deepest level; the ramps' too, with their exits' obstacle
     // rects on the level above and their links.
     const batch: suite.NavBatch = switch (workload) {
-        .dig => .{ .mark_chunks = dig_cell_count, .links = 0, .keys = squareBatchKeys(dig_window_chunks) },
-        .ramp => .{ .mark_chunks = 2 * dig_cell_count, .links = dig_cell_count, .keys = 2 * squareBatchKeys(dig_window_chunks) },
+        .dig => .{ .mark_chunks = dig_cell_count, .links = 0, .keys = suite.squareBatchKeys(dig_window_chunks) },
+        .ramp => .{ .mark_chunks = 2 * dig_cell_count, .links = dig_cell_count, .keys = 2 * suite.squareBatchKeys(dig_window_chunks) },
     };
     // The world first: its content sizes the nav.
     var world_fixture = try buildFixture(allocator, io, side, levels);
@@ -1456,14 +1469,14 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         .dig => nav_dig_group.name,
         .ramp => nav_ramp_group.name,
     };
-    if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(group_name, item_count, case, size_config);
 
     world_owned = false;
-    var nav = try navFixtureOver(allocator, io, world_fixture, navSizeCapacity(size_config), thread_ptr);
+    var nav = try navFixtureOver(allocator, io, world_fixture, suite.navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
     try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
-    setNavStageControls(&nav.system, case);
+    fixtures.setNavTuners(&nav.system, case);
 
     for (0..options.warmup_iterations) |_| {
         _ = try runNavIteration(&nav, workload);
@@ -1496,7 +1509,7 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     var stats = accumulator.finish();
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
-    stats.nav_conn = navConnSummary(timed_stats, &nav.system, case);
+    stats.nav_conn = suite.navConnSummary(timed_stats, fixtures.floodTunerWorkers(&nav.system, case));
     stats.nav_main = timed_main;
     stats.batch = suite.batchSummaryFromBatch(timed_stats.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(timed_stats.plan_batch);
@@ -1593,27 +1606,32 @@ fn runNavEncloseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     return runNavBatchCase(allocator, io, options, case, item_count, .enclose);
 }
 
-// The enclose group's pockets: variant 0 holds `count` pockets of `enclose_pocket_edge` chunks in a
-// square grid, variant 1 one pocket of edge `count`, variant 2 one tunnel of `count` chunks
-// running east from its mouth chunk (1, `enclose_tunnel_row`).
+const EncloseVariant = enum(u8) {
+    // `count` pockets of `enclose_pocket_edge` chunks in a square grid.
+    pockets,
+    // One pocket of edge `count`.
+    pocket_edge,
+    // One tunnel of `count` chunks running east from its mouth chunk (1, `enclose_tunnel_row`).
+    tunnel,
+};
+
+// The enclose group's pockets (`EncloseCode`).
 const EncloseConfig = struct {
-    variant: u8,
+    variant: EncloseVariant,
     count: u16,
 
     fn decode(item_count: usize) !EncloseConfig {
-        const variant = item_count / enclose_variant_encoding;
-        const count = item_count % enclose_variant_encoding / case_prefix_encoding;
-        if (variant > 2) return error.NavEncloseUnknownVariant;
-        if (count == 0 or count > std.math.maxInt(u16)) return error.NavEncloseBadCount;
-        return .{ .variant = @intCast(variant), .count = @intCast(count) };
+        const code = try EncloseCode.decode(item_count);
+        if (code.count == 0) return error.NavEncloseBadCount;
+        return .{ .variant = code.variant, .count = code.count };
     }
 
     fn pocketEdge(self: EncloseConfig) u16 {
-        return if (self.variant == 0) enclose_pocket_edge else self.count;
+        return if (self.variant == .pockets) enclose_pocket_edge else self.count;
     }
 
     fn pockets(self: EncloseConfig) u16 {
-        return if (self.variant == 0) self.count else 1;
+        return if (self.variant == .pockets) self.count else 1;
     }
 
     // Pocket `index`'s wall-ring corner chunk: rings in a square grid, one chunk apart.
@@ -1625,7 +1643,7 @@ const EncloseConfig = struct {
 
     // Pocket `index`'s doorway chunk, on its ring's east side; the tunnel's mouth.
     fn doorway(self: EncloseConfig, index: u16) [2]u16 {
-        if (self.variant == 2) return .{ 1, enclose_tunnel_row };
+        if (self.variant == .tunnel) return .{ 1, enclose_tunnel_row };
         const ring = self.corner(index);
         const edge = self.pocketEdge();
         return .{ ring[0] + edge + 1, ring[1] + 1 + edge / 2 };
@@ -1637,7 +1655,7 @@ fn buildEncloseFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, conf
     var fixture = try buildFixture(allocator, io, side, 1);
     errdefer fixture.deinit();
     const side_chunks = side / default_chunk_size_tiles;
-    if (config.variant == 2) {
+    if (config.variant == .tunnel) {
         // The tunnel: wall rows above and below it from its mouth to one past its far end,
         // which is capped.
         const length = config.count;
@@ -1698,24 +1716,30 @@ fn buildEncloseEdit(allocator: std.mem.Allocator, fixture: *const Fixture, confi
 
 fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: NavBatchWorkload) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const region_chunks = item_count / case_prefix_encoding;
-    const scale = item_count % case_prefix_encoding;
-    const side: u16 = @intCast(scale / case_encoding);
-    const levels: u16 = @intCast(scale % case_encoding);
-    std.debug.assert(side >= 256 and (if (workload == .enclose) levels == 1 else levels >= cave_in_levels + 1));
+    const enclose: ?EncloseConfig = if (workload == .enclose) try EncloseConfig.decode(item_count) else null;
+    const scale: [2]u16, const region_chunks: usize = if (enclose != null) blk: {
+        const code = try EncloseCode.decode(item_count);
+        break :blk .{ .{ code.level_side, code.levels }, 0 };
+    } else blk: {
+        const code = try RegionCode.decode(item_count);
+        if (code.sparse_props) return error.ChunkScaleSparsePropsOffExplosion;
+        break :blk .{ .{ code.level_side, code.levels }, code.region_chunks };
+    };
+    const side = scale[0];
+    const levels = scale[1];
+    if (side < 256 or (if (workload == .enclose) levels != 1 else levels < cave_in_levels + 1)) return error.ChunkScaleWorldTooSmall;
 
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const enclose: ?EncloseConfig = if (workload == .enclose) try EncloseConfig.decode(item_count) else null;
+    const participant_count = fixtures.participantCount(thread_ptr);
     // Every cell of the edit's chunks as a mark; its keys: a cave-in's square on each of its
     // levels, an explosion disk's bounding square, or each doorway chunk with its neighbours.
     const edit_chunks: usize = if (enclose) |config| config.pockets() else region_chunks;
     const batch_keys: usize = switch (workload) {
-        .cave_in => cave_in_levels * squareBatchKeys(std.math.sqrt(region_chunks / cave_in_levels)),
-        .explosion_fill => squareBatchKeys(std.math.sqrt(region_chunks)),
-        .enclose => edit_chunks * squareBatchKeys(1),
+        .cave_in => cave_in_levels * suite.squareBatchKeys(std.math.sqrt(region_chunks / cave_in_levels)),
+        .explosion_fill => suite.squareBatchKeys(std.math.sqrt(region_chunks)),
+        .enclose => edit_chunks * suite.squareBatchKeys(1),
     };
     const chunk_cells = @as(usize, default_chunk_size_tiles) * default_chunk_size_tiles;
     // The world first: its content sizes the nav.
@@ -1729,10 +1753,10 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .explosion_fill => nav_explosion_fill_group.name,
         .enclose => nav_enclose_group.name,
     };
-    if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(group_name, item_count, case, size_config);
 
     world_owned = false;
-    var nav = try navFixtureOver(allocator, io, world_fixture, navSizeCapacity(size_config), thread_ptr);
+    var nav = try navFixtureOver(allocator, io, world_fixture, suite.navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
     try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var edit = switch (workload) {
@@ -1755,7 +1779,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const system = &nav.system;
     world.terrain_edit_plan_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     world.terrain_edit_write_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    setNavStageControls(system, case);
+    fixtures.setNavTuners(system, case);
     const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
@@ -1807,7 +1831,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // The item count is a case code, so report throughput over the cells written.
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
-    stats.nav_conn = navConnSummary(forward, &nav.system, case);
+    stats.nav_conn = suite.navConnSummary(forward, fixtures.floodTunerWorkers(&nav.system, case));
     stats.nav_main = nav_main;
     stats.batch = suite.batchSummaryFromBatch(forward.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(system.last_mark_batch);
@@ -1831,19 +1855,17 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
 fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const case_code = item_count / case_prefix_encoding;
-    std.debug.assert(case_code <= level_add_replace_case);
-    const replace = case_code == level_add_replace_case;
-    const scale = item_count % case_prefix_encoding;
-    const side: u16 = @intCast(scale / case_encoding);
-    const levels: u16 = @intCast(scale % case_encoding);
-    std.debug.assert(levels >= cave_in_levels + 1 and side >= 256);
+    const code = try LevelAddCode.decode(item_count);
+    const replace = code.replace;
+    const side = code.level_side;
+    const levels = code.levels;
+    if (levels < cave_in_levels + 1 or side < 256) return error.ChunkScaleWorldTooSmall;
     // Every iteration (warmup included) adds a level, so the size check holds at the
     // deepest the run gets.
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     // Level builds only: no marks batch. The world first: its content, and the levels the run
     // adds (solid, or walkable for the replace case), size the nav.
     var world_fixture = try buildFixture(allocator, io, side, levels);
@@ -1858,14 +1880,14 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         content.max_level_open = chunks;
     }
     size_config.content = content;
-    if (suite.navSizeSkip(nav_level_add_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(nav_level_add_group.name, item_count, case, size_config);
 
     world_owned = false;
-    var nav = try navFixtureOver(allocator, io, world_fixture, navSizeCapacity(size_config), thread_ptr);
+    var nav = try navFixtureOver(allocator, io, world_fixture, suite.navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
     try suite.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
-    setNavStageControls(&nav.system, case);
+    fixtures.setNavTuners(&nav.system, case);
     var frame = SimulationFrame.init(allocator);
     defer frame.deinit();
     for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, &frame, replace);
@@ -1876,7 +1898,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     try suite.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     stats.output_count = nav.base.world.levelCount();
-    stats.nav_conn = navConnSummary(nav.last_stats, &nav.system, case);
+    stats.nav_conn = suite.navConnSummary(nav.last_stats, fixtures.floodTunerWorkers(&nav.system, case));
     stats.nav_main = nav.lastNavMain();
     // One level (or band) added per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);

@@ -12,18 +12,23 @@ const collision_range_alignment_items = @import("../game/systems/collision.zig")
 const simulation = @import("../game/simulation.zig");
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "collision",
+    .item_label = "collision bodies",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeCollisionWorkload,
 };
 
 pub const sparse_group = suite.BenchmarkGroup{
     .name = "collision-sparse",
+    .item_label = "collision bodies",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runSparseCase,
+    .write_workload = writeCollisionWorkload,
 };
 
 const FixtureMode = enum {
@@ -83,13 +88,7 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     for (0..options.warmup_iterations) |_| {
@@ -146,7 +145,7 @@ fn runOnce(
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(collision_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, collision_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, collision_range_alignment_items);
 }
 
 fn benchmarkPosition(index: usize, columns: usize, mode: FixtureMode) math.Vec2 {
@@ -168,4 +167,15 @@ fn sparseBenchmarkPosition(index: usize, columns: usize) math.Vec2 {
         .x = @floatFromInt((base_index % columns) * 32 + offset_x),
         .y = @floatFromInt((base_index / columns) * 32),
     };
+}
+
+fn writeCollisionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("candidate_pairs={} contacts={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .summary) return;
+    const narrow = stats.secondary_batch orelse return;
+    try writer.writeAll(" narrow=");
+    try suite.writeStageShape(writer, narrow);
+    if (narrow.ran_inline or narrow.active_worker_threads == 0) {
+        if (stats.secondary_work_tuning) |summary| try writer.print(" tuned={s}", .{if (summary.has_threaded_profile) "threaded" else "none"});
+    }
 }

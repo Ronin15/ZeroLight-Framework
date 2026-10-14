@@ -30,42 +30,55 @@ const SteeringStats = @import("../game/systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("../game/systems/steering.zig").SteeringSystem;
 const steering_range_alignment_items = @import("../game/systems/steering.zig").steering_range_alignment_items;
 const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "steering",
+    .item_label = "steering agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeSteeringWorkload,
 };
 
 pub const shuffled_group = suite.BenchmarkGroup{
     .name = "steering-shuffled",
+    .item_label = "steering agents",
     .defaultItemCounts = layoutItemCounts,
     .runCase = runShuffledCase,
+    .write_workload = writeSteeringWorkload,
 };
 
 pub const corridor_group = suite.BenchmarkGroup{
     .name = "steering-corridor",
+    .item_label = "steering agents",
     .defaultItemCounts = layoutItemCounts,
     .runCase = runCorridorCase,
+    .write_workload = writeSteeringWorkload,
 };
 
 pub const cluster_outlier_group = suite.BenchmarkGroup{
     .name = "steering-cluster-outlier",
+    .item_label = "steering agents",
     .defaultItemCounts = layoutItemCounts,
     .runCase = runClusterOutlierCase,
+    .write_workload = writeSteeringWorkload,
 };
 
 pub const static_change_group = suite.BenchmarkGroup{
     .name = "steering-static-change",
+    .item_label = "static bodies",
     .defaultItemCounts = staticChangeItemCounts,
     .runCase = runStaticChangeCase,
+    .write_workload = writeStaticChangeWorkload,
 };
 
 pub const static_dense_group = suite.BenchmarkGroup{
     .name = "steering-static-dense",
+    .item_label = "statics per chunk",
     .defaultItemCounts = staticDenseItemCounts,
     .runCase = runStaticDenseCase,
+    .write_workload = writeStaticDenseWorkload,
 };
 
 const quick_counts = [_]usize{ 128, 512, 1024 };
@@ -270,13 +283,7 @@ fn measureCase(
         system.grid_sort_tuner = bandTunerForCase(case).?;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -362,7 +369,7 @@ fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*Thr
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(steering_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, steering_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, steering_range_alignment_items);
 }
 
 fn appendNavigationIntents(frame: *SimulationFrame, agents: []const EntityId) !void {
@@ -582,7 +589,7 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
         colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
     colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(splice_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, splice_range_alignment_items) };
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, splice_range_alignment_items) };
     const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticChange, staticChangeOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;
@@ -761,4 +768,37 @@ fn staticDenseOnce(system: *SteeringSystem, fixture: *StaticDenseFixture, thread
         fixture.first_samples = stats.obstacle_samples;
     }
     return stats;
+}
+
+fn writeSteeringWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count });
+    if (view == .summary) return;
+    try writer.writeByte(' ');
+    try suite.writeSteeringStages(writer, stats);
+    try writer.print(" band_max={}", .{(stats.steering_stages orelse suite.SteeringStageSummary{}).band_max});
+    try writeSteerShape(writer, stats);
+}
+
+fn writeStaticChangeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("obstacle_checks={} obstacle_samples={}", .{ stats.candidate_pairs, stats.sample_count });
+    if (view == .summary) return;
+    try writer.writeByte(' ');
+    try suite.writeSteeringStages(writer, stats);
+    try writeSteerShape(writer, stats);
+}
+
+fn writeStaticDenseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    const visits_per_agent_tenths = if (stats.output_count == 0) 0 else stats.candidate_pairs * 10 / stats.output_count;
+    try writer.print("obstacle_visits={} ({}.{}/agent) obstacle_samples={} intents={}", .{ stats.candidate_pairs, visits_per_agent_tenths / 10, visits_per_agent_tenths % 10, stats.sample_count, stats.output_count });
+    if (view == .summary) return;
+    try writer.writeByte(' ');
+    try suite.writeSteeringStages(writer, stats);
+    try writeSteerShape(writer, stats);
+}
+
+// The avoidance pass's shape and the main thread's share.
+fn writeSteerShape(writer: *std.Io.Writer, stats: suite.RunStats) std.Io.Writer.Error!void {
+    try writer.writeAll(" steer=");
+    try suite.writeStageShape(writer, stats.batch);
+    try suite.writeShare(writer, "main", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
 }

@@ -163,6 +163,23 @@ pub const OrderedIndexSet = struct {
     }
 };
 
+/// Fails the build unless every field of `T` is named exactly once, in `counted` (its
+/// `residentBytes` sum reads it) or in `storage_free` (it owns no allocation), and every
+/// name is a field: a field added later builds only once its bytes are classified.
+pub fn assertFieldsClassified(comptime T: type, comptime counted: []const []const u8, comptime storage_free: []const []const u8) void {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        for (@typeInfo(T).@"struct".field_names) |name| {
+            var listed: usize = 0;
+            for (counted) |entry| listed += @intFromBool(std.mem.eql(u8, entry, name));
+            for (storage_free) |entry| listed += @intFromBool(std.mem.eql(u8, entry, name));
+            if (listed != 1) @compileError(@typeName(T) ++ "." ++ name ++ " is not listed exactly once as counted or storage-free");
+        }
+        for (counted) |entry| if (!@hasField(T, entry)) @compileError(@typeName(T) ++ " has no field " ++ entry);
+        for (storage_free) |entry| if (!@hasField(T, entry)) @compileError(@typeName(T) ++ " has no field " ++ entry);
+    }
+}
+
 /// Bytes of a std bit set: its masks and the length word before them, none when empty.
 pub fn bitSetBytes(set: std.bit_set.Dynamic) usize {
     return bitSetBytesFor(set.capacity());
@@ -270,6 +287,44 @@ pub const ChunkListMap = struct {
     /// `name` outlives the map.
     pub fn init(allocator: std.mem.Allocator, name: []const u8) ChunkListMap {
         return .{ .allocator = allocator, .name = name };
+    }
+
+    comptime {
+        assertFieldsClassified(ChunkListMap, &.{
+            "slot_keys",           "slot_heads", "slot_tails", "slot_values",    "slot_counts",
+            "slot_touch",          "entries",    "entry_free", "owner_heads",    "owner_heads_replacement",
+            "retired_owner_heads", "claims",     "touched",    "splice_records", "emptied_keys",
+        }, &.{
+            "allocator",  "name",       "live_keys",        "entry_key", "entry_owner", "entry_order",
+            "entry_prev", "entry_next", "entry_owner_next", "in_batch",  "grows",       "growth_logged",
+        });
+    }
+
+    /// Bytes the table, entry pool, free ids, owner heads, and batch scratch hold (allocated
+    /// capacity).
+    pub fn residentBytes(self: *const ChunkListMap) usize {
+        var bytes = self.slot_keys.len * bytes_per_key_slot + std.MultiArrayList(Entry).capacityInBytes(self.entries.capacity) +
+            self.entry_free.capacity * @sizeOf(u32) + self.owner_heads.capacity * @sizeOf(u32) + self.retired_owner_heads.capacity * @sizeOf(u32) +
+            self.claims.capacity * @sizeOf(Claim) + self.touched.capacity * @sizeOf(TouchedKey) +
+            self.splice_records.capacity * @sizeOf(SpliceRecord) + self.emptied_keys.capacity * @sizeOf(u64);
+        if (self.owner_heads_replacement) |replacement| bytes += replacement.capacity * @sizeOf(u32);
+        return bytes;
+    }
+
+    /// An over-estimate of `residentBytes` summed over `maps` maps grown through `reserve`
+    /// alone (no batch scratch, no owner-head truncate pending), each reserved for owner ids
+    /// below `owners`, whose own peak reserves, summed over the maps, never pass `keys` keys
+    /// and `entries` entries. A map's slots hold its keys at load 1/2 or more, so under four
+    /// slots per key; its entry pool grows to at least double past its need, and std's
+    /// growth past that. Saturates.
+    pub fn pooledStorageBytesBound(maps: usize, keys: usize, entries: usize, owners: usize) usize {
+        const Entries = std.MultiArrayList(Entry);
+        const Ids = std.ArrayList(u32);
+        const slots = maps *| min_slot_count +| 4 *| keys;
+        const pool = Entries.growCapacity(2 *| entries) +| maps *| Entries.growCapacity(0);
+        const free_ids = Ids.growCapacity(pool) +| maps *| Ids.growCapacity(0);
+        return slots *| bytes_per_key_slot +| Entries.capacityInBytes(pool) +| free_ids *| @sizeOf(u32) +|
+            maps *| Ids.growCapacity(owners) *| @sizeOf(u32);
     }
 
     pub fn deinit(self: *ChunkListMap) void {
@@ -1015,6 +1070,26 @@ fn expectSameLists(a: *const ChunkListMap, b: *const ChunkListMap, keys: []const
             entry_b = b.entry_next[entry_b];
         }
     }
+}
+
+test "maps grown through reserve stay within the pooled bound of their summed peaks, each peaking at its own step" {
+    var maps: [4]ChunkListMap = undefined;
+    for (&maps) |*map| map.* = ChunkListMap.init(std.testing.allocator, "test lists");
+    defer for (&maps) |*map| map.deinit();
+    // Each map peaks at a different step: the summed peaks pass every step's total.
+    var peaks: [4]usize = @splat(0);
+    for (0..maps.len) |peak_step| {
+        for (&maps, &peaks, 0..) |*map, *peak, index| {
+            const count: usize = if (index == peak_step) 900 + 37 * index else 5;
+            try map.reserve(count, count, 64);
+            peak.* = @max(peak.*, count);
+        }
+    }
+    var resident: usize = 0;
+    for (&maps) |*map| resident += map.residentBytes();
+    var peak_sum: usize = 0;
+    for (peaks) |peak| peak_sum += peak;
+    try std.testing.expect(resident <= ChunkListMap.pooledStorageBytesBound(maps.len, peak_sum, peak_sum, 64));
 }
 
 test "chunk keys are distinct and never set both bits 62-63" {

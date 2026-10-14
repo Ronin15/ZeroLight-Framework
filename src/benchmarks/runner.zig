@@ -46,7 +46,6 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.drain_group,
     pathfinding.fallback_group,
     pathfinding.fallback_detour_group,
-    pathfinding.fallback_unreachable_group,
     pathfinding.hard_fallback_group,
     pathfinding.hard_fallback_budget_group,
     pathfinding.escalated_detour_group,
@@ -54,6 +53,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.group_field_detour_moving_group,
     pathfinding.group_field_detour_moving_hysteresis_group,
     pathfinding.group_field_packs_group,
+    pathfinding.group_field_tunnel_group,
     pathfinding.query_group,
     pathfinding.level_size_group,
     pathfinding.cross_level_depth_group,
@@ -64,7 +64,6 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.evict_group,
     pathfinding.elastic_ramp_group,
     pathfinding.elastic_shrink_group,
-    pathfinding.cold_unreachable_group,
     pathfinding.negative_steady_group,
     pathfinding.negative_dig_group,
     pathfinding.negative_burst_group,
@@ -135,7 +134,5 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    // nav_update reuses one world+nav fixture per variant across all cases/counts; free them here.
-    defer nav_update.deinitCaches();
     try suite.runAll(init.gpa, init.io, &benchmark_groups, options);
 }

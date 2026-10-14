@@ -382,6 +382,13 @@ fn appendSegment(scratch: *SearchScratch, stitched: *std.ArrayList(StitchedCell)
     return .found;
 }
 
+/// Whether an abstract node ends a search toward its goal: a portal on the goal level, in the
+/// goal cell's chunk, sharing that cell's chunk-local component label. A goal labeled 0
+/// (blocked) has no goal portal.
+pub fn isGoalPortal(level: u16, chunk: usize, label: u8, goal_level: u16, goal_chunk: usize, goal_label: u8) bool {
+    return level == goal_level and goal_label != 0 and chunk == goal_chunk and label == goal_label;
+}
+
 const AbstractCorridor = struct {
     // Whether the chosen corridor crosses at least one inter-level link.
     crosses_level: bool,
@@ -921,7 +928,7 @@ fn abstractCorridor(
             };
         // Goal reached: this portal is on the goal level and shares the goal's chunk-local
         // component, so the local refiner can finish from here.
-        if (level == goal_level and goal_label != 0 and chunk == goal_chunk and portal.label == goal_label) {
+        if (isGoalPortal(level, chunk, portal.label, goal_level, goal_chunk, goal_label)) {
             // The objective at a goal portal is g plus its octile to the goal. An entry whose
             // estimate the long floor cut below that octile goes back at the objective, still
             // open, so the first goal portal to end the search is the cheapest.
@@ -1730,7 +1737,7 @@ const ReferenceAbstract = struct {
                 node.closed = true;
                 continue;
             };
-            if (level == goal_level and goal_label != 0 and chunk == goal_chunk and portal.label == goal_label) {
+            if (isGoalPortal(level, chunk, portal.label, goal_level, goal_chunk, goal_label)) {
                 const goal_octile = octileU32(x, y, goal_x, goal_y);
                 if (current.h < goal_octile) {
                     if (self.open.items.len >= self.open_limit) return .saturated;
@@ -2068,7 +2075,7 @@ fn exhaustiveAbstractObjective(allocator: std.mem.Allocator, graph: *const NavGr
         const local: u8 = @intCast((y % tiles) * tiles + x % tiles);
         const portals = graph.chunkPortals(level, chunk);
         const portal = portals.find(local) orelse continue;
-        if (level == goal_level and goal_label != 0 and chunk == goal_chunk and portal.label == goal_label) {
+        if (isGoalPortal(level, chunk, portal.label, goal_level, goal_chunk, goal_label)) {
             best = @min(best, g +| octileU32(x, y, goal_x, goal_y));
             continue;
         }
@@ -2203,7 +2210,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
                                 try std.testing.expect(h >= plain_h);
                                 if (level == goal_level) try std.testing.expectEqual(plain_h, h);
                                 raised += @intFromBool(h > plain_h);
-                                if (level == goal_level and goal_label != 0 and chunk == goal_chunk and portal.label == goal_label) {
+                                if (isGoalPortal(level, chunk, portal.label, goal_level, goal_chunk, goal_label)) {
                                     try std.testing.expect(h <= octileU32(x, y, goal_x, goal_y));
                                     goal_portals += 1;
                                 }

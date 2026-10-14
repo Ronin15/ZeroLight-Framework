@@ -54,6 +54,7 @@ const cognition_stagger_n = @import("../game/simulation_scope.zig").cognition_st
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
@@ -88,8 +89,10 @@ fn cognitionHaloRegion() ActiveRegion {
 
 pub const group = suite.BenchmarkGroup{
     .name = "scope",
+    .item_label = "entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeScopeWorkload,
 };
 
 const Fixture = struct {
@@ -192,13 +195,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         move.adaptive_tuner = tuner;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     var ctx = RunContext{ .scope = &scope, .spatial_index = &spatial_index, .ai = &ai, .collision = &collision, .move = &move, .fixture = &fixture, .case = case };
@@ -390,5 +387,9 @@ fn scopeConfig(case: suite.BenchmarkCase) ScopeConfig {
 fn itemsPerRange(case: suite.BenchmarkCase, alignment: usize) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(alignment) orelse
-        suite.alignItemCount(suite.default_items_per_range, alignment);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, alignment);
+}
+
+fn writeScopeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cognition_active={}", .{stats.output_count});
 }

@@ -25,9 +25,6 @@
 //!   near-monotonic in row order and would hide any such contention.
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -41,25 +38,31 @@ const PerceptionStats = perception_mod.PerceptionStats;
 const PerceptionSystem = perception_mod.PerceptionSystem;
 const perception_range_alignment_items = perception_mod.perception_range_alignment_items;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
-const TileId = @import("../game/world_system.zig").TileId;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "perception",
+    .item_label = "perception agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writePerceptionWorkload,
 };
 
 pub const los_dense_group = suite.BenchmarkGroup{
     .name = "perception-los-dense",
+    .item_label = "perception agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runLosDenseCase,
+    .write_workload = writePerceptionWorkload,
 };
 
 pub const scattered_dense_index_group = suite.BenchmarkGroup{
     .name = "perception-scattered-dense-index",
+    .item_label = "perception agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runScatteredDenseIndexCase,
+    .write_workload = writePerceptionWorkload,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
@@ -120,10 +123,6 @@ const los_dense_region_row_start: u16 = 210;
 const los_dense_region_width: u16 = 200;
 const world_tiles_side: u16 = 340;
 
-fn requireTile(meta: *const world_tileset_meta.WorldTilesetMeta, name: []const u8) !TileId {
-    return (meta.tileByName(name) orelse return error.TileNotFound).id;
-}
-
 const Fixture = struct {
     data: DataSystem,
     world: WorldSystem,
@@ -163,16 +162,15 @@ fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_s
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    var meta = try fixtures.loadTilesetMeta(allocator, io);
     defer meta.deinit();
-    const tree = try requireTile(&meta, "tree_0");
-    const deco = try requireTile(&meta, "deco_0");
 
     const tile_size = meta.tileSize();
     const bounds = @as(f32, @floatFromInt(world_tiles_side)) * tile_size;
     var world = try WorldSystem.initDemoFromMeta(allocator, &meta, bounds, bounds);
     errdefer world.deinit();
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const deco = try world.requireTileByName(&meta, "deco_0");
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
@@ -242,15 +240,14 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    var meta = try fixtures.loadTilesetMeta(allocator, io);
     defer meta.deinit();
-    const tree = try requireTile(&meta, "tree_0");
 
     const tile_size = meta.tileSize();
     const bounds = @as(f32, @floatFromInt(world_tiles_side)) * tile_size;
     var world = try WorldSystem.initDemoFromMeta(allocator, &meta, bounds, bounds);
     errdefer world.deinit();
+    const tree = try world.requireTileByName(&meta, "tree_0");
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
@@ -332,13 +329,7 @@ fn runCaseImpl(
     var events = SimulationEvents.init(allocator);
     defer events.deinit();
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     // Positions never change across iterations (this bench measures the
@@ -418,5 +409,9 @@ fn runOnce(
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(perception_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, perception_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, perception_range_alignment_items);
+}
+
+fn writePerceptionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("sensed={} los_checks={} los_blocked={} found={} events={} dropped_events={}", .{ stats.sample_count, stats.candidate_pairs, stats.deferred_count, stats.output_count, stats.fallback_deferred_count, stats.cache_evictions });
 }

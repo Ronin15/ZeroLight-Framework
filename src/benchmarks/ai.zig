@@ -15,6 +15,7 @@ const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialI
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const InterestMarkerStore = @import("../game/world_interest.zig").InterestMarkerStore;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
@@ -32,8 +33,10 @@ const behavior_archetype_cycle_len: usize = 5;
 
 pub const group = suite.BenchmarkGroup{
     .name = "ai",
+    .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeAiWorkload,
 };
 
 const Fixture = struct {
@@ -154,13 +157,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     // This bench never runs movement, so the fixture's positions never change
@@ -243,9 +240,25 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(ai_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, ai_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, ai_range_alignment_items);
 }
 
 fn benchmarkSeekTarget() math.Vec2 {
     return .{ .x = 480, .y = 270 };
+}
+
+fn writeAiWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("separation_checks={} intents={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .summary) {
+        if (stats.ai_behavior_histogram) |histogram| {
+            try writer.print(" behaviors wander={} pursue={} flee={} investigate={} cohere={}", .{ histogram.wander, histogram.pursue, histogram.flee, histogram.investigate, histogram.cohere });
+        }
+        return;
+    }
+    const intent = stats.secondary_batch orelse return;
+    try writer.writeAll(" intent=");
+    try suite.writeStageShape(writer, intent);
+    if (intent.ran_inline or intent.active_worker_threads == 0) {
+        if (stats.secondary_work_tuning) |summary| try writer.print(" tuned={s}", .{if (summary.has_threaded_profile) "threaded" else "none"});
+    }
 }

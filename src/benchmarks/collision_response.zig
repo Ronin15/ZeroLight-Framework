@@ -15,30 +15,39 @@ const CollisionResponseStats = @import("../game/systems/collision_response.zig")
 const CollisionResponseSystem = @import("../game/systems/collision_response.zig").CollisionResponseSystem;
 const simulation = @import("../game/simulation.zig");
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const solid_group = suite.BenchmarkGroup{
     .name = "collision-response-solid",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runSolidCase,
+    .write_workload = writeResponseWorkload,
 };
 
 pub const bounce_group = suite.BenchmarkGroup{
     .name = "collision-response-bounce",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runBounceCase,
+    .write_workload = writeResponseWorkload,
 };
 
 pub const trigger_group = suite.BenchmarkGroup{
     .name = "collision-response-trigger",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runTriggerCase,
+    .write_workload = writeResponseWorkload,
 };
 
 pub const mixed_group = suite.BenchmarkGroup{
     .name = "collision-response-mixed",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runMixedCase,
+    .write_workload = writeResponseWorkload,
 };
 
 const FixtureMode = enum {
@@ -198,8 +207,10 @@ fn addEntity(data: *DataSystem, position_x: f32, position_y: f32, velocity_x: f3
 // apply shapes, and the time and share on main outside the stage batches.
 pub const stage_group = suite.BenchmarkGroup{
     .name = "collision-response-stage",
+    .item_label = "contacts",
     .defaultItemCounts = stageItemCounts,
     .runCase = runStageCase,
+    .write_workload = writeResponseStageWorkload,
 };
 
 const stage_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
@@ -400,7 +411,7 @@ fn stageRunOnce(
 fn stageItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(movement_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, movement_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, movement_range_alignment_items);
 }
 
 // The fixed-range adaptive case's apply tuner: one band per range, so the fixed control
@@ -419,13 +430,7 @@ fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
 fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -486,4 +491,18 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         stats.secondary_work_tuning = suite.workTuningSummary(system.apply_tuner.report(), settled_before_measurement);
     }
     return stats;
+}
+
+fn writeResponseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count });
+}
+
+fn writeResponseStageWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("intents={} triggers={}", .{ stats.output_count, stats.candidate_pairs });
+    if (view == .summary) return;
+    try writer.writeAll(" gather=");
+    try suite.writeStageShape(writer, stats.batch);
+    try writer.writeAll(" apply=");
+    try suite.writeStageShape(writer, stats.secondary_batch orelse .{});
+    try suite.writeShare(writer, "main_outside_stage_batches", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
 }

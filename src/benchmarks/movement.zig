@@ -11,14 +11,17 @@ const movement_range_alignment_items = @import("../game/data_system.zig").moveme
 const movement = @import("../game/systems/movement.zig");
 const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
 
 pub const group = suite.BenchmarkGroup{
     .name = "movement",
+    .item_label = "movement bodies",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = suite.writeNoWorkload,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
@@ -58,13 +61,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var data = try createFixture(allocator, item_count);
     defer data.deinit();
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     var system = MovementSystem.init();
@@ -122,7 +119,7 @@ fn runOnce(
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(movement_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, movement_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, movement_range_alignment_items);
 }
 
 // `movement-apply-intents`: one AI movement intent per moving agent, written once in a
@@ -134,14 +131,18 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
 // ranges writing rows scattered across the velocity columns.
 pub const apply_intents_group = suite.BenchmarkGroup{
     .name = "movement-apply-intents",
+    .item_label = "moving agents",
     .defaultItemCounts = applyIntentsItemCounts,
     .runCase = runApplyIntentsScatteredCase,
+    .write_workload = writeApplyWorkload,
 };
 
 pub const apply_intents_sorted_group = suite.BenchmarkGroup{
     .name = "movement-apply-intents-sorted",
+    .item_label = "moving agents",
     .defaultItemCounts = applyIntentsItemCounts,
     .runCase = runApplyIntentsSortedCase,
+    .write_workload = writeApplyWorkload,
 };
 
 // The intent stream's row order.
@@ -265,13 +266,7 @@ fn runApplyIntentsSortedCase(allocator: std.mem.Allocator, io: std.Io, options: 
 fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, order_kind: IntentOrder) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -323,4 +318,12 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
         stats.work_tuning = suite.workTuningSummary(system.apply_intents_tuner.report(), settled_before_measurement);
     }
     return stats;
+}
+
+fn writeApplyWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("intents={}", .{stats.output_count});
+    if (view == .summary) return;
+    try writer.writeAll(" apply=");
+    try suite.writeStageShape(writer, stats.batch);
+    try suite.writeShare(writer, "main", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
 }

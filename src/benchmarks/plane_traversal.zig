@@ -26,9 +26,6 @@
 //! and its time per entry.
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -44,6 +41,7 @@ const level_z_step = @import("../game/world_system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const maxEventsPerStep = @import("../game/simulation.zig").maxEventsPerStep;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const level_count: u16 = 2;
@@ -105,26 +103,34 @@ const Layout = struct {
 
 pub const group = suite.BenchmarkGroup{
     .name = "plane-traversal",
+    .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runNoFallsCase,
+    .write_workload = writePlaneAgentsWorkload,
 };
 
 pub const falls_group = suite.BenchmarkGroup{
     .name = "plane-traversal-falls",
+    .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runFallsCase,
+    .write_workload = writePlaneAgentsWorkload,
 };
 
 pub const dense_falls_group = suite.BenchmarkGroup{
     .name = "plane-traversal-dense-falls",
+    .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runDenseFallsCase,
+    .write_workload = writePlaneAgentsWorkload,
 };
 
 pub const banded_falls_group = suite.BenchmarkGroup{
     .name = "plane-traversal-dense-falls-banded",
+    .item_label = std.fmt.comptimePrint("landing-level bands ({} AI agents)", .{banded_agent_count}),
     .defaultItemCounts = defaultBandCounts,
     .runCase = runBandedFallsCase,
+    .write_workload = writePlaneBandsWorkload,
 };
 
 fn defaultItemCounts(_: suite.Profile) []const usize {
@@ -189,8 +195,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
     const faller_count = workload.fallerCount(agent_count);
     std.debug.assert(faller_count <= agent_count);
     const layout = Layout.of(workload.worldSide(faller_count), faller_count);
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    var meta = try fixtures.loadTilesetMeta(allocator, io);
     var meta_owned = true;
     defer if (meta_owned) meta.deinit();
     var world = WorldSystem{
@@ -306,14 +311,6 @@ fn runBandedFallsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     return runCase(allocator, io, options, case, banded_agent_count, .banded_falls, item_count);
 }
 
-fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
-    if (!case.usesThreadSystem()) return null;
-    return try ThreadSystem.init(allocator, io, .{
-        .max_worker_threads = case.maxWorkerThreads(),
-        .items_per_range = suite.default_items_per_range,
-    });
-}
-
 // One plane stage's gather and dig half, after `resetStep`. Returns the gathered entries.
 fn runStage(fixture: *Fixture, thread_system: ?*ThreadSystem) !usize {
     const entries = try fixture.plane_entry.gather(&fixture.data, &fixture.world, fixture.player.entity, fixture.dig.tunnel_tile, thread_system);
@@ -325,7 +322,7 @@ fn runStage(fixture: *Fixture, thread_system: ?*ThreadSystem) !usize {
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, landing_bands: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
@@ -336,7 +333,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     plane_entry.tuner = suite.adaptiveTunerForCase(case, plane_entry_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     plane_entry.config = .{
         .items_per_range = if (case.adaptive) null else case.itemsPerRange(plane_entry_range_alignment_items) orelse
-            suite.alignItemCount(suite.default_items_per_range, plane_entry_range_alignment_items),
+            std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, plane_entry_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     };
@@ -392,4 +389,22 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         stats.work_tuning = suite.workTuningSummary(plane_entry.tuner.report(), settled_before_measurement);
     }
     return stats;
+}
+
+fn writePlaneAgentsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writePlaneWorkload(writer, stats, view, "agents");
+}
+
+fn writePlaneBandsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writePlaneWorkload(writer, stats, view, "bands");
+}
+
+fn writePlaneWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView, unit: []const u8) std.Io.Writer.Error!void {
+    try writer.print("{s}={} entries={}", .{ unit, stats.item_count, stats.output_count });
+    if (view == .summary) return;
+    const main_ns = (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns;
+    try writer.writeAll(" gather=");
+    try suite.writeStageShape(writer, stats.batch);
+    try suite.writeShare(writer, "main", main_ns, stats.mean_ns);
+    try writer.print(" main_per_entry={f}", .{suite.formatDuration(if (stats.output_count == 0) 0 else main_ns / stats.output_count)});
 }

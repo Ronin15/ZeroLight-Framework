@@ -17,6 +17,7 @@ const thread_shared_record_alignment = @import("../../../app/thread_system.zig")
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ElementMap = @import("connectivity.zig").ElementMap;
+const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
 const types = @import("types.zig");
 const GridCell = @import("types.zig").GridCell;
 const TraversalClass = @import("types.zig").TraversalClass;
@@ -68,6 +69,11 @@ const ScanTally = struct {
     blocked: usize = 0,
 };
 
+// A list whose buffer starts on a cache line, so range windows of it never share a line.
+fn LineList(comptime T: type) type {
+    return std.array_list.Aligned(T, .fromByteUnits(thread_shared_record_alignment));
+}
+
 /// One step's distinct blocked goals and their live cells. Built by
 /// `PathfindingSystem.resolveGoals` on the main thread around its two dispatches; read-only
 /// from the end of that call to the next one or the next grid change, so const readers are
@@ -79,16 +85,20 @@ pub const GoalTable = struct {
     // Per entry, in first-seen intent order: its goal ref (the project stage's items) and
     // its live cell (`no_cell`: no open cell within the projection radius).
     refs: std.ArrayList(u64) = .empty,
-    live: std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment)) = .empty,
+    live: LineList(u32) = .empty,
     // `goal_scan` staging: range r writes its distinct refs from `r * items_per_range`, and
     // its tally.
-    scan_refs: std.array_list.Aligned(u64, .fromByteUnits(thread_shared_record_alignment)) = .empty,
-    scan_tallies: std.array_list.Aligned(ScanTally, .fromByteUnits(thread_shared_record_alignment)) = .empty,
+    scan_refs: LineList(u64) = .empty,
+    scan_tallies: LineList(ScanTally) = .empty,
     // Intents one resolve covers without growing; assigned only after every reserve
     // succeeded.
     limit: usize = 0,
     // Entries match the grid now (cleared at every grid change and on a failed resolve).
     valid: bool = false,
+
+    comptime {
+        assertFieldsClassified(GoalTable, &.{ "map", "refs", "live", "scan_refs", "scan_tallies" }, &.{ "limit", "valid" });
+    }
 
     pub fn deinit(self: *GoalTable, allocator: std.mem.Allocator) void {
         self.scan_tallies.deinit(allocator);
@@ -113,6 +123,19 @@ pub const GoalTable = struct {
         try self.scan_tallies.ensureTotalCapacity(allocator, maxRangeCount(limit, scan_range_alignment_items));
         self.limit = limit;
         std.debug.assert(self.refs.capacity >= limit and self.live.capacity >= limit and self.scan_refs.capacity >= limit);
+    }
+
+    /// Bytes the map, entries, and scan staging hold (allocated capacity).
+    pub fn residentBytes(self: *const GoalTable) usize {
+        return self.map.residentBytes() + self.refs.capacity * @sizeOf(u64) + self.live.capacity * @sizeOf(u32) +
+            self.scan_refs.capacity * @sizeOf(u64) + self.scan_tallies.capacity * @sizeOf(ScanTally);
+    }
+
+    /// `residentBytes` once reserved for at most `limit` intents. Saturates.
+    pub fn storageBytesBound(limit: usize) usize {
+        return ElementMap.storageBytesBound(limit) +| std.ArrayList(u64).growCapacity(limit) *| @sizeOf(u64) +|
+            LineList(u32).growCapacity(limit) *| @sizeOf(u32) +| LineList(u64).growCapacity(limit) *| @sizeOf(u64) +|
+            LineList(ScanTally).growCapacity(maxRangeCount(limit, scan_range_alignment_items)) *| @sizeOf(ScanTally);
     }
 
     pub fn invalidate(self: *GoalTable) void {
@@ -480,6 +503,16 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     _ = try system.resolveGoals(TestIntent, &more, &threads, .{});
     try std.testing.expectEqual(grows_before + 1, system.goal_table_growth.count);
     try expectReferenceTable(&system, &more);
+}
+
+test "a reserved goal table holds exactly its storage bound, and a smaller reserve keeps it" {
+    const allocator = std.testing.allocator;
+    var table = GoalTable{};
+    defer table.deinit(allocator);
+    try table.reserve(allocator, 1000);
+    try std.testing.expectEqual(GoalTable.storageBytesBound(1000), table.residentBytes());
+    try table.reserve(allocator, 10);
+    try std.testing.expectEqual(GoalTable.storageBytesBound(1000), table.residentBytes());
 }
 
 test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, and lookups then compute the projection on the grid now" {

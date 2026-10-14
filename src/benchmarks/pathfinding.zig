@@ -30,7 +30,6 @@ const refLocal = @import("../game/systems/pathfinding/types.zig").refLocal;
 const cached_results_per_agent = @import("../game/systems/pathfinding/types.zig").cached_results_per_agent;
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const intake_range_alignment_items = @import("../game/systems/pathfinding/types.zig").intake_range_alignment_items;
-const evict_range_alignment_items = @import("../game/systems/pathfinding/types.zig").evict_range_alignment_items;
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 const GoalResolveStats = @import("../game/systems/pathfinding/types.zig").GoalResolveStats;
 const goal_scan_range_alignment_items = @import("../game/systems/pathfinding/goal_table.zig").scan_range_alignment_items;
@@ -38,162 +37,193 @@ const goal_project_range_alignment_items = @import("../game/systems/pathfinding/
 const AiDir = @import("../game/systems/ai.zig").AiDir;
 const computeRequantizedGoal = @import("../game/systems/ai.zig").computeRequantizedGoal;
 const default_goal_requantization_hysteresis_distance = @import("../game/systems/ai.zig").default_goal_requantization_hysteresis_distance;
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const CellCoord = @import("../game/world_system.zig").CellCoord;
 const TileId = @import("../game/world_system.zig").TileId;
-const level_z_step = @import("../game/world_system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
+const default_group_field_build_budget = @import("../game/systems/pathfinding/types.zig").default_group_field_build_budget;
+const isGoalPortal = @import("../game/systems/pathfinding/solve.zig").isGoalPortal;
+const connectivity = @import("../game/systems/pathfinding/connectivity.zig");
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
-// Headline solve curve: cold, DISTINCT-goal individual A* across the 512/frame ceiling.
-// Each measured frame performs min(512, count) real solves and defers the rest, so this is
-// a true cold solver-throughput curve (no goal-keyed dedup), not a single shared-goal solve.
+// The request-load groups (`pathfinding` through `pathfinding-query`) run world-backed nav on
+// one walkable level of a fixed side per layout, so the item count varies the load and never
+// the world; every request's route is the same at every count. Each times `update` steps;
+// `--details` prints each update stage's busiest shape and the main-thread time per phase.
+//   - Open routes (`pathfinding`, `-drain`, `-cache-open`, `-query`): request `i`'s goal on a
+//     grid of `request_columns` columns from cell (8, 8) of a `request_side`² level, its start
+//     (`request_route_dx`, `request_route_dy`) cells further on, a route across several chunks.
+//   - `-shared-goal`: the open routes' starts, every request to one far goal.
+//   - `-cache-detour`: a full-height wall down the level's middle, open at row
+//     `detour_gap_y`; starts in `detour_lanes` lanes left of it, goals mirrored right.
+//   - `-hard-fallback*`: a `hard_fallback_side`² level with one blocking cell on every third
+//     row's center; each request crosses its row past that cell.
+
+// Cold solve curve: one cold step of distinct-goal requests (runtime state cleared before
+// it, untimed), solving min(count, the per-step solve ceiling) and deferring the rest.
+// Items/s is solves serviced. Passes when the time grows linearly to the ceiling and is flat
+// past it.
 pub const group = suite.BenchmarkGroup{
     .name = "pathfinding",
+    .item_label = "path requests",
     .defaultItemCounts = coldSolveItemCounts,
     .runCase = runCase,
+    .write_workload = writeSolveWorkload,
 };
 
-// Shared-goal dedup path (kept distinct from the headline solve curve): every agent shares
-// one goal, so all but the first resolve via dedup/group-field off a single cold A* solve.
+// One cold step of requests sharing one goal: one solve, every other request folded into
+// its pending entry; the group-field threshold sits above the count, so no field begins.
+// Items/s is requests answered. Passes when linear in requests with one solve per step.
 pub const dedup_group = suite.BenchmarkGroup{
     .name = "pathfinding-shared-goal",
-    .defaultItemCounts = defaultItemCounts,
+    .item_label = "path requests to one goal",
+    .defaultItemCounts = sharedGoalItemCounts,
     .runCase = runDedupCase,
+    .write_workload = writeDedupWorkload,
 };
 
-// Multi-frame amortized drain: submit N >> 512 distinct goals once, then step successive
-// frames WITHOUT clearing so `pending` carries the remainder and drains at the per-frame
-// ceiling. Validates the cross-frame carry-over the 512 cap exists for.
+// A drain step: the item count's distinct requests accepted once (untimed), then each timed
+// step solves the per-step ceiling of the carried queue over an empty stream. Passes when
+// flat in queue depth.
 pub const drain_group = suite.BenchmarkGroup{
     .name = "pathfinding-drain",
+    .item_label = "queued path requests",
     .defaultItemCounts = drainItemCounts,
     .runCase = runDrainCase,
+    .write_workload = writeSolveWorkload,
 };
 
+// One step of open-route requests every one of which the warm cache serves. Passes when
+// linear in requests.
 pub const fallback_group = suite.BenchmarkGroup{
     .name = "pathfinding-cache-open",
+    .item_label = "cached path requests",
     .defaultItemCounts = fallbackDefaultItemCounts,
     .runCase = runFallbackCase,
+    .write_workload = writeCacheWorkload,
 };
 
+// `pathfinding-cache-open` over the detour routes. Passes when linear in requests.
 pub const fallback_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-cache-detour",
+    .item_label = "cached detour path requests",
     .defaultItemCounts = fallbackDefaultItemCounts,
     .runCase = runFallbackDetourCase,
+    .write_workload = writeCacheWorkload,
 };
 
-// Starts and goals on opposite sides of a wall with no gap: every timed step's request is
-// answered unavailable from reach at intake, never solved or cached.
-pub const fallback_unreachable_group = suite.BenchmarkGroup{
-    .name = "pathfinding-cache-unreachable",
-    .defaultItemCounts = unreachableDefaultItemCounts,
-    .runCase = runFallbackUnreachableCase,
-};
-
+// One cold step of the hard-fallback routes at the full solve budget. Passes when linear in
+// requests to the per-step ceiling and flat past it.
 pub const hard_fallback_group = suite.BenchmarkGroup{
     .name = "pathfinding-hard-fallback",
+    .item_label = "hard fallback path requests",
     .defaultItemCounts = fallbackDefaultItemCounts,
     .runCase = runHardFallbackCase,
+    .write_workload = writeFallbackWorkload,
 };
 
+// `pathfinding-hard-fallback` with solve admissions capped at `hard_fallback_admissions` per
+// step (`--fallback-budget` overrides it); the rest defer. Passes when linear in requests to
+// the cap and flat past it.
 pub const hard_fallback_budget_group = suite.BenchmarkGroup{
     .name = "pathfinding-hard-fallback-budget",
+    .item_label = "hard fallback path requests",
     .defaultItemCounts = fallbackDefaultItemCounts,
     .runCase = runHardFallbackBudgetCase,
+    .write_workload = writeFallbackWorkload,
 };
 
-// Escalated (tier-1) detour guard: a full-height wall with a single gap far from the
-// start/goal line forces the longest possible corridor detour — the shape of the
-// game-breaking FPS-drop bug (agents pathfinding around a large obstacle, e.g. a lake)
-// the two-tier retry ladder (PendingRequest.tier) fixed. Both tiers use FIXED budgets
-// (default_max_abstract_nodes for tier 0, default_tier1_abstract_node_cap for tier 1 —
-// never derived from or scaled to world/graph size, see types.zig), so per-query cost
-// stays bounded independent of grid size; item_count here is the grid SIDE in cells (not
-// an agent count), chosen to stay well under the fixed tier-1 budget regardless of
-// profile. The scenario that mattered was ONE agent's ONE worst-case long-range solve (a
-// simultaneous crowd of them is bounded separately by max_escalated_solves_per_step, not
-// this case). tier0_abstract_node_cap is forced deliberately tiny so the FIRST attempt
-// exhausts regardless of grid size — exercising the real promote-to-tier-1 path against
-// the fixed tier-1 budget. Measures the COLD escalated (tier-1) solve only, so a
-// regression that reintroduces the unbounded retry storm, or a detour this grid size that
-// no longer fits the fixed tier-1 budget, shows up here as a wall-clock regression or a
-// failed debug-assert.
+// One cold escalated (tier-1) solve around a full-height wall open only at row 1, the row
+// below the level's top border, from a start beside the wall's foot to a goal mirrored
+// across it: the longest detour on the level. An untimed step first exhausts the first attempt at a one-node cap, promoting the
+// request. The item count is the level side. Passes when every side's detour solves within
+// the fixed tier-1 budget, its time following the abstract nodes the search claims: at most
+// the detour region's chunks, quadratic in side, and never past the fixed cap.
 pub const escalated_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-escalated-detour",
+    .item_label = "level side (cells)",
     .defaultItemCounts = escalatedDetourItemCounts,
     .runCase = runEscalatedDetourCase,
+    .write_workload = writeSolveWorkload,
 };
 
-// Shared-goal flow field around a large obstacle at PRODUCTION nav-grid scale
-// (256x256, matching game_demo_state's procedural world) with a demo-scale pursuit
-// pack (~24 agents) declaring `.group`. This is the water-adjacent FPS-drop shape:
-// a chasing pack whose shared goal re-keys often, near a large blocked region (the
-// same wall/gap shape as escalated_detour_group). With min_group_field_agents
-// pinned to a fixed 8 (this bench's own standalone override — the demo no longer
-// pins this low: a live capture measured the field building constantly but never
-// once being sampled at demo scale, since pending-dedup and the result cache
-// already serve a goal-change burst off one solve for free, so the demo now pins
-// this far above any population it has), the pack crosses the threshold and the
-// managed flow field (serviceGroupFields / ensureGroupField) engages, so once
-// built every re-key is answered by a field sample instead of a per-agent
-// tier-0/tier-1 A* re-solve. Measures the STEADY-STATE ready-field sampling cost
-// (build happens during untimed setup) — a regression that stops the field from
-// engaging at this population/grid combination shows up here as
-// group_fields_built no longer 0 during measurement, or group_field_samples
-// dropping below item_count. This exercises the MECHANISM (a warm, actually-used
-// field is cheap) in isolation; whether real gameplay ever reaches this population
-// pattern is a separate, demo-level question — see proceduralPathfindingCapacity's
-// doc comment.
+// A pack (the item count) sharing one goal across the escalated detour's wall on a
+// `group_field_detour_side`² level, sampling a ready group field each step; the field
+// builds untimed. Passes when linear in pack size with no field build or solve in the
+// timed steps.
 pub const group_field_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour",
+    .item_label = "pack agents",
     .defaultItemCounts = groupFieldDetourItemCounts,
     .runCase = runGroupFieldDetourCase,
+    .write_workload = writeFieldSampleWorkload,
 };
 
-// Same production shape as group_field_detour_group, but the shared goal MOVES (re-keys) at
-// the real chase cadence instead of staying static for the whole run, exercising
-// ensureGroupField's rebuild throttle against a moving goal instead of only steady-state
-// sampling of an already-ready field. See runGroupFieldDetourMovingCase.
+// `pathfinding-group-field-detour` with the shared goal moving one new nav cell every
+// `group_field_detour_rekey_period_steps` steps; times every step of the measured cycles.
+// Passes when the field serves part of every run, escalated solves stay at most one per
+// rekey, and the per-step time is linear in pack size.
 pub const group_field_detour_moving_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour-moving",
+    .item_label = "pack agents",
     .defaultItemCounts = groupFieldDetourItemCounts,
     .runCase = runGroupFieldDetourMovingCase,
+    .write_workload = writeFieldMovingWorkload,
 };
 
-// Same production shape and per-step chase cadence as group_field_detour_moving_group, but
-// the live goal advances CONTINUOUSLY at the real per-step player speed instead of jumping a
-// whole nav cell at once, and the request goal only re-keys once that live position has
-// moved past `src/game/systems/ai.zig`'s `default_goal_requantization_hysteresis_distance`
-// from the last reported goal — calls the same `computeRequantizedGoal` pure function
-// `AiSystem.requantizeGoal` wraps (AiConfig.goal_requantization_hysteresis_distance).
-// This is the actual fix under test: proves fewer distinct-goal re-keys (and therefore
-// fewer escalated tier-0/tier-1 solves) over the identical sustained chase that
-// group_field_detour_moving_group measures with hysteresis disabled.
+// The moving goal advancing every step at the chase speed, its request goal re-keyed only past
+// `default_goal_requantization_hysteresis_distance` (`computeRequantizedGoal`). Passes when
+// rewrites stay below the measured steps, escalated solves at most one per rewrite, and the
+// per-step time is linear in pack size.
 pub const group_field_detour_moving_hysteresis_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour-moving-hysteresis",
+    .item_label = "pack agents",
     .defaultItemCounts = groupFieldDetourItemCounts,
     .runCase = runGroupFieldDetourMovingHysteresisCase,
+    .write_workload = writeFieldMovingWorkload,
 };
 
-// Query tier: per-agent statusForWorld against a WARM cache, distinct from the solve
-// groups (which measure update) and from steering/ai (which measure avoidance). Each
-// agent reads its own cached path mid-route, so this isolates the cache probe and the
-// per-step waypoint derivation — the crowd-scale path-following lookup. The queries are
-// read-only and independent, so they fan across workers (each agent owns its hint slot).
+// Packs (the item count) of `group_field_pack_agents` agents on an open
+// `group_field_detour_side`² level, each with its own goal marching one nav cell per rekey
+// cycle, so every pack's field builds at once (one `group_field_expand` item each). Times every
+// step of the measured cycles. Passes when linear in packs. `--details` prints per-field
+// coverage, blocks, resident bytes, and pool growths.
+pub const group_field_packs_group = suite.BenchmarkGroup{
+    .name = "pathfinding-group-field-packs",
+    .item_label = "packs",
+    .defaultItemCounts = groupFieldPacksItemCounts,
+    .runCase = runGroupFieldPacksCase,
+    .write_workload = writePacksWorkload,
+};
+
+// Sparse-coverage fields: four crowds on a 1024² level whose only walkable cells are a
+// lattice of 1-wide corridors every nav chunk, each flooding a field capped at the item
+// count's cells. One sample rebuilds the four fields from scratch until all are ready.
+// Passes when linear in the cell cap, every field covering its cap.
+pub const group_field_tunnel_group = suite.BenchmarkGroup{
+    .name = "pathfinding-group-field-tunnel",
+    .item_label = "field cell cap",
+    .defaultItemCounts = groupFieldTunnelItemCounts,
+    .runCase = runGroupFieldTunnelCase,
+    .write_workload = writeTunnelWorkload,
+};
+
+// Per-agent `statusForWorld` against a warm cache, each agent at its own cached path's
+// midpoint, so the waypoint scan finds a deep match: the cache probe and waypoint derivation.
+// The queries are read-only and fan across workers. Passes when linear in agents.
 pub const query_group = suite.BenchmarkGroup{
     .name = "pathfinding-query",
+    .item_label = "querying agents",
     .defaultItemCounts = queryDefaultItemCounts,
     .runCase = runQueryCase,
+    .write_workload = writeQueryWorkload,
 };
 
-// Nav scaling groups over a world-backed nav (item counts in the size groups encode
-// `level side * 1000 + levels`). A config whose nav storage exceeds the bench's
-// nav-size limit is skipped, its figure printed (`navSizeSkip`). The route groups time
-// one cold step of 64 distinct-goal requests; `candidates` is the abstract nodes the last
+// Nav scaling groups over a world-backed nav. A listed config whose nav storage exceeds the
+// bench's nav-size limit fails with its figure (`suite.checkNavSize`), and every config checks
+// each part of the nav's bytes against its charge (`suite.checkNavBytes`). The route groups
+// time one cold step of 64 distinct-goal requests; `candidates` is the abstract nodes the last
 // solve used and `outputs` the routes that solved. The level-size and depth groups fail
 // unless every route solves that step; the teleport and shaft groups count a route whose
 // search exhausted its budget as unsolved (`routes solved= unsolved=` under `--details`).
@@ -207,16 +237,17 @@ pub const query_group = suite.BenchmarkGroup{
 //   - `pathfinding-cross-level-teleport`: the depth fixture plus one bidirectional
 //     teleport between opposite corners of level 0 and the deepest level, far from the
 //     routes, whose span far exceeds its traversal cost. Passes when flat in depth. A
-//     teleport-count config (item count layout * 10^12 + teleports * 10^7 + side * 1000 +
-//     levels) instead adds that many such teleports from level 0 to the deepest level in
-//     one layout. Layout 0 spreads them evenly over level-0 cells within 16 of the border,
-//     each to its point mirror. Layout 1 spreads them evenly over level-0 rows
+//     teleport-count config instead adds that many such teleports from level 0 to the deepest
+//     level in one layout. Layout 0 spreads them evenly over level-0 cells within 16 of the
+//     border, each to its point mirror. Layout 1 spreads them evenly over level-0 rows
 //     [center - 112, center - 97) across the side, each to its point mirror. Layout 2 places
 //     random pads on a fixed seed: level-0 cells at least 24 cells from the routes' starts
-//     and goals, each to an independent random cell at least 64 cells away. Layout 0 passes
-//     when flat in teleport count at every side; layouts 1 and 2 pass when flat in side at a
-//     fixed teleport density. Layout 2 at side 256 and 16, 64, or 256 teleports passes when
-//     every route solves at 16 and 64; the 256 point is reported, not judged.
+//     and goals, each to an independent random cell at least 64 cells away. Layout 0 runs
+//     64, 256, or 1,024 teleports at 256² and 8 levels and passes when flat in teleport count.
+//     Layout 1 runs one teleport per 16 strip cells on sides 256, 1024, and 2048 at 8 levels
+//     and passes when flat in side. Layout 2 runs 16, 64, or 256 teleports at 256² and 8
+//     levels and passes when every route solves at 16 and 64; the 256 point is reported, not
+//     judged.
 //   - `pathfinding-cross-level-shaft`: a 256² world of 8, 32, or 128 walkable levels; a ramp
 //     shaft beside the starts joins levels 1 to the deepest, and level 0, which no ramp
 //     reaches, holds a one-way teleport from the shaft's planar cell to beside the goals.
@@ -224,30 +255,37 @@ pub const query_group = suite.BenchmarkGroup{
 //     every depth and the teleport is never usable. Passes when flat in depth.
 pub const level_size_group = suite.BenchmarkGroup{
     .name = "pathfinding-level-size",
+    .item_label = LevelCode.label,
     .defaultItemCounts = levelSizeItemCounts,
     .runCase = runLevelSizeCase,
+    .write_workload = writeRouteWorkload,
 };
 
 pub const cross_level_depth_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-depth",
+    .item_label = CrossLevelCode.label,
     .defaultItemCounts = crossLevelItemCounts,
     .runCase = runCrossLevelDepthCase,
+    .write_workload = writeRouteWorkload,
 };
 
 pub const cross_level_teleport_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-teleport",
-    .defaultItemCounts = crossLevelItemCounts,
+    .item_label = CrossLevelCode.label,
+    .defaultItemCounts = teleportItemCounts,
     .runCase = runCrossLevelTeleportCase,
+    .write_workload = writeRouteWorkload,
 };
 
 pub const cross_level_shaft_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-shaft",
+    .item_label = LevelCode.label,
     .defaultItemCounts = crossLevelItemCounts,
     .runCase = runCrossLevelShaftCase,
+    .write_workload = writeRouteWorkload,
 };
 
-// One far goal per route length D on the flat chunk-portal search (item code variant * 10^7 +
-// layout * 10^6 + parameter). Layouts:
+// One far goal per route length D on the flat chunk-portal search (`LongPathCode`). Layouts:
 //   - 0, serpentine: a 2048² level with a wall every 128 rows, each open by an 8-cell gap at
 //     alternating ends; start and goal sit on the center column, the parameter walls apart.
 //   - 1, open diagonal: an open 2048² level; start (8, 8), goal the parameter cells further
@@ -279,32 +317,38 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 // promoted, restarts at a partial's end on its level, and repeats until a hop arrives; the
 // sample's time is the steps' total, and a hop that drops or a chain past the route's cells +
 // 64 hops fails the case.
-// A caps, probe, or crowd sample is one request cycle from empty runtime state: the first attempt's step, the
-// escalated attempt's step when the first exhausted, then every agent's status. Claims must
-// repeat exactly across samples. Serial only: each step solves one request.
+// A caps, probe, or crowd sample is one request cycle from empty runtime state: the first
+// attempt's step, the escalated attempt's step when the first exhausted, then every agent's
+// status. Claims must repeat exactly across samples. Serial only: each step solves one
+// request. Each variant runs 3 route lengths per layout.
+// Passes when: caps and crowd attempts are flat in route length once the route passes the
+// escalated attempt's caps (each attempt's work is bounded by them), the crowd within spread
+// of caps at the same route; probe claims grow at most linearly in the nodes the layout's
+// route needs; walks and hop chains grow at most linearly in route length (each hop bounded).
 // `--details` prints, per attempt, the abstract nodes claimed, the chosen corridor's nodes,
 // the stitched cells and segment searches when the stitch ran, the crossing boxes the
 // heuristic settled and whether its budget froze, the outcome, and the step time, then the
 // blocked cells on level 0 and the agents' statuses. `candidates` is the last attempt's claims
-// and `outputs` the agents a path serves. A walk prints whether it arrived and where it
-// stopped, its steps, held steps, solves (its requests), partial and full results,
-// escalations, abstract claims over every solve, and total solve time; its `candidates` are
-// its solves and `outputs` its published results. A hop chain prints whether it arrived, its
-// last hop's start, its hops (published ones toward a least-estimate node as `least_hops`),
-// solves, escalations, claims, and total solve time; its `candidates` are its solves and
-// `outputs` its hops. An attempt's `abstract_partial` outcome is a saturated tier-1 search
-// published toward its least-estimate node.
+// and `outputs` the agents a path serves. A walk prints its steps, held steps, solves (its
+// requests), partial and full results, escalations, abstract claims over every solve, and total
+// solve time; its `candidates` are its solves and `outputs` its published results. A hop chain
+// prints its last hop's start, its hops (published ones toward a least-estimate node as
+// `least_hops`), solves, escalations, claims, and total solve time; its `candidates` are its
+// solves and `outputs` its hops. An attempt's `abstract_partial` outcome is a saturated tier-1
+// search published toward its least-estimate node.
 pub const long_path_group = suite.BenchmarkGroup{
     .name = "pathfinding-long-path",
+    .item_label = LongPathCode.label,
     .defaultItemCounts = longPathItemCounts,
     .runCase = runLongPathCase,
+    .write_workload = writeLongPathWorkload,
 };
 
 // A 512² world of 8 walkable levels holding random pads: bidirectional teleports from level 0
-// to the deepest level placed as the teleport group's layout 2 (item code axis * 10^9 + probe
-// preload * 10^6 + background pads before the run). One timed sample runs the post-commit nav
-// reaction that applies a batch of 64 more pads, added to the world untimed. Links are
-// append-only, so every sample (warmup included) leaves its batch in the world.
+// to the deepest level placed as the teleport group's layout 2 (`LinkFoldCode`). One timed
+// sample runs the post-commit nav reaction that applies a batch of 64 more pads, added to the
+// world untimed. Links are append-only, so every sample (warmup included) leaves its batch in
+// the world.
 //   - Axis 0 (uniform): 1,024, 8,192, or 32,768 background pads; every batch is uniform
 //     random pads too, so endpoints per touched chunk rise with pads held.
 //   - Axis 1 (probe): background pads keep off a probe region of chunk pairs (a level-0 chunk
@@ -322,52 +366,42 @@ pub const long_path_group = suite.BenchmarkGroup{
 // split by section.
 pub const link_fold_group = suite.BenchmarkGroup{
     .name = "pathfinding-link-fold",
+    .item_label = LinkFoldCode.label,
     .defaultItemCounts = linkFoldItemCounts,
     .runCase = runLinkFoldCase,
+    .write_workload = writeLinkFoldWorkload,
 };
 
 // One timed dig on a 256² walkable level holding 1,000, 10,000, or 50,000 cached results
-// (the item count) of short paths: the cell turns blocking and the nav reaction runs,
-// eviction included. The dig crosses the same few paths at every count, so it passes
-// when flat in cached results. `outputs` is the results evicted. An untimed reset
-// reopens the cell and re-solves the evicted results. A region config (item count
-// region chunks * 10^7 + cached results) instead fills a chunk-aligned square of that
-// many chunks in one step, crossing the routes of its rows: the dense-change reaction.
-// Items/s is the path-registry entries the eviction visited per second. `--details` prints
-// the eviction stages' shapes, the reaction's main-thread time, and the entries visited.
+// of short paths (`EvictCode`): the cell turns blocking and the nav reaction runs, eviction
+// included. The dig crosses the same few paths at every count, so it passes when flat in
+// cached results. `outputs` is the results evicted. An untimed reset reopens the cell and
+// re-solves the evicted results. The region configs (4, 16, or 64 chunks at 10,000 results)
+// instead fill a chunk-aligned square of that many chunks in one step, crossing the routes of
+// its rows: the dense-change reaction, which passes when linear in the region's chunks and
+// the registrations its eviction visits. Items/s is the path-registry
+// entries the eviction visited per second. `--details` prints the eviction stages' shapes,
+// the reaction's main-thread time, and the entries visited.
 pub const evict_group = suite.BenchmarkGroup{
     .name = "pathfinding-evict",
+    .item_label = EvictCode.label,
     .defaultItemCounts = evictItemCounts,
     .runCase = runEvictCase,
-};
-
-// Item counts up to `group_field_tunnel_min_cells`: moving packs of 24 agents (the item
-// count is the pack count) on an open 256² nav grid, each with its own goal marching one
-// nav cell per rekey cycle. Fields per pack and a threshold of 8 make the packs' fields
-// build at the same time, one `group_field_expand` item per building field. Times every
-// step of the measured cycles; `outputs` is the fields built and `candidates` the field
-// samples.
-// Larger item counts: sparse-coverage fields. Four crowds on a 1024² level whose only
-// walkable cells are a lattice of 1-wide corridors every nav chunk (31 cells per
-// 256-cell chunk) each flood a field capped at the item count's cells. One iteration
-// rebuilds the four fields from scratch until all are ready; the time is that build and
-// `outputs` the cells covered.
-// `--details` prints per-field coverage, blocks, resident bytes, and pool growths.
-pub const group_field_packs_group = suite.BenchmarkGroup{
-    .name = "pathfinding-group-field-packs",
-    .defaultItemCounts = groupFieldPacksItemCounts,
-    .runCase = runGroupFieldPacksCase,
+    .write_workload = writeEvictWorkload,
 };
 
 // The agent count ramps linearly to 1,000, 4,000, or 16,000 (the item count) over 64
 // steps, then holds until every agent's path is cached; each step every live agent
 // requests its own distinct goal. Times the pathfinding updates of the whole ramp;
 // `outputs` is the solves it took and `candidates` the solves past one per agent (cached
-// results lost to eviction or a resize, then solved again).
+// results lost to eviction or a resize, then solved again). Passes when linear in agents with
+// no re-solve.
 pub const elastic_ramp_group = suite.BenchmarkGroup{
     .name = "pathfinding-elastic-ramp",
+    .item_label = "agents at the ramp's top",
     .defaultItemCounts = elasticRampItemCounts,
     .runCase = runElasticRampCase,
+    .write_workload = writeElasticRampWorkload,
 };
 
 // The `pathfinding-elastic-ramp` ramp to 1,000, 4,000, or 16,000 agents (the item count),
@@ -375,175 +409,154 @@ pub const elastic_ramp_group = suite.BenchmarkGroup{
 // cached, held until the shrink window elapses. Times the step whose update shrinks the
 // capacity, result cache included; that step and the hold step before it serve only cache
 // hits. `outputs` is the cached results kept, `candidates` those moved to a lower owner id,
-// `evictions` those evicted. `--details` adds the hold step's time and the difference, the
-// resize, split into its worker-side copy and the rest on the main thread, with the cache
+// `evictions` those evicted. Passes when the resize (step minus hold) grows at most linearly
+// in the capacity it shrinks from. `--details` adds the hold step's time and the difference,
+// the resize, split into its worker-side copy and the rest on the main thread, with the cache
 // and agent capacities before and after.
 pub const elastic_shrink_group = suite.BenchmarkGroup{
     .name = "pathfinding-elastic-shrink",
+    .item_label = "agents before the drop",
     .defaultItemCounts = elasticRampItemCounts,
     .runCase = runElasticShrinkCase,
+    .write_workload = writeElasticShrinkWorkload,
 };
 
-// The `pathfinding-cache-unreachable` layout (starts and goals on opposite sides of a wall
-// with no gap), but every timed step requests goals the previous step did not, on result
-// state cleared before it (untimed): nothing is cached, and intake answers every request
-// unavailable from reach with no solve. `outputs` is the requests answered unavailable,
-// `candidates` the solves (zero), `deferred` the requests left pending (zero).
-pub const cold_unreachable_group = suite.BenchmarkGroup{
-    .name = "pathfinding-cold-unreachable",
-    .defaultItemCounts = coldSolveItemCounts,
-    .runCase = runColdUnreachableCase,
-};
-
-// Fresh unreachable goals every step. Goals lie in a sealed 80² pocket at the origin of a
-// walkable 256² level and are requested from outside it; each timed step requests the item
-// count of goals that no step of the last 16 asked for, and intake answers every request
-// unavailable from reach, with no solve and nothing cached. `outputs` is the step's
-// requests answered unavailable and `evictions` (`victims=`) the cache evictions (zero).
+// One step of the item count's requests from outside a sealed 80² pocket at the origin of a
+// walkable 256² level, each to its own pocket goal: intake answers every request unavailable
+// from reach, with no solve and nothing cached. The per-step load of unreachable requests.
+// `outputs` is the requests answered unavailable. Passes when linear in requests.
 pub const negative_steady_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-steady",
+    .item_label = "unreachable path requests per step",
     .defaultItemCounts = negativeSteadyItemCounts,
     .runCase = runNegativeSteadyCase,
+    .write_workload = writeUnavailableWorkload,
 };
 
-// The item count's requests (item code level side * 1000 + requests) from outside a
-// sealed 80² pocket at the origin of a walkable level, each to its own goal inside it.
-// Each timed step toggles one far cell's blocking, runs the nav reaction, and updates the
-// same requests; intake answers every request unavailable from reach, with no solve, so the
-// step is flat in side. `outputs` is the step's solves (zero), `candidates` its requests
-// answered unavailable from reach, `samples` its exhausted attempts, and `deferred` the
-// requests still pending after it. `--details` prints the update's stages, the reaction's
-// remask and eviction stages with its main-thread share, and the reaction/update split.
+// The item count's requests (`NegativeDigCode`) from outside a sealed 80² pocket at the origin
+// of a walkable level, each to its own goal inside it. Each timed step toggles one far cell's
+// blocking, runs the nav reaction, and updates the same requests; intake answers every request
+// unavailable from reach, with no solve. `outputs` is the requests answered unavailable.
+// Passes when flat in side and linear in requests. `--details` prints the update's stages, the
+// reaction's remask and eviction stages with its main-thread share, and the reaction/update
+// split.
 pub const negative_dig_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-dig",
+    .item_label = NegativeDigCode.label,
     .defaultItemCounts = negativeDigItemCounts,
     .runCase = runNegativeDigCase,
+    .write_workload = writeUnavailableWorkload,
 };
 
-// The item count's unreachable requests in one burst (item code variant * 10^6 + requests).
-// Four sealed 56² pockets line the top edge of a walkable 256² level; requesters start
-// outside them from row 72. Variant 0: request `i` goes to its own cell of pocket `i mod 4`.
-// Variant 1 (a blocked crowd): each pocket holds a 3x3 blocking block at its center, and
-// request `i` goes to pocket `i mod 4`'s block center, a blocked goal whose nearest open cell
-// lies inside the sealed pocket. One timed sample, on result state cleared before it
-// (untimed), submits every request on one step and then steps an empty stream until nothing
-// is pending, each step opening with the goal resolve over every request; a status query of
-// every request follows each step, untimed in variant 0 and timed in variant 1. `outputs` is
-// the requests answered unavailable and `candidates` the searches the burst ran; the
-// workload column adds the burst's steps, the step after which every status read
-// unavailable, the goal projections and intake fallbacks, and the mean longest step. Passes
-// when one step answers every request with no search, linear in requests, with four
-// projections for the blocked crowd at every size. `--details` prints the update stages
-// over the timed steps and the goal resolve's stage shapes.
+// The item count's unreachable requests in one step (`BurstCode`). Four sealed 56² pockets
+// line the top edge of a walkable 256² level; requesters start outside them from row 72.
+// Variant 0: request `i` goes to its own cell of pocket `i mod 4`. Variant 1 (a blocked
+// crowd): each pocket holds a 3x3 blocking block at its center, and request `i` goes to pocket
+// `i mod 4`'s block center, a blocked goal whose nearest open cell lies inside the sealed
+// pocket. One timed sample, on result state cleared before it (untimed), runs the goal resolve
+// over every request and the step that submits them; a status query of every request follows,
+// untimed in variant 0 and timed in variant 1. `outputs` is the requests answered unavailable;
+// the workload adds the goal projections. Passes when the step answers every request with no
+// search and nothing pending, linear in requests, with four projections for the blocked crowd
+// at every size. `--details` prints the update stages and the goal resolve's stage shapes.
 pub const negative_burst_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-burst",
+    .item_label = BurstCode.label,
     .defaultItemCounts = negativeBurstItemCounts,
     .runCase = runNegativeBurstCase,
+    .write_workload = writeBurstWorkload,
 };
 
-// One walkable level (item code variant * 10^10 + edge chunks * 10^7 + side * 1000 + 1)
-// holding, at its origin corner, solid chunks around one walkable gap chunk. Variant 0: a
-// room of edge² chunks walled off by a one-chunk band whose one open chunk is the gap;
-// blocking the gap seals the room. Variant 1: a one-chunk ring corridor around a solid block
-// of edge² chunks, walled off from the rest of the level, with the gap one chunk of the ring;
-// blocking it cuts the ring without splitting it. Variant 2: a one-chunk tunnel of edge
-// chunks along the level's north border, walled below, whose east mouth chunk is the gap;
-// blocking it seals the tunnel off the open level. One timed sample blocks the gap chunk and
-// runs the nav reaction, then reopens it and runs the reaction again; the tile writes are
-// untimed. `outputs` is the cells each change flips and `candidates` the room, ring, or tunnel
-// chunks. Passes when no config grows faster than its room, ring, or tunnel chunks and every
-// config is flat in side. `--details` prints the block and reopen reactions, the block
-// reaction's plan, remask, patch, and connectivity shapes (the flood's rounds, searches per
-// round, and its tuner's policy), and the reactions' main-thread share.
+// One walkable level (`SplitCode`) holding, at its origin corner, solid chunks around one
+// walkable gap chunk. Variant 0: a room of edge² chunks walled off by a one-chunk band whose
+// one open chunk is the gap; blocking the gap seals the room. Variant 1: a one-chunk ring
+// corridor around a solid block of edge² chunks, walled off from the rest of the level, with
+// the gap one chunk of the ring; blocking it cuts the ring without splitting it. Variant 2: a
+// one-chunk tunnel of edge chunks along the level's north border, walled below, whose east
+// mouth chunk is the gap; blocking it seals the tunnel off the open level. One timed sample
+// blocks the gap chunk and runs the nav reaction, then reopens it and runs the reaction again;
+// the tile writes are untimed. `outputs` is the cells each change flips and `candidates` the
+// room, ring, or tunnel chunks. Passes when no config grows faster than its room, ring, or
+// tunnel chunks and every config is flat in side. `--details` prints the block and reopen
+// reactions and the block reaction's plan, remask, patch, and connectivity shapes (the flood's
+// rounds, searches per round, and its tuner's policy) with the reactions' main-thread split.
 pub const connectivity_split_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-split",
+    .item_label = SplitCode.label,
     .defaultItemCounts = connectivitySplitItemCounts,
     .runCase = runConnectivitySplitCase,
+    .write_workload = writeSplitWorkload,
 };
 
-// A 256² world of 2 levels (item code variant * 10^10 + terminals * 10^5 + systems), each a
-// lattice of one-cell walled rooms, holding `systems` chains of `terminals` rooms, each room
-// joined to the next room of its chain by a one-way teleport. Variants 0 and 1 toggle the
-// first chain's last room (its last link's target), variant 2 its first room (its first
-// link's source), and variant 3 a far room no chain uses. Variant 4 closes the chain's first
-// `terminals - 64` rooms once, untimed (its block narrows), then toggles its last room.
-// Variant 5 is a fan: every room joined by a one-way teleport to a hub room, the hub to the
-// last room, which toggles, so one round recomputes every source's row (rows narrower than a
-// cache line below 512 terminals). Variants 1 to 5 hold one chain or fan. Variant 7 adds to
-// variant 0's chains a ballast chain on level 1 whose block holds over twice the chains' live
-// words; before every sample, untimed and with the nav tuners restored after, the ballast
-// reopens (its one block lands in that reaction) and then every ballast room closes (its
-// block is freed in that reaction), and the nav's bytes are checked. Its timed block and
-// reopen reactions must land, allocate, and free no block and leave the batch tail's capacity
-// as it was. The toggled end's 8 rooms sit in one fixed chunk whose orthogonal neighbours hold no
-// other chain room, so every config's toggle patches the same chunks. One timed sample blocks
-// the cell and runs the nav reaction, then reopens it and runs the reaction again; the tile
-// writes are untimed. `outputs` is the one-way links and `candidates` the rooms. Passes when
-// variants 0, 3, and 4 are flat (4 in its peak terminals), variant 2 grows at most linearly
-// in terminals, and variants 1 and 5 at most as terminals² / 32. Variant 7 passes when its
-// timed block reaction, that reaction's reserve section, and its closure stages are flat in
-// systems; the ballast's own landing and free follow its block alone. `--details` as for
-// `pathfinding-connectivity-split`, plus variant 7's ballast retire (the reopen's landing and
-// tail use, the close's free) and the split of its timed block reaction (reserve, closure
-// stages, landing, rest).
+// A 256² world of 2 levels (`OnewayCode`), each a lattice of one-cell walled rooms, holding
+// `systems` chains of `terminals` rooms, each room joined to the next room of its chain by a
+// one-way teleport. Variants 0 and 1 toggle the first chain's last room (its last link's
+// target), variant 2 its first room (its first link's source), and variant 3 a far room no
+// chain uses. Variant 4 closes the chain's first `terminals - 64` rooms once, untimed (its
+// block narrows), then toggles its last room. Variant 5 is a fan: every room joined by a
+// one-way teleport to a hub room, the hub to the last room, which toggles, so one round
+// recomputes every source's row (rows narrower than a cache line below 512 terminals).
+// Variants 1 to 5 hold one chain or fan. Variant 6 (dense) holds `systems` chains of
+// `oneway_dense_terminals` rooms whose heads sit side by side on level 0's last room row,
+// joined into one system through the open wall cells between them; the timed block reaction
+// fills every such wall cell (the system splits into `systems`) and the reopen opens them (one
+// dense opening merges them), its blocks resizing. Variant 7 adds to variant 0's chains a
+// ballast chain on level 1 whose block holds over twice the chains' live words; before every
+// sample, untimed and with the nav tuners restored after, the ballast reopens (its one block
+// lands in that reaction) and then every ballast room closes (its block is freed in that
+// reaction), and the nav's bytes are checked. Its timed block and reopen reactions must land,
+// allocate, and free no block and leave the batch tail's capacity as it was. The toggled end's
+// 8 rooms sit in one fixed chunk whose orthogonal neighbours hold no other chain room, so every
+// config's toggle patches the same chunks. One timed sample blocks the cell and runs the nav
+// reaction, then reopens it and runs the reaction again; the tile writes are untimed.
+// `outputs` is the one-way links and `candidates` the rooms. Passes when variants 0, 3, and 4
+// are flat (4 in its peak terminals), variant 2 grows at most linearly in terminals, variants 1
+// and 5 at most as terminals² / 32, and variant 6 at most as its merged system's rows,
+// (systems x terminals)² / 32; its block resizes and reserve ratio are reported, not checked,
+// since its fill and reopen resize blocks by design. Variant 7 passes when its timed block reaction, that reaction's reserve section,
+// and its closure stages are flat in systems; the ballast's own landing and free follow its
+// block alone. `--details` as for `pathfinding-connectivity-split`, plus variant 7's ballast
+// retire (the reopen's landing and tail use, the close's free) and the split of its timed
+// block reaction (reserve, closure stages, landing, rest).
 pub const connectivity_oneway_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-oneway",
+    .item_label = OnewayCode.label,
     .defaultItemCounts = connectivityOnewayItemCounts,
     .runCase = runConnectivityOnewayCase,
+    .write_workload = writeOnewayWorkload,
 };
 
-const quick_counts = [_]usize{ 128, 512, 1024 };
-const standard_counts = [_]usize{ 512, 1024, 4096 };
-const stress_counts = [_]usize{ 4096, 10000 };
-// Cold-solve curve sits at and well above the 512 ceiling so the deferral ratio is traced
-// (e.g. 4096 -> 512 solved, 3584 deferred). Every count >= the ceiling. Counts are kept lean
-// and capped below the 256x256-grid tier (10000): each cold row re-runs the full per-frame
-// solve ceiling on a count-sized grid, so an extra big count costs seconds per profile.
-const cold_solve_quick_counts = [_]usize{512};
-const cold_solve_standard_counts = [_]usize{ 512, 1024, 2048 };
-const cold_solve_stress_counts = [_]usize{ 2048, 4096 };
-// Drain counts are deep queues (N >> 512); each cycle spans ceil(N/512) drain frames, so one
-// count per profile (above the ceiling) already exercises the cross-frame carry-over.
-const drain_quick_counts = [_]usize{1024};
-const drain_standard_counts = [_]usize{2048};
-const drain_stress_counts = [_]usize{4096};
+// Cold solve counts: three below the per-step solve ceiling, the ceiling, and three past it,
+// so both regimes show their shape.
+const cold_solve_quick_counts = [_]usize{ 128, 256, 384, 512, 1024, 2048, 4096 };
+const cold_solve_standard_counts = [_]usize{ 128, 256, 384, 512, 1024, 4096, 8192 };
+const cold_solve_stress_counts = [_]usize{ 128, 256, 384, 512, 2048, 4096, 8192 };
+const shared_goal_quick_counts = [_]usize{ 128, 512, 2048 };
+const shared_goal_standard_counts = [_]usize{ 512, 2048, 8192 };
+const shared_goal_stress_counts = [_]usize{ 2048, 8192, 32768 };
+// Queue depths past the ceiling, so every drain step solves a full ceiling.
+const drain_quick_counts = [_]usize{ 1024, 2048, 4096 };
+const drain_standard_counts = [_]usize{ 1024, 4096, 16384 };
+const drain_stress_counts = [_]usize{ 2048, 8192, 16384 };
 const fallback_quick_counts = [_]usize{ 16, 64, 128 };
 const fallback_standard_counts = [_]usize{ 64, 128, 256, 1024 };
 const fallback_stress_counts = [_]usize{ 256, 512, 1024 };
-const unreachable_quick_counts = [_]usize{ 8, 16, 32 };
-const unreachable_standard_counts = [_]usize{ 16, 32, 64, 1024 };
-const unreachable_stress_counts = [_]usize{ 64, 128, 1024 };
-// Lean (two counts per profile): the query loop is cheap, and a crowd at and well above
-// the per-frame solve ceiling is enough to show the cache-probe and waypoint-scan cost.
-const query_quick_counts = [_]usize{ 256, 1024 };
-const query_standard_counts = [_]usize{ 1024, 4096 };
-const query_stress_counts = [_]usize{4096};
-// Grid SIDE (cells), not agent count — see escalated_detour_group's doc comment. Kept
-// well below the calibration repro's 256x256 production map so this stays CI-fast; the
-// fixed tier-1 budget does not depend on grid size, so a smaller grid still exercises
-// the real promote-to-tier-1 path once tier0 is forced to exhaust.
-const escalated_detour_quick_counts = [_]usize{64};
-const escalated_detour_standard_counts = [_]usize{96};
-const escalated_detour_stress_counts = [_]usize{128};
-// Item counts here are the shared-goal PACK size (agents), not the grid side — the
-// grid is pinned at production scale (group_field_detour_grid_side) for every count
-// and every profile, mirroring the demo's fixed ~24-mover pursuit pack.
-const group_field_detour_quick_counts = [_]usize{24};
-const group_field_detour_standard_counts = [_]usize{24};
-const group_field_detour_stress_counts = [_]usize{ 24, 48 };
-// Production nav-grid scale (matches game_demo_state's procedural world side).
-const group_field_detour_grid_side: usize = 256;
-// Untimed setup: fixed loop-safety bound on steps spent waiting for the field to
-// finish building (default_group_field_build_budget cells/step), plus slack — never
-// derived from grid size, just a guard against a stalled setup hanging the bench.
-const group_field_detour_setup_guard: usize = 64;
+const query_quick_counts = [_]usize{ 256, 1024, 4096 };
+const query_standard_counts = [_]usize{ 1024, 4096, 16384 };
+const query_stress_counts = [_]usize{ 2048, 8192, 16384 };
+// Level sides, in whole chunks, up to the largest whose detour the fixed tier-1 budget solves.
+const escalated_detour_quick_counts = [_]usize{ 64, 128, 256 };
+const escalated_detour_standard_counts = [_]usize{ 128, 256, 512 };
+const escalated_detour_stress_counts = [_]usize{ 128, 256, 512 };
+// Pack sizes.
+const group_field_detour_quick_counts = [_]usize{ 16, 64, 256 };
+const group_field_detour_standard_counts = [_]usize{ 16, 64, 256 };
+const group_field_detour_stress_counts = [_]usize{ 64, 256, 1024 };
+const group_field_packs_item_counts = [_]usize{ 1, 4, 16 };
+const group_field_tunnel_item_counts = [_]usize{ 2048, 16384, 65536 };
 
-// A cold pathfinding frame runs up to the per-frame solve ceiling of A* on a count-sized grid
-// — orders of magnitude heavier than the vectorized subsystem benches the suite measurement
-// defaults (warmup 5 / iterations 30 / adaptive settle up to 48) were sized for. A cold mean is
-// stable in far fewer samples, so the COLD runners use this tighter budget to keep each profile
-// well under a minute; the hot cache/query groups keep the full suite budget. User-supplied
-// --warmup/--iterations smaller than these caps still win (min), so explicit overrides are honored.
+// A cold step re-solves up to the per-step ceiling, so the cold groups take fewer samples
+// than the suite's defaults; a smaller `--warmup`/`--iterations` still wins.
 const cold_warmup_cap: usize = 1;
 const cold_iteration_cap: usize = 5;
 const cold_settle_cap: usize = 4;
@@ -558,47 +571,7 @@ fn coldSettleLimit(options: suite.Options) usize {
     return @min(suite.adaptiveSettleIterationLimit(options), cold_settle_cap);
 }
 
-const Workload = enum {
-    common_goal,
-    unique_open,
-    blocked_detour,
-    blocked_unreachable,
-    hard_fallback,
-};
-
-const MeasurementMode = enum {
-    // Warm cache: measures the cache-hit probe (no solve runs).
-    hot_cache,
-    // Cold per-cell A* fallback (heavy-obstacle field); serviced = solve_admissions.
-    cold_fallback,
-    // Cold mixed solve (abstract + fallback) on a representative map; serviced = solves.
-    cold_solve,
-
-    fn isCold(self: MeasurementMode) bool {
-        return self != .hot_cache;
-    }
-};
-
-const Fixture = struct {
-    data: DataSystem,
-    requests: RangeOutputStream(PathRequest),
-
-    fn deinit(self: *Fixture) void {
-        self.requests.deinit();
-        self.data.deinit();
-        self.* = undefined;
-    }
-};
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &quick_counts,
-        .standard => &standard_counts,
-        .stress => &stress_counts,
-    };
-}
-
-pub fn coldSolveItemCounts(profile: suite.Profile) []const usize {
+fn coldSolveItemCounts(profile: suite.Profile) []const usize {
     return switch (profile) {
         .quick => &cold_solve_quick_counts,
         .standard => &cold_solve_standard_counts,
@@ -606,7 +579,15 @@ pub fn coldSolveItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn drainItemCounts(profile: suite.Profile) []const usize {
+fn sharedGoalItemCounts(profile: suite.Profile) []const usize {
+    return switch (profile) {
+        .quick => &shared_goal_quick_counts,
+        .standard => &shared_goal_standard_counts,
+        .stress => &shared_goal_stress_counts,
+    };
+}
+
+fn drainItemCounts(profile: suite.Profile) []const usize {
     return switch (profile) {
         .quick => &drain_quick_counts,
         .standard => &drain_standard_counts,
@@ -614,7 +595,7 @@ pub fn drainItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn fallbackDefaultItemCounts(profile: suite.Profile) []const usize {
+fn fallbackDefaultItemCounts(profile: suite.Profile) []const usize {
     return switch (profile) {
         .quick => &fallback_quick_counts,
         .standard => &fallback_standard_counts,
@@ -622,15 +603,7 @@ pub fn fallbackDefaultItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn unreachableDefaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &unreachable_quick_counts,
-        .standard => &unreachable_standard_counts,
-        .stress => &unreachable_stress_counts,
-    };
-}
-
-pub fn queryDefaultItemCounts(profile: suite.Profile) []const usize {
+fn queryDefaultItemCounts(profile: suite.Profile) []const usize {
     return switch (profile) {
         .quick => &query_quick_counts,
         .standard => &query_standard_counts,
@@ -638,7 +611,7 @@ pub fn queryDefaultItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn escalatedDetourItemCounts(profile: suite.Profile) []const usize {
+fn escalatedDetourItemCounts(profile: suite.Profile) []const usize {
     return switch (profile) {
         .quick => &escalated_detour_quick_counts,
         .standard => &escalated_detour_standard_counts,
@@ -646,7 +619,7 @@ pub fn escalatedDetourItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn groupFieldDetourItemCounts(profile: suite.Profile) []const usize {
+fn groupFieldDetourItemCounts(profile: suite.Profile) []const usize {
     return switch (profile) {
         .quick => &group_field_detour_quick_counts,
         .standard => &group_field_detour_standard_counts,
@@ -654,209 +627,258 @@ pub fn groupFieldDetourItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize, workload: Workload) !Fixture {
-    var data = DataSystem.init(allocator);
-    errdefer data.deinit();
-    var requests = RangeOutputStream(PathRequest).init(allocator);
-    errdefer requests.deinit();
-    try requests.reserve(suite.rangeCount(count, suite.default_items_per_range), count);
-
-    const side = fixtureGridSide(count, workload);
-    try addObstacleField(&data, side, workload);
-    for (0..count) |index| {
-        const start_cell = requestStartCell(index, side, workload);
-        const goal_cell = requestGoalCell(index, side, workload);
-        const entity = try addEntity(&data, .{
-            .x = @as(f32, @floatFromInt(start_cell.x)) * 32.0,
-            .y = @as(f32, @floatFromInt(start_cell.y)) * 32.0,
-        }, false);
-        try appendRequest(&requests, .{
-            .entity = entity,
-            .start = .{
-                .x = @as(f32, @floatFromInt(start_cell.x)) * 32.0 + 8.0,
-                .y = @as(f32, @floatFromInt(start_cell.y)) * 32.0 + 8.0,
-            },
-            .goal = .{
-                .x = @as(f32, @floatFromInt(goal_cell.x)) * 32.0 + 8.0,
-                .y = @as(f32, @floatFromInt(goal_cell.y)) * 32.0 + 8.0,
-            },
-        });
-    }
-
-    return .{ .data = data, .requests = requests };
+fn groupFieldPacksItemCounts(_: suite.Profile) []const usize {
+    return &group_field_packs_item_counts;
 }
 
-// Headline pathfinding solve curve: cold, DISTINCT-goal individual A* at and above the
-// 512/frame amortization ceiling. min(512, count) solves run this frame; the remainder
-// defers (the drain group measures the carry-over). Distinct goals mean no goal-keyed dedup,
-// so this is a true cold solver-throughput curve, not a single shared-goal solve. The solve
-// budget is the full count so the per-frame ceiling (not a bench-imposed budget) does the
-// capping, and items_per_second reports solves actually serviced, not the requested count.
-pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn groupFieldTunnelItemCounts(_: suite.Profile) []const usize {
+    return &group_field_tunnel_item_counts;
+}
+
+fn writeSolveWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("solves={} results={} deferred={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count });
+}
+
+fn writeDedupWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("answered={} folded={}", .{ stats.output_count, stats.candidate_pairs });
+}
+
+fn writeCacheWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cache_hits={} results={}", .{ stats.candidate_pairs, stats.output_count });
+}
+
+fn writeFallbackWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("solve_admissions={} admission_deferred={} deferred={} results={} evictions={}", .{ stats.candidate_pairs, stats.fallback_deferred_count, stats.deferred_count, stats.output_count, stats.cache_evictions });
+}
+
+fn writeQueryWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("warm_paths={} queries={}", .{ stats.candidate_pairs, stats.output_count });
+}
+
+fn writeFieldSampleWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("field_samples={} folded={}", .{ stats.candidate_pairs, stats.output_count });
+}
+
+fn writeFieldMovingWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("escalated={} throttled={} fields_built={} field_samples={}", .{ stats.output_count, stats.candidate_pairs, stats.deferred_count, stats.sample_count });
+}
+
+fn writePacksWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("fields_built={} field_samples={}", .{ stats.output_count, stats.candidate_pairs });
+}
+
+fn writeTunnelWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cells_covered={}", .{stats.output_count});
+}
+
+// Request-load layouts. Open routes: request `i`'s goal on a grid of `request_columns`
+// columns from (8, 8), its start (`request_route_dx`, `request_route_dy`) cells on.
+const request_side: u16 = 512;
+const request_route_dx: u16 = 64;
+const request_route_dy: u16 = 32;
+const request_columns: usize = request_side - 16 - request_route_dx;
+// Detour routes: lanes beside the middle wall, open at this row.
+const detour_lanes: usize = 64;
+const detour_gap_y: u16 = 64;
+// Hard-fallback routes: one row of requests every third row, each blocked by its row's center
+// cell.
+const hard_fallback_side: u16 = 128;
+const hard_fallback_lanes: usize = (hard_fallback_side - 4) / 3;
+const hard_fallback_columns: usize = hard_fallback_side / 2 - 1;
+
+const Workload = enum {
+    unique_open,
+    common_goal,
+    blocked_detour,
+    hard_fallback,
+
+    fn side(self: Workload) u16 {
+        return if (self == .hard_fallback) hard_fallback_side else request_side;
+    }
+
+    // The most requests the layout holds, each its own start.
+    fn capacity(self: Workload) usize {
+        return switch (self) {
+            .unique_open, .common_goal => request_columns * (request_side - 16 - request_route_dy - 8),
+            .blocked_detour => detour_lanes * ((detour_gap_y - 8) / 2),
+            .hard_fallback => hard_fallback_lanes * hard_fallback_columns,
+        };
+    }
+
+    fn route(self: Workload, index: usize) PlanarRoute {
+        return switch (self) {
+            .unique_open, .common_goal => blk: {
+                const goal = CellCoord{ .x = @intCast(8 + index % request_columns), .y = @intCast(8 + index / request_columns) };
+                const start = CellCoord{ .x = goal.x + request_route_dx, .y = goal.y + request_route_dy };
+                if (self == .common_goal) break :blk .{ .start = start, .goal = .{ .x = request_side - 8, .y = request_side - 8 } };
+                break :blk .{ .start = start, .goal = goal };
+            },
+            .blocked_detour => blk: {
+                const lane: u16 = @intCast(index % detour_lanes);
+                const y: u16 = @intCast(8 + 2 * (index / detour_lanes));
+                break :blk .{ .start = .{ .x = request_side / 2 - 2 - lane, .y = y }, .goal = .{ .x = request_side / 2 + 2 + lane, .y = y } };
+            },
+            .hard_fallback => blk: {
+                const column: u16 = @intCast(index / hard_fallback_lanes);
+                const y: u16 = @intCast(2 + (index % hard_fallback_lanes) * 3);
+                break :blk .{ .start = .{ .x = 1 + column, .y = y }, .goal = .{ .x = hard_fallback_side - 2 - column, .y = y } };
+            },
+        };
+    }
+
+    // The layout's blocking cells on level 0.
+    fn blockedCells(self: Workload, allocator: std.mem.Allocator) ![]CellCoord {
+        var cells: std.ArrayList(CellCoord) = .empty;
+        errdefer cells.deinit(allocator);
+        switch (self) {
+            .unique_open, .common_goal => {},
+            .blocked_detour => for (0..request_side) |y| {
+                if (y != detour_gap_y) try cells.append(allocator, .{ .x = request_side / 2, .y = @intCast(y) });
+            },
+            .hard_fallback => for (0..hard_fallback_lanes) |lane| {
+                try cells.append(allocator, .{ .x = hard_fallback_side / 2, .y = @intCast(2 + lane * 3) });
+            },
+        }
+        return cells.toOwnedSlice(allocator);
+    }
+};
+
+// `count` requests of `workload` on its level, world-backed nav built over it.
+fn initRequestFixture(allocator: std.mem.Allocator, io: std.Io, workload: Workload, count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !RouteFixture {
+    if (count > workload.capacity()) return error.RequestLayoutTooSmall;
+    var open = try buildOpenWorld(allocator, io, workload.side(), 1);
+    var open_owned = true;
+    errdefer if (open_owned) open.world.deinit();
+    const blocked = try workload.blockedCells(allocator);
+    defer allocator.free(blocked);
+    try writeLevelZeroCells(&open, blocked, open.blocking);
+    const requests = try allocator.alloc(PathRequest, count);
+    defer allocator.free(requests);
+    for (requests, 0..) |*request, index| {
+        const route = workload.route(index);
+        request.* = .{ .entity = undefined, .start = open.cellCenter(route.start), .goal = open.cellCenter(route.goal) };
+    }
+    open_owned = false;
+    return initRouteFixture(allocator, open, requests, capacity, thread_system);
+}
+
+// A request-load group's capacity: the item count's agents.
+fn requestCapacity(item_count: usize, participant_count: usize) PathfindingCapacity {
+    return .{ .worker_participant_count = participant_count, .max_agent_budget = @max(item_count, 1) };
+}
+
+const MeasurementMode = enum {
+    // Warm cache: measures the cache-hit probe (no solve runs).
+    hot_cache,
+    // Cold solve at the admission window; serviced = solve admissions.
+    cold_fallback,
+    // Cold solve; serviced = results published.
+    cold_solve,
+
+    fn isCold(self: MeasurementMode) bool {
+        return self != .hot_cache;
+    }
+};
+
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runWorkloadCase(allocator, io, options, case, group.name, item_count, .unique_open, .cold_solve, item_count, item_count);
 }
 
-// Shared-goal dedup path: every agent requests the SAME goal cell, so all but the first hash
-// to one PathQueryKey (start is not part of the key) and resolve via dedup/group-field off a
-// single cold A* solve per frame. The transient request state is cleared each iteration so
-// every iteration is a fresh cold dedup. Throughput here is agents-resolved-via-dedup per
-// second (the dedup IS the workload), NOT solver throughput.
-pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+// Every request shares one goal: all but the first fold into its pending entry, so a cold
+// step is one solve. Items/s is requests answered, not solves.
+fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-
-    var fixture = try createFixture(allocator, item_count, .common_goal);
-    defer fixture.deinit();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-
-    const grid_side = fixtureGridSide(item_count, .common_goal);
-    const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
-
-    // Build the thread system first so the pathfinding system is sized for its real
-    // participant count (workers + 1); each participant gets one O(cells) A* slot.
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    // The field threshold above every sharer count (the agent ceiling clamps it), so the
+    // timed step is the fold alone, never a group-field begin.
+    var capacity = requestCapacity(item_count + 1, fixtures.participantCount(thread_ptr));
+    capacity.min_group_field_agents = item_count + 1;
+    var fixture = try initRequestFixture(allocator, io, .common_goal, item_count, capacity, thread_ptr);
+    defer fixture.deinit();
+    const system = &fixture.system;
+    setPathStageTuners(system, case);
 
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 8,
-        .worker_participant_count = participant_count,
-        // Let elastic capacity grow to the full benchmark item count (some profiles
-        // exceed the default ceiling); agent_count drives the per-step caps.
-        .max_agent_budget = @max(item_count, 1),
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
-
-    resetPathState(&system, .drop_fields);
-    _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
-    for (0..coldWarmup(options)) |_| {
-        resetPathState(&system, .keep_fields);
-        _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
+    for (0..1 + coldWarmup(options)) |_| {
+        system.clearRuntimeState();
+        _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
         while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            resetPathState(&system, .keep_fields);
-            _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
+            system.clearRuntimeState();
+            _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
         }
     }
-    const solve_settled_before_measurement = if (case.adaptive) system.tuners.solve.isSettled() else false;
+    const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     for (0..coldIterations(options)) |_| {
-        resetPathState(&system, .keep_fields);
+        system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
+        last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
+        if (last_stats.group_field_begin_batch.item_count != 0 or last_stats.group_fields_built != 0) return error.SharedGoalBeganField;
     }
-
+    if (last_stats.solve_admissions != 1) return error.SharedGoalNotOneSolve;
     var stats = accumulator.finish();
-    // Goal-keyed dedup resolves a shared goal once; same-goal duplicates and warm cache hits
-    // are also resolved agents. Count all so output_count reflects every requesting agent.
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results +
-        last_stats.duplicate_requests + last_stats.cache_hits;
+    stats.output_count = last_stats.available_results + last_stats.unavailable_results + last_stats.duplicate_requests + last_stats.cache_hits;
     stats.candidate_pairs = last_stats.duplicate_requests + last_stats.cache_hits;
-    // Honest denominator: agents resolved via dedup this step (every requesting agent),
-    // explicitly NOT the single A* solve. Equals item_count when nothing is dropped.
-    if (stats.mean_ns != 0) {
-        stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    }
-    if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), solve_settled_before_measurement);
-    }
+    stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled);
     return stats;
 }
 
-pub fn runFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runWorkloadCase(allocator, io, options, case, fallback_group.name, item_count, .unique_open, .hot_cache, item_count, item_count);
 }
 
-pub fn runFallbackDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runFallbackDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runWorkloadCase(allocator, io, options, case, fallback_detour_group.name, item_count, .blocked_detour, .hot_cache, item_count, item_count);
 }
 
-pub fn runFallbackUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, fallback_unreachable_group.name, item_count, .blocked_unreachable, .hot_cache, item_count, item_count);
-}
-
-pub fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runWorkloadCase(allocator, io, options, case, hard_fallback_group.name, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
 }
 
-pub fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    const fallback_budget = @min(options.fallback_budget orelse hardFallbackBudget(item_count), item_count);
+fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    const fallback_budget = @min(options.fallback_budget orelse hard_fallback_admissions, item_count);
     return runWorkloadCase(allocator, io, options, case, hard_fallback_budget_group.name, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
 }
 
-// Admissions per step of the hard-fallback case: a window narrower than its solve window,
-// so the admission limit defers the rest.
+// Admissions per step of the hard-fallback-budget case: a window narrower than its solve
+// window, so the admission limit defers the rest.
 const hard_fallback_admissions: usize = 128;
-
-fn hardFallbackBudget(item_count: usize) usize {
-    return @min(item_count, hard_fallback_admissions);
-}
 
 fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-
-    var fixture = try createFixture(allocator, item_count, workload);
-    defer fixture.deinit();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-
-    const grid_side = fixtureGridSide(item_count, workload);
-    const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
-
-    // Build the thread system first so the pathfinding A* scratch is sized for the
-    // real participant count (workers + 1) during the nav build, not lazily.
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var fixture = try initRequestFixture(allocator, io, workload, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
+    defer fixture.deinit();
+    const system = &fixture.system;
+    setPathStageTuners(system, case);
 
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 8,
-        .worker_participant_count = participant_count,
-        // Elastic capacity grows to the benchmark item count; the per-step solve and
-        // fallback budgets are still applied via the config each runColdOnce.
-        .max_agent_budget = @max(item_count, 1),
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
+    system.clearRuntimeState();
+    _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
+    if (mode == .hot_cache) try warmHotCache(system, &fixture.requests, thread_ptr, options, case, item_count);
 
-    resetPathState(&system, .drop_fields);
-    _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
-    if (mode == .hot_cache) try warmHotCache(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, options, case, item_count);
-
-    // Cold modes re-solve the full per-frame ceiling every frame, so they use the tighter cold
-    // measurement budget; the hot_cache mode is a cheap probe and keeps the full suite budget.
     const warmup_count = if (mode.isCold()) coldWarmup(options) else options.warmup_iterations;
     const measure_count = if (mode.isCold()) coldIterations(options) else options.iterations;
     for (0..warmup_count) |_| {
-        if (mode.isCold()) resetPathState(&system, .drop_fields);
-        _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+        if (mode.isCold()) system.clearRuntimeState();
+        _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
     }
     if (case.adaptive and mode.isCold()) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
         while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            resetPathState(&system, .drop_fields);
-            _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+            system.clearRuntimeState();
+            _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
         }
     }
     const settled_before_measurement = if (case.adaptive) system.tuners.solve.isSettled() else false;
@@ -865,110 +887,70 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
     for (0..measure_count) |_| {
-        if (mode.isCold()) resetPathState(&system, .drop_fields);
+        if (mode.isCold()) system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+        last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
         stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
     stage_report.print(options, group_name, item_count, case);
+    // Every route exists and starts open.
+    if (last_stats.unavailable_results != 0) return error.RouteUnavailable;
 
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results;
+    stats.output_count = last_stats.available_results;
     stats.deferred_count = last_stats.pending_requests;
     stats.fallback_deferred_count = last_stats.admission_deferred_requests;
     stats.cache_evictions = last_stats.cache_evictions;
-
-    // Throughput must reflect items actually serviced this step, not the requested count.
-    // Cold solves are capped at the per-frame amortization ceiling, so a 4096-request row
-    // only performs min(4096, ceiling) solves and defers the rest to later frames; counting
-    // all 4096 would inflate the curve to look like the solver scales past the cap when its
-    // real per-step work is flat at the ceiling. The serviced count is mode-specific: cache
-    // hits (or reach answers) when warm, fallback A* solves when cold-fallback,
-    // abstract+fallback solves when cold-solve. All three equal item_count when nothing is
-    // deferred, so honest rows match.
+    // Throughput counts what the step serviced: cache hits when warm, admissions when cold
+    // at the admission window, published results when cold; the per-step ceiling defers the
+    // rest.
     const serviced: usize = switch (mode) {
-        .hot_cache => last_stats.cache_hits + last_stats.unavailable_results,
+        .hot_cache => last_stats.cache_hits,
         .cold_fallback => last_stats.solve_admissions,
-        .cold_solve => stats.output_count,
+        .cold_solve => last_stats.available_results,
     };
     stats.candidate_pairs = serviced;
-    // Pin the "no silent cap drift" invariant: per-frame solves never exceed the ceiling.
-    // cold-fallback counts fallback ATTEMPTS (slots filled), which is exactly the fallback
-    // budget clamped to the ceiling. cold-solve counts SUCCESSES (results published); a long
-    // open-grid path may exhaust the node budget and defer to a later frame, so its serviced
-    // count is bounded by — not always equal to — the solve budget clamped to the ceiling.
     switch (mode) {
-        .hot_cache => {},
-        .cold_fallback => std.debug.assert(serviced == @min(item_count, @min(fallback_budget, default_max_solves_per_frame))),
-        .cold_solve => std.debug.assert(serviced <= @min(item_count, @min(solve_budget, default_max_solves_per_frame))),
+        .hot_cache => if (serviced != item_count) return error.HotCacheMissed,
+        .cold_fallback => if (serviced != @min(item_count, fallback_budget, default_max_solves_per_frame)) return error.FallbackAdmissionsDrifted,
+        // A solve may exhaust its budget and defer, so results are bounded by the ceiling.
+        .cold_solve => if (serviced > @min(item_count, solve_budget, default_max_solves_per_frame)) return error.SolvesPastCeiling,
     }
-    if (stats.mean_ns != 0) {
-        stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
-    }
+    stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
     if (case.adaptive and mode.isCold()) {
         stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled_before_measurement);
     }
     return stats;
 }
 
-// Multi-frame amortized drain: submits N >> 512 distinct goals once per cycle, then steps
-// successive frames over an EMPTY request stream WITHOUT clearing, so `pending` carries the
-// remainder and drains at the per-frame ceiling. Each timed sample is one drain frame, so the
-// mean reflects steady carry-over cost (flat ~ceiling solves) rather than the one-time accept.
-pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+// A drain step: the queue accepted untimed (`refillDrainQueue`), each timed step solving the
+// carried queue's front at the per-step ceiling over an empty stream.
+fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    if (item_count <= default_max_solves_per_frame) {
-        return suite.RunStats.skipped("count at or below the per-frame ceiling; nothing to drain");
-    }
-
-    var fixture = try createFixture(allocator, item_count, .unique_open);
-    defer fixture.deinit();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-
-    const grid_side = fixtureGridSide(item_count, .unique_open);
-    const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
-
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    // The refill step solves one ceiling; a full-ceiling drain step needs another behind it.
+    if (item_count < 2 * default_max_solves_per_frame) return error.DrainQueueBelowTwoCeilings;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 8,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = @max(item_count, 1),
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
-
-    // Drain frames step over an empty stream so no new request is accepted; only the carried
-    // pending queue is solved, isolating steady drain cost from the one-time accept.
+    var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
+    defer fixture.deinit();
+    const system = &fixture.system;
+    setPathStageTuners(system, case);
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
 
-    // Bounds one cycle's drain frames so a stalled queue (a request that never resolves)
-    // can never hang the loop; ceil(N/ceiling) frames empty a healthy queue, plus slack.
-    const drain_frame_budget = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
-
-    // Drain is cold (each cycle re-solves ceil(N/ceiling) frames), so use the cold budget.
+    // A healthy queue empties in ceil(N / ceiling) steps; past that a cycle stops.
+    const drain_step_limit = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
     const drain_samples = coldIterations(options);
-    // Warmup: a couple of full drain cycles so pools are at high-water and the tuner trains.
     for (0..@max(@as(usize, 1), coldWarmup(options))) |_| {
-        try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
-        var guard: usize = drain_frame_budget;
+        try refillDrainQueue(system, &fixture.requests, thread_ptr, case, item_count);
+        var guard: usize = drain_step_limit;
         while (system.pending.len > 0 and guard > 0) : (guard -= 1) {
             const before = system.pending.len;
-            _ = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
-            if (system.pending.len >= before) break; // no progress: stop draining this cycle
+            _ = try runColdOnce(system, &empty, thread_ptr, case, item_count, item_count, item_count);
+            if (system.pending.len >= before) return error.DrainStalled;
         }
     }
 
@@ -976,18 +958,17 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
     while (accumulator.iterations < drain_samples) {
-        // Refill is untimed: clears completed/pending then accepts all N (this frame also
-        // solves the first ceiling). The timed samples below are pure drain frames.
-        try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
-        var guard: usize = drain_frame_budget;
-        while (system.pending.len > 0 and accumulator.iterations < drain_samples and guard > 0) : (guard -= 1) {
+        try refillDrainQueue(system, &fixture.requests, thread_ptr, case, item_count);
+        var guard: usize = drain_step_limit;
+        // Only full-ceiling steps are drain samples: the queue's tail step solves fewer.
+        while (system.pending.len >= default_max_solves_per_frame and accumulator.iterations < drain_samples and guard > 0) : (guard -= 1) {
             const before = system.pending.len;
             const start_ns = suite.nowNs(io);
-            last_stats = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
+            last_stats = try runColdOnce(system, &empty, thread_ptr, case, item_count, item_count, item_count);
             const end_ns = suite.nowNs(io);
             accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
             stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
-            if (system.pending.len >= before) break; // no progress: refill next cycle
+            if (system.pending.len >= before) return error.DrainStalled;
         }
     }
     stage_report.print(options, drain_group.name, item_count, case);
@@ -996,29 +977,20 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
     stats.candidate_pairs = last_stats.solved_requests;
     stats.deferred_count = last_stats.pending_requests;
-    // Steady per-frame solver throughput: solves serviced in a drain frame, which stays flat
-    // at the ceiling regardless of how deep the carried queue is — that flat per-frame solve
-    // count while `pending` drains is the amortization (per-frame wall cost tracks grid size,
-    // not queue depth).
-    if (stats.mean_ns != 0) {
-        stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
-    }
-    if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), false);
-    }
+    stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), false);
     return stats;
 }
 
-// Resets the result/pending state and accepts all N distinct goals in one frame, so the next
-// frames drain the carried remainder. The accept frame itself solves the first ceiling.
+// Clears the runtime state and accepts every distinct goal in one step, which also solves
+// the first ceiling; the queue carries the rest.
 fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
-    resetPathState(system, .keep_fields);
+    system.clearRuntimeState();
     _ = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
 }
 
-// Steps until every request is answered without a solve (a cache hit, or unavailable from
-// reach) and, for an adaptive case, the intake tuner has settled (bounded), so the timed
-// steps are the answer path only.
+// Steps until every request is a cache hit and, for an adaptive case, the intake tuner has
+// settled (bounded), so the timed steps are the hit path only.
 fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !void {
     const fill_limit = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
     const settle_limit = fill_limit + suite.adaptiveSettleIterationLimit(options);
@@ -1026,7 +998,7 @@ fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathReq
     while (true) {
         const stats = try runColdOnce(system, requests, thread_system, case, item_count, item_count, item_count);
         steps += 1;
-        const all_hits = stats.cache_hits + stats.unavailable_results == item_count;
+        const all_hits = stats.cache_hits == item_count;
         if (!all_hits and steps > fill_limit) return error.HotCacheNotWarm;
         const tuner_ready = !case.adaptive or system.tuners.intake.isSettled() or steps >= settle_limit;
         if (all_hits and tuner_ready) return;
@@ -1061,55 +1033,6 @@ fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) voi
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.resize_copy = tuner;
     if (suite.adaptiveTunerForCase(case, goal_scan_range_alignment_items)) |tuner| system.tuners.goal_scan = tuner;
     if (suite.adaptiveTunerForCase(case, goal_project_range_alignment_items)) |tuner| system.tuners.goal_project = tuner;
-}
-
-// Cold-iteration fixture reset: the private `PathfindingSystem.clearRuntimeState` done from
-// outside (the production API has no reset), keeping the graph, the reserved pools, and the
-// tuners; `.keep_fields` also keeps the group fields. A fresh system per reset would rebuild
-// nav over the fixture's level (up to 2048^2 cells per cold iteration), retrain no tuner, and
-// lose the fields a `.keep_fields` case measures against. Asserts the result equals a fresh
-// system's runtime state, so a table `clearRuntimeState` gains and this misses fails loudly.
-fn resetPathState(system: *PathfindingSystem, fields: enum { keep_fields, drop_fields }) void {
-    system.completed.clear();
-    for (&system.path_index) |*shard| shard.clear();
-    system.publish_ranges = 0;
-    // std.Deque has no clear.
-    system.pending.head = 0;
-    system.pending.len = 0;
-    system.pending_keys.clear();
-    system.solve_results.clearRetainingCapacity();
-    system.solve_indices.clearRetainingCapacity();
-    system.solve_tier1_slot.clearRetainingCapacity();
-    system.solved_paths.clearRetainingCapacity();
-    system.group_requests.clearRetainingCapacity();
-    system.group_key_map.clear();
-    if (fields == .drop_fields) {
-        for (system.group_fields.items) |*field| field.state = .empty;
-        system.group_field_keys.clear();
-    }
-    assertFreshRuntimeState(system, fields == .keep_fields);
-}
-
-// Every runtime table of `system` holds what a freshly constructed system's does (its group
-// fields aside when `kept_fields`).
-fn assertFreshRuntimeState(system: *const PathfindingSystem, kept_fields: bool) void {
-    var fresh = PathfindingSystem.init(system.allocator);
-    defer fresh.deinit();
-    std.debug.assert(system.completed.count() == fresh.completed.count());
-    std.debug.assert(system.completed.core.ownerLog().len == fresh.completed.core.ownerLog().len);
-    for (&system.path_index, &fresh.path_index) |*shard, *fresh_shard| std.debug.assert(shard.live_keys == fresh_shard.live_keys);
-    std.debug.assert(system.publish_ranges == fresh.publish_ranges);
-    std.debug.assert(system.pending.len == fresh.pending.len);
-    std.debug.assert(system.pending_keys.table.len == fresh.pending_keys.table.len);
-    std.debug.assert(system.solve_results.items.len == fresh.solve_results.items.len);
-    std.debug.assert(system.solve_indices.items.len == fresh.solve_indices.items.len);
-    std.debug.assert(system.solve_tier1_slot.items.len == fresh.solve_tier1_slot.items.len);
-    std.debug.assert(system.solved_paths.items.len == fresh.solved_paths.items.len);
-    std.debug.assert(system.group_requests.items.len == fresh.group_requests.items.len);
-    std.debug.assert(system.group_key_map.table.len == fresh.group_key_map.table.len);
-    if (kept_fields) return;
-    for (system.group_fields.items) |field| std.debug.assert(field.state == .empty);
-    std.debug.assert(system.group_field_keys.table.len == fresh.group_field_keys.table.len);
 }
 
 // The case's goal resolve over `intents`, as the pipeline's `path_goal_resolve` stage.
@@ -1149,11 +1072,8 @@ const StageReport = struct {
     solve_main_ns: u128 = 0,
     publish_ns: u128 = 0,
     // Intake, group-field advance, group-field begin, solve, publish copy, registry flush,
-    // resize copy: each stage's busiest batch, and how many of its non-empty batches ran on
-    // workers.
-    busiest: [update_stage_count]BatchStats = @splat(.{}),
-    threaded: [update_stage_count]usize = @splat(0),
-    dispatched: [update_stage_count]usize = @splat(0),
+    // resize copy.
+    shapes: suite.StageShapes(update_stage_count) = .{},
     // Route groups that count unsolved routes: the last timed step's outcome.
     routes: ?RouteOutcome = null,
     // Path-registry entries the timed updates added and removed.
@@ -1176,24 +1096,14 @@ const StageReport = struct {
         self.registrations_removed += stats.registrations_removed;
         self.unavailable += stats.unavailable_results;
         self.goal_fallbacks += stats.goal_fallbacks;
-        for (updateBatches(stats), &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
-            if (batch.item_count == 0) continue;
-            dispatched.* += 1;
-            const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
-            if (on_workers) threaded.* += 1;
-            const busier = batch.item_count > busiest.item_count or
-                (batch.item_count == busiest.item_count and on_workers and (busiest.ran_inline or busiest.active_worker_threads == 0));
-            if (busier) busiest.* = batch;
-        }
+        self.shapes.add(updateBatches(stats));
     }
 
     fn print(self: StageReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.timed_ns == 0) return;
-        var shapes: [update_stage_count][48]u8 = undefined;
+        var buffers: [update_stage_count][48]u8 = undefined;
         var labels: [update_stage_count][]const u8 = undefined;
-        for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
-            label.* = stageShape(buffer, batch, threaded, dispatched);
-        }
+        for (&buffers, &labels, 0..) |*buffer, *label, index| label.* = self.shapes.label(index, buffer);
         const samples: u128 = self.samples * std.time.ns_per_us;
         std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
             group_name,
@@ -1225,24 +1135,15 @@ const StageReport = struct {
     }
 };
 
-// A stage's busiest batch as `inline` or workers/ranges, with its item count, then
-// threaded/non-empty batch counts.
-fn stageShape(buffer: []u8, batch: BatchStats, threaded: usize, dispatched: usize) []const u8 {
-    if (batch.ran_inline or batch.active_worker_threads == 0) {
-        return std.fmt.bufPrint(buffer, "inline({})[{}/{}]", .{ batch.item_count, threaded, dispatched }) catch "inline";
-    }
-    return std.fmt.bufPrint(buffer, "{}w/{}r({})[{}/{}]", .{ batch.active_worker_threads, batch.range_count, batch.item_count, threaded, dispatched }) catch "stage";
-}
-
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(pathfinding_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, pathfinding_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, pathfinding_range_alignment_items);
 }
 
 const QueryContext = struct {
     system: *const PathfindingSystem,
-    // Per-agent query inputs, all indexed by agent. starts[i] is the agent's CURRENT cell
+    // Per-agent query inputs, all indexed by agent. starts[i] is the agent's current cell
     // (mid-route), goals[i] its goal. hints[i] is its private waypoint hint (disjoint write
     // per worker). sink[i] consumes the returned status so the query is not elided.
     starts: []const math.Vec2,
@@ -1254,6 +1155,7 @@ const QueryContext = struct {
 fn queryJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     _ = worker_id;
     const ctx: *QueryContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.end <= ctx.hints.len and range.end <= ctx.sink.len);
     for (range.start..range.end) |i| {
         const view = ctx.system.statusForWorld(0, ctx.starts[i], 0, ctx.goals[i], .default, &ctx.hints[i]);
         ctx.sink[i] = @backingInt(view.status);
@@ -1273,47 +1175,20 @@ fn runQueries(ctx: *QueryContext, thread_system: ?*ThreadSystem, case: suite.Ben
     return inlineBatch(item_count, pathfinding_range_alignment_items);
 }
 
-// Per-agent statusForWorld against a warm cache: isolates the result-cache probe and the
-// per-step waypoint derivation (the crowd path-following lookup). Agents are queried from
-// the MIDPOINT of their own cached path so the waypoint scan has a deep match to find —
-// exactly the cost the per-agent hint optimizes.
-pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+// Per-agent statusForWorld against a warm cache: each agent queries from the midpoint of
+// its own cached path, so the waypoint scan has a deep match to find.
+fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-
-    var fixture = try createFixture(allocator, item_count, .unique_open);
-    defer fixture.deinit();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-
-    const grid_side = fixtureGridSide(item_count, .unique_open);
-    const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
-
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
+    defer fixture.deinit();
+    const system = &fixture.system;
 
-    try system.reserve(.{
-        .max_group_fields = 8,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = @max(item_count, 1),
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
-
-    // Warm the cache: solve every agent's path. Solves are capped per frame at
-    // default_max_solves_per_frame, so run enough frames to drain the queue (re-submitted
-    // already-cached requests are cheap no-ops). Derived from the real ceiling (not a
-    // hand-picked constant) so a lowered ceiling still warms fully instead of silently
-    // leaving this a partial-miss bench mislabeled as warm-cache.
-    const warm_frames = item_count / default_max_solves_per_frame + 4;
-    for (0..warm_frames) |_| {
-        _ = try system.updateSerial(&fixture.requests, item_count, .{});
-    }
+    // Warm: the per-step solve ceiling caps each step, so enough steps drain the queue.
+    const warm_steps = item_count / default_max_solves_per_frame + 4;
+    for (0..warm_steps) |_| _ = try system.updateSerial(&fixture.requests, item_count, .{});
 
     const starts = try allocator.alloc(math.Vec2, item_count);
     defer allocator.free(starts);
@@ -1329,580 +1204,345 @@ pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     const grid = system.graph.grid(0).?;
     var warm_paths: usize = 0;
     for (0..item_count) |i| {
-        const goal_cell = requestGoalCell(i, grid_side, .unique_open);
-        const goal_world = math.Vec2{ .x = @as(f32, @floatFromInt(goal_cell.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(goal_cell.y)) * 32.0 + 8.0 };
-        goals[i] = goal_world;
-        // Default query position: the agent's own start cell (front of the path).
-        const start_cell = requestStartCell(i, grid_side, .unique_open);
-        starts[i] = .{ .x = @as(f32, @floatFromInt(start_cell.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(start_cell.y)) * 32.0 + 8.0 };
-        // If the path is cached, move the query position to its midpoint so the waypoint
-        // derivation must locate a deep cell (the hint's target case).
-        if (system.graph.keyForWorld(0, goal_world, .default)) |key| {
-            if (system.completed.slotIndex(key)) |slot| {
-                // A cross-chunk route is cached as its stitched corridor (one level here).
-                const result = system.completed.resultAt(slot);
-                if (result.stitched_len != 0) {
-                    const stitched = system.completed.stitchedSlice(slot, result.stitched_len);
-                    starts[i] = grid.cellCenter(stitched.cells[stitched.len() / 2]);
-                    warm_paths += 1;
-                } else {
-                    const path = system.completed.pathSlice(slot, result.path_len);
-                    if (path.len > 0) {
-                        starts[i] = grid.cellCenter(path[path.len / 2]);
-                        warm_paths += 1;
-                    }
-                }
-            }
+        const route = Workload.unique_open.route(i);
+        goals[i] = fixture.open.cellCenter(route.goal);
+        starts[i] = fixture.open.cellCenter(route.start);
+        const key = system.graph.keyForWorld(0, goals[i], .default) orelse continue;
+        const slot = system.completed.slotIndex(key) orelse continue;
+        // A cross-chunk route is cached as its stitched corridor (one level here).
+        const result = system.completed.resultAt(slot);
+        if (result.stitched_len != 0) {
+            const stitched = system.completed.stitchedSlice(slot, result.stitched_len);
+            starts[i] = grid.cellCenter(stitched.cells[stitched.len() / 2]);
+            warm_paths += 1;
+        } else {
+            const path = system.completed.pathSlice(slot, result.path_len);
+            if (path.len == 0) continue;
+            starts[i] = grid.cellCenter(path[path.len / 2]);
+            warm_paths += 1;
         }
     }
+    // Every agent's path must be resident, or this times the miss path.
+    if (warm_paths != item_count) return error.QueryCacheNotWarm;
 
-    // Every agent's path must be resident before the timed loop, or this silently measures
-    // the cache-miss path while labeled a warm-cache bench (see the group-field cases'
-    // analogous group_field_samples assert).
-    std.debug.assert(warm_paths == item_count);
-
-    var context = QueryContext{ .system = &system, .starts = starts, .goals = goals, .hints = hints, .sink = sink };
-
+    var context = QueryContext{ .system = system, .starts = starts, .goals = goals, .hints = hints, .sink = sink };
     // Warmup also settles each agent's hint to its midpoint index.
-    for (0..options.warmup_iterations) |_| {
-        _ = runQueries(&context, if (threads) |*thread_system| thread_system else null, case, item_count);
-    }
+    for (0..options.warmup_iterations) |_| _ = runQueries(&context, thread_ptr, case, item_count);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runQueries(&context, if (threads) |*thread_system| thread_system else null, case, item_count);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
+        const batch = runQueries(&context, thread_ptr, case, item_count);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), batch);
     }
-
     var stats = accumulator.finish();
     stats.output_count = item_count;
-    stats.candidate_pairs = warm_paths; // agents served from a warm cached path
+    stats.candidate_pairs = warm_paths;
     return stats;
 }
 
-// Builds the single-agent, single-request large-obstacle-detour fixture: a full-height
-// wall at the grid's horizontal midline with ONE gap near the TOP edge, and the
-// start/goal pair placed near the BOTTOM edge on either side of the wall — the longest
-// possible detour on a `side`-cell-square grid (see escalated_detour_group).
-fn createEscalatedDetourFixture(allocator: std.mem.Allocator, side: usize) !Fixture {
-    var data = DataSystem.init(allocator);
-    errdefer data.deinit();
-    var requests = RangeOutputStream(PathRequest).init(allocator);
-    errdefer requests.deinit();
-    try requests.reserve(1, 1);
-
-    const wall_x = side / 2;
-    const gap_y: usize = 1;
+// The escalated detour level: a full-height wall down the middle open only at row 1, one
+// request from beside the wall's foot to its mirror across it.
+fn detourWallCells(allocator: std.mem.Allocator, side: u16) ![]CellCoord {
+    const cells = try allocator.alloc(CellCoord, side - 1);
+    var len: usize = 0;
     for (0..side) |y| {
-        if (y == gap_y) continue;
-        _ = try addEntity(&data, .{
-            .x = @as(f32, @floatFromInt(wall_x)) * 32.0,
-            .y = @as(f32, @floatFromInt(y)) * 32.0,
-        }, true);
+        if (y == 1) continue;
+        cells[len] = .{ .x = side / 2, .y = @intCast(y) };
+        len += 1;
     }
-    const far_y = side - 2;
-    const entity = try addEntity(&data, .{
-        .x = 2.0 * 32.0,
-        .y = @as(f32, @floatFromInt(far_y)) * 32.0,
-    }, false);
-    try appendRequest(&requests, .{
-        .entity = entity,
-        .start = .{ .x = 2.0 * 32.0 + 8.0, .y = @as(f32, @floatFromInt(far_y)) * 32.0 + 8.0 },
-        .goal = .{ .x = @as(f32, @floatFromInt(side - 2)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(far_y)) * 32.0 + 8.0 },
-    });
-
-    return .{ .data = data, .requests = requests };
+    return cells;
 }
 
-// Measures the COLD ESCALATED (tier-1) solve only: an unmeasured setup step submits the
-// request and lets the forced-tiny tier-0 attempt cap exhaust (promoting the request to
-// tier 1, per compactPendingAfterSolve), then the timed step re-solves the SAME
-// now-tier-1 request against the fixed tier-1 budget. See escalated_detour_group.
-pub fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+// A world-backed level of `side` cells holding the detour wall.
+fn buildDetourWorld(allocator: std.mem.Allocator, io: std.Io, side: u16) !OpenWorld {
+    var open = try buildOpenWorld(allocator, io, side, 1);
+    errdefer open.world.deinit();
+    const wall = try detourWallCells(allocator, side);
+    defer allocator.free(wall);
+    try writeLevelZeroCells(&open, wall, open.blocking);
+    return open;
+}
+
+// Times the cold escalated solve only: an untimed step submits the request and exhausts the
+// one-node first attempt, promoting it; the timed step solves it at the tier-1 budget.
+fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side = item_count;
-
-    var fixture = try createEscalatedDetourFixture(allocator, side);
-    defer fixture.deinit();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-
-    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    const side = std.math.cast(u16, item_count) orelse return error.EscalatedDetourSideTooWide;
+    if (side % default_chunk_size_tiles != 0 or side < 4 * default_chunk_size_tiles) return error.EscalatedDetourSideNotChunked;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-
-    try system.reserve(PathfindingCapacity{
+    const open = try buildDetourWorld(allocator, io, side);
+    var request = [_]PathRequest{.{
+        .entity = undefined,
+        .start = open.cellCenter(.{ .x = 2, .y = side - 2 }),
+        .goal = open.cellCenter(.{ .x = side - 2, .y = side - 2 }),
+    }};
+    var fixture = try initRouteFixture(allocator, open, &request, .{
+        .worker_participant_count = fixtures.participantCount(thread_ptr),
+        .max_agent_budget = min_capacity_floor,
         .max_group_fields = 1,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = 8,
-        // Deliberately tiny so the FIRST (tier-0) attempt exhausts regardless of grid
-        // size, exercising the real promote-to-tier-1 path against the fixed tier-1
-        // budget (see the group doc comment). Must stay below the fewest abstract-graph
-        // hops any such detour could need — the nav records hold one border portal per
-        // open boundary run per side, so the graph is far
-        // sparser than a per-cell scheme and a merely-small cap (64) is no longer
-        // guaranteed to exhaust; 1 is the true floor, matching the same pattern already
-        // used to force guaranteed tier-0 exhaustion in system.zig's own tests.
+        // One node: the first attempt exhausts at every side, so the request promotes.
         .tier0_abstract_node_cap = 1,
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
-
+    }, thread_ptr);
+    defer fixture.deinit();
+    const system = &fixture.system;
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
 
-    // One tier-0 setup step per sample: submits the request (or re-submits a dedup no-op
-    // after the first) and exhausts at the tiny tier-0 cap, promoting to tier 1.
-    const promoteToTier1 = struct {
-        fn run(sys: *PathfindingSystem, fixture_requests: *RangeOutputStream(PathRequest), threads_ptr: ?*ThreadSystem, bench_case: suite.BenchmarkCase) !void {
-            resetPathState(sys, .drop_fields);
-            const setup_stats = try runColdOnce(sys, fixture_requests, threads_ptr, bench_case, 1, 1, 1);
-            std.debug.assert(setup_stats.budget_exhausted == 1);
-            std.debug.assert(sys.pending.len == 1);
-            std.debug.assert(sys.pending.at(0).tier == 1);
-        }
-    }.run;
-
     for (0..coldWarmup(options)) |_| {
-        try promoteToTier1(&system, &fixture.requests, thread_ptr, case);
-        _ = try runColdOnce(&system, &empty, thread_ptr, case, 1, 1, 1);
+        try promoteDetour(system, &fixture.requests, thread_ptr, case);
+        _ = try runColdOnce(system, &empty, thread_ptr, case, 1, 1, 1);
     }
-
-    var accumulator = suite.StatsAccumulator.init(1);
+    var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     for (0..coldIterations(options)) |_| {
-        try promoteToTier1(&system, &fixture.requests, thread_ptr, case);
+        try promoteDetour(system, &fixture.requests, thread_ptr, case);
         const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &empty, thread_ptr, case, 1, 1, 1);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
+        last_stats = try runColdOnce(system, &empty, thread_ptr, case, 1, 1, 1);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
     }
-
-    // The fixed tier-1 budget resolves this grid size's detour; a second
-    // budget_exhausted would drop it to `.missing`, which this bench does not measure.
-    std.debug.assert(last_stats.available_results == 1);
-
+    // The fixed tier-1 budget solves the detour; a second exhaustion would drop it.
+    if (last_stats.available_results != 1 or last_stats.escalated_solves != 1) return error.EscalatedDetourUnsolved;
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results;
-    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
+    stats.output_count = last_stats.available_results;
+    stats.candidate_pairs = last_stats.solved_requests;
+    stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     return stats;
 }
 
-// Pursuit-pack shared-goal fixture: the same full-height-wall-with-one-gap shape as
-// createEscalatedDetourFixture (the longest detour on a `side`-cell-square grid), but
-// with `agent_count` agents spread along the near-side bottom rows, all declaring
-// `.group` for the SAME goal cell across the gap — the water-adjacent chase-pack
-// shape from the FPS-drop bug, shaped so the shared-goal flow field can engage.
-fn createGroupFieldDetourFixture(allocator: std.mem.Allocator, side: usize, agent_count: usize) !Fixture {
-    var data = DataSystem.init(allocator);
-    errdefer data.deinit();
-    var requests = RangeOutputStream(PathRequest).init(allocator);
-    errdefer requests.deinit();
-    try requests.reserve(suite.rangeCount(agent_count, suite.default_items_per_range), agent_count);
-
-    const wall_x = side / 2;
-    const gap_y: usize = 1;
-    for (0..side) |y| {
-        if (y == gap_y) continue;
-        _ = try addEntity(&data, .{
-            .x = @as(f32, @floatFromInt(wall_x)) * 32.0,
-            .y = @as(f32, @floatFromInt(y)) * 32.0,
-        }, true);
-    }
-
-    const far_y = side - 2;
-    const goal = math.Vec2{
-        .x = @as(f32, @floatFromInt(side - 2)) * 32.0 + 8.0,
-        .y = @as(f32, @floatFromInt(far_y)) * 32.0 + 8.0,
-    };
-    const lane_width = @max(@as(usize, 1), wall_x - 2);
-    for (0..agent_count) |index| {
-        const start_x = 2 + index % lane_width;
-        const start_y = far_y -| (index / lane_width) * 3;
-        const entity = try addEntity(&data, .{
-            .x = @as(f32, @floatFromInt(start_x)) * 32.0,
-            .y = @as(f32, @floatFromInt(start_y)) * 32.0,
-        }, false);
-        try appendRequest(&requests, .{
-            .entity = entity,
-            .kind = .group,
-            .start = .{
-                .x = @as(f32, @floatFromInt(start_x)) * 32.0 + 8.0,
-                .y = @as(f32, @floatFromInt(start_y)) * 32.0 + 8.0,
-            },
-            .goal = goal,
-        });
-    }
-
-    return .{ .data = data, .requests = requests };
+// The untimed setup step: submits the request on cleared state and exhausts its first
+// attempt, leaving it pending at tier 1.
+fn promoteDetour(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !void {
+    system.clearRuntimeState();
+    const stats = try runColdOnce(system, requests, thread_system, case, 1, 1, 1);
+    if (stats.budget_exhausted != 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.EscalatedDetourNotPromoted;
 }
 
-// Measures the STEADY-STATE cost of a demo-scale pursuit pack (all sharing one goal
-// across a large obstacle) once the managed flow field is ready: an untimed setup
-// phase resubmits the same pack every step (mirroring AI movers re-requesting every
-// tick) until every agent is answered via a field sample, then the timed phase keeps
-// resubmitting the SAME pack. See group_field_detour_group's doc comment.
-pub fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side = group_field_detour_grid_side;
+// The group-field detour level side: a whole-level field builds within the rebuild throttle
+// at the default build budget, so a re-keyed field is ready before the next rekey.
+const group_field_detour_side: u16 = std.math.sqrt(default_group_field_build_budget * group_field_detour_rebuild_min_steps);
+// Untimed setup: steps spent waiting for the field to build, a guard against a stalled build.
+const group_field_detour_setup_guard: usize = 64;
+// Agents a group field engages for: a fixed threshold below every pack size.
+const group_field_detour_threshold: usize = 8;
+// Fastest re-key cadence: a goal moving at 120 px/s crosses a 32 px nav cell every 16 steps
+// at 60 Hz.
+const group_field_detour_rekey_period_steps: usize = 16;
+// The rebuild throttle, below the rekey cadence, so a field rebuilt for a new goal is
+// sampled before the goal moves again.
+const group_field_detour_rebuild_min_steps: u32 = 8;
+// Rekey cycles run untimed before measuring, and measured.
+const group_field_detour_moving_warmup_cycles: usize = 2;
+const group_field_detour_moving_cycles: usize = 6;
 
-    var fixture = try createGroupFieldDetourFixture(allocator, side, item_count);
-    defer fixture.deinit();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-
-    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 4,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = @max(item_count, 1),
-        // Fixed low so a small item_count still exercises the field mechanism directly —
-        // this bench's own standalone override, decoupled from whatever population the
-        // demo currently pins (see game_demo_state.proceduralPathfindingCapacity's doc
-        // comment: production now reserves the field for battle-scale, not this pack
-        // size). --items overrides item_count for a direct at-scale check (verified up
-        // to 5000 agents at ~2.76ms mean, comfortably inside a 6ms frame budget).
-        .min_group_field_agents = 8,
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
-
-    // Untimed setup: keep resubmitting the shared-goal pack until the field is ready
-    // and answering every agent by sampling, bounded by a fixed loop-safety guard.
-    var last_stats = PathfindingStats{};
-    var guard: usize = group_field_detour_setup_guard;
-    while (guard > 0 and last_stats.group_field_samples < item_count) : (guard -= 1) {
-        last_stats = try runColdOnce(&system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-    }
-    std.debug.assert(last_stats.group_field_samples == item_count);
-
-    for (0..options.warmup_iterations) |_| {
-        _ = try runColdOnce(&system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-    }
-
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    var stage_report = StageReport{};
-    for (0..options.iterations) |_| {
-        const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
-        stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
-    }
-    stage_report.print(options, group_field_detour_group.name, item_count, case);
-
-    // Regression guard: once ready, the pinned threshold keeps the field engaged —
-    // every step samples it, none fall back to a per-agent A* re-solve.
-    std.debug.assert(last_stats.group_fields_built == 0);
-    std.debug.assert(last_stats.group_field_samples == item_count);
-
-    var stats = accumulator.finish();
-    stats.output_count = last_stats.duplicate_requests;
-    stats.candidate_pairs = last_stats.group_field_samples;
-    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    return stats;
+comptime {
+    std.debug.assert(group_field_detour_rebuild_min_steps < group_field_detour_rekey_period_steps);
+    std.debug.assert(group_field_detour_side % default_chunk_size_tiles == 0);
 }
 
-// Same wall/gap detour and agent lane layout as createGroupFieldDetourFixture, but keeps
-// the raw entities/starts (instead of a pre-baked static-goal request stream) so the case
-// runner can rewrite the shared goal into a NEW nav cell periodically, reproducing the
-// player re-keying the pack's shared goal as it crosses nav cells.
-const MovingFixture = struct {
+// Pack member `index`'s start: lanes left of the detour wall from the level's bottom rows.
+fn packStart(side: u16, index: usize) CellCoord {
+    const lane_width: usize = side / 2 - 2;
+    return .{ .x = @intCast(2 + index % lane_width), .y = @intCast(side - 2 - (index / lane_width) * 3) };
+}
+
+// The pack's goal for rekey cycle `cycle`: across the wall, marching up one cell a cycle.
+fn packGoal(side: u16, cycle: usize) CellCoord {
+    return .{ .x = side - 2, .y = @intCast(side - 2 - cycle) };
+}
+
+// Rewrites `requests` with every pack member's `.group` request toward `goal`.
+fn writePackRequests(allocator: std.mem.Allocator, stream: *RangeOutputStream(PathRequest), scratch: *std.ArrayList(PathRequest), open: *const OpenWorld, entities: []const EntityId, goal: math.Vec2) !void {
+    scratch.clearRetainingCapacity();
+    try scratch.ensureTotalCapacity(allocator, entities.len);
+    for (entities, 0..) |entity, index| {
+        scratch.appendAssumeCapacity(.{ .entity = entity, .kind = .group, .start = open.cellCenter(packStart(group_field_detour_side, index)), .goal = goal });
+    }
+    try fixtures.writeRequests(stream, scratch.items);
+}
+
+// The pack on the detour level: its entities, request stream, and world-backed nav.
+const PackFixture = struct {
+    open: OpenWorld,
     data: DataSystem,
     entities: []EntityId,
-    starts: []FixtureCell,
+    scratch: std.ArrayList(PathRequest) = .empty,
+    stream: RangeOutputStream(PathRequest),
+    system: PathfindingSystem,
 
-    fn deinit(self: *MovingFixture, allocator: std.mem.Allocator) void {
-        allocator.free(self.starts);
+    fn deinit(self: *PackFixture, allocator: std.mem.Allocator) void {
+        self.system.deinit();
+        self.stream.deinit();
+        self.scratch.deinit(allocator);
         allocator.free(self.entities);
         self.data.deinit();
+        self.open.world.deinit();
         self.* = undefined;
     }
 };
 
-fn createGroupFieldDetourMovingFixture(allocator: std.mem.Allocator, side: usize, agent_count: usize) !MovingFixture {
+fn initPackFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !PackFixture {
+    const side = group_field_detour_side;
+    if (agent_count > (side / 2 - 2) * ((side - 8) / 3)) return error.PackLayoutTooSmall;
+    var open = try buildDetourWorld(allocator, io, side);
+    errdefer open.world.deinit();
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
-
-    const wall_x = side / 2;
-    const gap_y: usize = 1;
-    for (0..side) |y| {
-        if (y == gap_y) continue;
-        _ = try addEntity(&data, .{
-            .x = @as(f32, @floatFromInt(wall_x)) * 32.0,
-            .y = @as(f32, @floatFromInt(y)) * 32.0,
-        }, true);
-    }
-
-    const far_y = side - 2;
-    const lane_width = @max(@as(usize, 1), wall_x - 2);
     const entities = try allocator.alloc(EntityId, agent_count);
     errdefer allocator.free(entities);
-    const starts = try allocator.alloc(FixtureCell, agent_count);
-    errdefer allocator.free(starts);
-    for (0..agent_count) |index| {
-        const start_x = 2 + index % lane_width;
-        const start_y = far_y -| (index / lane_width) * 3;
-        entities[index] = try addEntity(&data, .{
-            .x = @as(f32, @floatFromInt(start_x)) * 32.0,
-            .y = @as(f32, @floatFromInt(start_y)) * 32.0,
-        }, false);
-        starts[index] = .{ .x = start_x, .y = start_y };
-    }
-
-    return .{ .data = data, .entities = entities, .starts = starts };
-}
-
-// Rewrites `requests` with a fresh `.group` request per agent targeting `goal` — what every
-// AI mover actually issues each fixed tick (see src/game/systems/ai.zig). A new goal cell
-// here reproduces one player-crosses-a-nav-cell rekey.
-fn writeGroupFieldDetourRequests(requests: *RangeOutputStream(PathRequest), entities: []const EntityId, starts: []const FixtureCell, goal: math.Vec2) !void {
-    requests.clearRetainingCapacity();
-    try requests.reserve(suite.rangeCount(entities.len, suite.default_items_per_range), entities.len);
-    for (entities, starts) |entity, start| {
-        try appendRequest(requests, .{
-            .entity = entity,
-            .kind = .group,
-            .start = .{
-                .x = @as(f32, @floatFromInt(start.x)) * 32.0 + 8.0,
-                .y = @as(f32, @floatFromInt(start.y)) * 32.0 + 8.0,
-            },
-            .goal = goal,
-        });
-    }
-}
-
-// Fastest realistic re-key cadence: a moving `.group` goal quantizes to a new nav cell
-// every ceil(cell_size / player_speed) fixed steps in the worst case (straight-line
-// crossing). Player speed 120px/s (src/game/player.zig) over a 32px nav cell (types.zig
-// default_cell_size) at 60Hz is 32/120*60 = 16 steps; kept as a literal (not imported —
-// `Player.speed` is a private struct constant) so this bench states its own assumption
-// explicitly. A tuned throttle must rebuild well within this window to matter.
-const group_field_detour_rekey_period_steps: usize = 16;
-// A worst-case full-grid detour (group_field_detour_grid_side^2 cells, per this bench's
-// setup) needs cells/default_group_field_build_budget steps to reach `.ready` — well
-// under the rekey cadence above, so a build reliably finishes and gets resampled before
-// the next rekey supersedes it. This must stay BELOW group_field_detour_rekey_period_steps:
-// a field that finishes only AFTER the goal has already moved again is always ready for an
-// already-stale key, so it can never exact-match the current request and is never sampled
-// (see types.zig's group_field_build_budget doc comment for the budget/throttle pairing
-// this validates). The demo no longer pins its own override at this population (see
-// game_demo_state.proceduralPathfindingCapacity) — this is purely this bench's own
-// standalone exercise of the rebuild-under-motion mechanism.
-const group_field_detour_rebuild_min_steps: u32 = 8;
-// Rekey cycles run untimed before measuring, so the field has engaged past its first
-// (always-immediate, empty-slot) build and any transient has settled.
-const group_field_detour_moving_warmup_cycles: usize = 2;
-// Rekey cycles measured.
-const group_field_detour_moving_cycles: usize = 6;
-
-// Measures a MOVING shared goal at the real chase cadence (group_field_detour_group's static
-// case only proves steady-state sampling once ready; this proves the rebuild throttle
-// actually lets the field catch up to a re-keying goal instead of staying permanently stale).
-// Each cycle rewrites the pack's shared goal to a NEW nav cell it has never targeted before
-// (a strict march, not an oscillation — revisiting an old goal would get served for free by
-// the individual result cache and silently hide a dead field), then steps
-// group_field_detour_rekey_period_steps frames.
-//
-// IMPORTANT: this does NOT prove escalated (tier-1) solves go to zero, and no assertion here
-// claims that. The very FIRST request for a brand-new goal cell can never be answered by the
-// field (acceptRequests and serviceGroupFields run in the same step the goal changes, so the
-// field cannot already be `.ready` for a goal it has not started building), and PathQueryKey
-// dedup already collapses that one solve to a single attempt regardless of the field — so one
-// bounded solve per rekey is an expected, irreducible cost of a moving shared goal, not a
-// regression. What a broken throttle actually breaks is everything AFTER that first solve: with
-// the throttle at or above the real cadence (this bench's tuned group_field_detour_rebuild_min_steps
-// matches types.zig's default_group_field_rebuild_min_steps precisely to stay below it),
-// `ensureGroupField` finds the previous goal's field "stale" every single step but never
-// re-clears the throttle wait, so the field never reaches `.ready` again and group_field_samples
-// stays 0 for the rest of the run (proven by group_field_detour_group's static case going stale
-// forever). A tuned throttle instead lets the field reach `.ready` partway through each cycle
-// and serve the remainder cheaply.
-pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    // Cycle counts are fixed (like group_field_detour_setup_guard's loop-safety bound):
-    // this case simulates a fixed number of real re-key cycles rather than repeating one
-    // op, so --warmup/--iterations do not apply the way they do to the cold single-solve
-    // cases.
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side = group_field_detour_grid_side;
-
-    var fixture = try createGroupFieldDetourMovingFixture(allocator, side, item_count);
-    defer fixture.deinit(allocator);
+    for (entities) |*entity| entity.* = try data.createEntity();
     var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_system);
+    return .{ .open = open, .data = data, .entities = entities, .stream = RangeOutputStream(PathRequest).init(allocator), .system = system };
+}
 
-    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-
-    try system.reserve(PathfindingCapacity{
+fn packCapacity(agent_count: usize, participant_count: usize) PathfindingCapacity {
+    return .{
         .max_group_fields = 4,
         .worker_participant_count = participant_count,
-        .max_agent_budget = @max(item_count, 1),
-        // Mirrors game_demo_state.proceduralPathfindingCapacity's production pins.
-        .min_group_field_agents = 8,
+        .max_agent_budget = @max(agent_count, 1),
+        .min_group_field_agents = group_field_detour_threshold,
         .group_field_rebuild_min_steps = group_field_detour_rebuild_min_steps,
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
+    };
+}
 
-    const far_y = side - 2;
-    var requests = RangeOutputStream(PathRequest).init(allocator);
-    defer requests.deinit();
+// Steady sampling of a ready field: untimed steps build it, then the timed steps resubmit
+// the same pack and every member samples the field.
+fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
+    defer fixture.deinit(allocator);
+    const system = &fixture.system;
+    setPathStageTuners(system, case);
+    try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, fixture.open.cellCenter(packGoal(group_field_detour_side, 0)));
 
-    var escalated_total: usize = 0;
-    var throttled_total: usize = 0;
-    var built_total: usize = 0;
-    var samples_total: usize = 0;
+    var last_stats = PathfindingStats{};
+    var guard: usize = group_field_detour_setup_guard;
+    while (guard > 0 and last_stats.group_field_samples < item_count) : (guard -= 1) {
+        last_stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
+    }
+    if (last_stats.group_field_samples != item_count) return error.GroupFieldNotReady;
+    for (0..options.warmup_iterations) |_| _ = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
+
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};
-
-    const total_cycles = group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles;
-    for (0..total_cycles) |cycle_index| {
-        // Strictly monotonic march along the open (non-wall) column: every cell stays
-        // reachable, and no cycle ever revisits an earlier cycle's exact goal cell, so a
-        // later cycle cannot get a free ride off an already-cached individual result —
-        // every cycle is a genuinely new rekey, like a player walking in one direction.
-        const goal_y = far_y - cycle_index;
-        const goal = math.Vec2{
-            .x = @as(f32, @floatFromInt(side - 2)) * 32.0 + 8.0,
-            .y = @as(f32, @floatFromInt(goal_y)) * 32.0 + 8.0,
-        };
-        try writeGroupFieldDetourRequests(&requests, fixture.entities, fixture.starts, goal);
-        const measured = cycle_index >= group_field_detour_moving_warmup_cycles;
-        for (0..group_field_detour_rekey_period_steps) |_| {
-            const start_ns = suite.nowNs(io);
-            const stats = try runColdOnce(&system, &requests, thread_ptr, case, item_count, item_count, item_count);
-            const end_ns = suite.nowNs(io);
-            if (measured) {
-                accumulator.record(suite.elapsedNs(start_ns, end_ns), stats.solve_batch);
-                stage_report.add(suite.elapsedNs(start_ns, end_ns), stats);
-                escalated_total += stats.escalated_solves;
-                throttled_total += stats.group_field_rebuild_throttled;
-                built_total += stats.group_fields_built;
-                samples_total += stats.group_field_samples;
-            }
-        }
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        last_stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        accumulator.record(elapsed_ns, last_stats.solve_batch);
+        stage_report.add(elapsed_ns, last_stats);
+        // A ready field answers every member: no build, no per-agent solve.
+        if (last_stats.group_fields_built != 0 or last_stats.group_field_samples != item_count) return error.GroupFieldNotSampled;
     }
-    stage_report.print(options, group_field_detour_moving_group.name, item_count, case);
-
-    // Regression guard: the tuned throttle must let the field actually reach `.ready` and
-    // serve part of the run. A regression that leaves the throttle at/above the real cadence
-    // (an earlier default_group_field_rebuild_min_steps of 30 vs this bench's 16-step cadence
-    // is exactly how this was originally found) makes the field permanently stale — this
-    // assert fires with samples_total == 0 in that case.
-    std.debug.assert(samples_total > 0);
-    // Escalated solves are expected (one bounded, dedup'd solve per genuinely new rekey — see
-    // the doc comment above), but must stay bounded at one per cycle, not run away.
-    std.debug.assert(escalated_total <= group_field_detour_moving_cycles);
+    stage_report.print(options, group_field_detour_group.name, item_count, case);
 
     var stats = accumulator.finish();
-    stats.output_count = escalated_total;
-    stats.candidate_pairs = throttled_total;
-    stats.deferred_count = built_total;
-    stats.sample_count = samples_total;
+    stats.output_count = last_stats.duplicate_requests;
+    stats.candidate_pairs = last_stats.group_field_samples;
+    stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
     return stats;
 }
 
-// Same rekey cadence and cycle counts as the zero-hysteresis moving case, but the live
-// goal position advances every SINGLE fixed step (2px/step == 120px/s at 60Hz, the same
-// player speed the moving case's per-cycle jump is derived from) instead of jumping a
-// whole nav cell at the top of each cycle — the granularity a real per-step goal
-// requantization actually sees.
-pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+// The moving groups' measured totals.
+const MovingTotals = struct {
+    escalated: usize = 0,
+    throttled: usize = 0,
+    built: usize = 0,
+    samples: usize = 0,
+
+    fn add(self: *MovingTotals, stats: PathfindingStats) void {
+        self.escalated += stats.escalated_solves;
+        self.throttled += stats.group_field_rebuild_throttled;
+        self.built += stats.group_fields_built;
+        self.samples += stats.group_field_samples;
+    }
+
+    fn into(self: MovingTotals, stats: *suite.RunStats) void {
+        stats.output_count = self.escalated;
+        stats.candidate_pairs = self.throttled;
+        stats.deferred_count = self.built;
+        stats.sample_count = self.samples;
+    }
+};
+
+// A moving shared goal at the chase cadence: each cycle re-keys the pack's goal to a nav cell
+// no earlier cycle targeted (a strict march, so no cycle rides an earlier cached result), then
+// steps the rekey period. The first request for a new goal is always one bounded solve (the
+// field cannot be ready for it yet); the throttle must let the field serve the rest.
+fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    // Fixed cycle counts: --warmup and --iterations do not apply.
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
+    defer fixture.deinit(allocator);
+    const system = &fixture.system;
+    setPathStageTuners(system, case);
+
+    var totals = MovingTotals{};
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
+    for (0..group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) |cycle| {
+        try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, fixture.open.cellCenter(packGoal(group_field_detour_side, cycle)));
+        const measured = cycle >= group_field_detour_moving_warmup_cycles;
+        for (0..group_field_detour_rekey_period_steps) |_| {
+            const start_ns = suite.nowNs(io);
+            const stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
+            const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+            if (!measured) continue;
+            accumulator.record(elapsed_ns, stats.solve_batch);
+            stage_report.add(elapsed_ns, stats);
+            totals.add(stats);
+        }
+    }
+    stage_report.print(options, group_field_detour_moving_group.name, item_count, case);
+    // The throttle lets the field reach ready and serve part of the run; escalated solves stay
+    // at one per rekey.
+    if (totals.samples == 0) return error.GroupFieldNeverSampled;
+    if (totals.escalated > group_field_detour_moving_cycles) return error.GroupFieldEscalationsPastRekeys;
+    var stats = accumulator.finish();
+    totals.into(&stats);
+    return stats;
+}
+
+// The live goal advancing every step at the chase speed (one nav cell per rekey period), the
+// request goal re-keyed only past the AI's requantization hysteresis
+// (`computeRequantizedGoal`, the function `AiSystem.requantizeGoal` wraps).
+fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    // Fixed cycle counts: --warmup and --iterations do not apply.
     _ = options;
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side = group_field_detour_grid_side;
-
-    var fixture = try createGroupFieldDetourMovingFixture(allocator, side, item_count);
-    defer fixture.deinit(allocator);
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-
-    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
+    defer fixture.deinit(allocator);
+    const system = &fixture.system;
+    setPathStageTuners(system, case);
 
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 4,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = @max(item_count, 1),
-        .min_group_field_agents = 8,
-        .group_field_rebuild_min_steps = group_field_detour_rebuild_min_steps,
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
-
-    const far_y = side - 2;
-    var requests = RangeOutputStream(PathRequest).init(allocator);
-    defer requests.deinit();
-
-    var escalated_total: usize = 0;
-    var throttled_total: usize = 0;
-    var built_total: usize = 0;
-    var samples_total: usize = 0;
-    var accumulator = suite.StatsAccumulator.init(item_count);
-
-    const world_x = @as(f32, @floatFromInt(side - 2)) * 32.0 + 8.0;
-    const start_world_y = @as(f32, @floatFromInt(far_y)) * 32.0 + 8.0;
-    const px_per_step: f32 = 32.0 / @as(f32, @floatFromInt(group_field_detour_rekey_period_steps));
-
-    var snapped_goal = math.Vec2{ .x = world_x, .y = start_world_y };
+    const start_goal = fixture.open.cellCenter(packGoal(group_field_detour_side, 0));
+    const px_per_step: f32 = fixture.open.world.tile_size / @as(f32, @floatFromInt(group_field_detour_rekey_period_steps));
+    var snapped_goal = start_goal;
     var snapped_initialized = false;
     var last_written_goal: ?math.Vec2 = null;
-    // Counts actual goal rewrites (post-hysteresis), not raw steps, so the escalation bound
-    // below proves hysteresis is doing its job: without it, a per-step-advancing goal would
-    // rewrite (and escalate) every single step instead of only every real re-key.
+    // Goal rewrites past the hysteresis over the measured steps.
     var rewrite_count: usize = 0;
-
-    const total_cycles = group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles;
-    const total_steps = total_cycles * group_field_detour_rekey_period_steps;
+    const total_steps = (group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) * group_field_detour_rekey_period_steps;
     const warmup_steps = group_field_detour_moving_warmup_cycles * group_field_detour_rekey_period_steps;
-    const measured_steps = total_steps - warmup_steps;
 
+    var totals = MovingTotals{};
+    var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..total_steps) |step_index| {
-        const live = math.Vec2{
-            .x = world_x,
-            .y = start_world_y - @as(f32, @floatFromInt(step_index)) * px_per_step,
-        };
-        // Calls the same pure comparison AiSystem.requantizeGoal wraps, so this bench
-        // can't drift from the real hysteresis algorithm.
+        const live = math.Vec2{ .x = start_goal.x, .y = start_goal.y - @as(f32, @floatFromInt(step_index)) * px_per_step };
         const requantized = computeRequantizedGoal(
             AiDir{ .x = snapped_goal.x, .y = snapped_goal.y },
             snapped_initialized,
@@ -1911,50 +1551,281 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
         );
         snapped_goal = .{ .x = requantized.goal.x, .y = requantized.goal.y };
         snapped_initialized = requantized.initialized;
-
-        if (last_written_goal == null or last_written_goal.?.x != snapped_goal.x or last_written_goal.?.y != snapped_goal.y) {
-            try writeGroupFieldDetourRequests(&requests, fixture.entities, fixture.starts, snapped_goal);
-            last_written_goal = snapped_goal;
-            if (step_index >= warmup_steps) rewrite_count += 1;
-        }
-
         const measured = step_index >= warmup_steps;
+        if (last_written_goal == null or last_written_goal.?.x != snapped_goal.x or last_written_goal.?.y != snapped_goal.y) {
+            try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, snapped_goal);
+            last_written_goal = snapped_goal;
+            if (measured) rewrite_count += 1;
+        }
         const start_ns = suite.nowNs(io);
-        const stats = try runColdOnce(&system, &requests, thread_ptr, case, item_count, item_count, item_count);
-        const end_ns = suite.nowNs(io);
-        if (measured) {
-            accumulator.record(suite.elapsedNs(start_ns, end_ns), stats.solve_batch);
-            escalated_total += stats.escalated_solves;
-            throttled_total += stats.group_field_rebuild_throttled;
+        const stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        if (!measured) continue;
+        accumulator.record(elapsed_ns, stats.solve_batch);
+        totals.add(stats);
+    }
+    // The field still serves part of the run; escalated solves follow the hysteresis-reduced
+    // rewrites, which stay below the per-step count.
+    if (totals.samples == 0) return error.GroupFieldNeverSampled;
+    if (rewrite_count >= total_steps - warmup_steps) return error.GroupFieldRewroteEveryStep;
+    if (totals.escalated > rewrite_count) return error.GroupFieldEscalationsPastRewrites;
+    var stats = accumulator.finish();
+    totals.into(&stats);
+    return stats;
+}
+
+const group_field_pack_agents: usize = 2 * group_field_detour_threshold;
+const group_field_pack_side: u16 = group_field_detour_side;
+// Columns one pack's band holds: its start block and its goal.
+const group_field_pack_band_min: usize = 16;
+
+// Every pack's members requesting their pack's goal for `cycle`: pack `p` owns a column band
+// of the level, starts in a block at its top, and its goal marches up from the bottom one nav
+// cell per cycle (never revisited).
+fn writeGroupFieldPackRequests(allocator: std.mem.Allocator, stream: *RangeOutputStream(PathRequest), scratch: *std.ArrayList(PathRequest), open: *const OpenWorld, entities: []const EntityId, packs: usize, cycle: usize) !void {
+    const side: usize = group_field_pack_side;
+    const band = side / packs;
+    std.debug.assert(band >= group_field_pack_band_min and cycle < side / 2);
+    scratch.clearRetainingCapacity();
+    try scratch.ensureTotalCapacity(allocator, entities.len);
+    for (entities, 0..) |entity, index| {
+        const pack = index / group_field_pack_agents;
+        const member = index % group_field_pack_agents;
+        // In range: every band lies inside the level.
+        const start = CellCoord{ .x = @intCast(pack * band + 2 + member % 8), .y = @intCast(4 + (member / 8) * 2) };
+        const goal = CellCoord{ .x = @intCast(pack * band + band / 2), .y = @intCast(side - 4 - cycle) };
+        scratch.appendAssumeCapacity(.{ .entity = entity, .kind = .group, .start = open.cellCenter(start), .goal = open.cellCenter(goal) });
+    }
+    try fixtures.writeRequests(stream, scratch.items);
+}
+
+fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const packs = item_count;
+    if (packs == 0 or group_field_pack_side / packs < group_field_pack_band_min) return error.GroupFieldPacksTooMany;
+    const agent_count = packs * group_field_pack_agents;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
+    var open = try buildOpenWorld(allocator, io, group_field_pack_side, 1);
+    defer open.world.deinit();
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const entities = try allocator.alloc(EntityId, agent_count);
+    defer allocator.free(entities);
+    for (entities) |*entity| entity.* = try data.createEntity();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    var capacity = packCapacity(agent_count, fixtures.participantCount(thread_ptr));
+    capacity.max_group_fields = packs;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
+    setPathStageTuners(&system, case);
+
+    var stream = RangeOutputStream(PathRequest).init(allocator);
+    defer stream.deinit();
+    var scratch: std.ArrayList(PathRequest) = .empty;
+    defer scratch.deinit(allocator);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
+    var built_total: usize = 0;
+    var samples_total: usize = 0;
+    for (0..group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) |cycle| {
+        try writeGroupFieldPackRequests(allocator, &stream, &scratch, &open, entities, packs, cycle);
+        const measured = cycle >= group_field_detour_moving_warmup_cycles;
+        for (0..group_field_detour_rekey_period_steps) |_| {
+            const start_ns = suite.nowNs(io);
+            const stats = try runColdOnce(&system, &stream, thread_ptr, case, agent_count, agent_count, agent_count);
+            const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+            if (!measured) continue;
+            accumulator.record(elapsed_ns, stats.group_field_batch);
+            stage_report.add(elapsed_ns, stats);
             built_total += stats.group_fields_built;
             samples_total += stats.group_field_samples;
         }
     }
-
-    // Regression guard: the throttle must still let the field reach `.ready` and serve
-    // part of the run under hysteresis-throttled re-keys, same as the zero-hysteresis case.
-    std.debug.assert(samples_total > 0);
-    // The actual proof this case exists for: escalated solves are bounded by the
-    // HYSTERESIS-REDUCED rewrite count, not the raw per-step count — a regression that
-    // reintroduces a per-step re-key storm shows up here as escalated_total exceeding a
-    // rewrite count that itself stayed small.
-    std.debug.assert(rewrite_count < measured_steps);
-    std.debug.assert(escalated_total <= rewrite_count);
+    stage_report.print(options, group_field_packs_group.name, item_count, case);
+    printFieldMemory(options, group_field_packs_group.name, item_count, case, &system);
+    // Every pack's field builds each rekey and is sampled.
+    if (built_total < packs * group_field_detour_moving_cycles or samples_total == 0) return error.GroupFieldPacksNotEngaged;
 
     var stats = accumulator.finish();
-    stats.output_count = escalated_total;
-    stats.candidate_pairs = throttled_total;
-    stats.deferred_count = built_total;
-    stats.sample_count = samples_total;
+    stats.output_count = built_total;
+    stats.candidate_pairs = samples_total;
+    stats.items_per_second = suite.itemsPerSecond(built_total, stats.mean_ns *| stats.iterations);
     return stats;
 }
 
-const level_case_encoding: usize = 1000;
-const level_size_item_counts = [_]usize{ 256_001, 1_024_001, 2_048_001 };
-const cross_level_item_counts = [_]usize{ 256_008, 256_032, 256_128 };
-const teleport_count_encoding: usize = 10_000_000;
-// Teleport-count configs' layout digit sits above their teleport count.
-const teleport_layout_encoding: usize = 1_000_000_000_000;
+// Per-field coverage and memory of a system's fields, averaged over the built fields.
+fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase, system: *const PathfindingSystem) void {
+    if (!options.details) return;
+    var fields: usize = 0;
+    var covered: usize = 0;
+    var blocks: usize = 0;
+    var resident: usize = 0;
+    for (system.group_fields.items) |*field| {
+        if (field.state == .empty) continue;
+        fields += 1;
+        covered += field.pushed_count;
+        blocks += field.used_blocks;
+        resident += field.residentBytes();
+    }
+    if (fields == 0) return;
+    std.debug.print("  {s} {} {s}: fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
+        group_name,
+        item_count,
+        case.name,
+        fields,
+        covered / fields,
+        blocks / fields,
+        resident / fields,
+        resident / @max(@as(usize, 1), covered),
+        system.group_field_pool_growth.count,
+        system.group_field_pool_failure.count,
+    });
+}
+
+const group_field_tunnel_side: u16 = 1024;
+// Corridor pitch: one corridor row and column per default nav chunk.
+const group_field_tunnel_pitch: u16 = default_chunk_size_tiles;
+const group_field_tunnel_fields: usize = 4;
+const group_field_tunnel_agents: usize = 8;
+const group_field_tunnel_build_guard: usize = 256;
+
+// The lattice: every cell off the corridor rows and columns blocks.
+fn tunnelLatticeCells(allocator: std.mem.Allocator) ![]CellCoord {
+    var cells: std.ArrayList(CellCoord) = .empty;
+    errdefer cells.deinit(allocator);
+    for (0..group_field_tunnel_side) |y| {
+        if (y % group_field_tunnel_pitch == 0) continue;
+        for (0..group_field_tunnel_side) |x| {
+            if (x % group_field_tunnel_pitch == 0) continue;
+            try cells.append(allocator, .{ .x = @intCast(x), .y = @intCast(y) });
+        }
+    }
+    return cells.toOwnedSlice(allocator);
+}
+
+// Each field's crowd stands on the corridor row through its goal, the goal at a corridor
+// crossing in its own quadrant.
+fn tunnelRequests(open: *const OpenWorld, requests: []PathRequest) void {
+    const side = group_field_tunnel_side;
+    const goals = [group_field_tunnel_fields]CellCoord{ .{ .x = side / 4, .y = side / 4 }, .{ .x = 3 * side / 4, .y = side / 4 }, .{ .x = side / 4, .y = 3 * side / 4 }, .{ .x = 3 * side / 4, .y = 3 * side / 4 } };
+    for (requests, 0..) |*request, index| {
+        const goal = goals[index / group_field_tunnel_agents];
+        // In range: a crowd's starts stay on its goal's corridor row.
+        const start = CellCoord{ .x = goal.x + 2 + @as(u16, @intCast(index % group_field_tunnel_agents)), .y = goal.y };
+        request.* = .{ .entity = undefined, .kind = .group, .start = open.cellCenter(start), .goal = open.cellCenter(goal) };
+    }
+}
+
+// Rebuilds the four fields from scratch (pools kept) until all are ready; times the steps.
+fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !struct { elapsed_ns: u64, batch: BatchStats } {
+    system.clearRuntimeState();
+    var elapsed_ns: u64 = 0;
+    var batch = BatchStats{};
+    for (0..group_field_tunnel_build_guard) |_| {
+        const start_ns = suite.nowNs(io);
+        const stats = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
+        elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+        if (stats.group_field_begin_batch.item_count > batch.item_count) batch = stats.group_field_begin_batch;
+        if (stats.group_field_batch.item_count > batch.item_count) batch = stats.group_field_batch;
+        var ready: usize = 0;
+        for (system.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
+        if (ready == group_field_tunnel_fields) return .{ .elapsed_ns = elapsed_ns, .batch = batch };
+    }
+    return error.GroupFieldTunnelBuildStalled;
+}
+
+fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const agent_count = group_field_tunnel_fields * group_field_tunnel_agents;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
+    var open = try buildOpenWorld(allocator, io, group_field_tunnel_side, 1);
+    var open_owned = true;
+    errdefer if (open_owned) open.world.deinit();
+    {
+        const lattice = try tunnelLatticeCells(allocator);
+        defer allocator.free(lattice);
+        try writeLevelZeroCells(&open, lattice, open.blocking);
+    }
+    var requests: [group_field_tunnel_fields * group_field_tunnel_agents]PathRequest = undefined;
+    tunnelRequests(&open, &requests);
+    open_owned = false;
+    var fixture = try initRouteFixture(allocator, open, &requests, .{
+        .max_group_fields = group_field_tunnel_fields,
+        .worker_participant_count = fixtures.participantCount(thread_ptr),
+        .max_agent_budget = agent_count,
+        .min_group_field_agents = group_field_tunnel_agents,
+        .group_field_max_cells = item_count,
+    }, thread_ptr);
+    defer fixture.deinit();
+    const system = &fixture.system;
+    setPathStageTuners(system, case);
+
+    for (0..coldWarmup(options)) |_| _ = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    for (0..@max(@as(usize, 1), coldIterations(options))) |_| {
+        const built = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count);
+        accumulator.record(built.elapsed_ns, built.batch);
+    }
+    var covered: usize = 0;
+    for (system.group_fields.items) |field| covered += field.pushed_count;
+    // Every field covers its cap: the lattice's corridor cells reach past the largest cap.
+    if (covered != group_field_tunnel_fields * item_count) return error.GroupFieldTunnelShortOfCap;
+    printFieldMemory(options, group_field_tunnel_group.name, item_count, case, system);
+
+    var stats = accumulator.finish();
+    stats.output_count = covered;
+    stats.items_per_second = suite.itemsPerSecond(covered, stats.mean_ns);
+    return stats;
+}
+
+const LevelCode = suite.ItemCode(struct { level_side: u16, levels: u16 }, &.{3});
+const CrossLevelCode = suite.ItemCode(struct { layout: TeleportLayout, teleports: usize, level_side: u16, levels: u16 }, &.{ 5, 4, 3 });
+const LongPathCode = suite.ItemCode(struct { variant: LongPathVariant, layout: LongPathLayout, parameter: u16 }, &.{ 1, 6 });
+const LinkFoldCode = suite.ItemCode(struct { axis: LinkFoldAxis, probe_preload: usize, background_pads: usize }, &.{ 3, 6 });
+const EvictCode = suite.ItemCode(struct { region_chunks: usize, cached_results: usize }, &.{7});
+const NegativeDigCode = suite.ItemCode(struct { level_side: u16, requests: u16 }, &.{3});
+const BurstCode = suite.ItemCode(struct { variant: BurstVariant, requests: usize }, &.{6});
+const SplitCode = suite.ItemCode(struct { variant: SplitVariant, edge_chunks: u16, level_side: u16, levels: u16 }, &.{ 3, 4, 3 });
+const OnewayCode = suite.ItemCode(struct { variant: OnewayVariant, terminals_per_system: usize, systems: usize }, &.{ 5, 5 });
+
+const level_size_item_counts = [_]usize{
+    LevelCode.of(.{ .level_side = 256, .levels = 1 }),
+    LevelCode.of(.{ .level_side = 1024, .levels = 1 }),
+    LevelCode.of(.{ .level_side = 2048, .levels = 1 }),
+};
+const cross_level_item_counts = [_]usize{
+    LevelCode.of(.{ .level_side = 256, .levels = 8 }),
+    LevelCode.of(.{ .level_side = 256, .levels = 32 }),
+    LevelCode.of(.{ .level_side = 256, .levels = 128 }),
+};
+fn teleportCode(comptime layout: TeleportLayout, comptime teleports: usize, comptime level_side: u16) usize {
+    return CrossLevelCode.of(.{ .layout = layout, .teleports = teleports, .level_side = level_side, .levels = 8 });
+}
+
+// The depth configs with the one corner teleport, then each layout's teleport-count axis.
+const teleport_item_counts = cross_level_item_counts ++ [_]usize{
+    teleportCode(.border_band, 64, 256),
+    teleportCode(.border_band, 256, 256),
+    teleportCode(.border_band, 1024, 256),
+    teleportCode(.strip, teleport_strip_rows * 256 / 16, 256),
+    teleportCode(.strip, teleport_strip_rows * 1024 / 16, 1024),
+    teleportCode(.strip, teleport_strip_rows * 2048 / 16, 2048),
+    teleportCode(.random_pads, 16, 256),
+    teleportCode(.random_pads, 64, 256),
+    teleportCode(.random_pads, 256, 256),
+};
+
+fn teleportItemCounts(_: suite.Profile) []const usize {
+    return &teleport_item_counts;
+}
+
 // Teleport-count configs place their teleports on level-0 cells this close to the border.
 const teleport_border_band: u16 = 16;
 // The strip layout's rows: this many, from this far north of the level center.
@@ -1969,29 +1840,29 @@ const link_fold_side: u16 = 512;
 const link_fold_levels: u16 = 8;
 // Pads each timed link-fold reaction applies.
 const link_fold_batch: usize = 64;
-// Link-fold item codes' axis and probe preload digits.
-const link_fold_axis_encoding: usize = 1_000_000_000;
-const link_fold_preload_encoding: usize = 1_000_000;
 // Probe chunk pairs each probe-axis batch lands in, an equal share of its pads each.
 const link_fold_probe_pairs: usize = 8;
 // The uniform axis, then the probe axis in background pads at a fixed preload, then in
 // preload at a fixed background.
 const link_fold_item_counts = [_]usize{
-    linkFoldItemCode(.uniform, 0, 1024),
-    linkFoldItemCode(.uniform, 0, 8192),
-    linkFoldItemCode(.uniform, 0, 32768),
-    linkFoldItemCode(.probe, 16, 1024),
-    linkFoldItemCode(.probe, 16, 8192),
-    linkFoldItemCode(.probe, 16, 32768),
-    linkFoldItemCode(.probe, 4, 8192),
-    linkFoldItemCode(.probe, 64, 8192),
+    LinkFoldCode.of(.{ .axis = .uniform, .probe_preload = 0, .background_pads = 1024 }),
+    LinkFoldCode.of(.{ .axis = .uniform, .probe_preload = 0, .background_pads = 8192 }),
+    LinkFoldCode.of(.{ .axis = .uniform, .probe_preload = 0, .background_pads = 32768 }),
+    LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 16, .background_pads = 1024 }),
+    LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 16, .background_pads = 8192 }),
+    LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 16, .background_pads = 32768 }),
+    LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 4, .background_pads = 8192 }),
+    LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 64, .background_pads = 8192 }),
 };
-const evict_region_encoding: usize = 10_000_000;
-const evict_item_counts = [_]usize{ 1_000, 10_000, 50_000, 64 * evict_region_encoding + 10_000 };
-// Four packs, then three tunnel field caps: sample points on the coverage curve.
-const group_field_packs_item_counts = [_]usize{ 4, 2048, 16384, 65536 };
-// Item counts from here up are tunnel field caps, not pack counts.
-const group_field_tunnel_min_cells: usize = 1024;
+// The dig at each result count, then the region axis at a fixed result count.
+const evict_item_counts = [_]usize{
+    EvictCode.of(.{ .region_chunks = 0, .cached_results = 1_000 }),
+    EvictCode.of(.{ .region_chunks = 0, .cached_results = 10_000 }),
+    EvictCode.of(.{ .region_chunks = 0, .cached_results = 50_000 }),
+    EvictCode.of(.{ .region_chunks = 4, .cached_results = 10_000 }),
+    EvictCode.of(.{ .region_chunks = 16, .cached_results = 10_000 }),
+    EvictCode.of(.{ .region_chunks = 64, .cached_results = 10_000 }),
+};
 const elastic_ramp_item_counts = [_]usize{ 1_000, 4_000, 16_000 };
 
 fn levelSizeItemCounts(_: suite.Profile) []const usize {
@@ -2010,16 +1881,18 @@ fn evictItemCounts(_: suite.Profile) []const usize {
     return &evict_item_counts;
 }
 
-fn groupFieldPacksItemCounts(_: suite.Profile) []const usize {
-    return &group_field_packs_item_counts;
-}
-
 fn elasticRampItemCounts(_: suite.Profile) []const usize {
     return &elastic_ramp_item_counts;
 }
 
-const negative_steady_item_counts = [_]usize{ 64, 128, 256 };
-const negative_dig_item_counts = [_]usize{ 256_064, 256_128, 256_256, 1_024_064, 2_048_064 };
+const negative_steady_item_counts = [_]usize{ 256, 1024, 4096 };
+const negative_dig_item_counts = [_]usize{
+    NegativeDigCode.of(.{ .level_side = 256, .requests = 64 }),
+    NegativeDigCode.of(.{ .level_side = 256, .requests = 128 }),
+    NegativeDigCode.of(.{ .level_side = 256, .requests = 256 }),
+    NegativeDigCode.of(.{ .level_side = 1024, .requests = 64 }),
+    NegativeDigCode.of(.{ .level_side = 2048, .requests = 64 }),
+};
 
 fn negativeSteadyItemCounts(_: suite.Profile) []const usize {
     return &negative_steady_item_counts;
@@ -2029,16 +1902,22 @@ fn negativeDigItemCounts(_: suite.Profile) []const usize {
     return &negative_dig_item_counts;
 }
 
-const negative_burst_item_counts = [_]usize{ 1024, 4096, 12288, 1_001_024, 1_004_096, 1_012_288 };
+const negative_burst_item_counts = [_]usize{
+    BurstCode.of(.{ .variant = .open_goals, .requests = 1024 }),
+    BurstCode.of(.{ .variant = .open_goals, .requests = 4096 }),
+    BurstCode.of(.{ .variant = .open_goals, .requests = 12288 }),
+    BurstCode.of(.{ .variant = .blocked_crowd, .requests = 1024 }),
+    BurstCode.of(.{ .variant = .blocked_crowd, .requests = 4096 }),
+    BurstCode.of(.{ .variant = .blocked_crowd, .requests = 12288 }),
+};
 
 fn negativeBurstItemCounts(_: suite.Profile) []const usize {
     return &negative_burst_item_counts;
 }
 
-// The connectivity groups' variant digit sits above every other field of their item codes.
-const connectivity_variant_encoding: usize = 10_000_000_000;
-const split_edge_encoding: usize = 10_000_000;
-const oneway_terminals_encoding: usize = 100_000;
+fn splitItemCode(comptime variant: SplitVariant, comptime edge_chunks: u16, comptime level_side: u16) usize {
+    return SplitCode.of(.{ .variant = variant, .edge_chunks = edge_chunks, .level_side = level_side, .levels = 1 });
+}
 
 // Room edges at one side, then the middle edge at two more sides, then ring edges, then
 // tunnel lengths at one side and the shortest at two more.
@@ -2062,6 +1941,10 @@ fn connectivitySplitItemCounts(_: suite.Profile) []const usize {
     return &connectivity_split_item_counts;
 }
 
+fn onewayItemCode(comptime variant: OnewayVariant, comptime terminals: usize, comptime systems: usize) usize {
+    return OnewayCode.of(.{ .variant = variant, .terminals_per_system = terminals, .systems = systems });
+}
+
 const connectivity_oneway_item_counts = [_]usize{
     onewayItemCode(.locality, 8, 16),
     onewayItemCode(.locality, 8, 256),
@@ -2077,7 +1960,7 @@ const connectivity_oneway_item_counts = [_]usize{
     onewayItemCode(.far_dig, 4096, 1),
     onewayItemCode(.shrunk, 512, 1),
     onewayItemCode(.shrunk, 2048, 1),
-    onewayItemCode(.shrunk, 8192, 1),
+    onewayItemCode(.shrunk, 4096, 1),
     onewayItemCode(.fan, 64, 1),
     onewayItemCode(.fan, 128, 1),
     onewayItemCode(.fan, 256, 1),
@@ -2093,15 +1976,57 @@ fn connectivityOnewayItemCounts(_: suite.Profile) []const usize {
     return &connectivity_oneway_item_counts;
 }
 
-/// The capacity a nav scaling config's nav reserves; library defaults elsewhere.
-/// `suite.navStorageBytes` charges exactly these four fields.
-pub fn navSizeCapacity(config: suite.NavSizeConfig) PathfindingCapacity {
-    return .{
-        .worker_participant_count = config.participant_count,
-        .max_agent_budget = config.agent_budget,
-        .max_group_fields = config.group_fields,
-        .max_abstract_nodes = config.tier1_abstract_nodes,
-    };
+fn writeRouteWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("abstract_nodes={} routes_solved={}", .{ stats.candidate_pairs, stats.output_count });
+}
+
+fn writeLongPathWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("candidates={} outputs={}", .{ stats.candidate_pairs, stats.output_count });
+}
+
+fn writeLinkFoldWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("pads_held={} chunks_patched={}", .{ stats.output_count, stats.candidate_pairs });
+    if (view == .details) try suite.writeNavMain(writer, stats.nav_main);
+}
+
+fn writeEvictWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cached={} evicted={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .details) {
+        try writer.writeByte(' ');
+        try suite.writeNavStages(writer, stats);
+    }
+}
+
+fn writeElasticRampWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("solves={} re_solves={}", .{ stats.output_count, stats.candidate_pairs });
+}
+
+fn writeElasticShrinkWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("kept={} moved={} evicted={}", .{ stats.output_count, stats.candidate_pairs, stats.cache_evictions });
+}
+
+fn writeUnavailableWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("unavailable={}", .{stats.output_count});
+}
+
+fn writeBurstWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("unavailable={} projections={}", .{ stats.output_count, stats.candidate_pairs });
+}
+
+fn writeSplitWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("cells={} structure_chunks={}", .{ stats.output_count, stats.candidate_pairs });
+    if (view == .details) {
+        try writer.writeByte(' ');
+        try suite.writeNavStages(writer, stats);
+    }
+}
+
+fn writeOnewayWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("rooms={} oneway_links={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .details) {
+        try writer.writeByte(' ');
+        try suite.writeNavStages(writer, stats);
+    }
 }
 
 // Walkable levels of `side`² tiles in default chunks, one floor band per level (level
@@ -2124,42 +2049,12 @@ const OpenWorld = struct {
 };
 
 fn buildOpenWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16) !OpenWorld {
-    var world = try buildBandedWorld(allocator, io, side, levels, "grass", "grass");
+    var world = try fixtures.buildBandedWorld(allocator, io, side, levels, "grass", "grass");
     errdefer world.deinit();
     const meta = world.tilesetMeta().?;
     const walkable = try world.requireTileByName(meta, "grass");
     const blocking = try world.requireTileByName(meta, "dirt");
     return .{ .world = world, .walkable = walkable, .blocking = blocking };
-}
-
-/// The bench world fixture: `levels` square levels of `side`² tiles in default chunks,
-/// each one uniform dense floor band (level `i` owns layer `i`), the tile named `surface`
-/// on level 0 and `below` under it. The world owns its tileset metadata
-/// (`tilesetMeta()`) for further tile lookups.
-pub fn buildBandedWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16, surface: []const u8, below: []const u8) !WorldSystem {
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var meta_owned = true;
-    defer if (meta_owned) meta.deinit();
-    var world = WorldSystem{
-        .allocator = allocator,
-        .width = side,
-        .height = side,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = default_chunk_size_tiles,
-    };
-    errdefer world.deinit();
-    try world.buildCatalog(&meta);
-    const surface_tile = try world.requireTileByName(&meta, surface);
-    const below_tile = try world.requireTileByName(&meta, below);
-    for (0..levels) |level_index| {
-        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
-        const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) surface_tile else below_tile);
-        std.debug.assert(layer == level);
-    }
-    world.adoptTilesetMeta(meta);
-    meta_owned = false;
-    return world;
 }
 
 // Writes `tile` into `cells` on level 0 in one reserve scope.
@@ -2175,39 +2070,6 @@ fn writeLevelCells(open: *OpenWorld, level: u16, cells: []const CellCoord, tile:
     for (cells) |cell| _ = try open.world.setDenseTile(layer, cell.x, cell.y, tile);
 }
 
-// Writes `requests` as one range, replacing the stream's contents.
-fn writeRequests(stream: *RangeOutputStream(PathRequest), requests: []const PathRequest) !void {
-    stream.clearRetainingCapacity();
-    if (requests.len == 0) return;
-    const range_base = try stream.appendRangeCounts(1);
-    stream.addCount(range_base, requests.len);
-    try stream.prefixAppendedRanges(range_base);
-    var writer = stream.rangeWriter(range_base);
-    for (requests) |request| writer.write(request);
-    writer.finish();
-    stream.finishWrite();
-}
-
-fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
-    if (!case.usesThreadSystem()) return null;
-    return try ThreadSystem.init(allocator, io, .{
-        .max_worker_threads = case.maxWorkerThreads(),
-        .items_per_range = suite.default_items_per_range,
-    });
-}
-
-// Nav update stages are independent chunks: one chunk per range is the fixed controls'
-// partition.
-fn navUpdateItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(1) orelse suite.default_items_per_range;
-}
-
-// Gives the nav update stages this case's control config.
-fn configureNavUpdateThreads(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
-    system.nav_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = navUpdateItemsPerRange(case) };
-}
-
 // Most abstract nodes any participant's or tier-1 pool entry's last search claimed this step.
 fn lastAbstractNodesUsed(system: *const PathfindingSystem) usize {
     var nodes: usize = 0;
@@ -2221,14 +2083,8 @@ const route_request_count: usize = 64;
 const cross_level_goal_level: u16 = 4;
 
 // The chunk keys a marks batch toggling one cell patches: its chunk and four neighbours.
-const toggle_batch_keys: usize = squareBatchKeys(1);
+const toggle_batch_keys: usize = suite.squareBatchKeys(1);
 const toggle_batch: suite.NavBatch = .{ .mark_chunks = 1, .links = 0, .keys = toggle_batch_keys };
-
-/// The chunk keys a marks batch changing an `edge` x `edge` chunk square patches: the square
-/// and the ring of neighbours around it (`suite.NavSizeConfig.batch_keys`).
-pub fn squareBatchKeys(edge: usize) usize {
-    return edge * edge + 4 * edge;
-}
 
 // The route fixtures never change nav after the build: no marks batch.
 fn routeSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize) suite.NavSizeConfig {
@@ -2268,7 +2124,7 @@ fn initRouteFixture(allocator: std.mem.Allocator, open: OpenWorld, requests: []P
     for (requests) |*request| request.entity = try data.createEntity();
     var stream = RangeOutputStream(PathRequest).init(allocator);
     errdefer stream.deinit();
-    try writeRequests(&stream, requests);
+    try fixtures.writeRequests(&stream, requests);
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(capacity);
@@ -2278,15 +2134,15 @@ fn initRouteFixture(allocator: std.mem.Allocator, open: OpenWorld, requests: []P
 
 fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side: u16 = @intCast(item_count / level_case_encoding);
-    const levels: u16 = @intCast(item_count % level_case_encoding);
-    std.debug.assert(levels == 1 and side >= 256);
-    var threads = try initCaseThreads(allocator, io, case);
+    const code = try LevelCode.decode(item_count);
+    const side = code.level_side;
+    const levels = code.levels;
+    if (levels != 1 or side < 256) return error.LevelSizeBadConfig;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    const size_config = routeSizeConfig(side, levels, 0, participant_count);
-    if (suite.navSizeSkip(level_size_group.name, item_count, case, size_config)) |skip| return skip;
+    const participant_count = fixtures.participantCount(thread_ptr);
+    var size_config = routeSizeConfig(side, levels, 0, participant_count);
 
     var open = try buildOpenWorld(allocator, io, side, levels);
     var open_owned = true;
@@ -2302,6 +2158,9 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         wall_len += 1;
     }
     try writeLevelZeroCells(&open, wall[0..wall_len], open.blocking);
+    // The built world's content sizes the nav.
+    size_config.content = NavGraph.storageContentOf(&open.world);
+    try suite.checkNavSize(level_size_group.name, item_count, case, size_config);
 
     // An 8x8 block of starts left of the wall and their goals mirrored right of it,
     // rows 4 apart around the gap: each route crosses the gap.
@@ -2317,7 +2176,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         };
     }
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initRouteFixture(allocator, open, &requests, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try suite.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
     const stats = try runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr, .fail);
@@ -2350,7 +2209,7 @@ const TeleportLayout = enum(u8) {
     random_pads,
 };
 
-// A cross-level item count: layout * 10^12 + teleports * 10^7 + side * 1000 + levels.
+// A cross-level item code (`CrossLevelCode`).
 const CrossLevelConfig = struct {
     layout: TeleportLayout,
     // 0: the teleport group's one corner-to-corner teleport, or none in the depth group.
@@ -2358,27 +2217,20 @@ const CrossLevelConfig = struct {
     side: u16,
     levels: u16,
 
-    // Each field reads only its own digits. An unknown layout, teleports in the depth group,
-    // or a config the fixture cannot build is an error.
+    // Teleports in the depth group, a layout other than the border band with none, or a
+    // config the fixture cannot build is an error.
     fn decode(item_count: usize, teleport: bool) !CrossLevelConfig {
-        const layout_index = item_count / teleport_layout_encoding;
-        const teleports = item_count % teleport_layout_encoding / teleport_count_encoding;
-        const world_config = item_count % teleport_count_encoding;
-        if (layout_index > @backingInt(TeleportLayout.random_pads)) return error.CrossLevelUnknownLayout;
-        if (!teleport and item_count >= teleport_count_encoding) return error.CrossLevelDepthHoldsTeleports;
-        const layout: TeleportLayout = @fromBackingInt(@as(u8, @intCast(layout_index)));
-        if (layout != .border_band and teleports == 0) return error.CrossLevelLayoutNoTeleports;
-        // In range: below 10^4 by the encoding.
-        const side: u16 = @intCast(world_config / level_case_encoding);
-        const levels: u16 = @intCast(world_config % level_case_encoding);
-        if (levels <= cross_level_goal_level or side < 256) return error.CrossLevelWorldTooSmall;
-        const layout_cells: usize = switch (layout) {
-            .border_band => borderBandCells(side),
-            .strip => @as(usize, teleport_strip_rows) * side,
+        const code = try CrossLevelCode.decode(item_count);
+        if (!teleport and (code.teleports != 0 or code.layout != .border_band)) return error.CrossLevelDepthHoldsTeleports;
+        if (code.layout != .border_band and code.teleports == 0) return error.CrossLevelLayoutNoTeleports;
+        if (code.levels <= cross_level_goal_level or code.level_side < 256) return error.CrossLevelWorldTooSmall;
+        const layout_cells: usize = switch (code.layout) {
+            .border_band => borderBandCells(code.level_side),
+            .strip => @as(usize, teleport_strip_rows) * code.level_side,
             .random_pads => std.math.maxInt(usize),
         };
-        if (teleports > layout_cells) return error.CrossLevelTeleportsExceedLayout;
-        return .{ .layout = layout, .teleports = teleports, .side = side, .levels = levels };
+        if (code.teleports > layout_cells) return error.CrossLevelTeleportsExceedLayout;
+        return .{ .layout = code.layout, .teleports = code.teleports, .side = code.level_side, .levels = code.levels };
     }
 };
 
@@ -2389,16 +2241,15 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const levels = config.levels;
     const teleport_count = config.teleports;
 
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const link_count: usize = levels - 1 + if (teleport_count != 0) teleport_count else @intFromBool(teleport);
     var size_config = routeSizeConfig(side, levels, link_count, participant_count);
     // Every ramp and teleport here is bidirectional.
     size_config.oneway_links = 0;
     const group_name = if (teleport) cross_level_teleport_group.name else cross_level_depth_group.name;
-    if (suite.navSizeSkip(group_name, item_count, case, size_config)) |skip| return skip;
 
     var open = try buildOpenWorld(allocator, io, side, levels);
     var open_owned = true;
@@ -2439,6 +2290,10 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         });
     }
 
+    // The built world's content and links size the nav.
+    size_config.content = NavGraph.storageContentOf(&open.world);
+    try suite.checkNavSize(group_name, item_count, case, size_config);
+
     // Starts in an 8x8 block at the level-0 center, goals in an 8x8 block below it on
     // level 4.
     var requests: [route_request_count]PathRequest = undefined;
@@ -2454,7 +2309,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         };
     }
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initRouteFixture(allocator, open, &requests, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try suite.checkNavBytes(group_name, item_count, size_config, &fixture.system);
     const stats = try runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
@@ -2470,18 +2325,18 @@ const shaft_goal_offset: u16 = 48;
 
 fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side: u16 = @intCast(item_count / level_case_encoding);
-    const levels: u16 = @intCast(item_count % level_case_encoding);
-    std.debug.assert(levels > shaft_goal_level and side >= 256);
+    const code = try LevelCode.decode(item_count);
+    const side = code.level_side;
+    const levels = code.levels;
+    if (levels <= shaft_goal_level or side < 256) return error.CrossLevelShaftBadConfig;
 
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     // Ramps join levels 1..levels-1; one teleport leaves level 0.
     const link_count: usize = levels - 2 + 1;
-    const size_config = routeSizeConfig(side, levels, link_count, participant_count);
-    if (suite.navSizeSkip(cross_level_shaft_group.name, item_count, case, size_config)) |skip| return skip;
+    var size_config = routeSizeConfig(side, levels, link_count, participant_count);
 
     var open = try buildOpenWorld(allocator, io, side, levels);
     var open_owned = true;
@@ -2512,6 +2367,9 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         .traversal_cost = 1,
         .bidirectional = false,
     });
+    // The built world's content and links size the nav.
+    size_config.content = NavGraph.storageContentOf(&open.world);
+    try suite.checkNavSize(cross_level_shaft_group.name, item_count, case, size_config);
 
     var requests: [route_request_count]PathRequest = undefined;
     for (&requests, 0..) |*request, index| {
@@ -2526,7 +2384,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         };
     }
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, &requests, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initRouteFixture(allocator, open, &requests, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try suite.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
     const stats = try runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
@@ -2534,9 +2392,6 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     return stats;
 }
 
-// Long-path item codes: the variant digit above the layout digit above the parameter.
-const long_path_variant_encoding: usize = 10_000_000;
-const long_path_layout_encoding: usize = 1_000_000;
 const long_path_side: u16 = 2048;
 // Serpentine rows per wall, and the open cells at one end of each wall.
 const serpentine_pitch: u16 = 128;
@@ -2585,25 +2440,17 @@ const LongPathConfig = struct {
     layout: LongPathLayout,
     parameter: u16,
 
-    fn code(variant: LongPathVariant, layout: LongPathLayout, parameter: u16) usize {
-        return @as(usize, @backingInt(variant)) * long_path_variant_encoding + @as(usize, @backingInt(layout)) * long_path_layout_encoding + parameter;
+    fn code(comptime variant: LongPathVariant, comptime layout: LongPathLayout, comptime parameter: u16) usize {
+        return LongPathCode.of(.{ .variant = variant, .layout = layout, .parameter = parameter });
     }
 
-    // An unknown digit, a parameter the layout cannot build, a crowd off the serpentine and
-    // open diagonal, or a walk off the planar layouts is an error.
+    // A parameter the layout cannot build, a crowd off the serpentine and open diagonal, or a
+    // walk off the planar layouts is an error.
     fn decode(item_count: usize) !LongPathConfig {
-        const variant_index = item_count / long_path_variant_encoding;
-        const layout_index = item_count % long_path_variant_encoding / long_path_layout_encoding;
-        const parameter = item_count % long_path_layout_encoding;
-        if (variant_index > @backingInt(LongPathVariant.hops)) return error.LongPathUnknownVariant;
-        if (layout_index > @backingInt(LongPathLayout.deep_wide)) return error.LongPathUnknownLayout;
-        if (parameter == 0 or parameter > std.math.maxInt(u16)) return error.LongPathBadParameter;
-        // In range: every digit is checked above.
-        const config = LongPathConfig{
-            .variant = @fromBackingInt(@as(u8, @intCast(variant_index))),
-            .layout = @fromBackingInt(@as(u8, @intCast(layout_index))),
-            .parameter = @intCast(parameter),
-        };
+        const fields = try LongPathCode.decode(item_count);
+        const parameter = fields.parameter;
+        if (parameter == 0) return error.LongPathBadParameter;
+        const config = LongPathConfig{ .variant = fields.variant, .layout = fields.layout, .parameter = parameter };
         const buildable = switch (config.layout) {
             .serpentine => parameter <= serpentine_walls,
             .open_diagonal, .cave => open_diagonal_origin + parameter < long_path_side,
@@ -2664,19 +2511,17 @@ const LongPathConfig = struct {
     }
 };
 
-// The variant-0 curves, then the probe on the same routes, then the crowd at one route each,
-// then the walks.
+// Each variant at 3 route lengths per layout: the caps curves, the probe on the same routes,
+// the crowd, the walks, and the hop chains.
 const long_path_item_counts = [_]usize{
     LongPathConfig.code(.caps, .serpentine, 1),
     LongPathConfig.code(.caps, .serpentine, 4),
     LongPathConfig.code(.caps, .serpentine, 15),
     LongPathConfig.code(.caps, .open_diagonal, 256),
-    LongPathConfig.code(.caps, .open_diagonal, 512),
     LongPathConfig.code(.caps, .open_diagonal, 1024),
     LongPathConfig.code(.caps, .open_diagonal, 2032),
     LongPathConfig.code(.caps, .descent, 4),
     LongPathConfig.code(.caps, .descent, 16),
-    LongPathConfig.code(.caps, .descent, 64),
     LongPathConfig.code(.caps, .descent, 127),
     LongPathConfig.code(.caps, .depth, 8),
     LongPathConfig.code(.caps, .depth, 32),
@@ -2685,7 +2530,6 @@ const long_path_item_counts = [_]usize{
     LongPathConfig.code(.caps, .wide_descent, 1024),
     LongPathConfig.code(.caps, .wide_descent, 2048),
     LongPathConfig.code(.caps, .cave, 256),
-    LongPathConfig.code(.caps, .cave, 512),
     LongPathConfig.code(.caps, .cave, 1024),
     LongPathConfig.code(.caps, .cave, 2032),
     LongPathConfig.code(.caps, .deep_wide, 4),
@@ -2695,25 +2539,26 @@ const long_path_item_counts = [_]usize{
     LongPathConfig.code(.probe, .serpentine, 4),
     LongPathConfig.code(.probe, .serpentine, 15),
     LongPathConfig.code(.probe, .open_diagonal, 256),
-    LongPathConfig.code(.probe, .open_diagonal, 512),
     LongPathConfig.code(.probe, .open_diagonal, 1024),
     LongPathConfig.code(.probe, .open_diagonal, 2032),
     LongPathConfig.code(.probe, .descent, 4),
     LongPathConfig.code(.probe, .descent, 16),
-    LongPathConfig.code(.probe, .descent, 64),
     LongPathConfig.code(.probe, .descent, 127),
     LongPathConfig.code(.probe, .wide_descent, 256),
     LongPathConfig.code(.probe, .wide_descent, 1024),
     LongPathConfig.code(.probe, .wide_descent, 2048),
     LongPathConfig.code(.probe, .cave, 256),
-    LongPathConfig.code(.probe, .cave, 512),
     LongPathConfig.code(.probe, .cave, 1024),
     LongPathConfig.code(.probe, .cave, 2032),
     LongPathConfig.code(.probe, .deep_wide, 4),
     LongPathConfig.code(.probe, .deep_wide, 8),
     LongPathConfig.code(.probe, .deep_wide, 16),
     LongPathConfig.code(.crowd, .serpentine, 1),
+    LongPathConfig.code(.crowd, .serpentine, 4),
+    LongPathConfig.code(.crowd, .serpentine, 15),
+    LongPathConfig.code(.crowd, .open_diagonal, 256),
     LongPathConfig.code(.crowd, .open_diagonal, 1024),
+    LongPathConfig.code(.crowd, .open_diagonal, 2032),
     LongPathConfig.code(.walk, .open_diagonal, 512),
     LongPathConfig.code(.walk, .open_diagonal, 1024),
     LongPathConfig.code(.walk, .open_diagonal, 2032),
@@ -2802,34 +2647,12 @@ fn addCaveBlobs(allocator: std.mem.Allocator, open: *OpenWorld, route: *PlanarRo
     }
     const blocked_count = blocked.count();
 
-    // The main cave: a breadth-first flood from the open cell nearest the center.
+    // The main cave: a flood from the open cell nearest the center.
     const center = CellCoord{ .x = long_path_side / 2, .y = long_path_side / 2 };
     const seed = nearestCell(&blocked, false, center) orelse return error.LongPathCaveSolid;
     var main_cave = try std.DynamicBitSetUnmanaged.initEmpty(allocator, side * side);
     defer main_cave.deinit(allocator);
-    var queue = try std.ArrayList(u32).initCapacity(allocator, side * side - blocked_count);
-    defer queue.deinit(allocator);
-    const seed_index = @as(u32, seed.y) * side + seed.x;
-    main_cave.set(seed_index);
-    queue.appendAssumeCapacity(seed_index);
-    var head: usize = 0;
-    while (head < queue.items.len) : (head += 1) {
-        const cell = queue.items[head];
-        const x = cell % side;
-        const y = cell / side;
-        const neighbours = [_]?u32{
-            if (x > 0) cell - 1 else null,
-            if (x + 1 < side) cell + 1 else null,
-            if (y > 0) cell - side else null,
-            if (y + 1 < side) cell + side else null,
-        };
-        for (neighbours) |maybe_neighbour| {
-            const neighbour = maybe_neighbour orelse continue;
-            if (blocked.isSet(neighbour) or main_cave.isSet(neighbour)) continue;
-            main_cave.set(neighbour);
-            queue.appendAssumeCapacity(neighbour);
-        }
-    }
+    _ = try fixtures.flood4(allocator, side, side, .{ seed.x, seed.y }, CaveCells{ .blocked = &blocked, .side = side }, &main_cave);
     route.start = nearestCell(&main_cave, true, route.start) orelse return error.LongPathCaveSolid;
     route.goal = nearestCell(&main_cave, true, route.goal) orelse return error.LongPathCaveSolid;
 
@@ -2844,6 +2667,20 @@ fn addCaveBlobs(allocator: std.mem.Allocator, open: *OpenWorld, route: *PlanarRo
     try writeLevelZeroCells(open, cells, open.blocking);
     return blocked_count;
 }
+
+// A cave level's open cells: those `blocked` leaves clear. A flood over them never stops early.
+const CaveCells = struct {
+    blocked: *const std.DynamicBitSetUnmanaged,
+    side: u32,
+
+    pub fn open(self: CaveCells, x: u32, y: u32) bool {
+        return !self.blocked.isSet(@as(usize, y) * self.side + x);
+    }
+
+    pub fn stop(_: CaveCells, _: u32, _: u32) bool {
+        return false;
+    }
+};
 
 // The cell of a `long_path_side`² level whose bit in `cells` equals `value` nearest `target`
 // (Chebyshev, then row-major order); null when none does.
@@ -3067,17 +2904,18 @@ fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const R
     };
 }
 
-// Whether a corridor ends on a goal portal of `request`: on the goal level, in its live goal's
-// chunk, sharing that cell's chunk-local label. A least-estimate corridor ends short of one.
+// Whether a corridor ends on a goal portal of `request` (`isGoalPortal` at its live goal); a
+// least-estimate corridor ends short of one.
 fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize, request: PathRequest) bool {
     const last = corridor[corridor.len - 1];
-    if (refLevel(last) != request.goal_level) return false;
-    const grid = system.graph.grid(request.goal_level) orelse return false;
+    const level = refLevel(last);
+    const grid = system.graph.grid(level) orelse return false;
+    const goal_grid = system.graph.grid(request.goal_level) orelse return false;
     const geometry = system.graph.chunkGeometry();
     const key = system.graph.keyForWorld(request.goal_level, request.goal, request.agent_class) orelse return false;
-    const goal_index = system.liveGoal(key, grid).cell orelse return false;
+    const goal_index = system.liveGoal(key, goal_grid).cell orelse return false;
     const cell = refLocal(last);
-    return geometry.chunkOfCell(cell) == geometry.chunkOfCell(goal_index) and grid.labelAt(cell) == grid.labelAt(goal_index);
+    return isGoalPortal(level, geometry.chunkOfCell(cell), grid.labelAt(cell), request.goal_level, geometry.chunkOfCell(goal_index), goal_grid.labelAt(goal_index));
 }
 
 // One request cycle from empty runtime state: the first attempt, the escalated attempt when
@@ -3085,7 +2923,7 @@ fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize,
 // attempt: it solves or drops.
 fn runLongPathCycle(io: std.Io, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
     const system = &fixture.system;
-    resetPathState(system, .drop_fields);
+    system.clearRuntimeState();
     const first = try runLongPathAttempt(io, system, &fixture.requests, requests[0], requests.len, 0);
     var escalated: ?LongPathAttempt = null;
     if (first.outcome != .available) {
@@ -3114,9 +2952,6 @@ const walk_stall_steps: usize = 32;
 
 // One walk's counts and its timed steps' total.
 const LongPathWalk = struct {
-    arrived: bool = false,
-    // Where the walker stopped.
-    stop: CellCoord = .{ .x = 0, .y = 0 },
     // Abstract nodes claimed over every solve.
     claims: usize = 0,
     steps: usize = 0,
@@ -3129,8 +2964,7 @@ const LongPathWalk = struct {
     solve_ns: u64 = 0,
 
     fn sameWork(self: LongPathWalk, other: LongPathWalk) bool {
-        return self.arrived == other.arrived and std.meta.eql(self.stop, other.stop) and self.claims == other.claims and
-            self.steps == other.steps and self.held_steps == other.held_steps and self.solves == other.solves and
+        return self.claims == other.claims and self.steps == other.steps and self.held_steps == other.held_steps and self.solves == other.solves and
             self.partial_results == other.partial_results and self.full_results == other.full_results and self.escalations == other.escalations;
     }
 };
@@ -3138,7 +2972,7 @@ const LongPathWalk = struct {
 // Walks `request`'s agent from empty runtime state to its goal (see the group comment).
 fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
     const system = &fixture.system;
-    resetPathState(system, .drop_fields);
+    system.clearRuntimeState();
     const grid = system.graph.grid(request.start_level) orelse return error.RouteUnavailable;
     const goal_cell = grid.worldToCellClamped(request.goal);
     var position = request.start;
@@ -3156,7 +2990,7 @@ fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
         const wants_hop = view.status == .missing or (view.status == .partial and view.refresh);
         var hop = request;
         hop.start = position;
-        try writeRequests(stream, if (wants_hop) &.{hop} else &.{});
+        try fixtures.writeRequests(stream, if (wants_hop) &.{hop} else &.{});
         var moved: usize = 0;
         while (moved < walk_cells_per_step) : (moved += 1) {
             const next = system.statusForWorld(request.start_level, position, request.goal_level, request.goal, request.agent_class, &hint);
@@ -3180,11 +3014,7 @@ fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
         walk.full_results += stats.available_results - stats.cache_hits;
         walk.escalations += stats.escalated_solves;
     }
-    const stop = grid.worldToCellClamped(position);
-    walk.arrived = std.meta.eql(stop, goal_cell);
-    if (!walk.arrived) return error.LongPathWalkStalled;
-    // In range: a cell of a u16-sided level.
-    walk.stop = .{ .x = @intCast(stop.x), .y = @intCast(stop.y) };
+    if (!std.meta.eql(grid.worldToCellClamped(position), goal_cell)) return error.LongPathWalkStalled;
     return walk;
 }
 
@@ -3205,16 +3035,13 @@ fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     var stats = accumulator.finish();
     const walk = reference orelse return stats;
     if (options.details) {
-        std.debug.print("  {s} {} {s}: {s} walk parameter={} route~{} cells | arrived={} stop=({},{}) steps={} held={} solves={} partial={} full={} escalations={} claims={} solve={}us | blocked={}\n", .{
+        std.debug.print("  {s} {} {s}: {s} walk parameter={} route~{} cells | steps={} held={} solves={} partial={} full={} escalations={} claims={} solve={}us | blocked={}\n", .{
             long_path_group.name,
             item_count,
             case.name,
             @tagName(config.layout),
             config.parameter,
             config.routeCells(),
-            walk.arrived,
-            walk.stop.x,
-            walk.stop.y,
             walk.steps,
             walk.held_steps,
             walk.solves,
@@ -3234,7 +3061,6 @@ fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
 
 // One hop chain's counts and its steps' total.
 const LongPathHops = struct {
-    arrived: bool = false,
     // Requests the chain made: one per published hop, plus the last, which arrives or drops.
     hops: usize = 0,
     // Published hops toward a saturated search's least-estimate node.
@@ -3249,7 +3075,7 @@ const LongPathHops = struct {
     solve_ns: u64 = 0,
 
     fn sameWork(self: LongPathHops, other: LongPathHops) bool {
-        return self.arrived == other.arrived and self.hops == other.hops and self.least_hops == other.least_hops and
+        return self.hops == other.hops and self.least_hops == other.least_hops and
             self.claims == other.claims and self.solves == other.solves and self.escalations == other.escalations and
             self.stop_level == other.stop_level and self.stop_cell == other.stop_cell;
     }
@@ -3260,7 +3086,7 @@ const LongPathHops = struct {
 // its level, until a hop arrives (`.available`) or drops (`.missing`).
 fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, hop_limit: usize) !LongPathHops {
     const system = &fixture.system;
-    resetPathState(system, .drop_fields);
+    system.clearRuntimeState();
     const tier0_abstract = &system.scratch_slots.items[0].corridor.abstract;
     const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
     var chain = LongPathHops{};
@@ -3272,7 +3098,7 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
         // In range: a cell index of a u16-sided level.
         chain.stop_cell = @intCast(grid.indexForCell(grid.worldToCellClamped(hop.start)) orelse return error.RouteStartInvalid);
         chain.stop_level = hop.start_level;
-        try writeRequests(stream, &.{hop});
+        try fixtures.writeRequests(stream, &.{hop});
         const ended: enum { arrived, partial, dropped } = for (0..2) |attempt| {
             // Each attempt's claims, counted from empty tables.
             tier0_abstract.reset();
@@ -3280,7 +3106,7 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
             const start_ns = suite.nowNs(io);
             const stats = try system.updateSerial(stream, 1, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
             chain.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
-            try writeRequests(stream, &.{});
+            try fixtures.writeRequests(stream, &.{});
             chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
             if (stats.unavailable_results != 0) return error.RouteUnavailable;
             if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
@@ -3296,10 +3122,7 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
             if (attempt == 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
         } else return error.LongPathStillPending;
         switch (ended) {
-            .arrived => {
-                chain.arrived = true;
-                return chain;
-            },
+            .arrived => return chain,
             .dropped => return error.LongPathHopsDropped,
             .partial => {
                 const end = system.solved_paths.items[0].end;
@@ -3329,14 +3152,13 @@ fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     var stats = accumulator.finish();
     const chain = reference orelse return stats;
     if (options.details) {
-        std.debug.print("  {s} {} {s}: {s} hops parameter={} route~{} cells | arrived={} stop=L{}:{} hops={} least_hops={} solves={} escalations={} claims={} solve={}us\n", .{
+        std.debug.print("  {s} {} {s}: {s} hops parameter={} route~{} cells | stop=L{}:{} hops={} least_hops={} solves={} escalations={} claims={} solve={}us\n", .{
             long_path_group.name,
             item_count,
             case.name,
             @tagName(config.layout),
             config.parameter,
             config.routeCells(),
-            chain.arrived,
             chain.stop_level,
             chain.stop_cell,
             chain.hops,
@@ -3391,9 +3213,9 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .content = NavGraph.storageContentOf(&open.world),
         .tier1_abstract_nodes = if (config.variant == .probe) long_path_probe_nodes else default_tier1_abstract_node_cap,
     };
-    if (suite.navSizeSkip(long_path_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(long_path_group.name, item_count, case, size_config);
 
-    const capacity = navSizeCapacity(size_config);
+    const capacity = suite.navSizeCapacity(size_config);
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, requests[0..agent_count], capacity, null);
     defer fixture.deinit();
@@ -3401,8 +3223,15 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
     const agents = requests[0..agent_count];
-    if (config.variant == .walk) return runLongPathWalkCase(allocator, io, options, case, item_count, config, &fixture, agents[0], built.blocked);
-    if (config.variant == .hops) return runLongPathHopsCase(allocator, io, options, case, item_count, config, &fixture, agents[0]);
+    // Every variant checks the nav's bytes again once its paths are cached and registered.
+    if (config.variant == .walk or config.variant == .hops) {
+        const stats = if (config.variant == .walk)
+            try runLongPathWalkCase(allocator, io, options, case, item_count, config, &fixture, agents[0], built.blocked)
+        else
+            try runLongPathHopsCase(allocator, io, options, case, item_count, config, &fixture, agents[0]);
+        try suite.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
+        return stats;
+    }
 
     for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &fixture, &empty, agents);
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -3424,6 +3253,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         if (cycle.escalated) |escalated| escalated_ns += escalated.ns;
         accumulator.record(cycle.ns(), inlineBatch(1, pathfinding_range_alignment_items));
     }
+    try suite.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     const cycle = reference orelse return stats;
     if (options.details) {
@@ -3605,14 +3435,14 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     const system = &fixture.system;
     setPathStageTuners(system, case);
     for (0..options.warmup_iterations) |_| {
-        resetPathState(system, .drop_fields);
+        system.clearRuntimeState();
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
         while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            resetPathState(system, .drop_fields);
+            system.clearRuntimeState();
             _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         }
     }
@@ -3623,7 +3453,7 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     var abstract_nodes: usize = 0;
     var stage_report = StageReport{};
     for (0..options.iterations) |_| {
-        resetPathState(system, .drop_fields);
+        system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
         last_stats = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
@@ -3645,6 +3475,8 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
 // from cell (8, 8), its start 4 cells right and one down.
 const short_route_side: u16 = 256;
 const short_route_columns: usize = 240;
+// Registry runs a short route holds: it crosses at most one chunk edge on each axis.
+const short_route_runs: usize = 3;
 
 fn shortRouteRequest(open: *const OpenWorld, entity: EntityId, index: usize) PathRequest {
     const goal: CellCoord = .{ .x = @intCast(8 + index % short_route_columns), .y = @intCast(8 + index / short_route_columns) };
@@ -3672,7 +3504,9 @@ fn evictAgentBudget(result_count: usize) usize {
 // goal rows at every count and is no request's goal.
 const evict_dig_cell: CellCoord = .{ .x = 250, .y = 9 };
 
-const EvictFixture = struct {
+// A world-backed nav with its static colliders and requests, its terrain changed as a
+// writer changes it and the post-commit nav reaction run on it.
+const ReactFixture = struct {
     open: OpenWorld,
     data: DataSystem,
     colliders: StaticColliderSystem,
@@ -3686,7 +3520,7 @@ const EvictFixture = struct {
     // The last change's tile events, each a cell whose blocking flipped.
     changed: std.ArrayList(SimulationEvent) = .empty,
 
-    fn deinit(self: *EvictFixture, allocator: std.mem.Allocator) void {
+    fn deinit(self: *ReactFixture, allocator: std.mem.Allocator) void {
         self.changed.deinit(allocator);
         self.frame.deinit();
         self.system.deinit();
@@ -3701,11 +3535,11 @@ const EvictFixture = struct {
 
     // Requests every result in batches the intake admits and drains each batch, until
     // every result is cached. Untimed.
-    fn fillCache(self: *EvictFixture, case: suite.BenchmarkCase, thread_system: ?*ThreadSystem) !void {
+    fn fillCache(self: *ReactFixture, case: suite.BenchmarkCase, thread_system: ?*ThreadSystem) !void {
         var start: usize = 0;
         while (start < self.requests.len) : (start += self.agent_count) {
             const end = @min(start + self.agent_count, self.requests.len);
-            try writeRequests(&self.stream, self.requests[start..end]);
+            try fixtures.writeRequests(&self.stream, self.requests[start..end]);
             var step_stats = try runColdOnce(&self.system, &self.stream, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
             var guard = suite.rangeCount(self.agent_count, default_max_solves_per_frame) + 2;
             while (step_stats.pending_requests != 0) : (guard -= 1) {
@@ -3717,7 +3551,7 @@ const EvictFixture = struct {
     }
 
     // Requests whose path the cache serves. Untimed: one status query per request.
-    fn cachedCount(self: *const EvictFixture) usize {
+    fn cachedCount(self: *const ReactFixture) usize {
         var cached: usize = 0;
         for (self.requests) |request| {
             const view = self.system.statusForWorld(request.start_level, request.start, request.goal_level, request.goal, request.agent_class, null);
@@ -3730,12 +3564,12 @@ const EvictFixture = struct {
     // record reserve, then the write and its tile events), then times the writer's nav record
     // of the events and the post-commit nav reaction; returns the reaction's time and stats.
     // `changed` holds `cells.len` entries.
-    fn changeAndReact(self: *EvictFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
+    fn changeAndReact(self: *ReactFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
         return self.changeLevelAndReact(io, 0, cells, tile, thread_system);
     }
 
     // `changeAndReact` on `level`.
-    fn changeLevelAndReact(self: *EvictFixture, io: std.Io, level: u16, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
+    fn changeLevelAndReact(self: *ReactFixture, io: std.Io, level: u16, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
         const layer = OpenWorld.floor(level);
         self.changed.clearRetainingCapacity();
         try self.system.reserveTerrainNavRecord(cells.len);
@@ -3758,45 +3592,34 @@ const EvictFixture = struct {
     }
 };
 
-const EvictReaction = struct {
+const Reaction = struct {
     elapsed_ns: u64,
     stats: NavUpdateStats,
 };
 
-// Three stages' shapes in the timed nav reactions (each stage's busiest batch, then its
-// threaded and non-empty batch counts) and the reactions' main-thread share and split: each
-// reaction minus its worker-side stage time.
+// Three stages' shapes in the timed nav reactions and the reactions' main-thread share and
+// split: each reaction minus its worker-side stage time.
 const ReactionStages = struct {
     samples: usize = 0,
     timed_ns: u128 = 0,
     main_ns: u128 = 0,
-    busiest: [3]BatchStats = @splat(.{}),
-    threaded: [3]usize = @splat(0),
-    dispatched: [3]usize = @splat(0),
+    shapes: suite.StageShapes(3) = .{},
     nav_main: suite.NavMainSummary = .{},
 
-    fn add(self: *ReactionStages, reaction: EvictReaction, batches: [3]BatchStats) void {
+    fn add(self: *ReactionStages, reaction: Reaction, batches: [3]BatchStats) void {
         self.samples += 1;
         self.timed_ns += reaction.elapsed_ns;
         const main_ns = reaction.elapsed_ns -| reaction.stats.off_main_stage_ns;
         self.main_ns += main_ns;
         self.nav_main.add(main_ns, reaction.stats);
         self.nav_main.endSample();
-        for (batches, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
-            if (batch.item_count == 0) continue;
-            dispatched.* += 1;
-            const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
-            if (on_workers) threaded.* += 1;
-            if (batch.item_count >= busiest.item_count) busiest.* = batch;
-        }
+        self.shapes.add(batches);
     }
 
-    // The stages' shapes, written into `shapes`.
-    fn labels(self: *const ReactionStages, shapes: *[3][48]u8) [3][]const u8 {
+    // The stages' shapes, written into `buffers`.
+    fn labels(self: *const ReactionStages, buffers: *[3][48]u8) [3][]const u8 {
         var stage_labels: [3][]const u8 = undefined;
-        for (self.busiest, self.threaded, self.dispatched, shapes, &stage_labels) |batch, threaded, dispatched, *buffer, *label| {
-            label.* = stageShape(buffer, batch, threaded, dispatched);
-        }
+        for (buffers, &stage_labels, 0..) |*buffer, *label, index| label.* = self.shapes.label(index, buffer);
         return stage_labels;
     }
 
@@ -3816,7 +3639,7 @@ const EvictReport = struct {
     visited: usize = 0,
     evicted: usize = 0,
 
-    fn add(self: *EvictReport, reaction: EvictReaction) void {
+    fn add(self: *EvictReport, reaction: Reaction) void {
         self.stages.add(reaction, .{ reaction.stats.evict_count_batch, reaction.stats.evict_batch, reaction.stats.evict_flush_batch });
         self.visited = reaction.stats.evict_entries_visited;
         self.evicted = reaction.stats.evicted_results;
@@ -3845,7 +3668,7 @@ const EvictReport = struct {
 
 // Builds the colliders and the world-backed nav over `open` and `data`, then moves them
 // and `requests` into the fixture. On error they stay with the caller.
-fn assembleEvictFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *DataSystem, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+fn assembleReactFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *DataSystem, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&open.world);
@@ -3867,45 +3690,35 @@ fn assembleEvictFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *D
     };
 }
 
-fn initEvictFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+fn initShortRouteFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, short_route_side, 1);
     errdefer open.world.deinit();
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     const requests = try buildShortRouteRequests(allocator, &data, &open, result_count);
     errdefer allocator.free(requests);
-    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
-// The region config's square: chunk-aligned from chunk (2, 2), `side` chunks a side, its
-// cells chunk by chunk (row-major within each chunk) as a dense writer emits them.
-fn evictRegionCells(allocator: std.mem.Allocator, region_chunks: usize, chunk_tiles: usize) ![]CellCoord {
-    const side = std.math.sqrt(region_chunks);
-    std.debug.assert(side * side == region_chunks);
-    const origin = 2 * chunk_tiles;
-    const extent = side * chunk_tiles;
-    std.debug.assert(origin + extent <= short_route_side);
-    const cells = try allocator.alloc(CellCoord, extent * extent);
-    const chunk_cells = chunk_tiles * chunk_tiles;
-    for (cells, 0..) |*cell, index| {
-        const chunk = index / chunk_cells;
-        const local = index % chunk_cells;
-        cell.* = .{
-            .x = @intCast(origin + (chunk % side) * chunk_tiles + local % chunk_tiles),
-            .y = @intCast(origin + (chunk / side) * chunk_tiles + local / chunk_tiles),
-        };
-    }
-    return cells;
+// The region config's square: chunk-aligned from chunk (2, 2), `edge` chunks a side.
+fn evictRegionChunks(allocator: std.mem.Allocator, edge: u16) ![]ChunkCoord {
+    if (2 + @as(usize, edge) > short_route_side / default_chunk_size_tiles) return error.EvictRegionTooLarge;
+    const chunks = try allocator.alloc(ChunkCoord, @as(usize, edge) * edge);
+    for (chunks, 0..) |*chunk, index| chunk.* = .{ .x = @intCast(2 + index % edge), .y = @intCast(2 + index / edge) };
+    return chunks;
 }
 
 fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const region_chunks = item_count / evict_region_encoding;
-    const result_count = item_count % evict_region_encoding;
-    var threads = try initCaseThreads(allocator, io, case);
+    const code = try EvictCode.decode(item_count);
+    const region_chunks = code.region_chunks;
+    const result_count = code.cached_results;
+    const region_edge = std.math.cast(u16, std.math.sqrt(region_chunks)) orelse return error.EvictRegionTooLarge;
+    if (@as(usize, region_edge) * region_edge != region_chunks) return error.EvictRegionNotSquare;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = suite.NavSizeConfig{
         .side = short_route_side,
         .levels = 1,
@@ -3913,25 +3726,29 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .agent_budget = evictAgentBudget(result_count),
         .group_fields = 1,
         .long_results = 0,
+        .runs_per_result = short_route_runs,
         // The dig's cell, or every cell of the region square; their chunks with their
         // neighbours.
         .batch = if (region_chunks == 0) toggle_batch else .{
             .mark_chunks = region_chunks * default_chunk_size_tiles * default_chunk_size_tiles,
             .links = 0,
-            .keys = squareBatchKeys(std.math.sqrt(region_chunks)),
+            .keys = suite.squareBatchKeys(region_edge),
         },
     };
-    if (suite.navSizeSkip(evict_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(evict_group.name, item_count, case, size_config);
 
-    var fixture = try initEvictFixture(allocator, io, result_count, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initShortRouteFixture(allocator, io, result_count, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
-    const region_cells: ?[]CellCoord = if (region_chunks == 0) null else try evictRegionCells(allocator, region_chunks, fixture.open.world.chunk_size_tiles);
+    const region_cells: ?[]CellCoord = if (region_chunks == 0) null else region: {
+        const chunks = try evictRegionChunks(allocator, region_edge);
+        defer allocator.free(chunks);
+        break :region try chunkCells(allocator, chunks, fixture.open.world.chunk_size_tiles);
+    };
     defer if (region_cells) |cells| allocator.free(cells);
     const cells: []const CellCoord = region_cells orelse &.{evict_dig_cell};
     try fixture.changed.ensureTotalCapacity(allocator, cells.len);
-    setNavReactionTuners(&fixture.system, case);
-    configureNavUpdateThreads(&fixture.system, case);
+    fixtures.setNavTuners(&fixture.system, case);
     try fixture.fillCache(case, thread_ptr);
 
     for (0..options.warmup_iterations) |_| {
@@ -3969,260 +3786,6 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     return stats;
 }
 
-// Gives the nav reaction's stages this case's tuners.
-fn setNavReactionTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
-        system.tuners.nav = .initFill(tuner);
-        system.tuners.nav_mark = tuner;
-        system.tuners.nav_evict_count = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
-        system.tuners.nav_evict = suite.adaptiveTunerForCase(case, evict_range_alignment_items).?;
-        system.tuners.evict_flush = suite.adaptiveTunerForCase(case, 1).?;
-    }
-}
-
-const group_field_pack_agents: usize = 24;
-
-// Rewrites `requests` with every pack's members requesting their pack's goal for `cycle`:
-// pack `p` owns a column band of the grid, starts in a block at its top, and its goal
-// marches up from the bottom one nav cell per cycle (never revisited).
-fn writeGroupFieldPackRequests(requests: *RangeOutputStream(PathRequest), entities: []const EntityId, packs: usize, cycle: usize) !void {
-    const side = group_field_detour_grid_side;
-    const band = side / packs;
-    std.debug.assert(band >= 16 and cycle < side / 2);
-    requests.clearRetainingCapacity();
-    try requests.reserve(1, entities.len);
-    const range_base = try requests.appendRangeCounts(1);
-    requests.addCount(range_base, entities.len);
-    try requests.prefixAppendedRanges(range_base);
-    var writer = requests.rangeWriter(range_base);
-    for (entities, 0..) |entity, index| {
-        const pack = index / group_field_pack_agents;
-        const member = index % group_field_pack_agents;
-        const start: FixtureCell = .{ .x = pack * band + 2 + member % 8, .y = 4 + (member / 8) * 2 };
-        const goal: FixtureCell = .{ .x = pack * band + band / 2, .y = side - 4 - cycle };
-        writer.write(.{
-            .entity = entity,
-            .kind = .group,
-            .start = .{ .x = @as(f32, @floatFromInt(start.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(start.y)) * 32.0 + 8.0 },
-            .goal = .{ .x = @as(f32, @floatFromInt(goal.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(goal.y)) * 32.0 + 8.0 },
-        });
-    }
-    writer.finish();
-    requests.finishWrite();
-}
-
-fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (item_count >= group_field_tunnel_min_cells) return runGroupFieldTunnelCase(allocator, io, options, case, item_count);
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side = group_field_detour_grid_side;
-    const packs = item_count;
-    const agent_count = packs * group_field_pack_agents;
-
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
-    const entities = try allocator.alloc(EntityId, agent_count);
-    defer allocator.free(entities);
-    for (entities) |*entity| entity.* = try data.createEntity();
-
-    var threads = try initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = packs,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = agent_count,
-        .min_group_field_agents = 8,
-        .group_field_rebuild_min_steps = group_field_detour_rebuild_min_steps,
-    });
-    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
-    try system.rebuildStaticNavGrid(&data, world_extent, world_extent, 32.0);
-
-    var requests = RangeOutputStream(PathRequest).init(allocator);
-    defer requests.deinit();
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    var stage_report = StageReport{};
-    var built_total: usize = 0;
-    var samples_total: usize = 0;
-    const total_cycles = group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles;
-    for (0..total_cycles) |cycle| {
-        try writeGroupFieldPackRequests(&requests, entities, packs, cycle);
-        const measured = cycle >= group_field_detour_moving_warmup_cycles;
-        for (0..group_field_detour_rekey_period_steps) |_| {
-            const start_ns = suite.nowNs(io);
-            const stats = try runColdOnce(&system, &requests, thread_ptr, case, agent_count, agent_count, agent_count);
-            const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-            if (!measured) continue;
-            accumulator.record(elapsed_ns, stats.group_field_batch);
-            stage_report.add(elapsed_ns, stats);
-            built_total += stats.group_fields_built;
-            samples_total += stats.group_field_samples;
-        }
-    }
-    stage_report.print(options, group_field_packs_group.name, item_count, case);
-    printFieldMemory(options, group_field_packs_group.name, item_count, case, &system);
-    // Every pack's field engages and is sampled.
-    std.debug.assert(built_total >= packs * group_field_detour_moving_cycles);
-    std.debug.assert(samples_total > 0);
-
-    var stats = accumulator.finish();
-    stats.output_count = built_total;
-    stats.candidate_pairs = samples_total;
-    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(built_total, stats.mean_ns * stats.iterations);
-    return stats;
-}
-
-// Per-field coverage and memory of a system's fields, averaged over the built fields.
-fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase, system: *const PathfindingSystem) void {
-    if (!options.details) return;
-    var fields: usize = 0;
-    var covered: usize = 0;
-    var blocks: usize = 0;
-    var resident: usize = 0;
-    for (system.group_fields.items) |*field| {
-        if (field.state == .empty) continue;
-        fields += 1;
-        covered += field.pushed_count;
-        blocks += field.used_blocks;
-        resident += field.residentBytes();
-    }
-    if (fields == 0) return;
-    std.debug.print("  {s} {} {s}: fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
-        group_name,
-        item_count,
-        case.name,
-        fields,
-        covered / fields,
-        blocks / fields,
-        resident / fields,
-        resident / @max(@as(usize, 1), covered),
-        system.group_field_pool_growth.count,
-        system.group_field_pool_failure.count,
-    });
-}
-
-const group_field_tunnel_side: usize = 1024;
-// Corridor pitch: one corridor row and column per default nav chunk.
-const group_field_tunnel_pitch: usize = 16;
-const group_field_tunnel_fields: usize = 4;
-const group_field_tunnel_agents: usize = 8;
-const group_field_tunnel_build_guard: usize = 256;
-
-// The lattice: a static body over each pitch-1 square between corridors.
-fn addTunnelLattice(data: *DataSystem) !void {
-    const pitch = group_field_tunnel_pitch;
-    const squares = group_field_tunnel_side / pitch;
-    const extent = @as(f32, @floatFromInt(pitch - 1)) * 32.0;
-    for (0..squares) |square_y| {
-        for (0..squares) |square_x| {
-            const entity = try data.createEntity();
-            const position = math.Vec2{ .x = @as(f32, @floatFromInt(square_x * pitch + 1)) * 32.0, .y = @as(f32, @floatFromInt(square_y * pitch + 1)) * 32.0 };
-            try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
-            try data.setCollisionBounds(entity, .{ .size = .{ .x = extent, .y = extent } });
-            try data.setCollisionResponse(entity, .{ .mobility = .static });
-        }
-    }
-}
-
-// Each field's crowd stands on the corridor row through its goal, the goal at a corridor
-// crossing in its own quadrant.
-fn writeTunnelRequests(requests: *RangeOutputStream(PathRequest), entities: []const EntityId) !void {
-    const side = group_field_tunnel_side;
-    const goals = [group_field_tunnel_fields]FixtureCell{ .{ .x = side / 4, .y = side / 4 }, .{ .x = 3 * side / 4, .y = side / 4 }, .{ .x = side / 4, .y = 3 * side / 4 }, .{ .x = 3 * side / 4, .y = 3 * side / 4 } };
-    requests.clearRetainingCapacity();
-    try requests.reserve(1, entities.len);
-    const range_base = try requests.appendRangeCounts(1);
-    requests.addCount(range_base, entities.len);
-    try requests.prefixAppendedRanges(range_base);
-    var writer = requests.rangeWriter(range_base);
-    for (entities, 0..) |entity, index| {
-        const goal = goals[index / group_field_tunnel_agents];
-        const start: FixtureCell = .{ .x = goal.x + 2 + index % group_field_tunnel_agents, .y = goal.y };
-        writer.write(.{
-            .entity = entity,
-            .kind = .group,
-            .start = .{ .x = @as(f32, @floatFromInt(start.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(start.y)) * 32.0 + 8.0 },
-            .goal = .{ .x = @as(f32, @floatFromInt(goal.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(goal.y)) * 32.0 + 8.0 },
-        });
-    }
-    writer.finish();
-    requests.finishWrite();
-}
-
-// Rebuilds the four fields from scratch (pools kept) until all are ready; times the steps.
-fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !struct { elapsed_ns: u64, batch: BatchStats } {
-    resetPathState(system, .drop_fields);
-    var elapsed_ns: u64 = 0;
-    var batch = BatchStats{};
-    for (0..group_field_tunnel_build_guard) |_| {
-        const start_ns = suite.nowNs(io);
-        const stats = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
-        elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
-        if (stats.group_field_begin_batch.item_count > batch.item_count) batch = stats.group_field_begin_batch;
-        if (stats.group_field_batch.item_count > batch.item_count) batch = stats.group_field_batch;
-        var ready: usize = 0;
-        for (system.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
-        if (ready == group_field_tunnel_fields) return .{ .elapsed_ns = elapsed_ns, .batch = batch };
-    }
-    return error.GroupFieldTunnelBuildStalled;
-}
-
-fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side = group_field_tunnel_side;
-    const agent_count = group_field_tunnel_fields * group_field_tunnel_agents;
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
-    try addTunnelLattice(&data);
-    const entities = try allocator.alloc(EntityId, agent_count);
-    defer allocator.free(entities);
-    for (entities) |*entity| entity.* = try data.createEntity();
-
-    var threads = try initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = group_field_tunnel_fields,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = agent_count,
-        .min_group_field_agents = group_field_tunnel_agents,
-        .group_field_max_cells = item_count,
-    });
-    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
-    try system.rebuildStaticNavGrid(&data, world_extent, world_extent, 32.0);
-    var requests = RangeOutputStream(PathRequest).init(allocator);
-    defer requests.deinit();
-    try writeTunnelRequests(&requests, entities);
-
-    const warmup = @min(options.warmup_iterations, cold_warmup_cap);
-    const iterations = @max(@as(usize, 1), @min(options.iterations, cold_iteration_cap));
-    for (0..warmup) |_| _ = try buildTunnelFields(io, &system, &requests, thread_ptr, case, agent_count);
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    for (0..iterations) |_| {
-        const built = try buildTunnelFields(io, &system, &requests, thread_ptr, case, agent_count);
-        accumulator.record(built.elapsed_ns, built.batch);
-    }
-    var covered: usize = 0;
-    for (system.group_fields.items) |field| covered += field.pushed_count;
-    // Every field covers its cap: the lattice's 126,976 cells reach past the largest cap.
-    std.debug.assert(covered == group_field_tunnel_fields * item_count);
-    printFieldMemory(options, group_field_packs_group.name, item_count, case, &system);
-
-    var stats = accumulator.finish();
-    stats.output_count = covered;
-    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(covered, stats.mean_ns);
-    return stats;
-}
-
 const elastic_ramp_steps: usize = 64;
 
 const ElasticRamp = struct {
@@ -4234,10 +3797,10 @@ const ElasticRamp = struct {
 
 fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = suite.NavSizeConfig{
         .side = short_route_side,
         .levels = 1,
@@ -4245,11 +3808,12 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         .agent_budget = item_count,
         .group_fields = 1,
         .long_results = 0,
+        .runs_per_result = short_route_runs,
         // Requests only: no marks batch.
         .batch = suite.NavBatch.none,
     };
-    if (suite.navSizeSkip(elastic_ramp_group.name, item_count, case, size_config)) |skip| return skip;
-    const capacity = navSizeCapacity(size_config);
+    try suite.checkNavSize(elastic_ramp_group.name, item_count, case, size_config);
+    const capacity = suite.navSizeCapacity(size_config);
 
     var open = try buildOpenWorld(allocator, io, short_route_side, 1);
     defer open.world.deinit();
@@ -4289,13 +3853,13 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 // steps until every agent's result is cached. Times the pathfinding updates only.
 fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSystem, capacity: PathfindingCapacity, stream: *RangeOutputStream(PathRequest), requests: []const PathRequest, thread_system: ?*ThreadSystem) !ElasticRamp {
     try system.reserve(capacity);
-    resetPathState(system, .drop_fields);
+    system.clearRuntimeState();
     const agent_total = requests.len;
     const step_limit = elastic_ramp_steps + 4 * suite.rangeCount(agent_total, default_max_solves_per_frame) + elastic_ramp_steps;
     var ramp = ElasticRamp{};
     for (0..step_limit) |step| {
         const live = if (step < elastic_ramp_steps) agent_total * (step + 1) / elastic_ramp_steps else agent_total;
-        try writeRequests(stream, requests[0..live]);
+        try fixtures.writeRequests(stream, requests[0..live]);
         const start_ns = suite.nowNs(io);
         const step_stats = try runColdOnce(system, stream, thread_system, case, live, live, live);
         ramp.elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
@@ -4378,11 +3942,11 @@ const ShrinkReport = struct {
 
 fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    if (item_count / elastic_shrink_divisor < min_capacity_floor) return suite.RunStats.skipped("an eighth of the agents is below the capacity floor; nothing shrinks");
-    var threads = try initCaseThreads(allocator, io, case);
+    if (item_count / elastic_shrink_divisor < min_capacity_floor) return error.ElasticShrinkBelowCapacityFloor;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = suite.NavSizeConfig{
         .side = short_route_side,
         .levels = 1,
@@ -4390,11 +3954,12 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         .agent_budget = item_count,
         .group_fields = 1,
         .long_results = 0,
+        .runs_per_result = short_route_runs,
         // Requests only: no marks batch.
         .batch = suite.NavBatch.none,
     };
-    if (suite.navSizeSkip(elastic_shrink_group.name, item_count, case, size_config)) |skip| return skip;
-    const capacity = navSizeCapacity(size_config);
+    try suite.checkNavSize(elastic_shrink_group.name, item_count, case, size_config);
+    const capacity = suite.navSizeCapacity(size_config);
 
     var open = try buildOpenWorld(allocator, io, short_route_side, 1);
     defer open.world.deinit();
@@ -4454,7 +4019,7 @@ fn runElasticShrink(
     _ = try runElasticRamp(io, case, system, capacity, stream, requests, thread_system);
     if (system.low_load_steps != 0) return error.ElasticShrinkRampLeftLowLoad;
     const held = requests[requests.len - requests.len / elastic_shrink_divisor ..];
-    try writeRequests(stream, held);
+    try fixtures.writeRequests(stream, held);
     const window = system.capacity.capacity_shrink_window;
     if (window < 2) return error.ElasticShrinkWindowTooShort;
     for (0..window - 2) |_| _ = try runHeldStep(system, stream, thread_system, case, held.len);
@@ -4508,104 +4073,6 @@ fn runHeldStep(system: *PathfindingSystem, stream: *RangeOutputStream(PathReques
     return stats;
 }
 
-fn runColdUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var fixture = try createFixture(allocator, item_count, .blocked_unreachable);
-    defer fixture.deinit();
-    const side = fixtureGridSide(item_count, .blocked_unreachable);
-    // Distinct goal cells right of the wall: one step's requests take distinct keys, and the
-    // rotation moves the next step on to other cells where the wall side has room. The
-    // per-step clear keeps any repeated key uncached.
-    const goal_cells = blockedLaneCount(side) * (side - 2);
-    if (goal_cells < item_count) return error.ColdUnreachableGoalCellsTooFew;
-    const requests = try allocator.dupe(PathRequest, fixture.requests.mergedItems());
-    defer allocator.free(requests);
-    var stream = RangeOutputStream(PathRequest).init(allocator);
-    defer stream.deinit();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    setPathStageTuners(&system, case);
-
-    var threads = try initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 8,
-        .worker_participant_count = participant_count,
-        .max_agent_budget = @max(item_count, 1),
-    });
-    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
-
-    var next_goal: usize = 0;
-    // Untimed priming step: the first step grows the capacity from the reserve floor.
-    _ = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
-    for (0..coldWarmup(options)) |_| {
-        _ = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) system.tuners.intake.isSettled() else false;
-
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    var last_stats = PathfindingStats{};
-    var stage_report = StageReport{};
-    for (0..coldIterations(options)) |_| {
-        const step = try runColdUnreachableStep(io, case, &system, &stream, requests, side, goal_cells, &next_goal, thread_ptr);
-        last_stats = step.stats;
-        accumulator.record(step.elapsed_ns, last_stats.intake_batch);
-        stage_report.add(step.elapsed_ns, last_stats);
-    }
-    stage_report.print(options, cold_unreachable_group.name, item_count, case);
-
-    var stats = accumulator.finish();
-    stats.output_count = last_stats.unavailable_results;
-    stats.candidate_pairs = last_stats.solved_requests;
-    stats.deferred_count = last_stats.pending_requests;
-    stats.cache_evictions = last_stats.cache_evictions;
-    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requests.len, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.intake.report(), settled_before_measurement);
-    return stats;
-}
-
-// Points every request at the next goal cells (untimed), clears the result state, and
-// times one step; every request must be answered unavailable at intake, with no solve.
-fn runColdUnreachableStep(
-    io: std.Io,
-    case: suite.BenchmarkCase,
-    system: *PathfindingSystem,
-    stream: *RangeOutputStream(PathRequest),
-    requests: []PathRequest,
-    side: usize,
-    goal_cells: usize,
-    next_goal: *usize,
-    thread_system: ?*ThreadSystem,
-) !struct { elapsed_ns: u64, stats: PathfindingStats } {
-    for (requests, 0..) |*request, index| {
-        const goal = requestGoalCell((next_goal.* + index) % goal_cells, side, .blocked_unreachable);
-        request.goal = .{
-            .x = @as(f32, @floatFromInt(goal.x)) * 32.0 + 8.0,
-            .y = @as(f32, @floatFromInt(goal.y)) * 32.0 + 8.0,
-        };
-    }
-    next_goal.* = (next_goal.* + requests.len) % goal_cells;
-    try writeRequests(stream, requests);
-    resetPathState(system, .drop_fields);
-    const start_ns = suite.nowNs(io);
-    const stats = try runColdOnce(system, stream, thread_system, case, requests.len, requests.len, requests.len);
-    const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-    if (stats.cache_hits != 0) return error.ColdUnreachableCacheHit;
-    if (stats.solved_requests != 0 or stats.accepted_requests != 0) return error.ColdUnreachableSearched;
-    if (stats.unavailable_results != requests.len) return error.ColdUnreachableNotAnsweredAtIntake;
-    return .{ .elapsed_ns = elapsed_ns, .stats = stats };
-}
-
 // Goal-pocket fixture: a walkable pocket of `pocket_side`² cells at the level origin, closed
 // by the level border and a blocking column x = `pocket_side` and row y = `pocket_side`.
 // Goals are pocket cells in row-major order; requesters start outside it on rows from
@@ -4616,8 +4083,6 @@ const pocket_requester_margin: u16 = 8;
 // The far dig sits this many cells in from the level's far corner.
 const pocket_dig_inset: u16 = 6;
 const negative_steady_side: u16 = 256;
-// Timed negative-steady steps draw their goals from this many steps' worth, in rotation.
-const negative_steady_pool_steps: usize = 16;
 
 fn pocketGoalCell(index: usize) CellCoord {
     std.debug.assert(index < @as(usize, pocket_side) * pocket_side);
@@ -4670,7 +4135,7 @@ fn checkPocketLayout(allocator: std.mem.Allocator, side: u16, goal_count: usize,
 
 // The pocket on a walkable `side`² level with one requester per request; goals are set per
 // step. Nav is world-backed, so the far dig reaches it through `changeAndReact`.
-fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, requester_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, requester_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, side, 1);
     errdefer open.world.deinit();
     const walls = pocketWallCells();
@@ -4686,7 +4151,7 @@ fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, reques
             .goal = open.cellCenter(pocketGoalCell(index)),
         };
     }
-    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
 fn pocketSizeConfig(side: u16, participant_count: usize, requester_count: usize) suite.NavSizeConfig {
@@ -4696,8 +4161,9 @@ fn pocketSizeConfig(side: u16, participant_count: usize, requester_count: usize)
         .participant_count = participant_count,
         .agent_budget = requester_count,
         .group_fields = 1,
-        // No path is published, so no long block is taken.
+        // No path is published, so no long block or registry run is taken.
         .long_results = 0,
+        .runs_per_result = 0,
         // At most one toggled cell per step.
         .batch = toggle_batch,
     };
@@ -4708,63 +4174,43 @@ const PocketStep = struct {
     stats: PathfindingStats,
 };
 
-// Points request `i` at goal `first_goal + i` when `first_goal` is given, then times one
-// update of every request. No requester reaches a goal, and each request is answered
-// unavailable, exhausts its attempt, or still waits.
-fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem, first_goal: ?usize) !PocketStep {
-    if (first_goal) |first| {
-        for (fixture.requests, 0..) |*request, index| request.goal = fixture.open.cellCenter(pocketGoalCell(first + index));
-    }
-    try writeRequests(&fixture.stream, fixture.requests);
+// Times one update of every request; intake must answer every one unavailable from reach,
+// with no solve and nothing cached.
+fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !PocketStep {
+    try fixtures.writeRequests(&fixture.stream, fixture.requests);
     const count = fixture.requests.len;
     const start_ns = suite.nowNs(io);
     const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.available_results != 0) return error.PocketGoalReached;
     if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.PocketRequestDropped;
-    if (stats.unavailable_results + stats.budget_exhausted + stats.escalated_deferred + stats.admission_deferred_requests != count) return error.PocketRequestUnaccounted;
+    if (stats.solved_requests != 0 or stats.accepted_requests != 0 or stats.cache_hits != 0) return error.PocketSearched;
+    if (stats.unavailable_results != count) return error.PocketNotAnsweredAtIntake;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
-}
-
-// One negative-steady step on goals from `first_goal`: intake answers every fresh request
-// unavailable from reach, with no solve and nothing cached.
-fn runNegativeSteadyStep(io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem, first_goal: usize) !PocketStep {
-    const step = try runPocketUpdate(io, case, fixture, thread_system, first_goal);
-    const count = fixture.requests.len;
-    if (step.stats.cache_hits != 0) return error.NegativeSteadyCacheHit;
-    if (step.stats.solved_requests != 0 or step.stats.accepted_requests != 0) return error.NegativeSteadySearched;
-    if (step.stats.unavailable_results != count) return error.NegativeSteadyNotAnsweredAtIntake;
-    if (step.stats.cache_evictions != 0) return error.NegativeSteadyEvicted;
-    return step;
 }
 
 fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = negative_steady_side;
-    try checkPocketLayout(allocator, side, negative_steady_pool_steps * item_count, item_count);
-    var threads = try initCaseThreads(allocator, io, case);
+    try checkPocketLayout(allocator, side, item_count, item_count);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, item_count);
-    if (suite.navSizeSkip(negative_steady_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(negative_steady_group.name, item_count, case, size_config);
 
-    var fixture = try initPocketFixture(allocator, io, side, item_count, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initPocketFixture(allocator, io, side, item_count, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     setPathStageTuners(&fixture.system, case);
 
-    var pool_step: usize = 0;
-    for (0..coldWarmup(options)) |_| {
-        _ = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, pool_step * item_count);
-        pool_step = (pool_step + 1) % negative_steady_pool_steps;
-    }
+    for (0..coldWarmup(options)) |_| _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
         while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, pool_step * item_count);
-            pool_step = (pool_step + 1) % negative_steady_pool_steps;
+            _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
         }
     }
     const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
@@ -4773,8 +4219,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
     for (0..coldIterations(options)) |_| {
-        const step = try runNegativeSteadyStep(io, case, &fixture, thread_ptr, pool_step * item_count);
-        pool_step = (pool_step + 1) % negative_steady_pool_steps;
+        const step = try runPocketUpdate(io, case, &fixture, thread_ptr);
         last_stats = step.stats;
         accumulator.record(step.elapsed_ns, last_stats.intake_batch);
         stage_report.add(step.elapsed_ns, last_stats);
@@ -4784,60 +4229,40 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     try suite.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = last_stats.unavailable_results;
-    stats.cache_evictions = last_stats.cache_evictions;
-    stats.candidate_pairs = last_stats.cache_hits;
-    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
     return stats;
 }
 
-// The timed negative-dig steps' reaction/update split, the reaction's remask shape, and the
-// last step's outcome, printed under --details. The reaction's eviction stages and
-// main-thread share print through `EvictReport`.
+// The timed negative-dig steps' reaction/update split and the reaction's remask shape,
+// printed under --details. The reaction's eviction stages and main-thread share print through
+// `EvictReport`.
 const NegativeDigReport = struct {
     samples: usize = 0,
     react_ns: u128 = 0,
     update_ns: u128 = 0,
-    remask_busiest: BatchStats = .{},
-    remask_threaded: usize = 0,
-    remask_dispatched: usize = 0,
-    last: PathfindingStats = .{},
+    remask: suite.StageShapes(1) = .{},
 
-    fn add(self: *NegativeDigReport, reaction: EvictReaction, step: PocketStep) void {
+    fn add(self: *NegativeDigReport, reaction: Reaction, step: PocketStep) void {
         self.samples += 1;
         self.react_ns += reaction.elapsed_ns;
         self.update_ns += step.elapsed_ns;
-        self.last = step.stats;
-        const remask = reaction.stats.remask_batch;
-        if (remask.item_count == 0) return;
-        self.remask_dispatched += 1;
-        if (!remask.ran_inline and remask.active_worker_threads != 0) self.remask_threaded += 1;
-        if (remask.item_count >= self.remask_busiest.item_count) self.remask_busiest = remask;
+        self.remask.add(.{reaction.stats.remask_batch});
     }
 
     fn print(self: NegativeDigReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.samples == 0) return;
         const samples: u128 = self.samples * std.time.ns_per_us;
         var remask_buffer: [48]u8 = undefined;
-        std.debug.print("  {s} {} {s}: react={}us update={}us remask={s} unavailable={} solves={} pending={}\n", .{
+        std.debug.print("  {s} {} {s}: react={}us update={}us remask={s}\n", .{
             negative_dig_group.name,
             item_count,
             case.name,
             @as(u64, @intCast(self.react_ns / samples)),
             @as(u64, @intCast(self.update_ns / samples)),
-            stageShape(&remask_buffer, self.remask_busiest, self.remask_threaded, self.remask_dispatched),
-            self.last.unavailable_results,
-            self.last.solved_requests,
-            self.last.pending_requests,
+            self.remask.label(0, &remask_buffer),
         });
     }
 };
-
-// Fails unless intake answered every request unavailable from reach, with no solve.
-fn expectAnsweredAtIntake(stats: PathfindingStats, count: usize) !void {
-    if (stats.solved_requests != 0 or stats.accepted_requests != 0) return error.NegativeDigSearched;
-    if (stats.unavailable_results != count) return error.NegativeDigNotAnsweredAtIntake;
-}
 
 // The negative-dig step: toggles the far cell's blocking and runs the nav reaction (its
 // time measured inside `changeAndReact`), then updates the same requests, every one
@@ -4846,40 +4271,39 @@ const NegativeDig = struct {
     cell: CellCoord,
     blocked: bool = false,
 
-    fn step(self: *NegativeDig, io: std.Io, case: suite.BenchmarkCase, fixture: *EvictFixture, thread_system: ?*ThreadSystem) !struct { reaction: EvictReaction, update: PocketStep } {
+    fn step(self: *NegativeDig, io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !struct { reaction: Reaction, update: PocketStep } {
         self.blocked = !self.blocked;
         const tile = if (self.blocked) fixture.open.blocking else fixture.open.walkable;
         const reaction = try fixture.changeAndReact(io, &.{self.cell}, tile, thread_system);
-        const update = try runPocketUpdate(io, case, fixture, thread_system, null);
-        try expectAnsweredAtIntake(update.stats, fixture.requests.len);
+        const update = try runPocketUpdate(io, case, fixture, thread_system);
         return .{ .reaction = reaction, .update = update };
     }
 };
 
 fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    const side: u16 = @intCast(item_count / level_case_encoding);
-    const requester_count = item_count % level_case_encoding;
+    const code = try NegativeDigCode.decode(item_count);
+    const side = code.level_side;
+    const requester_count: usize = code.requests;
     if (requester_count == 0) return error.NegativeDigNoRequests;
     try checkPocketLayout(allocator, side, requester_count, requester_count);
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, requester_count);
-    if (suite.navSizeSkip(negative_dig_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(negative_dig_group.name, item_count, case, size_config);
 
-    var fixture = try initPocketFixture(allocator, io, side, requester_count, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initPocketFixture(allocator, io, side, requester_count, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     try fixture.changed.ensureTotalCapacity(allocator, 1);
     setPathStageTuners(&fixture.system, case);
-    setNavReactionTuners(&fixture.system, case);
-    configureNavUpdateThreads(&fixture.system, case);
+    fixtures.setNavTuners(&fixture.system, case);
 
     // Untimed first update: every request answered at intake, as every later one.
     var report = NegativeDigReport{};
-    try expectAnsweredAtIntake((try runPocketUpdate(io, case, &fixture, thread_ptr, null)).stats, requester_count);
+    _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
 
     var dig = NegativeDig{ .cell = pocketDigCell(side) };
     for (0..coldWarmup(options)) |_| _ = try dig.step(io, case, &fixture, thread_ptr);
@@ -4909,10 +4333,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 
     try suite.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
-    stats.output_count = report.last.solved_requests;
-    stats.candidate_pairs = report.last.unavailable_results;
-    stats.sample_count = report.last.budget_exhausted;
-    stats.deferred_count = report.last.pending_requests;
+    stats.output_count = requester_count;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
     return stats;
@@ -4933,8 +4354,6 @@ const burst_requester_columns: usize = burst_side - 2 * pocket_requester_margin;
 // Per pocket: two side columns of `burst_pocket_side + 1` cells and the row between them.
 const burst_wall_cells_per_pocket: usize = 3 * burst_pocket_side + 2;
 const burst_block_side: u16 = 3;
-// The item code's variant digit sits above every request count.
-const burst_variant_encoding: usize = 1_000_000;
 
 comptime {
     // Requesters start below every pocket's bottom wall, and the last pocket's right wall
@@ -4945,7 +4364,7 @@ comptime {
     std.debug.assert(burst_block_side < burst_pocket_side);
 }
 
-const BurstVariant = enum {
+const BurstVariant = enum(u8) {
     // Each request's own open goal cell.
     open_goals,
     // Every request of a pocket at its blocked center.
@@ -4957,12 +4376,8 @@ const BurstConfig = struct {
     requests: usize,
 
     fn decode(item_count: usize) !BurstConfig {
-        const variant: BurstVariant = switch (item_count / burst_variant_encoding) {
-            0 => .open_goals,
-            1 => .blocked_crowd,
-            else => return error.NegativeBurstUnknownVariant,
-        };
-        return .{ .variant = variant, .requests = item_count % burst_variant_encoding };
+        const code = try BurstCode.decode(item_count);
+        return .{ .variant = code.variant, .requests = code.requests };
     }
 };
 
@@ -5033,7 +4448,7 @@ fn checkBurstLayout(config: BurstConfig) !void {
     if (burst_requester_row + rows > burst_side) return error.NegativeBurstRequesterRowsTooFew;
 }
 
-fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, burst_side, 1);
     errdefer open.world.deinit();
     const walls = burstWallCells();
@@ -5053,7 +4468,7 @@ fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfi
             .goal = open.cellCenter(burstGoalCell(config.variant, index)),
         };
     }
-    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
 fn burstSizeConfig(participant_count: usize, requester_count: usize) suite.NavSizeConfig {
@@ -5063,15 +4478,16 @@ fn burstSizeConfig(participant_count: usize, requester_count: usize) suite.NavSi
         .participant_count = participant_count,
         .agent_budget = requester_count,
         .group_fields = 1,
-        // No path is published, so no long block is taken.
+        // No path is published, so no long block or registry run is taken.
         .long_results = 0,
+        .runs_per_result = 0,
         // Requests only: no marks batch.
         .batch = suite.NavBatch.none,
     };
 }
 
 // Requests whose status reads unavailable: one status query per request.
-fn unavailableCount(fixture: *const EvictFixture) usize {
+fn unavailableCount(fixture: *const ReactFixture) usize {
     var unavailable: usize = 0;
     for (fixture.requests) |request| {
         const view = fixture.system.statusForWorld(request.start_level, request.start, request.goal_level, request.goal, request.agent_class, null);
@@ -5080,18 +4496,16 @@ fn unavailableCount(fixture: *const EvictFixture) usize {
     return unavailable;
 }
 
-// The burst's goal resolves under --details: the scan and project stage shapes (each its
-// busiest timed batch) and their worker-side time per burst.
+// The burst's goal resolves under --details: the scan and project stage shapes and their
+// worker-side time per burst.
 const ResolveReport = struct {
     samples: usize = 0,
-    scan: BatchStats = .{},
-    project: BatchStats = .{},
+    shapes: suite.StageShapes(2) = .{},
     off_main_ns: u128 = 0,
 
     fn add(self: *ResolveReport, resolve: GoalResolveStats) void {
         self.samples += 1;
-        if (resolve.scan_batch.item_count >= self.scan.item_count) self.scan = resolve.scan_batch;
-        if (resolve.project_batch.item_count >= self.project.item_count) self.project = resolve.project_batch;
+        self.shapes.add(.{ resolve.scan_batch, resolve.project_batch });
         self.off_main_ns += offMainNs(resolve.scan_batch) + offMainNs(resolve.project_batch);
     }
 
@@ -5103,100 +4517,72 @@ const ResolveReport = struct {
             negative_burst_group.name,
             item_count,
             case.name,
-            stageShape(&scan_buffer, self.scan, @intFromBool(!self.scan.ran_inline), 1),
-            stageShape(&project_buffer, self.project, @intFromBool(!self.project.ran_inline), @intFromBool(self.project.item_count != 0)),
+            self.shapes.label(0, &scan_buffer),
+            self.shapes.label(1, &project_buffer),
             @as(u64, @intCast(self.off_main_ns / self.samples / std.time.ns_per_us)),
         });
     }
 };
 
 const BurstOutcome = struct {
-    // Sum of the burst's step times (goal resolve and update); the status sweeps are
-    // included in the blocked-crowd variant only.
-    elapsed_ns: u64 = 0,
-    steps: usize = 0,
-    // The step after which every request's status read unavailable.
-    status_steps: usize = 0,
-    max_step_ns: u64 = 0,
-    searches: usize = 0,
-    unavailable: usize = 0,
-    // Projections the goal resolves computed, and blocked goals intake projected itself.
-    projections: usize = 0,
-    fallbacks: usize = 0,
-    // The submitting step's stats, and its goal resolve's.
-    first: PathfindingStats = .{},
-    first_resolve: GoalResolveStats = .{},
+    // The goal resolve and the step, plus the status sweep in the blocked-crowd variant.
+    elapsed_ns: u64,
+    unavailable: usize,
+    // Projections the goal resolve computed.
+    projections: usize,
+    stats: PathfindingStats,
+    resolve: GoalResolveStats,
 };
 
-// One burst on cleared result state: every request on the first step, each step opening
-// with the goal resolve over every request (the pipeline resolves every intent each step).
-// Intake answers every request unavailable from reach on that step, with no search and
-// nothing pending, and every status reads unavailable after it.
-fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixture: *EvictFixture, thread_system: ?*ThreadSystem, stage_report: ?*StageReport) !BurstOutcome {
+// One burst on cleared result state: the goal resolve over every request (the pipeline
+// resolves every intent each step) and the step that submits them. Intake answers every
+// request unavailable from reach on that step, with no search and nothing pending, and every
+// status reads unavailable after it.
+fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !BurstOutcome {
     const count = fixture.requests.len;
-    resetPathState(&fixture.system, .drop_fields);
-    try writeRequests(&fixture.stream, fixture.requests);
-    const step_limit = suite.rangeCount(count, default_max_solves_per_frame) + 1;
-    var outcome = BurstOutcome{};
-    var stream = &fixture.stream;
-    while (true) {
-        if (outcome.steps == step_limit) return error.NegativeBurstNotDrained;
-        const start_ns = suite.nowNs(io);
-        const resolve = try runResolveGoals(&fixture.system, fixture.requests, thread_system, case);
-        const stats = try runColdOnce(&fixture.system, stream, thread_system, case, count, count, count);
-        var elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        outcome.projections += resolve.distinct;
-        outcome.fallbacks += stats.goal_fallbacks;
-        if (outcome.steps == 0) outcome.first_resolve = resolve;
-        if (stats.available_results != 0) return error.NegativeBurstGoalReached;
-        if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.NegativeBurstRequestDropped;
-        if (outcome.steps == 0) outcome.first = stats;
-        outcome.steps += 1;
-        outcome.searches += stats.solved_requests;
-        outcome.unavailable += stats.unavailable_results;
-        // The update's stages and main share; the resolve's worker time prints on its own.
-        if (stage_report) |report| report.add(elapsed_ns -| (offMainNs(resolve.scan_batch) + offMainNs(resolve.project_batch)), stats);
-        stream = &fixture.empty;
-        const status_start_ns = suite.nowNs(io);
-        const all_unavailable = unavailableCount(fixture) == count;
-        if (variant == .blocked_crowd) elapsed_ns += suite.elapsedNs(status_start_ns, suite.nowNs(io));
-        outcome.elapsed_ns += elapsed_ns;
-        outcome.max_step_ns = @max(outcome.max_step_ns, elapsed_ns);
-        if (outcome.status_steps == 0 and all_unavailable) outcome.status_steps = outcome.steps;
-        if (stats.pending_requests == 0) break;
-    }
-    if (outcome.unavailable != count) return error.NegativeBurstUnanswered;
-    if (outcome.steps != 1 or outcome.searches != 0) return error.NegativeBurstSearched;
-    if (outcome.status_steps != 1) return error.NegativeBurstStatusNotUnavailable;
+    fixture.system.clearRuntimeState();
+    try fixtures.writeRequests(&fixture.stream, fixture.requests);
+    const start_ns = suite.nowNs(io);
+    const resolve = try runResolveGoals(&fixture.system, fixture.requests, thread_system, case);
+    const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
+    var elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+    if (stats.available_results != 0) return error.NegativeBurstGoalReached;
+    if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.NegativeBurstRequestDropped;
+    if (stats.unavailable_results != count or stats.pending_requests != 0) return error.NegativeBurstUnanswered;
+    if (stats.solved_requests != 0) return error.NegativeBurstSearched;
+    const status_start_ns = suite.nowNs(io);
+    const all_unavailable = unavailableCount(fixture) == count;
+    if (variant == .blocked_crowd) elapsed_ns += suite.elapsedNs(status_start_ns, suite.nowNs(io));
+    if (!all_unavailable) return error.NegativeBurstStatusNotUnavailable;
     // One projection per distinct blocked goal, shared: four for the blocked crowd.
     const expected_projections: usize = if (variant == .blocked_crowd) burst_pockets else 0;
-    if (outcome.projections != expected_projections * outcome.steps or outcome.fallbacks != 0) return error.NegativeBurstProjectionsNotShared;
-    return outcome;
+    if (resolve.distinct != expected_projections or stats.goal_fallbacks != 0) return error.NegativeBurstProjectionsNotShared;
+    return .{ .elapsed_ns = elapsed_ns, .unavailable = stats.unavailable_results, .projections = resolve.distinct, .stats = stats, .resolve = resolve };
 }
 
 fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try BurstConfig.decode(item_count);
     try checkBurstLayout(config);
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = burstSizeConfig(participant_count, config.requests);
-    if (suite.navSizeSkip(negative_burst_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(negative_burst_group.name, item_count, case, size_config);
 
-    var fixture = try initBurstFixture(allocator, io, config, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initBurstFixture(allocator, io, config, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     setPathStageTuners(&fixture.system, case);
 
     // At least one untimed burst: the first grows the capacity from the reserve floor.
-    for (0..@max(1, coldWarmup(options))) |_| _ = try runBurst(io, case, config.variant, &fixture, thread_ptr, null);
+    for (0..@max(1, coldWarmup(options))) |_| _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = coldSettleLimit(options);
         while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runBurst(io, case, config.variant, &fixture, thread_ptr, null);
+            _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
         }
     }
     const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
@@ -5204,27 +4590,25 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};
     var resolve_report = ResolveReport{};
-    var last = BurstOutcome{};
-    var max_step_total: u128 = 0;
+    var last: ?BurstOutcome = null;
     for (0..coldIterations(options)) |_| {
-        last = try runBurst(io, case, config.variant, &fixture, thread_ptr, &stage_report);
-        resolve_report.add(last.first_resolve);
-        accumulator.record(last.elapsed_ns, last.first.intake_batch);
-        max_step_total += last.max_step_ns;
+        const burst = try runBurst(io, case, config.variant, &fixture, thread_ptr);
+        resolve_report.add(burst.resolve);
+        // The update's stages and main share; the resolve's worker time prints on its own.
+        stage_report.add(burst.elapsed_ns -| (offMainNs(burst.resolve.scan_batch) + offMainNs(burst.resolve.project_batch)), burst.stats);
+        accumulator.record(burst.elapsed_ns, burst.stats.intake_batch);
+        last = burst;
     }
     stage_report.print(options, negative_burst_group.name, item_count, case);
+    resolve_report.print(options, item_count, case);
 
     try suite.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
-    stats.output_count = last.unavailable;
-    stats.candidate_pairs = last.searches;
-    stats.sample_count = last.steps;
-    stats.deferred_count = last.status_steps;
-    stats.cache_evictions = last.projections;
-    stats.fallback_deferred_count = last.fallbacks;
-    if (accumulator.iterations != 0) stats.max_step_ns = @intCast(max_step_total / accumulator.iterations);
-    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
-    resolve_report.print(options, item_count, case);
+    if (last) |burst| {
+        stats.output_count = burst.unavailable;
+        stats.candidate_pairs = burst.projections;
+    }
+    stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
     return stats;
 }
@@ -5235,11 +4619,11 @@ const toggle_agent_budget: usize = 8;
 // One timed toggle: a change of `cells` and its nav reaction, then the revert and its
 // reaction, with the change reaction's plan, remask, and patch batches.
 const ToggleSample = struct {
-    change: EvictReaction,
+    change: Reaction,
     // The change reaction's plan, remask, patch, connectivity seed, gather, and flood, and
     // closure candidates, resolve, mask, plan, rows, and landing.
     change_stages: [toggle_stage_count]BatchStats,
-    revert: EvictReaction,
+    revert: Reaction,
 
     fn elapsedNs(self: ToggleSample) u64 {
         return self.change.elapsed_ns + self.revert.elapsed_ns;
@@ -5266,14 +4650,14 @@ fn checkOnewayReserve(stats: NavUpdateStats) !void {
 // Fails when a toggle reaction relocated, landed, allocated, or freed a block, or grew or
 // released the batch tail (its capacity left `tail_capacity`): a toggle in place touches only
 // its own system's rows.
-fn checkOnewayIsolated(fixture: *const EvictFixture, stats: NavUpdateStats, tail_capacity: usize) !void {
+fn checkOnewayIsolated(fixture: *const ReactFixture, stats: NavUpdateStats, tail_capacity: usize) !void {
     if (stats.closure_landed_words != 0 or stats.closure_tail_used != 0) return error.ConnectivityOnewayBallastLanded;
     if (stats.closure_block_allocs != 0 or stats.closure_block_frees != 0) return error.ConnectivityOnewayBallastBlocks;
     if (fixture.system.graph.connectivity.closure.tail.capacity != tail_capacity) return error.ConnectivityOnewayBallastTail;
 }
 
 // Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again.
-fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !ToggleSample {
+fn runToggle(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !ToggleSample {
     const tail_capacity = fixture.system.graph.connectivity.closure.tail.capacity;
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
     if (checks.isolated) try checkOnewayIsolated(fixture, change.stats, tail_capacity);
@@ -5297,130 +4681,83 @@ fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, threa
 
 const toggle_stage_count = 12;
 
-// The timed toggles' change and revert reactions, the change reaction's plan, remask, patch,
-// connectivity seed, gather, and flood, and closure candidates, resolve, mask, plan, rows,
-// and landing shapes (each stage's busiest batch), its closure counters and closure rows'
-// dispatch time on workers, its connectivity flood (nodes expanded, root-groups, families,
-// rounds, the fewest and most searches a round dispatched, components split off, dispatch
-// time on workers) beside the revert's flood nodes, the flood tuner's policy after the
-// samples, and the reactions' main-thread share: each reaction minus its worker-side stage
-// time. Printed under --details.
+// The timed toggles' change and revert reactions: their times and main-thread share, printed
+// under --details; and, for the workload column, the change reaction's stage shapes (each
+// stage's busiest batch), its connectivity and closure summary beside the revert's flood
+// nodes, and both reactions' main-thread split.
 const ToggleReport = struct {
     samples: usize = 0,
     change_ns: u128 = 0,
     revert_ns: u128 = 0,
     main_ns: u128 = 0,
-    busiest: [toggle_stage_count]BatchStats = @splat(.{}),
-    threaded: [toggle_stage_count]usize = @splat(0),
-    dispatched: [toggle_stage_count]usize = @splat(0),
-    closure_touched: usize = 0,
-    closure_links: usize = 0,
-    closure_terms_new: usize = 0,
-    closure_terms_left: usize = 0,
-    closure_a_rows: usize = 0,
-    closure_rounds: usize = 0,
-    closure_words_written: usize = 0,
-    closure_shrinks: usize = 0,
+    // Plan, remask, patch, connectivity seed, gather, and flood, and closure candidates,
+    // resolve, mask, plan, rows, and landing.
+    shapes: suite.StageShapes(toggle_stage_count) = .{},
+    last_change: NavUpdateStats = .{},
+    revert_flood_nodes: usize = 0,
     // Summed over both reactions of every sample.
+    closure_shrinks: usize = 0,
     closure_block_allocs: usize = 0,
     closure_block_frees: usize = 0,
     closure_landed_words: usize = 0,
-    closure_live_words: usize = 0,
-    closure_tail_capacity: usize = 0,
-    closure_rows_off_main_ns: u128 = 0,
-    // The closure reserve of the sample's reaction with the larger tail bound.
-    closure_tail_bound: usize = 0,
-    closure_tail_used: usize = 0,
-    closure_candidate_words: usize = 0,
-    closure_kb: usize = 0,
-    chunks_patched: usize = 0,
-    records_patched: usize = 0,
-    flood_nodes: usize = 0,
-    groups: usize = 0,
-    families: usize = 0,
-    rounds: usize = 0,
-    round_items_min: usize = 0,
-    round_items_max: usize = 0,
-    splits: usize = 0,
-    flood_off_main_ns: u64 = 0,
-    revert_flood_nodes: usize = 0,
-    // The flood tuner's workers when the case runs it adaptive (zero: inline).
-    flood_tuner_workers: ?usize = null,
-    // Both reactions' main-thread split, per sample.
+    // The change reactions' closure rows on workers, summed.
+    closure_rows_off_main_ns: u64 = 0,
+    // The sample reaction with the larger closure tail bound.
+    reserve: NavUpdateStats = .{},
     nav_main: suite.NavMainSummary = .{},
 
     fn add(self: *ToggleReport, sample: ToggleSample) void {
+        const change = sample.change.stats;
+        const revert = sample.revert.stats;
         self.samples += 1;
         self.change_ns += sample.change.elapsed_ns;
         self.revert_ns += sample.revert.elapsed_ns;
-        self.main_ns += (sample.change.elapsed_ns -| sample.change.stats.off_main_stage_ns) + (sample.revert.elapsed_ns -| sample.revert.stats.off_main_stage_ns);
-        self.nav_main.add(sample.change.elapsed_ns -| sample.change.stats.off_main_stage_ns, sample.change.stats);
-        self.nav_main.add(sample.revert.elapsed_ns -| sample.revert.stats.off_main_stage_ns, sample.revert.stats);
+        self.main_ns += (sample.change.elapsed_ns -| change.off_main_stage_ns) + (sample.revert.elapsed_ns -| revert.off_main_stage_ns);
+        self.nav_main.add(sample.change.elapsed_ns -| change.off_main_stage_ns, change);
+        self.nav_main.add(sample.revert.elapsed_ns -| revert.off_main_stage_ns, revert);
         self.nav_main.endSample();
-        self.chunks_patched = sample.change.stats.chunks_patched;
-        self.records_patched = sample.change.stats.records_patched;
-        self.flood_nodes = sample.change.stats.conn_flood_nodes;
-        self.groups = sample.change.stats.conn_groups;
-        self.families = sample.change.stats.conn_families;
-        self.rounds = sample.change.stats.conn_rounds;
-        self.round_items_min = sample.change.stats.conn_round_items_min;
-        self.round_items_max = sample.change.stats.conn_round_items_max;
-        self.flood_off_main_ns = sample.change.stats.conn_flood_off_main_ns;
-        self.splits = sample.change.stats.conn_splits;
-        self.revert_flood_nodes = sample.revert.stats.conn_flood_nodes;
-        const closure = sample.change.stats;
-        self.closure_touched = closure.closure_touched;
-        self.closure_links = closure.closure_links;
-        self.closure_terms_new = closure.closure_terms_new;
-        self.closure_terms_left = closure.closure_terms_left;
-        self.closure_a_rows = closure.closure_a_rows;
-        self.closure_rounds = closure.closure_rounds;
-        self.closure_words_written = closure.closure_words_written;
-        self.closure_shrinks += closure.closure_shrinks + sample.revert.stats.closure_shrinks;
-        const revert = sample.revert.stats;
-        self.closure_block_allocs += closure.closure_block_allocs + revert.closure_block_allocs;
-        self.closure_block_frees += closure.closure_block_frees + revert.closure_block_frees;
-        self.closure_landed_words += closure.closure_landed_words + revert.closure_landed_words;
-        self.closure_live_words = closure.closure_live_words;
-        self.closure_tail_capacity = closure.closure_tail_capacity;
-        self.closure_rows_off_main_ns += offMainNs(closure.conn_closure_rows_batch);
-        const reserve = if (revert.closure_tail_bound > closure.closure_tail_bound) revert else closure;
-        self.closure_tail_bound = reserve.closure_tail_bound;
-        self.closure_tail_used = reserve.closure_tail_used;
-        self.closure_candidate_words = reserve.closure_candidate_words;
-        self.closure_kb = reserve.closure_kb;
-        for (sample.change_stages, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
-            if (batch.item_count == 0) continue;
-            dispatched.* += 1;
-            const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
-            if (on_workers) threaded.* += 1;
-            if (batch.item_count >= busiest.item_count) busiest.* = batch;
+        self.shapes.add(sample.change_stages);
+        self.last_change = change;
+        self.revert_flood_nodes = revert.conn_flood_nodes;
+        self.closure_shrinks += change.closure_shrinks + revert.closure_shrinks;
+        self.closure_block_allocs += change.closure_block_allocs + revert.closure_block_allocs;
+        self.closure_block_frees += change.closure_block_frees + revert.closure_block_frees;
+        self.closure_landed_words += change.closure_landed_words + revert.closure_landed_words;
+        self.closure_rows_off_main_ns += offMainNs(change.conn_closure_rows_batch);
+        if (self.samples == 1 or @max(change.closure_tail_bound, revert.closure_tail_bound) > self.reserve.closure_tail_bound) {
+            self.reserve = if (revert.closure_tail_bound > change.closure_tail_bound) revert else change;
         }
     }
 
-    // The busiest plan, remask, and patch batches into `stats`' nav stage summaries.
-    fn summarize(self: ToggleReport, stats: *suite.RunStats) void {
+    // The busiest plan, remask, and patch batches, the connectivity summary, and the
+    // main-thread split into `stats`.
+    fn summarize(self: ToggleReport, stats: *suite.RunStats, flood_tuner_workers: ?usize) void {
+        const busiest = self.shapes.busiest;
         stats.nav_main = self.nav_main;
-        stats.nav_plan_batch = suite.batchSummaryFromBatch(self.busiest[0]);
-        stats.batch = suite.batchSummaryFromBatch(self.busiest[1]);
-        stats.secondary_batch = suite.batchSummaryFromBatch(self.busiest[2]);
+        stats.nav_plan_batch = suite.batchSummaryFromBatch(busiest[0]);
+        stats.batch = suite.batchSummaryFromBatch(busiest[1]);
+        stats.secondary_batch = suite.batchSummaryFromBatch(busiest[2]);
+        var conn = suite.navConnSummary(self.last_change, flood_tuner_workers);
+        const stage_summaries = [_]*suite.BatchSummary{ &conn.seed, &conn.gather, &conn.flood, &conn.candidates, &conn.closure_resolve, &conn.closure_mask, &conn.closure_plan, &conn.closure_rows, &conn.closure_land };
+        for (stage_summaries, busiest[3..]) |summary, batch| summary.* = suite.batchSummaryFromBatch(batch);
+        conn.reopen_flood_nodes = self.revert_flood_nodes;
+        conn.closure_shrinks = self.closure_shrinks;
+        conn.closure_block_allocs = self.closure_block_allocs;
+        conn.closure_block_frees = self.closure_block_frees;
+        conn.closure_landed_words = self.closure_landed_words;
+        conn.closure_rows_off_main_ns = if (self.samples == 0) 0 else self.closure_rows_off_main_ns / self.samples;
+        conn.closure_tail_bound = self.reserve.closure_tail_bound;
+        conn.closure_tail_used = self.reserve.closure_tail_used;
+        conn.closure_candidate_words = self.reserve.closure_candidate_words;
+        conn.closure_kb = self.reserve.closure_kb;
+        stats.nav_conn = conn;
     }
 
     fn print(self: ToggleReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
         if (!options.details or self.samples == 0) return;
-        var shapes: [toggle_stage_count][48]u8 = undefined;
-        var labels: [toggle_stage_count][]const u8 = undefined;
-        for (self.busiest, self.threaded, self.dispatched, &shapes, &labels) |batch, threaded, dispatched, *buffer, *label| {
-            label.* = stageShape(buffer, batch, threaded, dispatched);
-        }
         const samples: u128 = self.samples * std.time.ns_per_us;
         const timed_ns = self.change_ns + self.revert_ns;
-        var tuner_buffer: [24]u8 = undefined;
-        const tuner: []const u8 = if (self.flood_tuner_workers) |workers|
-            (if (workers == 0) "inline" else std.fmt.bufPrint(&tuner_buffer, "{}w", .{workers}) catch "tuner")
-        else
-            "-";
-        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%) plan={s} remask={s} patch={s} conn_seed={s} conn_gather={s} conn_flood={s} flood_nodes={} groups={} families={} rounds={} round_items={}-{} splits={} flood_off_main={}us flood_tuner={s} reopen_flood_nodes={} chunks_patched={} records_patched={}", .{
+        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%)\n", .{
             group_name,
             item_count,
             case.name,
@@ -5428,52 +4765,6 @@ const ToggleReport = struct {
             @as(u64, @intCast(self.revert_ns / samples)),
             @as(u64, @intCast(self.main_ns / samples)),
             @as(u64, @intCast(if (timed_ns == 0) 0 else self.main_ns * 100 / timed_ns)),
-            labels[0],
-            labels[1],
-            labels[2],
-            labels[3],
-            labels[4],
-            labels[5],
-            self.flood_nodes,
-            self.groups,
-            self.families,
-            self.rounds,
-            self.round_items_min,
-            self.round_items_max,
-            self.splits,
-            self.flood_off_main_ns / std.time.ns_per_us,
-            tuner,
-            self.revert_flood_nodes,
-            self.chunks_patched,
-            self.records_patched,
-        });
-        std.debug.print(" conn_candidates={s} closure_resolve={s} closure_mask={s} closure_plan={s} closure_rows={s} closure_land={s} touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} block_allocs={} block_frees={} landed_words={} live_words={} tail_capacity={} closure_rows_off_main={}us tail_bound={} tail_used={} cand_words={} kb={} reserve_ratio={d:.2}\n", .{
-            labels[6],
-            labels[7],
-            labels[8],
-            labels[9],
-            labels[10],
-            labels[11],
-            self.closure_touched,
-            self.closure_links,
-            self.closure_terms_new,
-            self.closure_terms_left,
-            self.closure_a_rows,
-            self.closure_rounds,
-            self.closure_words_written,
-            self.closure_shrinks,
-            self.closure_block_allocs,
-            self.closure_block_frees,
-            self.closure_landed_words,
-            self.closure_live_words,
-            self.closure_tail_capacity,
-            @as(u64, @intCast(self.closure_rows_off_main_ns / samples)),
-            self.closure_tail_bound,
-            self.closure_tail_used,
-            self.closure_candidate_words,
-            self.closure_kb,
-            // The tail bound over the candidates' block words (`checkOnewayReserve`).
-            if (self.closure_candidate_words == 0) 0.0 else @as(f64, @floatFromInt(self.closure_tail_bound)) / @as(f64, @floatFromInt(self.closure_candidate_words)),
         });
     }
 };
@@ -5481,7 +4772,7 @@ const ToggleReport = struct {
 // Times `options.iterations` toggles of `cells` after `options.warmup_iterations` untimed
 // ones, each toggle after an untimed retire of `ballast` when there is one. Items/s is the
 // cells flipped per second.
-fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
+fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
     for (0..options.warmup_iterations) |_| {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
         _ = try runToggle(io, fixture, cells, thread_system, checks);
@@ -5495,13 +4786,9 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
         report.add(sample);
         if (ballast) |chain| chain.addSample(sample);
     }
-    if (case.adaptive and thread_system != null) {
-        const tuner = fixture.system.tuners.nav.getPtrConst(.conn_flood).report();
-        report.flood_tuner_workers = if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
-    }
     report.print(options, group_name, item_count, case);
     var stats = accumulator.finish();
-    report.summarize(&stats);
+    report.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
     stats.items_per_second = suite.itemsPerSecond(2 * cells.len, stats.mean_ns);
     return stats;
 }
@@ -5515,10 +4802,6 @@ const SplitVariant = enum(u8) {
     tunnel,
 };
 
-fn splitItemCode(variant: SplitVariant, edge_chunks: usize, side: usize) usize {
-    return @as(usize, @backingInt(variant)) * connectivity_variant_encoding + edge_chunks * split_edge_encoding + side * level_case_encoding + 1;
-}
-
 // A chunk of a toggle fixture, in chunk coordinates.
 const ChunkCoord = struct {
     x: u16,
@@ -5531,15 +4814,10 @@ const SplitConfig = struct {
     side: u16,
 
     fn decode(item_count: usize) !SplitConfig {
-        const variant_index = item_count / connectivity_variant_encoding;
-        const edge_chunks = item_count % connectivity_variant_encoding / split_edge_encoding;
-        const world_config = item_count % split_edge_encoding;
-        if (variant_index > @backingInt(SplitVariant.tunnel)) return error.ConnectivitySplitUnknownVariant;
-        if (world_config % level_case_encoding != 1) return error.ConnectivitySplitNotOneLevel;
-        if (edge_chunks == 0) return error.ConnectivitySplitNoEdge;
-        const side = world_config / level_case_encoding;
-        if (side > std.math.maxInt(u16) or edge_chunks > std.math.maxInt(u16)) return error.ConnectivitySplitTooLarge;
-        return .{ .variant = @fromBackingInt(@as(u8, @intCast(variant_index))), .edge_chunks = @intCast(edge_chunks), .side = @intCast(side) };
+        const code = try SplitCode.decode(item_count);
+        if (code.levels != 1) return error.ConnectivitySplitNotOneLevel;
+        if (code.edge_chunks == 0) return error.ConnectivitySplitNoEdge;
+        return .{ .variant = code.variant, .edge_chunks = code.edge_chunks, .side = code.level_side };
     }
 
     // Chunks a side of the structure's square, its outer wall band (or the tunnel's mouth
@@ -5655,7 +4933,7 @@ fn toggleSizeConfig(side: usize, levels: usize, links: usize, participant_count:
 }
 
 // The split fixture on a walkable level: the structure's solid chunks written, no requests.
-fn initSplitFixture(allocator: std.mem.Allocator, io: std.Io, config: SplitConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+fn initSplitFixture(allocator: std.mem.Allocator, io: std.Io, config: SplitConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, config.side, 1);
     errdefer open.world.deinit();
     if (config.spanChunks() * open.world.chunk_size_tiles > config.side) return error.ConnectivitySplitStructureTooLarge;
@@ -5669,53 +4947,35 @@ fn initSplitFixture(allocator: std.mem.Allocator, io: std.Io, config: SplitConfi
     errdefer data.deinit();
     const requests = try allocator.alloc(PathRequest, 0);
     errdefer allocator.free(requests);
-    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
-const SplitFlood = struct {
-    // Open cells of the structure the flood reached.
-    visited: usize,
-    // Whether it reached an open cell outside the structure (and stopped there).
-    escaped: bool,
+// The split structure's open cells: level 0's walkable cells, the gap chunk blocked when
+// `gap_blocked`; a flood stops at the first open cell outside the structure.
+const SplitFloodCells = struct {
+    world: *const WorldSystem,
+    config: SplitConfig,
+    gap_blocked: bool,
+
+    pub fn open(self: SplitFloodCells, x: u32, y: u32) bool {
+        const cell = CellCoord{ .x = @intCast(x), .y = @intCast(y) };
+        if (self.world.levelBlocksMovement(0, cell.x, cell.y)) return false;
+        return !(self.gap_blocked and self.config.inGapChunk(cell, self.world.chunk_size_tiles));
+    }
+
+    pub fn stop(self: SplitFloodCells, x: u32, y: u32) bool {
+        return !self.config.inStructure(.{ .x = @intCast(x), .y = @intCast(y) }, self.world.chunk_size_tiles);
+    }
 };
 
-// Untimed: a 4-connected flood over level 0's open cells from the level origin, which lies
-// in the room or the ring, treating the gap chunk as blocking when `gap_blocked`. Stops at
-// the first open cell outside the structure. The corner rule lets a diagonal step only
-// through two open orthogonal cells, so 4-connected components equal the nav's.
-fn floodSplitStructure(allocator: std.mem.Allocator, world: *const WorldSystem, config: SplitConfig, gap_blocked: bool) !SplitFlood {
-    const chunk_tiles: usize = world.chunk_size_tiles;
-    const region = config.spanChunks() * chunk_tiles;
-    var visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, region * region);
-    defer visited.deinit(allocator);
-    var queue: std.ArrayList(CellCoord) = .empty;
-    defer queue.deinit(allocator);
-    const seed = CellCoord{ .x = 0, .y = 0 };
-    if (world.levelBlocksMovement(0, seed.x, seed.y)) return error.ConnectivitySplitSeedBlocked;
-    visited.set(0);
-    try queue.append(allocator, seed);
-    var read: usize = 0;
-    while (read < queue.items.len) : (read += 1) {
-        const cell = queue.items[read];
-        const x: i32 = cell.x;
-        const y: i32 = cell.y;
-        const steps = [4][2]i32{ .{ x + 1, y }, .{ x - 1, y }, .{ x, y + 1 }, .{ x, y - 1 } };
-        for (steps) |step| {
-            if (step[0] < 0 or step[1] < 0 or step[0] >= world.width or step[1] >= world.height) continue;
-            // In range: inside the level, whose sides fit `u16`.
-            const next = CellCoord{ .x = @intCast(step[0]), .y = @intCast(step[1]) };
-            if (world.levelBlocksMovement(0, next.x, next.y)) continue;
-            if (gap_blocked and config.inGapChunk(next, chunk_tiles)) continue;
-            if (next.x >= region or next.y >= region or !config.inStructure(next, chunk_tiles)) {
-                return .{ .visited = queue.items.len, .escaped = true };
-            }
-            const slot = @as(usize, next.y) * region + next.x;
-            if (visited.isSet(slot)) continue;
-            visited.set(slot);
-            try queue.append(allocator, next);
-        }
-    }
-    return .{ .visited = queue.items.len, .escaped = false };
+// Untimed: a 4-connected flood over level 0's open cells from the level origin, which lies in
+// the room or the ring. The corner rule lets a diagonal step only through two open orthogonal
+// cells, so 4-connected components equal the nav's.
+fn floodSplitStructure(allocator: std.mem.Allocator, world: *const WorldSystem, config: SplitConfig, gap_blocked: bool) !fixtures.Flood {
+    if (world.levelBlocksMovement(0, 0, 0)) return error.ConnectivitySplitSeedBlocked;
+    var reached = try std.DynamicBitSetUnmanaged.initEmpty(allocator, @as(usize, world.width) * world.height);
+    defer reached.deinit(allocator);
+    return fixtures.flood4(allocator, world.width, world.height, .{ 0, 0 }, SplitFloodCells{ .world = world, .config = config, .gap_blocked = gap_blocked }, &reached);
 }
 
 // Fails unless the layout has the shape its variant claims. Room: with the gap blocked the
@@ -5726,14 +4986,14 @@ fn checkSplitTopology(allocator: std.mem.Allocator, world: *const WorldSystem, c
     const sealed = try floodSplitStructure(allocator, world, config, true);
     switch (config.variant) {
         .room, .tunnel => {
-            if (sealed.escaped) return error.ConnectivitySplitRoomNotSealed;
-            if (sealed.visited != config.structureChunks() * chunk_cells) return error.ConnectivitySplitRoomNotOneArea;
+            if (sealed.stopped) return error.ConnectivitySplitRoomNotSealed;
+            if (sealed.reached != config.structureChunks() * chunk_cells) return error.ConnectivitySplitRoomNotOneArea;
             const opened = try floodSplitStructure(allocator, world, config, false);
-            if (!opened.escaped) return error.ConnectivitySplitRoomGapClosed;
+            if (!opened.stopped) return error.ConnectivitySplitRoomGapClosed;
         },
         .ring => {
-            if (sealed.escaped) return error.ConnectivitySplitRingNotEnclosed;
-            if (sealed.visited != (config.structureChunks() - 1) * chunk_cells) return error.ConnectivitySplitRingSplit;
+            if (sealed.stopped) return error.ConnectivitySplitRingNotEnclosed;
+            if (sealed.reached != (config.structureChunks() - 1) * chunk_cells) return error.ConnectivitySplitRingSplit;
         },
     }
 }
@@ -5741,22 +5001,21 @@ fn checkSplitTopology(allocator: std.mem.Allocator, world: *const WorldSystem, c
 fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try SplitConfig.decode(item_count);
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     // The gap chunk's cells.
     const size_config = toggleSizeConfig(config.side, 1, 0, participant_count, .{ .mark_chunks = default_chunk_size_tiles * default_chunk_size_tiles, .links = 0, .keys = toggle_batch_keys });
-    if (suite.navSizeSkip(connectivity_split_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(connectivity_split_group.name, item_count, case, size_config);
 
-    var fixture = try initSplitFixture(allocator, io, config, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initSplitFixture(allocator, io, config, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     const gap = try chunkCells(allocator, &.{config.gapChunk()}, fixture.open.world.chunk_size_tiles);
     defer allocator.free(gap);
     try fixture.changed.ensureTotalCapacity(allocator, gap.len);
-    setNavReactionTuners(&fixture.system, case);
-    configureNavUpdateThreads(&fixture.system, case);
+    fixtures.setNavTuners(&fixture.system, case);
 
     var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr, .{}, null);
     try suite.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
@@ -5785,10 +5044,6 @@ const OnewayVariant = enum(u8) {
     // The locality chains plus a ballast chain on level 1, retired before every sample.
     ballast,
 };
-
-fn onewayItemCode(variant: OnewayVariant, terminals: usize, systems: usize) usize {
-    return @as(usize, @backingInt(variant)) * connectivity_variant_encoding + terminals * oneway_terminals_encoding + systems;
-}
 
 // One-way fixture: a `oneway_side`² world of `oneway_levels` levels, each level a 2-cell
 // lattice of blocking cells around one-cell rooms (its even cells). The toggled chain's end
@@ -5898,11 +5153,10 @@ const OnewayConfig = struct {
     systems: usize,
 
     fn decode(item_count: usize) !OnewayConfig {
-        const variant_index = item_count / connectivity_variant_encoding;
-        const terminals = item_count % connectivity_variant_encoding / oneway_terminals_encoding;
-        const systems = item_count % oneway_terminals_encoding;
-        if (variant_index > @backingInt(OnewayVariant.ballast)) return error.ConnectivityOnewayUnknownVariant;
-        const variant: OnewayVariant = @fromBackingInt(@as(u8, @intCast(variant_index)));
+        const code = try OnewayCode.decode(item_count);
+        const variant = code.variant;
+        const terminals = code.terminals_per_system;
+        const systems = code.systems;
         if (terminals < oneway_site_rooms or systems == 0) return error.ConnectivityOnewayChainTooShort;
         if (variant != .locality and variant != .dense and variant != .ballast and systems != 1) return error.ConnectivityOnewayOneChainOnly;
         if (variant == .dense and (systems < 2 or systems > oneway_rooms_per_row)) return error.ConnectivityOnewayDenseSystems;
@@ -5922,17 +5176,17 @@ const OnewayConfig = struct {
     // The ballast chain's rooms (none outside the ballast variant): the smallest power of two
     // whose block holds over twice the chains' words, so its block alone outweighs every live
     // one and any cost it moved into the timed toggle would show.
-    fn ballastRooms(self: OnewayConfig) usize {
+    fn ballastRooms(self: OnewayConfig) !usize {
         if (self.variant != .ballast) return 0;
-        const chain_words = self.systems * onewayBlockWords(self.terminals);
+        const chain_words = self.systems * try onewayBlockWords(self.terminals);
         var ballast: usize = oneway_site_rooms;
-        while (onewayBlockWords(ballast) <= 2 * chain_words) ballast *= 2;
+        while (try onewayBlockWords(ballast) <= 2 * chain_words) ballast *= 2;
         return ballast;
     }
 
     // The one-way links of every chain and the ballast.
-    fn allLinks(self: OnewayConfig) usize {
-        const ballast = self.ballastRooms();
+    fn allLinks(self: OnewayConfig) !usize {
+        const ballast = try self.ballastRooms();
         return self.links() + if (ballast == 0) 0 else ballast - 1;
     }
 
@@ -5957,12 +5211,10 @@ const OnewayConfig = struct {
     }
 };
 
-// The words of the one-way block a system of `terminals` terminals holds after a relocation:
-// at a power-of-two cap, one row of `cap` bits (at least a word) and one index-map word per
-// index. Sizes the ballast only; its retire checks the measured words.
-fn onewayBlockWords(terminals: usize) usize {
-    const cap = std.math.ceilPowerOfTwoAssert(usize, terminals);
-    return cap * (@max(1, cap / 32) + 1);
+// The words of the one-way block a system of `terminals` terminals holds once built or
+// regrown.
+fn onewayBlockWords(terminals: usize) !usize {
+    return connectivity.blockWords(try connectivity.boundCap(terminals));
 }
 
 // The ballast variant's chain: `config.ballastRooms()` rooms on level 1 after every chain
@@ -5973,7 +5225,7 @@ fn onewayBallastRooms(allocator: std.mem.Allocator, config: OnewayConfig) ![]One
     // The chains took the free rooms before `start`; chain 0's end group sits in the site.
     var start = config.rooms() - oneway_site_rooms;
     while (start < free_rooms.len and free_rooms[start].level == 0) start += 1;
-    const count = config.ballastRooms();
+    const count = try config.ballastRooms();
     if (start + count > free_rooms.len) return error.ConnectivityOnewayRoomsTooFew;
     return allocator.dupe(OnewayRoom, free_rooms[start..][0..count]);
 }
@@ -5991,8 +5243,8 @@ const OnewayBallast = struct {
     // The ballast's block words, which its reopen lands and its close frees.
     block_words: usize,
     // The last retire's reopen and close reactions.
-    reopen: EvictReaction = .{ .elapsed_ns = 0, .stats = .{} },
-    close: EvictReaction = .{ .elapsed_ns = 0, .stats = .{} },
+    reopen: Reaction = .{ .elapsed_ns = 0, .stats = .{} },
+    close: Reaction = .{ .elapsed_ns = 0, .stats = .{} },
     retires: usize = 0,
     // The timed block reactions' split, summed over `samples`: the reaction, its main-thread
     // reserve section, its closure stages (candidates, resolve, mask, plan, rows), and its
@@ -6002,17 +5254,12 @@ const OnewayBallast = struct {
     reserve_ns: u128 = 0,
     closure_stages_ns: u128 = 0,
     land_ns: u128 = 0,
-    // Untimed probes, outside every reaction: one allocation and one free of the ballast's
-    // block, each timed alone and summed over `probes`.
-    probes: usize = 0,
-    alloc_probe_ns: u128 = 0,
-    free_probe_ns: u128 = 0,
 
     // Reopens the ballast's rooms and closes them, one untimed reaction each. Fails when the
     // reopen does not land exactly the ballast's one block or the close does not free exactly
     // it, when the block holds no more than twice the live words it left, or when the nav
     // holds more bytes than charged.
-    fn retire(self: *OnewayBallast, io: std.Io, fixture: *EvictFixture, thread_system: ?*ThreadSystem) !void {
+    fn retire(self: *OnewayBallast, io: std.Io, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !void {
         self.reopen = try untimedReaction(io, fixture, self.cells, fixture.open.walkable, thread_system);
         const reopen = self.reopen.stats;
         if (reopen.closure_tail_used != self.block_words or reopen.closure_landed_words != self.block_words or reopen.closure_block_allocs != 1) return error.ConnectivityOnewayBallastLanding;
@@ -6025,13 +5272,13 @@ const OnewayBallast = struct {
     }
 
     // Closes every ballast room in one untimed reaction.
-    fn closeAll(self: *OnewayBallast, io: std.Io, fixture: *EvictFixture, thread_system: ?*ThreadSystem) !void {
+    fn closeAll(self: *OnewayBallast, io: std.Io, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !void {
         self.close = try untimedReaction(io, fixture, self.cells, fixture.open.blocking, thread_system);
     }
 
     // Sets the ballast's rooms to `tile` in one reaction, leaving every tuner as it was, so
     // it never trains the timed reactions' stages.
-    fn untimedReaction(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !EvictReaction {
+    fn untimedReaction(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
         const tuners = fixture.system.tuners;
         defer fixture.system.tuners = tuners;
         return fixture.changeLevelAndReact(io, ballast_level, cells, tile, thread_system);
@@ -6049,29 +5296,16 @@ const OnewayBallast = struct {
         self.land_ns += change.conn_closure_land_batch.batch_duration_ns;
     }
 
-    // Runs `probes` allocation and free probes of the ballast's block.
-    fn probe(self: *OnewayBallast, allocator: std.mem.Allocator, io: std.Io, probes: usize) !void {
-        for (0..probes) |_| {
-            const alloc_start = suite.nowNs(io);
-            const allocated = try allocator.alignedAlloc(u32, .@"64", self.block_words);
-            self.alloc_probe_ns += suite.elapsedNs(alloc_start, suite.nowNs(io));
-            allocator.free(allocated);
-            const freed = try allocator.alignedAlloc(u32, .@"64", self.block_words);
-            const free_start = suite.nowNs(io);
-            allocator.free(freed);
-            self.free_probe_ns += suite.elapsedNs(free_start, suite.nowNs(io));
-            self.probes += 1;
-        }
-    }
-
     // The last retire: the reopen's landing (its shape, time, and words) and its tail bound
     // and use, and the close's main-thread closure time (it holds the free) and the words it
     // freed; then the timed block reactions' split (the rest is everything outside the
-    // reserve, closure, and landing) and the probes. Printed under --details.
+    // reserve, closure, and landing). Printed under --details.
     fn print(self: OnewayBallast, options: suite.Options, case: suite.BenchmarkCase) void {
         if (!options.details or self.retires == 0) return;
         const reopen = self.reopen.stats;
         const close = self.close.stats;
+        var land_shape = suite.StageShapes(1){};
+        land_shape.add(.{reopen.conn_closure_land_batch});
         var land_buffer: [48]u8 = undefined;
         const land = reopen.conn_closure_land_batch;
         std.debug.print("  {s} {} {s}: ballast rooms={} block_words={} retires={} reopen={}us reopen_land={s} reopen_land_ns={} landed_words={} tail_bound={} tail_used={} tail_ratio={d:.2} close={}us close_closure_main={}ns freed_words={} left_live_words={}\n", .{
@@ -6082,7 +5316,7 @@ const OnewayBallast = struct {
             self.block_words,
             self.retires,
             self.reopen.elapsed_ns / std.time.ns_per_us,
-            stageShape(&land_buffer, land, @intFromBool(!land.ran_inline and land.active_worker_threads != 0), @intFromBool(land.item_count != 0)),
+            land_shape.label(0, &land_buffer),
             land.batch_duration_ns,
             reopen.closure_landed_words,
             reopen.closure_tail_bound,
@@ -6095,9 +5329,8 @@ const OnewayBallast = struct {
         });
         if (self.samples == 0) return;
         const samples: u128 = self.samples;
-        const probes: u128 = @max(1, self.probes);
         const parts = self.reserve_ns + self.closure_stages_ns + self.land_ns;
-        std.debug.print("  {s} {} {s}: timed block split total={}ns reserve={}ns closure_stages={}ns land={}ns rest={}ns alloc_probe={}ns free_probe={}ns probes={}\n", .{
+        std.debug.print("  {s} {} {s}: timed block split total={}ns reserve={}ns closure_stages={}ns land={}ns rest={}ns\n", .{
             connectivity_oneway_group.name,
             self.item_count,
             case.name,
@@ -6106,9 +5339,6 @@ const OnewayBallast = struct {
             @as(u64, @intCast(self.closure_stages_ns / samples)),
             @as(u64, @intCast(self.land_ns / samples)),
             @as(u64, @intCast((self.close_ns -| parts) / samples)),
-            @as(u64, @intCast(self.alloc_probe_ns / probes)),
-            @as(u64, @intCast(self.free_probe_ns / probes)),
-            self.probes,
         });
     }
 };
@@ -6180,7 +5410,7 @@ fn addOnewayLink(world: *WorldSystem, from: OnewayRoom, to: OnewayRoom) !void {
     });
 }
 
-fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, rooms: []const OnewayRoom, ballast: []const OnewayRoom, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, rooms: []const OnewayRoom, ballast: []const OnewayRoom, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, oneway_side, oneway_levels);
     errdefer open.world.deinit();
     std.debug.assert(open.world.chunk_size_tiles == default_chunk_size_tiles);
@@ -6207,7 +5437,7 @@ fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayCon
             try addOnewayLink(&open.world, from, to);
         }
     }
-    std.debug.assert(ballast.len == config.ballastRooms());
+    std.debug.assert(ballast.len == try config.ballastRooms());
     if (ballast.len != 0) {
         for (ballast[1..], 0..) |room, previous| try addOnewayLink(&open.world, ballast[previous], room);
     }
@@ -6215,11 +5445,11 @@ fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayCon
     errdefer data.deinit();
     const requests = try allocator.alloc(PathRequest, 0);
     errdefer allocator.free(requests);
-    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
 // Closes `rooms` (level-0 rooms of one chain) in one untimed nav reaction.
-fn cutOnewayChain(allocator: std.mem.Allocator, io: std.Io, fixture: *EvictFixture, rooms: []const OnewayRoom, thread_system: ?*ThreadSystem) !void {
+fn cutOnewayChain(allocator: std.mem.Allocator, io: std.Io, fixture: *ReactFixture, rooms: []const OnewayRoom, thread_system: ?*ThreadSystem) !void {
     const cells = try allocator.alloc(CellCoord, rooms.len);
     defer allocator.free(cells);
     for (rooms, cells) |room, *cell| {
@@ -6235,10 +5465,10 @@ fn cutOnewayChain(allocator: std.mem.Allocator, io: std.Io, fixture: *EvictFixtu
 fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try OnewayConfig.decode(item_count);
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     const rooms = try onewayRooms(allocator, config);
     defer allocator.free(rooms);
     const ballast_rooms = if (config.variant == .ballast) try onewayBallastRooms(allocator, config) else try allocator.alloc(OnewayRoom, 0);
@@ -6258,12 +5488,12 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
         else
             toggle_batch_keys),
     };
-    var size_config = toggleSizeConfig(oneway_side, oneway_levels, config.allLinks(), participant_count, batch);
+    var size_config = toggleSizeConfig(oneway_side, oneway_levels, try config.allLinks(), participant_count, batch);
     // A system is one chain or fan of rooms; the dense variant's opening merges every one.
     size_config.oneway_system_terminals = if (config.variant == .dense) config.rooms() else @max(config.terminals, ballast_rooms.len);
-    if (suite.navSizeSkip(connectivity_oneway_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(connectivity_oneway_group.name, item_count, case, size_config);
 
-    var fixture = try initOnewayFixture(allocator, io, config, rooms, ballast_rooms, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initOnewayFixture(allocator, io, config, rooms, ballast_rooms, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     // One toggled cell, or the dense variant's walls.
@@ -6278,11 +5508,10 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
         cell.* = room.cell;
     }
     try fixture.changed.ensureTotalCapacity(allocator, @max(cells.len, ballast_cells.len));
-    setNavReactionTuners(&fixture.system, case);
-    configureNavUpdateThreads(&fixture.system, case);
+    fixtures.setNavTuners(&fixture.system, case);
     if (config.variant == .shrunk) try cutOnewayChain(allocator, io, &fixture, rooms[0 .. config.terminals - oneway_shrunk_live], thread_ptr);
     // The ballast starts retired: every sample reopens it first.
-    var ballast = OnewayBallast{ .cells = ballast_cells, .size_config = size_config, .item_count = item_count, .block_words = if (ballast_cells.len == 0) 0 else onewayBlockWords(ballast_cells.len) };
+    var ballast = OnewayBallast{ .cells = ballast_cells, .size_config = size_config, .item_count = item_count, .block_words = if (ballast_cells.len == 0) 0 else try onewayBlockWords(ballast_cells.len) };
     if (config.variant == .ballast) try ballast.closeAll(io, &fixture, thread_ptr);
 
     // The dense variant's fill and reopen resize blocks and reserve the merged block the
@@ -6293,7 +5522,6 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
         else => .{},
     };
     var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null);
-    if (config.variant == .ballast and options.details) try ballast.probe(allocator, io, options.iterations);
     ballast.print(options, case);
     try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     stats.output_count = config.links();
@@ -6309,11 +5537,7 @@ const LinkFoldAxis = enum(u8) {
     probe,
 };
 
-fn linkFoldItemCode(axis: LinkFoldAxis, preload: usize, pads: usize) usize {
-    return @as(usize, @backingInt(axis)) * link_fold_axis_encoding + preload * link_fold_preload_encoding + pads;
-}
-
-// A link-fold item code: axis * 10^9 + probe preload per chunk * 10^6 + background pads.
+// A link-fold item code (`LinkFoldCode`).
 const LinkFoldConfig = struct {
     axis: LinkFoldAxis,
     // Pads ending in each probe chunk before its batch lands.
@@ -6321,17 +5545,12 @@ const LinkFoldConfig = struct {
     // Random pads before the run, off the probe chunks.
     pads: usize,
 
-    // Each field reads only its own digits. An unknown axis, a uniform run with a preload, or
-    // a uniform run with no pads is an error.
+    // A uniform run with a preload, or a uniform run with no pads, is an error.
     fn decode(item_count: usize) !LinkFoldConfig {
-        const axis_index = item_count / link_fold_axis_encoding;
-        const preload = item_count % link_fold_axis_encoding / link_fold_preload_encoding;
-        const pads = item_count % link_fold_preload_encoding;
-        if (axis_index > @backingInt(LinkFoldAxis.probe)) return error.LinkFoldUnknownAxis;
-        const axis: LinkFoldAxis = @fromBackingInt(@as(u8, @intCast(axis_index)));
-        if (axis == .uniform and preload != 0) return error.LinkFoldUniformPreload;
-        if (axis == .uniform and pads == 0) return error.LinkFoldNoPads;
-        return .{ .axis = axis, .preload = preload, .pads = pads };
+        const code = try LinkFoldCode.decode(item_count);
+        if (code.axis == .uniform and code.probe_preload != 0) return error.LinkFoldUniformPreload;
+        if (code.axis == .uniform and code.background_pads == 0) return error.LinkFoldNoPads;
+        return .{ .axis = code.axis, .preload = code.probe_preload, .pads = code.background_pads };
     }
 
     // Probe chunk pairs a run of `samples` batches takes: one set per batch.
@@ -6348,10 +5567,10 @@ const LinkFoldConfig = struct {
 fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try LinkFoldConfig.decode(item_count);
-    var threads = try initCaseThreads(allocator, io, case);
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const participant_count = fixtures.participantCount(thread_ptr);
     // Every sample adds a batch, so the size check holds at the most pads the run holds.
     const samples = options.warmup_iterations + options.iterations;
     const peak_pads = config.padsAfter(samples);
@@ -6359,16 +5578,15 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count, .{ .mark_chunks = 0, .links = link_fold_batch, .keys = 2 * link_fold_batch });
     // Every pad is bidirectional.
     size_config.oneway_links = 0;
-    if (suite.navSizeSkip(link_fold_group.name, item_count, case, size_config)) |skip| return skip;
+    try suite.checkNavSize(link_fold_group.name, item_count, case, size_config);
 
     var prng = std.Random.DefaultPrng.init(random_pad_seed);
     const random = prng.random();
     const probe_pairs = config.probePairs(samples);
-    var fixture = try initLinkFoldFixture(allocator, io, random, config, probe_pairs, navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initLinkFoldFixture(allocator, io, random, config, probe_pairs, suite.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try suite.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
-    setNavReactionTuners(&fixture.system, case);
-    configureNavUpdateThreads(&fixture.system, case);
+    fixtures.setNavTuners(&fixture.system, case);
     var batch: usize = 0;
     for (0..options.warmup_iterations) |_| {
         _ = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
@@ -6396,7 +5614,7 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
 // The link-fold world, with no requests: `config.pads` random pads off the first
 // `probe_pairs` probe chunk pairs, and `config.preload` pads joining each pair.
-fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !EvictFixture {
+fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, link_fold_side, link_fold_levels);
     errdefer open.world.deinit();
     const deepest = link_fold_levels - 1;
@@ -6406,7 +5624,7 @@ fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Ran
     errdefer data.deinit();
     const requests = try allocator.alloc(PathRequest, 0);
     errdefer allocator.free(requests);
-    return assembleEvictFixture(allocator, &open, &data, requests, capacity, thread_system);
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
 // Adds `per_pair` bidirectional pads to each probe chunk pair in `[first_pair, first_pair +
@@ -6441,7 +5659,7 @@ fn addProbePads(world: *WorldSystem, random: std.Random, deepest: u16, first_pai
 // One timed link-fold reaction and the chunks it touched: the batch's distinct endpoint
 // chunks and the link endpoints they hold after it.
 const LinkFoldSample = struct {
-    reaction: EvictReaction,
+    reaction: Reaction,
     touched_chunks: usize,
     touched_endpoints: usize,
 };
@@ -6451,7 +5669,7 @@ const LinkFoldSample = struct {
 // nav reaction that applies them and counts the touched chunks' endpoints untimed. Fails
 // unless the reaction applied every pad in one marks batch and patched exactly the touched
 // chunks.
-fn foldPadBatch(io: std.Io, fixture: *EvictFixture, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, batch: usize, thread_system: ?*ThreadSystem) !LinkFoldSample {
+fn foldPadBatch(io: std.Io, fixture: *ReactFixture, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, batch: usize, thread_system: ?*ThreadSystem) !LinkFoldSample {
     const world = &fixture.open.world;
     const graph = &fixture.system.graph;
     const applied_before = graph.links_applied;
@@ -6536,114 +5754,3 @@ const LinkFoldReport = struct {
         });
     }
 };
-
-fn appendRequest(stream: *RangeOutputStream(PathRequest), request: PathRequest) !void {
-    const range_base = try stream.appendRangeCounts(1);
-    stream.addCount(range_base, 1);
-    try stream.prefixAppendedRanges(range_base);
-    var writer = stream.rangeWriter(range_base);
-    writer.write(request);
-    writer.finish();
-    stream.finishWrite();
-}
-
-fn addEntity(data: *DataSystem, position: math.Vec2, static: bool) !@import("../game/data_system.zig").EntityId {
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
-    try data.setCollisionBounds(entity, .{ .size = .{ .x = 8, .y = 8 } });
-    try data.setCollisionResponse(entity, .{ .mobility = if (static) .static else .dynamic });
-    return entity;
-}
-
-const FixtureCell = struct {
-    x: usize,
-    y: usize,
-};
-
-fn requestStartCell(index: usize, side: usize, workload: Workload) FixtureCell {
-    return switch (workload) {
-        .common_goal, .unique_open => .{
-            .x = index % side,
-            .y = index / side,
-        },
-        .blocked_detour, .blocked_unreachable => .{
-            .x = 1 + index % blockedLaneCount(side),
-            .y = 1 + (index / blockedLaneCount(side)) % @max(@as(usize, 1), side - 2),
-        },
-        .hard_fallback => .{
-            .x = 1 + (index / hardLaneCount(side)) % hardColumnCount(side),
-            .y = 2 + (index % hardLaneCount(side)) * 3,
-        },
-    };
-}
-
-fn requestGoalCell(index: usize, side: usize, workload: Workload) FixtureCell {
-    return switch (workload) {
-        .common_goal => .{ .x = side - 2, .y = side - 2 },
-        .unique_open => .{
-            .x = side - 1 - index % side,
-            .y = side - 1 - index / side,
-        },
-        .blocked_detour, .blocked_unreachable => .{
-            .x = side - 2 - index % blockedLaneCount(side),
-            .y = 1 + (index / blockedLaneCount(side)) % @max(@as(usize, 1), side - 2),
-        },
-        .hard_fallback => .{
-            .x = side - 2 - (index / hardLaneCount(side)) % hardColumnCount(side),
-            .y = 2 + (index % hardLaneCount(side)) * 3,
-        },
-    };
-}
-
-fn addObstacleField(data: *DataSystem, side: usize, workload: Workload) !void {
-    switch (workload) {
-        .common_goal, .unique_open => {},
-        .blocked_detour => try addVerticalWall(data, side, true),
-        .blocked_unreachable => try addVerticalWall(data, side, false),
-        .hard_fallback => try addHardFallbackObstacles(data, side),
-    }
-}
-
-fn addVerticalWall(data: *DataSystem, side: usize, with_gap: bool) !void {
-    const wall_x = side / 2;
-    const gap_y = side / 2;
-    for (0..side) |y| {
-        if (with_gap and y == gap_y) continue;
-        _ = try addEntity(data, .{
-            .x = @as(f32, @floatFromInt(wall_x)) * 32.0,
-            .y = @as(f32, @floatFromInt(y)) * 32.0,
-        }, true);
-    }
-}
-
-fn blockedLaneCount(side: usize) usize {
-    return @max(@as(usize, 1), side / 2 -| 2);
-}
-
-fn addHardFallbackObstacles(data: *DataSystem, side: usize) !void {
-    const obstacle_x = side / 2;
-    for (0..hardLaneCount(side)) |lane| {
-        _ = try addEntity(data, .{
-            .x = @as(f32, @floatFromInt(obstacle_x)) * 32.0,
-            .y = @as(f32, @floatFromInt(2 + lane * 3)) * 32.0,
-        }, true);
-    }
-}
-
-fn hardLaneCount(side: usize) usize {
-    return @max(@as(usize, 1), (side - 4) / 3);
-}
-
-fn hardColumnCount(side: usize) usize {
-    return @max(@as(usize, 1), side / 2 - 1);
-}
-
-fn fixtureGridSide(item_count: usize, workload: Workload) usize {
-    var side: usize = 16;
-    while (side * side < item_count) side *= 2;
-    if (workload == .hard_fallback) {
-        while (hardLaneCount(side) * hardColumnCount(side) < item_count) side *= 2;
-        return @max(side, @as(usize, 64));
-    }
-    return @max(side * 2, @as(usize, 64));
-}

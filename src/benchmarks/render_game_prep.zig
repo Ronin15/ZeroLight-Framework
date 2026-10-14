@@ -7,8 +7,6 @@
 //! realistic static+dynamic `mergeDrawList` group counts. CPU-only; no SDL_GPU.
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -23,11 +21,11 @@ const render_prep = @import("../game/render_prep.zig");
 const WorldDepth = render_depth.WorldDepth;
 const world_system = @import("../game/world_system.zig");
 const WorldSystem = world_system.WorldSystem;
-const TileId = world_system.TileId;
 const Renderer = @import("../render/renderer.zig");
 const mergeDrawList = Renderer.mergeDrawList;
 const resources = @import("../render/resources.zig");
 const sprite_batch = @import("../render/sprite_batch.zig");
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const render_game_prep_range_alignment_items: usize = 1;
@@ -58,20 +56,29 @@ const default_fixture_config = FixtureConfig{};
 
 pub const group = suite.BenchmarkGroup{
     .name = "render-game-prep",
+    .item_label = "render entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeRenderGamePrepWorkload,
+    .summary_focus = .production_adaptive,
 };
 
 pub const dense_surface_group = suite.BenchmarkGroup{
     .name = "render-game-prep-dense-surface",
+    .item_label = "render entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runDenseSurfaceCase,
+    .write_workload = writeRenderGamePrepWorkload,
+    .summary_focus = .production_adaptive,
 };
 
 pub const dense_deep_group = suite.BenchmarkGroup{
     .name = "render-game-prep-dense-deep",
+    .item_label = "render entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runDenseDeepCase,
+    .write_workload = writeRenderGamePrepWorkload,
+    .summary_focus = .production_adaptive,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
@@ -195,13 +202,7 @@ fn runCaseWithConfig(
     defer draw_list.deinit(allocator);
     try draw_list.ensureTotalCapacity(allocator, fixture.static_group_count + command_capacity);
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     if (suite.adaptiveTunerForCase(case, render_game_prep_range_alignment_items)) |tuner| {
@@ -399,7 +400,7 @@ fn emitVertices(
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(render_game_prep_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, render_game_prep_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, render_game_prep_range_alignment_items);
 }
 
 // Requires `setBenchCollectChunkVisibility` first: full-world visibility is an
@@ -557,8 +558,7 @@ fn initFixture(
 
     fixture.static_group_count = benchStaticGroups(tile_texture, fixture_config, &fixture.static_groups);
 
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    fixture.tileset_meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    fixture.tileset_meta = try fixtures.loadTilesetMeta(allocator, io);
     stage = .tileset_meta;
 
     const tile_size_px = fixture.tileset_meta.tileSize();
@@ -581,7 +581,7 @@ fn initFixture(
         _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * world_system.level_z_step);
     }
 
-    const deco = try requireTile(&fixture.tileset_meta, "deco_0");
+    const deco = try fixture.world.requireTileByName(&fixture.tileset_meta, "deco_0");
     // Sparse tiles sit on the player's level so both variants draw them: sparse
     // tiles draw only on the render window's levels.
     const level: u16 = fixture_config.player_level;
@@ -690,10 +690,6 @@ fn benchAccentSpriteDepth(fixture_config: FixtureConfig) i32 {
     return benchDenseFloorDepth(top_level) + render_depth.worldZ(.actor) - render_depth.worldZ(.floor);
 }
 
-fn requireTile(meta: *const world_tileset_meta.WorldTilesetMeta, name: []const u8) !TileId {
-    return (meta.tileByName(name) orelse return error.TileNotFound).id;
-}
-
 fn sparseTileCount(item_count: usize) usize {
     return @max(@min(item_count / 4, 12_288), 64);
 }
@@ -795,4 +791,19 @@ fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
 
 fn u128ToU64Saturated(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+}
+
+fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}", .{
+        stats.candidate_pairs,
+        stats.output_count,
+        stats.deferred_count,
+        stats.sample_count,
+        stats.render_game_prep_sparse_submitted,
+        stats.render_game_prep_dynamic_records,
+        stats.render_game_prep_static_groups,
+        stats.render_game_prep_merged_tilemap_groups,
+    });
+    const phases = stats.render_game_prep_phases orelse return;
+    try writer.print(" phases entity_collect={f} merge={f} snapshot={f} vertex_emit={f}", .{ suite.formatDuration(phases.entity_collect_ns), suite.formatDuration(phases.merge_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns) });
 }

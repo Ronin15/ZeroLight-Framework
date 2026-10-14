@@ -24,6 +24,8 @@ const OwnerOp = @import("types.zig").OwnerOp;
 const no_owner = @import("types.zig").no_owner;
 const hashPathKey = @import("types.zig").hashPathKey;
 const emptyKey = @import("types.zig").emptyKey;
+const listBytesBound = @import("nav_graph.zig").listBytesBound;
+const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
 
 // Forward window probed around a per-agent waypoint hint before falling back to a full
 // path scan. Agents walk a shared goal-keyed path monotonically (~1 cell/step), so the
@@ -55,9 +57,23 @@ fn ProbeTable(comptime Payload: type) type {
         // Insert ceiling; slots.items.len is 2x this for probe headroom.
         logical_capacity: usize = 0,
 
+        comptime {
+            assertFieldsClassified(Self, &.{"slots"}, &.{ "len", "logical_capacity" });
+        }
+
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.slots.deinit(allocator);
             self.* = undefined;
+        }
+
+        // Bytes the slots hold (allocated capacity).
+        fn residentBytes(self: *const Self) usize {
+            return self.slots.capacity * @sizeOf(Slot);
+        }
+
+        // `residentBytes` once reserved for at most `capacity` keys: two slots each, exact.
+        fn storageBytesBound(capacity: usize) usize {
+            return capacity *| 2 *| @sizeOf(Slot);
         }
 
         // Resizes to `capacity` keeping the entries: the slots are rebuilt on the side and
@@ -147,6 +163,16 @@ pub const KeySet = struct {
         return self.table.reserve(allocator, capacity);
     }
 
+    /// Bytes the set holds (allocated capacity).
+    pub fn residentBytes(self: *const KeySet) usize {
+        return self.table.residentBytes();
+    }
+
+    /// `residentBytes` once reserved for at most `capacity` keys.
+    pub fn storageBytesBound(capacity: usize) usize {
+        return ProbeTable(void).storageBytesBound(capacity);
+    }
+
     pub fn clear(self: *KeySet) void {
         self.table.clear();
     }
@@ -178,6 +204,16 @@ pub const GroupKeyMap = struct {
 
     pub fn reserve(self: *GroupKeyMap, allocator: std.mem.Allocator, capacity: usize) !void {
         return self.table.reserve(allocator, capacity);
+    }
+
+    /// Bytes the map holds (allocated capacity).
+    pub fn residentBytes(self: *const GroupKeyMap) usize {
+        return self.table.residentBytes();
+    }
+
+    /// `residentBytes` once reserved for at most `capacity` keys.
+    pub fn storageBytesBound(capacity: usize) usize {
+        return ProbeTable(u32).storageBytesBound(capacity);
     }
 
     pub fn clear(self: *GroupKeyMap) void {
@@ -278,6 +314,12 @@ fn CacheCore(comptime Extra: type) type {
         // The current publish and how many entries it claimed.
         claim_epoch: u32 = 0,
         epoch_claims: usize = 0,
+
+        comptime {
+            assertFieldsClassified(Self, &.{ "slots", "records", "keys", "free", "owner_log", "owner_log_replacement" }, &.{
+                "owner_log_limit", "logical_capacity", "len", "next_evict", "claim_epoch", "epoch_claims",
+            });
+        }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (self.owner_log_replacement) |*replacement| replacement.deinit(allocator);
@@ -610,6 +652,12 @@ pub const ResultCache = struct {
     // A shrink's stripe and long-block moves, for its resize copy; freed after it.
     resize_moves: std.ArrayList(ResizeMove) = .empty,
 
+    comptime {
+        assertFieldsClassified(ResultCache, &.{ "core", "inline_pages", "long_pages", "free_long_blocks", "resize_moves" }, &.{
+            "inline_words", "long_block_words", "inline_page_shift", "long_page_shift", "inline_page_count", "long_page_count", "long_block_count",
+        });
+    }
+
     pub fn deinit(self: *ResultCache, allocator: std.mem.Allocator) void {
         self.resize_moves.deinit(allocator);
         self.free_long_blocks.deinit(allocator);
@@ -621,15 +669,34 @@ pub const ResultCache = struct {
         self.* = undefined;
     }
 
-    /// Bytes one entry of logical capacity holds at `inline_words`-word stripes: two probe
-    /// slots, its record and key, free index, and owner-log room, and its stripe.
-    pub fn bytesPerEntry(inline_words: usize) usize {
-        return 2 * @sizeOf(ProbeSlot) + @sizeOf(Core.Record) + @sizeOf(PathQueryKey) + @sizeOf(u32) + ops_per_entry * @sizeOf(OwnerOp) + inline_words * @sizeOf(u32);
+    /// Bytes the probe table, records, keys, free lists, owner logs, stripe and long-block
+    /// pages, and pending moves hold (allocated capacity).
+    pub fn residentBytes(self: *const ResultCache) usize {
+        const core = &self.core;
+        var bytes = core.slots.capacity * @sizeOf(ProbeSlot) + core.records.capacity * @sizeOf(Core.Record) +
+            core.keys.capacity * @sizeOf(PathQueryKey) + core.free.capacity * @sizeOf(u32) + core.owner_log.capacity * @sizeOf(OwnerOp) +
+            self.inline_pages.capacity * @sizeOf([]u32) + self.long_pages.capacity * @sizeOf([]u32) +
+            self.free_long_blocks.capacity * @sizeOf(u32) + self.resize_moves.capacity * @sizeOf(ResizeMove);
+        if (core.owner_log_replacement) |replacement| bytes += replacement.capacity * @sizeOf(OwnerOp);
+        for (self.inline_pages.items) |page| bytes += page.len * @sizeOf(u32);
+        for (self.long_pages.items) |page| bytes += page.len * @sizeOf(u32);
+        return bytes;
     }
 
-    /// Bytes one long block of `long_block_words` words holds, its free index included.
-    pub fn longBlockBytes(long_block_words: usize) usize {
-        return long_block_words * @sizeOf(u32) + @sizeOf(u32);
+    /// `residentBytes` between resizes for a cache never reserved past `capacity` entries of
+    /// `inline_words`-word stripes, holding at most `long_blocks` live long blocks of
+    /// `long_block_words` words. Saturates.
+    pub fn storageBytesBound(capacity: usize, inline_words: usize, long_block_words: usize, long_blocks: usize) usize {
+        const inline_shift = pageShift(inline_words);
+        const inline_pages = pageCount(capacity, inline_shift);
+        const long_shift = pageShift(long_block_words);
+        const long_pages = pageCount(@min(long_blocks, capacity), long_shift);
+        const core = capacity *| 2 *| @sizeOf(ProbeSlot) +| listBytesBound(Core.Record, capacity) +| listBytesBound(PathQueryKey, capacity) +|
+            listBytesBound(u32, capacity) +| listBytesBound(OwnerOp, ops_per_entry *| capacity);
+        const stripes = inline_pages *| (@as(usize, 1) << inline_shift) *| inline_words *| @sizeOf(u32) +| listBytesBound([]u32, inline_pages);
+        const long_pool = long_pages *| (@as(usize, 1) << long_shift) *| long_block_words *| @sizeOf(u32) +| listBytesBound([]u32, long_pages) +|
+            listBytesBound(u32, long_pages *| (@as(usize, 1) << long_shift));
+        return core +| stripes +| long_pool;
     }
 
     /// Long blocks one page of `long_block_words`-word blocks holds.
@@ -1461,6 +1528,19 @@ test "pathfinding result cache stores a long path whole in a long block and neve
     try std.testing.expect(cache.findFresh(testGoalKey(3), 1000, 10) == null);
     try std.testing.expectEqual(free_after_put + 2, cache.free_long_blocks.items.len);
     try expectResultCacheConsistent(&cache);
+}
+
+test "pathfinding result cache holds its storage bound after a reserve, a long-pool grow, and a grow then shrink" {
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try testResize(&cache, std.testing.allocator, 64, test_inline_words, test_long_block_words, 0);
+    try std.testing.expect(cache.residentBytes() <= ResultCache.storageBytesBound(64, test_inline_words, test_long_block_words, 0));
+    _ = try cache.reserveLongBlocks(std.testing.allocator, 3);
+    try std.testing.expect(cache.residentBytes() > ResultCache.storageBytesBound(64, test_inline_words, test_long_block_words, 0));
+    try std.testing.expect(cache.residentBytes() <= ResultCache.storageBytesBound(64, test_inline_words, test_long_block_words, 3));
+    try testResize(&cache, std.testing.allocator, 256, test_inline_words, test_long_block_words, 0);
+    try testResize(&cache, std.testing.allocator, 16, test_inline_words, test_long_block_words, 0);
+    try std.testing.expect(cache.residentBytes() <= ResultCache.storageBytesBound(256, test_inline_words, test_long_block_words, 3));
 }
 
 test "pathfinding result cache long pool never passes the page of the entry limit, and a full cache of long entries still publishes" {

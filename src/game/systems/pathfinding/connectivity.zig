@@ -41,6 +41,7 @@ const NavLevelGraph = @import("nav_graph.zig").NavLevelGraph;
 const BatchLevels = @import("nav_graph.zig").BatchLevels;
 const PatchInfo = @import("nav_graph.zig").PatchInfo;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
+const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
 const keyLevel = @import("../chunk_list_map.zig").keyLevel;
 const keyChunk = @import("../chunk_list_map.zig").keyChunk;
 const LevelRuns = @import("nav_graph.zig").LevelRuns;
@@ -390,6 +391,10 @@ fn ElementMapAt(comptime load: SlotLoad) type {
 
         const Self = @This();
 
+        comptime {
+            assertFieldsClassified(Self, &.{ "keys", "values", "stamps" }, &.{ "generation", "limit", "used" });
+        }
+
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.stamps.deinit(allocator);
             self.values.deinit(allocator);
@@ -406,6 +411,17 @@ fn ElementMapAt(comptime load: SlotLoad) type {
             };
             // Overflowing usize needs over 2^62 live keys, so it fails as the allocator does.
             return std.math.ceilPowerOfTwo(usize, @max(least, 16)) catch error.OutOfMemory;
+        }
+
+        /// Bytes the slots hold (allocated capacity).
+        pub fn residentBytes(self: *const Self) usize {
+            return self.keys.capacity * @sizeOf(u64) + self.values.capacity * @sizeOf(u32) + self.stamps.capacity * @sizeOf(u32);
+        }
+
+        /// `residentBytes` once reserved for at most `limit` keys. Saturates.
+        pub fn storageBytesBound(limit: usize) usize {
+            const slots = slotCount(limit) catch return std.math.maxInt(usize);
+            return slots *| (@sizeOf(u64) + 2 * @sizeOf(u32));
         }
 
         /// Grows the slots to hold `limit` keys, emptying the map when they grow; never shrinks.
@@ -645,9 +661,9 @@ fn compactCap(terms: u32) u32 {
     return std.math.ceilPowerOfTwoAssert(u32, terms + (terms + 1) / 2);
 }
 
-// Words of a block of `k_cap` indices: its rows and index map, padded to whole lines so every
-// block starts on a line.
-fn blockWords(k_cap: u32) usize {
+/// Words of a block of `k_cap` indices: its rows and index map, padded to whole lines so every
+/// block starts on a line.
+pub fn blockWords(k_cap: u32) usize {
     const raw = @as(usize, k_cap) * (@as(usize, rowWords(k_cap)) + 1);
     return std.mem.alignForward(usize, raw, span_words);
 }
@@ -890,9 +906,9 @@ const BoundSums = struct {
     }
 };
 
-// The power-of-two block cap holding `terms` indices; at most 2^31, so local indices stay
-// below `no_index`.
-fn boundCap(terms: usize) error{OutOfMemory}!u32 {
+/// The power-of-two block cap a block built or regrown for `terms` indices takes; at most
+/// 2^31, so local indices stay below `no_index`.
+pub fn boundCap(terms: usize) error{OutOfMemory}!u32 {
     // Passing 2^31 needs over 2^30 live terminals in one block, so it fails as the allocator
     // does.
     const cap = std.math.ceilPowerOfTwo(usize, terms) catch return error.OutOfMemory;

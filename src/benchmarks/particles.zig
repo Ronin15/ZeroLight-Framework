@@ -8,6 +8,7 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const particle_range_alignment_items = @import("../game/systems/particle.zig").particle_range_alignment_items;
 const ParticleSystem = @import("../game/systems/particle.zig").ParticleSystem;
 const WorldDepth = @import("../game/render_depth.zig").WorldDepth;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
@@ -15,8 +16,10 @@ const benchmark_particle_depths = [_]WorldDepth{ .actor, .effect, .marker };
 
 pub const group = suite.BenchmarkGroup{
     .name = "particles",
+    .item_label = "particle rows",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = suite.writeNoWorkload,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
@@ -64,13 +67,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         particles.adaptive_tuner = tuner;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     for (0..options.warmup_iterations) |_| {
@@ -115,5 +112,5 @@ fn runOnce(particles: *ParticleSystem, thread_system: ?*ThreadSystem, case: suit
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(particle_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, particle_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, particle_range_alignment_items);
 }

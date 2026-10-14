@@ -22,6 +22,8 @@ const openHeapLimit = @import("types.zig").openHeapLimit;
 const hashTableSlots = @import("../../stamped_table.zig").hashTableSlots;
 const fibonacciSlot = @import("../../stamped_table.zig").fibonacciSlot;
 const crossingBoxBudget = @import("types.zig").crossingBoxBudget;
+const listBytesBound = @import("nav_graph.zig").listBytesBound;
+const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
 
 const AbstractSlotFlags = packed struct(u8) {
     // The slot's best parent edge is a cross-level or teleport link.
@@ -121,6 +123,12 @@ pub const CrossingScratch = struct {
     settles: usize = 0,
     frozen: bool = false,
 
+    comptime {
+        assertFieldsClassified(CrossingScratch, &.{ "box_slots", "level_slots", "open" }, &.{
+            "box_generation", "level_generation", "boxes_used", "levels_used", "box_limit", "budget", "box_shift", "level_shift", "open_limit", "settles", "frozen",
+        });
+    }
+
     pub fn deinit(self: *CrossingScratch, allocator: std.mem.Allocator) void {
         allocator.free(self.level_slots);
         allocator.free(self.box_slots);
@@ -157,6 +165,17 @@ pub const CrossingScratch = struct {
         self.open.clearRetainingCapacity();
         self.settles = 0;
         self.frozen = false;
+    }
+
+    // Bytes the tables and heap hold (allocated capacity).
+    fn residentBytes(self: *const CrossingScratch) usize {
+        return self.box_slots.len * @sizeOf(CrossingBoxSlot) + self.level_slots.len * @sizeOf(CrossingLevelSlot) + self.open.capacity * @sizeOf(OpenNode);
+    }
+
+    // `residentBytes` once reserved for at most `box_limit` boxes. Saturates.
+    fn storageBytesBound(box_limit: usize) usize {
+        const slots = hashTableSlots(box_limit) catch std.math.maxInt(usize);
+        return slots *| (@sizeOf(CrossingBoxSlot) + @sizeOf(CrossingLevelSlot)) +| listBytesBound(OpenNode, openHeapLimit(box_limit));
     }
 
     /// Starts a query whose box budget is `budget`, clamped to `box_limit`. O(1).
@@ -234,6 +253,12 @@ pub const AbstractScratch = struct {
     /// The search's cross-level heuristic crossing scratch, at `crossingBoxBudget(node_limit)`.
     crossing: CrossingScratch = .{},
 
+    comptime {
+        assertFieldsClassified(AbstractScratch, &.{ "open", "slots", "corridor", "corridor_link", "crossing" }, &.{
+            "generation", "node_budget", "nodes_used", "node_limit", "slot_shift", "open_limit", "corridor_limit",
+        });
+    }
+
     pub fn deinit(self: *AbstractScratch, allocator: std.mem.Allocator) void {
         self.crossing.deinit(allocator);
         self.corridor_link.deinit(allocator);
@@ -279,6 +304,20 @@ pub const AbstractScratch = struct {
         self.corridor_link.clearRetainingCapacity();
     }
 
+    // Bytes the table, heap, corridor lists, and crossing scratch hold (allocated capacity).
+    fn residentBytes(self: *const AbstractScratch) usize {
+        return self.slots.len * @sizeOf(AbstractSlot) + self.open.capacity * @sizeOf(OpenNode) +
+            self.corridor.capacity * @sizeOf(usize) + self.corridor_link.capacity * @sizeOf(bool) + self.crossing.residentBytes();
+    }
+
+    // `residentBytes` once reserved for at most `max_abstract_nodes`. Saturates.
+    fn storageBytesBound(max_abstract_nodes: usize) usize {
+        const slots = hashTableSlots(max_abstract_nodes) catch std.math.maxInt(usize);
+        return slots *| @sizeOf(AbstractSlot) +| listBytesBound(OpenNode, openHeapLimit(max_abstract_nodes)) +|
+            listBytesBound(usize, max_abstract_nodes) +| listBytesBound(bool, max_abstract_nodes) +|
+            CrossingScratch.storageBytesBound(crossingBoxBudget(max_abstract_nodes));
+    }
+
     pub fn reset(self: *AbstractScratch) void {
         self.open.clearRetainingCapacity();
         self.corridor.clearRetainingCapacity();
@@ -310,6 +349,10 @@ pub const CorridorScratch = struct {
     /// Logical stitched-path cap set by `reserve`; a query cap never exceeds it.
     stitched_limit: usize = 0,
 
+    comptime {
+        assertFieldsClassified(CorridorScratch, &.{ "abstract", "stitched" }, &.{"stitched_limit"});
+    }
+
     pub fn deinit(self: *CorridorScratch, allocator: std.mem.Allocator) void {
         self.stitched.deinit(allocator);
         self.abstract.deinit(allocator);
@@ -324,6 +367,17 @@ pub const CorridorScratch = struct {
         try self.stitched.ensureTotalCapacity(allocator, max_stitched_path_cells +| 1);
         self.stitched_limit = max_stitched_path_cells;
         std.debug.assert(self.stitched.capacity > self.stitched_limit);
+    }
+
+    /// Bytes the abstract search and stitched path hold (allocated capacity).
+    pub fn residentBytes(self: *const CorridorScratch) usize {
+        return self.abstract.residentBytes() + self.stitched.capacity * @sizeOf(StitchedCell);
+    }
+
+    /// `residentBytes` once reserved at caps no larger than `max_abstract_nodes` and
+    /// `max_stitched_path_cells`. Saturates.
+    pub fn storageBytesBound(max_abstract_nodes: usize, max_stitched_path_cells: usize) usize {
+        return AbstractScratch.storageBytesBound(max_abstract_nodes) +| listBytesBound(StitchedCell, max_stitched_path_cells +| 1);
     }
 };
 
@@ -406,6 +460,10 @@ pub const SearchScratch = struct {
     comptime {
         std.debug.assert(@alignOf(SearchScratch) == thread_shared_record_alignment);
         std.debug.assert(@sizeOf(SearchScratch) % thread_shared_record_alignment == 0);
+        assertFieldsClassified(SearchScratch, &.{ "open", "slots", "path_scratch", "corridor" }, &.{
+            "generation",               "explored",               "explored_budget",        "explored_limit", "open_limit", "slot_shift",
+            "max_stitch_segments_used", "crossing_boxes_settled", "crossing_budget_frozen",
+        });
     }
 
     pub fn deinit(self: *SearchScratch, allocator: std.mem.Allocator) void {
@@ -446,6 +504,21 @@ pub const SearchScratch = struct {
         self.open.clearRetainingCapacity();
     }
 
+    /// Bytes the search table, heap, path scratch, and corridor scratch hold (allocated
+    /// capacity).
+    pub fn residentBytes(self: *const SearchScratch) usize {
+        return self.slots.len * @sizeOf(SearchSlot) + self.open.capacity * @sizeOf(OpenNode) +
+            self.path_scratch.capacity * @sizeOf(u32) + self.corridor.residentBytes();
+    }
+
+    /// `residentBytes` once reserved at budgets no larger than these. Saturates.
+    pub fn storageBytesBound(max_explored_nodes: usize, max_abstract_nodes: usize, max_stitched_path_cells: usize) usize {
+        const slots = hashTableSlots(max_explored_nodes) catch std.math.maxInt(usize);
+        return slots *| @sizeOf(SearchSlot) +| listBytesBound(OpenNode, openHeapLimit(max_explored_nodes)) +|
+            listBytesBound(u32, @max(@as(usize, 1), max_explored_nodes)) +|
+            CorridorScratch.storageBytesBound(max_abstract_nodes, max_stitched_path_cells);
+    }
+
     pub fn reset(self: *SearchScratch) void {
         self.open.clearRetainingCapacity();
         self.explored = 0;
@@ -483,6 +556,21 @@ test "the search table holds ceilPow2(2B) rows whatever the level" {
         try std.testing.expectEqual(case[0], scratch.explored_limit);
         try std.testing.expectEqual(openHeapLimit(case[0]), scratch.open_limit);
     }
+}
+
+test "a reserved search scratch holds exactly its storage bound, and a smaller re-reserve stays within the larger bound" {
+    const allocator = std.testing.allocator;
+    var scratch = SearchScratch{};
+    defer scratch.deinit(allocator);
+    try scratch.reserve(allocator, 4096, 4096, 512);
+    try std.testing.expectEqual(SearchScratch.storageBytesBound(4096, 4096, 512), scratch.residentBytes());
+    try scratch.reserve(allocator, 100, 64, 16);
+    try std.testing.expect(scratch.residentBytes() <= SearchScratch.storageBytesBound(4096, 4096, 512));
+    var corridor = CorridorScratch{};
+    defer corridor.deinit(allocator);
+    try corridor.reserve(allocator, 16384, 2048);
+    try std.testing.expectEqual(CorridorScratch.storageBytesBound(16384, 2048), corridor.residentBytes());
+    try std.testing.expect(CorridorScratch.storageBytesBound(16384, 2048) > CorridorScratch.storageBytesBound(4096, 512));
 }
 
 test "SearchScratch generation wraparound clears stamps and the closed bit" {
