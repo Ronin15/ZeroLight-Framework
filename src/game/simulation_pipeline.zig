@@ -611,6 +611,11 @@ pub const SimulationPipelineStats = struct {
         perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
         perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
         perf.recordTiming(.pathfinding_publish, pathfinding_stats.publish_ns);
+        // Only a step that resized records its resize, so the timing averages per resize.
+        if (pathfinding_stats.resize_ns != 0) {
+            perf.recordTiming(.pathfinding_resize, pathfinding_stats.resize_ns);
+            perf.recordBatch(.path_resize_copy, pathfinding_stats.resize_copy_batch);
+        }
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         perf.recordBatch(.movement, movement_stats.batch);
@@ -755,6 +760,9 @@ pub const SimulationPipeline = struct {
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
         try pathfinding.reserveGoals(population);
+        // The elastic pools cover the committed steering agents now, so the first update has
+        // nothing to grow. A failure here or later frees them with the system.
+        try growPathfindingForAgents(&pathfinding, rows.steering_agents);
         // With a world, nav covers its levels at its own tile and chunk dimensions; the
         // bounds and `nav_cell_size` shape only a world-less build. The colliders build first,
         // on nav's cell grid, and nav reads them.
@@ -1009,14 +1017,7 @@ pub const SimulationPipeline = struct {
             try self.reserve(frame, body);
         }
 
-        if (!self.pathfinding.coversAgentCount(rows.steering_agents)) {
-            const old_agent_budget = self.pathfinding.capacity.max_agent_budget;
-            errdefer self.pathfinding.capacity.max_agent_budget = old_agent_budget;
-            if (rows.steering_agents > self.pathfinding.agentBudget()) {
-                self.pathfinding.raiseAgentBudget(grownPopulationCapacity(rows.steering_agents));
-            }
-            try self.pathfinding.growForAgentCount(rows.steering_agents);
-        }
+        try growPathfindingForAgents(&self.pathfinding, rows.steering_agents);
 
         if (body_grew or shares_grew) {
             stats.grew = true;
@@ -1030,6 +1031,20 @@ pub const SimulationPipeline = struct {
             }
         }
         return stats;
+    }
+
+    // Sizes pathfinding's elastic pools for `steering_agents`, raising its agent ceiling
+    // geometrically when the crowd passes it; O(1) when they already cover it. Shared by init
+    // (the committed rows) and the population seam. An error restores the ceiling, and the
+    // pools keep the fallback limits their resize installs.
+    fn growPathfindingForAgents(pathfinding: *PathfindingSystem, steering_agents: usize) error{OutOfMemory}!void {
+        if (pathfinding.coversAgentCount(steering_agents)) return;
+        const old_agent_budget = pathfinding.capacity.max_agent_budget;
+        errdefer pathfinding.capacity.max_agent_budget = old_agent_budget;
+        if (steering_agents > pathfinding.agentBudget()) {
+            pathfinding.raiseAgentBudget(grownPopulationCapacity(steering_agents));
+        }
+        try pathfinding.growForAgentCount(steering_agents);
     }
 
     /// Releases owned processor/controller state. Borrowed gameplay data and
@@ -2602,6 +2617,8 @@ const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
 const denseTileBlocksMovement = @import("world_test_support.zig").denseTileBlocksMovement;
 const InterestMarkerId = @import("world_interest.zig").InterestMarkerId;
 const nav_test_support = @import("systems/pathfinding/test_support.zig");
+const PathRequest = @import("simulation.zig").PathRequest;
+const RangeOutputStream = @import("simulation.zig").RangeOutputStream;
 const AiAgent = @import("data_system.zig").AiAgent;
 const MovementBody = @import("data_system.zig").MovementBody;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
@@ -6570,6 +6587,118 @@ test "population sync that runs out of memory growing pathfinding keeps the old 
     // max(12, 2 x the floor 8).
     try std.testing.expectEqual(@as(usize, 16), pipeline.pathfinding.effective_agent_capacity);
     try std.testing.expect(pipeline.pathfinding.coversAgentCount(12));
+}
+
+// `count` steering agents with movement bodies, committed before a pipeline is built.
+fn addSteeringAgents(data: *DataSystem, count: usize) !void {
+    for (0..count) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+}
+
+test "a pipeline built over steering agents sizes pathfinding for them, so its first update allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    const agent_count = 40;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addSteeringAgents(&data, agent_count);
+    var pathfinding = sync_test_pathfinding;
+    pathfinding.worker_participant_count = threads.participantSlotCount();
+    // World-less nav over 16x16 open cells.
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 512, 512, .{ .pathfinding = pathfinding });
+    defer pipeline.deinit();
+    const system = &pipeline.pathfinding;
+    try std.testing.expect(system.coversAgentCount(agent_count));
+    try std.testing.expect(system.effective_agent_capacity >= agent_count);
+    const capacity_at_init = system.effective_agent_capacity;
+    const bytes_at_init = system.requestResidentBytes();
+
+    // One distinct goal per agent, so intake keeps every request.
+    var requests: [agent_count]PathRequest = undefined;
+    for (&requests, data.steeringAgentSliceConst().entities, 0..) |*request, entity, index| {
+        const goal_x: f32 = @floatFromInt(8 + index % 8);
+        const goal_y: f32 = @floatFromInt(index / 8);
+        request.* = .{ .entity = entity, .start = .{ .x = 48, .y = 48 }, .goal = .{ .x = goal_x * 32 + 16, .y = goal_y * 32 + 16 } };
+    }
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    const range_base = try stream.appendRangeCounts(1);
+    stream.addCount(range_base, requests.len);
+    try stream.prefixAppendedRanges(range_base);
+    var writer = stream.rangeWriter(range_base);
+    for (requests) |request| writer.write(request);
+    writer.finish();
+    stream.finishWrite();
+
+    // The first update, with no admission, so the step has no path content to publish: every
+    // allocation fails (the system, its graph, its registry shards with their owner heads,
+    // and the thread system), and the whole crowd's intake lands in the pools init sized.
+    // Driven on the system rather than the pipeline's step, whose path requests come only
+    // from AI navigation intents through steering; the whole first step after a seam growth
+    // has its own every-owner proof.
+    const real_allocator = system.allocator;
+    const threads_allocator = threads.allocator;
+    const failing = std.testing.failing_allocator;
+    system.allocator = failing;
+    system.graph.allocator = failing;
+    for (&system.path_index) |*shard| shard.allocator = failing;
+    threads.allocator = failing;
+    const first = system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8, .max_solve_admissions_per_step = 0 });
+    system.allocator = real_allocator;
+    system.graph.allocator = real_allocator;
+    for (&system.path_index) |*shard| shard.allocator = real_allocator;
+    threads.allocator = threads_allocator;
+    const intake_stats = try first;
+    try std.testing.expect(!intake_stats.intake_batch.ran_inline);
+    try std.testing.expect(intake_stats.intake_batch.range_count > 1);
+    try std.testing.expectEqual(@as(usize, agent_count), intake_stats.accepted_requests);
+    try std.testing.expectEqual(@as(usize, agent_count), intake_stats.pending_requests);
+    try std.testing.expectEqual(@as(usize, 0), intake_stats.dropped_requests);
+    try std.testing.expectEqual(@as(u64, 0), intake_stats.resize_ns);
+    try std.testing.expectEqual(capacity_at_init, system.effective_agent_capacity);
+
+    // The first solving update: only path content grows (registry runs and long blocks);
+    // every elastic pool keeps its init size.
+    stream.clearRetainingCapacity();
+    const solve_stats = try system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8 });
+    try std.testing.expectEqual(@as(usize, agent_count), solve_stats.available_results);
+    try std.testing.expectEqual(capacity_at_init, system.effective_agent_capacity);
+    const bytes_after = system.requestResidentBytes();
+    try std.testing.expectEqual(bytes_at_init.queues, bytes_after.queues);
+    try std.testing.expectEqual(bytes_at_init.search, bytes_after.search);
+    try std.testing.expectEqual(bytes_at_init.tier1, bytes_after.tier1);
+    try std.testing.expectEqual(bytes_at_init.change_scratch, bytes_after.change_scratch);
+}
+
+test "a pipeline init that runs out of memory at any allocation frees everything; one that completes covers its steering agents" {
+    const agent_count = 12;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addSteeringAgents(&data, agent_count);
+    // Below the crowd, so init raises the ceiling as well as growing the pools.
+    var pathfinding = sync_test_pathfinding;
+    pathfinding.max_agent_budget = 8;
+    const config: SimulationPipelineConfig = .{ .pathfinding = pathfinding };
+    // Hand-rolled: `std.testing.checkAllAllocationFailures` never fails a resize; this sweep does.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
+        if (SimulationPipeline.init(failing.allocator(), &data, 256, 256, config)) |built| {
+            var pipeline = built;
+            defer pipeline.deinit();
+            try std.testing.expect(pipeline.pathfinding.coversAgentCount(agent_count));
+            try std.testing.expectEqual(grownPopulationCapacity(agent_count), pipeline.pathfinding.agentBudget());
+            if (!failing.has_induced_failure) break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
 }
 
 fn responderTemplate(index: usize, mobility: CollisionResponseMobility) StructuralCommand {

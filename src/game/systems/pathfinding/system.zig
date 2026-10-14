@@ -768,15 +768,17 @@ pub const PathfindingSystem = struct {
     }
 
     /// Raises `max_agent_budget` to `requested` (never lowers it). Population is
-    /// runtime-growing, so the raise is never refused. Main thread, population seam. Never writes
-    /// `group_field_threshold_ceiling`: a raise lifts capacity, not policy.
+    /// runtime-growing, so the raise is never refused. Main thread: pipeline init and the
+    /// population seam. Never writes `group_field_threshold_ceiling`: a raise lifts capacity,
+    /// not policy.
     pub fn raiseAgentBudget(self: *PathfindingSystem, requested: usize) void {
         self.capacity.max_agent_budget = @max(self.capacity.max_agent_budget, requested);
     }
 
     /// Grow half of the elastic resize: when `agent_count` derives more than the live
     /// capacity, grows (at least 2x, clamped to `agentBudget()`) preserving live state.
-    /// Called from the pipeline's population seam and from `beginUpdate`'s safety net.
+    /// Called from pipeline init (the committed steering agents), the population seam, and
+    /// `beginUpdate`'s safety net.
     pub fn growForAgentCount(self: *PathfindingSystem, agent_count: usize) error{OutOfMemory}!void {
         if (self.effective_agent_capacity == 0) return; // not reserved yet
         const target = deriveLimits(self.capacity, agent_count).pending_requests;
@@ -807,22 +809,27 @@ pub const PathfindingSystem = struct {
     // the group tally round-trip through reusable snapshots and pending_keys is rebuilt
     // from the restored pending. Search scratch, the tier-1 pool, and group fields follow
     // fixed budgets an elastic resize does not change, so their reserves are no-ops here.
-    // No worker runs.
-    fn adjustCapacityForAgentCount(self: *PathfindingSystem, agent_count: usize, threads: ?StageThreads) error{OutOfMemory}!void {
-        if (self.effective_agent_capacity == 0) return; // not reserved yet
+    // No worker runs. Returns whether a resize ran.
+    fn adjustCapacityForAgentCount(self: *PathfindingSystem, agent_count: usize, threads: ?StageThreads) error{OutOfMemory}!bool {
+        if (self.effective_agent_capacity == 0) return false; // not reserved yet
         const target = deriveLimits(self.capacity, agent_count).pending_requests;
         const current = self.effective_agent_capacity;
-        if (target > current) return self.growForAgentCount(agent_count);
+        if (target > current) {
+            try self.growForAgentCount(agent_count);
+            return true;
+        }
         // Shrink only after the agent count stays below half capacity for the window.
         if (agent_count * 2 < current) {
             self.low_load_steps +|= 1;
             if (self.low_load_steps >= self.capacity.capacity_shrink_window) {
                 self.low_load_steps = 0;
                 try self.resizePreservingLiveState(self.capacity, target, threads);
+                return true;
             }
         } else {
             self.low_load_steps = 0;
         }
+        return false;
     }
 
     // Re-sizes all pools for `capacity` at `agent_count` while preserving the live
@@ -1587,9 +1594,12 @@ pub const PathfindingSystem = struct {
     fn beginUpdate(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: ?StageThreads, stats: *PathfindingStats) !usize {
         self.step_counter +%= 1;
         self.last_resize_copy_batch = .{};
-        try self.adjustCapacityForAgentCount(agent_count, threads);
+        var resize_timer = StageTimer.begin();
+        const resized = try self.adjustCapacityForAgentCount(agent_count, threads);
+        const resize_ns = if (resized) resize_timer.lap() else 0;
         var accept_timer = StageTimer.begin();
         stats.* = self.acceptRequests(requests.mergedItems(), threads);
+        stats.resize_ns = resize_ns;
         stats.resize_copy_batch = self.last_resize_copy_batch;
         // Fold in any requests an elastic shrink dropped (it ran before acceptRequests
         // reset the step stats), then clear the accumulator.

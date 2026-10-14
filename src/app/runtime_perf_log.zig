@@ -195,11 +195,14 @@ pub const Timing = enum {
     gameplay_structural,
     // Pathfinding sub-stages: a breakdown of pipeline_pathfinding into request
     // accept/dedup, group-field service/build, individual+abstract solve+stitch,
-    // and result publish/compact, so the dominant phase is visible.
+    // and result publish/compact, so the dominant phase is visible. `pathfinding_resize`
+    // is the update's elastic resize (shrinks, and a grow after a failed population seam),
+    // recorded only on a step that resized, so its average is per resize.
     pathfinding_accept,
     pathfinding_group_service,
     pathfinding_solve,
     pathfinding_publish,
+    pathfinding_resize,
     // Steering prepare stages before the avoidance batch: wall time of selection, of the
     // agents stage with its rekey, of directions, and of the agent grid, each inline or
     // dispatched to workers.
@@ -229,6 +232,8 @@ pub const BatchStage = enum {
     path_intake,
     // The pathfinding update's registry flush, shrinks included; not the eviction flush.
     path_registry_flush,
+    // The pathfinding update's resize copy: a capacity shrink's byte moves, its cost driver.
+    path_resize_copy,
     movement,
     chunk_derive,
     collision_broadphase,
@@ -553,8 +558,9 @@ const EnabledRuntimePerfLog = struct {
         const pathfinding_group_timing = self.timingValue(.pathfinding_group_service);
         const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
         const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
+        const pathfinding_resize_timing = self.timingValue(.pathfinding_resize);
         log.debug(
-            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={} group_evictions={}",
+            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} resize_avg_ms={d:.3} resize_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={} group_evictions={}",
             .{
                 elapsed_s,
                 millis(pathfinding_accept_timing.averageNs()),
@@ -565,6 +571,8 @@ const EnabledRuntimePerfLog = struct {
                 millis(pathfinding_solve_timing.max_ns),
                 millis(pathfinding_publish_timing.averageNs()),
                 millis(pathfinding_publish_timing.max_ns),
+                millis(pathfinding_resize_timing.averageNs()),
+                millis(pathfinding_resize_timing.max_ns),
                 self.metricValue(.path_max_stitch_segments),
                 self.metricValue(.path_group_fields_built),
                 self.metricValue(.path_group_field_reuses),

@@ -633,6 +633,8 @@ pub const PathfindingStats = struct {
     group_service_ns: u64 = 0,
     solve_ns: u64 = 0,
     publish_ns: u64 = 0,
+    // The safe point's elastic resize (a grow or a shrink); zero on a step without one.
+    resize_ns: u64 = 0,
 };
 
 /// One step's goal resolve (`PathfindingSystem.resolveGoals`): the intents scanned, those

@@ -1654,7 +1654,8 @@ pub const NavGraph = struct {
             fresh.built_world_revision = world_system.contentRevision();
         }
         fresh.pool_grows = self.pool_grows + fresh.pool_grows;
-        fresh.pool_growth_logged = self.pool_growth_logged;
+        // The fresh levels' builds already logged their growth; the swap keeps that.
+        fresh.pool_growth_logged = self.pool_growth_logged or fresh.pool_growth_logged;
         fresh.land_deferrals = self.land_deferrals;
         fresh.land_deferral_logged = self.land_deferral_logged;
         self.deinit();
@@ -4321,6 +4322,22 @@ test "a world build that runs out of memory leaves the previous graph intact; a 
     defer fresh.deinit();
     try expectGraphsEquivalent(&system.graph, &fresh.graph);
     try std.testing.expectEqual(fresh.graph.residentBytes(), system.graph.residentBytes());
+}
+
+test "a world build's growth log stays logged through the swap and a later rebuild, so the next change never logs it again" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try twoLevelWorld(&meta);
+    defer fixture.world.deinit();
+    var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
+    defer system.deinit();
+    try std.testing.expect(system.graph.pool_grows != 0);
+    try std.testing.expect(system.graph.pool_growth_logged);
+
+    _ = try system.graph.rebuild(no_colliders.view(), .{ .world = &fixture.world }, null);
+    try std.testing.expect(system.graph.pool_growth_logged);
 }
 
 test "nav over a zero-level world builds no level; the first added level routes" {
