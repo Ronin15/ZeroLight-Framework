@@ -397,6 +397,18 @@ a design open for this slice):
 - [ ] The nav estimate's level-build staging peak is measured, not derived:
       `buildLevel` shrinks its staging before it returns, so `checkNavBytes` never
       sees the peak its bound charges (`639f55d`).
+- [ ] Result-cache size, hit/miss, and eviction follow capacity history (the
+      per-step gates do not since `78f4f90`): the logical size is
+      `4 × effective_agent_capacity` (`system.zig:623`, reserved at `:554`), the
+      victim is a round-robin over physical probe slots whose layout depends on
+      the last resize's size (`caches.zig:410-419`, cursor reset at `:449`,
+      `:538`), and shrink eviction follows the shrink window (`caches.zig:506`,
+      `system.zig:859`). Scenario: 40 agents grown to capacity 64 vs freshly
+      sized to 40 (a save/load); after 200 distinct results one has evicted 40,
+      the other none, so later hits and re-solves differ. Admission and deferral
+      are identical and a miss re-solves correctly. Needs a live-count logical
+      limit and a layout-independent victim order (new eviction machinery, about
+      200–300 production lines; `.claude/reports/64g-capacity-gates-design.md`).
 - [x] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
       and 64B checked against chunk storage.
 

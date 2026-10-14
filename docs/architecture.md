@@ -845,8 +845,11 @@ tuner per stage. `SimulationFrame.path_requests` carries transient requests from
 steering; queues, scratch, thread state, and caches stay out of `DataSystem`.
 Results are consumed on later steps, so a missing path never stalls same-step
 movement. `PathfindingCapacity` is configuration only (agent ceiling, search and
-field budgets, policy knobs); every per-step and memory limit derives from it and
-the live agent count in a private `Limits`. The fixed-step work:
+field budgets, policy knobs). Pools are sized by a private `Limits` derived from it
+and the elastic capacity; each step's gates (`StepGates`: frame and pending at
+`max(agents, 8)`, group tallies at `min(512, that)`) derive only from the live
+steering-agent count, so admission never depends on capacity history (the result
+cache still does; Slice 64G checklist). The fixed-step work:
 
 - `path_goal_resolve` (its own pipeline stage, before steering) builds the step's
   goal table: one projection per distinct blocked goal key (nearest open cell
@@ -857,8 +860,10 @@ the live agent count in a private `Limits`. The fixed-step work:
 - `path_intake` converts start and goal cells four requests per
   `src/core/simd.zig` vector; ranges classify against step-start state into their
   windows, and the main thread merges the windows in range order (group tallies,
-  expired results, in-step duplicates, the logical frame-request limit, pending
-  pushes), one classifier for every partition. Each request is answered
+  expired results, in-step duplicates, pending pushes past the pending gate
+  dropped deterministically and re-requested on `.missing`), one classifier for
+  every partition; a step carries at most one request per steering agent
+  (asserted). Each request is answered
   `unavailable` (no open goal cell within the radius, or reach says the open start
   cannot reach the live goal), a cache hit (a fresh result whose stored goal cell
   is the live goal, unless it is partial and the start lies in its end's refresh
@@ -982,9 +987,11 @@ steering agents through the same helper the population seam uses
 (`growPathfindingForAgents`), so the first update after load has nothing to grow;
 after that the seam grows them at least 2× for the live agent count
 (`growForAgentCount`), never refused (`raiseAgentBudget`), and the update's own
-resize remains for shrinks and as the fallback after a failed seam. A count below
-half capacity for `capacity_shrink_window` (120) steps shrinks them, keeping cached
-results that fit. Every reserve is failure-atomic, and on OOM each table-sizing
+resize remains for shrinks and as the fallback after a failed seam (raising the
+ceiling 1.5× past a crowd beyond it). A count below half capacity for
+`capacity_shrink_window` (120) steps shrinks them to the larger of the crowd, the
+live pending queue, and the live group tallies, never dropping live work, and
+keeps the cached results that fit. Every reserve is failure-atomic, and on OOM each table-sizing
 budget falls back to min(committed, requested). A budget whose indices cannot hold a
 field cap or result block fails with `PathfindingBudgetTooWide`.
 

@@ -207,6 +207,9 @@ Long paths:
 - Init sizing `4c247e7`: pipeline init sizes pathfinding's elastic pools for the
   committed crowd, so the first update after load grows nothing (the demo's one-off
   5.5 ms ReleaseSafe spike at 2,000 entities).
+- Capacity gates `78f4f90`: per-step admission follows the live agent count, never
+  capacity history; shrinks keep live pending work. The result cache's
+  history dependence is a 64G checklist item.
 
 
 ## Rendering And Build
@@ -583,3 +586,6 @@ Long paths:
 - `b83dd86` Slice 64G acceptance: chunk-scale and path-cost checks pass; the cave clause becomes arrival within the node caps
 - `feeabd0` Slice 64G acceptance: the manual demo check passes
 - `4c247e7` Pipeline init sizes pathfinding's elastic pools for the committed steering agents; the first update after load grows nothing
+- `dcdbea5` Docs for 4c247e7: pathfinding capacity sized at pipeline init; resize timing and path_resize_copy in the perf log
+- `821eb62` Roadmap: Slice 82 splits the world module; Slice 81 keeps the pathfinding split
+- `78f4f90` Pathfinding gates follow the live agent count, never capacity history; shrinks keep live pending work and tallies
