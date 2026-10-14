@@ -313,8 +313,23 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      the scattered one at 16,384 intents serial in ReleaseFast (38.5 vs 61.5 µs,
      `639f55d`; no false sharing between ranges), a locality gain for ordering
      intents by movement row.
+   - [ ] World creation and worldgen (never assessed against the cost model):
+     `initProcedural*` and level builds have no measured cost for the cost
+     model's "creating or destroying a world" row, and the target is several
+     worlds created in play. Assessed in the branch's opening measurement with a
+     world-create bench at three sizes; its storage rework lands with the core
+     storage work, ahead of Slice 74 (world instances), which builds on it.
+   - [ ] Render backend pass, last on this branch, after render collect moves to
+     visible chunks (same files, touched once): the renderer, sprite batch, text,
+     and GPU buffers checked against the cost model and `render.md`
+     (`zig-best-practices-review`, review-only, then local fixes).
 3. **AI:** cognition, perception, memory, affect, sensory bus and interest
    markers, built on the core branch's final form.
+4. **Remaining layers, when normal roadmap flow resumes after the AI branch:**
+   the app layer (state stack, input), assets, audio, and platform get one
+   best-practices pass (`zig-best-practices-review`). They are setup-time or
+   bounded per frame, so they get no branch of their own, and neither the core
+   nor the AI branch touches their files.
 
 Each branch opens by measuring first (bench-only landing on today's code), then
 writes the findings below into slice checklists or new slice files.
