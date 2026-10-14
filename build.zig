@@ -742,11 +742,6 @@ comptime {
     }
 }
 
-/// Zig 0.17 LTO requires LLD; LLD cannot link Mach-O object files.
-/// Windows (COFF) is also excluded: under Zig 0.17, full and thin LTO with
-/// `link_libc` fail at `lld-link` with undefined mingw libc/libm symbols
-/// (`frexpf`, `lrintl`, `modfl`, `wmemcpy`, `strndup`, ...) for x86_64 and
-/// aarch64 windows-gnu. Without LTO, ReleaseFast links and emits the PDB.
 fn shippedCpuFloor(host: std.Target) std.Target.Query {
     return switch (host.cpu.arch) {
         .x86_64 => .{ .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v2 } },
@@ -758,6 +753,11 @@ fn shippedCpuFloor(host: std.Target) std.Target.Query {
     };
 }
 
+/// Zig 0.17 LTO requires LLD; LLD cannot link Mach-O object files.
+/// Windows (COFF) is also excluded: under Zig 0.17, full and thin LTO with
+/// `link_libc` fail at `lld-link` with undefined mingw libc/libm symbols
+/// (`frexpf`, `lrintl`, `modfl`, `wmemcpy`, `strndup`, ...) for x86_64 and
+/// aarch64 windows-gnu. Without LTO, ReleaseFast links and emits the PDB.
 fn ltoSupportedForTarget(target: std.Target) bool {
     return switch (target.ofmt) {
         .macho, .coff => false,

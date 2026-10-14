@@ -246,8 +246,9 @@ pub const query_group = suite.BenchmarkGroup{
 //     64, 256, or 1,024 teleports at 256² and 8 levels and passes when flat in teleport count.
 //     Layout 1 runs one teleport per 16 strip cells on sides 256, 1024, and 2048 at 8 levels
 //     and passes when flat in side. Layout 2 runs 16, 64, or 256 teleports at 256² and 8
-//     levels and passes when every route solves at 16 and 64; the 256 point is reported, not
-//     judged.
+//     levels and passes when every route solves at 16; at 64 and 256 no route solves within
+//     the abstract node budget, a recorded limit (scattered random pads are not content the
+//     game makes), reported, not judged.
 //   - `pathfinding-cross-level-shaft`: a 256² world of 8, 32, or 128 walkable levels; a ramp
 //     shaft beside the starts joins levels 1 to the deepest, and level 0, which no ramp
 //     reaches, holds a one-way teleport from the shaft's planar cell to beside the goals.
