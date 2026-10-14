@@ -429,5 +429,8 @@ a design open for this slice):
       distance runs above octile; the region layer that would remove it is
       shelved.
 - [ ] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
-- [ ] Manual (display, Debug): digs and ramps in the demo; NPCs route over
-      the changes. The in-demo cave-in check is Slice 76's.
+- [x] Manual (display, Debug): digs and ramps in the demo; NPCs route over
+      the changes. The in-demo cave-in check is Slice 76's. Owner 2026-10-14
+      at `b83dd86`: dug one layer deep and built ramps up; entities used the
+      ramps (60 s: 40 dig events, 202 chunks patched, 44,826 paths available,
+      none dropped or budget-exhausted).
