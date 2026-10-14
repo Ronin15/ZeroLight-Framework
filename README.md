@@ -17,16 +17,16 @@ simulation, richer emergent AI, and production-friendly asset workflows.
   leaves gameplay.
 - **SDL_GPU rendering** — sprites, multi-level tilemaps, camera transforms,
   text, and ordered world drawing behind a small game-facing render API.
-- **Worlds and tilemaps** — procedural multi-level worlds, chunk visibility,
-  dig and plane traversal between floors, and tile edits that feed navigation
-  and gameplay.
+- **Worlds and tilemaps** — large procedural multi-level worlds built from
+  chunks, dig and plane traversal between floors, and tile edits that feed
+  navigation and gameplay.
 - **Fixed-step simulation** — 60Hz gameplay with AI, steering, pathfinding,
   movement, collision, particles, and small domain controllers (dig, audio,
   interactables).
 - **Scoped simulation** — full detail near the view, cheaper tiers farther
   out.
-- **Dig-aware pathfinding** — NPCs path across levels and use newly dug
-  tunnels and ramps right away.
+- **Dig-aware pathfinding** — NPCs path across levels and long distances and
+  use newly dug tunnels and ramps right away.
 - **Emergent AI (in progress)** — agents see, hear, remember, and react with
   simple emotions and data-authored personalities. Combat AI and deeper goals
   are on the roadmap.
@@ -35,8 +35,8 @@ simulation, richer emergent AI, and production-friendly asset workflows.
 - **Atlas-backed assets** — packed runtime atlases with stable IDs so art and
   audio can be swapped without rewriting game code.
 - **Multithreaded and deterministic** — threaded systems with identical
-  serial and threaded results, allocation-free hot paths, and benchmarks that
-  track scaling.
+  serial and threaded results, memory that scales with the world,
+  allocation-free hot paths, and benchmarks that track scaling.
 
 For design detail and ownership boundaries, start with
 [architecture](docs/architecture.md). Topic guides cover
