@@ -40,8 +40,8 @@ preferences, never save data and never simulation input (Ground Rules).
 ### Architecture notes
 
 - Settings live in `settings.zon` under the pref dir; Slice 46 has no
-  settings section. A settings value never feeds simulation state, the
-  replay, or the checksum (`.claude/rules/simulation.md` § Determinism).
+  settings section. A settings value never feeds simulation state or the
+  checksum (`.claude/rules/simulation.md` § Determinism).
 - The store is an `Engine` field, never a global; methods that do I/O take
   the user-storage owner explicitly (`.claude/rules/engine-design.md`).
   User-storage (pref dir, bounded read, atomic write, rejected-file backup)

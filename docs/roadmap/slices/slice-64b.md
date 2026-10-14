@@ -7,8 +7,8 @@ hashed set, uses `normalizeDerivedState` as its load-parity reference, and
 writes `buildFingerprint()`.
 
 Goal: the checksum (1) is a pure function of IEEE-observable state, so NaN
-sign and payload never cause a false cross-machine mismatch while NaN
-presence is still reported; (2) covers every piece of carried pipeline
+sign and payload never cause a false mismatch (a runtime and a folded NaN
+differ within one binary) while NaN presence is still reported; (2) covers every piece of carried pipeline
 history that changes future persistent state, in every world instance, with a
 comptime-enforced classification of every pipeline field; (3) hashes terrain
 per chunk on the `ThreadSystem` with an ordered combine, identical serial or
@@ -54,7 +54,7 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   extent (`.claude/rules/budgets-capacities.md`); no allocation; owner thread
   only. Tag is live + 1 (Table T6).
 - `buildFingerprint()` (app version, Zig version, checksum tag) is the only
-  build fingerprint; consumers are 46's save header and 64C's replay header.
+  build fingerprint; its consumer is 46's save header.
   Adds the `app_version` build option if 52B has not.
 - Every field of `SimulationPipeline` and each subsystem holding hashed
   state is classified hashed (saved verbatim by 46), normalized (rebuilt by

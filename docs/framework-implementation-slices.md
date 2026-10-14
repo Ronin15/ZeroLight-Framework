@@ -32,7 +32,7 @@ files it links. Do not load the whole roadmap.
 - **A slice is small:** one feature, one owning area, designed, landed, and
   reviewed as one batch. Larger work is several slices.
 - **One file per slice or sub-slice** (`slices/slice-<id>.md`, lowercase id;
-  umbrellas such as `slice-64.md` summarize their sub-slices), each with exactly
+  umbrellas such as `slice-52.md` summarize their sub-slices), each with exactly
   one row in the Open Frontier Slice Index that links to it.
 - **Completed slices move to the archive:** `git mv` the file to
   `roadmap/archive/`, move its row to the
@@ -67,8 +67,8 @@ files it links. Do not load the whole roadmap.
   persistent `DataSystem`/`WorldSystem` state classifies it in Slice 49's
   checksum completeness lists (and 64B's classification) and adds its Slice 46
   save section in the same change.
-- Version numbers (replay format and flag bits, settings schema, save format,
-  checksum tag), `stage_order` positions, and component tags follow Tables
+- Version numbers (settings schema, save format, checksum tag),
+  `stage_order` positions, and component tags follow Tables
   T1–T6 in the [VoidLight port track](roadmap/tracks/voidlight-port.md); a slice
   that changes one updates the table in the same change.
 - Validate per `.claude/rules/build-validation.md`; `zig build verify` passes
@@ -152,17 +152,16 @@ the [archive](framework-implementation-slices-archive.md).
 | [**56**](roadmap/slices/slice-56.md) | Not started | Health, Damage, And Combat Domain Controller — after 49, 73 |
 | [**56B**](roadmap/slices/slice-56b.md) | Not started | Projectiles And Ranged Combat — after 56 |
 | [**57**](roadmap/slices/slice-57.md) | Not started | Items, Inventory, And Equipment — after 56, 49, 59 |
-| [**57B**](roadmap/slices/slice-57b.md) | Not started | Inventory And Equipment UI — after 53A, 53B, 57, 49, 64C |
+| [**57B**](roadmap/slices/slice-57b.md) | Not started | Inventory And Equipment UI — after 53A, 53B, 57, 49 |
 | [**58**](roadmap/slices/slice-58.md) | Not started | Seeded Procedural World Generation — after 49, 57, 61, 64G |
 | [**59**](roadmap/slices/slice-59.md) | Not started | Game Time, Day/Night Cycle, Seasons, And Weather — after 49, 60 |
 | [**60**](roadmap/slices/slice-60.md) | Not started | Camera Behavior And Scene Composite Pass — after 49, 54, 70A |
 | [**61**](roadmap/slices/slice-61.md) | Not started | Harvesting And World Resource Nodes — after 73, 56, 57, 49 |
 | [**62**](roadmap/slices/slice-62.md) | Not started | NPC Population, Spawning, And Spawn Tables — after 49, 57, 58, 59, 63, 64G, 75 |
 | [**63**](roadmap/slices/slice-63.md) | Not started | Social Relationships And Trade — after 73, 53B, 56, 57, 57B, 61 |
-| [**64**](roadmap/slices/slice-64.md) | Not started (umbrella) | Cross-Machine Determinism Completion And Replay Tooling — after 49, 50, 51, 52D, 53B |
 | [**64A**](roadmap/slices/slice-64a.md) | Not started | Simulation-Invisible Pause, Float Min/Max Policy, And FP Environment Assertion — after 49, 52D |
 | [**64B**](roadmap/slices/slice-64b.md) | Not started | Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74 |
-| [**64C**](roadmap/slices/slice-64c.md) | Not started | Headless Replay Runner, Session Descriptor, And New Game Seed Flow — after 49, 51, 53B, 64A, 64B, 74 |
+| [**64C**](roadmap/slices/slice-64c.md) | Not started | Session Descriptor And New Game Seed Flow — after 49, 53B, 74 |
 | [**64D**](roadmap/slices/slice-64d.md) | Gated: first simulation `atan2` consumer | Deterministic Vector `atan2` — after 52D |
 | [**64G**](roadmap/slices/slice-64g.md) | In progress | Chunk-Owned Terrain And Nav |
 | [**65**](roadmap/slices/slice-65.md) | Not started (umbrella) | Threading Layout Cleanup And Background-Lane Heavy Consumers — after 50, 51 |
@@ -171,7 +170,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**65C**](roadmap/slices/slice-65c.md) | Not started | Streaming Worldgen On The Background Lane — after 58, 53B, 51, 74 |
 | [**66**](roadmap/slices/slice-66.md) | Not started (umbrella) | Distribution, Signing, Symbols, And Store Delivery — after 52B, 52C, 54 |
 | [**66A**](roadmap/slices/slice-66a.md) | Not started | Shipped-Build Crash Triage — Split Symbols, Symbol Store, Crash Reports, Linux Window Icon — after 52B, 52C, 54 |
-| [**66B**](roadmap/slices/slice-66b.md) | Gated: per target | Additional Package Targets — macOS universal2, aarch64-linux, aarch64-windows — after 66A, 64C, 52A |
+| [**66B**](roadmap/slices/slice-66b.md) | Gated: per target | Additional Package Targets — macOS universal2, aarch64-linux, aarch64-windows — after 66A, 52A |
 | [**66C**](roadmap/slices/slice-66c.md) | Gated: first public release outside Steam | Signing, Notarization, .dmg, And Linux AppImage — after 66A |
 | [**66D**](roadmap/slices/slice-66d.md) | Gated: a Steamworks app ID | SteamPipe Upload Automation — after 66A |
 | [**66E**](roadmap/slices/slice-66e.md) | Gated: first release-candidate tag | Authoritative Perf Runner — after 52C |
@@ -205,7 +204,8 @@ the [archive](framework-implementation-slices-archive.md).
 | [**76**](roadmap/slices/slice-76.md) | Not started | Cave-Ins — after 64G |
 | [**77**](roadmap/slices/slice-77.md) | Not started | Explosions — after 64G, 76 |
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
-| [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — input before 49 pins replay v1 |
+| [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
+| [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
 
 **Recently settled (archive only):** 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
@@ -222,10 +222,10 @@ residual only); open work grows beside that loop.
 | Track | Slices | Focus |
 | --- | --- | --- |
 | **Fully simulated worlds** | **64G** → **73** → **75** → **74** (74 after 50) | Chunk-owned terrain and nav, data-driven cognition, fidelity by distance from the observer, and world instances created, stepped, and destroyed in play. |
-| **Determinism & threading** | **49** → **50** → **52A–52D** → **64A** → **51** → **65A** → **64B** → **64C** → **65B** (65C after 58 and 74; 64D gated) | Seeded sessions, checksum and replay over every world, cross-machine determinism, and lane consumers. |
+| **Determinism & threading** | **49** → **50** → **52A–52D** → **64A** → **51** → **65A** → **64B** → **64C** → **65B** (65C after 58 and 74; 64D gated) | Seeded sessions, checksum over every world, serial == threaded results, and lane consumers. |
 | **Perf** | **72**, **55**, **35**, **70A**, **71B**, **68A** | Behavior independent of physical capacity, decision cadence, AI/steering math, sprite bandwidth, shared entity tables, static fast paths. |
 | **Release & platform** | **52A** → **52B** → **52C** → **66A**; **52D** after 52A; **66B–66E** gated | Pinned baseline, packaging, CI, crash triage; 52A before games fork, 66A before any build leaves the team. |
-| **Shipping UI / settings / input / persistence** | **53A** → **53B** → **54** → **44** → **46** → **67A** / **67B** → (60) → **67C** → **67E** | UI, settings, rebinding, and saves; bindings live in settings, never saves; no 67 work touches simulation, replay, or the checksum. |
+| **Shipping UI / settings / input / persistence** | **53A** → **53B** → **54** → **44** → **46** → **67A** / **67B** → (60) → **67C** → **67E** | UI, settings, rebinding, and saves; bindings live in settings, never saves; no 67 work touches simulation or the checksum. |
 | **Gameplay domains** | **56** → **56B** → **59** → **57** → **57B** → **61** → **58** → **63** → **62** → **71A** → **71C** / **71D** → **69A**; **42**; **68B** → **68C** | Combat, items, time, harvesting, worldgen, social, population, and AI behavior, built on 73's data-driven cognition. |
 | **World presentation** | **60** → **69B** / **69C** → **70B** (69D–69F gated) | Camera rig and scene composite, regional weather, time skip, presentation polish. |
 
@@ -356,8 +356,9 @@ order.
 - **Capacity sizing:** [72](roadmap/slices/slice-72.md), any time; F and G
   are re-scoped against 64G first. Its open items cross-edit the slices they
   name in the same change.
-- **Game-loop input and timing:** [79](roadmap/slices/slice-79.md), any time
-  before 49 pins replay v1's input bits (Table T1).
+- **Game-loop input and timing:** [79](roadmap/slices/slice-79.md), any time.
+- **Observer and optional player:** [80](roadmap/slices/slice-80.md), before
+  75 and 74 bind the observer; 60's rig drives it once landed.
 
 1. **64G** Chunk-Owned Terrain And Nav.
 2. **50** Thread System Hardening (opens the core-systems branch).
@@ -382,7 +383,7 @@ order.
 21. **54** Persistent Settings — after 53B, 52B.
 22. **66A** Shipped-Build Crash Triage — Split Symbols, Symbol Store, Crash Reports, Linux Window Icon — after 52B, 52C, 54.
 23. **44** Input Rebinding And Extended Gamepad Controls — after 53B, 54.
-24. **64C** Headless Replay Runner, Session Descriptor, And New Game Seed Flow — after 49, 51, 53B, 64A, 64B, 74.
+24. **64C** Session Descriptor And New Game Seed Flow — after 49, 53B, 74.
 25. **65B** Deferred Nav Rebuild On The Background Lane — after 51, 65A, 64G, 49, 64B.
 26. **46** Save/Load Persistence — after 49, 51, 53B, 54, 64B, 64G, 74.
 27. **70A** Sprite Vertex Compaction (Indexed Quads, Packed Color).
@@ -396,7 +397,7 @@ order.
 35. **56B** Projectiles And Ranged Combat — after 56.
 36. **59** Game Time, Day/Night Cycle, Seasons, And Weather — after 49, 60.
 37. **57** Items, Inventory, And Equipment — after 56, 49, 59.
-38. **57B** Inventory And Equipment UI — after 53A, 53B, 57, 49, 64C.
+38. **57B** Inventory And Equipment UI — after 53A, 53B, 57, 49.
 39. **69C** Time Skip — after 59, 49, 75, 64B, 67B, 67E, 57B.
 40. **38** Elevation Above The Surface — after 64G.
 41. **61** Harvesting And World Resource Nodes — after 73, 56, 57, 49.
@@ -416,7 +417,7 @@ order.
 55. **68C** Carried-Inventory Death Drop And Ranged Ammo — after 56B, 57, 61.
 56. **Gated** (each lands when its trigger trips; see its Status line):
     - **64D:** first simulation `atan2` consumer — after 52D.
-    - **66B:** per target — after 66A, 64C, 52A.
+    - **66B:** per target — after 66A, 52A.
     - **66C:** first public release outside Steam — after 66A.
     - **66D:** a Steamworks app ID — after 66A.
     - **66E:** first release-candidate tag — after 52C.
@@ -424,7 +425,7 @@ order.
     - **69E:** benches show off-view weather is a measurable cost share — after 59, 60.
     - **69F:** worlds that cannot hold every chunk expanded in memory — after 64G, 58, 46, 74, 75.
 
-Umbrellas (52, 64, 65, 66, 67, 69, 70, 71) close when their sub-slices do.
+Umbrellas (52, 65, 66, 67, 69, 70, 71) close when their sub-slices do.
 
 ## Roadmap Files
 

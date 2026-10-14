@@ -11,7 +11,7 @@ including far-simulation state, persisted as stable IDs and scalar/enum data,
 never paths or live handles. Saves go to 8 manual slots with readable
 metadata through Save/Load menus on 53B widgets; file I/O stays off the main
 thread when the background lane has a thread; saving is invisible to the
-continuing session and to replay.
+continuing session.
 
 ### Current foundation
 
@@ -63,6 +63,10 @@ continuing session and to replay.
   The encode buffer is sized from content and reserved once before writing
   (`.claude/rules/memory-performance.md`); a load trusts no length field
   beyond the file's actual size and the format's index widths.
+- Payload encoding matches T3's header: every field at a fixed width in
+  little-endian order, floats as their bit patterns, and no in-memory struct
+  or SoA column written raw (plain `struct` layout is unspecified; `usize`
+  is target-width). A save written on one OS loads on another.
 - Cold path, but it scales with content: encode runs at the paused quiescent
   point (no structural commands pending), with per-chunk and per-world work on
   the thread system and a deterministic ordered merge where the cost model
@@ -96,8 +100,7 @@ continuing session and to replay.
       script equal the reference run normalized at S, with a multi-chunk
       cave-in and a runtime ramp an NPC routes through before the save.
 - [ ] Save invisibility: a session that saves at S keeps the same trace and
-      derived-state counters as one that never saves; a replay recorded across
-      a save verifies `matched` with no flag bits set.
+      derived-state counters as one that never saves.
 - [ ] Save request → gameplay-state capture hook → Engine flow; menus decline.
 - [ ] Lane jobs plus inline fallback for write, read and decode, and slot scan;
       `SaveStatus` publication; outstanding tickets completed before the lane
@@ -113,7 +116,7 @@ continuing session and to replay.
       allocation.
 - [ ] Payload-purity test: no handles, paths, settings, bindings, environment
       snapshots, or derived nav state.
-- [ ] (added by Slice 64) `world_environment` section (game clock, per-level
+- [ ] `world_environment` section (game clock, per-level
       sky exposure), with round-trip, rejection, and same-environment-transition
       tests; lands with whichever of 46 and 59 lands second.
 - [ ] (added by Slice 65B, once landed) A save with a deferred nav job in

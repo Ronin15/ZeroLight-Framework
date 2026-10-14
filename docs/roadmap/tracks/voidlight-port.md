@@ -5,8 +5,8 @@
 
 Slices 49–63 add shipping features (combat, items, harvesting, worldgen,
 time/weather, camera, UI, settings, saves, packaging, CI); Slices 64–71 finish
-the track: cross-machine determinism and replay tooling (64), lane-heavy
-consumers (65), distribution (66), UI/input/text completion (67), battle-scale
+the track: determinism hazards and session setup (64A–64D), chunk-owned
+terrain and nav (64G), lane-heavy consumers (65), distribution (66), UI/input/text completion (67), battle-scale
 hardening (68), worldgen breadth and regional environment (69), presentation
 polish (70), and AI behavior parity (71); 74 (world instances) and 75 (far
 simulation) carry the multi-world direction. The older C++ VoidLight framework
@@ -19,7 +19,7 @@ camera focus, or a player when a game has one), never stopped; worlds the
 observer is not in still step at lower fidelity. Worlds are created and
 destroyed in play and own their storage. Terrain and nav are owned per chunk
 `(level, cx, cy)` (64G). So every contract below holds per world instance,
-and the checksum, saves, and replays cover every world instance and all
+and the checksum and saves cover every world instance and all
 simulated state, including far-simulation state
 (`.claude/rules/engine-design.md` § Target scale).
 
@@ -38,12 +38,12 @@ pool.
 | Far simulation: fidelity by distance from the observer (slower AI ticks, never skipped progress; dormancy only for inert things; ambient recycling only for unimportant spawns), with a lowest band for worlds the observer is not in | 75 | 46, 49, 57, 62, 64B, 74 |
 | `SimulationSeed` (`root`), `seed.derive(SeedDomain)` once at `SimulationPipeline.init`; append-only `SeedDomain` registry (`ai_wander = 1`, `worldgen_procedural = 2` land with 49; reserved: `combat = 3` 56, `loot = 4` 57, `dig_yield = 5` 58, `environment = 6` 59, `harvest = 7` 61, `population = 8` 62); per-world seeds derive from the root | 49 | 56–62, 74 |
 | Simulation scope from fixed-step simulation inputs (the observer's `sim_view` through `simViewRegion`), never the render window; scope sets fidelity, never whether anything advances | 49 (60 supplies the rect; 75 adds the bands; 74 applies the lowest band to other worlds) | 55, 59, 62, 75 |
-| `simulationChecksum()` same-binary oracle over every world instance, `checksum_format_tag`, `DataSystem`/`WorldSystem` completeness lists; replay frame with pinned gameplay bits (Table T1) | 49 | 46, 51, 52C, every persistent-state slice |
+| `simulationChecksum()` same-binary oracle over every world instance, `checksum_format_tag`, `DataSystem`/`WorldSystem` completeness lists | 49 | 46, 52C, every persistent-state slice |
 | Background lane `submit`/`complete` with step-keyed handoff at `submit + k`; `isDone` for app-layer consumers only | 51 | 46 |
 | Absolute-step schedules through `stepAfter` / `stepReached` | 56 | 57, 59, 61, 62 |
 | Shared action bus: one AI action emitter (`ai_action_select`, per-kind arms) and one `ActionClaimSet` / `action_claims`, claim order trade → harvest → destructible (`combat_resolve` takes unclaimed `.attack`); fairness from 68A | 56 | 57 (`.use`), 61, 63, 71D (`.sell`) |
 | Inventory transfers: `TransferBatch` / `canAccept` / `canRemove` / `canRemoveCoins` / apply in `inventory_update`; `consume` (68C) | 57 (pipeline wiring lands with 61) | 61, 63, 68C |
-| `PendingPlayerActions` UI→gameplay queue, `live_modal_overlay` preset, toast primitive, replay v3 action records (Table T1) | 57B | 63 |
+| `PendingPlayerActions` UI→gameplay queue, `live_modal_overlay` preset, toast primitive | 57B | 63 |
 | `AffectImpulse` queue, drained at the commit seam (none pending at a step boundary) | 61 | 63 (`.social`), 71A (`guard_alarm`) |
 | Engine-owned `SettingsStore` (versioned ZON, upgrade chain, Table T2); settings never enter a save | 54 | 44, 60, 67A, 70B; a locale setting is deferred ([Deferred By Owner](../../framework-implementation-slices.md#deferred-by-owner)) |
 | `StepIndex = u64` / `stepKey` | 49 | all |
@@ -78,39 +78,11 @@ A slice landing out of that order still takes live + 1 and updates the table
 in the same change. A slice file that disagrees with a table is a defect: fix
 both together.
 
-### T1. Replay `held_gameplay_bits`, `flags`, and `replay_format_version`
+### T1. Retired
 
-| Bit | Action | Owner |
-| --- | --- | --- |
-| 0–7 | `move_left`, `move_right`, `move_up`, `move_down`, `dig_hole`, `dig_ramp`, `dig_down`, `interact` | live / 49 |
-| 8 | `attack` | 56 |
-| 9 | `use_item` | 57 |
-| 10 | `camera_zoom_in` | 60 |
-| 11 | `camera_zoom_out` | 60 |
-| 12 | `rest` | 69C |
-| 13–15 | must be 0 | — |
-
-70B moves only pad bindings; no bit changes. Appending a bit needs no version
-bump.
-
-| `flags` bit | Meaning | Owner |
-| --- | --- | --- |
-| 0 | `pause_boundary_before_step` (was `resync_before_step`) | 49, renamed by 64A |
-| 1–7 | must be 0 | — |
-
-A save sets no flag: the saved image is normalized and the live session never
-is (64B).
-
-| `replay_format_version` | Change | Owner |
-| --- | --- | --- |
-| 1 | 48-byte header, chunked frames (`u32` steps) | 49 |
-| 2 | header gains `build_fingerprint` and the session descriptor block | 64C |
-| 3 | per-frame player action count + action records | 57B (after 64C) |
-| 4 | action records gain `quantity`, `price_limit` | 63 |
-
-Each bump is cumulative and keeps every earlier extension; the edge 64C → 57B
-keeps the numbering correct. 64C sizes its descriptor block from the
-creation inputs it must carry, so v2's byte layout is set when 64C lands.
+Replay was dropped (owner decision 2026-10-14): no replay format, flag
+bits, or pinned action bits exist. The label stays so T2–T6 keep their
+names.
 
 ### T2. Settings `k_settings_format_version` chain (relative, one upgrade step per version)
 

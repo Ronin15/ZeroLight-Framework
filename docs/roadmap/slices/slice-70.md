@@ -33,6 +33,5 @@ three unlanded slices and is mostly cold app and settings work.
 | Zoom tween | Fixed-step, drawable only, never touches the simulation anchor | 70B |
 
 Cross-slice tables honored (Tables T1–T6 in the
-[VoidLight port track](../tracks/voidlight-port.md)): no replay bit or
-replay format change, settings live + 1 (Table T2), no stage, no component
+[VoidLight port track](../tracks/voidlight-port.md)): settings live + 1 (Table T2), no stage, no component
 tag, no checksum tag bump.

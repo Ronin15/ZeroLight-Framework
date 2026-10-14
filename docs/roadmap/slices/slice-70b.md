@@ -51,8 +51,7 @@ None of this touches the simulation anchor, `sim_view`, or the checksum.
   overwrites it; a user edit wins.
 - The re-layout is cold and main-thread, never inside a frame; it touches only
   the scene target (`.claude/rules/render.md`).
-- Pad defaults keep one action per input; replay bits record actions, so no
-  replay change (Table T1). Migration moves old trigger defaults before
+- Pad defaults keep one action per input. Migration moves old trigger defaults before
   filling zoom, and an explicit user binding always beats a default fill.
 - The fade-out hold freezes the outgoing stack: no updates, events to states,
   or pause while holding; the accumulator is drained so no catch-up burst

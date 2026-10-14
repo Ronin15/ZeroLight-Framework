@@ -81,7 +81,7 @@ The nav storage below is per level today; 64G replaces it.
       holding marks and new links, abandon on rebuild, normalize, and
       teardown.
 - [ ] Pipeline and state wiring: publish serviced in the main-thread input
-      phase after replay capture; the nav event at the publish step's seam
+      phase; the nav event at the publish step's seam
       (still at most one per step).
 - [ ] 64B's normalize abandons the deferred job; 46's mid-job round-trip
       trace test passes when 46 lands.

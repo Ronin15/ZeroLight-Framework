@@ -9,7 +9,7 @@ without a recompile, the right stick and triggers become bindable inputs,
 custom bindings persist across launches in Slice 54's settings file, and
 every prompt and binding cell names the active device's own keys or buttons
 (keyboard, Xbox, PlayStation, Nintendo). Bindings are app preferences: they
-resolve to `Action` before gameplay, replay, or the checksum see input, so
+resolve to `Action` before gameplay or the checksum see input, so
 nothing here touches simulation.
 
 ### Current foundation

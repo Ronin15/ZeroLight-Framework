@@ -3,11 +3,10 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: not started.** Owner direction 2026-10-14: investigate the items
-found in a game-loop read. Settle the input item before
-[Slice 49](slice-49.md) pins replay v1's per-step input bits (Table T1).
+found in a game-loop read.
 
 Goal: a gameplay press reaches the simulation however short it is and
-however many frames pass between fixed steps, and replay can record it.
+however many frames pass between fixed steps.
 Display timing jitter never turns a steady frame rate into an uneven run of
 fixed steps per frame. `TimeLoop`'s catch-up cap is enforced in one place,
 with its invariant held in code and tested, and no unreachable branch.
@@ -30,8 +29,6 @@ with its invariant held in code and tested, and no unreachable branch.
   every step, so no dig or interact intent is emitted. The window is the
   time between steps: up to ~16.7 ms at steady state, spanning several
   frames on a high-refresh display, and the whole stall during a hitch.
-- Slice 49's replay v1 records `held_gameplay_bits` per step (Table T1),
-  which cannot represent such a tap.
 - `TimeLoop.beginFrame` (`src/app/time_loop.zig:22`) adds the raw measured
   frame interval (`SDL_GetTicksNS` deltas) to the accumulator. Nothing in
   `src/` queries the display's refresh rate; `frame_pacer.zig` knows only
@@ -54,10 +51,9 @@ with its invariant held in code and tested, and no unreachable branch.
 - `InputState` stays the simulation's only input; app commands stay in
   `FrameCommands`; fixed update never runs in render cadence
   (`.claude/rules/input-state.md`).
-- What the simulation reads per step is per-step input that replay records
-  (`.claude/rules/simulation.md` § Determinism). If this lands after Slice
-  49's replay v1, it updates Table T1 and bumps `replay_format_version` in
-  the same change.
+- What the simulation reads per step is per-step input, so a pending press
+  is consumed at a step, never at a frame
+  (`.claude/rules/simulation.md` § Determinism).
 - Pause, modal block, and pad disconnect clear any new per-step input state
   on the same paths that call `releaseHeldGameplay`.
 - Snapping changes only how many fixed steps run in a frame, never a step's
@@ -77,8 +73,7 @@ with its invariant held in code and tested, and no unreachable branch.
       tests: a tap between steps yields one intent; a held press yields one
       intent, not one per step; several steps in one frame consume a press
       once; pause and pad disconnect drop a pending press.
-- [ ] Update Table T1 and Slice 49's replay input if per-step input gains
-      state.
+- [ ] Slice 49's pinned input script can express a sub-step tap.
 - [ ] Measure jitter: record the per-frame fixed-step count distribution
       (0/1/2+) and measured interval spread in `runtime_perf_log`, then
       capture it on a 60 Hz display and on a high-refresh display with vsync

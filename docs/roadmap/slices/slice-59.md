@@ -10,7 +10,7 @@ clock.
 Goal: every world has a deterministic game clock advanced by the fixed step,
 from which a calendar, seasons, a continuous day/night phase, and seeded
 weather derive as pure functions of `(config, env_seed, game_ms)`, so saves
-and replays need only the clock. Environment modifiers scale AI perception
+need only the clock. Environment modifiers scale AI perception
 range and AI move speed on sky-exposed levels for every agent at every
 fidelity; weather particles, audio, and Slice 60's scene grade present the
 observer's environment; low-volume transition events feed audio and camera.

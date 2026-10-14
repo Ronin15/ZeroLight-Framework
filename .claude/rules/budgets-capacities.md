@@ -28,7 +28,7 @@
 - No order, deferral, refusal, or result depends on reserved capacity. No dig,
   build, cave-in, or explosion is ever refused for capacity; a new limit or
   refusal is never a design tool.
-- The only fixed caps are index/format widths (`u16`/`u32`, save/replay
+- The only fixed caps are index/format widths (`u16`/`u32`, save
   layouts) proven unreachable for everything the world can grow to (growth
   paths included, not only initial sizes) and failing loudly when the world is
   created or loaded, and presentation-only pools no simulation reads

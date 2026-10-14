@@ -2,17 +2,17 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 49](slice-49.md), [Slice 52D](slice-52d.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** Needs 49's harness, replay flag bit0, and
-`simViewRect()`, and 52D's select-form `simd`/`math` min/max and lint
-precedent. Rebases with 50 on `thread_system.zig` worker entry. No stage,
-resource, or store change.
+**Status: not started.** Needs 49's harness and `simViewRect()`, and 52D's
+select-form `simd`/`math` min/max and lint precedent. Rebases with 50 on
+`thread_system.zig` worker entry. No stage, resource, or store change.
 
 Goal: pausing and resuming never changes simulation-visible state, so a
 paused-and-resumed run is bit-identical to an unpaused one with the same
-input; every scalar float `min`/`max`/`clamp` in `src/game/` has one pinned
-semantics on x86, arm64, runtime, and comptime; float bits used as keys are
-canonical; a non-default MXCSR/FPCR is caught at the step boundary instead of
-silently desynchronizing a world.
+input; every scalar float `min`/`max`/`clamp` in `src/game/` has the same
+semantics as its SIMD form and at comptime, so a thread split never changes a
+result; float bits used as keys are canonical; a non-default MXCSR/FPCR on
+any thread is caught at the step boundary instead of silently making threaded
+and serial runs differ.
 
 ### Current foundation
 
@@ -51,9 +51,7 @@ silently desynchronizing a world.
   the previous pose (integrate, snaps, spawns); while paused and until the
   first executed step after resume, render draws the settled pose (alpha 1),
   through a presentation-only flag no pipeline or checksum reads. Pause never
-  touches the sim-view camera. The resync APIs are removed. Replay flag bit0
-  keeps its wire position, renamed `pause_boundary_before_step` (Table T1),
-  and producers still set it.
+  touches the sim-view camera. The resync APIs are removed.
 - Float min/max/clamp (decision): `core/math.zig` provides generic `min`/`max`
   equal to `@min`/`@max` for integers (same value and result type) and select
   form for floats, delegating `Float4` to 52D's `simd` helpers so scalar and
@@ -65,26 +63,21 @@ silently desynchronizing a world.
   `std.math` transcendentals in `src/` through `core/math.zig`, outside
   tests.
 - Key bits: one `math.floatKeyBits` maps every NaN to one quiet NaN and −0 to
-  +0, so equal-comparing floats give equal keys on every target; every
-  float-to-bits conversion feeding a hash, map, sort, or dedup key goes
-  through it. The checksum is separate (64B keeps ±0
-  distinct).
+  +0, so equal-comparing floats give equal keys; every float-to-bits
+  conversion feeding a hash, map, sort, or dedup key goes through it. The checksum is separate (64B keeps ±0 distinct).
 - FP environment: `core/fp_env.zig` asserts the IEEE default control bits
   (status flags masked) under runtime safety only, at every pipeline step
   entry (each world instance's step), at worker start, at lane-thread start
-  (51, or addition (k)), and at headless-session init (64C); ReleaseFast pays
-  nothing. A trip is fixed at the dependency boundary that changed the
-  environment.
+  (51, or addition (k)); ReleaseFast pays nothing. A trip is fixed at the
+  dependency boundary that changed the environment.
 - No allocation added; every helper is pure or reads one register.
 
 ### Checklist
 
 - [ ] Alpha hold in `GameDemoState` (pause, resume, update, render); resync
-      APIs and their tests removed; replay flag constant and docs renamed.
-      Tests with 49's harness: pause and resume leave the 120-step checksum
-      trace unchanged (replaces 49's resync test); the hold lasts until the next
-      executed step; pause does not move the sim view; 49's replay test still
-      matches with the pause flag set.
+      APIs and their tests removed. Tests with 49's harness: pause and resume
+      leave the 120-step checksum trace unchanged; the hold lasts until the
+      next executed step; pause does not move the sim view.
 - [ ] `math.min`/`max`, generic `clamp`, parameter renames, and migration of
       every non-test `src/game/` `@min`/`@max` and `std.math.clamp`. Tests on
       runtime inputs: integer value and type parity; float ±0 and NaN bits,
@@ -97,8 +90,8 @@ silently desynchronizing a world.
 - [ ] `core/fp_env.zig` with pure x86 and arm64 control classifiers, a
       host-read test, and the step, worker, and lane call sites (lane only if
       51 has landed); no test writes MXCSR/FPCR.
-- [ ] Docs: Determinism Contract (pause invisibility, pause-boundary flag,
-      float min/max/clamp, key bits, FP environment); `docs/architecture.md`
+- [ ] Docs: Determinism Contract (pause invisibility, float min/max/clamp,
+      key bits, FP environment); `docs/architecture.md`
       Coordination Boundaries (pause freezes presentation only).
 - [ ] Rule additions when this lands: float min/max/clamp and transcendental
       routing (`.claude/rules/memory-performance.md`); float key bits, pause

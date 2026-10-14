@@ -11,8 +11,8 @@ Windows x86_64 (native and cross from Linux), and macOS arm64; a display-gated
 gpu-smoke runs under Xvfb with Mesa lavapipe; tags produce downloadable per-OS
 packages with symbols; a ReleaseSafe soak and release bench run archives its
 outputs. `frame-battle` measures how the full fixed step plus CPU render prep
-scales with population and world size, and proves serial == threaded and
-`compat` == `ship` state digests at every size.
+scales with population and world size, and proves serial == threaded state
+digests at every size.
 
 ### Current foundation
 
@@ -90,7 +90,7 @@ scales with population and world size, and proves serial == threaded and
       ladder over population and world extent, fixed settle, split sim and
       render-prep timers, serial and threaded cases, `state_digest`, and
       internal asserts; registered.
-- [ ] (added by Slice 64) `state_nan_values` beside `state_digest`; the soak
+- [ ] `state_nan_values` beside `state_digest`; the soak
       fails on any nonzero value.
 - [ ] `ci.yml` jobs as above, including the `x86_64_v2` header grep, the
       package refusals, the Windows cross steps, and the TSan race gate on
@@ -102,8 +102,7 @@ scales with population and world size, and proves serial == threaded and
 - [ ] (added by Slice 66) macOS release job uploads its `package-symbols` dir
       as `symbols-macos` (66A later renames both per OS and arch).
 - [ ] `soak-bench.yml`: ReleaseSafe tests and long `frame-battle` run, stress
-      sweep, serial-vs-threaded and `compat`-vs-`ship` digest checks at every
-      ladder point, ReleaseFast baseline, artifact upload; cron after a
+      sweep, serial-vs-threaded digest checks at every ladder point, ReleaseFast baseline, artifact upload; cron after a
       recorded duration.
 - [ ] Docs: DW "Continuous Integration" (what gates, artifacts, shader
       regeneration, trend-data caveat, lavapipe scope); close the 0.17
@@ -122,8 +121,8 @@ scales with population and world size, and proves serial == threaded and
       binary runs on the reference Arch host (manual, display).
 - [ ] A manual `soak-bench` run completes and uploads its outputs; its duration
       sets the timeout before the cron is enabled.
-- [ ] `frame-battle` digests are equal serial vs threaded and `compat` vs
-      `ship` at every ladder point; its scaling shape across the ladder is
+- [ ] `frame-battle` digests are equal serial vs threaded at every ladder
+      point; its scaling shape across the ladder is
       recorded on the reference machine in ReleaseFast and ReleaseSafe, and the
       `compat`/`ship` A/B completes 52A's baseline evidence.
 - [ ] `zig build verify` passes; docs updated.

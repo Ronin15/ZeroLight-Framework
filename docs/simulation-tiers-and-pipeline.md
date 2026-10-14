@@ -14,7 +14,7 @@ Related docs:
   future pipeline/tier direction.
 - [framework-implementation-slices.md](framework-implementation-slices.md) (roadmap
   index) and the per-slice files under [roadmap/slices/](roadmap/slices/) for
-  roadmap status and acceptance checklists; cross-slice stage order, replay,
+  roadmap status and acceptance checklists; cross-slice stage order,
   save, and checksum version tables are in
   [roadmap/tracks/voidlight-port.md](roadmap/tracks/voidlight-port.md).
 

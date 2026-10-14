@@ -7,8 +7,8 @@
 Goal: a time skip fast-forwards the observer's world to the next dusk or dawn,
 advancing its whole simulation across the skipped interval at reduced
 fidelity, not just the calendar; a game with a player may call it rest.
-Calendar transition events fire through the normal snapshot diff, the result
-is deterministic, and replays reproduce a skip from its input bit.
+Calendar transition events fire through the normal snapshot diff, and the
+result is deterministic.
 
 ### Current foundation
 
@@ -27,8 +27,7 @@ is deterministic, and replays reproduce a skip from its input bit.
 
 ### Architecture notes
 
-- `Action.rest` is a gameplay action with pinned replay bit 12 (Table T1);
-  rising-edge latched, and a refused press is consumed
+- `Action.rest` is a gameplay action, rising-edge latched, and a refused press is consumed
   (`.claude/rules/input-state.md`). The latch is hashed and saved (64B / 46)
   so a save taken with the key held never produces a spurious rest on load.
 - The target is the next dawn or dusk phase start, always within two days
@@ -53,8 +52,7 @@ is deterministic, and replays reproduce a skip from its input bit.
 
 ### Checklist
 
-- [ ] `Action.rest` with binding, classification, routing tests, and replay
-      bit 12.
+- [ ] `Action.rest` with binding, classification, and routing tests.
 - [ ] Pure skip target and `time_skipped` event kind.
 - [ ] Rest capture with edge latch, phase toggle, and threat gate; external
       request resource carried by the environment stage.
@@ -85,8 +83,8 @@ is deterministic, and replays reproduce a skip from its input bit.
       does not rest later.
 - [ ] Step-domain schedules, memory, affect, and cognition advance across
       the skip; agents have moved and acted; a second world is unchanged.
-- [ ] A recorded session with a rest replays to the same checksum trace;
-      serial == threaded across the rest step; save with the key held, load,
+- [ ] A scripted session with a rest gives the same checksum trace serial
+      and threaded across the rest step; save with the key held, load,
       keep holding: no `time_skipped` on either side.
 - [ ] `FailingAllocator`: capture, skip step, and publish allocate nothing.
 - [ ] `zig build verify` passes.

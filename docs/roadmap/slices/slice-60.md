@@ -53,8 +53,7 @@ and an app-level fade-in on state replacement.
   swapchain (`.claude/rules/render.md` § Frame and uploads).
 - Fades are an app-level ordered UI rect above stacked states and below
   debug, not a composite term.
-- Zoom actions are gameplay actions with pinned replay bits (Table T1);
-  zoom index persists through Slice 54's settings (next schema version,
+- Zoom actions are gameplay actions; zoom index persists through Slice 54's settings (next schema version,
   Table T2).
 - Spatial-index sizing is out of scope here: 75 owns spatial-index coverage
   of the whole population, not a window around the camera.
@@ -70,7 +69,7 @@ and an app-level fade-in on state replacement.
 - [ ] `math.expSmoothingFactor` with tests.
 - [ ] `CameraRig` with the separate simulation anchor; replaces the demo's
       camera fields and `cameraForPlayer`.
-- [ ] Zoom actions, bindings, routing tests, replay bits (Table T1).
+- [ ] Zoom actions, bindings, routing tests.
 - [ ] `simViewRect()` returns the rig's anchor.
 - [ ] Zoom setting on 54's store (schema live + 1).
 - [ ] Trauma from destructible destroys (and 59's lightning).
@@ -80,7 +79,7 @@ and an app-level fade-in on state replacement.
 - [ ] Screen fade-in on replace with its command headroom.
 - [ ] `scene_resolution` app config and build option.
 - [ ] `gpu-smoke`: both modes, a regrow, UI and debug after the composite.
-- [ ] (added by Slice 64) Pause does not resync the rig (64A alpha hold).
+- [ ] Pause does not resync the rig (64A alpha hold).
 - [ ] (added by Slice 67) Strings as `StringId`s if this lands after 67E.
 - [ ] Docs: `docs/rendering-assets-shaders.md` (composite, modes, cycle row,
       fade order), `docs/architecture.md` (rig and anchor ownership),

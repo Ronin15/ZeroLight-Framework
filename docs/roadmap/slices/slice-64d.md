@@ -10,8 +10,8 @@ That slice lists 64D as a prerequisite and lands it first or in the same
 change.
 
 Goal: when the simulation first needs an angle from a vector, it gets an
-`atan2` that is bit-identical across every supported target and between its
-SIMD lanes and scalar tail, and never goes through `std.math.atan`'s vector
+`atan2` that is bit-identical between its SIMD lanes and scalar tail, so a
+thread split never changes a result, and never goes through `std.math.atan`'s vector
 path, which uses `@mulAdd` and lowers to per-lane `fmaf` calls on
 `x86_64_v2`.
 
@@ -63,8 +63,7 @@ path, which uses `@mulAdd` and lowers to per-lane `fmaf` calls on
 - [ ] `zig build verify` passes with `probe_atan2Float4` within budget on all
       four `simd-asm-check` targets.
 - [ ] `zig build test` passes in Debug, ReleaseFast `ship`, ReleaseFast
-      `compat`, and on Apple Silicon (52C macOS job or a manual run recorded in
-      Status).
+      `compat`.
 - [ ] `zig build -Doptimize=ReleaseFast bench -- --group simd-atan2` is
       recorded in Status, showing the SIMD kernel's scaling across the ladder
       against the scalar row.

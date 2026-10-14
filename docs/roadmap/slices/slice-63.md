@@ -29,7 +29,7 @@ Goal: bounded, deterministic social state per world.
 - From earlier slices: 56's claim set and order (trade first) and combat
   events; 57's item `value`, coins, transfer batches, and `canAccept` /
   `canRemove` / `canRemoveCoins`; 57B's `PendingPlayerActions`,
-  `live_modal_overlay`, toast, and replay action records; 61's affect-impulse
+  `live_modal_overlay`, and toast; 61's affect-impulse
   substrate, `harvest_completed` ownership facts, and transfer wiring; 73's
   drive catalog and factions.
 
@@ -53,8 +53,6 @@ Goal: bounded, deterministic social state per world.
   intent's price limit, stock, capacity, funds against this step's queued
   transfers, accepted category) and applies through one all-or-nothing 57
   transfer batch; no session state in the sim.
-- Adding `ActionIntent` fields extends 57B's replay records and bumps the
-  replay format relative to live (Tables T1–T6).
 - Social deltas net in event order and emit commands in ascending order;
   affect impulses go through 61's substrate under a new producer budget;
   combat reputation reaches feelings through stance → perception.
@@ -84,9 +82,8 @@ Goal: bounded, deterministic social state per world.
 - [ ] Merchant component and strict profile catalog; demo merchants.
 - [ ] Integer pricing module with table tests and the comptime overflow
       proof.
-- [ ] Buy / sell / give intents and fields; replay record extension and
-      relative format bump with round-trip test; `TradeController` first in
-      the claim order.
+- [ ] Buy / sell / give intents and fields; `TradeController` first in the
+      claim order.
 - [ ] Trades and gifts through 57 transfer batches with step-queue
       preflight; a queued trade batch never fails at apply.
 - [ ] Trade events and stats; (added by Slice 67) event-log lines and
@@ -116,8 +113,8 @@ Goal: bounded, deterministic social state per world.
 - [ ] Trade and gift move ledger affinity and lower merchant aggression on
       the next appraisal.
 - [ ] Serial == threaded perception and AI with non-baseline relations; a
-      replay with UI trades verifies; the composite pipeline allocates
-      nothing after reserve.
+      scripted session with UI trades gives the same checksum trace serial
+      and threaded; the composite pipeline allocates nothing after reserve.
 - [ ] Bench `social-react` (cost linear in events); no perception or AI
       regression; `zig build verify` passes.
 - [ ] Manual / `gpu-smoke`: the trade screen renders, navigates by keyboard

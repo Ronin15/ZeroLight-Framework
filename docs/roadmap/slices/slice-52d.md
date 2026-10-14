@@ -4,17 +4,16 @@
 
 **Status: not started.** Needs 52A's `-Dcpu-baseline` (until then the same
 commands work with `-Dcpu=x86_64_v2` / `-Dcpu=x86_64`). Land before Slice 35
-(its kernels are mask/select-heavy) and before 52C records cross-baseline
-digests (the trig change moves last bits once). If 49 lands first, re-baseline
+(its kernels are mask/select-heavy). If 49 lands first, re-baseline
 49's checksum goldens in the sin/cos commit.
 
 Goal: every `src/core/simd.zig` primitive lowers to the shortest libcall-free
-sequence the `ship` baseline offers and stays libcall-free on `compat`; every
-result of the layer, sin/cos included, is bit-identical across `x86_64`,
-`x86_64_v2`, `x86_64_v3`, native, Debug (self-hosted backend), and
-`apple_m1`. A `zig build simd-asm-check` step in `verify` holds that line, and
-`simd-*` bench groups measure it. This closes the sin/cos part of 49's
-cross-machine caveat.
+sequence the `ship` baseline offers and stays libcall-free on `compat`;
+within a build, every SIMD lane of the layer, sin/cos included, is
+bit-identical to its scalar form, so how a threaded run splits items
+between lanes and scalar tails never changes a result. A `zig build
+simd-asm-check` step in `verify` holds the codegen line, and `simd-*` bench
+groups measure it.
 
 ### Current foundation
 
@@ -70,7 +69,7 @@ cross-machine caveat.
     (single-source parity).
   - Float `min`/`max`/`clamp` use select forms pinning x86 `MINPS`/`MAXPS`
     semantics (NaN in the first operand yields the second; ties including ±0
-    yield the second), so comptime, runtime, x86, and arm64 agree.
+    yield the second), so comptime, runtime, scalar, and SIMD agree.
   - A uniform-divisor reciprocal multiply replaces `divInt4`, exact for every
     non-negative dividend below 2^31; `divInt4` is deleted.
   - sin/cos become a deterministic polynomial with a fixed op order pinned by
@@ -103,7 +102,7 @@ cross-machine caveat.
       normalize, sincos, sincos-scalar, gather-scatter, count-true) registered,
       with a `ship` and `compat` baseline recorded; no production change.
 - [ ] Mask4 helpers `inline` and the `MASK_FN_NOT_INLINE` rule.
-- [ ] (added by Slice 64) Upstream Zig issue filed (or an existing one joined)
+- [ ] Upstream Zig issue filed (or an existing one joined)
       with the minimal repro, its URL in Status, and the repro in
       `tools/README.md`; the lint rule cites it and stays after a fix.
 - [ ] `floorToI4` rewrite and `floorToI32` delegation, both floor paths tested
@@ -119,11 +118,11 @@ cross-machine caveat.
       non-finite, and lane-equality tests.
 - [ ] `simd-asm-check` probe, checker, and `verify` wiring.
 - [ ] Determinism contract header on `simd.zig` and corrected doc comments.
-- [ ] Docs: Determinism Contract (sin/cos no longer a caveat; symbol facts;
-      residual hazards owned by 64A, 64B, 64D); DW `simd-asm-check` and bench
+- [ ] Docs: Determinism Contract (scalar/SIMD identity; residual hazards
+      owned by 64A, 64B, 64D); DW `simd-asm-check` and bench
       procedure; `docs/architecture.md` core line; `CLAUDE.md` command.
 - [ ] Add the SIMD codegen and determinism rule (inline Mask4, select-form
-      min/max, no libm builtins or estimates, `simd-asm-check`, cross-target
+      min/max, no libm builtins or estimates, `simd-asm-check`, scalar/SIMD
       bit identity) to `.claude/rules/memory-performance.md` when this lands.
 
 ### Acceptance checks
@@ -132,8 +131,6 @@ cross-machine caveat.
       targets and the new lint rules.
 - [ ] `zig build test` passes in Debug, ReleaseFast `ship`, ReleaseFast
       `compat`, and ReleaseSafe `x86_64_v3` (informational).
-- [ ] `zig build test` passes on Apple Silicon with the same golden constants
-      (52C macOS job or a manual run recorded in Status).
 - [ ] `zig build check -Doptimize=ReleaseFast -Dcpu-baseline=compat` compiles.
 - [ ] Each new lint rule fires on a temporary, uncommitted edit.
 - [ ] Bench gate on adjacent commits (ReleaseFast, `serial-direct`, pinned

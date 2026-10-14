@@ -42,7 +42,7 @@ Goal:
 
 ### Architecture notes
 
-- App and UI only; no simulation, replay, or checksum change (Slice 67).
+- App and UI only; no simulation or checksum change (Slice 67).
 - `Engine` resolves each pointer event to logical space once and passes it
   in the per-event context; `src/game/ui/` never sees SDL types
   (`.claude/rules/input-state.md`, `.claude/rules/engine-design.md`).

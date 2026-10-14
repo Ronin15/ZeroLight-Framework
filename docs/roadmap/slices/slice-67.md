@@ -23,8 +23,8 @@ text, settings, and saves backlog remains.
 
 - No simulation surface: 67 adds no stage, pipeline resource, component tag,
   seed domain, or persistent `DataSystem`/`WorldSystem` field, and never
-  changes the replay format or checksum. Input resolves to `Action` before
-  the recorder sees it; UI-originated gameplay requests stay with Slice
+  changes the checksum. Input resolves to `Action` before the simulation
+  sees it; UI-originated gameplay requests stay with Slice
   57B's queue (`.claude/rules/simulation.md`).
 - Debug overlays and the event log are read-only over simulation
   (`.claude/rules/engine-design.md`).

@@ -25,5 +25,5 @@ local fixes.
 | Shaders | Committed SPIR-V/MSL/DXIL with a source-hash lock gated by `verify`; compile mode kept; CI regenerates with pinned tools. | 52A (+ 52C job) |
 | Packaging | One staging dir per OS: Linux tarball dir, Windows icon/VERSIONINFO/GUI subsystem, macOS `.app` with ad-hoc signature (non-LTO). | 52B |
 | CI | GitHub Actions: verify matrix, shader regeneration, tag packaging, soak and bench. | 52C |
-| Release perf baseline | `frame-battle`: the full fixed step plus CPU render prep (no GPU) as a scaling bench over population and world size, with serial/threaded and cross-baseline digest parity. | 52C |
+| Release perf baseline | `frame-battle`: the full fixed step plus CPU render prep (no GPU) as a scaling bench over population and world size, with serial/threaded digest parity. | 52C |
 | SIMD codegen | `core/simd.zig` primitives lower libcall-free and bit-identical across baselines and targets, held by `simd-asm-check` in `verify`. | 52D |

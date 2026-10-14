@@ -85,8 +85,7 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
   deterministically to later steps, never dropped or refused; a kill
   resolves when its hit applies (`.claude/rules/budgets-capacities.md`).
 - Player: `Action.attack` is a gameplay action under modal routing
-  (`.claude/rules/input-state.md`); a replay bit is pinned with it (Slice
-  49); death is downed-then-revived.
+  (`.claude/rules/input-state.md`); death is downed-then-revived.
 - New hashed stores are classified in Slice 49's lists and saved by Slice
   46 in the same change (Ground Rules; Tables T3/T6).
 - Knockback stays out of `combat_resolve`, which runs after `chunk_derive`;
@@ -119,8 +118,7 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
       structural share for kills.
 - [ ] Affect damage signal through the watermark; undamaged rows
       bit-identical.
-- [ ] `Action.attack` bindings, routing tests, replay bit, and capture
-      latch (classified in 64B and saved in 46's `pipeline_history`).
+- [ ] `Action.attack` bindings, routing tests, and capture latch (classified in 64B and saved in 46's `pipeline_history`).
 - [ ] `AudioController.queueCombat` with a fixed per-step SFX cap.
 - [ ] (added by Slice 67) Event-log lines for both events; `StringId` text
       if 67E has landed.

@@ -7,9 +7,9 @@
 Goal: a low-priority background lane, separate from fork-join `parallelFor`,
 runs coarse jobs off the main thread and hands each result back on a fixed
 simulation step chosen at submit, so no simulation outcome depends on how fast
-a job ran. The first consumer is live replay capture (Slice 49's chunked
-format streamed to disk); later consumers are 46 (save/load, app-layer), 65B
-(deferred nav rebuild), and 65C (streaming worldgen).
+a job ran. Its consumers are 46 (save/load, app-layer), 65B (deferred nav
+rebuild), and 65C (streaming worldgen); this slice lands the lane and handoff
+with tests, and its consumers land with their slices.
 
 ### Current foundation
 
@@ -26,15 +26,13 @@ format streamed to disk); later consumers are 46 (save/load, app-layer), 65B
   commit, post-commit reactions) → `finished`.
 - `LoadingState.loadGameDemo` builds gameplay with `UpdateContext` in reach;
   `assets.validateRelativePath` is the traversal-safe path validator.
-- Needed and not landed: 49's chunked replay format, verifier, and
-  `simulationChecksum()`; 50's foreign-thread `parallelFor` panic, thread
+- Needed and not landed: 49's `simulationChecksum()`; 50's foreign-thread `parallelFor` panic, thread
   self-naming, and `-Dsanitize-thread`; 64A's FP-environment assertion.
 
 ### Architecture notes
 
 - Placement: the lane lives in `src/app/` and knows nothing of simulation
-  steps; the step-keyed handoff helper and the replay-capture consumer live in
-  `src/game/`. Engine owns the lane and passes it through `UpdateContext`.
+  steps; the step-keyed handoff helper lives in `src/game/`. Engine owns the lane and passes it through `UpdateContext`.
   Everything the lane thread touches is heap-allocated, so a moved `Engine`
   stays valid (`.claude/rules/engine-design.md` § Ownership boundaries).
 - Thread policy (decided): one dedicated lane thread, not taken from the
@@ -64,10 +62,7 @@ format streamed to disk); later consumers are 46 (save/load, app-layer), 65B
   states deinit before the lane; Engine-owned app-layer jobs (46) complete
   before the lane deinits, so quitting mid-save finishes the write; lane
   deinit never runs a job whose owner is gone and reports leaked jobs.
-- Replay capture is opt-in (config plus a build option, path-validated),
-  allocation-free per step after init, stops at 49's decode bound, and writes
-  its header through 49's shared encoder (64C extends it). A write failure
-  disables capture and never changes the simulation. No new `StageId`.
+- No new `StageId`.
 - VoidLight: port the long-running versus frame-bounded split and main-thread
   commit with stale-result filtering; do not port apply-when-finished,
   unbounded allocating queues, priority levels, futures, or a singleton.
@@ -78,28 +73,22 @@ format streamed to disk); later consumers are 46 (save/load, app-layer), 65B
       machine, lane thread, submit / complete / cancel, app-layer readiness,
       stats, deinit; a thread-less mode runs jobs inline at completion.
 - [ ] Step-keyed handoff helper (`src/game/`) with bounded latency.
-- [ ] Engine wiring: lane config, capture-directory config and build option
-      with path validation, the Engine-owned lane in the deinit order above,
-      `UpdateContext` fields, `LoadingState` forwarding.
-- [ ] Replay capture owned by `GameDemoState`: record, checkpoint, seal and
-      submit per chunk, due-step service, finish on teardown, the
-      pause-boundary flag (64A's name).
+- [ ] Engine wiring: lane config, the Engine-owned lane in the deinit order
+      above, `UpdateContext` fields, `LoadingState` forwarding.
 - [ ] The lane thread calls 64A's FP-environment assertion at entry (beside
       65A's priority call once landed).
 - [ ] Tests: a lane returned by value works; readiness never frees a slot;
       a full lane refuses and frees on complete; cancel stops a queued job; a
       main-thread steal leaves the lane healthy; deinit never runs leaked
       jobs; stale tickets are rejected; thread-less lane; handoff results
-      equal across no-thread, fast, and slow lanes; the live capture round
-      trip verifies `.matched`; capture writes inline on a full lane; a write
-      failure leaves the checksum trace unchanged; `FailingAllocator` proofs
-      for lane operations and per-step capture.
+      equal across no-thread, fast, and slow lanes, with the same checksum
+      trace; `FailingAllocator` proofs for lane operations.
 - [ ] Bench `background-lane`: a fork-join movement batch timed while a
       CPU-bound lane job runs, plus the lane round-trip cost.
 - [ ] Docs: `docs/architecture.md` Background Lane (ownership, thread policy,
       handoff, polling, job inputs with the frozen borrow, shutdown);
       `docs/simulation-tiers-and-pipeline.md` handoff rule;
-      `docs/development-workflow.md` capture option and TSan group.
+      `docs/development-workflow.md` TSan group.
 - [ ] Add the background-lane rule (polling, step handoff, job inputs with
       the frozen borrow, refusal fallback, pause, ticket lifetime) to
       `.claude/rules/threading.md` when this lands.
@@ -108,8 +97,7 @@ format streamed to disk); later consumers are 46 (save/load, app-layer), 65B
 
 - [ ] Every test passes under `zig build test` and
       `zig build test -Dsanitize-thread=true` with zero reports.
-- [ ] Outcome invariance: the three-lane handoff test passes and the capture
-      round trip verifies.
+- [ ] Outcome invariance: the three-lane handoff test passes.
 - [ ] No readiness query in simulation, pipeline, controller, or per-step
       gameplay code (grep).
 - [ ] `background-lane` and `movement` numbers recorded in the landing

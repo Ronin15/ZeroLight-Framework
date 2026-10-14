@@ -34,7 +34,7 @@ is Slice 44.
 
 ### Architecture notes
 
-- App/input layer only; no simulation, render, or replay surface.
+- App/input layer only; no simulation or render surface.
 - One active pad, shared `Action` and routing machinery, per-axis clamping,
   and `releaseHeldGameplay()` on context loss are rules in
   `.claude/rules/input-state.md`.

@@ -85,8 +85,8 @@ it is deterministic and allocation-free after reserve.
 - [ ] Transfer substrate: batches, preflight queries, all-or-nothing apply.
 - [ ] Equipment modifiers in action selection and combat.
 - [ ] Events, stats, structural share, and audio for pickups.
-- [ ] `use_item` player action with its replay bit (Table T1).
-- [ ] (added by Slice 64) The use-item latch is hashed (64B) and saved in
+- [ ] `use_item` player action.
+- [ ] The use-item latch is hashed (64B) and saved in
       Slice 46's `pipeline_history`.
 - [ ] (added by Slice 67) Event-log arm for pickups (67B); strings as
       `StringId`s if this lands after 67E.
