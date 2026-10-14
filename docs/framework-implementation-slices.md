@@ -205,6 +205,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**76**](roadmap/slices/slice-76.md) | Not started | Cave-Ins — after 64G |
 | [**77**](roadmap/slices/slice-77.md) | Not started | Explosions — after 64G, 76 |
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
+| [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — input before 49 pins replay v1 |
 
 **Recently settled (archive only):** 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
@@ -355,6 +356,8 @@ order.
 - **Capacity sizing:** [72](roadmap/slices/slice-72.md), any time; F and G
   are re-scoped against 64G first. Its open items cross-edit the slices they
   name in the same change.
+- **Game-loop input and timing:** [79](roadmap/slices/slice-79.md), any time
+  before 49 pins replay v1's input bits (Table T1).
 
 1. **64G** Chunk-Owned Terrain And Nav.
 2. **50** Thread System Hardening (opens the core-systems branch).
