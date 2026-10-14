@@ -402,18 +402,32 @@ a design open for this slice):
 
 ### Acceptance checks
 
-- [ ] `chunk-scale-*` bench groups at 256², 1024², 2048², and 8 / 32 / 128
+- [x] `chunk-scale-*` bench groups at 256², 1024², 2048², and 8 / 32 / 128
       levels (`.claude/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
       explosion fill flat across sizes; level create flat across depth and
       linear in its own chunks (level destroy and the world-count axis are
       74's).
       Fixtures build once outside the timed loop and the groups run quickly in
-      Debug.
-- [ ] An A\* path of the same length costs the same at 2048² as at 256²
+      Debug. Measured at `75be288` (Debug, serial): dig 152 µs and ramp 226 µs
+      at every side and depth (nav 434 / 730 µs); cave-in and explosion fill
+      linear in region chunks and flat in side and depth (64 chunks:
+      3.43–3.47 ms / 2.33–2.39 ms); level add flat in depth (400–414 µs at
+      256²) and at most linear in its own chunks (0.41 / 2.1 / 7.5 ms at
+      256² / 1024² / 2048²).
+- [x] An A\* path of the same length costs the same at 2048² as at 256²
       (`pathfinding-level-size`), and a cross-level path of the same length costs
       the same at 8, 32, and 128 levels (`pathfinding-cross-level-depth`,
-      `pathfinding-long-path` layout 3), and a cave route's cost follows its
-      length (`pathfinding-long-path` layout 5).
+      `pathfinding-long-path` layout 3), and a cave route arrives with each
+      search within the node caps (`pathfinding-long-path` layout 5 and its
+      walks; owner 2026-10-14, replacing "a cave route's cost follows its
+      length"). Measured at `75be288` (Debug, serial): level size 1.20 / 1.17 /
+      1.16 ms at 256² / 1024² / 2048²; cross-level depth 20.8 / 20.2 / 20.2 ms
+      and layout 3 7.8 / 8.1 / 7.9 ms at 8 / 32 / 128 levels; cave walks arrive
+      at 512 / 1024 / 2032. Recorded limit: one cave search's claims grow about
+      as length squared (287 / 8,344 / 19,820 claims, 0.35 / 5.4 / 13.0 ms at
+      256 / 1024 / 2032 cells; tier 1 4,248 → 15,724 for 2× length), since graph
+      distance runs above octile; the region layer that would remove it is
+      shelved.
 - [ ] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
 - [ ] Manual (display, Debug): digs and ramps in the demo; NPCs route over
       the changes. The in-demo cave-in check is Slice 76's.
