@@ -333,18 +333,6 @@ pub const AdaptiveWorkTuner = struct {
         return self.phase == .settled;
     }
 
-    // Benchmarks use this to give the tuner enough windows to try useful
-    // range sizes before measurement begins.
-    pub fn settleWarmupLimit(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) usize {
-        const normalized_request = self.normalizeRequest(request);
-        const max_range = self.effectiveMaxItemsPerRange(normalized_request);
-        const alignment = @max(normalized_request.range_alignment_items, @as(usize, 1));
-        const range_span_steps = @max(@as(usize, 1), (max_range - self.config.smallest_range_items) / alignment);
-        const range_windows = saturatingMul(ceilLog2(range_span_steps) + 2, @as(usize, 2));
-        const windows = saturatingAdd(@as(usize, 3), range_windows);
-        return saturatingMul(windows, self.config.sample_window);
-    }
-
     // Learning establishes the baseline for the currently sampled profile.
     // Cheap inline work settles immediately instead of probing workers.
     fn finishLearningWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
@@ -587,7 +575,7 @@ pub const AdaptiveWorkTuner = struct {
             self.config.min_ranges_per_participant,
             self.config.max_ranges_per_participant,
         );
-        const target_ranges = saturatingMul(clamped_participants, ranges_per_participant);
+        const target_ranges = clamped_participants *| ranges_per_participant;
         const predicted_items_per_range = self.normalizedItemsPerRange(
             targetRangeSizeForRangeCount(request.item_count, target_ranges),
             request.range_alignment_items,
@@ -774,14 +762,6 @@ pub const AdaptiveWorkTuner = struct {
         const aligned_max = alignItemCountDown(self.config.largest_range_items, alignment);
         if (aligned_max >= self.config.smallest_range_items) return aligned_max;
         return clamped;
-    }
-
-    fn effectiveMaxItemsPerRange(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) usize {
-        if (request.item_count == 0) return self.config.smallest_range_items;
-        return @max(
-            self.config.smallest_range_items,
-            @min(self.config.largest_range_items, request.item_count),
-        );
     }
 
     fn recordBest(self: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile, mean_ns: u64) void {
@@ -1614,26 +1594,6 @@ fn clampItemCount(value: usize, min_value: usize, max_value: usize) usize {
 fn ceilDiv(numerator: usize, denominator: usize) usize {
     std.debug.assert(denominator > 0);
     return (numerator + denominator - 1) / denominator;
-}
-
-fn saturatingMul(left: usize, right: usize) usize {
-    if (right != 0 and left > std.math.maxInt(usize) / right) return std.math.maxInt(usize);
-    return left * right;
-}
-
-fn saturatingAdd(left: usize, right: usize) usize {
-    if (left > std.math.maxInt(usize) - right) return std.math.maxInt(usize);
-    return left + right;
-}
-
-fn ceilLog2(value: usize) usize {
-    if (value <= 1) return 0;
-    var shifted = value - 1;
-    var result: usize = 0;
-    while (shifted > 0) : (shifted >>= 1) {
-        result += 1;
-    }
-    return result;
 }
 
 fn targetRangeSizeForRangeCount(item_count: usize, target_ranges: usize) usize {
@@ -3646,21 +3606,6 @@ test "threaded batch submission does not allocate after init" {
     try std.testing.expectEqual(@as(usize, 1), stats.active_worker_threads);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
-    }
-}
-
-fn recordSyntheticTuningRun(
-    tuner: *AdaptiveWorkTuner,
-    request: AdaptiveWorkRequest,
-    winning_profile: AdaptiveWorkProfile,
-    winning_duration_ns: u64,
-    default_duration_ns: u64,
-) void {
-    var guard: usize = 0;
-    while (!tuner.isSettled() and guard < 128) : (guard += 1) {
-        const selected = tuner.selectProfile(request);
-        const duration_ns = if (profilesEqual(selected, winning_profile)) winning_duration_ns else default_duration_ns;
-        tuner.record(tunerTestBatchWithProfile(request.item_count, selected, duration_ns));
     }
 }
 

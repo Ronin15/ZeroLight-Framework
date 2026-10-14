@@ -23,7 +23,6 @@ const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMo
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const DataSystem = @import("data_system.zig").DataSystem;
 const DigConfig = @import("dig_controller.zig").DigConfig;
-const DigController = @import("dig_controller.zig").DigController;
 const EntityId = @import("data_system.zig").EntityId;
 const Faction = @import("data_system.zig").Faction;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
@@ -61,7 +60,6 @@ const estimateTriggerCapacity = @import("systems/collision_response.zig").estima
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
-const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Rect = @import("../render/renderer.zig").Rect;
 const Camera2D = @import("../render/camera.zig").Camera2D;
 const TextureId = @import("../render/resources.zig").TextureId;
@@ -157,7 +155,6 @@ const procedural_world_height_tiles: u16 = 256;
 /// Surface + underground dense floors for the procedural 32-level mine (runtime load).
 /// Unit tests use `initDemoForTest` / `initDemoFromMetaWithUnderground` (3 levels), not this config.
 const procedural_underground_count: u16 = 31; //31
-const procedural_dense_layer_count: usize = 1 + procedural_underground_count;
 /// Dense floors below `active_level` kept in the render window: the full authored
 /// underground stack. Draw count follows interleave points this frame (normally
 /// 1), not window depth, and GPU memory follows the window's layers times its
@@ -229,7 +226,7 @@ comptime {
     std.debug.assert(sim_view_overscan_chunks == world_render_overscan_chunks);
 }
 
-const StageTimer = runtime_perf_log.StageTimer;
+const StageTimer = @import("../app/runtime_perf_log.zig").StageTimer;
 
 pub const GameDemoState = struct {
     // Owns test_squares; freed via this field in deinit (not data.allocator, a
@@ -442,7 +439,7 @@ pub const GameDemoState = struct {
         // seam stays allocation-free on churn frames. The event value capacity and
         // limit are set by `pipeline.reserve` below.
         try simulation_frame.reserveStreams(pipeline.eventCapacitySum(), 0, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.intent_capacity + pipeline.structuralCommandHeadroom());
-        try simulation_frame.reservePathRequests(pipeline.eventCapacitySum(), pop_cap.mover_count);
+        try simulation_frame.reservePathRequests(pipeline.steeringStreamRangeCount(), pop_cap.mover_count);
         // Raises `frame.events.capacity_limit` to the exhaustive producer sum.
         try pipeline.reserve(&simulation_frame, pop_cap.intent_capacity);
 
@@ -1240,13 +1237,8 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
 fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
     demo.simulation_frame.beginStep();
     demo.simulation_frame.dig_intent = intent;
-    // Stage order: reserve the dig and its nav record, commit it, then record its events.
-    const edit = (try demo.pipeline.dig.reserveWorldEdit(&demo.world, &demo.data, demo.player, intent)) orelse return;
-    try demo.pipeline.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.dig_world_edit, .{}));
-    const first_event = demo.simulation_frame.events.mergedItems().len;
-    const written = DigController.commitWorldEdit(&demo.world, edit, &demo.simulation_frame);
-    demo.pipeline.pathfinding.recordTerrainNavEvents(demo.simulation_frame.events.mergedItems()[first_event..], &demo.world, null);
-    try written;
+    const edit = (try demo.pipeline.reserveDigWorldEdit(&demo.world, &demo.data, demo.player, intent)) orelse return;
+    try demo.pipeline.commitDigWorldEdit(&demo.world, edit, &demo.simulation_frame);
 }
 
 const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;

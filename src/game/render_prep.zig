@@ -44,13 +44,6 @@ pub const PreparedDraw = union(enum) {
             .rect => |rect| rect.order.depth,
         };
     }
-
-    pub fn renderOrder(self: PreparedDraw) RenderOrder {
-        return switch (self) {
-            .sprite => |sprite| sprite.order,
-            .rect => |rect| rect.order,
-        };
-    }
 };
 
 pub const RectDraw = struct {

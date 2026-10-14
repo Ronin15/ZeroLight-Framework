@@ -167,8 +167,8 @@ pub fn estimateTriggerCapacity(contact_capacity: usize) usize {
     return contact_capacity;
 }
 
-const IndexList = std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment));
-const TriggerList = std.ArrayListAligned(CollisionTriggerEvent, .fromByteUnits(thread_shared_record_alignment));
+const IndexList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
+const TriggerList = std.array_list.Aligned(CollisionTriggerEvent, .fromByteUnits(thread_shared_record_alignment));
 
 // One gather range's counts, and, when the gather ran on workers, the per-band start
 // offsets of its placed intents within its order window; entry `band_count` is the
@@ -392,7 +392,7 @@ pub const CollisionResponseSystem = struct {
             const count = slot.value.observer;
             std.debug.assert(dst <= src);
             if (dst != src and count != 0) {
-                std.mem.copyForwards(u32, entries[dst..][0..count], entries[src..][0..count]);
+                @memmove(entries[dst..][0..count], entries[src..][0..count]);
             }
             dst += count;
         }
@@ -1262,16 +1262,7 @@ fn expectRingResultsEqual(expected: RingResult, actual: RingResult) !void {
     try std.testing.expectEqualSlices(u32, expected.observer_contacts, actual.observer_contacts);
 }
 
-// Indices of the frame's contacts naming `entity`, in contact order.
-fn expectedObserverContacts(allocator: std.mem.Allocator, frame: *const SimulationFrame, entity: EntityId) ![]u32 {
-    var list: std.ArrayList(u32) = .empty;
-    errdefer list.deinit(allocator);
-    for (frame.contacts.mergedItems(), 0..) |contact, index| {
-        // Test frames hold far fewer than 2^32 contacts.
-        if (contact.a.eql(entity) or contact.b.eql(entity)) try list.append(allocator, @intCast(index));
-    }
-    return list.toOwnedSlice(allocator);
-}
+const contactsNaming = @import("collision_response_test_support.zig").contactsNaming;
 
 test "threaded response matches serial bit for bit across range sizes, worker counts and band counts" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
@@ -1422,7 +1413,7 @@ fn applyIntentsReference(columns: ApplyColumns, rows: []const usize, intents: In
     }
 }
 
-test "apply lanes match today's scalar apply bit for bit" {
+test "apply lanes match the scalar apply bit for bit" {
     const max_intents = 17;
     const row_count = 6;
     const normals = [_]f32{ 1, -1, 0, -0.0, 0.6 };
@@ -1581,8 +1572,9 @@ test "observer contacts list every contact naming the observer in contact order"
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
     defer fixture.deinit(allocator);
-    const expected = try expectedObserverContacts(allocator, &fixture.frame, fixture.observer);
-    defer allocator.free(expected);
+    const expected_buffer = try allocator.alloc(u32, fixture.frame.contacts.mergedItems().len);
+    defer allocator.free(expected_buffer);
+    const expected = contactsNaming(&fixture.frame, fixture.observer, expected_buffer);
     try std.testing.expectEqual(2 * ring_contacts_per_entity, expected.len);
     // The observer appears as `a` and as `b`, in contacts spread over several ranges.
     var as_a: usize = 0;

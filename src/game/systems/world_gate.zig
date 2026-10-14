@@ -3,7 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Bounds clamp and solid-tile gate for one settled movement step.
-//! Scalar. Threading and SIMD are gated on the `world-gate` bench trigger.
+//! Scalar and serial on the main thread.
 //! Level 0 (the surface) is a pass-through: it is fully walkable.
 
 const math = @import("../../core/math.zig");

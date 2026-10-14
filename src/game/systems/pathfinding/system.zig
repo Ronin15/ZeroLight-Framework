@@ -32,7 +32,6 @@ const WorldSystem = @import("../../world_system.zig").WorldSystem;
 const ChunkGridError = @import("../../world_system.zig").ChunkGridError;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const PathRequest = @import("../../simulation.zig").PathRequest;
-const PathRequestKind = @import("../../simulation.zig").PathRequestKind;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
@@ -40,7 +39,6 @@ const NavInvalidationReason = @import("../../simulation.zig").NavInvalidationRea
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const EntityTemplate = @import("../../data_system.zig").EntityTemplate;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
-const ColliderView = @import("../static_colliders.zig").ColliderView;
 const ColliderChange = @import("../static_colliders.zig").ColliderChange;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavExtent = @import("nav_graph.zig").NavExtent;
@@ -131,15 +129,15 @@ const NavApplyError = error{OutOfMemory};
 // `solve_tier1_slot` entry of a tier-0 admission.
 const no_tier1_slot: u32 = std.math.maxInt(u32);
 
-const IntakeRecordList = std.ArrayListAligned(IntakeRecord, .fromByteUnits(thread_shared_record_alignment));
-const GroupKeyCountList = std.ArrayListAligned(GroupKeyCount, .fromByteUnits(thread_shared_record_alignment));
-const IntakeTallyList = std.ArrayListAligned(IntakeTally, .fromByteUnits(thread_shared_record_alignment));
-const NavMarkList = std.ArrayListAligned(NavMark, .fromByteUnits(thread_shared_record_alignment));
-const NavMarkTallyList = std.ArrayListAligned(NavMarkTally, .fromByteUnits(thread_shared_record_alignment));
-const RegRecordList = std.ArrayListAligned(RegRecord, .fromByteUnits(thread_shared_record_alignment));
-const PublishBandList = std.ArrayListAligned(PublishBand, .fromByteUnits(thread_shared_record_alignment));
-const EvictItemList = std.ArrayListAligned(EvictItem, .fromByteUnits(thread_shared_record_alignment));
-const HitList = std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment));
+const IntakeRecordList = std.array_list.Aligned(IntakeRecord, .fromByteUnits(thread_shared_record_alignment));
+const GroupKeyCountList = std.array_list.Aligned(GroupKeyCount, .fromByteUnits(thread_shared_record_alignment));
+const IntakeTallyList = std.array_list.Aligned(IntakeTally, .fromByteUnits(thread_shared_record_alignment));
+const NavMarkList = std.array_list.Aligned(NavMark, .fromByteUnits(thread_shared_record_alignment));
+const NavMarkTallyList = std.array_list.Aligned(NavMarkTally, .fromByteUnits(thread_shared_record_alignment));
+const RegRecordList = std.array_list.Aligned(RegRecord, .fromByteUnits(thread_shared_record_alignment));
+const PublishBandList = std.array_list.Aligned(PublishBand, .fromByteUnits(thread_shared_record_alignment));
+const EvictItemList = std.array_list.Aligned(EvictItem, .fromByteUnits(thread_shared_record_alignment));
+const HitList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
 
 // `registry_flush` work pairs: one per path registry shard.
 const flush_pair_count = registry_shard_count;

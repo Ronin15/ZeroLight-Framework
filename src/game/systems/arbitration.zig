@@ -546,8 +546,7 @@ test "resolveGoal pursue prefers a visible threat over stale memory over focus_t
 test "resolveGoal pursue rejects fresh memory of a different entity than focus_target" {
     // Memory is fresh and valid but belongs to a different entity than the
     // configured focus_target fallback -- it must not be trusted as a
-    // substitute for the live focus goal (mirrors the pre-Slice-32 seek_entity
-    // identity check).
+    // substitute for the live focus goal.
     const signals = Signals{
         .memory_last_known_target = EntityId{ .index = 9, .generation = 1 },
         .memory_last_known_x = 30,

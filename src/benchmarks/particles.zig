@@ -5,7 +5,6 @@
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const math = @import("../core/math.zig");
 const particle_range_alignment_items = @import("../game/systems/particle.zig").particle_range_alignment_items;
 const ParticleSystem = @import("../game/systems/particle.zig").ParticleSystem;
 const WorldDepth = @import("../game/render_depth.zig").WorldDepth;

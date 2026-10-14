@@ -214,11 +214,6 @@ pub const FacingData = struct {
     direction: Facing = .down,
 };
 
-pub const FacingSlice = struct {
-    entities: []const EntityId,
-    directions: []Facing,
-};
-
 pub const ConstFacingSlice = struct {
     entities: []const EntityId,
     directions: []const Facing,

@@ -17,6 +17,7 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
 const rangeCount = @import("../app/thread_system.zig").rangeCount;
+const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const DataSystem = @import("data_system.zig").DataSystem;
 const hotStoreCapacity = @import("data_system.zig").hotStoreCapacity;
 const PopulationRowCounts = @import("data_system.zig").PopulationRowCounts;
@@ -25,12 +26,12 @@ const EntityId = @import("data_system.zig").EntityId;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const Faction = @import("data_system.zig").Faction;
-const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
-const MovementBodySlice = @import("data_system.zig").MovementBodySlice;
-const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
+const DigEdit = @import("dig_controller.zig").DigController.DigEdit;
+const DigEditError = @import("dig_controller.zig").DigEditError;
+const DigIntent = @import("simulation.zig").DigIntent;
 const facedCellForEntity = @import("dig_controller.zig").facedCellForEntity;
 const DestructibleController = @import("destructible_controller.zig").DestructibleController;
 const DestructibleProcessStats = @import("destructible_controller.zig").DestructibleProcessStats;
@@ -68,8 +69,10 @@ const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPercep
 const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
+const steering_range_alignment_items = @import("systems/steering.zig").steering_range_alignment_items;
+const ai_range_alignment_items = @import("systems/ai.zig").ai_range_alignment_items;
+const scope_range_alignment_items = @import("systems/simulation_scope.zig").scope_range_alignment_items;
 const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
-const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const EventBudgetInputs = @import("simulation.zig").EventBudgetInputs;
 const StructuralCommitBudget = @import("simulation.zig").StructuralCommitBudget;
@@ -82,13 +85,10 @@ const affect_events_per_row_max = @import("simulation.zig").affect_events_per_ro
 const ActionIntent = @import("simulation.zig").ActionIntent;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const pipeline_structural_event_share = @import("simulation.zig").pipeline_structural_event_share;
-const WorldStimulus = @import("simulation.zig").WorldStimulus;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_capacity;
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const stimulus_max_impacts_per_step = @import("simulation.zig").stimulus_max_impacts_per_step;
-const stimulus_sticky_capacity = @import("simulation.zig").stimulus_sticky_capacity;
-const cognition_stagger_n = @import("simulation_scope.zig").cognition_stagger_n;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -99,7 +99,6 @@ const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSyst
 const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
-const TileId = @import("world_system.zig").TileId;
 const Rect = @import("../render/renderer.zig").Rect;
 const world_gate = @import("systems/world_gate.zig");
 
@@ -423,7 +422,8 @@ pub const SimulationPipelineConfig = struct {
     /// destructible share (`pipeline_structural_event_share`) on top. The total is
     /// enforced on its own at the commit (`structuralCommitBudget`), never borrowed
     /// from other producers, and sizes the structural-command stream beyond one tier
-    /// command per body (`structuralCommandHeadroom`).
+    /// command per body (`structuralCommandHeadroom`) and its range count beyond the
+    /// pipeline's own ranges, one range per event.
     structural_headroom: usize = 0,
     stimuli: StimulusConfig = .{},
 };
@@ -579,6 +579,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
         perf.recordTiming(.steering_directions, steering_stats.directions_ns);
+        perf.recordTiming(.steering_grid, steering_stats.grid_ns);
 
         perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
         perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
@@ -611,11 +612,9 @@ pub const SimulationPipelineStats = struct {
         perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
         perf.recordTiming(.pathfinding_publish, pathfinding_stats.publish_ns);
 
-        perf.recordBatch(.apply_intents, self.apply_intents.batch);
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         perf.recordBatch(.movement, movement_stats.batch);
         perf.recordBatch(.chunk_derive, self.chunk_derive);
-        perf.recordBatch(.plane_entry, self.plane_entry);
 
         perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
         perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
@@ -631,8 +630,6 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
         perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
-        perf.recordBatch(.collision_response_gather, collision_response_stats.gather_batch);
-        perf.recordBatch(.collision_response_apply, collision_response_stats.apply_batch);
 
         perf.recordMetric(.stimuli_live_dropped, metric(self.stimuli_live_dropped));
         perf.recordMetric(.stimuli_deferred_dropped, metric(self.stimuli_deferred_dropped));
@@ -653,7 +650,7 @@ fn metric(value: usize) u64 {
 
 /// The population seam's geometric growth target: 1.5x plus one 16-row alignment
 /// block, hot-store aligned (e.g. 12 -> 48, 37 -> 80, 7 -> 32).
-pub fn grownPopulationCapacity(rows: usize) usize {
+fn grownPopulationCapacity(rows: usize) usize {
     return hotStoreCapacity(rows + rows / 2 + movement_range_alignment_items);
 }
 
@@ -870,6 +867,27 @@ pub const SimulationPipeline = struct {
         try self.collision_response.reserveForContacts(contact_capacity);
     }
 
+    /// The most ranges steering's avoidance pass appends to `frame.intents` and to
+    /// `frame.path_requests` in one step at the tracked population (one of each per pass
+    /// range): the range count to reserve both streams to.
+    pub fn steeringStreamRangeCount(self: *const SimulationPipeline) usize {
+        return maxRangeCount(self.movement_body_capacity, steering_range_alignment_items);
+    }
+
+    // The most ranges `ai_decide` appends to `frame.navigation_intents` in one step at the
+    // tracked population.
+    fn navigationIntentRangeCount(self: *const SimulationPipeline) usize {
+        return maxRangeCount(self.movement_body_capacity, ai_range_alignment_items);
+    }
+
+    // The most ranges one step appends to `frame.structural_commands` at the tracked
+    // population: the tier policy's ranges, the destructible controller's one, and the
+    // caller's queued ranges, at most one per event of its `structural_headroom` (each
+    // range holds at least one command).
+    fn structuralCommandRangeCount(self: *const SimulationPipeline) usize {
+        return maxRangeCount(self.movement_body_capacity, scope_range_alignment_items) + 1 + self.structural_headroom;
+    }
+
     /// The per-step `frame.events` bound: the exhaustive sum of `maxEventsPerStep`
     /// over every `EventProducerId` under this pipeline's budgets.
     pub fn eventCapacitySum(self: *const SimulationPipeline) usize {
@@ -980,12 +998,11 @@ pub const SimulationPipeline = struct {
         self.affect_max_events_per_step = affect_share;
 
         if (body_grew or shares_grew) {
-            // The event bound now includes the grown plane-traversal and structural arms.
-            const range_count = self.eventCapacitySum();
-            try frame.navigation_intents.reserve(range_count, body);
-            try frame.intents.reserve(range_count, body);
-            try frame.structural_commands.reserve(range_count, body + self.structuralCommandHeadroom());
-            try frame.reservePathRequests(range_count, body);
+            // Each stream's range count is the most ranges its writers dispatch at `body`.
+            try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), body);
+            try frame.intents.reserve(self.steeringStreamRangeCount(), body);
+            try frame.structural_commands.reserve(self.structuralCommandRangeCount(), body + self.structuralCommandHeadroom());
+            try frame.reservePathRequests(self.steeringStreamRangeCount(), body);
             // Raises the event limit, re-runs the cognition reserves and the contact
             // streams + response reserves to the grown pair bound (and every other
             // reserve attached to `reserve`).
@@ -1290,23 +1307,32 @@ pub const SimulationPipeline = struct {
         // clear and link) reserved once, before the promote, so an OOM fails the
         // stage with the deferred impacts still queued; the promote writes no world
         // state.
-        const dig_edit = try self.dig.reserveWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
-        // Nav records the edit's events right after the world write; its room is reserved
-        // with the world growth, so an OOM fails before anything is written.
-        if (dig_edit != null) try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.dig_world_edit, .{}));
+        const dig_edit = try self.reserveDigWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
-        // Player-authored world edit, plus a ramp's exit cleared walkable on the
-        // level above. Its world_tile_changed event (and the exit's
-        // world_obstacle_changed) becomes nav marks here; the commit seam applies them.
-        if (dig_edit) |edit| {
-            const first_event = context.frame.events.mergedItems().len;
-            const written = DigController.commitWorldEdit(context.world, edit, context.frame);
-            // Earlier events keep their positions, so the tail is the edit's own events.
-            self.pathfinding.recordTerrainNavEvents(context.frame.events.mergedItems()[first_event..], context.world, null);
-            try written;
-        }
+        if (dig_edit) |edit| try self.commitDigWorldEdit(context.world, edit, context.frame);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
+    }
+
+    /// Plans `intent`'s dig and reserves its world growth and its nav record, so an OOM
+    /// fails before anything is written. Returns the edit for `commitDigWorldEdit`, with
+    /// no world write between them, or null when the intent does nothing.
+    pub fn reserveDigWorldEdit(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, intent: DigIntent) DigEditError!?DigEdit {
+        const edit = (try self.dig.reserveWorldEdit(world, data, player, intent)) orelse return null;
+        try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.dig_world_edit, .{}));
+        return edit;
+    }
+
+    /// Writes a player-authored edit `reserveDigWorldEdit` reserved, plus a ramp's exit
+    /// cleared walkable on the level above, and records its `world_tile_changed` event
+    /// (and the exit's `world_obstacle_changed`) as nav marks; the commit seam applies
+    /// them. Every write that landed is recorded, error included.
+    pub fn commitDigWorldEdit(self: *SimulationPipeline, world: *WorldSystem, edit: DigEdit, frame: *SimulationFrame) DigEditError!void {
+        const first_event = frame.events.mergedItems().len;
+        const written = DigController.commitWorldEdit(world, edit, frame);
+        // Earlier events keep their positions, so the tail is the edit's own events.
+        self.pathfinding.recordTerrainNavEvents(frame.events.mergedItems()[first_event..], world, null);
+        try written;
     }
 
     /// Advance the stagger clock, derive the cognition halo from the fixed-step
@@ -1611,7 +1637,7 @@ pub const SimulationPipeline = struct {
     }
 };
 
-const StageTimer = runtime_perf_log.StageTimer;
+const StageTimer = @import("../app/runtime_perf_log.zig").StageTimer;
 
 test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
     const contract = stageContract(.ai_decide);
@@ -2572,9 +2598,9 @@ const GridCell = @import("systems/pathfinding/types.zig").GridCell;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const lane_count = @import("../core/simd.zig").lane_count;
 const plane_entry_range_alignment_items = @import("systems/plane_entry.zig").plane_entry_range_alignment_items;
-const DigIntent = @import("simulation.zig").DigIntent;
 const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
 const denseTileBlocksMovement = @import("world_test_support.zig").denseTileBlocksMovement;
+const InterestMarkerId = @import("world_interest.zig").InterestMarkerId;
 const nav_test_support = @import("systems/pathfinding/test_support.zig");
 const AiAgent = @import("data_system.zig").AiAgent;
 const MovementBody = @import("data_system.zig").MovementBody;
@@ -5307,54 +5333,55 @@ const TestAllocatorSwap = struct {
     }
 };
 
-// Indices of the frame's contacts naming `entity`, in contact order, as the collision
-// response lists its observer contacts. Test-only local fixture.
-fn contactsNaming(frame: *const SimulationFrame, entity: EntityId, buffer: []u32) []const u32 {
-    var count: usize = 0;
-    for (frame.contacts.mergedItems(), 0..) |contact, index| {
-        if (!contact.a.eql(entity) and !contact.b.eql(entity)) continue;
-        // Test frames hold far fewer than 2^32 contacts.
-        buffer[count] = @intCast(index);
-        count += 1;
-    }
-    return buffer[0..count];
-}
+const contactsNaming = @import("systems/collision_response_test_support.zig").contactsNaming;
 
 /// Pins every pipeline batch tuner to one settled threaded `profile` that never
 /// re-probes, demotes, or resets on item-count drift, so the multi-worker path runs a
 /// deterministic multi-range partition. The tuners would otherwise keep this small
-/// test workload inline (below `threaded_batch_ns`). Test-only local fixture.
+/// test workload inline (below `threaded_batch_ns`). The tuners are found by walking the
+/// pipeline's fields at comptime, so a tuner a system adds is pinned with it.
+/// Test-only local fixture.
 fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveWorkProfile) void {
-    const tuners = [_]*AdaptiveWorkTuner{
-        &pipeline.movement.adaptive_tuner,
-        &pipeline.movement.apply_intents_tuner,
-        &pipeline.collision.broadphase_tuner,
-        &pipeline.collision.narrowphase_tuner,
-        &pipeline.collision_response.gather_tuner,
-        &pipeline.collision_response.apply_tuner,
-        &pipeline.ai.separation_tuner,
-        &pipeline.ai.intent_tuner,
-        &pipeline.steering.adaptive_tuner,
-        &pipeline.steering.agents_tuner,
-        &pipeline.steering.select_resolve_tuner,
-        &pipeline.steering.select_claim_tuner,
-        &pipeline.steering.directions_tuner,
-        &pipeline.steering.grid_bucket_tuner,
-        &pipeline.steering.grid_sort_tuner,
-        &pipeline.pathfinding.tuners.solve,
-        &pipeline.pathfinding.tuners.nav_mark,
-        &pipeline.scope.chunk_derive_tuner,
-        &pipeline.scope.collision_gather_tuner,
-        &pipeline.scope.ai_gather_tuner,
-        &pipeline.scope.tier_policy_tuner,
-        &pipeline.spatial_index.build_tuner,
-        &pipeline.perception.compute_tuner,
-        &pipeline.ai_memory.decay_tuner,
-        &pipeline.affect.compute_tuner,
-        &pipeline.plane_entry.tuner,
+    pinTunersIn(SimulationPipeline, pipeline, profile);
+}
+
+// Pins every `AdaptiveWorkTuner` `value` holds by value: itself, or in a struct field, an
+// array element, or a set optional, at any depth. A single pointer is not owned, so it is
+// not walked. Test-only local fixture.
+fn pinTunersIn(comptime T: type, value: *T, profile: AdaptiveWorkProfile) void {
+    if (T == AdaptiveWorkTuner) return pinThreadedProfile(value, profile);
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.field_names, info.field_types) |name, Field| {
+            if (comptime holdsTuner(Field)) pinTunersIn(Field, &@field(value, name), profile);
+        },
+        .array => |info| for (value) |*element| pinTunersIn(info.child, element, profile),
+        .optional => |info| if (value.*) |*payload| pinTunersIn(info.child, payload, profile),
+        else => {},
+    }
+}
+
+// Whether a `T` holds an `AdaptiveWorkTuner` where `pinTunersIn` walks. A tuner the walk
+// cannot reach fails the build: in a union (which variant is live), behind a slice or
+// many-item pointer (owned heap rows), or in an error-union payload.
+fn holdsTuner(comptime T: type) bool {
+    @setEvalBranchQuota(100_000);
+    if (T == AdaptiveWorkTuner) return true;
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| for (info.field_types) |Field| {
+            if (holdsTuner(Field)) break true;
+        } else false,
+        .array => |info| holdsTuner(info.child),
+        .optional => |info| holdsTuner(info.child),
+        .@"union" => |info| for (info.field_types) |Field| {
+            if (holdsTuner(Field)) @compileError("pinTunersIn cannot walk a tuner in union " ++ @typeName(T));
+        } else false,
+        .pointer => |info| switch (info.size) {
+            .one => false,
+            .slice, .many, .c => if (holdsTuner(info.child)) @compileError("pinTunersIn cannot walk a tuner behind " ++ @typeName(T)) else false,
+        },
+        .error_union => |info| if (holdsTuner(info.payload)) @compileError("pinTunersIn cannot walk a tuner in error union " ++ @typeName(T)) else false,
+        else => false,
     };
-    for (tuners) |tuner| pinThreadedProfile(tuner, profile);
-    for (&pipeline.pathfinding.tuners.nav.values) |*tuner| pinThreadedProfile(tuner, profile);
 }
 
 /// Pins one tuner as `pinPipelineThreadedProfiles` does. Test-only local fixture.
@@ -5392,13 +5419,6 @@ const TestAllocatorCounters = struct {
 
     fn countAt(self: *const TestAllocatorCounters, index: usize) usize {
         return self.counters[index].allocations + self.counters[index].resize_index;
-    }
-
-    fn allocationsOf(self: *const TestAllocatorCounters, comptime owner: []const u8) usize {
-        inline for (TestAllocatorSwap.owner_names, 0..) |name, index| {
-            if (comptime std.mem.eql(u8, name, owner)) return self.countAt(index);
-        }
-        @compileError("no allocator owner " ++ owner);
     }
 
     /// Fails naming the first owner outside `allowed` that allocated.
@@ -5742,6 +5762,331 @@ test "population growth scenario is identical on the serial and multi-worker pat
         try std.testing.expectEqual(a[0], b[0]);
         try std.testing.expectEqual(a[1], b[1]);
     }
+}
+
+// The pathing crowd: more agents than one 16-item range, each investigating its own
+// marker on a distinct blocked cell, so the goal scan and projection, path intake, and
+// registry flush each span several ranges on a 16-item partition.
+const pathing_crowd_count: usize = 22;
+// Cells between crowd columns: each agent's nearest marker is its own, before and after
+// the markers shift one cell east.
+const pathing_crowd_column_cells: u16 = 4;
+// The crowd's row; the markers sit on the blocked row 0 above it.
+const pathing_crowd_row: u16 = 4;
+
+fn pathingCrowdCellX(column: usize) u16 {
+    // The crowd's columns fit a test world's u16 width.
+    return @intCast(1 + column * pathing_crowd_column_cells);
+}
+
+fn pathingCrowdTemplate(column: usize) StructuralCommand {
+    const position = math.Vec2{ .x = @as(f32, @floatFromInt(pathingCrowdCellX(column))) * 32, .y = @as(f32, @floatFromInt(pathing_crowd_row)) * 32 };
+    return .{
+        .create_entity = .{
+            .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 },
+            .ai_agent = .{ .active_behavior = .investigate, .gain_wander = 0, .gain_investigate = 1, .wander_amplitude = 0 },
+            // No replan cooldown: a moved goal is requested the step it moves.
+            .steering_agent = .{
+                .agent_radius = 8,
+                .waypoint_tolerance = 4,
+                .avoidance_radius = 48,
+                .avoidance_weight = 1.5,
+                .max_neighbor_samples = 8,
+                .stuck_step_threshold = 3,
+                .replan_cooldown_steps = 0,
+                .unavailable_backoff_steps = 12,
+            },
+            .world_level = 0,
+        },
+    };
+}
+
+// Places one investigate marker on row 0 of each crowd column, `shift` cells east.
+fn placePathingCrowdMarkers(world: *WorldSystem, ids: []InterestMarkerId, shift: u16) !void {
+    for (ids, 0..) |*id, column| {
+        id.* = try world.addInterestMarker(.{
+            .kind = .investigate,
+            .level = 0,
+            .x = @as(f32, @floatFromInt(pathingCrowdCellX(column) + shift)) * 32 + 16,
+            .y = 16,
+            .radius = 16,
+        });
+    }
+}
+
+/// Grows a 2-body population (the player and a static wall over row 0) by the pathing
+/// crowd through structural creates and the population seam, pins every pipeline tuner to
+/// a 2-worker partition of `first_items_per_range` items, and runs the first post-growth
+/// step under per-owner counting allocators: only pathfinding allocates, its path registry
+/// growing at its counted publish seam for the step's new path content, while its agent
+/// capacity and its goal-table, nav-mark, eviction and group-field pool growth counts
+/// hold. Then it shifts every marker, so each agent
+/// asks for a new goal, re-pins the tuners to `second`, and runs one more step with every
+/// allocator failing: nothing allocates, and the goal scan and projection, path intake,
+/// and registry flush run threaded.
+fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: AdaptiveWorkProfile) !void {
+    const width_cells = pathingCrowdCellX(pathing_crowd_count);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = width_cells,
+        .height = pathing_crowd_row + 2,
+        .tile_size = 32,
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var markers: [pathing_crowd_count]InterestMarkerId = undefined;
+    try placePathingCrowdMarkers(&world, &markers, 0);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    placePlayerFlush(&data, player, .{ 0, pathing_crowd_row + 1 });
+    try addStaticBox(&data, .{ .x = 0, .y = 0 }, .{ .x = @as(f32, @floatFromInt(width_cells)) * 32, .y = 32 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    const headroom: usize = 16 * pathing_crowd_count;
+    const bounds_width = world.worldWidthPixels();
+    const bounds_height = world.worldHeightPixels();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, bounds_width, bounds_height, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = headroom,
+        .navigation_world = &world,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + headroom);
+    try frame.reservePathRequests(pipeline.steeringStreamRangeCount(), 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = bounds_width,
+        .bounds_height = bounds_height,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    var commands: [pathing_crowd_count]StructuralCommand = undefined;
+    for (&commands, 0..) |*command, column| command.* = pathingCrowdTemplate(column);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expect(sync.grew);
+    try markAllAlwaysActive(&data);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = first_items_per_range });
+    // Population-sized pathfinding storage the seam grew: the agent capacity and every
+    // counted growth but the registry's path content.
+    const PathfindingSeamState = struct { agent_capacity: usize, goal_table: u64, nav_mark: u64, evict: u64, group_field_pool: u64 };
+    const seam_state = struct {
+        fn of(pathfinding: *const PathfindingSystem) PathfindingSeamState {
+            return .{
+                .agent_capacity = pathfinding.effective_agent_capacity,
+                .goal_table = pathfinding.goal_table_growth.count,
+                .nav_mark = pathfinding.nav_mark_growth.count,
+                .evict = pathfinding.evict_growth.count,
+                .group_field_pool = pathfinding.group_field_pool_growth.count,
+            };
+        }
+    }.of;
+    const seam_before = seam_state(&pipeline.pathfinding);
+    const registry_growths = pipeline.pathfinding.registry_growth.count;
+    frame.beginStep();
+    var counters = TestAllocatorCounters.init();
+    var counting_swap: TestAllocatorSwap = .{};
+    counting_swap.install(targets, counters.allocators());
+    const first_result = pipeline.update(context);
+    counting_swap.restore(targets);
+    const first_stats = try first_result;
+    try std.testing.expectEqual(pathing_crowd_count, first_stats.steering.path_request_count);
+    // On a 16-item partition the projection is threaded on this step too.
+    try std.testing.expectEqual(rangeCount(pathing_crowd_count, first_items_per_range), first_stats.path_goals.project_batch.range_count);
+    try counters.expectOnlyOwnersAllocated(&.{"pathfinding"});
+    try std.testing.expectEqual(seam_before, seam_state(&pipeline.pathfinding));
+    try std.testing.expect(pipeline.pathfinding.registry_growth.count > registry_growths);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    for (markers) |id| try std.testing.expect(world.interest_markers.removeMarker(id));
+    try placePathingCrowdMarkers(&world, &markers, 1);
+    pinPipelineThreadedProfiles(&pipeline, second);
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var failing_swap: TestAllocatorSwap = .{};
+    failing_swap.install(targets, .uniform(failing.allocator()));
+    const second_result = pipeline.update(context);
+    failing_swap.restore(targets);
+    const second_stats = try second_result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(pathing_crowd_count, second_stats.path_goals.distinct);
+    try std.testing.expectEqual(pathing_crowd_count, second_stats.steering.path_request_count);
+    for ([_]BatchStats{ second_stats.path_goals.scan_batch, second_stats.path_goals.project_batch, second_stats.pathfinding.intake_batch, second_stats.pathfinding.registry_flush_batch }) |batch| {
+        try std.testing.expect(!batch.ran_inline);
+        try std.testing.expect(batch.range_count > 1);
+    }
+}
+
+test "a pathing crowd grown at the population seam keeps its first step's growth to the counted path registry, then runs goal resolve, path intake and registry flush threaded allocating nothing" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    try runPathingCrowdGrowthScenario(16, .{ .worker_threads = 2, .items_per_range = 16 });
+}
+
+test "a partition retune after a pathing crowd grows runs goal resolve, path intake and registry flush threaded allocating nothing" {
+    // 22 items: one 32-item range, then two 16-item ranges.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    try runPathingCrowdGrowthScenario(32, .{ .worker_threads = 2, .items_per_range = 16 });
+}
+
+// A pursuer of the sealed player (`addSealedGoalBoxes`) for the range-binding scenario:
+// AI and steering run every step, and the goal stays unavailable, so no path is solved.
+fn sealedPursuerTemplate(index: usize) StructuralCommand {
+    // Rows 12-14 of a 25-cell-wide world, outside the sealing ring.
+    const position = math.Vec2{ .x = @floatFromInt(32 * (index % 25)), .y = @floatFromInt(32 * (12 + index / 25)) };
+    return .{ .create_entity = .{
+        .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 },
+        .ai_agent = .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 },
+        .steering_agent = .{
+            .agent_radius = 8,
+            .waypoint_tolerance = 4,
+            .avoidance_radius = 48,
+            .avoidance_weight = 1.5,
+            .max_neighbor_samples = 8,
+            .stuck_step_threshold = 3,
+            .replan_cooldown_steps = 4,
+            .unavailable_backoff_steps = 12,
+        },
+        .world_level = 0,
+    } };
+}
+
+// The player's goal cell (12, 7) under a 3x3 block, inside a wall ring at cells x 9..15,
+// y 4..10 that seals the open cells holding its projection.
+fn addSealedGoalBoxes(data: *DataSystem) !void {
+    try addStaticBox(data, .{ .x = 352, .y = 192 }, .{ .x = 96, .y = 96 });
+    try addStaticBox(data, .{ .x = 288, .y = 128 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(data, .{ .x = 288, .y = 320 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(data, .{ .x = 288, .y = 160 }, .{ .x = 32, .y = 160 });
+    try addStaticBox(data, .{ .x = 480, .y = 160 }, .{ .x = 32, .y = 160 });
+}
+
+test "after population growth the seam's stream range counts are the binding reserve and every producer fills them without allocating" {
+    // The frame reserves one range per stream at init, so only the population seam sizes
+    // the ranges. Seven bodies (player, five walls, a crate) grow by 25 pursuers to 32
+    // rows (capacity 64), then 32 more fill the capacity without another growth, so on a
+    // 16-item partition every producer appends its bound's ranges.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 25,
+        .height = 15,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    placePlayerFlush(&data, player, .{ 12, 7 });
+    try addSealedGoalBoxes(&data);
+    const crate = try data.createEntity();
+    try data.setMovementBody(crate, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setDestructible(crate, .{ .hit_points = 1 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    const headroom: usize = 256;
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 8,
+        .structural_headroom = headroom,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(1, 0, 8, 8, 8, 8 + pipeline.structuralCommandHeadroom());
+    try frame.reservePathRequests(1, 8);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 8);
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    var commands: [32]StructuralCommand = undefined;
+    for (commands[0..25], 0..) |*command, index| command.* = sealedPursuerTemplate(index);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, commands[0..25]);
+    try std.testing.expect((try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expectEqual(@as(usize, 64), pipeline.movement_body_capacity);
+    for (&commands, 25..) |*command, index| command.* = sealedPursuerTemplate(index);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expectEqual(@as(usize, 64), data.movementBodySliceConst().entities.len);
+    try markAllAlwaysActive(&data);
+    // The crate alone is tier-policed, and its tier is wrong: the policy changes it, so
+    // the tier stage appends every range.
+    var crate_metadata = data.simulationMetadata(crate).?;
+    crate_metadata.always_active = false;
+    crate_metadata.tier = .dormant;
+    try data.setSimulationMetadata(crate, crate_metadata);
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    // The caller queues its whole headroom as single-command ranges, and the player hits
+    // the crate.
+    const caller_result = blk: {
+        for (0..headroom) |_| {
+            const range = frame.structural_commands.appendRangeCounts(1) catch |err| break :blk err;
+            frame.structural_commands.addCount(range, 1);
+            frame.structural_commands.prefixAppendedRanges(range) catch |err| break :blk err;
+            var writer = frame.structural_commands.rangeWriter(range);
+            writer.write(.{ .set_simulation_tier = .{ .entity = player.entity, .tier = .cognition } });
+            writer.finish();
+            frame.structural_commands.finishWrite();
+        }
+        frame.appendActionIntent(.{ .entity = player.entity, .kind = .interact, .target = crate }) catch |err| break :blk err;
+        break :blk {};
+    };
+    const result = if (caller_result) |_| pipeline.update(context) else |err| err;
+    swap.restore(targets);
+    const stats = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), stats.destructibles_destroyed);
+    // Each stream's writers appended exactly its seam bound.
+    try std.testing.expectEqual(pipeline.navigationIntentRangeCount(), frame.navigation_intents.counts.items.len);
+    try std.testing.expectEqual(pipeline.steeringStreamRangeCount(), frame.intents.counts.items.len);
+    try std.testing.expectEqual(pipeline.steeringStreamRangeCount(), frame.path_requests.counts.items.len);
+    try std.testing.expectEqual(pipeline.structuralCommandRangeCount(), frame.structural_commands.counts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stats.steering.path_request_count);
 }
 
 const apply_intents_agent_count: usize = 20;
@@ -6877,6 +7222,15 @@ test "pipeline stats record the path intake and registry flush batches under the
     try std.testing.expectEqual(@as(u64, 7), flush.items);
     try std.testing.expectEqual(@as(u64, 6), perf.metrics[@backingInt(runtime_perf_log.Metric.path_max_distinct_group_keys)]);
     try std.testing.expectEqual(@as(u64, 2), perf.metrics[@backingInt(runtime_perf_log.Metric.path_group_field_evictions)]);
+}
+
+test "pipeline stats record the steering grid build under its own timing, apart from the snapshot" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+    var perf = runtime_perf_log.RuntimePerfLog.init(0);
+    const stats = SimulationPipelineStats{ .steering = .{ .snapshot_ns = 3, .grid_ns = 11 } };
+    stats.recordTo(runtime_perf_log.Context.bind(&perf));
+    try std.testing.expectEqual(@as(u64, 11), perf.timings[@backingInt(runtime_perf_log.Timing.steering_grid)].total_ns);
+    try std.testing.expectEqual(@as(u64, 3), perf.timings[@backingInt(runtime_perf_log.Timing.steering_snapshot)].total_ns);
 }
 
 const StructuralBurstOutcome = struct {

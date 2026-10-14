@@ -108,15 +108,6 @@ pub const BenchmarkCase = struct {
             .large => alignItemCount(base * 4, range_alignment_items),
         };
     }
-
-    pub fn workerModeLabel(self: BenchmarkCase) []const u8 {
-        return switch (self.worker_mode) {
-            .serial_direct => "serial",
-            .fixed_1 => "fixed-1",
-            .fixed_2 => "fixed-2",
-            .fixed_auto => "fixed-auto",
-        };
-    }
 };
 
 pub const WorkerMode = enum {
@@ -1760,11 +1751,6 @@ fn measured(result: ?CaseResult) ?CaseResult {
 fn speedupBasisPoints(baseline: RunStats, candidate: RunStats) u64 {
     if (candidate.mean_ns == 0) return 0;
     return @intCast((@as(u128, baseline.mean_ns) * 100) / candidate.mean_ns);
-}
-
-fn outputsPerItemBasisPoints(stats: RunStats) u64 {
-    if (stats.item_count == 0) return 0;
-    return @intCast((@as(u128, stats.output_count) * 100) / stats.item_count);
 }
 
 fn percentDelta(candidate_ns: u64, baseline_ns: u64) i64 {

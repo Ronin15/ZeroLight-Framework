@@ -2008,16 +2008,6 @@ fn testTextureId(index: u32, generation: u32) TextureId {
     return TextureId.init(index, generation) catch unreachable;
 }
 
-fn testTextureSlot(texture: *c.SDL_GPUTexture, width: u32, height: u32, generation: u32, internal: bool) TextureSlot {
-    return .{
-        .texture = texture,
-        .desc = .{ .width = width, .height = height },
-        .generation = generation,
-        .alive = true,
-        .internal = internal,
-    };
-}
-
 test "texture slots reuse retired slots with fresh generations" {
     const allocator = std.testing.allocator;
     var renderer = Renderer{

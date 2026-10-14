@@ -290,18 +290,7 @@ fn contactFixture(a: EntityId, b: EntityId, penetration: f32) CollisionContact {
     };
 }
 
-// Indices of the frame's contacts naming `entity`, in contact order, as the collision
-// response lists its observer contacts.
-fn contactsNaming(frame: *const SimulationFrame, entity: EntityId, buffer: []u32) []const u32 {
-    var count: usize = 0;
-    for (frame.contacts.mergedItems(), 0..) |contact, index| {
-        if (!contact_query.involvesEntity(contact, entity)) continue;
-        // Test frames hold far fewer than 2^32 contacts.
-        buffer[count] = @intCast(index);
-        count += 1;
-    }
-    return buffer[0..count];
-}
+const contactsNaming = @import("systems/collision_response_test_support.zig").contactsNaming;
 
 fn countKind(commands: *const AudioCommandBuffer, comptime tag: std.meta.Tag(AudioCommand)) usize {
     var n: usize = 0;

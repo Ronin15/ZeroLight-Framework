@@ -43,7 +43,6 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const CellCoord = @import("../game/world_system.zig").CellCoord;
-const LevelLink = @import("../game/world_system.zig").LevelLink;
 const TileId = @import("../game/world_system.zig").TileId;
 const level_z_step = @import("../game/world_system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;

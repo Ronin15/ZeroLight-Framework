@@ -25,7 +25,6 @@ const ConstMovementBodySlice = types.ConstMovementBodySlice;
 const ScopeColumnsSlice = types.ScopeColumnsSlice;
 const ConstScopeColumnsSlice = types.ConstScopeColumnsSlice;
 const FacingData = types.FacingData;
-const FacingSlice = types.FacingSlice;
 const ConstFacingSlice = types.ConstFacingSlice;
 const ConstFactionSlice = types.ConstFactionSlice;
 const PrimitiveVisual = types.PrimitiveVisual;
@@ -521,10 +520,6 @@ pub const DataSystem = struct {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.facing_index orelse return null;
         return .{ .direction = self.facings.directionAt(@intCast(dense_index)) };
-    }
-
-    pub fn facingSlice(self: *DataSystem) FacingSlice {
-        return self.facings.slice();
     }
 
     pub fn facingSliceConst(self: *const DataSystem) ConstFacingSlice {

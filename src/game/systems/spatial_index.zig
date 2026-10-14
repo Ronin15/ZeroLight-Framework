@@ -64,7 +64,6 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
@@ -664,7 +663,7 @@ pub const SpatialIndexSystem = struct {
     }
 
     /// Copies each range's staging window (`count` rows at `r * items_per_range`) into
-    /// `rows` in range order: the same per-row copy count as the old per-range merge.
+    /// `rows` in range order, copying each row once.
     fn mergeRowWindows(self: *SpatialIndexSystem, items_per_range: usize) !void {
         self.rows.clearRetainingCapacity();
         var total: usize = 0;
@@ -833,7 +832,7 @@ fn entryLessThan(_: void, lhs: SpatialEntry, rhs: SpatialEntry) bool {
 /// Cache-line-aligned staging: with a 16-item range alignment every range's window
 /// starts on a cache-line boundary for 24-byte rows, so concurrent range writes never
 /// share a line.
-const RowStagingList = std.ArrayListAligned(SpatialIndexRow, .fromByteUnits(thread_shared_record_alignment));
+const RowStagingList = std.array_list.Aligned(SpatialIndexRow, .fromByteUnits(thread_shared_record_alignment));
 
 /// One range's gathered-row count, written once by the range's job.
 const RowCountTally = struct {
@@ -846,7 +845,7 @@ comptime {
     std.debug.assert(@sizeOf(RowCountTally) % thread_shared_record_alignment == 0);
 }
 
-const RowCountTallyList = std.ArrayListAligned(RowCountTally, .fromByteUnits(thread_shared_record_alignment));
+const RowCountTallyList = std.array_list.Aligned(RowCountTally, .fromByteUnits(thread_shared_record_alignment));
 
 const SpatialGatherContext = struct {
     ai_entities: []const EntityId,

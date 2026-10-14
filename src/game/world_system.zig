@@ -14,7 +14,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../core/math.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
-const PreparedSprite = @import("../assets/runtime_assets.zig").PreparedSprite;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const manifest = @import("../assets/manifest.zig");
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;

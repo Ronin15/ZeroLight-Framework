@@ -14,7 +14,6 @@ const movement_range_alignment_items = @import("../game/data_system.zig").moveme
 const CollisionResponseStats = @import("../game/systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("../game/systems/collision_response.zig").CollisionResponseSystem;
 const simulation = @import("../game/simulation.zig");
-const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const suite = @import("suite.zig");
 
@@ -62,14 +61,6 @@ const Fixture = struct {
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
     return suite.eventScaleCounts(profile);
-}
-
-pub fn createSolidFixture(allocator: std.mem.Allocator, contact_count: usize) !Fixture {
-    return createFixture(allocator, contact_count, .solid_static);
-}
-
-pub fn createMixedFixture(allocator: std.mem.Allocator, contact_count: usize) !Fixture {
-    return createFixture(allocator, contact_count, .mixed);
 }
 
 fn runSolidCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {

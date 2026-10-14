@@ -13,9 +13,7 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const ConstAiAgentSlice = @import("../game/data_system.zig").ConstAiAgentSlice;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
-const EntityId = @import("../game/data_system.zig").EntityId;
 const AffectStats = @import("../game/systems/affect.zig").AffectStats;
 const AffectSystem = @import("../game/systems/affect.zig").AffectSystem;
 const affect_range_alignment_items = @import("../game/systems/affect.zig").affect_range_alignment_items;

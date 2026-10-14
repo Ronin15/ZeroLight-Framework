@@ -38,7 +38,6 @@ const thread_shared_record_alignment = @import("../../../app/thread_system.zig")
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavLevelGraph = @import("nav_graph.zig").NavLevelGraph;
-const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const BatchLevels = @import("nav_graph.zig").BatchLevels;
 const PatchInfo = @import("nav_graph.zig").PatchInfo;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;

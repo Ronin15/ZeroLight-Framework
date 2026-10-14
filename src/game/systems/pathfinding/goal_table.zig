@@ -79,11 +79,11 @@ pub const GoalTable = struct {
     // Per entry, in first-seen intent order: its goal ref (the project stage's items) and
     // its live cell (`no_cell`: no open cell within the projection radius).
     refs: std.ArrayList(u64) = .empty,
-    live: std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment)) = .empty,
+    live: std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment)) = .empty,
     // `goal_scan` staging: range r writes its distinct refs from `r * items_per_range`, and
     // its tally.
-    scan_refs: std.ArrayListAligned(u64, .fromByteUnits(thread_shared_record_alignment)) = .empty,
-    scan_tallies: std.ArrayListAligned(ScanTally, .fromByteUnits(thread_shared_record_alignment)) = .empty,
+    scan_refs: std.array_list.Aligned(u64, .fromByteUnits(thread_shared_record_alignment)) = .empty,
+    scan_tallies: std.array_list.Aligned(ScanTally, .fromByteUnits(thread_shared_record_alignment)) = .empty,
     // Intents one resolve covers without growing; assigned only after every reserve
     // succeeded.
     limit: usize = 0,

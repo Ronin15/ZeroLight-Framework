@@ -106,31 +106,6 @@ pub fn recordVertexUploadInPass(
     c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, cycle);
 }
 
-/// One-shot vertex upload that opens/ends its own copy pass. Treats
-/// `vertex_buffer_byte_size` as both transfer and destination capacity (paired
-/// streams share that size). Callers that stage separately, share a pass, or
-/// need distinct transfer vs vertex sizes must use `stageVertices` +
-/// `recordVertexUploadInPass` instead.
-pub fn recordVertexUpload(
-    command_buffer: *c.SDL_GPUCommandBuffer,
-    transfer_buffer: *c.SDL_GPUTransferBuffer,
-    vertex_buffer: *c.SDL_GPUBuffer,
-    vertex_buffer_byte_size: u32,
-    bytes: []const u8,
-) !void {
-    var copy_pass_scope = try CopyPassScope.begin(command_buffer);
-    defer copy_pass_scope.end();
-    try recordVertexUploadInPass(
-        copy_pass_scope.pass,
-        transfer_buffer,
-        vertex_buffer_byte_size,
-        vertex_buffer,
-        vertex_buffer_byte_size,
-        bytes,
-        true,
-    );
-}
-
 /// One tile-store storage element: a directory word or two packed `u16` tile ids
 /// (see `renderer.zig` tile store layout). A `u32` element keeps the storage
 /// layout portable, with no 16-bit storage extension.

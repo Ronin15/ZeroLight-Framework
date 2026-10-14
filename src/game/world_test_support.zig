@@ -6,7 +6,6 @@
 //! no production path imports it. Single-module helpers stay in their module.
 
 const std = @import("std");
-const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");

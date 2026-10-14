@@ -43,14 +43,6 @@ pub const AssetCache = struct {
         self.deinitWithContext(@ptrCast(renderer));
     }
 
-    pub fn acquireTexture(self: *AssetCache, renderer: *Renderer, relative_path: []const u8) !TextureLease {
-        return self.acquireTextureWithContext(@ptrCast(renderer), relative_path);
-    }
-
-    pub fn releaseTexture(self: *AssetCache, renderer: *Renderer, lease: *TextureLease) void {
-        self.releaseTextureWithContext(@ptrCast(renderer), lease);
-    }
-
     fn initWithBackend(allocator: std.mem.Allocator, asset_store: assets.AssetStore, backend: TextureBackend) AssetCache {
         return .{
             .allocator = allocator,
@@ -522,10 +514,6 @@ pub const testing = if (builtin.is_test) struct {
 
     pub fn entryCount(cache: *const AssetCache) usize {
         return cache.entries.count();
-    }
-
-    pub fn batchUploadCount(fake: *const Backend) u32 {
-        return fake.batch_upload_count;
     }
 } else struct {};
 

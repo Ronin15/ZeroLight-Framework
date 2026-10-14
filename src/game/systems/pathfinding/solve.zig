@@ -58,7 +58,6 @@ const octileU32 = @import("types.zig").octileU32;
 const siftUp = @import("types.zig").siftUp;
 const popHeap = @import("types.zig").popHeap;
 const neighbor_dirs = @import("types.zig").neighbor_dirs;
-const default_goal_projection_radius = @import("types.zig").default_goal_projection_radius;
 
 pub const SolveJobContext = struct {
     system: *PathfindingSystem,

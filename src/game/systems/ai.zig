@@ -47,7 +47,6 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiAgentSlice = @import("../data_system.zig").AiAgentSlice;
 const ConstAiMemorySlice = @import("../data_system.zig").ConstAiMemorySlice;
@@ -58,7 +57,6 @@ const DataSystem = @import("../data_system.zig").DataSystem;
 const max_ai_memory_staleness = @import("../data_system.zig").max_ai_memory_staleness;
 const ai_memory_ring_capacity = @import("../data_system.zig").ai_memory_ring_capacity;
 const EntityId = @import("../data_system.zig").EntityId;
-const AiAgent = @import("../data_system.zig").AiAgent;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
 const Faction = @import("../data_system.zig").Faction;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
@@ -86,8 +84,6 @@ const ai_adaptive_tuner_config = AdaptiveWorkTunerConfig{
 /// == 32.0), not derived from world/map size. See
 /// `AiConfig.goal_requantization_hysteresis_distance`.
 pub const default_goal_requantization_hysteresis_distance: f32 = 56.0;
-
-pub const HotF32Slice = []f32;
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, ai_range_alignment_items);
@@ -3235,7 +3231,7 @@ test "ai seek keeps the default seek target when memory can't override it" {
     const remembered_target = try data.createEntity();
 
     // No memory / no perception at all: default behavior is unaffected by
-    // config fields defaulting to null (mirrors pre-Slice-30 seek).
+    // config fields defaulting to null.
     const no_memory = try data.createEntity();
     try data.setMovementBody(no_memory, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
     try data.setAiAgent(no_memory, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });

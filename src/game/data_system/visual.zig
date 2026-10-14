@@ -11,7 +11,6 @@ const types = @import("types.zig");
 const EntityId = types.EntityId;
 const Facing = types.Facing;
 const FacingData = types.FacingData;
-const FacingSlice = types.FacingSlice;
 const ConstFacingSlice = types.ConstFacingSlice;
 const PrimitiveVisual = types.PrimitiveVisual;
 const ConstPrimitiveVisualSlice = types.ConstPrimitiveVisualSlice;
@@ -105,11 +104,6 @@ pub const FacingStore = struct {
         const moved_entity = if (index != last) s.items(.entity)[last] else null;
         self.rows.swapRemove(index);
         return moved_entity;
-    }
-
-    pub fn slice(self: *FacingStore) FacingSlice {
-        const s = self.rows.slice();
-        return .{ .entities = s.items(.entity), .directions = s.items(.direction) };
     }
 
     pub fn sliceConst(self: *const FacingStore) ConstFacingSlice {

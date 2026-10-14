@@ -11,7 +11,6 @@
 const std = @import("std");
 const contact_query = @import("contact_query.zig");
 const DataSystem = @import("data_system.zig").DataSystem;
-const EntityId = @import("data_system.zig").EntityId;
 const Player = @import("player.zig").Player;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const CollisionContact = @import("simulation.zig").CollisionContact;

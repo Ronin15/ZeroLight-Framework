@@ -9,8 +9,6 @@
 //! `src/benchmarks/ai.zig`).
 
 const std = @import("std");
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;

@@ -33,13 +33,12 @@ const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
-const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
 const ConstSteeringAgentSlice = @import("../data_system.zig").ConstSteeringAgentSlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const StructuralChange = @import("../data_system.zig").StructuralChange;
-const StageTimer = runtime_perf_log.StageTimer;
+const StageTimer = @import("../../app/runtime_perf_log.zig").StageTimer;
 const MovementIntent = @import("../simulation.zig").MovementIntent;
 const NavigationIntent = @import("../simulation.zig").NavigationIntent;
 const PathRequest = @import("../simulation.zig").PathRequest;
@@ -59,8 +58,8 @@ const steering_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .smallest_range_items = steering_range_alignment_items,
 };
 
-pub const HotF32Slice = []f32;
-pub const ConstHotF32Slice = []const f32;
+const HotF32Slice = @import("../data_system.zig").HotF32Slice;
+const ConstHotF32Slice = @import("../data_system.zig").ConstHotF32Slice;
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, steering_range_alignment_items);
@@ -146,10 +145,11 @@ pub const SteeringStats = struct {
     /// Zero items on the serial path, where the grid runs its single sort.
     grid_sort_batch: BatchStats = .{},
     // Wall time (ns) of the prepare stages, inline or dispatched: selection, the agents stage
-    // with its rekey and the agent grid, and directions; zero when perf logging is disabled.
+    // with its rekey, directions, and the agent grid; zero when perf logging is disabled.
     select_ns: u64 = 0,
     snapshot_ns: u64 = 0,
     directions_ns: u64 = 0,
+    grid_ns: u64 = 0,
 };
 
 pub const SteeringSystem = struct {
@@ -234,7 +234,7 @@ pub const SteeringSystem = struct {
         self.* = undefined;
     }
 
-    pub fn invalidateSteeringMovementIndexCache(self: *SteeringSystem) void {
+    fn invalidateSteeringMovementIndexCache(self: *SteeringSystem) void {
         self.steering_movement_index_valid = false;
     }
 
@@ -371,7 +371,7 @@ pub const SteeringSystem = struct {
 
         var grid_timer = StageTimer.start();
         self.buildAgentGrid(threads, &stats);
-        stats.snapshot_ns += grid_timer.lap();
+        stats.grid_ns = grid_timer.lap();
 
         try self.writeMovementIntents(frame, threads, obstacles, steering, &stats);
         return stats;
@@ -716,7 +716,7 @@ pub const SteeringSystem = struct {
     // out the band slices and the band directory.
     fn buildAgentGridBanded(self: *SteeringSystem, stage: StageThreads, selection: BatchSelection, splitters: [max_bands - 1]CellKey, stats: *SteeringStats) void {
         const agent_count = self.agent_snapshot_rows.len;
-        for (splitters[0 .. max_bands - 2], splitters[1..]) |lower, upper| std.debug.assert(!cellKeyLessThan(upper, lower));
+        for (splitters[0 .. max_bands - 2], splitters[1..]) |lower, upper| std.debug.assert(cellKeyOrder(upper, lower) != .lt);
         std.debug.assert(self.agent_cell_entries.capacity >= agent_count and self.agent_cell_ranges.capacity >= agent_count);
         std.debug.assert(self.agent_cell_staging.capacity >= agent_count);
         self.agent_cell_entries.items.len = agent_count;
@@ -920,8 +920,8 @@ const SelectedWindow = struct {
     request_base: usize,
 };
 
-const SelectedList = std.ArrayListAligned(SelectedIntent, .fromByteUnits(thread_shared_record_alignment));
-const RowList = std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment));
+const SelectedList = std.array_list.Aligned(SelectedIntent, .fromByteUnits(thread_shared_record_alignment));
+const RowList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
 
 const AgentsTally = struct {
     mismatches: usize = 0,
@@ -973,8 +973,12 @@ const CellKey = struct {
     cell_x: i32,
 };
 
-fn cellKeyLessThan(lhs: CellKey, rhs: CellKey) bool {
-    return cellLessThan(lhs.cell_x, lhs.cell_y, rhs.cell_x, rhs.cell_y);
+// `cell` against `key` in (cell_y, cell_x) order, as `std.sort`'s searches compare. Plain
+// comparisons: per-field `std.math.order` calls measure slower on this per-query lookup.
+fn cellKeyOrder(cell: CellKey, key: CellKey) std.math.Order {
+    if (cell.cell_y != key.cell_y) return if (cell.cell_y < key.cell_y) .lt else .gt;
+    if (cell.cell_x != key.cell_x) return if (cell.cell_x < key.cell_x) .lt else .gt;
+    return .eq;
 }
 
 // The largest cell key; splitters at it leave the bands after them empty.
@@ -1000,20 +1004,15 @@ const AgentGridDirectory = struct {
     splitter_count: usize = 0,
     bands: [max_bands]CellBand = @splat(.{}),
 
-    // Upper-bound binary search over the splitters.
     fn bandOfCell(self: *const AgentGridDirectory, cell_x: i32, cell_y: i32) usize {
         const cell = CellKey{ .cell_y = cell_y, .cell_x = cell_x };
-        var low: usize = 0;
-        var high: usize = self.splitter_count;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            if (cellKeyLessThan(cell, self.splitters[mid])) {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-        return low;
+        return std.sort.partitionPoint(CellKey, self.splitters[0..self.splitter_count], cell, splitterAtOrBelow);
+    }
+
+    // `std.sort.upperBound` as one predicate call per probe: its order wrapper measures
+    // slower on this per-query lookup.
+    fn splitterAtOrBelow(cell: CellKey, splitter: CellKey) bool {
+        return cellKeyOrder(cell, splitter) != .lt;
     }
 
     // The cell ranges of the band holding the cell, sorted by (cell_y, cell_x).
@@ -1755,19 +1754,14 @@ fn requestsBefore(windows: []const SelectedWindow, request_prefix: []const u32, 
 // The window holding selected position `logical` (below the selected count): the last
 // window starting at or before it, which is never empty.
 fn windowContaining(windows: []const SelectedWindow, logical: usize) usize {
-    var low: usize = 0;
-    var high: usize = windows.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        if (windows[mid].logical_base <= logical) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    std.debug.assert(low > 0);
-    std.debug.assert(logical < windows[low - 1].logical_base + windows[low - 1].count);
-    return low - 1;
+    const after = std.sort.partitionPoint(SelectedWindow, windows, logical, windowStartsAtOrBefore);
+    std.debug.assert(after > 0);
+    std.debug.assert(logical < windows[after - 1].logical_base + windows[after - 1].count);
+    return after - 1;
+}
+
+fn windowStartsAtOrBefore(logical: usize, window: SelectedWindow) bool {
+    return window.logical_base <= logical;
 }
 
 fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -2109,26 +2103,14 @@ fn spatialCellEntryLessThan(_: void, lhs: SpatialCellEntry, rhs: SpatialCellEntr
     return lhs.index < rhs.index;
 }
 
+// A band holds one range per occupied cell, so the equal key is the cell's range.
 fn findCellRange(ranges: []const SpatialCellRange, cell_x: i32, cell_y: i32) ?SpatialCellRange {
-    var low: usize = 0;
-    var high: usize = ranges.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        const range = ranges[mid];
-        if (cellLessThan(range.cell_x, range.cell_y, cell_x, cell_y)) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    if (low >= ranges.len) return null;
-    const range = ranges[low];
-    if (range.cell_x == cell_x and range.cell_y == cell_y) return range;
-    return null;
+    const index = std.sort.binarySearch(SpatialCellRange, ranges, CellKey{ .cell_y = cell_y, .cell_x = cell_x }, cellRangeOrder) orelse return null;
+    return ranges[index];
 }
 
-fn cellLessThan(lhs_x: i32, lhs_y: i32, rhs_x: i32, rhs_y: i32) bool {
-    return lhs_y < rhs_y or (lhs_y == rhs_y and lhs_x < rhs_x);
+fn cellRangeOrder(cell: CellKey, range: SpatialCellRange) std.math.Order {
+    return cellKeyOrder(cell, .{ .cell_y = range.cell_y, .cell_x = range.cell_x });
 }
 
 fn spatialCell(value: f32, cell_size: f32) i32 {
@@ -4160,6 +4142,7 @@ fn behaviorStats(stats: SteeringStats) SteeringStats {
     behavior.select_ns = 0;
     behavior.snapshot_ns = 0;
     behavior.directions_ns = 0;
+    behavior.grid_ns = 0;
     return behavior;
 }
 

@@ -39,8 +39,8 @@ pub const collision_range_alignment_items: usize = movement_range_alignment_item
 /// merged-candidate / narrowphase-staging bound.
 const broadphase_pairs_per_item: usize = 4;
 
-pub const HotF32Slice = []f32;
-pub const ConstHotF32Slice = []const f32;
+const HotF32Slice = @import("../data_system.zig").HotF32Slice;
+const ConstHotF32Slice = @import("../data_system.zig").ConstHotF32Slice;
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, collision_range_alignment_items);
@@ -176,13 +176,13 @@ const BroadphaseRangeSlot = struct {
     padding: [paddingForCacheLine(BroadphaseRangeBuffer)]u8 = @splat(0),
 };
 
-const BroadphaseRangeSlotList = std.ArrayListAligned(BroadphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));
+const BroadphaseRangeSlotList = std.array_list.Aligned(BroadphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));
 
 /// Narrowphase emits at most one contact per candidate pair, so it needs no per-range
 /// buffers: range r writes only its own `[range.start, range.end)` window of one
 /// candidate-pair-count staging list and its count into a padded tally; the main
 /// thread streams the windows in range order.
-const ContactStagingList = std.ArrayListAligned(CollisionContact, .fromByteUnits(thread_shared_record_alignment));
+const ContactStagingList = std.array_list.Aligned(CollisionContact, .fromByteUnits(thread_shared_record_alignment));
 
 /// One narrowphase range's contact count, written once by the range's job.
 const ContactCountTally = struct {
@@ -195,7 +195,7 @@ comptime {
     std.debug.assert(@sizeOf(ContactCountTally) % thread_shared_record_alignment == 0);
 }
 
-const ContactCountTallyList = std.ArrayListAligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
+const ContactCountTallyList = std.array_list.Aligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
 
 pub const CollisionSystem = struct {
     allocator: std.mem.Allocator,

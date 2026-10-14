@@ -9,7 +9,6 @@ const std = @import("std");
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
-const Faction = @import("data_system.zig").Faction;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const render_depth = @import("render_depth.zig");
 

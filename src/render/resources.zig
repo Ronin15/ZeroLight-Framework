@@ -57,23 +57,6 @@ pub const TextureDesc = struct {
     }
 };
 
-pub const FilterMode = enum {
-    nearest,
-    linear,
-};
-
-pub const AddressMode = enum {
-    clamp_to_edge,
-    repeat,
-};
-
-pub const SamplerDesc = struct {
-    min_filter: FilterMode = .nearest,
-    mag_filter: FilterMode = .nearest,
-    address_u: AddressMode = .clamp_to_edge,
-    address_v: AddressMode = .clamp_to_edge,
-};
-
 pub fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;

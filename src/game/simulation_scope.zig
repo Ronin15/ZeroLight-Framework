@@ -171,16 +171,6 @@ pub const SimulationScopeStats = struct {
     stagger_skips: usize = 0,
     /// Entities excluded from cognition because their chunk is outside the halo.
     chunk_filtered_entities: usize = 0,
-
-    pub fn recordEntity(self: *SimulationScopeStats, metadata: EntitySimulationMetadata) void {
-        self.total_entities += 1;
-        switch (metadata.tier) {
-            .dormant => self.dormant_entities += 1,
-            .kinematic => self.kinematic_entities += 1,
-            .locomotion => self.locomotion_entities += 1,
-            .cognition => self.cognition_entities += 1,
-        }
-    }
 };
 
 /// Transient fixed-step scope. active_region is the cognition halo (camera visible

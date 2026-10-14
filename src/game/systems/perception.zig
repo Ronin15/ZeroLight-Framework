@@ -310,7 +310,7 @@ const PerceptionRangeStatsSlot = struct {
     padding: [paddingForCacheLine(PerceptionRangeStats)]u8 = @splat(0),
 };
 
-const PerceptionRangeStatsSlotList = std.ArrayListAligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));
+const PerceptionRangeStatsSlotList = std.array_list.Aligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));
 
 pub const PerceptionSystem = struct {
     allocator: std.mem.Allocator,

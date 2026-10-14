@@ -135,14 +135,6 @@ pub const TextRequest = struct {
         };
     }
 
-    pub fn withLayout(self: TextRequest, layout: TextLayoutOptions) TextRequest {
-        return .{
-            .text = self.text,
-            .style = self.style,
-            .layout = layout,
-        };
-    }
-
     pub fn validate(self: TextRequest) !void {
         if (self.text.len == 0) return error.InvalidText;
         try self.style.validate();

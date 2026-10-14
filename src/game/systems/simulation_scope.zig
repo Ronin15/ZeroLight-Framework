@@ -564,7 +564,7 @@ pub const SimulationScopeSystem = struct {
     fn prepareRangeWindows(
         self: *SimulationScopeSystem,
         comptime T: type,
-        out: *std.ArrayListAligned(T, .fromByteUnits(thread_shared_record_alignment)),
+        out: *std.array_list.Aligned(T, .fromByteUnits(thread_shared_record_alignment)),
         item_count: usize,
         range_count: usize,
     ) !void {
@@ -586,8 +586,8 @@ const IndexMergeResult = struct {
 /// Cache-line-aligned output lists: with a 16-item range alignment, every range's
 /// window starts on a cache-line boundary for u32 rows, so concurrent range writes
 /// never share a line.
-const IndexList = std.ArrayListAligned(u32, .fromByteUnits(thread_shared_record_alignment));
-const CommandList = std.ArrayListAligned(StructuralCommand, .fromByteUnits(thread_shared_record_alignment));
+const IndexList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
+const CommandList = std.array_list.Aligned(StructuralCommand, .fromByteUnits(thread_shared_record_alignment));
 
 /// One range's output count and diagnostics, written once by the range's job.
 const GatherTally = struct {
@@ -608,7 +608,7 @@ comptime {
     std.debug.assert(@sizeOf(GatherTallySlot) % thread_shared_record_alignment == 0);
 }
 
-const GatherTallyList = std.ArrayListAligned(GatherTallySlot, .fromByteUnits(thread_shared_record_alignment));
+const GatherTallyList = std.array_list.Aligned(GatherTallySlot, .fromByteUnits(thread_shared_record_alignment));
 
 /// Compacts the per-range windows of `list` (range r's `count` records at
 /// `r * items_per_range`) into one contiguous prefix in range order and sums the
@@ -625,7 +625,7 @@ fn compactIndexWindows(list: *IndexList, tallies: []const GatherTallySlot, items
         const src = range_index * items_per_range;
         std.debug.assert(dst <= src);
         if (dst != src and tally.count != 0) {
-            std.mem.copyForwards(u32, list.items[dst..][0..tally.count], list.items[src..][0..tally.count]);
+            @memmove(list.items[dst..][0..tally.count], list.items[src..][0..tally.count]);
         }
         dst += tally.count;
     }

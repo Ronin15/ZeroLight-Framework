@@ -39,10 +39,6 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     return createFixtureWithMode(allocator, count, .dense);
 }
 
-pub fn createSparseFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
-    return createFixtureWithMode(allocator, count, .sparse);
-}
-
 fn createFixtureWithMode(allocator: std.mem.Allocator, count: usize, mode: FixtureMode) !DataSystem {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();

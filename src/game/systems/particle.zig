@@ -25,8 +25,8 @@ const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 pub const hot_particle_column_alignment: usize = 64;
 pub const particle_range_alignment_items: usize = hot_particle_column_alignment / @sizeOf(f32);
 
-pub const HotF32Slice = []f32;
-pub const ConstHotF32Slice = []const f32;
+const HotF32Slice = @import("../data_system.zig").HotF32Slice;
+const ConstHotF32Slice = @import("../data_system.zig").ConstHotF32Slice;
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, particle_range_alignment_items);

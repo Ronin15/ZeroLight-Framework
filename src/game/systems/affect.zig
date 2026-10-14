@@ -732,7 +732,6 @@ const AiAgent = @import("../data_system.zig").AiAgent;
 const AiAffect = @import("../data_system.zig").AiAffect;
 const AiPerception = @import("../data_system.zig").AiPerception;
 const AiMemory = @import("../data_system.zig").AiMemory;
-const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 
 fn addAgentWithAffect(data: *DataSystem, agent: AiAgent, affect_value: AiAffect) !EntityId {
     const entity = try data.createEntity();
