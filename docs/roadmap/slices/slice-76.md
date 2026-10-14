@@ -19,11 +19,20 @@ render pick it up the same step as any other terrain change.
   `commitWorldEdit`); falls carve their landing cell. No support or
   collapse rule exists anywhere.
 - Dense one-step terrain edits exist on the engine side (64G S3b):
-  `WorldSystem.applyDenseCellWrites` takes chunk-major writes, plans and
-  writes per chunk on the thread system, serial equals threaded, and OOM
-  changes nothing. Benches `chunk-scale-cave-in` and
-  `chunk-scale-explosion-fill` time it at 4, 64, and 256 chunks; nothing in
-  gameplay calls it yet.
+  `WorldSystem.applyDenseCellWrites` takes chunk-major writes (a batch in any
+  order groups in O(1) per write, `groupDenseCellWrites`), plans and writes per
+  chunk on the thread system, serial equals threaded, and OOM changes nothing.
+  Benches `chunk-scale-cave-in` and `chunk-scale-explosion-fill` time it at 4,
+  64, and 256 chunks; plane traversal's fall carves are its only gameplay caller
+  (`dig_controller.zig:476`).
+- Terrain writers reach nav through a two-call contract (64G): reserve the nav
+  record before the world write (`PathfindingSystem.reserveTerrainNavRecord`,
+  sized by the writer's `maxEventsPerStep`), then record the appended events
+  right after it, on every exit path including a failure after writing
+  (`recordTerrainNavEvents`). The dig stage and plane traversal follow it.
+- The runtime perf log has no stage for the dense terrain write: the
+  `terrain_edit_write` cost-driver entry was deferred until a gameplay producer
+  calls it (`.claude/rules/threading.md`).
 - The dense path emits one `WorldTileChangedEvent` per changed cell, so a
   large collapse can exceed a fixed per-step event capacity.
 
@@ -61,6 +70,10 @@ render pick it up the same step as any other terrain change.
       destruction (collapses, and explosions with 77).
 - [ ] Downstream reactions take a collapse without a per-cell event cap:
       nav, perception, and render marks per chunk.
+- [ ] The collapse writer reserves its nav record before its write and records
+      every applied write on every exit path, as the dig stage does.
+- [ ] The collapse's dense write records its cost-driver stage
+      (`terrain_edit_write`) in the runtime perf log at its call site.
 - [ ] Entities caught in a collapse are handled (the rule decides how).
 - [ ] Tests: serial equals threaded; OOM leaves terrain intact and the
       retry gives the same result; a collapse spanning chunks and levels in

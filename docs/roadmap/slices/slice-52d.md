@@ -17,7 +17,9 @@ groups measure it.
 
 ### Current foundation
 
-- `core/simd.zig` (19 importers): `lane_count = 4`; every helper is a plain
+- `core/simd.zig` (25 importing files): lane counts derive from one 16-byte
+  register constant (`lane_count = 4` for 32-bit lanes; a private 8 × u16 vector
+  behind `countUnequalU16` and its scalar twin); every helper is a plain
   `pub fn`. `floorToI4` calls `@floor` plus four saturation patches; `divInt4`
   divides per lane; `minFloat4`/`maxFloat4` use `@min`/`@max`;
   `sinFloat4`/`cosFloat4`/`sinCosFloat4` use `@sin`/`@cos` and have no callers.

@@ -2,8 +2,10 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none (F and G re-scoped against [Slice 64G](slice-64g.md) first) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** A1–A4, B1, C1–C7, I1, I2, K6 landed; E4 and K3
-moved into 64G; M1, D, E, F, G, H, J, K1, K2, K4, K5, X1 open.
+**Status: in progress.** A1–A4, B1, C1–C7, D3, E2, G1–G3, H2, H3, I1, I2, K6
+landed (D3, E2, G1–G3, H2, H3 with 64G); E3, F1–F3, and J3 superseded; E4 and K3
+moved into 64G; M1, D1, D4, E1, E5–E9, H1, H4, J1, J2, J4, K1, K2, K4, K5, X1
+open.
 
 Goal: no live behavior (iteration order, deferral, refusal, drops,
 truncation, cache flushes, query reach) depends on physical `.capacity`,
@@ -30,23 +32,22 @@ content across world sizes.
 - Measured: battle-scale contact density ≈0.03 pairs/body/step with
   `collision_pair_bound_exceeded = 0` (C7).
 - Open sites in live code: a pathfinding shrink drops accepted work
-  (`resize_dropped`);
-  `unavailable` never expires and refuses when full; the group tally is
+  (`resize_dropped`); the group tally is
   capped at `min(512, n)`; elastic capacity starts at a floor of 8;
   destructible cell resolve scans only the first
   `destructible_cell_scan_budget` (256) dense rows; the spatial-index dense
   window is halo-derived on every instance and clamps a wider populated box
   out silently; AI scan radius uses an unenforced `grid_cell_size` (32);
   `solved_paths` and the worker path pool stripes share lines across
-  workers; GPU static streams and the tile-edit transfer buffer grow from
-  exact sizes and GPU growth waits for idle; `StateTransitions.reserve` sets the refusal bound.
+  workers; GPU static streams are created at the first upload's exact size;
+  `StateTransitions.reserve` sets the refusal bound.
 - Per-level nav arrays, dense world arrays, the nav memory gate, and
   `SearchScratch` O(cells) are replaced by 64G's chunk storage.
 - Owned elsewhere: nav dirty buffers and level links (64G);
   `max_agent_budget` (71B.1, landed); deferred-nav buffers (65B); the
-  `markStaticBodies` per-call map (64G's nav storage); stacked-UI headroom
+  static obstacle sync (64G's `StaticColliderSystem`); stacked-UI headroom
   (53B, 60); spatial-index coverage of the whole population (75);
-  perception `pending_dirty` (64G); `behavior_count` (73);
+  `behavior_count` (73);
   `cognition_stagger_n` and LOD bands (75).
 - Kept, justified at each site: work budgets (audio commands per step, SFX
   voices, `TimeLoop.max_updates_per_frame`, full SDL event drain); format
@@ -73,8 +74,8 @@ content across world sizes.
 
 ### Checklist
 
-- [ ] Re-scope F1, F2, F3, and G against 64G before implementing them:
-      each is dropped, moved into 64G, or rewritten to size by content.
+- [x] Re-scope F1, F2, F3, and G against 64G: F1–F3 superseded by 64G's chunk
+      storage, G1–G3 landed with it (below).
 - [ ] M1 · Footprint benches `footprint-world`, `footprint-nav`,
       `footprint-spatial` reporting reserved and peak bytes at three world
       sizes; baselines before F/G land.
@@ -98,31 +99,38 @@ content across world sizes.
 - [ ] E1 · A pathfinding shrink never drops accepted work.
 - [x] E2 · Elastic resizes preserve cache entries and pending work, with a
       `pathfinding-elastic-ramp` bench (solves after ≤ before).
-- [ ] E3 · Negative cache expires and evicts deterministically instead of
-      refusing.
+- [x] E3 · Negative cache expires and evicts deterministically instead of
+      refusing. Superseded: 64G deleted the negative cache; reachability answers
+      unreachable goals in O(1) (`2c1a9c1`).
 - [ ] E5 · Group tally sized from per-step intake.
 - [ ] E6 · Initial elastic capacity from the loaded population.
 - [ ] E7 · Solve result slots isolated per worker (65A's helper).
 - [ ] E8 · Worker path and stitched pool stripes start on a line.
 - [ ] E9 · Per-step solve and fallback budgets are fixed counts, not clamped
       to population.
-- [ ] F1 · Exact reserves for exact-size nav arrays (re-scoped by 64G).
-- [ ] F2 · Nav memory gate charges what load reserves (re-scoped by 64G).
-- [ ] F3 · Dense world arrays sized exactly (re-scoped by 64G).
-- [ ] G1 · Tier-1 search scratch sized per escalated solve, not per
-      participant (re-scoped by 64G).
+- [x] F1 · Exact reserves for exact-size nav arrays. Superseded: nav has no
+      level-sized arrays; per-chunk pools grow counted at their seam (`5db9025`,
+      `eaa4a80`) and each structure's byte bound is checked against live bytes
+      (`639f55d`).
+- [x] F2 · Nav memory gate charges what load reserves. Superseded: the gate is
+      deleted (`1305fa9`); no platform check refuses a world.
+- [x] F3 · Dense world arrays sized exactly. Superseded: terrain is per-chunk
+      blocks (`453993f`).
+- [x] G1 · Tier-1 search scratch sized per escalated solve, not per
+      participant (`10bbbc7`).
 - [x] G2 · Result-cache path storage sized to the common bound plus a long
       pool that never evicts a live entry (re-scoped by 64G).
-- [ ] G3 · `PathfindingCapacity` holds caller knobs only; derived values
-      private.
+- [x] G3 · `PathfindingCapacity` holds caller knobs only; derived values
+      private (`a869e15`).
 - [ ] H1 · GPU static streams created at the declared reservation.
 - [x] H2 · Geometric tile-edit transfer growth.
 - [x] H3 · `FailingAllocator` proof for the warmed tile-edit upload: renderer
       test "queueTileStoreUploads folds a carried batch allocation-free after
       reserve".
 - [ ] H4 · GPU buffer growth without draining the device (`gpu-smoke` per
-      backend). Tile path landed; vertex and static streams
-      (`ensureBatchCapacity`, `ensureStaticCapacity`) still open.
+      backend). Tile path (`89f5c9a`) and vertex and static streams
+      (`ensureBatchCapacity`, `ensureStaticCapacity`, `08c01c2`) landed;
+      `gpu-smoke` on each backend remains.
 - [x] I1 · Perception events from per-row columns after the join.
 - [x] I2 · Affect crossings from per-row bits; checksum tag unchanged.
 - [ ] J1 · `StateTransitions` budget set at init, `reserve` follows it.

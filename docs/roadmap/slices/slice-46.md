@@ -17,8 +17,7 @@ continuing session.
 
 - `DataSystem` holds the SoA stores plus entity slots, generations, and the
   free-slot list (`data_system/system.zig`). `WorldSystem` owns terrain,
-  levels, level links, and interest markers; terrain is per-level flat storage
-  today and chunk-owned after 64G. `player.zig` owns the player;
+  levels, level links, and interest markers; terrain is chunk-owned (64G). `player.zig` owns the player;
   `manifest.zig` owns stable `SpriteAssetId` / `AudioAssetId`.
 - `world_tileset_meta.zig` and `sprite_atlas_meta.zig` are the strict,
   versioned load-time validation pattern.

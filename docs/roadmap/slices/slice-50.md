@@ -34,8 +34,9 @@ instances, dispatches through this pool, so its safety is engine-wide.
 - Workers (`WorkerRecord`, `workerMain`, `workerLoop`) are unnamed; the loop
   tolerates a wake with no batch. `BatchStats` has a size test, and
   allocation-free submission tests exist.
-- Six private copies of a 64-byte `thread_shared_record_alignment` exist
-  across systems (Slice 65A consolidates them).
+- One 64-byte `thread_shared_record_alignment` and one `paddingForCacheLine`
+  live in `thread_system.zig`, imported by every system; the private copies are
+  gone (64G `819d8d8`). The comptime layout gate is still Slice 65A's.
 - Zig 0.17: `std.Build.Module.CreateOptions.sanitize_thread` exists and the
   toolchain bundles libtsan; the x86_64-Linux Debug self-hosted backend does
   not instrument. `std.Thread.setName` names any thread on Linux/Windows but

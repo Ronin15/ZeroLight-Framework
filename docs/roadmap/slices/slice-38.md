@@ -23,15 +23,14 @@ symmetrically.
     ramp early-return on level 0, `setEntityLevel`'s `level == 0` return, and
     `digRamp` treating `level - 1` as the plane above;
   - `systems/world_gate.zig`: both walk gates return on `level == 0`;
-  - `systems/pathfinding/nav_graph.zig` / `nav_grid.zig`: `markStaticBodies`
-    runs only for level 0, so non-surface levels never receive `DataSystem`
-    collision bodies (64G replaces this storage; the outcome must carry over);
   - `game_demo_state.placeDemoInterestMarkers` places markers on level 0.
+- Nav takes static collision bodies on every level from `StaticColliderSystem`
+  (64G).
 - `DenseLayerRenderWindow` (`world_system.zig`) looks below the active level,
   plus one level above only through `ceiling_when_underground`.
-- `worldZForLevel` saturates Z through `i64` math; `k_max_dense_submit_stack_cap`
-  (32) bounds the levels drawn in one window, validated at load by
-  `validateDenseRenderBudget`.
+- `worldZForLevel` saturates Z through `i64` math; the render window draws any
+  number of levels, and past the GPU store's u32 width the deepest drop,
+  reported once (64G).
 - Slice 59 (not landed) plans `level_sky_exposed` beside `level_base_z`.
 
 ### Architecture notes

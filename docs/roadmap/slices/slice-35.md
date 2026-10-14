@@ -63,7 +63,7 @@ and the `world-gate` bench that measures it.
       set, at least three body counts.
 - [ ] `world_gate.apply` NPC clamp and tile gate as a threaded SIMD range
       job with its serial path, with scalar/SIMD and serial/threaded parity
-      covering edge epsilon, off-world cells, level-0 pass-through,
+      covering the 0.5-unit edge-sample inset, off-world cells, level-0 pass-through,
       non-movement tiers, x-then-y resolve order, and any elevation (38) or
       knockback (68B) reads present then; `FailingAllocator` proof for serial
       and multi-worker steps.

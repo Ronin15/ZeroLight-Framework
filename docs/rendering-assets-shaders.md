@@ -140,9 +140,17 @@ whose submits exceed that reservation is counted once
 and warned through `logging.render` (1st, 2nd, 4th, ... drifting frame), whether or
 not the command list's rounded-up capacity absorbed the overshoot. The comparison is
 against the reservation because that is the bound past which
-`ensureFrameBatchCapacity` grows prepared/vertex/group storage and the GPU streams
-(a possible GPU-idle stall). A short reservation formula shows up as a counter
-instead of exiting the app.
+`ensureFrameBatchCapacity` grows prepared/vertex/group storage and the GPU streams.
+A short reservation formula shows up as a counter instead of exiting the app.
+
+GPU buffer growth never drains the device. The dynamic vertex streams
+(`ensureBatchCapacity`) and the retained static streams (`ensureStaticCapacity`)
+grow geometrically by creating the new stream set before releasing the old one, so
+a creation failure leaves the live streams untouched, and SDL frees the old set
+once in-flight frames finish; the tile store and its upload transfer grow the same
+way (GPU-Driven Tilemap). Each growth is counted (`batch_stream_grows`,
+`static_stream_grows`, `tile_store_grows`, `tile_upload_transfer_grows`) and logged
+once; an unreserved batch-stream growth warns.
 
 ## GPU-Driven Tilemap
 
@@ -177,7 +185,8 @@ shader's `TilemapUniform`) carries the grid and atlas, the chunk shift and
 `side` (`layer_meta.z`/`.w`), the resident chunk window (`window`, moved by
 `Renderer.setTileStoreWindow`), and per draw the layer count, shallowest flag,
 and topmost directory (`layer_meta.x`/`.y`, `chain.x`, from
-`Renderer.applyWindowLayers`). The shader discards pixels whose chunk is
+`Renderer.applyWindowLayers`). The store records its chunk shift and side at
+creation (`TileStoreDesc.chunk_shift`, `side`; validated there). The shader discards pixels whose chunk is
 outside the window; directory words of chunks outside it are never read. The
 shader and the store layout take the window per draw; the renderer and the
 mirror hold one window per store today.
@@ -243,7 +252,10 @@ main thread before `ensureStaticGeometryCapacity`, `submitStaticDenseGeometry`,
 and swapchain acquisition. It plans first (`GpuTileMirror.plan` sizes every span
 and reserves every growth, the frame's dense render scratch included, changing
 nothing a retry depends on), then commits and queues one upload batch
-(`Renderer.queueTileStoreUploads`) recorded in the frame's one copy pass. Spans
+(`Renderer.queueTileStoreUploads`) recorded in the frame's one copy pass. The queue
+cannot fail once `reserveTileStoreUploads` covered its counts (it returns `void`),
+so the mirror commits its side before queueing; it validates the batch's spans
+once, and `recordStorageSpansInPass` only asserts. Spans
 are whole units (a directory, a word, a link, a block), so a batch
 carried from a skipped frame folds into the next (`mergeTileStoreSpans`), newer
 values winning. `Renderer.reserveTileStoreUploads` reserves the CPU upload lists
@@ -252,7 +264,8 @@ before it grows the store's GPU buffer, so any reserve failure (`OutOfMemory`,
 growth source unchanged for retry.
 
 - **Residency.** When the active level, the level window, the chunk window, the
-  side, or the layer set changed: layers leaving free their directory and
+  side, or the layer set changed (an unchanged window skips the staying layers'
+  rederive): layers leaving free their directory and
   window blocks; staying layers free the blocks of chunks leaving the window and
   upload each entering chunk's word and, when mixed, its block; entering layers
   upload their directory and their mixed window chunks' blocks; a staying layer
@@ -264,7 +277,7 @@ growth source unchanged for retry.
   writes the CPU chunk store, the source of truth, which marks each block it
   takes or changes (`BlockFill.changed`, render-only, never saved). A change on a
   resident layer also flags the layer (`render_changed`) and the world
-  (`gpu_edits_pending`); edits hold no GPU-side memory, so a world nobody renders
+  (`resident_layers_changed`); edits hold no GPU-side memory, so a world nobody renders
   pays nothing for them. The next sync scans each flagged layer's chunks in the
   window and compares the CPU form with the uploaded directory word: a chunk
   that split takes a block and uploads its word and whole block, one that
@@ -280,8 +293,11 @@ growth source unchanged for retry.
   Active level change O(L × Wc + the entering layer's mixed window blocks)
   (`chunk-scale-gpu-sync-level-enter`, flat across level size and depth, L at
   2, 8, and 32). One dig: an O(Wc) scan of its layer and one word or block
-  upload (`chunk-scale-gpu-sync-dig`: flat across level size and depth,
-  measured; linear in window chunks, derived). Never dependent on chunks or levels
+  upload (`chunk-scale-gpu-sync-dig`, measured `639f55d`: flat across level size
+  and depth, linear in window chunks at about 82 ns per window chunk per flagged
+  layer, Debug). A batched change over many resident layers: one scan and its
+  uploads per written layer (measured linear in written layers, about 61 µs per
+  layer, upload-bound, Debug). Never dependent on chunks or levels
   outside the window. Serial render-boundary work, O(window).
 
 The world holds only a non-owning, generational `TileDataId` (slot index plus
@@ -532,8 +548,9 @@ acquires, and increments a retain count. `TextureLease` is a non-owning retained
 texture token; it does not store an `AssetCache` pointer or renderer/backend
 context. It still carries enough identity for the cache to reject stale,
 forged, or wrong-owner releases before retiring a slot. Owners that hold leases
-release them through `AssetCache.releaseTexture(renderer, &lease)` before
-renderer teardown. Gameplay and render prep pass `SpriteAssetId`; cache
+release them through `AssetCache.releaseTextureWithContext(backend_context, &lease)`
+before renderer teardown; `RuntimeAssets` is the owner that does so for startup
+sprites. Gameplay and render prep pass `SpriteAssetId`; cache
 lookup and retain/release happen at setup, and per-frame rendering uses the
 startup catalog and retained IDs directly.
 

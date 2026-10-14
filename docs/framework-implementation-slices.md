@@ -163,7 +163,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**64B**](roadmap/slices/slice-64b.md) | Not started | Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74 |
 | [**64C**](roadmap/slices/slice-64c.md) | Not started | Session Descriptor And New Game Seed Flow — after 49, 53B, 74 |
 | [**64D**](roadmap/slices/slice-64d.md) | Gated: first simulation `atan2` consumer | Deterministic Vector `atan2` — after 52D |
-| [**64G**](roadmap/slices/slice-64g.md) | In progress | Chunk-Owned Terrain And Nav |
+| [**64G**](roadmap/slices/slice-64g.md) | In progress | Chunk-Owned Terrain And Nav — seal gate remaining |
 | [**65**](roadmap/slices/slice-65.md) | Not started (umbrella) | Threading Layout Cleanup And Background-Lane Heavy Consumers — after 50, 51 |
 | [**65A**](roadmap/slices/slice-65a.md) | Not started | Thread-Shared Layout Consolidation And Background-Lane OS Priority — after 50, 51 |
 | [**65B**](roadmap/slices/slice-65b.md) | Not started | Deferred Nav Rebuild On The Background Lane — after 51, 65A, 64G, 49, 64B |
@@ -206,6 +206,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
+| [**81**](roadmap/slices/slice-81.md) | Not started | Split The Pathfinding Module — after 64G |
 
 **Recently settled (archive only):** 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
@@ -251,16 +252,62 @@ The rest of the engine gets the same pass, one area per branch, in this order.
 The owner merges each sealed branch to main before the next starts. Normal
 roadmap flow (Suggested Order) resumes after the AI branch.
 
-1. **Pathfinding (`slice-64g-seal`):** finish [64G](roadmap/slices/slice-64g.md):
-   - maintained reachability (connectivity IDs: O(1) per request, never a
-     failed search);
-   - dense-dig main-thread split;
-   - the cross-level heuristic at scale;
-   - the seal gate (a combined review since the 2026-10-07 branch review).
+1. **Pathfinding (`slice-64g-seal`):** finish [64G](roadmap/slices/slice-64g.md).
+   Landed: maintained reachability (connectivity IDs and the one-way closure:
+   O(1) per request, never a failed search), the dense-dig main-thread split,
+   the cross-level heuristic at scale with partial hops for far goals, and the
+   combined review since the 2026-10-07 branch review. Remaining: the seal
+   gate. Then [81](roadmap/slices/slice-81.md) splits the pathfinding module.
 2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
    2026-10-12), so the branch's threaded rework runs under the race
    detector; then spatial index, steering, collision, tile gate, render
-   prep, inert rows, and Slice 75's tier mechanics.
+   prep, inert rows, and Slice 75's tier mechanics. Findings the 64G combined
+   review routed here (file:line at `e2b9b2c`), written into slice checklists
+   when the branch opens:
+   - [ ] Tile gate on main (64G area D H1): `world_gate.apply`
+     (`simulation_pipeline.zig:1556`) runs `gateNpcEntitiesToWalkableTiles`
+     (`world_gate.zig:36`) and `clampAiEntitiesToBounds` (`:114`), two serial
+     main passes over every AI agent each step with no threaded path or SIMD, so
+     main time grows with population. Slice 35's `world_gate` item and its
+     `world-gate` bench at three sizes are the fix.
+   - [ ] Halo agents sorted twice per step (area D M1): steering's agent grid
+     (`steering.zig:690` `buildAgentGrid`, `:2024` `sortCellEntries`) and
+     `SpatialIndexSystem`'s `DenseCellLookup` (`spatial_index.zig:142`) sort the
+     same positions. Keep steering's whole-population banded grid as the shared
+     index and retire `DenseCellLookup` (Slice 75 builds on it; steering's
+     private grid is today a `simulation.md` exception).
+   - [ ] Agent avoidance has no SIMD verdict (area D M4):
+     `accumulateAgentAvoidanceBounded` (`steering.zig:1939`) is scalar over up to
+     64 candidates per agent while its sibling obstacle push is SIMD; collision
+     response's `gatherRange` (`collision_response.zig:437`) states no verdict.
+   - [ ] The commit-seam order lives in the demo state (area D L5):
+     `commitStructuralAndReact` (`game_demo_state.zig:674`) orders seven calls; a
+     second gameplay state that reorders them desyncs the collider or nav sync.
+     Moves to the pipeline when a second gameplay state is confirmed.
+   - [ ] Any create re-resolves every steering row's movement index (area D L10):
+     `changeInvalidatesSteeringMovementIndexCache` (`steering.zig:2123`) drops the
+     whole cache on any `entity_created`, so spawn churn pays nanoseconds per row
+     per step (threaded).
+   - [ ] File splits (area D L11): `steering.zig` (4,539 lines) and
+     `simulation_pipeline.zig` (7,470; scenario fixtures could move to a
+     `pipeline_test_support.zig`).
+   - [ ] Per-system tuner config fields (`threading.md`: a production processor
+     owns its tuner): `collision.zig:113-114`, `movement.zig:23`,
+     `particle.zig:43`, `ai_memory.zig:84`, `affect.zig:127`, `perception.zig:183`,
+     `ai.zig:311-312`, and `sprite_batch.zig:236` let a caller pass one tuner to
+     several stages, and the null fallbacks (`particle.zig:386`,
+     `ai_memory.zig:141`, `movement.zig:233`) train `ThreadSystem`'s shared tuner;
+     only tests set the fields. Check each site's setters and route every stage to
+     its own tuner, as 64G did for pathfinding and steering (`2496824`).
+   - [ ] Render collect follows total population (area C):
+     `render_prep.collectDynamicRecords` (`render_prep.zig:374`) walks every
+     movement body each frame on main, not the bodies in view. The GPU sync's
+     batched-change upload copying is linear in what changed (about 2 ms on main
+     for 32 written layers, Debug, `639f55d`).
+   - [ ] Movement intent order: the row-sorted intent stream applies faster than
+     the scattered one at 16,384 intents serial in ReleaseFast (38.5 vs 61.5 µs,
+     `639f55d`; no false sharing between ranges), a locality gain for ordering
+     intents by movement row.
 3. **AI:** cognition, perception, memory, affect, sensory bus and interest
    markers, built on the core branch's final form.
 
@@ -295,7 +342,8 @@ writes the findings below into slice checklists or new slice files.
     slices 56, 57, 61, 62, 76 and 77 must budget and defer theirs.
 - **Already owned:**
   - far-tier freeze: 75;
-  - GPU per-edit sync: 64G B2.
+  - GPU per-edit sync: measured by 64G (`639f55d`); its render follow-up is in
+    item 2's list above.
 
 **AI findings** (derived from code, 2026-10-11; benches to confirm):
 - **Critical:** far AI stops advancing (no thinking outside the halo, dormant
@@ -361,61 +409,62 @@ order.
   75 and 74 bind the observer; 60's rig drives it once landed.
 
 1. **64G** Chunk-Owned Terrain And Nav.
-2. **50** Thread System Hardening (opens the core-systems branch).
-3. **76** Cave-Ins — after 64G.
-4. **77** Explosions — after 64G, 76.
-5. **49** Session Seed And Determinism Checksum Harness — after 64G.
-6. **73** Data-Driven Cognition — after 49.
-7. **75** Far Simulation — after 64G, 73.
-8. **74** World Instances — after 64G, 49, 50, 75.
-9. **52A** Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders.
-10. **52B** Platform Packaging Layouts — after 52A.
-11. **52C** CI Workflows And Release Performance Baseline — after 52A, 49, 50, 52B.
-12. **52D** SIMD Layer Codegen For The v2 Release Baseline — after 52A.
-13. **64A** Simulation-Invisible Pause, Float Min/Max Policy, And FP Environment Assertion — after 49, 52D.
-14. **55** Cognition Think-Interval Coasting (Decision LOD) — after 73.
-15. **35** AI And Steering Hot-Loop SIMD Restructure — after 55, 52D.
-16. **51** Background Job Lane With Deterministic Step Handoff — after 49, 50, 64A.
-17. **65A** Thread-Shared Layout Consolidation And Background-Lane OS Priority — after 50, 51.
-18. **64B** Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74.
-19. **53A** Scalable GPU Text Labels.
-20. **53B** UI Widget Toolkit, Menu Migration, And HUD Primitives — after 53A.
-21. **54** Persistent Settings — after 53B, 52B.
-22. **66A** Shipped-Build Crash Triage — Split Symbols, Symbol Store, Crash Reports, Linux Window Icon — after 52B, 52C, 54.
-23. **44** Input Rebinding And Extended Gamepad Controls — after 53B, 54.
-24. **64C** Session Descriptor And New Game Seed Flow — after 49, 53B, 74.
-25. **65B** Deferred Nav Rebuild On The Background Lane — after 51, 65A, 64G, 49, 64B.
-26. **46** Save/Load Persistence — after 49, 51, 53B, 54, 64B, 64G, 74.
-27. **70A** Sprite Vertex Compaction (Indexed Quads, Packed Color).
-28. **60** Camera Behavior And Scene Composite Pass — after 49, 54, 70A.
-29. **67A** Pointer Input, Menu Hold-To-Repeat, And Scancode Bindings — after 53B, 54, 44.
-30. **67B** Debug Text Migration, Event Log, Text Atlas Telemetry, And UI Sound Cues — after 53A, 53B, 44.
-31. **67C** Save Slot Presentation — Thumbnails, Named Saves, And The Text-Input Widget — after 46, 60, 67A.
-32. **67E** Localization Roots — after 53B.
-33. **70B** Presentation Polish (Runtime Scene Resolution, Pad Zoom, Fade-Out, Sharp-Bilinear, Zoom Tween) — after 60, 54, 44.
-34. **56** Health, Damage, And Combat Domain Controller — after 49, 73.
-35. **56B** Projectiles And Ranged Combat — after 56.
-36. **59** Game Time, Day/Night Cycle, Seasons, And Weather — after 49, 60.
-37. **57** Items, Inventory, And Equipment — after 56, 49, 59.
-38. **57B** Inventory And Equipment UI — after 53A, 53B, 57, 49.
-39. **69C** Time Skip — after 59, 49, 75, 64B, 67B, 67E, 57B.
-40. **38** Elevation Above The Surface — after 64G.
-41. **61** Harvesting And World Resource Nodes — after 73, 56, 57, 49.
-42. **58** Seeded Procedural World Generation — after 49, 57, 61, 64G.
-43. **65C** Streaming Worldgen On The Background Lane — after 58, 53B, 51, 74.
-44. **69B** Regional (Biome) Weather — after 58, 59, 60.
-45. **63** Social Relationships And Trade — after 73, 53B, 56, 57, 57B, 61.
-46. **62** NPC Population, Spawning, And Spawn Tables — after 49, 57, 58, 59, 63, 64G, 75.
-47. **71A** AI Behavior Parity — Patrol, Follow, Guard — after 73, 55, 56, 61, 62, 63.
-48. **71B** Static Collider Index, Collision Static Split, And Group-Field Prewarm — after 64G, 62, 71A.
-49. **71C** Cover-Aware Flee And Ranged Pursue (`cover` Interest Markers) — after 73, 56B.
-50. **71D** AI Merchant Selling (Forage → Sell Loop) — after 73, 63, 61, 57, 56, 55, 71A.
-51. **69A** Worldgen Breadth — Caves, Structures And Villages, Autotile Edge Sets — after 58, 61, 62, 65C, 64G.
-52. **42** Affect Expansion — More Feelings, Coupling, And Mood — after 73, 56, 61, 59.
-53. **68A** Battle-Scale Hardening — Shared Entity Table, Action-Bus Fairness, Control Re-Baseline — after 55, 56, 75.
-54. **68B** Knockback Impulses And Retaliation Memory — after 73, 55, 56, 56B, 49.
-55. **68C** Carried-Inventory Death Drop And Ranged Ammo — after 56B, 57, 61.
-56. **Gated** (each lands when its trigger trips; see its Status line):
+2. **81** Split The Pathfinding Module — after 64G.
+3. **50** Thread System Hardening (opens the core-systems branch).
+4. **76** Cave-Ins — after 64G.
+5. **77** Explosions — after 64G, 76.
+6. **49** Session Seed And Determinism Checksum Harness — after 64G.
+7. **73** Data-Driven Cognition — after 49.
+8. **75** Far Simulation — after 64G, 73.
+9. **74** World Instances — after 64G, 49, 50, 75.
+10. **52A** Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders.
+11. **52B** Platform Packaging Layouts — after 52A.
+12. **52C** CI Workflows And Release Performance Baseline — after 52A, 49, 50, 52B.
+13. **52D** SIMD Layer Codegen For The v2 Release Baseline — after 52A.
+14. **64A** Simulation-Invisible Pause, Float Min/Max Policy, And FP Environment Assertion — after 49, 52D.
+15. **55** Cognition Think-Interval Coasting (Decision LOD) — after 73.
+16. **35** AI And Steering Hot-Loop SIMD Restructure — after 55, 52D.
+17. **51** Background Job Lane With Deterministic Step Handoff — after 49, 50, 64A.
+18. **65A** Thread-Shared Layout Consolidation And Background-Lane OS Priority — after 50, 51.
+19. **64B** Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74.
+20. **53A** Scalable GPU Text Labels.
+21. **53B** UI Widget Toolkit, Menu Migration, And HUD Primitives — after 53A.
+22. **54** Persistent Settings — after 53B, 52B.
+23. **66A** Shipped-Build Crash Triage — Split Symbols, Symbol Store, Crash Reports, Linux Window Icon — after 52B, 52C, 54.
+24. **44** Input Rebinding And Extended Gamepad Controls — after 53B, 54.
+25. **64C** Session Descriptor And New Game Seed Flow — after 49, 53B, 74.
+26. **65B** Deferred Nav Rebuild On The Background Lane — after 51, 65A, 64G, 49, 64B.
+27. **46** Save/Load Persistence — after 49, 51, 53B, 54, 64B, 64G, 74.
+28. **70A** Sprite Vertex Compaction (Indexed Quads, Packed Color).
+29. **60** Camera Behavior And Scene Composite Pass — after 49, 54, 70A.
+30. **67A** Pointer Input, Menu Hold-To-Repeat, And Scancode Bindings — after 53B, 54, 44.
+31. **67B** Debug Text Migration, Event Log, Text Atlas Telemetry, And UI Sound Cues — after 53A, 53B, 44.
+32. **67C** Save Slot Presentation — Thumbnails, Named Saves, And The Text-Input Widget — after 46, 60, 67A.
+33. **67E** Localization Roots — after 53B.
+34. **70B** Presentation Polish (Runtime Scene Resolution, Pad Zoom, Fade-Out, Sharp-Bilinear, Zoom Tween) — after 60, 54, 44.
+35. **56** Health, Damage, And Combat Domain Controller — after 49, 73.
+36. **56B** Projectiles And Ranged Combat — after 56.
+37. **59** Game Time, Day/Night Cycle, Seasons, And Weather — after 49, 60.
+38. **57** Items, Inventory, And Equipment — after 56, 49, 59.
+39. **57B** Inventory And Equipment UI — after 53A, 53B, 57, 49.
+40. **69C** Time Skip — after 59, 49, 75, 64B, 67B, 67E, 57B.
+41. **38** Elevation Above The Surface — after 64G.
+42. **61** Harvesting And World Resource Nodes — after 73, 56, 57, 49.
+43. **58** Seeded Procedural World Generation — after 49, 57, 61, 64G.
+44. **65C** Streaming Worldgen On The Background Lane — after 58, 53B, 51, 74.
+45. **69B** Regional (Biome) Weather — after 58, 59, 60.
+46. **63** Social Relationships And Trade — after 73, 53B, 56, 57, 57B, 61.
+47. **62** NPC Population, Spawning, And Spawn Tables — after 49, 57, 58, 59, 63, 64G, 75.
+48. **71A** AI Behavior Parity — Patrol, Follow, Guard — after 73, 55, 56, 61, 62, 63.
+49. **71B** Static Collider Index, Collision Static Split, And Group-Field Prewarm — after 64G, 62, 71A.
+50. **71C** Cover-Aware Flee And Ranged Pursue (`cover` Interest Markers) — after 73, 56B.
+51. **71D** AI Merchant Selling (Forage → Sell Loop) — after 73, 63, 61, 57, 56, 55, 71A.
+52. **69A** Worldgen Breadth — Caves, Structures And Villages, Autotile Edge Sets — after 58, 61, 62, 65C, 64G.
+53. **42** Affect Expansion — More Feelings, Coupling, And Mood — after 73, 56, 61, 59.
+54. **68A** Battle-Scale Hardening — Shared Entity Table, Action-Bus Fairness, Control Re-Baseline — after 55, 56, 75.
+55. **68B** Knockback Impulses And Retaliation Memory — after 73, 55, 56, 56B, 49.
+56. **68C** Carried-Inventory Death Drop And Ranged Ammo — after 56B, 57, 61.
+57. **Gated** (each lands when its trigger trips; see its Status line):
     - **64D:** first simulation `atan2` consumer — after 52D.
     - **66B:** per target — after 66A, 52A.
     - **66C:** first public release outside Steam — after 66A.

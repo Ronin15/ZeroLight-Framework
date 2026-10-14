@@ -14,15 +14,15 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 
 ### Current foundation
 
-- Six private `thread_shared_record_alignment = 64` constants (`collision.zig`,
-  `spatial_index.zig`, `simulation_scope.zig`, `perception.zig`,
-  `pathfinding/nav_graph.zig`, `pathfinding/scratch.zig`) and four private
-  `paddingForCacheLine` helpers (collision, spatial index, scope,
-  perception).
+- `thread_shared_record_alignment` (64) and `paddingForCacheLine` are declared
+  once, in `src/app/thread_system.zig`, beside `PaddedSlot`, `SlotList`, and
+  `BandPartition`; every system imports them and the private copies are deleted
+  (64G `819d8d8`). No comptime layout gate exists: padded types carry their own
+  size asserts, and no lint rejects a new private copy.
 - Padded slot types: `GatherTallySlot`, `RowCountTally`,
-  `BroadphaseRangeSlot`, `ContactCountTally`, `PerceptionRangeStatsSlot`,
-  `ChunkPatchScratch` / `ChunkRemaskScratch` (nav storage 64G replaces), and
-  `SearchScratch`; some already carry comptime size asserts.
+  `BroadphaseRangeSlot`, `ContactCountTally`, `PerceptionRangeStatsSlot`, the
+  nav reaction's and pathfinding's range tallies, and the tier-1 corridor pool
+  entries; some carry comptime size asserts.
 - `WorkerRecord` (`thread_system.zig`, `{ id, shared, wake, thread }`) is
   56 B with alignment 8 on x86_64-linux (Zig 0.17 probe) and allocated as one
   slice, so records straddle lines and main's post to one worker contends
@@ -65,7 +65,8 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 
 - [ ] Shared quantum, padding helper, and layout gate in `thread_system.zig`;
       every padded slot site imports them and gates its types; private copies
-      deleted.
+      deleted. Quantum, helper, and the deletions landed with 64G (`819d8d8`);
+      the layout gate and its use at every site remain.
 - [ ] `idiom-lint` rule rejecting a private quantum or helper outside the
       owner.
 - [ ] `WorkerRecord` padded to exactly one line, comptime-asserted, with a

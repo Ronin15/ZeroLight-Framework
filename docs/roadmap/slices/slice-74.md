@@ -37,16 +37,18 @@ One world per gameplay state; nothing models a set of worlds.
 - No world identity exists in `src/`; `EntityId` is a slot + generation
   inside one `DataSystem`.
 - `WorldSystem` adds levels at runtime (`addLevel`, `u16` index,
-  `WorldLevelOverflow`) and keeps one world-wide `level_links` list (64G moves
-  links into their chunks).
+  `WorldLevelOverflow`) and keeps one append-only `level_links` list indexed per
+  endpoint chunk (64G); nav builds an added level from its own chunks and keeps
+  connectivity and the one-way closure exact per batch (64G). No path destroys a
+  level: a level build's replace is the only release.
 - Render: each world has its own renderer-owned GPU tile store under a
   generational id the world claims every frame it renders
   (`Renderer.claimTileStore`); `endFrame` retires a store nobody claimed, so a
   destroyed or replaced world's store is released at the first frame its world
   does not render, with no game-side release call.
-- Load-time checks that refuse: `NavMemoryBudget.check` (`NavWorldTooLarge`
-  at `max_nav_memory_bytes`). World terrain and render refuse nothing: band
-  lists grow, and the GPU store keeps only the render window.
+- No load-time check refuses a world: 64G deleted the nav memory gate, band
+  lists grow, the GPU store keeps only the render window, and ids that grow in
+  play fail only as `OutOfMemory` at their growth seam.
 
 ### Architecture notes
 
@@ -76,7 +78,7 @@ One world per gameplay state; nothing models a set of worlds.
   render boundary (`.claude/rules/engine-design.md` § Ownership boundaries).
 - Presentation (render prep, audio, camera) follows the viewed world; worlds
   without a viewer run simulation only.
-- Creating a world in play is never refused for capacity; 64G retires the
+- Creating a world in play is never refused for capacity; 64G retired the
   level-sized load gates (dense GPU budget, nav memory), and no platform check
   refuses a world (`.claude/rules/budgets-capacities.md`).
 - Owner decision (2026-10-08): entities (NPCs, and a player when present)
@@ -108,6 +110,11 @@ One world per gameplay state; nothing models a set of worlds.
 - [ ] Level destroy in play (moved from 64G): a level's terrain, nav, and
       render storage released, flat across depth and linear in its own
       chunks.
+- [ ] Level destroy keeps reachability exact at its own cost: the level's
+      connectivity nodes, components, terminals, and closure blocks go with it,
+      and the connections its links carried are removed at the reachability
+      maintenance cost (`.claude/rules/budgets-capacities.md`), never a
+      world-wide rebuild.
 - [ ] Per-world state classified for 49/64B; included in 46's v1.
 - [ ] Tests: create, step, and destroy leak nothing; an entity moved
       between worlds keeps its identity as designed; one world's step is

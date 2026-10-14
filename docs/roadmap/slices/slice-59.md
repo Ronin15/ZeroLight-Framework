@@ -28,8 +28,9 @@ observer's environment; low-volume transition events feed audio and camera.
 - Perception gather rows carry `vision_range`, `hearing_range`, and `level`
   per observer (`systems/perception.zig`); ranges are capped at validation
   (`data_system/perception.zig`).
-- `MovementSystem.applyIntents` (`systems/movement.zig`) is a serial loop over
-  merged intents using `body.speed`.
+- `MovementSystem.applyIntents` (`systems/movement.zig`) is a threaded stage
+  over the merged intents (64G), writing velocity from `body.speed` (the default
+  speed where it is not positive).
 - `systems/particle.zig`: a fixed-capacity SoA pool, threaded SIMD update
   with `v += a*dt; p += v*dt`, no drag or wind; the demo pool is shared with
   destructible debris.

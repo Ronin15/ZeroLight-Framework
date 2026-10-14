@@ -3,9 +3,9 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md) (71B.1 rows, 71B.3), [Slice 62](slice-62.md) and [Slice 71A](slice-71a.md) (71B.3 only); 71B.2 is bench-gated · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: in progress.** The fixed group-field threshold, its capacity-audit
-follow-up, and the steering level gate are landed; the shared static
-structure and steering migration (71B.1), the collision split (71B.2), and
-prewarm (71B.3) are open.
+follow-up, the steering level gate, the shared static structure, and
+steering's migration onto it (64G) are landed; collision's move onto the
+structure (71B.1), the collision split (71B.2), and prewarm (71B.3) are open.
 
 Goal:
 
@@ -29,17 +29,23 @@ Goal:
   generation)`. Contact consumers (`CollisionResponseSystem`,
   `AudioController.queueCollision`, `SensoryBus.enqueuePlayerImpacts`) are
   order-sensitive.
-- Steering (`src/game/systems/steering.zig`): `rebuildStaticObstacleSnapshot`
-  walks every collision response on rebuild; obstacle rows carry the level
-  and other-level obstacles are skipped (landed); invalidation through
-  `eventInvalidatesStaticObstacleSpatial`.
+- `StaticColliderSystem` (`src/game/systems/static_colliders.zig`, 64G): one
+  row per static navigation obstacle (AABB, level, cell span) listed per
+  (level, chunk) in entity order, synced at the commit seam with O(1) main work
+  per change, plus a size-class query tier with per-chunk anchor bitmaps.
+  Nav and steering read it through `ColliderView`; steering's box query
+  (`queryBox`) visits at most 64 hits and 512 probes per agent, so a static
+  change costs steering nothing (`steering-static-change` flat in static count,
+  `173cc17`). Collision still gathers its statics every step.
 - Statics move only through structural commands; a created static emits
   `component_changed` with `is_static`.
 - Group fields (`src/game/systems/pathfinding/`): `max_group_fields` slots
   (`default_max_group_fields = 4`) with a per-field expansion budget
-  (`default_group_field_build_budget = 8192`), reserved O(level cells) at nav
-  build and dropped wholesale on every nav update. Slice 64G replaces the
-  per-level nav storage they sit on.
+  (`default_group_field_build_budget = 8192`); each field's storage is a pool of
+  nav-chunk cell blocks reserved at its first build (64G), and a nav change
+  drops only the fields with a costed cell within one cell of a changed cell
+  (a rebuilt level drops its own fields). An active goal's field is never
+  taken.
 - Threshold (landed): `PathfindingSystem.groupFieldThreshold` clamps to a
   fixed `default_min_group_field_agents = 1024` with the ceiling frozen at
   reserve; the demo agent budget is content-sized.
@@ -92,7 +98,8 @@ Goal:
 - [ ] **71B.1** The shared static-collider structure built in
       [Slice 64G](slice-64g.md) (nav its first consumer) serves steering's
       and collision's queries; Slice 64B cache row with its proving test.
-- [ ] **71B.1** Steering reads the shared rows.
+      Steering's queries landed (`173cc17`); collision's and the 64B row remain.
+- [x] **71B.1** Steering reads the shared rows (64G `173cc17`).
 - [ ] **71B.2 (gate, first)** Control benches `collision-static-heavy-sap`,
       `collision-static-heavy`, and `collision-static-index-change` at three
       static counts.
@@ -104,23 +111,25 @@ Goal:
       coordinates) and serial == threaded; out-of-band move caught.
 - [ ] **71B.2** `FailingAllocator` proofs; contact reserves unchanged.
 - [ ] **71B.3** Prewarm origin, empty-slot claim, demand promotion and
-      eviction, level- or chunk-scoped field drop on nav change.
+      eviction, level- or chunk-scoped field drop on nav change (the
+      chunk-scoped drop landed with 64G, `83172ce`, `a869e15`).
 - [ ] **71B.3** Slice 64B normalization of prewarm fields.
 - [ ] **71B.3** Per-step prewarm (release, cursor, start) with tests and a
       `pathfinding-prewarm` bench.
 - [ ] Docs: `docs/architecture.md`, `docs/simulation-tiers-and-pipeline.md`,
       bench examples.
-- [ ] Add the static-mobility writer rule to `.claude/rules/simulation.md`
-      when this lands.
+- [x] Add the static-mobility writer rule to `.claude/rules/simulation.md`
+      (landed with 64G: a static body changes only through structural
+      commands).
 
 ### Acceptance checks
 
 - [x] 71B.1 fixed threshold: no budget derives from world size.
 - [x] 71B.1 capacity audit: no pathfinding threshold or capacity default
       cites world size.
-- [ ] 71B.1: steering suite unchanged; steering no longer walks every
+- [x] 71B.1: steering suite unchanged; steering no longer walks every
       collision response; a static change costs flat across total static
-      count at three sizes.
+      count at three sizes (`steering-static-change` 10/1,000/10,000, `173cc17`).
 - [ ] 71B.2: identical filtered contacts and response outcomes across every
       fixture and worker configuration; static-heavy collision cost no
       longer grows with static count; `collision` and `collision-sparse`

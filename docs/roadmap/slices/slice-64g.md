@@ -2,8 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Before: [Slice 65B](slice-65b.md), [Slice 46](slice-46.md), [Slice 76](slice-76.md), [Slice 77](slice-77.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** Last work on `ai_update3`, before merge. Kept as one
-slice by owner decision (2026-10-08).
+**Status: in progress.** Programming landed through `e2b9b2c`; the seal gate
+(verify, ReleaseFast test, gpu-smoke, the acceptance benches, the owner demo)
+remains. Kept as one slice by owner decision (2026-10-08).
 
 Goal: terrain and nav storage and work owned per chunk `(level, cx, cy)`, so a
 dig, ramp, cave-in, or explosion costs work only in the chunks it touches,
@@ -26,7 +27,9 @@ fixed node budgets with a two-attempt retry. Its storage, fallbacks, and
 per-change work are still sized by level, world, or content totals. Numbers are
 derived for one 2048² level (4,194,304 cells, 16-cell nav chunks, 16,384
 chunks); multiply by depth and world count. The defect lists describe main
-(`b39a46f`); the Checklist records what has landed since.
+(`b39a46f`), the replaced baseline; the Checklist records what landed against
+each, and § Landed nav: measured limits records what the landed nav still leaves
+(numbers from the landing commits, Debug unless noted).
 
 Storage sized to level area:
 
@@ -86,7 +89,9 @@ Work sized to the world, a level, or content totals:
   `blocks_movement`, so nav filters its tile event (`system.zig:684`).
 - Cross-level search uses a zero heuristic off the goal level
   (`solve.zig:401-404`), so it explores every level it reaches within its node
-  budget and far cross-level goals exhaust both attempts.
+  budget and far cross-level goals exhaust both attempts. Replaced by a
+  consistent cross-level heuristic (`22ac6ae`, `8358b37`, `41afa5f`); far goals
+  past the tier-1 caps advance by partial hops (`1a5241f`, `ac48f66`).
 - Creating a level or world: the abstract build is serial per chunk and level
   (`nav_graph.zig:580-593`), perception prebuilds every level serially
   (`perception.zig:543-548`), and a nav rebuild clears all runtime state
@@ -117,6 +122,72 @@ Failure and limits:
   one 256² world (`nav_update.zig:52`), and `pathfinding*` stays at or below
   256² on one level.
 
+Landed nav: measured limits (each kept by an owner or main-session call; none is
+a design open for this slice):
+
+- **Long links.** `pathfinding-cross-level-teleport` at side 256 (`b76d06d`, the
+  N6c-0 benches are the record): random pads at 64 or more teleports solve 0/64
+  routes at the 4096-node tier-0 cap; the border band at 15,000 teleports solves
+  54/64; band up to 4,096, strip, and random 16 solve 64/64. The band residual
+  is 16-pair merge precision (`8358b37`: T = 4,096 claims 2,415 nodes against
+  1,884 with an ideal h). Not re-run on the dense layouts since the
+  crossing-aware heuristic (`41afa5f`) and least-h partials (`ac48f66`). Owner
+  2026-10-12: the game's long links are one-off world gates and dungeon
+  entrances, never dense fields; the trie and cut designs (N6c-1, N6c-2) are
+  dropped.
+- **Dense-change main floor.** After B2a every main section left in the
+  dense-change reaction is an O(1)-per-item ordered merge or commit, linear in
+  what changed (`threading.md` allows it); together they are the floor, a one-step
+  cost, not a growing order (B2a-2 dropped). Measured at `2c1a9c1`, tuned:
+  connectivity merge 218 µs (cave-in 256 chunks) and 412 µs (enclose P = 196),
+  connectivity layout/open 249 µs and flood merge 735 µs (P = 196, 2× the flood's
+  threaded search), eviction removal 385 µs (2.7k evictions,
+  `pathfinding-evict 640010000`). Main totals then were 2.3–3.7 ms, including the
+  plan merge and mark loop B2a-1 then removed (plan 824 → 228 µs, mark 428 → 24 µs,
+  `d11f1d9`).
+- **Dense-dig threading.** `pathfinding-evict 640010000 --details` (`83172ce`):
+  the eviction stage costs about 0.7 ms inline, above the 250 µs gate; the tuner
+  probes workers, they do not win on wall time beyond spread (2.62–2.91 ms across
+  cases), and it settles inline or threaded run to run: a measured choice with the
+  threaded path present.
+- **Long paths** (`pathfinding-long-path`, `ac48f66`): every walk and hop chain
+  arrives. Walks: open diagonal and cave at 512/1024/2032; serpentine 1/4/15 walls
+  in 3/9/32 solves, 6.3/45.4/200.9 ms. Hop chains (hops, claims, ms): descent
+  16/64/127 levels 3/9/18, 32.6k/167k/341k, 46/239/480; wide 512/1024/2048 1/2/4,
+  9.1k/27.5k/60.4k, 13/37/77; deep wide 4/8/16 3/5/9, 35.4k/84.0k/174k, 48/116/238:
+  linear in route length, about 18.6k claims per hop. One attempt still ends
+  `.missing` at the caps for descent 64/127, wide 1024/2048, and deep wide, which
+  the hops serve. On wide levels H about halves the claims (layout 4:
+  2,175 → 1,439, 34,851 → 18,637, 139,347 → 71,275 at 256/1024/2048, `41afa5f`)
+  but they still grow about as D²: graph distance runs above octile. Owner
+  2026-10-14: no optimization loop on long paths; what remains is recorded:
+  - pocket floor: an h-minimum pocket deeper than the tier-1 budget walks to its
+    floor, drops, and retries each cooldown;
+  - cut-induced creep: a capped stitch climbing above h(start) keeps only its
+    descending head (not seen measured);
+  - shared partials: an off-corridor agent outside the end window steers to the
+    corridor's first cell (`cachedView`), as shared full paths do (kept);
+  - a nav change between hops voids the hop chain's descent argument;
+  - a long route costs about route length / hop reach hops, each up to the full
+    ladder (about 18.6k claims, about 25 ms on descent).
+- **Region layer shelved** (owner 2026-10-12,
+  `.claude/reports/64g-long-path-owner.md`): region corridors and windows return
+  only if long routes fail again.
+- **One-way closure** (`a294a7a`): a tail toggle of a 4,096-terminal chain costs
+  20.7 ms (its SCC plan is level-serial, accepted), a head toggle 2.44 ms tuned; a
+  dense opening reserves about 2.1× the merged block it creates; a system of k
+  terminals holds about k²/32 words. A single dominant one-way system's Tarjan is
+  one item, so it runs where the thread system places one item; its rows thread.
+- **Accepted constants.** Reach and the goal check cost status and cache hits a
+  fixed O(1) per query (`pathfinding-query` 4096 +117 ns per query, `2c1a9c1`).
+  Path registration costs `pathfinding` 512 about +0.33 ms tuned per step (3,072
+  registrations) and the query +8% (`870ac61`, owner). Connectivity maintenance
+  adds a flat +22–29 µs per dig and about +200 µs per ramp (`e793590`). A level add
+  pays about +15 µs for its own plan sets, flat in depth (`d11f1d9`).
+- **Traversal classes.** Reach is keyed by traversal class with one connectivity
+  instance per class; `walk` is the only one, so a class that moves differently
+  adds an instance.
+
 ### Architecture notes
 
 - Owner direction (2026-10-07, 2026-10-08): the chunk is the unit of terrain
@@ -141,9 +212,10 @@ Failure and limits:
 - Render presentation pools may be sized from the viewport; nothing in render
   is sized to level area (`.claude/rules/render.md`).
 - Provides: 65B copies and swaps only dirty chunks; 46 saves terrain per
-  chunk; 64B normalizes perception's chunk-owned LOS state; 38 gets static
-  collision bodies in nav on every level; 74 creates and destroys worlds by
-  their chunks; 75 paths far-off agents over the whole-world graph.
+  chunk; 64B rebuilds derived nav from chunk storage (perception holds no LOS
+  state); 38 gets static collision bodies in nav on every level; 74 creates and
+  destroys worlds by their chunks; 75 paths far-off agents over the whole-world
+  graph.
 - Accessor contracts used by gameplay, perception, and render stay the same.
 - Owner decision (2026-10-09): a ramp dig always digs out its exit cell on
   the level above, so a ramp never leads into rock. A blocking obstacle or
@@ -164,32 +236,48 @@ Failure and limits:
 ### Checklist
 
 - [x] One chunk edge size (power of two, at most 16) and tile-sized nav cells
-      shared by terrain, nav, and scope (`23c24ec`).
+      shared by terrain, nav, and scope (`23c24ec`); one `ChunkGeometry` with u32
+      sides for terrain, nav, and static colliders, validated at every create
+      path (`19256c5`).
 - [x] Terrain stored per chunk behind the existing accessors; the blocked
       query costs its chunk (`453993f`).
-- [ ] Uniform and all-solid chunks stay cheap after edits elsewhere on their
-      level. Terrain landed (`453993f`); nav remains.
-- [ ] Level links stored with their endpoint chunks; a link lookup, including
-      on entity cell entry, costs the chunk, not the world's links. World side
-      landed (`453993f`); nav side remains.
-- [ ] Nav storage per chunk; a level holds only a directory of its chunks,
-      and nothing in nav is sized to level cells.
-- [ ] Runtime ramps routable the same step on both levels, perimeter or
-      interior, never refused.
-- [ ] Nav apply per step all-or-nothing over dirty chunks, threaded; no
-      relabel or full-rebuild fallback.
-- [ ] A local nav change leaves pending requests, negative results, group
-      fields, and cached paths outside its chunks untouched; path eviction
-      costs the results that touch its chunks, not the cache size.
-- [ ] A static obstacle add, move, or destroy costs its footprint chunks,
+- [x] Uniform and all-solid chunks stay cheap after edits elsewhere on their
+      level: terrain (`453993f`); nav chunks OPEN or BLOCKED hold no cells, and a
+      chunk with no portal holds no record (`5db9025`).
+- [x] Level links stored with their endpoint chunks; a link lookup, including
+      on entity cell entry, costs the chunk, not the world's links: world
+      (`453993f`, `fe2d99e`), nav records (`1305fa9`, `5db9025`), O(1) endpoint
+      dedupe per chunk (`408b5a0`).
+- [x] Nav storage per chunk; a level holds only a directory of its chunks, and
+      nothing in nav is sized to level cells: per-chunk cells and records
+      (`5db9025`), budget-sized search scratch and chunk-block group fields
+      (`10bbbc7`), level-owned plan sets (`d11f1d9`), staging released after use
+      (`e40845d`), counted pool growth (`eaa4a80`).
+- [x] Runtime ramps routable the same step on both levels, perimeter or
+      interior, never refused (`fe2d99e`, `1305fa9`).
+- [x] Nav apply per step all-or-nothing over dirty chunks, threaded; no relabel
+      or full-rebuild fallback (`1305fa9`).
+- [x] A local nav change leaves pending requests, group fields, and cached paths
+      outside its chunks untouched; path eviction costs the results that touch its
+      chunks, not the cache size (`870ac61`, `8b59c3c`, `9f7de20`, `83172ce`); a
+      level rebuilt by a content revision evicts only that level's results and
+      fields (`a869e15`). Negative results no longer exist: reachability answers
+      unreachable goals (`2c1a9c1`).
+- [x] A static obstacle add, move, or destroy costs its footprint chunks,
       independent of static-body and entity counts, on every level, with no
-      whole-level fallback and no per-call map.
-- [ ] Path search crosses chunks and levels through the chunked graph with
+      whole-level fallback and no per-call map (`5db9025`: 77 ms → 18 µs at 10k
+      statics, flat).
+- [x] Path search crosses chunks and levels through the chunked graph with
       budget-sized scratch; a cross-level path's cost follows path length, not
-      levels explored; group flow fields not sized to level cells.
-- [ ] A level added in play builds only its own chunks, threaded, and is never
-      refused; other levels' nav, caches, and runtime state are untouched; a
-      replaced world releases all its storage.
+      levels explored; group flow fields not sized to level cells: scratch and
+      fields (`10bbbc7`), cross-level heuristic (`22ac6ae`, `8358b37`,
+      `41afa5f`), partial and least-h hops for routes past the tier-1 caps
+      (`1a5241f`, `ac48f66`), long-route baseline (`982d934`), hole-moving heap
+      sifts (`e2b9b2c`). Limits above.
+- [x] A level added in play builds only its own chunks, threaded, and is never
+      refused; other levels' nav, caches, and runtime state are untouched
+      (`1305fa9`: 85.8 ms → 1.2 ms at 256², `d11f1d9`, `a869e15`); a replaced
+      world releases all its storage.
 - [x] Render terrain uploaded per chunk for the render window; dense layers
       added in play; GPU byte gate replaced by a report (`9bbfdc0`).
 - [x] A world's GPU tile store is released when its world is destroyed or
@@ -200,6 +288,8 @@ Failure and limits:
 - [x] The GPU sync after one dig is back within spread of `5439e36`
       (`chunk-scale-gpu-sync-dig` was 4–12% slower after render step (c);
       +0.5%, within spread, once change marks replaced the edit queue).
+- [x] The GPU sync's edit cost is measured on its own axes: linear in window
+      chunks per edit and in written layers for a batched change (`639f55d`).
 - [x] Dense one-step terrain changes (cave-in, explosion) written per chunk on
       the thread system, serial equals threaded (S3b). Their gameplay
       producers are [Slice 76](slice-76.md) and [Slice 77](slice-77.md).
@@ -209,11 +299,12 @@ Failure and limits:
 - [x] A nav-apply failure leaves that step's perception and steering
       reactions intact (nav N1: steering runs before the nav error returns;
       perception has no reaction).
-- [ ] Nav's request side threads like other systems. Delivered (nav T1):
-      request intake and group-field expansion are threaded stages with their
-      own tuners, serial equals threaded, solve outputs sit at the fallback
-      ordinal, pending compaction costs the solve window. Remaining: the items
-      below, so the stages engage under varying load.
+- [x] Nav's request side threads like other systems: request intake and
+      group-field expansion are threaded stages with their own tuners, serial
+      equals threaded, solve outputs sit at their ordinals, pending compaction
+      costs the solve window (`8ee993a`), and the stages engage under varying
+      load (`4b15d88`); publish copies and registry flushes thread (`870ac61`,
+      `8b59c3c`, `9f7de20`); the step's goal projections thread (`2c1a9c1`).
 - [x] Tuner resets learning when an inline batch's item count changes
       (`thread_system.zig:1134-1137`, `:229-237`: the inline shape's range size
       is the item count, so `record` sees a new profile): nav intake and group
@@ -225,33 +316,88 @@ Failure and limits:
       `:599-610`): four lockstep group fields finish in one near-empty batch, the
       advance pass demotes to inline and stays there for 360 batches.
       Landed (TS1): windows read the median batch.
-- [ ] The runtime perf log records only the solve batch
-      (`simulation_pipeline.zig:584`); the intake and group-field batches are
-      visible only in benches.
-- [ ] One shared static-collider structure, synced once per entity per step,
+- [x] Tuner judges a demotion and a shift correctly: the first inline window
+      after a settled demotion restores a wrongly dropped threaded profile; a
+      sustained shift's retune re-bases on the incumbent; probe and demotion
+      counters for `--details` (`69e7ed2`, `c31d8b1`, `15362e7`); a
+      wait-dominated demotion no longer drops a threaded profile (`ff670b4`).
+- [x] The runtime perf log records each change path's cost-driver stage:
+      `path_intake`, `path_registry_flush`, `nav_remask`, `nav_evict`,
+      `static_collider_splice` (`69dba4f`), `nav_connect` (`e793590`),
+      `nav_closure` (`a294a7a`). Group-field batches stay bench-only: they drive
+      no change path (`threading.md`).
+- [x] One shared static-collider structure, synced once per entity per step,
       with nav as its first consumer; a static add, move, or destroy costs its
-      own rows and chunks. Steering and collision move onto it in 71B.1.
+      own rows and chunks (`5db9025`); steering reads it through a size-class
+      query map (`173cc17`). Collision moves onto it in 71B.1.
+- [x] Steering's prepare phase, its agent grid, AI movement-intent apply, and
+      collision response run as threaded stages with main O(1) per item
+      (`ede5509`, `df7f1ea`, `cc58f38`, `ff670b4`); plane traversal's per-agent
+      cell-entry test runs on workers, main O(1) per entry (`3d0e8f5`, `08c01c2`).
 - [x] Runtime ramps dig out their exit cell on the level above in the same
       dig, with the edge cases above (owner decision).
-- [ ] Slice 72 D3, G1, G2, E2, and E3 closed with the nav landings that
-      rewrite the same code; their 72 lines checked off there.
-- [ ] Level-sized load gates retired, so creating a world in play (74) and
-      adding a link are never refused for capacity; index and format widths
-      (cell, chunk, label, slot, edge offsets, level) fail loudly at world
-      create, load, and growth. Index widths landed (`23c24ec`); gates remain.
+- [x] Slice 72 D3, G1, G2, E2, and E3 closed with the nav landings that
+      rewrite the same code: D3 (`1e97b65`), G1 (`10bbbc7`), G2 and E2
+      (`f638ff3`), E3 superseded (no negative cache, `2c1a9c1`).
+- [x] Level-sized load gates retired, so creating a world in play (74) and
+      adding a link are never refused for capacity (`1305fa9`, `ab9f01f`); index
+      and format widths (cell, chunk, label, slot, edge offsets, level) fail
+      loudly at world create, load, and growth (`23c24ec`, `eaa4a80`,
+      `19256c5`); ids that grow in play fail as `OutOfMemory` at their growth
+      seam (`ab9f01f`).
 - [x] World creation and dense-layer adds in play are never refused for
       capacity: band lists grow, and edits hold no GPU memory for unrendered
       worlds (render R3).
 - [x] Replaced branch nav code and its tests removed; main's nav restored
       (`2c09cec`).
-- [ ] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
+- [x] Reachability is maintained at every nav batch and answered in O(1) at
+      intake, status, and solve, never by a failed search: benches (`8a28fd1`),
+      connectivity ids with a balanced threaded flood (`e793590`), the exact
+      one-way closure (`a294a7a`), reach checks and one shared goal projection
+      per goal key per step (`2c1a9c1`), per-H-component closure blocks with no
+      world-scale compaction (`309a1a5`, base `285b1d2`).
+- [x] The dense-change reaction's main thread is split by section, and its
+      growing main work threads: level-owned ordered plan sets replace the heap
+      merge, the mark assert moves into the per-event loops (`1657d63`,
+      `d11f1d9`). The floor left is recorded above.
+- [x] Long-link heuristic: level-aware link bounds (`0ee5a6d`, `22ac6ae`),
+      coupled long-link pairs (`8358b37`), layout benches and the link-fold
+      baseline (`b76d06d`). The trie and cut follow-ups are dropped (owner); the
+      limits are recorded above.
+- [x] Nav storage bounds are honest: an `@sizeOf`-based bound beside each
+      structure fed by the built world's content, checked whole against live
+      bytes in every nav group (`639f55d`, `0c85293`); one bench world builder
+      (`639f55d`).
+- [x] Combined-review fixes since the 2026-10-07 branch review: exact half-open
+      cell spans (`685df2d`), shared stage helpers and one dispatch pattern
+      (`819d8d8`, `2496824`), std-first pathfinding (`3be2d5c`), staging release
+      (`e40845d`), and areas A–D (`eaa4a80`, `a869e15`, `08c01c2`, `adf883d`).
+      Core-system findings went to the core-systems branch checklist.
+- [x] Benches cohere: production-read estimates, per-group labels and
+      formatters, one item code and fixture set, single-axis right-sized sweeps,
+      world-backed request-load groups (`0c85293`).
+- [x] H's per-node cost on capped searches (+137% Debug / +29.5% ReleaseFast on
+      `pathfinding-long-path` 2000064, `41afa5f`): the open-heap sifts move a hole
+      (`e2b9b2c`: descent 64 at caps 29.75 → 26.54 ms, its hop chain
+      239.2 → 207.5 ms, `pathfinding` 1024 serial 41.7 → 31.4 ms, cross-level depth
+      256032 serial 24.8 → 20.9 ms).
+- [x] Tests: incremental equals a full rebuild, serial equals threaded; OOM at
       every allocation leaves state intact and the retry equals a rebuild; one
       chunk's change leaves every other chunk untouched; a multi-level cave-in
       in one step; a runtime ramp routable the same step on both levels; one
       dig leaves unrelated pending requests, group fields, and cache entries
-      intact; a static-obstacle move costs the same at 10 and 10k static
-      bodies.
-- [ ] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
+      intact; a static-obstacle move patches a constant chunk set at any static
+      count (each beside its landing).
+- [ ] Followers of a shared goal's partial path keep following when another
+      agent re-solves it from the end window. Today the re-solve replaces the
+      cached partial, and followers still on the old path, now off the new one,
+      steer toward its first cell; a TTL re-solve of a full path does the same.
+      Gated on a crowd walk in `pathfinding-long-path` that shows followers
+      orphaned.
+- [ ] The nav estimate's level-build staging peak is measured, not derived:
+      `buildLevel` shrinks its staging before it returns, so `checkNavBytes` never
+      sees the peak its bound charges (`639f55d`).
+- [x] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
       and 64B checked against chunk storage.
 
 ### Acceptance checks
@@ -264,8 +410,10 @@ Failure and limits:
       Fixtures build once outside the timed loop and the groups run quickly in
       Debug.
 - [ ] An A\* path of the same length costs the same at 2048² as at 256²
-      (`pathfinding*` groups), and a cross-level path of the same length costs
-      the same at 8, 32, and 128 levels.
+      (`pathfinding-level-size`), and a cross-level path of the same length costs
+      the same at 8, 32, and 128 levels (`pathfinding-cross-level-depth`,
+      `pathfinding-long-path` layout 3), and a cave route's cost follows its
+      length (`pathfinding-long-path` layout 5).
 - [ ] `zig build verify` and `zig build test -Doptimize=ReleaseFast` pass.
 - [ ] Manual (display, Debug): digs and ramps in the demo; NPCs route over
       the changes. The in-demo cave-in check is Slice 76's.

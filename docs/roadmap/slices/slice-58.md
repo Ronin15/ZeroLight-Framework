@@ -25,10 +25,10 @@ same golden hash on serial and threaded runs and in Debug and ReleaseFast.
 - `WorldBuildConfig` has a literal `seed` default and `chunk_size_tiles = 16`;
   Slice 49 sets the seed from `session_seed.derive(.worldgen_procedural)`.
 - Underground levels are a uniform `dirt` fill (`addUndergroundLevelStack`);
-  uniform layers (`uniform_fill_tile`) drive the nav and perception fast
-  paths.
-- `levelBlocksMovement` scans every dense band of the world and the level's
-  whole sparse list per query; 64G replaces this storage.
+  a uniform chunk stores no cells in terrain or nav (64G), which keeps the fill
+  cheap.
+- `levelBlocksMovement` reads the level's composed blocked bits, O(1) per cell
+  (64G chunk storage).
 - Demo spawns are hard-coded grids (`spawnTestSquares`, underground pockets)
   sized by the demo constant `battle_scale_demo_mover_count`; obstacles and
   interest markers are fixed (`game_demo_state.zig`).

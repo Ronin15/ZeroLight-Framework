@@ -187,7 +187,7 @@ rebuild are `normalized` (64B) and rebuilt on load.
 65B, 65C, 67C (beyond its header bump), 69A, 69B, 69E, 70A, 70B, 71B, and 71C
 add no saved state.
 
-### T4. Merged `stage_order` (live 19, plus 55/56/56B/57/59/62/63, plus 64–71)
+### T4. Merged `stage_order` (live 20, plus 55/56/56B/57/59/62/63, plus 64–71)
 
 | # | Stage | Origin |
 | --- | --- | --- |
@@ -200,26 +200,27 @@ add no saved state.
 | 6 | affect_update | live; 42 `+reads environment` (caution) |
 | 7 | ai_decide_gather | 55 |
 | 8 | ai_decide | live; 71A `carried spawn_anchors`; 71D `carried inventory_state`, `faction_relations` |
-| 9 | steering_update | live; 71B.1 `carried static_colliders` |
-| 10 | pathfinding_update | live; 71B.3 `carried interest_markers, spawn_anchors` |
-| 11 | apply_ai_movement_intents | live |
-| 12 | movement_integrate | live |
-| 13 | **knockback_apply** | 68B; writes `movement_positions`, `movement_knockback` |
-| 14 | collision_scope_gather | live |
-| 15 | collision_detect | live; 71B `carried static_colliders` |
-| 16 | collision_respond | live |
-| 17 | bounds_and_tile_gate | live |
-| 18 | plane_traversal | live |
-| 19 | chunk_derive | live |
-| 20 | ai_action_select | 56; 68A writes `ai_action_deferrals` |
-| 21 | action_react | live |
-| 22 | projectile_update | 56B |
-| 23 | combat_resolve | 56; 68B `+writes movement_knockback`; 68C `+reads/writes inventory_transfers`, `+carried inventory_state` |
-| 24 | inventory_update | 57 |
-| 25 | social_react | 63 |
-| 26 | **guard_alarm** | 71A; writes `affect_impulses` |
-| 27 | tier_policy | live |
-| 28 | population_update | 62 |
+| 9 | path_goal_resolve | live (64G); reads `navigation_intents`, writes `path_goals` |
+| 10 | steering_update | live; 71B.1 `carried static_colliders` |
+| 11 | pathfinding_update | live; 71B.3 `carried interest_markers, spawn_anchors` |
+| 12 | apply_ai_movement_intents | live |
+| 13 | movement_integrate | live |
+| 14 | **knockback_apply** | 68B; writes `movement_positions`, `movement_knockback` |
+| 15 | collision_scope_gather | live |
+| 16 | collision_detect | live; 71B `carried static_colliders` |
+| 17 | collision_respond | live |
+| 18 | bounds_and_tile_gate | live |
+| 19 | plane_traversal | live |
+| 20 | chunk_derive | live |
+| 21 | ai_action_select | 56; 68A writes `ai_action_deferrals` |
+| 22 | action_react | live |
+| 23 | projectile_update | 56B |
+| 24 | combat_resolve | 56; 68B `+writes movement_knockback`; 68C `+reads/writes inventory_transfers`, `+carried inventory_state` |
+| 25 | inventory_update | 57 |
+| 26 | social_react | 63 |
+| 27 | **guard_alarm** | 71A; writes `affect_impulses` |
+| 28 | tier_policy | live |
+| 29 | population_update | 62 |
 
 - **External resources:** `action_intents`, `interest_markers`,
   `structural_events`, plus `time_skip_request` (69C), `weather_overrides`
@@ -230,8 +231,9 @@ add no saved state.
   no position; every new `carried` entry is external or has a later writer
   (`combat_state` → `combat_resolve`, `spawn_anchors` → `population_update`,
   `inventory_state` → `inventory_update`).
-- 64–67, 69A/B/E/F, 70, 71C, and 71D add no stage. 73, 74, and 75 state any
-  stage they add here when they land.
+- 64G added `path_goal_resolve` (writes the step's goal table, read by
+  steering and pathfinding). 64–67, 69A/B/E/F, 70, 71C, and 71D add no stage.
+  73, 74, and 75 state any stage they add here when they land.
 
 ### T5. Component tag tally
 

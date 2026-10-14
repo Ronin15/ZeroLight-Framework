@@ -28,14 +28,11 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   `SensoryBus` deferred and sticky stimuli (storage `undefined` past their
   counts); `DigController` latches and `player_last_cell`; `AiSystem`'s
   snapped goal; `SteeringSystem.runtime_rows` (per-entity history);
-  `PathfindingSystem` request queues, result cache with TTL eviction, group
-  fields, and the nav graph; perception's LOS cache; steering obstacle and
-  movement-index caches; tuners, scratch, and the audio controller.
-- Terrain is one flat dense-tile list per world today; 64G moves it to
-  chunk-owned storage, so the chunk is the hashing unit.
-- `PerceptionSystem.markLevelDirty` appends to a per-level `pending_dirty`
-  list on every edit and clears it only when an observer next builds that
-  level, so a level no observer visits grows it without bound.
+  `PathfindingSystem` request queues, result cache with TTL eviction and its
+  path registry, group fields, and the nav graph with its connectivity ids and
+  one-way closure; `StaticColliderSystem` rows; steering's movement-index cache;
+  tuners, scratch, and the audio controller. Perception holds no LOS state.
+- Terrain is chunk-owned (64G), so the chunk is the hashing unit.
 
 ### Architecture notes
 
@@ -72,9 +69,8 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   reference; saves never call it on the live session, so a save is invisible
   to the continuing session. Callers: load-parity tests, the harness, and
   deferred-nav abandonment (65B).
-- Derived perception state is rebuilt by `normalizeDerivedState` from 64G's
-  chunk-owned LOS state; no per-level dirty list or level-wide rebuild
-  remains.
+- Perception holds no LOS state: line of sight reads chunk terrain (64G), so
+  terrain changes rebuild nothing perception-side.
 
 ### Checklist
 

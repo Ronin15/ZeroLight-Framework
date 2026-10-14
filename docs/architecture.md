@@ -49,7 +49,9 @@ Designs start here, then read the live structure below (rules:
 - `src/app/frame_pacer.zig` classifies window visibility and applies fallback frame pacing.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
 - `src/app/pause_controller.zig` owns the pause policy: pushes the modal `PauseState` over gameplay and resets timing on resume.
-- `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
+- `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU
+  batches, the adaptive tuner, and the one copy of the stage pattern every threaded
+  system uses (§ Thread System).
 - `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
 - `src/app/runtime_perf_log.zig` records fixed-step runtime perf metrics (Debug and
   ReleaseSafe; fully compiled out of ReleaseFast/Small) consumed by the engine
@@ -78,10 +80,16 @@ Designs start here, then read the live structure below (rules:
   radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
   not the discovery gate. Queries return nearest-k (dist², then slot index).
 - `src/game/world_terrain.zig` holds `WorldSystem`'s chunk-owned terrain
-  storage: per dense layer a chunk directory over a pool of tile blocks, per
-  level a growable band list, a composed movement-blocked directory over a pool
-  of bit blocks, and per-chunk link-endpoint list heads, directories sized at
-  level create.
+  storage: per dense layer a chunk directory over a pool of tile blocks, and per
+  level a `LevelTerrain` (growable band list and cached floor layer, a composed
+  movement-blocked directory over a pool of bit blocks, per-chunk link-endpoint
+  heads and counts, and per-chunk sparse-tile chain heads), directories sized at
+  level create. Its `ChunkGeometry` (u32 sides, u16 chunk edge, shift-based
+  `chunkOf`/`localOf`) is the one chunk tiling terrain, nav, and static colliders
+  share.
+- `src/game/stamped_table.zig` holds the generation-stamped open-addressed table
+  the per-step key tables share (nav's abstract and local search tables, the plane
+  stage's landing claims): an O(1) reset outside the rare wraparound.
 - `src/game/world_test_support.zig` holds test-only `WorldSystem` fixtures shared
   across modules (a demo surface at any chunk edge, terrain pool warmup).
 - `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
@@ -109,7 +117,18 @@ Designs start here, then read the live structure below (rules:
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
   serial or threaded SIMD-aware ranges (world x/y only; discrete vertical plane
-  is `position_z` / `world_level`, not continuous z motion).
+  is `position_z` / `world_level`, not continuous z motion) and applies the
+  step's AI movement intents as a threaded stage.
+- `src/game/systems/world_gate.zig` clamps settled bodies to world bounds and
+  gates them off solid tiles (serial, main thread).
+- `src/game/systems/plane_entry.zig` owns `PlaneEntrySystem`, plane traversal's
+  threaded per-agent cell-entry gather and classification.
+- `src/game/systems/static_colliders.zig` owns `StaticColliderSystem`, the shared
+  static-collider rows nav and steering read through `ColliderView`.
+- `src/game/systems/chunk_list_map.zig` holds `ChunkListMap` (per-key owner lists
+  backing the static-collider chunk lists and the path registry) and
+  `OrderedIndexSet` (the ordered chunk/level set nav's plan merge and the world's
+  write grouping drain).
 - `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
   pipeline-shared per-step uniform grid built once from the cognition-scoped
   population and read by AI separation and perception.
@@ -138,12 +157,15 @@ Designs start here, then read the live structure below (rules:
   neighbor gating mirrors collision).
 - `src/game/systems/collision.zig` generates deterministic contact streams.
 - `src/game/systems/collision_response.zig` consumes contacts and applies
-  response-policy movement corrections.
+  response-policy movement corrections;
+  `src/game/systems/collision_response_test_support.zig` holds its test-only
+  fixtures shared across modules.
 - `src/game/systems/particle.zig` owns state-local transient particle effects
   in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
 - `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage
-  (types, nav_grid, nav_graph, caches, group_field, scratch, solve, system,
-  nav_memory, test_support) for frame-delayed multi-level grid navigation.
+  (types, nav_grid, nav_graph, connectivity, caches, goal_table, group_field,
+  scratch, solve, system, test_support) for frame-delayed multi-level grid
+  navigation.
 - `src/game/dig_controller.zig` is the pipeline-owned controller for player
   digging, authoring world-tile edits and navigation-invalidation signals.
 - `src/game/destructible_controller.zig` is the pipeline-owned controller that
@@ -169,6 +191,11 @@ Designs start here, then read the live structure below (rules:
 - `src/root.zig` stays minimal for math aliases and compile coverage; feature
   modules live in their matching `src/` area and import each other directly.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
+- `src/benchmarks/` holds the `zig build bench` groups, one file per area:
+  `suite.zig` is the shared harness (options, cases, item codes, stage shapes,
+  reporting, the nav memory estimate) and `fixtures.zig` the shared fixtures
+  (thread systems, bodies, request streams, tilesets, banded worlds, nav tuner
+  setup).
 
 ## Frame Flow
 
@@ -389,10 +416,19 @@ Each decision reads the median of a short sample window, so one spike or one
 near-free batch never decides alone. A batch outside the learned item-count band
 runs with the current profile without being sampled; a full window of them in a
 row on the same side is a sustained shift, which re-tunes a threaded stage at the
-new count and relearns an inline one. There are no static item-count floors
+new count and relearns an inline one; that retune re-bases on the incumbent profile
+at the new count and commits a climb only at the threaded commit margin (5%), while
+the periodic retune keeps the measured best and the 1% margin. A settled
+threaded-to-inline demotion remembers its threaded profile, and the first inline
+window judges it: at or above the gate, with the profile still dispatching threaded
+at that count, the profile is restored at once and the bound rule is suppressed
+until the next retune probe or sustained shift; otherwise the demotion stands. Main
+waiting on workers never demotes a stage. There are no static item-count floors
 (`.claude/rules/threading.md`);
 slower hardware or expensive small-N processors train their own threaded
-profile.
+profile. The tuner counts closed probe windows and demotions for `--details`
+(`probes=`, `demotes=`); the counters compile to nothing in ReleaseFast and
+ReleaseSmall and no policy reads them.
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
 for the batch barrier.
@@ -410,6 +446,16 @@ stage (broadphase and narrowphase, AI gather and decision emission). A stage
 that preselects a profile passes it with its own tuner, so inline samples still
 train that stage, and diagnostics report inline stages as `inline`
 (`.claude/rules/threading.md`).
+
+`thread_system.zig` holds the one copy of the stage pattern: `StageControls`
+(`items_per_range`, `max_worker_threads`, `adaptive`; every stage takes a per-stage
+worker cap, which production leaves unset), `Dispatch` (select a profile under the
+stage's tuner, then run it), `StageThreads(Config)` (a system's thread system plus
+config), `stageShape`/`runShaped`/`runStage` (pre-size range windows for the shape
+the dispatch will use, then run), and `RoundDispatch` (a multi-round stage selects
+once and records one tuner sample per step). Beside them: the 64-byte
+`thread_shared_record_alignment`, `paddingForCacheLine`, `PaddedSlot`/`SlotList`,
+`BandPartition`, `inlineBatch`, `accumulateBatch`, and `offMainNs`.
 
 ## Gameplay Data
 
@@ -448,22 +494,27 @@ uniform tile or a block index into a pool of chunk-sized tile blocks, and a
 block returns to uniform when a write leaves its in-level cells holding one
 tile, whichever tile (an O(1) count of unequal neighbors along a row-major cell
 chain). Pool growth is counted (`terrain_pool_grows`) and logged once.
-Each level keeps its band list (growable: a band add is never refused, and a
-batched edit carries per-group band bits sized to the widest touched level) and
+Each level's `LevelTerrain` keeps its band list (growable: a band add is never
+refused, and a batched edit carries per-group band bits sized to the widest
+touched level), its floor layer (so `denseFloorLayerForLevel` is O(1)), and
 composed movement-blocked bits per chunk
 (OPEN, BLOCKED, or a bit block), so `levelBlocksMovement` is O(1) and a write
 recomposes only its own cell. Level links are append-only and indexed per
-endpoint chunk, so `levelChunkLinkEndpoints` (and `rampLinkOtherLevel` on it)
-walks one chunk's endpoints. A dig or fall carve reserves its growth with
+endpoint chunk (per-chunk heads and counts), so `levelChunkLinkEndpoints` (and
+`rampLinkOtherLevel` on it) walks one chunk's endpoints. Sparse tiles chain per
+chunk both ways, so an add or remove is O(1) and a chunk's sparse tiles are one
+walk. A dig or fall carve reserves its growth with
 `reserveDenseCellWrite` (and `reserveLevelLink`) before any mutation, so an OOM
 leaves the step's state intact; a ramp dig also clears its exit cell on the
 level above (`reserveClearCellBlocking`/`clearCellBlocking`: blocking bands to
-the floor tile or empty, blocking sparse tiles swap-removed, O(bands + sparse
-tiles in the chunk)) and emits its `world_obstacle_changed` with the ramp's
+the floor tile or empty, blocking sparse tiles unlinked from their chunk's chain,
+O(bands + sparse tiles in the chunk)) and emits its `world_obstacle_changed` with the ramp's
 `world_tile_changed`; a local change costs only the chunks it touches, and
-adding a level costs only its own directories. A dense one-step change (cave-in, explosion)
-goes through `applyDenseCellWrites`: writes arrive grouped by chunk, storage is
-reserved on the main thread first, chunks are written in parallel on the
+adding a level costs only its own directories. A dense one-step change (cave-in,
+explosion, the step's fall carves) goes through `applyDenseCellWrites`: writes
+arrive grouped by chunk (`groupDenseCellWrites` groups a batch given in any order
+in O(1) per write through each level's ordered chunk set, with no sort), storage
+is reserved on the main thread first (`reserveDenseCellWrites`), chunks are written in parallel on the
 `ThreadSystem`, and results merge in a fixed order, so threaded equals serial
 (`.claude/rules/threading.md`). A write marks its block changed and, on a layer
 resident in the GPU tile store, flags the layer for the next
@@ -493,7 +544,8 @@ The current gameplay fixed-step pipeline is:
    `spatial_index_build` (shared `SpatialIndexSystem`, Slice 28) →
    `perception_update` (vision/hearing,
    Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
-   `ai_decide` → `steering_update` → `pathfinding_update` (frame-delayed) →
+   `ai_decide` → `path_goal_resolve` (the step's goal table) →
+   `steering_update` → `pathfinding_update` (frame-delayed) →
    `apply_ai_movement_intents` → `movement_integrate` →
    `collision_scope_gather` → `collision_detect` → `collision_respond` →
    `bounds_and_tile_gate` (world bounds clamp + solid-tile gate; after
@@ -503,14 +555,17 @@ The current gameplay fixed-step pipeline is:
    `tier_policy` (deferred `set_simulation_tier` commands).
 4. Queue contact audio, emit/update transient particles, and merge outputs.
 5. Update the state-owned follow camera and visible world chunks.
-6. Commit deferred structural commands to `DataSystem`, run
-   `SimulationPipeline.syncPopulationCapacity` (the population growth seam),
-   then run the pipeline's post-commit reactions (nav, then steering:
-   `SimulationPipeline.reactToPostCommitNavEvents` and
-   `.reactToPostCommitSteeringEvents`, independent side effects on disjoint
-   state reacting to the same committed event stream) so nav patches from this
-   step's world edits. A nav error is returned only after the steering reaction
-   has run.
+6. The structural-commit seam, in order: reserve the static-collider rows and
+   static nav marks, commit deferred structural commands to `DataSystem` under the
+   budgeted all-or-fail commit, capture the step's static changes into the
+   collider's dirty list, run `SimulationPipeline.syncPopulationCapacity` (the
+   population growth seam), sync the static colliders (recording their nav marks;
+   it runs even when the growth seam failed), then the post-commit reactions:
+   `reactToPostCommitNavEvents` (only after a successful growth seam and collider
+   sync, else every mark stays for the next step) and
+   `reactToPostCommitSteeringEvents` (always). The first growth, collider, or nav
+   error is returned only after the steering reaction has run. The demo state holds
+   this order (`commitStructuralAndReact`).
 7. Render current `WorldSystem`, `DataSystem`, and particle state with
    interpolation.
 
@@ -594,7 +649,18 @@ processors with typed `DataSystem` views (`.claude/rules/simulation.md`).
 
 Landed pipeline-owned domain controllers (beside processors):
 
-- `DigController` — dig intents → world-tile edits + stimuli/events
+- `DigController` — dig intents → world-tile edits + stimuli/events, and plane
+  traversal: `PlaneEntrySystem` gathers, on workers, each AI agent that entered a
+  new cell where it could change plane (a ramp-link cell, or a hole with a level
+  below) or lacks `world_level`, and classifies that cell there (`PlaneTarget`:
+  the action, target level, landing floor layer, whether a carve is needed;
+  through the one `planeTarget` the player's own path also uses). The reserve
+  then decides every traversal in commit order in O(1) per entry through
+  stamp-cleared plane claims (`StampedTable`: shut holes, deduped landings, an
+  exact carve count), and the step's carves go out as one (level, chunk)-ordered
+  `applyDenseCellWrites` batch on `carve_controls`, all-or-nothing, its scratch
+  reserved and counted at the plane reserve; carve events are in (level, chunk,
+  cell) order. Main is O(1) per entry and flat in agents on steps with no entry.
 - `SensoryBus` — deferred impacts, sticky dig/impact linger, and the hearing scratch. Promote and footstep run in `dig_world_edit`; perception reads `hearingSlice` then `advanceSticky`; collision response enqueues the next step's impacts
 - `AudioController` — ambient + collision SFX queues (no SDL in the controller). Impact gain uses the same penetration scale as `SensoryBus`
 - `DestructibleController` (Slice 45) — first `action_intents` consumer:
@@ -627,6 +693,16 @@ processor, using SIMD lanes inside each assigned range and
 `ThreadSystem.parallelForWithOptions` when completion-time feedback shows the
 batch is large enough. Worker ranges are aligned to movement cache-line
 boundaries and only write their assigned movement rows.
+`MovementSystem.applyIntents` (`apply_ai_movement_intents`) runs over the step's
+merged movement intents as a threaded stage with its own tuner and an inline path:
+one dense-index resolve per intent (`DataSystem.aiMovementDenseIndex`), a 4-lane
+SIMD velocity block (default speed where speed is not positive) with a
+bit-identical scalar finish, and velocity written in place at each intent's
+movement row. Rows are disjoint because `SimulationFrame.intents` carries at most
+one movement intent per entity per step (steering's first claim), asserted at the
+stage; main keeps O(ranges) dispatch. The rows are scattered across the velocity
+columns, which `threading.md` allows: `movement-apply-intents-sorted` is its
+row-order control.
 
 `CollisionSystem` is a high-throughput contact generator over entities that have
 both movement bodies and collision bounds. It owns warmed, 64-byte-aligned AABB
@@ -643,9 +719,20 @@ separately so an inline narrowphase cannot be mistaken for a broadphase tuning
 result.
 Contacts are transient `SimulationFrame` data; `CollisionResponseSystem`
 consumes the completed same-step contact stream through explicit response-policy
-components, computes aligned correction columns with `src/core/simd.zig`, and
-applies sparse movement writes deterministically on the main thread before
-structural commands commit.
+components in two threaded stages, each with its own tuner and an inline path.
+`gather` (over contacts) classifies each contact, resolves each response intent's
+movement row, writes its range's windows of intents, triggers, and observer
+contacts, and runs the intent math with `src/core/simd.zig`; with workers it also
+places its intents by 16-row movement band, and `apply` (over bands) applies, for
+the rows each band owns, every gather range's segment in range order (a 4-lane
+SIMD block, flushed when a row repeats). An inline gather applies its own window
+inside its timed range, so its tuner measures everything the inline choice keeps
+on main. Either way each movement row takes its intents in contact order, so the
+result is bit-identical for any worker count, range size, or tuner decision. Main
+does O(ranges) tallies, merges the trigger stream and observer contacts in range
+order (O(1) per record), and reserves everything before dispatch.
+`observerContacts` (the contacts naming the observer) serves player impacts and
+collision audio, replacing two scans of every contact.
 
 `PerceptionSystem` (`src/game/systems/perception.zig`, Slice 29) runs over the
 cognition-scoped `AiPerception` subset right after the shared spatial index is
@@ -718,106 +805,184 @@ index — it is a different, already-tuned algorithm, not a duplicate grid
 build.
 
 `SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
-component data, movement slices, static obstacle data, and frame-delayed
-`PathfindingSystem` status. It owns runtime path-following rows, replan
-cooldowns, unavailable-path backoff, stuck counters, and bounded local-avoidance
-bucket scratch outside `DataSystem`. Path-status, cooldown mutation, runtime-row
-pruning, and intent arbitration stay on the main-thread boundary, then the
-prepared steering work emits final NPC `MovementIntent`s through deterministic
-threaded range writes to `SimulationFrame.intents`.
+component data, movement slices, the shared static-collider rows, and
+frame-delayed `PathfindingSystem` status. It owns runtime path-following rows
+(indexed by steering row; an O(k) main-thread rekey follows the rows a commit
+swap-removed), replan cooldowns, unavailable-path backoff, stuck counters, and its
+agent grid outside `DataSystem`. Its prepare phase runs as threaded stages, each
+with its own tuner and an inline path: `agents` (runtime tick, agent snapshot,
+movement-index refresh), `select_resolve` and `select_claim` (one intent per
+steering row, banded first-appearance and best-intent claims with per-step
+stamps), `directions` (path status and base direction, SIMD tail, per-item path
+request prefixes), and `grid_bucket`/`grid_sort` (the agent grid in 64
+count-balanced cell-key bands whose splitters are quantiles of up to 256 rows
+sampled on main in a golden-ratio sequence, so clustered and corridor crowds split
+like uniform ones; a cell never straddles bands). With threads, a stage its tuner
+keeps inline runs the same job as threaded; the serial and zero-worker paths keep
+the single pass and single sort. Main keeps per-range and per-band bookkeeping,
+the splitters, and the rekey. The avoidance pass emits final NPC
+`MovementIntent`s through deterministic threaded range writes to
+`SimulationFrame.intents`, and the movement job writes path requests per range
+from the prefixes. Static avoidance queries `ColliderView.queryBox` (largest size
+class first, at most 64 box hits and 512 probes per agent) and pushes with SIMD
+over the packed hits, so a static change costs steering nothing; agent-agent
+avoidance reads the agent grid. Steering follows a `.partial` path like
+`.available`, requests the next hop on its replan cooldown once inside the end's
+refresh window, and holds at the end with no direction.
 Priority arbitration chooses the highest-priority navigation intent per entity
 with stable stream order as the tie-breaker.
 Player movement remains direct input with no steering component, while collision
 response still resolves after movement.
 
-`PathfindingSystem` is a frame-delayed, Z-aware grid pathfinding processor under
-`src/game/systems/` (Slice 25A-25C). It runs two coordinated solver modes selected
-per request kind: budget-bounded goal-keyed heap A* for individual goals, and a
-demand-driven managed shared-goal reverse-Dijkstra flow field for declared `group`
-requests. Long-range and cross-level individual queries route through a per-level
-chunk-portal abstract graph plus inter-level `LevelLink` edges: abstract A* picks a
-corridor, then the system STITCHES a full obstacle-aware (level,cell) path by running
-per-segment local A* between consecutive corridor portals (a discrete jump only
-across a link edge) and caches it whole. The per-agent query walks that path on its
-current level cell by cell, exactly like a single-level A* path, so every heading is a
-traversable neighbor — never a straight-line cut across a wall — and multi-hop and
-cross-floor routes converge. Abstract seeding scans only the start level's portals
-that share the start cell's connected component, via a per-(level,component) portal
-index, so seeding scales with the reachable subset rather than the level's full
-border; abstract scratch saturation or a per-segment node-budget
-spill returns `pending` (retry) rather than a hard negative. It owns the static versioned
-nav grid (one per level), the chunk-portal/link graph,
-pending request queue, duplicate suppression, the goal-keyed completed path
-cache, unavailable-path cache, per-worker budgeted A* scratch, a fixed group-field
-registry, per-stage adaptive tuner state, and benchmark stats.
-`SimulationFrame.path_requests` carries transient requests from steering or
-future rule systems; path queues, scratch, thread state, and live path caches
-stay out of `DataSystem`. Each update runs four stages with their own adaptive
-tuners (`group_field_expand` has one per pass) and inline paths
-(`.claude/rules/threading.md`): `path_intake` converts start and goal cells
-four requests per `src/core/simd.zig` vector and runs one direct
-classify-and-accept pass when it stays on the main thread; on workers, ranges
-classify against step-start state and the main thread merges their windows in
-range order (group tallies, expired results, in-step duplicates folded per range,
-the pending cap); `group_field_expand` runs each building field's budgeted
-expansion as one item, in an advance pass before the main-thread slot
-decisions and a begin pass after them; the solve batch keeps branch-heavy A*
-frontier expansion scalar inside threaded ranges and writes every output at the
-request's fallback ordinal; publish is a serial, fixed-count ordered commit that
-copies each result whole into the cache after one long-block reserve.
-Pending is a ring, so compaction costs the solve window, not the queue. Path results
-are consumed on later fixed steps so missing or unreachable paths do not stall
-same-step movement. Cache and pending keys are goal-keyed
-(`nav_version + agent_class + goal_level + goal_cell`) so a moving agent reuses one
-shared result and derives its per-step waypoint from its current cell against the
-stored path/corridor; agents that share a goal share one pending entry. The local A*
-node state (g-cost/parent/closed) lives in generation-stamped DIRECT per-cell arrays
-indexed by cell index — O(1) access with no hash probes or collisions, in exchange
-for per-worker scratch that is O(cells) (the grid is world-bounded, so this is a fixed
-cost the build-time memory gate counts). `max_explored_nodes` stays the node BUDGET:
-an explicit per-solve expansion counter caps how many distinct cells one solve may
-stamp. Hitting that local node budget or saturating the abstract scratch returns
-`pending` and increments `path_budget_exhausted`. Abstract/stitched-corridor work
-follows a two-tier attempt ladder (`PendingRequest.tier`) rather than retrying a
-budget-exhausted query at unchanged cost: a cheap tier-0 attempt uses the small fixed
-`tier0_abstract_node_cap`/`tier0_stitched_cell_cap`; exhausting it promotes the
-request to tier 1 exactly once, which retries against `max_abstract_nodes`/
-`max_stitched_path_cells`, a larger fixed per-query budget (`default_tier1_*` in
-`types.zig`; `.claude/rules/budgets-capacities.md`). A tier-1 exhaustion
-drops the request WITHOUT negative-caching — it does not fit either fixed budget,
-which is not the same as a definitive "no path exists" — so the next query falls
-through to `.missing` (retryable after the caller's own replan cooldown) rather than a
-false `unavailable`. A request therefore costs at most two solve attempts per replan
-cycle, never an unbounded retry storm and never a permanently wrong negative. Per-step
-`max_escalated_solves_per_step` additionally bounds how many tier-1 (expensive)
-attempts one fixed step admits, so several simultaneously-stuck agents cannot
-stack their escalated cost into a single frame. A blocked
-goal projects to the nearest open cell on the goal level
-(`path_goal_projected`); `unavailable` is reserved for definitive negatives
-(disconnected component, no open cell near the goal, or no corridor across levels). With a world,
-nav takes the world's width, height, `tile_size`, and `chunk_size_tiles`
-(`NavExtent.world`); bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a
-world-less build. Index widths fail loud
-(`validateChunkGrid`) at world create, level add, and nav build: the chunk edge,
-u32 level cell indices, and u32 chunk labels (`chunks × (edge² + 1)` below
-`no_cell`); the u16 level index fails with `WorldLevelOverflow`. Oversized worlds fail
-loud at `NavGrid.rebuild` with `error.NavWorldTooLarge` rather than degrading at
-query time. The managed flow field is built only on declared group requests
-(zero cost otherwise), rebuilt only when the goal crosses a nav cell and at most
-once per `group_field_rebuild_min_steps`, and budgeted across frames by
-`group_field_build_budget`. Completed-path, unavailable-key, and group-field
-registries are fixed-capacity runtime structures with explicit eviction or
-saturation behavior rather than unbounded growth. Cached paths are stored exactly,
-never downsampled: each entry owns an inline stripe of `max_stored_path_cells` words
-(a plain path of up to that many cells, or a stitched path of half as many), and a
-longer result takes one long block (`resultBlockWords`: the longest plain or
-stitched result) from a pool the publish reserve grows, at most one block per entry,
-so a live entry is never evicted for path storage. Removal returns a block to the
-pool's free list; a shrink releases the memory of blocks no live entry holds. An
-elastic resize keeps cached paths and negatives: a grow rehashes the probe slots, and
-a shrink evicts oldest first (steps since the stamp, then payload index) until the
-entries fit, then moves high payloads and long blocks down, so a grow costs no
-re-solves and a shrink re-solves only the entries it evicted.
+`PathfindingSystem` (`src/game/systems/pathfinding/`) is a frame-delayed, Z-aware
+grid pathfinding processor (rules: `.claude/rules/pathfinding.md`). It runs two
+solver modes per request kind: budget-bounded goal-keyed A* for individual goals,
+and a demand-driven shared-goal reverse-Dijkstra flow field for declared `group`
+requests. It owns the nav graph (§ Nav Graph And Reaction), the pending queue (a
+`std.Deque`), the goal table, the goal-keyed result cache and its path registry,
+the group fields, per-participant search scratch, the tier-1 corridor pool, and a
+tuner per stage. `SimulationFrame.path_requests` carries transient requests from
+steering; queues, scratch, thread state, and caches stay out of `DataSystem`.
+Results are consumed on later steps, so a missing path never stalls same-step
+movement. `PathfindingCapacity` is configuration only (agent ceiling, search and
+field budgets, policy knobs); every per-step and memory limit derives from it and
+the live agent count in a private `Limits`. The fixed-step work:
+
+- `path_goal_resolve` (its own pipeline stage, before steering) builds the step's
+  goal table: one projection per distinct blocked goal key (nearest open cell
+  within `default_goal_projection_radius`, 16), shared by every status query,
+  intake request, group-field decision, and solve that step. Two threaded stages,
+  `goal_scan` over intents and `goal_project` over distinct blocked goals, with an
+  ordered main merge between them; any grid change invalidates the table.
+- `path_intake` converts start and goal cells four requests per
+  `src/core/simd.zig` vector; ranges classify against step-start state into their
+  windows, and the main thread merges the windows in range order (group tallies,
+  expired results, in-step duplicates, the logical frame-request limit, pending
+  pushes), one classifier for every partition. Each request is answered
+  `unavailable` (no open goal cell within the radius, or reach says the open start
+  cannot reach the live goal), a cache hit (a fresh result whose stored goal cell
+  is the live goal, unless it is partial and the start lies in its end's refresh
+  window), or a candidate. Agents that share a goal key share one pending entry.
+- `group_field_expand` advances building fields (one item per field, an advance
+  pass before the main-thread slot decisions and a begin pass after; stall rounds
+  have their own tuner).
+- The solve batch admits up to the per-step ceiling (`default_max_solves_per_frame`
+  512, a fixed count; at most `max_escalated_solves_per_step` of them tier-1) and
+  writes each output at its solve ordinal; branch-heavy A* frontier work stays
+  scalar inside threaded ranges.
+- Publish: the main thread claims slots, payloads, and long blocks in order, O(1)
+  per result (a claim is never another claim's victim in the same publish);
+  `publish_copy` copies path bytes and buckets each path's registry runs per shard
+  on workers. `registry_flush` then applies the owner log (retire, rename) and adds
+  per shard, appending each shard's sorted segment with one probe per run of
+  same-key records (`ChunkListMap.addAll`); its items are work units over the 16 shard pairs (a pair weighs its
+  ops plus its adds plus one), a range runs the pairs whose first unit lies in it,
+  and at most 15 workers dispatch. Pending compaction costs the solve window, not the queue.
+
+Reachability answers before any search (`pathfinding.md`). Status, intake, and solve
+read, in order, the live goal (the key's cell when open, else its projection from
+the goal table), reach (`connectivity.reach`, O(1): `start_blocked`, `reaches`, or
+`unreachable_goal`), the cache (served only when its stored goal cell is the live
+goal), and pending. Reach is keyed by `TraversalClass` (one per way agents move;
+`walk` today), so a new class adds a connectivity instance. An accepted request
+whose goal became unreachable answers at solve with no search.
+
+A solve on one level within one chunk-local component runs local A* in the
+participant's `SearchScratch`: an AoS table of 16 B slots (cell, stamp with closed
+bit, g, parent slot) at `ceilPow2(2 × budget)` rows (`stamped_table.zig`), a
+per-solve explored budget of min(capacity, reserved limit), and an open heap at
+`openHeapLimit` (4 entries per budgeted node, lazy pop-skip of superseded entries)
+whose sifts move a hole and store the moving node once. Anything else routes
+through the abstract chunk graph: abstract A* over the per-chunk records' portals
+and links picks a corridor (abstract slots cache cell coordinates and portal
+label), then `stitchCorridor` runs local A* per corridor segment (a link is one
+discrete jump) into one obstacle-aware (level, cell) path, at most
+`max_stitch_segments` (512) segment searches per solve. The query walks it cell by
+cell on the agent's level. A two-tier ladder bounds each attempt: tier 0 runs in
+the participant's corridor scratch at 4096 abstract nodes and 512 stitched cells;
+exhausting it promotes the request once to tier 1, which runs in the tier-1 pool
+entry of its escalated admission index at fixed caps of 16384 nodes and 2048 cells,
+never derived from world size (`.claude/rules/budgets-capacities.md`). At tier 1:
+
+- a stitch stopped by its cell or segment cap publishes its prefix as `.partial`
+  when the prefix leaves its start cell, else drops;
+- a segment's node-budget spill drops (the next hop would spill again);
+- an abstract saturation publishes `.partial` toward the least-estimate expanded
+  node (`LeastExpanded`, O(1) per expansion), its stitch cut to the last cell whose
+  estimate lies below the start's (`cutBelowStart`), else drops. On an unchanged
+  graph each such hop ends strictly below its start's estimate, so a hop chain
+  requested from exact ends advances;
+- a drop leaves no negative: the next query reads `.missing` and the requester
+  retries on its replan cooldown. An exhausted budget is never `unavailable`.
+
+`PathView.refresh` marks a start inside a partial's end window (the end's level,
+Chebyshev distance at most one nav chunk side, `inPartialRefreshWindow`, which
+status and intake share), where a request re-solves instead of hitting the cache;
+a re-solve from inside the window costs at most one request per cooldown.
+
+The abstract heuristic (`CrossLevelHeuristic`) is admissible and consistent on
+every edge kind, so corridors are optimal. On the goal level it is octile. Off it,
+h = min(max(h_short, crossing distance), long term):
+
+- h_short prices K = ceil(level gap / widest crossing span) crossings by the
+  cheapest level-crossing short link (a link whose cost covers its planar octile).
+- The crossing distance is a lazy Dijkstra from the goal (`CrossingSearch`) over
+  each level's departing short crossing links clustered into at most 16 boxes plus
+  an arrival window (`NavGraph.level_crossings`, about 840 B per level), exact in a
+  relaxed graph (free octile per level, boxes at least cost). Its budget is the
+  search's node budget / 4 settles (`crossingBoxBudget`); past it the search
+  freezes at the distance of the settle in progress, so h stays a pure function of
+  (graph, goal, budget). A 16-entry level-indexed cache keeps gathered boxes
+  (on the 127-level descent probe, 49,944 gathers became 266, `41afa5f`).
+  Work starts only when a search evaluates a level other than the goal's.
+- The long term is the least, over at most 16 directed long-link pairs (entrance
+  box, exit box, least cost; merged on combined entrance+exit volume at the cap),
+  of the node's entrance-box term plus the pair's cost and its chain bound to the
+  goal (`LinkBounds.chains`: a min-plus closure of pair chains under the crossing
+  rates). Per query the exit lanes and a lazy 16×16 min-plus run once; per push,
+  two gates and one SIMD offset scan over the pairs' lane groups.
+- `LinkBounds` and `level_crossings` fold once per link where links enter the graph
+  (world build, marks commit): O(1) per link, the pair chain closure once per batch
+  that changes the pairs or crossing rates. A refold is a no-op; a dig costs the
+  heuristic nothing. Links are append-only; a future removal seam refolds both
+  from the remaining links.
+
+The result cache (`caches.zig`) is goal-keyed (`.claude/rules/pathfinding.md`): a
+`CacheCore` slot table and entry records (4 results per agent; round-robin victims,
+never a refusal; TTL 300 steps) whose record index is the owner id in the path
+registry. Each entry stores its path exactly in a paged inline stripe of
+`max_stored_path_cells` words (a plain path, or a stitched one as SoA words) or one
+long block (`resultBlockWords`) from a paged pool the publish reserve grows, at most
+one per entry, plus its end and goal cell. A grow appends pages and copies nothing; a
+shrink selects survivors by an O(n) radix pass (oldest first, equal to the age
+order), `resize_copy` moves path bytes on workers, tail pages free, and the owner log
+renames registry owners. A shrink's registry flush runs at a fixed one-range-per-pair
+shape outside the flush tuner. The path registry is 16 `ChunkListMap` shards keyed
+by (level, chunk) (shard = top bits of `std.hash.int` of the key): every published
+path registers each run of consecutive cells on one level in one chunk, so eviction
+reaches exactly the results whose cells a change touches.
+
+Group fields (`group_field.zig`) build only for declared group requests whose
+decaying per-step tally reaches `min_group_field_agents` (1024 sharers, a fixed
+policy constant) and rekey at most once per `group_field_rebuild_min_steps` (8). A
+field floods with Dial's monotone bucket queue at `group_field_build_budget` (8192)
+pops per step, capped per build at `group_field_max_cells` = budget × 16 steps, so
+it is ready within 16 steps on any level; cells past the cap are uncovered and their
+agents take individual solves, never `unavailable`. Storage is a per-field pool of
+nav-chunk cell blocks under a chunk directory, reserved at the field's first build
+and grown on the main thread between expand rounds: a field that runs out stalls
+before its pop and resumes the same step, so coverage never depends on pool
+capacity, and memory follows covered chunks (measured 13 B per covered cell in an
+open crowd, 113–130 B in tunnels, `10bbbc7`). An active goal's field is never
+taken: a new goal takes an empty slot, else the least-demanded inactive goal's
+(lowest slot on a tie), else waits on individual solves.
+
+Capacity is elastic: the population seam grows the pools at least 2× for the live
+agent count (`growForAgentCount`), never refused (`raiseAgentBudget`); a count below
+half capacity for `capacity_shrink_window` (120) steps shrinks them, keeping cached
+results that fit. Every reserve is failure-atomic, and on OOM each table-sizing
+budget falls back to min(committed, requested). A budget whose indices cannot hold a
+field cap or result block fails with `PathfindingBudgetTooWide`.
 
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects are
@@ -871,95 +1036,158 @@ producers: required events fail before structural mutation or domain reaction
 side effects, while diagnostic events are dropped and counted. Reaction work has
 explicit ownership: light orchestration runs inline, and expensive consumers
 split over immutable event slices and write range-owned outputs. After the commit point, the
-post-commit nav reaction folds static obstacle-affecting changes into the
-pathfinding nav graph INCREMENTALLY rather than rebuilding the whole world.
-`PathfindingSystem` owns that reaction end to end (`reactToPostCommitNavEvents`):
-interpreting structural events into changed nav cells, the dirty buffer, and the
-incremental update — it is the named owner for work that scales with
-digging/obstacle edits. `SimulationPipeline` orchestrates by delegating to it,
-and the gameplay state only invokes that delegation at its main-thread commit
-seam, holding the resulting `NavUpdateStats`. The nav-invalidation classifiers
-(`eventInvalidatesNavigation`, `structuralCommandsMayInvalidateNavigation`,
-`pendingEventsMayInvalidateNavigation`) are reusable nav policy on
-`PathfindingSystem` too, used for both the reaction and the pre-commit event
-capacity preflight. Cell-localizable edits — blocking `world_tile_changed` /
-`world_obstacle_changed` changes (only when `old_blocks_movement !=
-new_blocks_movement`) — are forwarded to the system-owned dirty buffer via
-`pipeline.markNavDirty` (one entry per changed cell). Entity-driven obstacle changes
-(`component_changed` on `movement_body`/`collision_bounds`/`collision_response`, and
-`entity_destroyed`) instead carry an optional `ObstacleWorldRect` — the changed
-entity's world-space collision AABB, before and/or after the change, when it was/is a
-static navigation obstacle. `PathfindingSystem` resolves that rect to a nav-cell span
-via `markNavObstacleRectDirty` and patches only the affected chunks, the same
-incremental mechanism tile edits already use, instead of invalidating the whole level.
-`pipeline.markNavLevelDirty(0)` — a whole-level dirty request that re-derives every
-chunk on level 0 (the only level sourcing collision bodies) from the world — is only a
-defensive fallback for the (stated-unreachable) case where the carried rect is null:
-`isStaticNavigationObstacle` requires the same components the rect is derived from, so
-that fallback logs a warn rather than silently rebuilding the whole level.
-`pipeline.applyNavUpdates` coalesces the buffered work to the set of touched chunks
-(resolved obstacle-rect spans, plus every chunk on any whole-level-dirty level),
-RE-DERIVES each touched chunk's
-blocked mask from the world WHOLE-CHUNK (so a coalesced rect, a large multi-actor
-batch, or a cell-less entity change can never leave a cell stale against the world),
-recomputes those chunks' components, and patches the chunk-portal abstract graph once
-(bounded by chunk borders, not cells). An incremental batch keeps `nav_version` STABLE
-and evicts only the cached paths crossing the changed cells (a whole-level request,
-whose change is not bounded by edit spans, drops the whole completed-path cache
-instead); only a degenerate full relabel or an edge-cap fallback — a genuine topology
-rebuild — bumps `nav_version` once so every goal-keyed cache/pending entry and group
-field keyed on the old version re-solves. The dirty
-buffer GROWS rather than dropping, so any number of simultaneous diggers or
-obstacle edits in one step all reach the graph — a dropped cell would leave the
-graph stale. Unaffected chunks are never touched, and the whole-world build runs
-only at init. The abstract SLOT GEOMETRY — the per-chunk perimeter slots plus the
-per-chunk interior link-endpoint runs that index portal nodes — is a pure function of the
-dimensions and the INIT-TIME link set, computed once by `computePortalGeometry`; the
-incremental patch never renumbers it. A `LevelLink` ADDED at runtime (e.g. a ramp
-dig through `DigController.commitWorldEdit`) is therefore handled by endpoint: a PERIMETER
-endpoint keeps its positional slot and is admitted as a portal incrementally, while an
-INTERIOR endpoint has no reserved slot and is DEFERRED — `tryLinkPortal` skips it, leaving
-it non-live in the abstract graph (no portal node), exactly as a blocked endpoint would,
-rather than resolving against an absent run. The walkability-keyed `link_edges` entry still
-forms but is inert: the abstract solver only relaxes a link whose partner endpoint resolves
-to a live portal (`cell_to_portal != no_cell`), so a deferred endpoint is never traversed.
-A deferred interior endpoint is reserved by the next full rebuild. This is correct while
-cross-level NPC pathing is inactive — NPC `goal_level` is pinned to the surface, and the
-PLAYER climbs ramps through the `WorldSystem` link tier (`rampLinkOtherLevel`), not the
-abstract graph; making a runtime interior ramp NPC-pathable would require per-chunk
-interior-link slot headroom reserved at init. The reaction is recorded
-through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel` /
-`nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
-counted full relabel only past a configured level threshold), and a
-`nav_region_invalidated` event is still emitted whenever the graph actually
-changed. The reaction runs at the main-thread post-commit point, but it has TWO independently
-threaded stages, each fanned across the `ThreadSystem` by its OWN adaptive tuner (one
-tuner per stage, never shared): the remask-from-world + component re-flood through
-`nav_remask_tuner`, and the per-chunk abstract patch through `nav_patch_tuner`. So a
-single-tile dig stays inline while a many-chunk dig-storm (NPCs plus the player digging
-at once) parallelizes both stages — the tuners are the work-sizing policy, with no fixed
-per-step budget. Each worker re-derives or patches only its chunk's own disjoint
-mask/component cells and slot/edge windows using a per-participant scratch slot, so the
-threaded result is byte-identical to the serial one (and to a full rebuild). Only the
-`link_edges` rebuild stays serial on the main-thread reaction. It is allocation-free on
-the steady path: the abstract chunk-portal
-buffers grow to their real size at the init rebuild and retain that high-water
-capacity, so an incremental rebuild whose topology stays within the high-water
-mark grows no buffer. The per-participant patch scratch is likewise pre-reserved at
-the build to the largest chunk's caps. The system-owned dirty buffer is likewise
-reserved to a steady-path high-water and does one bounded amortized grow only for an
-unusually large structural step. A genuine topology expansion past it (an unblock opening
-more portals than any prior build) does one bounded amortized growth, which is
-acceptable on this cold, event-triggered path. The `max_nav_memory_bytes` gate
-estimates nav memory from realistic structure (portals bounded by chunk-border
-cells, CSR edges by portal count times a small abstract degree), not a per-chunk
-pairwise worst case, so large sparse worlds build instead of being falsely
-rejected.
+post-commit nav reaction applies the step's terrain and static changes to the
+nav graph (§ Nav Graph And Reaction).
+
+### Nav Graph And Reaction
+
+The nav graph (`nav_graph.zig`, `nav_grid.zig`, `connectivity.zig`) is stored per
+chunk (`.claude/rules/budgets-capacities.md`). With a world, a nav cell is a tile
+and a nav chunk the world's chunk (`NavExtent.world`, one `ChunkGeometry`);
+bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
+
+- **Cells.** Per level, `NavGrid` holds a chunk directory whose entry is OPEN,
+  BLOCKED, or a slot in a pool of cell blocks (blocked bits plus chunk-local
+  component labels; a uniform chunk holds no cells). A chunk's cells are the
+  world's composed blocked bits OR the static colliders listed at that chunk.
+  Reads go through a 3×3 neighborhood and a comptime move table.
+- **Records.** Per level, `NavLevelGraph` holds one record per chunk that has a
+  portal: its border-run portals in a fixed `border_stride` window (at most
+  4 × ceil(E / 2)), its open link-endpoint portals, the links leaving them, and one
+  connectivity node per portal-bearing label. Records, link slots, and nodes are
+  pools with exact free lists (`growPool`), so a release never allocates. Graph
+  node ids never leave a batch (`.claude/rules/pathfinding.md`).
+- **Connectivity.** Each node's row holds a comp, and every comp hangs off one
+  root, so two nodes connect over border mirrors and two-way links exactly when
+  their comps share a root. Over the roots sits the exact one-way closure: a
+  terminal is a root holding an endpoint of a live one-way link, an H-component a
+  weak component of terminals over those links, and each H-component owns its
+  reachability matrix (one bit row per terminal) in a block of its own, freed with
+  it. Memory follows nodes and terminals; a one-way system of k terminals holds
+  about k²/32 words, inherent to an exact table.
+- **Statics.** `StaticColliderSystem` rows (one per static navigation obstacle:
+  committed AABB, level, cell span) are listed per (level, chunk) in a
+  `ChunkListMap` in entity-index order, plus a query tier (a size-class map with
+  per-chunk anchor bitmaps) for `ColliderView.queryBox`. The commit seam captures
+  the step's entity changes into a persistent dirty list; `sync` applies them with
+  O(1) main work per change and a threaded `static_collider_splice` stage that
+  places list entries in entity order, so a static add, move, or destroy costs its
+  own footprint chunks, never the static count.
+
+`PathfindingSystem` owns the post-commit nav reaction end to end
+(`.claude/rules/pathfinding.md`). Writers record what changed, never the reaction:
+a terrain writer (the dig stage, plane traversal's carve batch) reserves its record
+before its world write (`reserveTerrainNavRecord`) and records its appended events
+right after it, even when it failed after writing (`recordTerrainNavEvents`, the
+`nav_mark` stage interpreting events into per-range windows that merge tile boxes
+of one chunk); the collider sync records each change's old and new cell spans
+(`recordStaticColliderChanges`, room reserved before the commit by
+`reserveStaticColliderMarks`). At the seam `reactToPostCommitNavEvents` runs
+`applyBufferedNavUpdates`, each step its own transaction:
+
+1. **Level builds.** Levels the world added build into fresh storage (the same
+   batch over a new level, with an open/blocked/mixed chunk fast path): a level
+   added in play costs its own chunks and nodes, threaded, never refused.
+2. **Revision rebuilds.** The world-wide content revision is compared once (O(1));
+   only when it moved are levels walked, and a level whose revision moved (a change
+   with no per-cell events: a blocking band add, a procedural fill) is rebuilt.
+   `evictLevel` then evicts the results with a path run on that level and its group
+   fields, O(level chunks + registrations), one flush after the loop; pending
+   requests survive, since a solve re-checks its live goal and reach.
+3. **Marks batch.** The recorded marks and every link added since the last batch
+   apply as one transaction. `prepareMarks`, the fallible half, plans the changed,
+   dirty, and patch keys (the `plan` stage sorts and dedupes per range; the merge
+   pops each level's ordered chunk set, `LevelPlanSets`, about 3 bits per chunk,
+   sized at level build and freed with the level, through a world-level set over
+   the levels holding keys, so main is linear in keys) and reserves cell blocks,
+   records, link slots, connectivity and closure staging, and the eviction windows
+   (`nav_evict_count`). `commitMarks`, the infallible half, folds the new links into
+   `link_bounds` and `level_crossings`, remasks the changed chunks from the world and
+   the colliders (recording each chunk's flipped cells), re-derives only the patch
+   keys on the changed span's edge plus link keys, and updates connectivity and the
+   closure. `abortMarks` drops a prepare with the graph and its marks unchanged. On
+   any error the graph is intact and every mark, level, revision, and link gap stays
+   pending for the next step; there is no relabel, degraded state, or level- or
+   world-wide fallback, and an incremental batch never bumps `nav_version`.
+4. **Eviction.** `nav_evict` walks each changed key's owned halo keys (its 3×3
+   block, each halo key owned by exactly one changed key) and evicts exactly the
+   cached paths with a cell within one cell of a changed cell and the group fields
+   with a costed cell within one cell of one; the main thread removes the hits in
+   item order, O(1) each, and `evict_flush` unlinks their registrations. Pending
+   requests, tallies, and every other result and field survive. A new ramp or
+   teleport evicts nothing: it only adds connectivity.
+5. **Landing.** `landClosure` lands the one-way closure blocks the step relocated
+   (below), once, on the error path too.
+
+Connectivity maintenance per batch: a seed stage reads the changed chunks'
+pre-change adjacency, a gather stage reads the re-derived records, and the main
+thread merges both in key order (node rows, unions, fresh ids, union by size).
+Changes no removal can split settle at once. Removals flood both sides read-only on
+workers in balanced rounds: per round each lagging set of a family runs one search
+of up to its budget (targets m + clamp(m / 2, 1, 512), round window 16384), budgets
+equalize the family's claimed counts, and main merges claims, joins, and queue
+splices in item order at O(1) per item; every round runs under one profile selected
+once and recorded once (`RoundDispatch`). A removal therefore costs about its smaller
+side when it splits a component, or the reach until both floods meet when it does
+not, the reachability exception in `.claude/rules/budgets-capacities.md` (measured:
+at most ~2.2× the smaller side, a thin tunnel ~2× its length, flat in level side
+256–2048, `e793590`). A change touching no one-way system does no closure work. A
+touched system re-resolves its links (threaded per link), masks the rows whose reach
+can change, plans SCC levels (Tarjan per piece), and recomputes only those rows per
+SCC span in level rounds, threaded under `RoundDispatch`; main merges terminals and
+pieces and commits, O(1) per item. Blocks grow by powers of two and narrow when under
+a quarter full; a relocated or new block is written at commit into the batch's tail,
+reserved at prepare from the batch's exact per-key bound, so commit stays
+allocation-free, and lands (`conn_closure_land`, threaded per line) into its own
+allocation at the end of the update. No batch reads or moves an untouched
+component's block. A landing that runs out of memory is deferred: the blocks stay
+valid in the tail, `land_deferrals` counts it (logged once), and the next prepare
+retries it, failing as ordinary OOM with the graph intact. An index-map entry is
+live when the terminal it names points back to it at its own index, so terminal and
+H-component ids use the full u32.
+
+Every stage has its own tuner and an inline path: `nav_mark` and the eviction trio
+(`nav_evict_count`, `nav_evict`, `evict_flush`) on `PathfindingSystem`, and the
+graph's `NavStage` tuners (`plan`, `remask`, `patch`, `conn_seed`, `conn_gather`,
+`conn_flood`, `conn_closure_candidates`, `_resolve`, `_mask`, `_plan`, `_rows`,
+`_land`) under one `nav_controls`. The main thread keeps O(1) work per item
+(`.claude/rules/threading.md`); a single dominant one-way system's Tarjan is one
+item, so it runs where the thread system places one item, and its rows thread. The
+runtime perf log records `nav_remask`, `nav_connect` (the flood rounds), `nav_closure`
+(the closure rows), and `nav_evict`. `NavUpdateStats` folds the plan, remask, and
+patch stats over level builds and marks, and `--details` splits the reaction's main
+time by section (`main_split`).
+
+Batch staging (key lists, windows, tallies, masks, remask and patch lists, plan and
+connectivity staging) grows through counted helpers and is released by a
+sustained-window rule (`types.StagingWindow`: `capacity_shrink_window` fixed steps,
+quiet steps included, below half), only at `finishStagingStep` at the end of a step,
+never inside a stage; floors keep a single dig allocation-free. A step's level builds
+share one level-sized staging, freed at that step's end. Connectivity's merge map
+runs at load 3/4; the goal table, read on workers, at 1/2.
+
+Index widths fail loudly (`budgets-capacities.md`): `validateChunkGrid` runs at world
+create, level add in play, nav rebuild, and collider geometry (the chunk edge; each
+side below the u32 sentinel; width × height below 2^32 - 1; chunk count below 2^31;
+`chunks_x × chunk_tiles` within u32), and `NavExtent.validatedCellGrid` is the one
+validate-and-cast site, clamping each side's float quotient so an oversize or
+infinite bound fails as `LevelCellIndexOverflow`. The u16 level index fails with
+`WorldLevelOverflow`. Node rows are proven below `no_node` through the label space
+(live plus one batch's claims at most 2 × chunks × labels); closure offsets are
+`usize`. Ids that grow in play (connectivity comp, root, terminal, and H-component
+ids, the one-way registry, merge staging, level-link endpoints, sparse rows, dense
+layers, chunk-list entries, anchor blocks) stay u32 and fail as `OutOfMemory` at
+their growth seam, state intact for retry.
 
 ## SIMD Helpers
 
-`src/core/simd.zig` provides project-named four-lane vector aliases and helper
-functions for SoA movement, particle, and data processor loops. The helpers use
+`src/core/simd.zig` provides project-named vector aliases and helper functions for
+SoA movement, particle, terrain, nav, steering, and data processor loops. Every lane
+count derives from one 16-byte register constant (the SSE2/NEON width): four lanes
+for 32-bit elements (`Float4`, `Int4`), and a private 8 × u16 vector behind
+`countUnequalU16`; nothing is wider than 128 bits. Each kernel has a scalar twin
+and a parity test (for example `math.lastCellOfSpan` and `lastCellOfSpan4`, the one
+mapping of a half-open max edge to its cell). The helpers use
 Zig `@Vector` operations as the portable abstraction so LLVM can lower vector
 math to the target CPU features, such as SSE-family instructions on x86 targets
 or NEON on ARM targets, when the target and optimization mode make that

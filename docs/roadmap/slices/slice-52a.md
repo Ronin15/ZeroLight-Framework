@@ -3,7 +3,8 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: in progress.** The Windows LTO-off item landed 2026-10-05
-(`01754ec`); everything else is not started. First of 52A → 52B → 52C; 52D
+(`01754ec`); 64G set the release-mode CPU default (`46d3b7f`, `83f36a6`);
+everything else is not started. First of 52A → 52B → 52C; 52D
 needs its `-Dcpu-baseline`. Rebases on Slice 50's `build.zig` edits.
 
 Goal: a release build means the same ISA, Zig, SDL, and shader bytes on every
@@ -14,12 +15,16 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 ### Current foundation
 
-- `build.zig` calls `b.standardTargetOptions(.{})`, which resolves to the host
-  CPU with no `-Dcpu`. On the Zen 4 dev host a `--release=fast` package can
-  emit AVX-512 and SIGILL on Zen 2/3, the Steam Deck, and Intel 12th–14th gen
-  consumer parts; a Windows cross package gets generic `x86_64` (SSE2), so
-  native and cross packages ship different ISAs.
-- `core/simd.zig` fixes `lane_count = 4` (`@Vector(4, f32)`). `src/` has no
+- `build.zig` defaults every release mode (ReleaseSafe soaks included) to the
+  shipped CPU: `x86_64_v2` on x86-64, `apple_m1` on macOS arm64, the arch
+  baseline elsewhere (64G P1, `build.zig:80-83`, `:750-758`); Debug resolves to
+  the host CPU; `-Dcpu`/`-Dtarget` override. There is no `-Dcpu-baseline`
+  option yet. A `-Dtarget` cross build without `-Dcpu` takes that target's
+  default CPU (derived, not run).
+- `core/simd.zig` derives every lane count from one 16-byte register constant
+  (`vector_bytes`, the SSE2/NEON width): `lane_count = 4` (`@Vector(4, f32)`) and
+  a private 8 × u16 vector behind `countUnequalU16`; nothing is wider than 128
+  bits. `src/` has no
   `@setFloatMode` or `@mulAdd`, so strict float mode keeps results
   bit-identical across `x86_64`, `x86_64_v2`, and native. Scalar==SIMD and
   serial==threaded parity tests exist in about 18 modules.

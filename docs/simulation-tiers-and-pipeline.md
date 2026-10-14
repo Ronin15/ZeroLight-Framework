@@ -82,7 +82,8 @@ mechanism needed), then the **affect stage**
 (appraising this step's just-written perception/memory state, both
 independently optional per row, plus each agent's own `AiAgent.behavior`, into
 four drives — fear, curiosity, aggression, fatigue — decayed toward per-entity
-baselines), then owns AI navigation-intent production, steering/path status,
+baselines), then owns AI navigation-intent production, the step's goal table
+(`path_goal_resolve`), steering/path status,
 pathfinding, sparse movement-intent application, movement, collision detection,
 collision response, bounds clamp + world-tile gating, and plane traversal — AI,
 movement, and collision run scope-gated through a `scope_dense_indices` option.
@@ -114,10 +115,15 @@ Late-stage pose order (after movement integrate):
 
 1. `collision_scope_gather` → `collision_detect` → `collision_respond`
 2. `bounds_and_tile_gate` (world bounds clamp + solid-tile gate)
-3. `plane_traversal` (ramp follow / one-level fall; batches landing-cell tile
-   events into one `finishWrite`; landing-carve scratch is preflighted before any
-   carve; a carve count past the declared reservation is counted in
-   `dig_plane_scratch_grown`, and grows the scratch first if its capacity is short)
+3. `plane_traversal` (ramp follow / one-level fall): `PlaneEntrySystem` gathers
+   and classifies the step's NPC cell entries on workers into windows reserved at
+   init and at the population seam (a shortfall grows on main before dispatch,
+   counted in `plane_entry_windows_grown`); the reserve decides every traversal in
+   commit order, O(1) per entry, and reserves the carves' write scratch (a carve
+   count past the declared reservation is counted in `dig_plane_scratch_grown`);
+   the carves write as one batched `applyDenseCellWrites` (all or nothing, on the
+   world's terrain-edit tuners under `DigController.carve_controls`), their
+   landing-cell tile events published as one event range and recorded for nav
 4. `chunk_derive` → `action_react` → `tier_policy`
 
 The tile gate runs **after** collision response so a contact push into solid
@@ -127,9 +133,9 @@ movement and the gate. The gate resolves X then Y against the pre-move position
 (wall-sliding) and is a no-op on level 0 (surface is fully walkable there).
 
 NPCs carry a `world_level` component in `DataSystem` (Slice 25E). After movement,
-collision, and the tile gate settle, plane traversal mirrors the player
-ramp/fall cell-entry policy for NPCs and commits level changes on the main
-thread. Off-surface entities are gated by `gateNpcEntitiesToWalkableTiles`
+collision, and the tile gate settle, plane traversal applies the player's
+ramp/fall cell-entry policy (one shared `planeTarget`) to NPCs and commits level
+changes on the main thread. Off-surface entities are gated by `gateNpcEntitiesToWalkableTiles`
 against solid tiles on their current plane; NPC gate and plane-traversal both
 skip dormant-tier entities, since movement never moves them. Steering and
 pathfinding read each entity's `world_level` for `start_level`; level transitions
@@ -272,7 +278,9 @@ the count it declared.
   `.dig` (a full live bus returns `StimulusCapacityExceeded` and leaves the
   tile unchanged), then `SensoryBus.appendFootstep` may emit one optional
   `.footstep`. **Deferred producer:** `SensoryBus.enqueuePlayerImpacts` after
-  `collision_respond` writes `.impact` into the bus's fixed deferred buffer;
+  `collision_respond` reads the response's observer contacts (the contacts naming
+  the player, merged in range order) and writes `.impact` into the bus's fixed
+  deferred buffer;
   promote runs on the next step's `dig_world_edit`, so perception never reads
   same-step impacts. **Sticky one-shots:** `advanceSticky` after perception
   captures live `.dig` and `.impact` for `cognition_stagger_n - 1` further
@@ -333,14 +341,11 @@ tile and obstacle flags. They wake explicit reaction points such as pathfinding
 or future world-collision refreshes; they are not immediate callbacks from
 `WorldSystem`.
 
-Entity-driven obstacle events (`component_changed` on `movement_body`/
-`collision_bounds`/`collision_response`, and `entity_destroyed`) also carry an
-optional `ObstacleWorldRect` — the changed entity's world-space collision AABB,
-before and/or after the change, when it was/is a static navigation obstacle.
-Pathfinding resolves that rect to a nav-cell span (`markNavObstacleRectDirty`)
-and patches only the affected chunks, the same incremental mechanism tile edits
-already use, instead of invalidating the whole level. A null rect (component
-data insufficient to derive one) falls back to a whole-level nav dirty mark.
+Static obstacles reach nav through the static-collider sync, not events: the
+commit seam captures the step's entity changes, `StaticColliderSystem.sync`
+applies them from the entities' final state, and pathfinding records each
+change's old and new cell spans as marks for the same step's nav reaction, which
+patches only those chunks.
 
 `appendRequired` fails if the configured event capacity cannot hold the event.
 `appendDiagnostic` drops on capacity failure and increments dropped stats. Use
@@ -355,7 +360,9 @@ a capacity condition. The `.structural_commit` arm is the pipeline's own share
 (`pipeline_structural_event_share`: one single-event `destroy_entity`/`set_destructible`
 per live action intent from the `action_react` stage) plus the caller's
 `SimulationPipelineConfig.structural_headroom`, which covers only the structural commands
-the caller itself queues.
+the caller itself queues. `structural_headroom` also sizes the structural-command
+stream past one tier command per body and its range count past the pipeline's own
+ranges, one range per event.
 
 Events are for low-volume notable changes and transitions, not high-volume
 per-frame per-entity data. Dense per-step results — for example AI separation,
@@ -391,9 +398,15 @@ Commit behavior:
   counts against tracked logical capacities, and on growth a geometric
   (`rows + rows/2 + 16`, hot-store aligned) re-reserve of every
   population-sized pipeline capacity, frame stream, the event bound, and the
-  pathfinding elastic pools. It is the only population growth point. The
+  pathfinding elastic pools. It is the only population growth point. Each frame
+  stream reserves the range count its writers can produce at the tracked
+  population: `navigation_intents` the `ai_decide` ranges, `intents` and
+  `path_requests` steering's avoidance ranges (`steeringStreamRangeCount`), and
+  `structural_commands` the tier-policy ranges, one destructible range, and one
+  per `structural_headroom` event. The
   contact-dependent capacities (`frame.contacts`, `frame.collision_triggers`, the
-  collision-response intents and trigger pairs) are reserved in
+  collision-response intents, band order, trigger pairs, observer contacts, and
+  gather-range staging) are reserved in
   `SimulationPipeline.reserve`, which the seam re-runs, to the collision pair bound
   (`CollisionSystem.estimateContactCapacity`: 4 candidate pairs per body of capacity,
   the bound the collision stores use; each broadphase range slot holds 4 pairs per
@@ -406,24 +419,36 @@ capacity fails.
 
 ## Post-Commit Reactions
 
-After structural commit and event publication, `GameDemoState` calls two
-independent `SimulationPipeline` reactions against the same committed event
-stream. The reactions run after `syncPopulationCapacity`, so they see grown
-capacities.
+The commit seam (`GameDemoState`'s `commitStructuralAndReact`) runs, in order:
+`reserveStaticColliders` (collider rows and static nav marks, before the commit),
+the budgeted commit, `captureStaticColliderChanges` (the step's entity changes into
+the collider's persistent dirty list), `syncPopulationCapacity`,
+`syncStaticColliders` (run even when the growth seam failed, so the step's static
+changes land and reach nav; it records their nav marks), then two independent
+reactions against the same committed state:
 
-- `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, interpreting
-  nav-invalidating committed events (`world_tile_changed`,
-  `world_obstacle_changed`, entity-driven obstacle changes) into dirty nav
-  cells, applying the incremental nav-graph patch, and emitting
-  `nav_region_invalidated`.
+- `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, which applies
+  every pending nav change (marks the terrain writers and the collider sync
+  recorded, and the world's level, link, and content-revision gaps) as one
+  transaction per step and emits one `nav_region_invalidated` when the graph
+  changed. It runs only after a successful growth seam and collider sync; else
+  every mark stays for the next step.
 - `reactToPostCommitSteeringEvents` delegates to `SteeringSystem`, marking its
-  static-obstacle snapshot and steering-to-movement index cache stale when
-  committed events change static obstacles or renumber dense rows.
+  steering-to-movement index cache stale when the commit renumbered dense rows.
+  Steering reads the synced collider rows directly, so a static change rebuilds
+  nothing steering-side. It always runs.
 
-The reactions are side effects on fully disjoint state. The nav result is
-captured, the steering reaction runs, and only then is a nav error returned, so
-a nav failure never leaves steering's snapshot stale. Perception has no
-reaction: line of sight reads the world's chunk terrain directly.
+The reactions are side effects on fully disjoint state. The first growth,
+collider, or nav error is returned only after the steering reaction has run. A
+growth or nav failure still leaves steering on the committed statics; a failed
+collider sync keeps steering on the pre-commit rows and keeps its changes for the
+next step's sync. Perception has no reaction: line of sight reads the world's
+chunk terrain directly.
+
+Nav, the static-collider splice, and the terrain edit stages take their range
+controls as one `StageControls` each (`PathfindingSystem.nav_controls`,
+`StaticColliderSystem.splice_controls`, `TerrainEditThreads.controls`), like every
+other threaded stage; production leaves them at their defaults.
 
 ## Current Integration
 
@@ -433,9 +458,9 @@ reaction: line of sight reads the world's chunk terrain directly.
 - starts each fixed step with `beginStep()`;
 - writes player input and audio commands at the main-thread boundary;
 - delegates reusable fixed-step systems and stage order to `SimulationPipeline`;
-- consumes structural/domain/world events to rebuild navigation when static
-  obstacle-affecting changes require it;
-- applies structural commands at the fixed-step commit boundary;
+- applies structural commands at the fixed-step commit boundary and runs the
+  commit seam above (collider sync, population seam, nav and steering
+  reactions);
 - reserves renderer command capacity after structural commits and before render
   submission.
 
@@ -472,3 +497,8 @@ Tests for this module prove the stream contracts directly:
   mutation;
 - no test-only payload tags or fake stages in production contracts
   (`.claude/rules/tests-benchmarks.md`).
+
+The pipeline's threaded-profile tests pin every stage tuner through a comptime
+walk of `SimulationPipeline`'s fields (`pinPipelineThreadedProfiles`): a tuner
+behind a slice, many-item pointer, error union, or union fails the build, so a new
+tuner cannot be missed.

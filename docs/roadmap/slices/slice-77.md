@@ -18,7 +18,10 @@ up the same step.
 - Dense one-step terrain edits exist (64G S3b):
   `WorldSystem.applyDenseCellWrites`, chunk-major, threaded, serial equals
   threaded, OOM changes nothing. `chunk-scale-explosion-fill` times a disk
-  region at 4, 64, and 256 chunks; no gameplay calls it.
+  region at 4, 64, and 256 chunks; only plane traversal's fall carves call it.
+- Terrain writers reach nav through 64G's two-call contract (reserve the nav
+  record before the write, record every applied write after it on every exit
+  path); see [Slice 76](slice-76.md).
 - The demo's crates (`game_demo_state.zig`, `setDestructible` with one hit
   point) break on interact/attack with a small particle puff
   (`destroy_burst_*`, `destructible_controller.zig`): no area, no terrain
@@ -47,6 +50,11 @@ up the same step.
 - [ ] Entities in the region hit through deferred commands; required events
       reserved before the step.
 - [ ] Downstream reactions take an explosion without a per-cell event cap.
+- [ ] The explosion writer reserves its nav record before its write and records
+      every applied write on every exit path, as the dig stage does.
+- [ ] The explosion's dense write records its cost-driver stage
+      (`terrain_edit_write`) in the runtime perf log at its call site, shared with
+      Slice 76's.
 - [ ] Tests: serial equals threaded; OOM leaves terrain and entities intact
       and the retry gives the same result; an explosion spanning chunks and
       levels; an explosion that triggers a collapse.

@@ -17,10 +17,9 @@ results never depend on a chunk's form.
 
 ### Current foundation
 
-- Terrain and nav are per-level flat arrays and per-level graphs today
-  (`WorldSystem` `dense_tile_ids`, `NavGrid`, `NavLevelGraph`); 64G replaces
-  them with chunk-owned storage, a per-level chunk directory, and per-chunk
-  render upload; storage forms are this slice's.
+- Terrain and nav are chunk-owned (64G): per-level chunk directories over
+  pools of tile blocks, nav cell blocks, and per-chunk records, with per-chunk
+  render upload for the window; storage forms are this slice's.
 - Positions are absolute world `f32` coordinates in every position column,
   path cache, marker, anchor, and node index; level dimensions are `u16`.
 - Slice 58 (not landed) makes terrain a pure function of seed, spec, and cell,

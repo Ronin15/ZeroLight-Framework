@@ -14,26 +14,29 @@ apply produces for the same batch.
 
 ### Current foundation
 
-The nav storage below is per level today; 64G replaces it.
+Nav is chunk-owned (64G).
 
 - `PathfindingSystem.reactToPostCommitNavEvents`
-  (`src/game/systems/pathfinding/system.zig`) marks events into grow-only
-  dirty buffers, applies them synchronously (`applyBufferedNavUpdates`), and
-  emits at most one `nav_region_invalidated`. It runs at the commit seam
-  (`merge_outputs`), outside `stage_order`, from
-  `GameDemoState.applyStructuralCommandsAndPostCommitEvents` through
-  `SimulationPipeline`.
+  (`src/game/systems/pathfinding/system.zig`) applies the marks terrain
+  writers and the collider sync recorded (grow-only) synchronously
+  (`applyBufferedNavUpdates`) as one prepare/commit transaction over dirty
+  chunks, threaded per stage, and emits at most one `nav_region_invalidated`.
+  It runs at the commit seam, outside `stage_order`, from
+  `GameDemoState`'s `commitStructuralAndReact` through `SimulationPipeline`.
 - `PathfindingSystem.graph` is read every step by `pathfinding_update`
   workers and steering, and written only by the full build and the
   post-commit apply. Movement and collision read the world, never the graph.
-- After an apply, cached paths are evicted by changed spans, cleared for a
-  whole-level change, or invalidated by a version bump.
-- A batch touching more than `nav_full_relabel_level_threshold` (8) levels
-  relabels every level; 64G retires relabel, fallback rebuilds, and
-  per-level storage and makes the per-step apply all-or-nothing and threaded
-  over dirty chunks.
-- `expectGraphsEquivalent` (`nav_graph.zig`) is today's equivalence oracle;
-  64G keeps incremental == full rebuild.
+- After an apply, exactly the cached paths and group fields within one cell of
+  a changed cell are evicted, and a level rebuilt by a content revision evicts
+  its own results; connectivity ids and the one-way closure are updated in the
+  same transaction. No relabel, fallback rebuild, or version bump runs on an
+  incremental change.
+- `expectGraphsEquivalent` (`nav_graph.zig`) is the equivalence oracle;
+  incremental equals a full rebuild, connectivity included.
+- Measured dense-change reaction (`chunk-scale-nav-cave-in`,
+  `chunk-scale-nav-enclose`, `pathfinding-evict` regions): linear in the change's
+  chunks with an O(1)-per-item main floor (Slice 64G § Landed nav: measured
+  limits).
 - The production allocator (`std.process.Init.gpa`) is thread-safe.
 
 ### Architecture notes
