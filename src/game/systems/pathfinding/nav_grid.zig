@@ -135,7 +135,7 @@ pub const NavGrid = struct {
     // levels.
     level: u16 = 0,
     cell_size: f32 = default_cell_size,
-    geometry: types.ChunkGeometry = .empty,
+    geometry: world_terrain.ChunkGeometry = .empty,
     blocked_count: usize = 0,
     dir: std.ArrayList(u32) = .empty,
     blocks: std.MultiArrayList(NavCellBlock) = .{},
@@ -160,8 +160,8 @@ pub const NavGrid = struct {
         self: *NavGrid,
         allocator: std.mem.Allocator,
         level: u16,
-        width: usize,
-        height: usize,
+        width: u32,
+        height: u32,
         cell_size: f32,
         chunk_tiles: u16,
     ) !void {
@@ -243,7 +243,7 @@ pub const NavGrid = struct {
             blocked_entry => blocked: {
                 // A chunk's in-level extent is at most its edge of 16 cells.
                 const b = self.chunkBounds(chunk);
-                break :blocked world_terrain.inLevelMask(self.edgeGeometry(), .{ .min_x = 0, .min_y = 0, .cols = @intCast(b.x1 - b.x0), .rows = @intCast(b.y1 - b.y0) });
+                break :blocked world_terrain.inLevelMask(self.geometry, .{ .min_x = 0, .min_y = 0, .cols = @intCast(b.x1 - b.x0), .rows = @intCast(b.y1 - b.y0) });
             },
             else => |slot| self.block_bits[slot],
         };
@@ -261,7 +261,7 @@ pub const NavGrid = struct {
             .open => @splat(0),
             .blocked => blocked: {
                 const b = self.chunkBounds(chunk);
-                break :blocked world_terrain.inLevelMask(self.edgeGeometry(), .{ .min_x = 0, .min_y = 0, .cols = @intCast(b.x1 - b.x0), .rows = @intCast(b.y1 - b.y0) });
+                break :blocked world_terrain.inLevelMask(self.geometry, .{ .min_x = 0, .min_y = 0, .cols = @intCast(b.x1 - b.x0), .rows = @intCast(b.y1 - b.y0) });
             },
             .mixed => world_system.levelChunkBlockedBits(self.level, chunk).?.*,
         };
@@ -275,7 +275,6 @@ pub const NavGrid = struct {
     // ORs in as one `rectMask`; no per-cell loop is left to vectorize.
     pub fn composeChunk(self: *const NavGrid, chunk: u32, world: ?*const WorldSystem, colliders: ColliderView) ChunkBits {
         const b = self.chunkBounds(chunk);
-        const edge = self.edgeGeometry();
         var bits = self.worldChunkBits(chunk, world);
         var rows = colliders.chunkRows(self.level, chunk);
         while (rows.next()) |row| {
@@ -286,15 +285,10 @@ pub const NavGrid = struct {
             const x1 = @min(@as(usize, cells.max_x) + 1, b.x1);
             const y1 = @min(@as(usize, cells.max_y) + 1, b.y1);
             if (x0 >= x1 or y0 >= y1) continue;
-            const mask = world_terrain.rectMask(edge, @intCast(x0 - b.x0), @intCast(y0 - b.y0), @intCast(x1 - b.x0), @intCast(y1 - b.y0));
+            const mask = world_terrain.rectMask(self.geometry, @intCast(x0 - b.x0), @intCast(y0 - b.y0), @intCast(x1 - b.x0), @intCast(y1 - b.y0));
             for (&bits, mask) |*word, row_bits| word.* |= row_bits;
         }
         return bits;
-    }
-
-    // One chunk square of this grid's edge, for chunk-local bit masks.
-    fn edgeGeometry(self: *const NavGrid) world_terrain.ChunkGeometry {
-        return world_terrain.ChunkGeometry.init(self.geometry.chunk_tiles, self.geometry.chunk_tiles, self.geometry.chunk_tiles);
     }
 
     /// Stores `bits` as `chunk`'s cells: OPEN or BLOCKED when every in-level cell agrees,
@@ -337,7 +331,7 @@ pub const NavGrid = struct {
         const shift = self.geometry.shift;
         const edge: usize = self.geometry.chunk_tiles;
         const mask: usize = edge - 1;
-        const in_level = world_terrain.inLevelMask(self.edgeGeometry(), .{ .min_x = 0, .min_y = 0, .cols = @intCast(cols), .rows = @intCast(rows) });
+        const in_level = world_terrain.inLevelMask(self.geometry, .{ .min_x = 0, .min_y = 0, .cols = @intCast(cols), .rows = @intCast(rows) });
         var open: ChunkBits = undefined;
         for (&open, bits, in_level) |*word, blocked, inside| word.* = ~blocked & inside;
         var unvisited = open;
@@ -393,9 +387,8 @@ pub const NavGrid = struct {
     // `ColliderGeometry.footprint` maps a static. Precondition: a prepared grid.
     pub fn cellSpanForWorldRect(self: *const NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) NavSpan {
         std.debug.assert(self.geometry.width != 0 and self.geometry.height != 0);
-        // `validateChunkGrid` keeps the cell count, so each dimension, below 2^32.
-        const width: u32 = @intCast(self.geometry.width);
-        const height: u32 = @intCast(self.geometry.height);
+        const width = self.geometry.width;
+        const height = self.geometry.height;
         return .{
             .min_x = math.worldPosToCell(min_x, self.cell_size, width),
             .min_y = math.worldPosToCell(min_y, self.cell_size, height),
@@ -525,23 +518,8 @@ pub const NavGrid = struct {
         return self.cellSpanForWorldRect(first.x, first.y, last.x + last.w, last.y + last.h);
     }
 
-    // Chunk-tiling geometry for this grid; every level of a graph shares it.
-    pub fn chunkGeometry(self: *const NavGrid) types.ChunkGeometry {
-        return self.geometry;
-    }
-
-    pub fn chunksX(self: *const NavGrid) usize {
-        return self.geometry.chunksX();
-    }
-
-    pub fn chunksY(self: *const NavGrid) usize {
-        return self.geometry.chunksY();
-    }
-
-    pub const ChunkBounds = types.ChunkGeometry.Bounds;
-
     // Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the grid.
-    pub fn chunkBounds(self: *const NavGrid, chunk_id: u32) ChunkBounds {
+    pub fn chunkBounds(self: *const NavGrid, chunk_id: u32) world_terrain.ChunkGeometry.Bounds {
         return self.geometry.chunkBounds(chunk_id);
     }
 
@@ -748,7 +726,7 @@ test "a block pool grown one claim at a time stays within its storage bound, its
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 64, 64, 1, 4);
-    const chunks = grid.chunkGeometry().chunkCount();
+    const chunks = grid.geometry.chunkCount();
     var pool_grows: u64 = 0;
     // Half the chunks plus one claimed one at a time, each grown for just the next one: the
     // last claim doubles the pool to nearly twice its need.
@@ -818,9 +796,9 @@ test "a cell-aligned static past 32768 world units blocks only its own nav cell"
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 2048, 2048, 32, 16);
-    const chunks_x: u32 = @intCast(grid.geometry.chunks_x);
+    const chunks_x = grid.geometry.chunks_x;
     const own = grid.composeChunk(68 * chunks_x + 68, null, colliders.view());
-    try std.testing.expectEqual(world_terrain.rectMask(grid.edgeGeometry(), 15, 15, 16, 16), own);
+    try std.testing.expectEqual(world_terrain.rectMask(grid.geometry, 15, 15, 16, 16), own);
     const empty: ChunkBits = @splat(0);
     try std.testing.expectEqual(empty, grid.composeChunk(68 * chunks_x + 69, null, colliders.view()));
     try std.testing.expectEqual(empty, grid.composeChunk(69 * chunks_x + 68, null, colliders.view()));

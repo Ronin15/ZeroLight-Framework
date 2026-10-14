@@ -786,7 +786,7 @@ fn expectFieldEqualsFlat(field: *const GroupField, flat: *const FlatField, grid:
 }
 
 // A width x height grid at chunk edge `edge` with about a quarter of its cells blocked.
-fn randomObstacleGrid(allocator: std.mem.Allocator, grid: *NavGrid, width: usize, height: usize, edge: u16, seed: u64) !void {
+fn randomObstacleGrid(allocator: std.mem.Allocator, grid: *NavGrid, width: u32, height: u32, edge: u16, seed: u64) !void {
     try grid.prepare(allocator, 0, width, height, default_cell_size, edge);
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();

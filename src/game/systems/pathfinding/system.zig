@@ -52,7 +52,7 @@ const bitIsSet = @import("../../world_terrain.zig").bitIsSet;
 const NavBatchResult = @import("nav_graph.zig").NavBatchResult;
 const keyLevel = @import("../chunk_list_map.zig").keyLevel;
 const keyChunk = @import("../chunk_list_map.zig").keyChunk;
-const ChunkGeometry = @import("types.zig").ChunkGeometry;
+const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
 const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
 const ChunkListMap = @import("../chunk_list_map.zig").ChunkListMap;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
@@ -5212,8 +5212,8 @@ test "nav over a world takes the world's chunk edge and tile size; a world-less 
     try std.testing.expectEqual(@as(usize, world.height), system.graph.geometry.height);
     const level_grid = system.graph.grid(0).?;
     try std.testing.expectEqual(world.chunk_size_tiles, level_grid.geometry.chunk_tiles);
-    try std.testing.expectEqual(@as(usize, world.chunksX()), level_grid.chunksX());
-    try std.testing.expectEqual(@as(usize, world.chunksY()), level_grid.chunksY());
+    try std.testing.expectEqual(@as(u32, world.chunksX()), level_grid.geometry.chunks_x);
+    try std.testing.expectEqual(@as(u32, world.chunksY()), level_grid.geometry.chunks_y);
     // Every tile's nav chunk is its world chunk.
     for (0..world.height) |y| {
         for (0..world.width) |x| {
@@ -5247,6 +5247,13 @@ test "nav build fails loudly when its chunk edge or index widths do not fit" {
     try system.reserve(unit_edge);
     try std.testing.expectError(error.ChunkLabelOverflow, system.rebuildStaticNavGrid(&data, 65535, 32769, 1));
     try std.testing.expectError(error.LevelCellIndexOverflow, system.rebuildStaticNavGrid(&data, 1.0e6, 1.0e6, 1));
+    // A side past 2^32 cells, a side past usize, and a subnormal cell size's inf quotient each
+    // reach the validator rather than trapping in the float conversion.
+    try std.testing.expectError(error.LevelCellIndexOverflow, system.rebuildStaticNavGrid(&data, 0x1p33, 1, 1));
+    try std.testing.expectError(error.LevelCellIndexOverflow, system.rebuildStaticNavGrid(&data, 1.0e30, 1.0e30, 1));
+    try std.testing.expectError(error.LevelCellIndexOverflow, system.rebuildStaticNavGrid(&data, 1, 1, std.math.floatTrueMin(f32)));
+    const huge_extent = system.boundsNavExtent(1.0e30, 1, 1);
+    try std.testing.expectError(error.LevelCellIndexOverflow, system.graph.rebuild(.{}, huge_extent, null));
 }
 
 test "a nav update reports its marks batch's remask, and an update without marks reports none" {
@@ -6877,8 +6884,7 @@ fn saturatingStripCapacity(nodes: usize) PathfindingCapacity {
 
 // The search's estimate on the strip (one level, no links): the octile from `cell` to `goal`.
 fn stripEstimate(system: *const PathfindingSystem, cell: u32, goal: u32) u32 {
-    // Sides of the strip fit u32.
-    const width: u32 = @intCast(system.graph.geometry.width);
+    const width = system.graph.geometry.width;
     return types.octileU32(cell % width, cell / width, goal % width, goal / width);
 }
 

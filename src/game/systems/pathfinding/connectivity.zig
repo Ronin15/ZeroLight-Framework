@@ -50,6 +50,7 @@ const LabelSet = @import("nav_graph.zig").LabelSet;
 const maxChunkLabels = @import("nav_grid.zig").maxChunkLabels;
 const CellCoord = @import("../../world_system.zig").CellCoord;
 const no_link_endpoint = @import("../../world_terrain.zig").no_link_endpoint;
+const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
@@ -1805,7 +1806,7 @@ pub const Connectivity = struct {
         const world_system = world orelse return;
         const links = world_system.levelLinks();
         std.debug.assert(self.endpoint_links_seen <= links.len);
-        const geometry = types.ChunkGeometry.init(world_system.width, world_system.height, world_system.chunk_size_tiles);
+        const geometry = ChunkGeometry.init(world_system.width, world_system.height, world_system.chunk_size_tiles);
         for (links[self.endpoint_links_seen..]) |link| {
             inline for (.{ .{ link.level_a, link.cell_a }, .{ link.level_b, link.cell_b } }) |end| {
                 const chunk = geometry.chunkOf(end[1].x, end[1].y);
@@ -4762,7 +4763,7 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         }
         if (job.world) |world| {
             // The world's tiling: `level` may be the one being built, absent from `levels`.
-            const geometry = types.ChunkGeometry.init(world.width, world.height, world.chunk_size_tiles);
+            const geometry = ChunkGeometry.init(world.width, world.height, world.chunk_size_tiles);
             // The distinct qualifying endpoint cells (chunk-local) and their old labels, and the
             // distinct newly opened endpoint cells.
             var cells: LabelSet = .empty;

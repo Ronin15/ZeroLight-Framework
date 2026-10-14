@@ -13,6 +13,7 @@ const simd = @import("../../../core/simd.zig");
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const types = @import("types.zig");
+const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const StitchedCell = @import("types.zig").StitchedCell;
 const StitchedView = @import("types.zig").StitchedView;
@@ -2109,8 +2110,8 @@ test "pathfinding fixed-capacity key set stays correct at full logical occupancy
 // Minimal single-level NavGraph for waypoint tests: only the grid geometry is read, so an
 // empty-backed grid of the requested size suffices. Caller must deinit the returned graph's
 // level list.
-fn makeTestGraph(allocator: std.mem.Allocator, width: usize, height: usize) !NavGraph {
-    const geometry = types.ChunkGeometry.init(width, height, types.default_nav_chunk_tiles);
+fn makeTestGraph(allocator: std.mem.Allocator, width: u32, height: u32) !NavGraph {
+    const geometry = ChunkGeometry.init(width, height, types.default_nav_chunk_tiles);
     var graph = NavGraph{ .allocator = allocator, .geometry = geometry };
     try graph.levels.append(allocator, NavGrid{ .geometry = geometry, .cell_size = 1 });
     return graph;

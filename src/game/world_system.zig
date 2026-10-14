@@ -83,18 +83,25 @@ pub const LevelAddError = ChunkGridError || error{ WorldLevelOverflow, OutOfMemo
 /// allocator OOM; each leaves the world unchanged.
 pub const WorldEditError = error{ InvalidWorldLevel, InvalidWorldLayer, InvalidWorldCell, InvalidWorldTile, OutOfMemory };
 
+// `WorldSystem.chunk_geom` before its first level: `chunk_tiles` 0, which no real grid has
+// (`ChunkGeometry.empty` has 1), so `chunkGeometry` can assert a level exists.
+const no_level_chunk_geom: ChunkGeometry = .{ .width = 0, .height = 0, .chunk_tiles = 0, .shift = 0, .chunks_x = 0, .chunks_y = 0 };
+
 // Cell indices and chunk-local labels are u32 with maxInt as the "none" sentinel.
 const chunk_grid_index_sentinel: u64 = std.math.maxInt(u32);
 
 /// O(1) loud index-width check for one level of `width` x `height` cells cut into
 /// `chunk_size`-cell chunks: the edge is a power of two in [1, max_chunk_size_tiles],
-/// every cell index is below the u32 sentinel, and so is the label space `chunks *
-/// (chunk_size² + 1)`, which bounds a nav level's node rows. World create, level add, and
-/// the nav build call it before sizing anything from these widths.
+/// each side and every cell index is below the u32 sentinel (so `ChunkGeometry`'s u32
+/// sides hold), and so is the label space `chunks * (chunk_size² + 1)`, which bounds a
+/// nav level's node rows. World create, level add, and the nav build call it before
+/// sizing anything from these widths.
 pub fn validateChunkGrid(width: usize, height: usize, chunk_size: u16) ChunkGridError!void {
     if (chunk_size == 0 or chunk_size > max_chunk_size_tiles or !std.math.isPowerOfTwo(chunk_size)) {
         return error.InvalidChunkSize;
     }
+    // A zero side leaves no cell, so the cell-count check alone would pass any other side.
+    if (width >= chunk_grid_index_sentinel or height >= chunk_grid_index_sentinel) return error.LevelCellIndexOverflow;
     const cell_count = std.math.mul(u64, width, height) catch return error.LevelCellIndexOverflow;
     if (cell_count >= chunk_grid_index_sentinel) return error.LevelCellIndexOverflow;
     const chunk_edge: u64 = chunk_size;
@@ -546,7 +553,7 @@ pub const WorldSystem = struct {
     // The level chunk grid of `width`, `height`, and `chunk_size_tiles`, which never
     // change after create. Set when the first level is added: every level enters
     // through `appendLevelBaseZ`, and no chunk storage exists before it.
-    chunk_geom: ChunkGeometry = .{ .width = 0, .height = 0, .edge = 0, .shift = 0, .chunks_x = 0, .chunks_y = 0 },
+    chunk_geom: ChunkGeometry = no_level_chunk_geom,
 
     /// Borrowed atlas metadata used for `sourceRect` lookups. Satisfied by
     /// `RuntimeAssets.worldTilesetMeta()` for production startup, or by
@@ -734,8 +741,8 @@ pub const WorldSystem = struct {
         chunk_size_tiles: u16,
     ) !WorldSystem {
         const tile_size = meta.tileSize();
-        const width = ceilTiles(bounds_width, tile_size);
-        const height = ceilTiles(bounds_height, tile_size);
+        const width = try ceilTiles(bounds_width, tile_size);
+        const height = try ceilTiles(bounds_height, tile_size);
         var world = WorldSystem{
             .allocator = allocator,
             .width = width,
@@ -775,7 +782,8 @@ pub const WorldSystem = struct {
         }
 
         _ = try world.addSparseTile(level, width / 4, height / 3, deco, 0, .obstacle);
-        _ = try world.addSparseTile(level, (width * 3) / 4, (height * 2) / 3, deco, 0, .obstacle);
+        // Widened so a side past a third of u16 does not wrap; each result is below its side.
+        _ = try world.addSparseTile(level, @intCast(@as(u32, width) * 3 / 4), @intCast(@as(u32, height) * 2 / 3), deco, 0, .obstacle);
 
         world.tilemap_params = tilemapParamsFor(meta, world.width, world.height, world.tile_size);
         return world;
@@ -1033,7 +1041,7 @@ pub const WorldSystem = struct {
     // to the level's chunk grid. Depends only on the rect size, so a pan keeps it.
     fn renderSideForRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16) u32 {
         const geom = self.chunkGeometry();
-        const chunk_px = @as(f32, @floatFromInt(geom.edge)) * self.tile_size;
+        const chunk_px = @as(f32, @floatFromInt(geom.chunk_tiles)) * self.tile_size;
         const overscan = 1 + 2 * @as(u32, overscan_chunks);
         const span_x = rectChunkSpan(rect.w, chunk_px, geom.chunks_x) + overscan;
         const span_y = rectChunkSpan(rect.h, chunk_px, geom.chunks_y) + overscan;
@@ -1375,7 +1383,7 @@ pub const WorldSystem = struct {
         }
         const desired = try self.collectDenseSubmitLayers(active_level);
         try self.dense_render.reserve(self.allocator, desired.len);
-        const fit = world_gpu_tiles.residentLayerFit(fitted.side, tileStoreBlockElements(geom.edge));
+        const fit = world_gpu_tiles.residentLayerFit(fitted.side, tileStoreBlockElements(geom.chunk_tiles));
         return self.gpu_tiles.plan(self.allocator, geom, rows.items(.store), rows.items(.gpu_slot), layer_changed, .{
             .layers = fitResidentLayers(desired, fit, &self.gpu_tiles.width_drop_reported),
             .window = window,
@@ -2657,7 +2665,7 @@ pub const WorldSystem = struct {
     }
 
     fn chunkGeometry(self: *const WorldSystem) ChunkGeometry {
-        std.debug.assert(self.chunk_geom.edge != 0);
+        std.debug.assert(self.chunk_geom.chunk_tiles != no_level_chunk_geom.chunk_tiles);
         return self.chunk_geom;
     }
 
@@ -2976,7 +2984,7 @@ fn writeDenseEditGroup(job: *const DenseEditWriteJob, group_index: usize, partic
 
     const events = job.events[group.start..][0..group.writes.len];
     var change_count: usize = 0;
-    const edge_mask: u32 = geom.edge - 1;
+    const edge_mask: u32 = geom.chunk_tiles - 1;
     // SIMD verdict: scalar. Set-bit iteration over touched cells with a branchy
     // per-band compare and event write per changed cell.
     for (any_touched, 0..) |touched_word, word_index| {
@@ -3116,8 +3124,11 @@ fn catalogCapacity(meta: *const WorldTilesetMeta) usize {
     return max_id + 1;
 }
 
-fn ceilTiles(value: f32, tile_size: f32) u16 {
+// Tiles covering `value`, at least one. A count past a u16 world side (inf and NaN
+// included) fails before any conversion.
+fn ceilTiles(value: f32, tile_size: f32) error{LevelCellIndexOverflow}!u16 {
     const tiles = @ceil(value / tile_size);
+    if (!(tiles <= std.math.maxInt(u16))) return error.LevelCellIndexOverflow;
     return @intFromFloat(@max(tiles, 1));
 }
 
@@ -4350,6 +4361,10 @@ test "chunk label width fails loudly at its u32 boundary" {
     // Cell indices reach the sentinel before any label does.
     try std.testing.expectError(error.LevelCellIndexOverflow, validateChunkGrid(65537, 65535, max_chunk_size_tiles));
     try std.testing.expectError(error.LevelCellIndexOverflow, validateChunkGrid(std.math.maxInt(usize), 2, 1));
+    // A side at the u32 sentinel fails even when the other side leaves no cell.
+    try std.testing.expectError(error.LevelCellIndexOverflow, validateChunkGrid(std.math.maxInt(u32), 0, 1));
+    try std.testing.expectError(error.LevelCellIndexOverflow, validateChunkGrid(0, @as(usize, 1) << 32, 1));
+    try validateChunkGrid(std.math.maxInt(u32) - 1, 0, 1);
 
     // A world over the label boundary is refused at its first level, before any storage.
     var world = WorldSystem{
@@ -4362,6 +4377,19 @@ test "chunk label width fails loudly at its u32 boundary" {
     defer world.deinit();
     try std.testing.expectError(error.ChunkLabelOverflow, world.addLevel(0));
     try std.testing.expectEqual(@as(usize, 0), world.levelCount());
+}
+
+test "demo bounds past a u16 world side fail loudly instead of converting" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    const tile_size = meta.tileSize();
+    const widest = @as(f32, std.math.maxInt(u16)) * tile_size;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, widest, tile_size);
+    defer world.deinit();
+    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), world.width);
+    try std.testing.expectError(error.LevelCellIndexOverflow, WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, widest + tile_size, tile_size));
+    try std.testing.expectError(error.LevelCellIndexOverflow, WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 1.0e30, 1.0e30));
+    try std.testing.expectError(error.LevelCellIndexOverflow, WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, std.math.inf(f32), tile_size));
 }
 
 test "world add level keeps chunks renderable without manual rebuild" {
@@ -7286,7 +7314,7 @@ fn expectCanonicalBatchEvents(world: *const WorldSystem, before: *const BatchRef
         for (0..geom.chunkCount()) |chunk_index| {
             const extent = geom.extent(@intCast(chunk_index));
             for (0..geom.blockCells()) |local| {
-                const col = local & (geom.edge - 1);
+                const col = local & (geom.chunk_tiles - 1);
                 const row = local >> geom.shift;
                 if (col >= extent.cols or row >= extent.rows) continue;
                 const x: u16 = @intCast(extent.min_x + col);

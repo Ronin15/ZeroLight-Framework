@@ -16,7 +16,7 @@ const NavGrid = @import("nav_grid.zig").NavGrid;
 const allowed_moves = @import("nav_grid.zig").allowed_moves;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavPortal = @import("nav_graph.zig").NavPortal;
-const ChunkGeometry = @import("types.zig").ChunkGeometry;
+const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
 const LinkBounds = @import("nav_graph.zig").LinkBounds;
 const LinkPairs = @import("nav_graph.zig").LinkPairs;
 const PairChains = @import("nav_graph.zig").PairChains;
@@ -687,8 +687,8 @@ const CrossingSearch = struct {
 
     fn init(crossings: []const LevelCrossings, scratch: *CrossingScratch, budget: usize, goal_level: u16, goal_x: u32, goal_y: u32, geometry: ChunkGeometry) CrossingSearch {
         // Sides of a world-backed graph fit u16, so the diameter stays below 2^21.
-        const width: u32 = @intCast(geometry.width);
-        const height: u32 = @intCast(geometry.height);
+        const width = geometry.width;
+        const height = geometry.height;
         return .{
             .crossings = crossings,
             .scratch = scratch,
@@ -844,9 +844,9 @@ fn abstractCorridor(
     const slots = abstract.slots;
 
     // Chunk geometry once per query: a cell's chunk and chunk-local index are shifts and
-    // masks of its coordinates. Sides of a validated level fit u32.
+    // masks of its coordinates.
     const geometry = graph.chunkGeometry();
-    const width: u32 = @intCast(geometry.width);
+    const width = geometry.width;
     const shift: u5 = geometry.shift;
     const mask: u32 = @as(u32, geometry.chunk_tiles) - 1;
     // Coordinates and indices stay unsigned: a validated level's cell index can pass 2^31.
@@ -1613,7 +1613,7 @@ test "a saturated search with a fallback returns the chain to its least-estimate
                 const to_cell = refLocal(to);
                 if (geometry.chunkOfCell(from_cell) == geometry.chunkOfCell(to_cell)) continue;
                 // In range: a 32-cell side.
-                const side: u32 = @intCast(width);
+                const side = width;
                 try std.testing.expectEqual(cardinal_cost, octileU32(from_cell % side, from_cell / side, to_cell % side, to_cell / side));
             }
         }
@@ -1682,7 +1682,7 @@ const ReferenceAbstract = struct {
 
     fn search(self: *ReferenceAbstract, graph: *const NavGraph, start_grid: *const NavGrid, goal_grid: *const NavGrid, start_level: u16, goal_level: u16, start_index: usize, goal_index: usize) !AbstractResult {
         const allocator = self.nodes.allocator;
-        const width: u32 = @intCast(graph.geometry.width);
+        const width = graph.geometry.width;
         const tiles: u32 = graph.geometry.chunk_tiles;
         const chunks_x = (width + tiles - 1) / tiles;
         const goal: u32 = @intCast(goal_index);
@@ -2026,7 +2026,7 @@ fn pushDistance(allocator: std.mem.Allocator, distances: *std.AutoHashMap(usize,
 // path `abstractCorridor` may take: an exhaustive Dijkstra over the same nodes and edges with
 // goal portals terminal. Null when no goal portal is reachable.
 fn exhaustiveAbstractObjective(allocator: std.mem.Allocator, graph: *const NavGraph, start_grid: *const NavGrid, goal_grid: *const NavGrid, start_level: u16, goal_level: u16, start_index: usize, goal_index: usize) !?u32 {
-    const width: u32 = @intCast(graph.geometry.width);
+    const width = graph.geometry.width;
     const tiles: u32 = graph.geometry.chunk_tiles;
     const chunks_x = (width + tiles - 1) / tiles;
     const goal: u32 = @intCast(goal_index);
@@ -2161,7 +2161,7 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
             for (graph.level_crossings.items) |crossings| full_levels += @intFromBool(crossings.departing.count == long_link_pairs);
             try std.testing.expect(full_levels > 0);
         }
-        const width: u32 = @intCast(graph.geometry.width);
+        const width = graph.geometry.width;
         // Random goals, then the first open cell on the wide teleport's exit row beyond its
         // exit: there a path through the teleport saves exactly its planar span.
         const wide = links[4];

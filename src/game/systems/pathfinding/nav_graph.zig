@@ -37,6 +37,7 @@ const thread_shared_record_alignment = @import("../../../app/thread_system.zig")
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
+const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
 const no_block = @import("nav_grid.zig").no_block;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
 const ColliderGeometry = @import("../static_colliders.zig").ColliderGeometry;
@@ -829,37 +830,44 @@ pub const NavExtent = union(enum) {
     /// The cell grid a build over this extent uses; the static colliders a nav reads must
     /// be placed on it. Fails loudly (`ChunkGridError`) when its index widths do not fit.
     pub fn colliderGeometry(self: NavExtent) ChunkGridError!ColliderGeometry {
-        const cells = self.cellGrid();
-        try validateChunkGrid(cells.width, cells.height, cells.chunk_tiles);
-        // `validateChunkGrid` keeps the cell count below 2^32, so each side fits u32.
-        return ColliderGeometry.init(cells.cell_size, @intCast(cells.width), @intCast(cells.height), cells.chunk_tiles);
+        const cells = try self.validatedCellGrid();
+        return ColliderGeometry.init(cells.cell_size, cells.width, cells.height, cells.chunk_tiles);
     }
 
-    const CellGrid = struct { cell_size: f32, width: usize, height: usize, chunk_tiles: u16 };
+    const CellGrid = struct { cell_size: f32, width: u32, height: u32, chunk_tiles: u16 };
 
-    fn cellGrid(self: NavExtent) CellGrid {
-        return switch (self) {
+    // This extent's cell grid once `validateChunkGrid` accepts it, before anything is sized
+    // from it.
+    fn validatedCellGrid(self: NavExtent) ChunkGridError!CellGrid {
+        const cell_size: f32, const width: usize, const height: usize, const chunk_tiles: u16 = switch (self) {
             // A nav cell is a tile and a nav chunk the world's chunk.
             .world => |world_system| blk: {
                 std.debug.assert(std.math.isFinite(world_system.tile_size) and world_system.tile_size > 0);
-                break :blk .{ .cell_size = world_system.tile_size, .width = world_system.width, .height = world_system.height, .chunk_tiles = world_system.chunk_size_tiles };
+                break :blk .{ world_system.tile_size, world_system.width, world_system.height, world_system.chunk_size_tiles };
             },
-            // A 0/negative/non-finite cell_size or bound would make @intFromFloat see
-            // inf/NaN (illegal behavior); degenerate config collapses to a 1x1 grid.
+            // A 0/negative/non-finite cell_size or bound collapses to a 1x1 grid. A side's
+            // quotient is clamped while a float (an oversize or subnormal-cell quotient is
+            // huge or inf), so the validator, not @intFromFloat, rejects it.
             .bounds => |bounds| blk: {
                 const cell_size: f32 = if (std.math.isFinite(bounds.cell_size) and bounds.cell_size > 0) bounds.cell_size else 1.0;
                 const safe_w: f32 = if (std.math.isFinite(bounds.width) and bounds.width > 0) bounds.width else 0;
                 const safe_h: f32 = if (std.math.isFinite(bounds.height) and bounds.height > 0) bounds.height else 0;
                 break :blk .{
-                    .cell_size = cell_size,
-                    .width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_w / cell_size)))),
-                    .height = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_h / cell_size)))),
-                    .chunk_tiles = bounds.chunk_tiles,
+                    cell_size,
+                    @max(@as(usize, 1), @as(usize, @intFromFloat(@min(@ceil(safe_w / cell_size), side_quotient_clamp)))),
+                    @max(@as(usize, 1), @as(usize, @intFromFloat(@min(@ceil(safe_h / cell_size), side_quotient_clamp)))),
+                    bounds.chunk_tiles,
                 };
             },
         };
+        try validateChunkGrid(width, height, chunk_tiles);
+        // `validateChunkGrid` keeps each side below 2^32 - 1.
+        return .{ .cell_size = cell_size, .width = @intCast(width), .height = @intCast(height), .chunk_tiles = chunk_tiles };
     }
 };
+
+// Past every side `validateChunkGrid` accepts, and exact in f32.
+const side_quotient_clamp: f32 = 0x1p32;
 
 /// Per-level rates the long-link term charges for a level gap: the least excess and the least
 /// cost of a level-crossing short link, per level it spans, capped at `crossing_rate_cap`.
@@ -1318,7 +1326,7 @@ pub const NavGraph = struct {
     allocator: std.mem.Allocator,
     cell_size: f32 = default_cell_size,
     // Every level's sides and chunk tiling (`NavGrid.geometry`).
-    geometry: types.ChunkGeometry = .empty,
+    geometry: ChunkGeometry = .empty,
     // Bumped only by a world build; part of every query key.
     version: u32 = 1,
     // Built over a world: levels, links, and content revisions follow that world.
@@ -1579,16 +1587,8 @@ pub const NavGraph = struct {
     }
 
     /// Every level's chunk tiling; agrees with each level's `NavGrid.geometry`.
-    pub fn chunkGeometry(self: *const NavGraph) types.ChunkGeometry {
+    pub fn chunkGeometry(self: *const NavGraph) ChunkGeometry {
         return self.geometry;
-    }
-
-    fn chunksX(self: *const NavGraph) usize {
-        return self.geometry.chunksX();
-    }
-
-    fn chunksY(self: *const NavGraph) usize {
-        return self.geometry.chunksY();
     }
 
     pub fn chunkCount(self: *const NavGraph) usize {
@@ -1609,14 +1609,13 @@ pub const NavGraph = struct {
             .world => |world_system| world_system,
             .bounds => null,
         };
-        const cells = extent.cellGrid();
-        const safe_cell_size = cells.cell_size;
-        const width = cells.width;
-        const height = cells.height;
-        const chunk_tiles = cells.chunk_tiles;
         // Cell indices and chunk labels are u32 below `no_cell`; fail loud before any
         // dimension is stored or array sized.
-        try validateChunkGrid(width, height, chunk_tiles);
+        const cells = try extent.validatedCellGrid();
+        const safe_cell_size = cells.cell_size;
+        const chunk_tiles = cells.chunk_tiles;
+        const width = cells.width;
+        const height = cells.height;
         if (colliders.geometry) |geometry| {
             std.debug.assert(geometry.cell_size == safe_cell_size and geometry.grid.width == width and
                 geometry.grid.height == height and geometry.grid.chunk_tiles == chunk_tiles);
@@ -2003,8 +2002,8 @@ pub const NavGraph = struct {
         const changed = @backingInt(PlanStream.changed);
         const dirty = @backingInt(PlanStream.dirty);
         const patch = @backingInt(PlanStream.patch);
-        const cx_count = self.chunksX();
-        const cy_count = self.chunksY();
+        const cx_count = self.geometry.chunks_x;
+        const cy_count = self.geometry.chunks_y;
         if (item < marks.len) {
             const mark = marks[item];
             const span = self.markSpan(world, mark) orelse return;
@@ -2229,8 +2228,8 @@ pub const NavGraph = struct {
     fn planPatchInfo(self: *NavGraph, world: ?*const WorldSystem) !void {
         const patch_count = self.patch_keys.items.len;
         try types.resizeStaging(&self.patch_info, self.allocator, patch_count, &self.pool_grows);
-        const cx_count = self.chunksX();
-        const cy_count = self.chunksY();
+        const cx_count = self.geometry.chunks_x;
+        const cy_count = self.geometry.chunks_y;
         for (self.patch_keys.items, self.patch_info.items) |key, *info| {
             const level = keyLevel(key);
             const chunk = keyChunk(key);
@@ -2420,15 +2419,15 @@ pub const NavGraph = struct {
         const cols = bounds.x1 - bounds.x0;
         const rows = bounds.y1 - bounds.y0;
         const shift: u4 = level_grid.geometry.shift;
-        const chunks_x = self.chunksX();
+        const chunks_x = self.geometry.chunks_x;
         var portals: [max_border_portals]NavPortal = undefined;
         var count: usize = 0;
         const Side = NavGrid.ChunkSide;
         const sides = [_]struct { present: bool, side: Side, mirror: Side, neighbour: u32, length: usize, flags: PortalFlags }{
             .{ .present = bounds.x0 > 0, .side = .west, .mirror = .east, .neighbour = chunk -% 1, .length = rows, .flags = .{ .west = true } },
             .{ .present = bounds.x1 < w, .side = .east, .mirror = .west, .neighbour = chunk +% 1, .length = rows, .flags = .{ .east = true } },
-            .{ .present = bounds.y0 > 0, .side = .north, .mirror = .south, .neighbour = chunk -% @as(u32, @intCast(chunks_x)), .length = cols, .flags = .{ .north = true } },
-            .{ .present = bounds.y1 < self.geometry.height, .side = .south, .mirror = .north, .neighbour = chunk +% @as(u32, @intCast(chunks_x)), .length = cols, .flags = .{ .south = true } },
+            .{ .present = bounds.y0 > 0, .side = .north, .mirror = .south, .neighbour = chunk -% chunks_x, .length = cols, .flags = .{ .north = true } },
+            .{ .present = bounds.y1 < self.geometry.height, .side = .south, .mirror = .north, .neighbour = chunk +% chunks_x, .length = cols, .flags = .{ .south = true } },
         };
         for (sides) |side| {
             if (!side.present) continue;
@@ -5324,8 +5323,8 @@ fn referencePlan(allocator: std.mem.Allocator, graph: *const NavGraph, world: *c
     const dirty = &lists[@backingInt(PlanStream.dirty)];
     const patch = &lists[@backingInt(PlanStream.patch)];
     const ct: usize = graph.geometry.chunk_tiles;
-    const chunks_x = graph.chunkGeometry().chunksX();
-    const chunks_y = graph.chunkGeometry().chunksY();
+    const chunks_x = graph.chunkGeometry().chunks_x;
+    const chunks_y = graph.chunkGeometry().chunks_y;
     for (marks) |mark| {
         const span = graph.markSpan(world, mark) orelse continue;
         for (span.min_y / ct..span.max_y / ct + 1) |cy| for (span.min_x / ct..span.max_x / ct + 1) |cx| {

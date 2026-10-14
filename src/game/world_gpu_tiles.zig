@@ -271,7 +271,7 @@ pub const GpuTileMirror = struct {
         layer_changed: ?[]const bool,
         desired: ?Residency,
     ) error{OutOfMemory}!SyncPlan {
-        const block_elements = tileStoreBlockElements(geom.edge);
+        const block_elements = tileStoreBlockElements(geom.chunk_tiles);
         var result = SyncPlan{ .side = self.side, .window = self.window };
         var dir_frees: usize = 0;
         var dir_takes: usize = 0;
@@ -453,7 +453,7 @@ pub const GpuTileMirror = struct {
         self.regions.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
         self.values.clearRetainingCapacity();
-        const block_elements = tileStoreBlockElements(geom.edge);
+        const block_elements = tileStoreBlockElements(geom.chunk_tiles);
         const stays = self.plan_stays.items;
         const old_window = self.window;
         const new_window = sync_plan.window;

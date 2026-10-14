@@ -18,6 +18,7 @@ const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const EntityId = @import("../../data_system.zig").EntityId;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
+const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
 
 pub const pathfinding_range_alignment_items: usize = simd.lane_count;
 
@@ -465,82 +466,6 @@ pub const NavSpan = struct {
     min_y: usize,
     max_x: usize,
     max_y: usize,
-};
-
-/// The chunk tiling of a nav level: power-of-two chunks of `chunk_tiles` cells a side,
-/// row-major over `chunks_x` x `chunks_y`, border chunks clipped to the level. Cell and
-/// chunk-local coordinates map by shifts and masks; only a flat cell index divides (once).
-/// Sides are `usize`: a bounds build may exceed `u16`.
-pub const ChunkGeometry = struct {
-    width: usize,
-    height: usize,
-    chunk_tiles: u16,
-    shift: u4,
-    chunks_x: usize,
-    chunks_y: usize,
-
-    /// No cells: an unbuilt grid's.
-    pub const empty: ChunkGeometry = .{ .width = 0, .height = 0, .chunk_tiles = 1, .shift = 0, .chunks_x = 0, .chunks_y = 0 };
-
-    pub const Bounds = struct { x0: usize, y0: usize, x1: usize, y1: usize };
-
-    pub fn init(width: usize, height: usize, chunk_tiles: u16) ChunkGeometry {
-        std.debug.assert(chunk_tiles != 0 and std.math.isPowerOfTwo(chunk_tiles));
-        const shift: u4 = @intCast(@ctz(chunk_tiles));
-        const edge: usize = chunk_tiles;
-        return .{
-            .width = width,
-            .height = height,
-            .chunk_tiles = chunk_tiles,
-            .shift = shift,
-            .chunks_x = (width + edge - 1) >> shift,
-            .chunks_y = (height + edge - 1) >> shift,
-        };
-    }
-
-    pub fn chunksX(self: ChunkGeometry) usize {
-        return self.chunks_x;
-    }
-
-    pub fn chunksY(self: ChunkGeometry) usize {
-        return self.chunks_y;
-    }
-
-    pub fn chunkCount(self: ChunkGeometry) usize {
-        return self.chunks_x * self.chunks_y;
-    }
-
-    /// The chunk of in-level cell (x, y).
-    pub inline fn chunkOf(self: ChunkGeometry, x: usize, y: usize) u32 {
-        // Below the level's chunk count, which `validateChunkGrid` keeps below 2^31.
-        return @intCast((y >> self.shift) * self.chunks_x + (x >> self.shift));
-    }
-
-    /// The chunk of in-level cell index `cell` (`y * width + x`): one division.
-    pub fn chunkOfCell(self: ChunkGeometry, cell: usize) u32 {
-        const y = cell / self.width;
-        return self.chunkOf(cell - y * self.width, y);
-    }
-
-    /// Chunk-local index (`row * chunk_tiles + column`) of in-level cell (x, y).
-    pub inline fn localOf(self: ChunkGeometry, x: usize, y: usize) u8 {
-        const mask: usize = self.chunk_tiles - 1;
-        // A chunk holds at most 256 cells.
-        return @intCast(((y & mask) << self.shift) | (x & mask));
-    }
-
-    /// Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the level.
-    pub fn chunkBounds(self: ChunkGeometry, chunk: u32) Bounds {
-        const cy = chunk / self.chunks_x;
-        const x0 = (chunk - cy * self.chunks_x) << self.shift;
-        const y0 = cy << self.shift;
-        return .{
-            .x0 = x0,
-            .y0 = y0,
-            .x1 = @min(x0 + @as(usize, self.chunk_tiles), self.width),
-            .y1 = @min(y0 + @as(usize, self.chunk_tiles), self.height),
-        };
-    }
 };
 
 /// Goal-keyed query identity. nav_version invalidates old work on rebuild without
@@ -1401,14 +1326,14 @@ const test_support = @import("test_support.zig");
 test "the shift-based chunk geometry equals division over every cell, short border chunks included" {
     for ([_]u16{ 1, 2, 4, 16 }) |edge| {
         // Two full chunks and a short one per axis, different per axis.
-        const width: usize = 2 * @as(usize, edge) + (edge + 1) / 2;
-        const height: usize = 3 * @as(usize, edge) - edge / 2;
+        const width: u32 = 2 * @as(u32, edge) + (edge + 1) / 2;
+        const height: u32 = 3 * @as(u32, edge) - edge / 2;
         const geometry = ChunkGeometry.init(width, height, edge);
         const ct: usize = edge;
-        try std.testing.expectEqual((width + ct - 1) / ct, geometry.chunksX());
-        try std.testing.expectEqual((height + ct - 1) / ct, geometry.chunksY());
+        try std.testing.expectEqual((width + ct - 1) / ct, geometry.chunks_x);
+        try std.testing.expectEqual((height + ct - 1) / ct, geometry.chunks_y);
         for (0..height) |y| for (0..width) |x| {
-            const chunk: u32 = @intCast((y / ct) * geometry.chunksX() + x / ct);
+            const chunk: u32 = @intCast((y / ct) * geometry.chunks_x + x / ct);
             const local: u8 = @intCast((y % ct) * ct + x % ct);
             try std.testing.expectEqual(chunk, geometry.chunkOf(x, y));
             try std.testing.expectEqual(chunk, geometry.chunkOfCell(y * width + x));

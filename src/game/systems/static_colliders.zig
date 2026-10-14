@@ -34,7 +34,7 @@ const keyLevel = @import("chunk_list_map.zig").keyLevel;
 const no_entry = @import("chunk_list_map.zig").no_entry;
 const no_value = @import("chunk_list_map.zig").no_value;
 const max_chunk_size_tiles = @import("../world_system.zig").max_chunk_size_tiles;
-const ChunkGeometry = @import("pathfinding/types.zig").ChunkGeometry;
+const ChunkGeometry = @import("../world_terrain.zig").ChunkGeometry;
 
 const no_row: u32 = std.math.maxInt(u32);
 
@@ -90,39 +90,21 @@ pub const ColliderGeometry = struct {
         return .{ .cell_size = cell_size, .grid = ChunkGeometry.init(cells_x, cells_y, chunk_tiles) };
     }
 
-    /// Cells per level row.
-    pub fn width(self: ColliderGeometry) u32 {
-        return @intCast(self.grid.width);
-    }
-
-    /// Cell rows per level.
-    pub fn height(self: ColliderGeometry) u32 {
-        return @intCast(self.grid.height);
-    }
-
-    fn chunkShift(self: ColliderGeometry) u5 {
-        return self.grid.shift;
-    }
-
-    pub fn chunksX(self: ColliderGeometry) u32 {
-        return @intCast(self.grid.chunks_x);
-    }
-
     /// The inclusive cells the half-open `aabb` covers, clamped to the grid: its min
     /// corner's cell to the last cell before its max edge (`math.lastCellOfSpan`).
     pub fn footprint(self: ColliderGeometry, aabb: math.Aabb) CellSpan {
         return .{
-            .min_x = math.worldPosToCell(aabb.min_x, self.cell_size, self.width()),
-            .min_y = math.worldPosToCell(aabb.min_y, self.cell_size, self.height()),
-            .max_x = math.lastCellOfSpan(aabb.min_x, aabb.max_x, self.cell_size, self.width()),
-            .max_y = math.lastCellOfSpan(aabb.min_y, aabb.max_y, self.cell_size, self.height()),
+            .min_x = math.worldPosToCell(aabb.min_x, self.cell_size, self.grid.width),
+            .min_y = math.worldPosToCell(aabb.min_y, self.cell_size, self.grid.height),
+            .max_x = math.lastCellOfSpan(aabb.min_x, aabb.max_x, self.cell_size, self.grid.width),
+            .max_y = math.lastCellOfSpan(aabb.min_y, aabb.max_y, self.cell_size, self.grid.height),
         };
     }
 
     /// The query class whose single cell covers the whole level: the smallest k with
     /// 2^k >= max(width, height).
     pub fn topQueryClass(self: ColliderGeometry) u6 {
-        return std.math.log2_int_ceil(u32, @max(self.width(), self.height(), 1));
+        return std.math.log2_int_ceil(u32, @max(self.grid.width, self.grid.height, 1));
     }
 
     // The world edge of a class-`class` cell: an exact power-of-two scale of the cell size,
@@ -133,7 +115,7 @@ pub const ColliderGeometry = struct {
 
     // Class-`class` cells per row of the level.
     fn classCellsX(self: ColliderGeometry, class: u6) u64 {
-        return (@as(u64, self.width()) + (@as(u64, 1) << class) - 1) >> class;
+        return (@as(u64, self.grid.width) + (@as(u64, 1) << class) - 1) >> class;
     }
 
     /// The smallest class below `top` whose cell edge covers `aabb` on both axes, tested
@@ -163,7 +145,7 @@ pub const ColliderGeometry = struct {
         const class: u6 = @intCast((key >> 48) & 0x3f);
         const level = keyLevel(key & query_class_clear_mask);
         const cell: u64 = keyChunk(key);
-        const shift: u6 = self.chunkShift();
+        const shift: u6 = self.grid.shift;
         std.debug.assert(class <= shift);
         const cells_x = self.classCellsX(class);
         const cell_x = cell % cells_x;
@@ -171,16 +153,16 @@ pub const ColliderGeometry = struct {
         const per_chunk_shift: u6 = shift - class;
         const cell_mask = (@as(u64, 1) << per_chunk_shift) - 1;
         // Chunk indices stay below the level's chunk count, under 2^32.
-        const chunk: u32 = @intCast((cell_y >> per_chunk_shift) * self.chunksX() + (cell_x >> per_chunk_shift));
+        const chunk: u32 = @intCast((cell_y >> per_chunk_shift) * self.grid.chunks_x + (cell_x >> per_chunk_shift));
         const bit = anchorClassOffset(shift, class) + @as(usize, @intCast(((cell_y & cell_mask) << per_chunk_shift) + (cell_x & cell_mask)));
         return .{ .chunk_key = chunkKey(level, chunk), .bit = bit };
     }
 
     fn chunkRect(self: ColliderGeometry, placement: Placement) ChunkRect {
-        const shift = self.chunkShift();
+        const shift = self.grid.shift;
         return .{
             .level = placement.level,
-            .chunks_x = self.chunksX(),
+            .chunks_x = self.grid.chunks_x,
             .min_x = placement.cells.min_x >> shift,
             .min_y = placement.cells.min_y >> shift,
             .max_x = placement.cells.max_x >> shift,
@@ -387,17 +369,17 @@ const BoxWalk = struct {
         const geometry = self.geometry;
         const edge = geometry.classEdge(class);
         // Class coordinates in u64: a class may reach 32.
-        const min_x = @as(u64, math.worldPosToCell(self.box.min_x - edge, geometry.cell_size, geometry.width())) >> class;
-        const min_y = @as(u64, math.worldPosToCell(self.box.min_y - edge, geometry.cell_size, geometry.height())) >> class;
-        const max_x = @as(u64, math.worldPosToCell(self.box.max_x, geometry.cell_size, geometry.width())) >> class;
-        const max_y = @as(u64, math.worldPosToCell(self.box.max_y, geometry.cell_size, geometry.height())) >> class;
+        const min_x = @as(u64, math.worldPosToCell(self.box.min_x - edge, geometry.cell_size, geometry.grid.width)) >> class;
+        const min_y = @as(u64, math.worldPosToCell(self.box.min_y - edge, geometry.cell_size, geometry.grid.height)) >> class;
+        const max_x = @as(u64, math.worldPosToCell(self.box.max_x, geometry.cell_size, geometry.grid.width)) >> class;
+        const max_y = @as(u64, math.worldPosToCell(self.box.max_y, geometry.cell_size, geometry.grid.height)) >> class;
         const cells_x = geometry.classCellsX(class);
-        const chunk_shift: u6 = geometry.chunkShift();
+        const chunk_shift: u6 = geometry.grid.shift;
         if (class > chunk_shift) return self.walkCells(class, cells_x, min_x, min_y, max_x, max_y);
         // A class cell lies in one chunk, whose anchor block (the chunk-tier key's value)
         // marks the class cells holding a query entry; a chunk without one holds none.
         const per_chunk_shift = chunk_shift - class;
-        const chunks_x = geometry.chunksX();
+        const chunks_x = geometry.grid.chunks_x;
         const class_offset = anchorClassOffset(chunk_shift, class);
         var chunk_y = min_y >> per_chunk_shift;
         while (chunk_y <= max_y >> per_chunk_shift) : (chunk_y += 1) {
@@ -700,7 +682,7 @@ pub const StaticColliderSystem = struct {
             const query_key = geometry.queryKey(placement.level, class, placement.cells);
             fresh.query_lists.appendTail(row, query_key, entity.index);
             fresh.query_class_rows[class] += 1;
-            if (class <= geometry.chunkShift()) {
+            if (class <= geometry.grid.shift) {
                 // The row's chunk entries are listed, so its anchor chunk's key exists.
                 const anchor = geometry.anchorBit(query_key);
                 if (fresh.chunk_lists.value(anchor.chunk_key) == no_value) try fresh.ensureFreeAnchorBlocks(1);
@@ -950,7 +932,7 @@ pub const StaticColliderSystem = struct {
         var anchor_sets: usize = 0;
         var anchor_clears: usize = 0;
         var new_blocks: usize = 0;
-        const chunk_shift = geometry.chunkShift();
+        const chunk_shift = geometry.grid.shift;
         for (pending) |index| {
             const entity = self.dirty_entity.items[index];
             const old_row = self.row_of_index.items[index];
@@ -1251,7 +1233,7 @@ fn expectedAnchors(colliders: *const StaticColliderSystem) !std.AutoHashMap(u64,
     for (colliders.query_lists.slot_keys) |key| {
         if (key == test_empty_key) continue;
         const class: u6 = @intCast((key >> 48) & 0x3f);
-        if (class > geometry.chunkShift()) continue;
+        if (class > geometry.grid.shift) continue;
         const anchor = geometry.anchorBit(key);
         const words = try expected.getOrPut(anchor.chunk_key);
         if (!words.found_existing) words.value_ptr.* = @splat(0);
@@ -1412,7 +1394,7 @@ test "a cell-aligned static past 32768 world units covers only its own cell and 
     try std.testing.expectEqual(@as(usize, 1), listEntryCount(&fixture.colliders));
     var listed: std.ArrayList(u32) = .empty;
     defer listed.deinit(std.testing.allocator);
-    try listedIndices(&fixture.colliders, 0, 68 * far.chunksX() + 68, &listed);
+    try listedIndices(&fixture.colliders, 0, 68 * far.grid.chunks_x + 68, &listed);
     try std.testing.expectEqual(@as(usize, 1), listed.items.len);
 }
 
@@ -1503,7 +1485,7 @@ test "chunk lists stay in entity order under any add/remove order" {
         try expectSameRows(&fixture.colliders, &rebuilt, 1);
         var listed: std.ArrayList(u32) = .empty;
         defer listed.deinit(std.testing.allocator);
-        for (0..test_geometry.chunksX() * test_geometry.chunksX()) |chunk| {
+        for (0..test_geometry.grid.chunks_x * test_geometry.grid.chunks_x) |chunk| {
             try listedIndices(&fixture.colliders, 0, @intCast(chunk), &listed);
             for (0..listed.items.len -| 1) |at| try std.testing.expect(listed.items[at] < listed.items[at + 1]);
         }
@@ -1586,7 +1568,7 @@ test "sync after reserve allocates nothing (FailingAllocator)" {
     // A static alone in its chunk, destroyed by the measured commit.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 40, .y = 1000 }, .{ .x = 8, .y = 8 }) }});
     const kept = fixture.colliders.changesThisStep()[0].entity;
-    const kept_chunk = chunkKey(0, 7 * test_geometry.chunksX());
+    const kept_chunk = chunkKey(0, 7 * test_geometry.grid.chunks_x);
     // Warm: create, then destroy, so rows, lists, anchor blocks, and the change list hold
     // their high-water.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &templates);
@@ -2029,7 +2011,7 @@ fn bruteHitLessThan(_: void, a: BruteHit, b: BruteHit) bool {
 fn bruteForceHits(colliders: *const StaticColliderSystem, level: u16, box: math.Aabb, out: *std.ArrayList(BruteHit)) !void {
     out.clearRetainingCapacity();
     const geometry = colliders.geometry.?;
-    const shift = geometry.chunkShift();
+    const shift = geometry.grid.shift;
     for (colliders.row_of_index.items) |row| {
         if (row == no_row or colliders.row_level[row] != level) continue;
         const aabb = colliders.rowAabb(row);
@@ -2152,7 +2134,7 @@ test "queryBox reaches every row whose AABB meets the box, once, in query order"
     // The test grid, and a level narrower than a chunk (its top class is no larger than a
     // chunk).
     const narrow = ColliderGeometry.init(32, 3, 2, 4);
-    try std.testing.expect(narrow.topQueryClass() <= narrow.chunkShift());
+    try std.testing.expect(narrow.topQueryClass() <= narrow.grid.shift);
     for ([_]ColliderGeometry{ test_geometry, narrow }) |geometry| {
         var fixture = try SeamFixture.initWith(geometry);
         defer fixture.deinit();
@@ -2162,7 +2144,7 @@ test "queryBox reaches every row whose AABB meets the box, once, in query order"
         defer rebuilt.deinit();
         try expectSameRows(&fixture.colliders, &rebuilt, 2);
         // Fine classes 0..2 and a coarse class hold rows on the test grid.
-        if (geometry.width() == test_geometry.width()) for (0..4) |class| try std.testing.expect(fixture.colliders.query_class_mask.isSet(class));
+        if (geometry.grid.width == test_geometry.grid.width) for (0..4) |class| try std.testing.expect(fixture.colliders.query_class_mask.isSet(class));
         try queryTestBoxes(&fixture.colliders, random, &boxes);
         for (boxes.items) |box| for (0..2) |level| {
             try expectQueryMatchesBruteForce(&fixture.colliders, @intCast(level), box, &expected, hits);
@@ -2238,7 +2220,7 @@ test "with the work budget exhausted, a large static is still hit before small o
     };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, commands.items);
     try std.testing.expect(fixture.colliders.query_class_mask.isSet(0));
-    try std.testing.expect(fixture.colliders.query_class_mask.findLastSet().? > test_geometry.chunkShift());
+    try std.testing.expect(fixture.colliders.query_class_mask.findLastSet().? > test_geometry.grid.shift);
     const view = fixture.colliders.view();
     const box = math.Aabb{ .min_x = 0, .min_y = 0, .max_x = 255, .max_y = 255 };
     const capacity = 128;
@@ -2410,7 +2392,7 @@ test "anchor blocks equal a rebuild after random incremental syncs, serial and t
     // a leaves tile (6, 1) and b enters it in one sync.
     try Step.run(&serial, &threaded, &threads, &.{ moveCommand(a, .{ .x = 230, .y = 100 }), moveCommand(b, .{ .x = 200, .y = 40 }) });
     // d's chunk empties: its block is released and its value cleared.
-    const d_chunk = chunkKey(0, 2 * test_geometry.chunksX() + 2);
+    const d_chunk = chunkKey(0, 2 * test_geometry.grid.chunks_x + 2);
     try std.testing.expect(serial.colliders.chunk_lists.value(d_chunk) != no_value);
     try Step.run(&serial, &threaded, &threads, &.{.{ .set_world_level = .{ .entity = d, .level = 2 } }});
     try std.testing.expectEqual(no_value, serial.colliders.chunk_lists.value(d_chunk));
@@ -2485,7 +2467,7 @@ test "queryBox skips a covered chunk without anchors" {
 test "a static whose clamped min corner sits in a level's last partial chunk is anchored and found by queryBox" {
     // 10 x 10 cells in 4-cell chunks: the last chunk column and row hold cells 8-9.
     const partial = ColliderGeometry.init(32, 10, 10, 4);
-    try std.testing.expect(partial.width() % partial.grid.chunk_tiles != 0);
+    try std.testing.expect(partial.grid.width % partial.grid.chunk_tiles != 0);
     var fixture = try SeamFixture.initWith(partial);
     defer fixture.deinit();
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{
@@ -2494,7 +2476,7 @@ test "a static whose clamped min corner sits in a level's last partial chunk is 
         .{ .create_entity = staticTemplate(.{ .x = 500, .y = 700 }, .{ .x = 8, .y = 8 }) },
         .{ .create_entity = staticTemplate(.{ .x = 260, .y = 260 }, .{ .x = 50, .y = 50 }) },
     });
-    const corner_chunk = chunkKey(0, 2 * partial.chunksX() + 2);
+    const corner_chunk = chunkKey(0, 2 * partial.grid.chunks_x + 2);
     const block = fixture.colliders.chunk_lists.value(corner_chunk);
     try std.testing.expect(block != no_value);
     try std.testing.expectEqual(@as(u16, 2), fixture.colliders.anchor_blocks.items[block].set_bits);

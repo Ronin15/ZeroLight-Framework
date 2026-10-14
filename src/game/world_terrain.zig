@@ -24,6 +24,10 @@ pub const TileId = u16;
 /// tile blocks, nav's per-chunk kernels). `WorldSystem.validateChunkGrid` enforces it.
 pub const max_chunk_edge: u16 = 16;
 pub const max_chunk_cells: usize = @as(usize, max_chunk_edge) * max_chunk_edge;
+comptime {
+    // `ChunkGeometry.localOf` returns a u8.
+    std.debug.assert(max_chunk_cells <= 256);
+}
 /// One bit per chunk-local cell. Raw words, not `std.bit_set`: nav's per-cell kernels read
 /// these words and measured std's per-bit methods at about 3x the serial reaction (Debug,
 /// nav-update-scattered at 256 digs); `bitIsSet`/`setBit`/`clearBit` are the one bit access.
@@ -48,25 +52,38 @@ const uniform_bit: u32 = 1 << 31;
 const open_entry: u32 = std.math.maxInt(u32);
 const blocked_entry: u32 = std.math.maxInt(u32) - 1;
 
-/// One level's chunk grid. `edge` is a power of two in [1, max_chunk_edge].
+/// One level's chunk tiling: power-of-two chunks of `chunk_tiles` cells a side, row-major
+/// over `chunks_x` x `chunks_y`, border chunks clipped to the level. Cell and chunk-local
+/// coordinates map by shifts and masks; only a flat cell index divides (once). Sides are
+/// u32: a world level's are u16, a nav bounds build's may exceed u16, and
+/// `validateChunkGrid` keeps each side and the cell count below 2^32 - 1 and the chunk
+/// count below 2^31.
 pub const ChunkGeometry = struct {
-    width: u16,
-    height: u16,
-    edge: u16,
+    width: u32,
+    height: u32,
+    chunk_tiles: u16,
     shift: u4,
     chunks_x: u32,
     chunks_y: u32,
 
-    pub fn init(width: u16, height: u16, edge: u16) ChunkGeometry {
-        std.debug.assert(edge >= 1 and edge <= max_chunk_edge and std.math.isPowerOfTwo(edge));
-        const edge_wide: u32 = edge;
+    /// No cells: an unbuilt grid's.
+    pub const empty: ChunkGeometry = .{ .width = 0, .height = 0, .chunk_tiles = 1, .shift = 0, .chunks_x = 0, .chunks_y = 0 };
+
+    pub const Bounds = struct { x0: usize, y0: usize, x1: usize, y1: usize };
+
+    /// `chunk_tiles` is a power of two in [1, max_chunk_edge].
+    pub fn init(width: u32, height: u32, chunk_tiles: u16) ChunkGeometry {
+        std.debug.assert(chunk_tiles >= 1 and chunk_tiles <= max_chunk_edge and std.math.isPowerOfTwo(chunk_tiles));
+        const shift: u4 = @intCast(@ctz(chunk_tiles));
+        const edge_less_one: u64 = chunk_tiles - 1;
         return .{
             .width = width,
             .height = height,
-            .edge = edge,
-            .shift = @intCast(@ctz(edge)),
-            .chunks_x = (@as(u32, width) + edge_wide - 1) / edge_wide,
-            .chunks_y = (@as(u32, height) + edge_wide - 1) / edge_wide,
+            .chunk_tiles = chunk_tiles,
+            .shift = shift,
+            // Ceiling divisions widened so a side near 2^32 cannot wrap; each is at most its side.
+            .chunks_x = @intCast((width + edge_less_one) >> shift),
+            .chunks_y = @intCast((height + edge_less_one) >> shift),
         };
     }
 
@@ -75,20 +92,47 @@ pub const ChunkGeometry = struct {
     }
 
     pub fn blockCells(self: ChunkGeometry) usize {
-        return @as(usize, self.edge) * self.edge;
+        return @as(usize, self.chunk_tiles) * self.chunk_tiles;
     }
 
-    pub fn chunkOf(self: ChunkGeometry, x: u16, y: u16) u32 {
-        return (@as(u32, y) >> self.shift) * self.chunks_x + (@as(u32, x) >> self.shift);
+    /// The chunk of in-level cell (x, y). Inline: called per cell in nav's flood and
+    /// solve and per write in terrain edits.
+    pub inline fn chunkOf(self: ChunkGeometry, x: usize, y: usize) u32 {
+        // Below the level's chunk count, which `validateChunkGrid` keeps below 2^31.
+        return @intCast((y >> self.shift) * self.chunks_x + (x >> self.shift));
     }
 
-    pub fn localOf(self: ChunkGeometry, x: u16, y: u16) u32 {
-        const mask: u32 = self.edge - 1;
-        return ((@as(u32, y) & mask) << self.shift) | (@as(u32, x) & mask);
+    /// The chunk of in-level cell index `cell` (`y * width + x`): one division.
+    pub fn chunkOfCell(self: ChunkGeometry, cell: usize) u32 {
+        const y = cell / self.width;
+        return self.chunkOf(cell - y * self.width, y);
+    }
+
+    /// Chunk-local index (`row * chunk_tiles + column`) of in-level cell (x, y). Inline:
+    /// called per cell in nav's flood and solve and per write in terrain edits.
+    pub inline fn localOf(self: ChunkGeometry, x: usize, y: usize) u8 {
+        const mask: usize = self.chunk_tiles - 1;
+        // Below chunk_tiles², at most max_chunk_cells (256).
+        return @intCast(((y & mask) << self.shift) | (x & mask));
+    }
+
+    /// Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the level.
+    pub fn chunkBounds(self: ChunkGeometry, chunk: u32) Bounds {
+        std.debug.assert(chunk < self.chunkCount());
+        const cy = chunk / self.chunks_x;
+        const x0 = @as(usize, chunk - cy * self.chunks_x) << self.shift;
+        const y0 = @as(usize, cy) << self.shift;
+        return .{
+            .x0 = x0,
+            .y0 = y0,
+            .x1 = @min(x0 + self.chunk_tiles, self.width),
+            .y1 = @min(y0 + self.chunk_tiles, self.height),
+        };
     }
 
     /// The chunk's in-level cell rectangle: origin plus column/row counts, which are
-    /// short of `edge` on the right and bottom border chunks.
+    /// short of `chunk_tiles` on the right and bottom border chunks. A world level's sides
+    /// are u16, so its origins fit.
     pub fn extent(self: ChunkGeometry, chunk: u32) ChunkExtent {
         std.debug.assert(chunk < self.chunkCount());
         const min_x: u32 = (chunk % self.chunks_x) << self.shift;
@@ -96,8 +140,8 @@ pub const ChunkGeometry = struct {
         return .{
             .min_x = @intCast(min_x),
             .min_y = @intCast(min_y),
-            .cols = @intCast(@min(@as(u32, self.edge), @as(u32, self.width) - min_x)),
-            .rows = @intCast(@min(@as(u32, self.edge), @as(u32, self.height) - min_y)),
+            .cols = @intCast(@min(self.chunk_tiles, self.width - min_x)),
+            .rows = @intCast(@min(self.chunk_tiles, self.height - min_y)),
         };
     }
 };
@@ -703,10 +747,10 @@ pub fn inLevelMask(geom: ChunkGeometry, extent: ChunkExtent) ChunkBits {
 }
 
 /// Bits of the chunk-local cells in columns [x0, x1) and rows [y0, y1), within one
-/// `geom.edge` square. O(rows): each row is one run of at most `edge` bits inside
-/// one word (64 is a multiple of every edge).
+/// `geom.chunk_tiles` square. O(rows): each row is one run of at most `chunk_tiles` bits
+/// inside one word (64 is a multiple of every chunk edge).
 pub fn rectMask(geom: ChunkGeometry, x0: u32, y0: u32, x1: u32, y1: u32) ChunkBits {
-    std.debug.assert(x0 <= x1 and x1 <= geom.edge and y0 <= y1 and y1 <= geom.edge);
+    std.debug.assert(x0 <= x1 and x1 <= geom.chunk_tiles and y0 <= y1 and y1 <= geom.chunk_tiles);
     var words: ChunkBits = @splat(0);
     if (x0 == x1 or y0 == y1) return words;
     // x1 - x0 <= edge <= 16, so the run fits below bit 64.
@@ -816,6 +860,26 @@ test "chunk geometry maps cells to chunk and local indices with short border chu
     try std.testing.expectEqual(@as(u16, 4), border.min_y);
     try std.testing.expectEqual(@as(u16, 2), border.cols);
     try std.testing.expectEqual(@as(u16, 2), border.rows);
+}
+
+test "chunk bounds and extent describe one rect for every chunk at every edge" {
+    for ([_]u16{ 1, 2, 4, 8, 16 }) |edge| {
+        // Short border chunks on both axes except at edge 1.
+        const geom = ChunkGeometry.init(3 * edge - @intFromBool(edge > 1), 2 * edge + edge / 2, edge);
+        for (0..geom.chunkCount()) |chunk_index| {
+            const chunk: u32 = @intCast(chunk_index);
+            const bounds = geom.chunkBounds(chunk);
+            const extent = geom.extent(chunk);
+            try std.testing.expectEqual(@as(usize, extent.min_x), bounds.x0);
+            try std.testing.expectEqual(@as(usize, extent.min_y), bounds.y0);
+            try std.testing.expectEqual(@as(usize, extent.min_x) + extent.cols, bounds.x1);
+            try std.testing.expectEqual(@as(usize, extent.min_y) + extent.rows, bounds.y1);
+            for (bounds.y0..bounds.y1) |y| for (bounds.x0..bounds.x1) |x| {
+                try std.testing.expectEqual(chunk, geom.chunkOf(x, y));
+                try std.testing.expectEqual(chunk, geom.chunkOfCell(y * geom.width + x));
+            };
+        }
+    }
 }
 
 // The per-cell form of `rectMask`.
