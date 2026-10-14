@@ -31,6 +31,9 @@ paths:
 - Tests never time anything and never call `src/benchmarks/` (except
   `suite.zig`'s tests of its pure utilities); bench-fixture correctness relies
   on internal asserts firing during a real bench run.
+- Tests and benches drive production sequences, resets, and rules through
+  the production functions; never re-implement an order, a field-by-field
+  reset, or a rule they check, since a copy passes when production drifts.
 
 ## Benchmarks
 
@@ -61,10 +64,22 @@ paths:
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
+- Benches read production defaults, constants, layouts, and byte bounds
+  (pure `@sizeOf`-based bounds beside each structure); never copy them. A
+  memory estimate is checked whole against live bytes.
+- Each group's doc states what it measures and its pass shape, and its
+  asserts check that shape. A config the bench cannot run fails, never skips.
+  A variant, column, or assert that measures a removed design goes with it.
+- Shared harness pieces live once (`suite.zig`: item codes, labels, stage
+  shapes, reporting; `fixtures.zig`: worlds, bodies, threads, tuners). A group
+  declares its label and formatter in its definition, never through a switch
+  on its name.
 - A scaling bench runs at least three sizes far enough apart to show the growth
   shape, each right-sized: large enough that the shape is clear and the
   threaded case runs the changed stage, no larger (oversized runs slow the dev
-  cycle and show nothing more). It passes when the shape matches the cost
+  cycle and show nothing more). A sweep varies one axis with the others
+  fixed, never a cross product, and the fixture's world stays fixed unless
+  world size is the axis. It passes when the shape matches the cost
   model's order (flat for a local change, linear where linear is right). A
   cost that grows with world size on a local change is a design defect
   regardless of the absolute number, except reachability maintenance
