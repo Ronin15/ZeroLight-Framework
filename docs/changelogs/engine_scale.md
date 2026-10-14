@@ -304,9 +304,14 @@ Long paths:
 
 ## Known Open Items
 
-- **64G:** the seal gate (verify, ReleaseFast test, gpu-smoke, the acceptance
-  benches, the owner demo check); measured limits are in its slice file.
-- **81:** split the pathfinding module, after 64G.
+- **64G (sealed):** three follow-ups stay open in its slice file: partial-path
+  followers (gated on a crowd walk), the measured level-build staging peak, and
+  the result cache's capacity-history dependence; measured limits are recorded
+  there too.
+- **81, 82:** split the pathfinding module, then the world module.
+- **Core systems (50 first):** the deferred area D findings (serial tile gate,
+  duplicate neighbor grid, steering avoidance SIMD, commit-seam method, file
+  splits) on the Engine-Core Overhaul checklist.
 - **73, 74, 75:** the fully simulated direction's planning slices (cognition,
   world instances, far simulation); not started.
 - **65B:** re-scoped against 64G's chunk storage at its design pass.
