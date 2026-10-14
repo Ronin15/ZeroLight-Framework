@@ -31,7 +31,6 @@ production code, doc comments, and helpers):
 | Package total | 36,997 | 14,943 | 22,054 |
 | `benchmarks/pathfinding.zig` | 5,756 | 0 | 5,756 |
 | `benchmarks/suite.zig` | 2,082 | 382 | 1,700 |
-| `game/world_system.zig` | 8,450 | 4,256 | 4,194 |
 
 - `systems/pathfinding.zig` is a thin facade re-exporting the package's public
   surface; external importers resolve through it.
@@ -39,9 +38,9 @@ production code, doc comments, and helpers):
   fixtures and drivers; `suite.zig` holds the generic harness and also the nav
   memory estimate (`navStorageParts`, `checkNavSize`, `checkNavBytes`).
 - The 64G combined review named candidate seams in nav_graph, connectivity,
-  system, and world_system; the bench review named the bench file's (shared nav
-  fixtures, request load, routes, cache/eviction/elastic, negative,
-  connectivity).
+  and system; the bench review named the bench file's (shared nav fixtures,
+  request load, routes, cache/eviction/elastic, negative, connectivity). The
+  world module's move and split is [Slice 82](slice-82.md).
 
 ### Architecture notes
 
@@ -54,9 +53,6 @@ production code, doc comments, and helpers):
 - Imports are direct, with no bridge aliases (`.claude/rules/zig-style.md`).
 - A seam is one a design pass finds in the code as landed, never a target line
   count.
-- Owner direction 2026-10-09: after 64G seals, the world files move into
-  `src/game/world/` (as `data_system/` is laid out) and `world_system.zig` splits,
-  a file move and split only (64G area C routed the split here).
 
 ### Checklist
 
@@ -68,7 +64,6 @@ production code, doc comments, and helpers):
       fixtures, request load, routes, cache/eviction/elastic, negative,
       connectivity); the nav memory estimate moves out of the generic `suite.zig`
       harness.
-- [ ] World files under `src/game/world/` and `world_system.zig` split.
 - [ ] `docs/architecture.md` § Source Layout lists the new files.
 
 ### Acceptance checks
