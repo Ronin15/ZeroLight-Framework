@@ -258,8 +258,11 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    O(1) per request, never a failed search), the dense-dig main-thread split,
    the cross-level heuristic at scale with partial hops for far goals, and the
    combined review since the 2026-10-07 branch review; every acceptance check
-   passes, with three follow-ups open in the slice. Then [81](roadmap/slices/slice-81.md) splits the pathfinding module and
-   [82](roadmap/slices/slice-82.md) the world module.
+   passes, with three follow-ups open in the slice. Then one short branch of
+   file moves, merged before the core branch opens: [82](roadmap/slices/slice-82.md)
+   moves and splits the world module (owner 2026-10-09: first item after the
+   seal), then [81](roadmap/slices/slice-81.md) splits the pathfinding module, so
+   the core and AI branches plan against the final file layout.
 2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
    2026-10-12), so the branch's threaded rework runs under the race
    detector; then spatial index, steering, collision, tile gate, render
@@ -411,8 +414,8 @@ order.
   75 and 74 bind the observer; 60's rig drives it once landed.
 
 1. **64G** Chunk-Owned Terrain And Nav.
-2. **81** Split The Pathfinding Module — after 64G.
-3. **82** Split The World Module — after 64G.
+2. **82** Split The World Module — after 64G.
+3. **81** Split The Pathfinding Module — after 64G, 82.
 4. **50** Thread System Hardening (opens the core-systems branch).
 5. **76** Cave-Ins — after 64G.
 6. **77** Explosions — after 64G, 76.

@@ -1,8 +1,8 @@
 ## Slice 81: Split The Pathfinding Module
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md) · Track: standalone (engine core)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 82](slice-82.md) · Track: standalone (engine core)
 
-**Status: not started.** Owner todo 2026-10-11: after 64G seals.
+**Status: not started.** Owner todo 2026-10-11: after 64G seals; runs right after 82 on the same file-move branch, before the core branch opens.
 
 Goal: the pathfinding package's production parts that can stand on their own are
 separated into their own files, each with its tests beside it, so every file has
