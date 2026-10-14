@@ -25,6 +25,8 @@ const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const PathQueryKey = @import("../game/systems/pathfinding/types.zig").PathQueryKey;
 const default_tier1_abstract_node_cap = @import("../game/systems/pathfinding/types.zig").default_tier1_abstract_node_cap;
+const refLevel = @import("../game/systems/pathfinding/types.zig").refLevel;
+const refLocal = @import("../game/systems/pathfinding/types.zig").refLocal;
 const cached_results_per_agent = @import("../game/systems/pathfinding/types.zig").cached_results_per_agent;
 const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_capacity_floor;
 const intake_range_alignment_items = @import("../game/systems/pathfinding/types.zig").intake_range_alignment_items;
@@ -272,9 +274,12 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 // whole walk: each step reads its status, requests on `.missing` or a partial's refresh,
 // advances up to `walk_cells_per_step` waypoints (holding when pending or at a partial's end),
 // then runs one timed step; the sample's time is the steps' total. A walk holding
-// `walk_stall_steps` steps in a row stops short: it fails the case unless its config may stop
-// short (`walkMayStopShort`), which then reports where it stopped; one past 4 x the route's
-// cells + 64 steps fails the case.
+// `walk_stall_steps` steps in a row, or past 4 x the route's cells + 64 steps, fails the case.
+// Variant 4 chains hops for the cross-level layouts, which a walk cannot cross: a sample
+// requests from the start, runs the first attempt's step and the escalated one's when it
+// promoted, restarts at a partial's end on its level, and repeats until a hop arrives; the
+// sample's time is the steps' total, and a hop that drops or a chain past the route's cells +
+// 64 hops fails the case.
 // A caps, probe, or crowd sample is one request cycle from empty runtime state: the first attempt's step, the
 // escalated attempt's step when the first exhausted, then every agent's status. Claims must
 // repeat exactly across samples. Serial only: each step solves one request.
@@ -285,7 +290,11 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 // and `outputs` the agents a path serves. A walk prints whether it arrived and where it
 // stopped, its steps, held steps, solves (its requests), partial and full results,
 // escalations, abstract claims over every solve, and total solve time; its `candidates` are
-// its solves and `outputs` its published results.
+// its solves and `outputs` its published results. A hop chain prints whether it arrived, its
+// last hop's start, its hops (published ones toward a least-estimate node as `least_hops`),
+// solves, escalations, claims, and total solve time; its `candidates` are its solves and
+// `outputs` its hops. An attempt's `abstract_partial` outcome is a saturated tier-1 search
+// published toward its least-estimate node.
 pub const long_path_group = suite.BenchmarkGroup{
     .name = "pathfinding-long-path",
     .defaultItemCounts = longPathItemCounts,
@@ -2531,9 +2540,6 @@ const long_path_side: u16 = 2048;
 const serpentine_pitch: u16 = 128;
 const serpentine_gap: u16 = 8;
 const serpentine_walls: u16 = long_path_side / serpentine_pitch - 1;
-// Walls from which a serpentine's search passes the tier-1 abstract node cap (measured by the
-// probe and caps variants), so its walk stops short.
-const serpentine_abstract_cap_walls: u16 = 4;
 // The open diagonal's start on both axes.
 const open_diagonal_origin: u16 = 8;
 const stack_side: u16 = 256;
@@ -2569,6 +2575,7 @@ const LongPathVariant = enum(u8) {
     probe,
     crowd,
     walk,
+    hops,
 };
 
 const LongPathConfig = struct {
@@ -2586,7 +2593,7 @@ const LongPathConfig = struct {
         const variant_index = item_count / long_path_variant_encoding;
         const layout_index = item_count % long_path_variant_encoding / long_path_layout_encoding;
         const parameter = item_count % long_path_layout_encoding;
-        if (variant_index > @backingInt(LongPathVariant.walk)) return error.LongPathUnknownVariant;
+        if (variant_index > @backingInt(LongPathVariant.hops)) return error.LongPathUnknownVariant;
         if (layout_index > @backingInt(LongPathLayout.deep_wide)) return error.LongPathUnknownLayout;
         if (parameter == 0 or parameter > std.math.maxInt(u16)) return error.LongPathBadParameter;
         // In range: every digit is checked above.
@@ -2637,13 +2644,6 @@ const LongPathConfig = struct {
             .wide_descent => wide_descent_levels - 1,
             .deep_wide => self.parameter - 1,
         };
-    }
-
-    // Whether a walk may stop short of its goal: a serpentine of `serpentine_abstract_cap_walls`
-    // walls or more, whose route the tier-1 abstract node cap cannot hold. Every other walk
-    // must arrive.
-    fn walkMayStopShort(self: LongPathConfig) bool {
-        return self.variant == .walk and self.layout == .serpentine and self.parameter >= serpentine_abstract_cap_walls;
     }
 
     fn agents(self: LongPathConfig) usize {
@@ -2718,10 +2718,22 @@ const long_path_item_counts = [_]usize{
     LongPathConfig.code(.walk, .cave, 512),
     LongPathConfig.code(.walk, .cave, 1024),
     LongPathConfig.code(.walk, .cave, 2032),
-    // One wall: past the stitched-cell cap, inside the abstract cap, so it must arrive. Four:
-    // past the abstract cap, so it may stop short (`walkMayStopShort`).
+    // One wall: past the stitched-cell cap, inside the abstract cap. Four and fifteen: past the
+    // abstract cap, each hop toward a saturated search's least-estimate node.
     LongPathConfig.code(.walk, .serpentine, 1),
     LongPathConfig.code(.walk, .serpentine, 4),
+    LongPathConfig.code(.walk, .serpentine, 15),
+    // The cross-level routes past the tier-1 abstract cap, as hop chains (a walk cannot change
+    // level).
+    LongPathConfig.code(.hops, .descent, 16),
+    LongPathConfig.code(.hops, .descent, 64),
+    LongPathConfig.code(.hops, .descent, 127),
+    LongPathConfig.code(.hops, .wide_descent, 512),
+    LongPathConfig.code(.hops, .wide_descent, 1024),
+    LongPathConfig.code(.hops, .wide_descent, 2048),
+    LongPathConfig.code(.hops, .deep_wide, 4),
+    LongPathConfig.code(.hops, .deep_wide, 8),
+    LongPathConfig.code(.hops, .deep_wide, 16),
 };
 
 fn longPathItemCounts(_: suite.Profile) []const usize {
@@ -2954,6 +2966,8 @@ const LongPathOutcome = enum {
     available,
     // A tier-1 stitch past its cell or segment cap published its prefix.
     partial,
+    // A saturated tier-1 search published toward its least-estimate node.
+    abstract_partial,
     // The abstract search hit its node cap or open-heap limit.
     abstract_saturated,
     // The stitch hit the attempt's stitched-cell cap.
@@ -3007,7 +3021,7 @@ const LongPathCycle = struct {
 // Times one serial step that must solve exactly one request, at `tier`, and reads that solve
 // from its scratch: the participant's corridor for a first attempt, the first tier-1 pool
 // entry (the step's only escalated admission) for an escalated one.
-fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, tier: u8) !LongPathAttempt {
+fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), request: PathRequest, agent_count: usize, tier: u8) !LongPathAttempt {
     const start_ns = suite.nowNs(io);
     const stats = try system.updateSerial(requests, agent_count, .{
         .max_solved_requests_per_step = agent_count,
@@ -3027,7 +3041,8 @@ fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const R
     const outcome: LongPathOutcome = if (stats.available_results == 1 or stats.partial_results == 1) published: {
         // Every layout's route leaves its start's chunk, so the solve ran the abstract search.
         if (stats.abstract_solves != 1 or !found) return error.LongPathSolvedOffCorridor;
-        break :published if (stats.partial_results == 1) .partial else .available;
+        if (stats.partial_results == 0) break :published .available;
+        break :published if (corridorEndsAtGoal(system, abstract.corridor.items, request)) .partial else .abstract_partial;
     } else if (stats.budget_exhausted != 1)
         return error.LongPathUnexpectedOutcome
     else if (!found)
@@ -3050,17 +3065,30 @@ fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const R
     };
 }
 
+// Whether a corridor ends on a goal portal of `request`: on the goal level, in its live goal's
+// chunk, sharing that cell's chunk-local label. A least-estimate corridor ends short of one.
+fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize, request: PathRequest) bool {
+    const last = corridor[corridor.len - 1];
+    if (refLevel(last) != request.goal_level) return false;
+    const grid = system.graph.grid(request.goal_level) orelse return false;
+    const geometry = system.graph.chunkGeometry();
+    const key = system.graph.keyForWorld(request.goal_level, request.goal, request.agent_class) orelse return false;
+    const goal_index = system.liveGoal(key, grid).cell orelse return false;
+    const cell = refLocal(last);
+    return geometry.chunkOfCell(cell) == geometry.chunkOfCell(goal_index) and grid.labelAt(cell) == grid.labelAt(goal_index);
+}
+
 // One request cycle from empty runtime state: the first attempt, the escalated attempt when
 // the first exhausted, then every agent's status. No request stays pending after the second
 // attempt: it solves or drops.
 fn runLongPathCycle(io: std.Io, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
     const system = &fixture.system;
     resetPathState(system, .drop_fields);
-    const first = try runLongPathAttempt(io, system, &fixture.requests, requests.len, 0);
+    const first = try runLongPathAttempt(io, system, &fixture.requests, requests[0], requests.len, 0);
     var escalated: ?LongPathAttempt = null;
     if (first.outcome != .available) {
         if (system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
-        escalated = try runLongPathAttempt(io, system, empty, requests.len, 1);
+        escalated = try runLongPathAttempt(io, system, empty, requests[0], requests.len, 1);
     }
     if (system.pending.len != 0) return error.LongPathStillPending;
     var cycle = LongPathCycle{ .first = first, .escalated = escalated, .available = 0, .partial = 0, .missing = 0 };
@@ -3078,8 +3106,8 @@ fn runLongPathCycle(io: std.Io, fixture: *RouteFixture, empty: *const RangeOutpu
 // Waypoints a walker advances per step: a hop of the tier-1 stitched cap ends well inside
 // the result's TTL, so a walk measures refresh hops rather than TTL re-solves.
 const walk_cells_per_step: usize = 16;
-// Held steps in a row past which a walk stops short: well past the two-attempt ladder a hop
-// takes and its refresh cooldown.
+// Held steps in a row past which a walk fails: well past the two-attempt ladder a hop takes and
+// its refresh cooldown.
 const walk_stall_steps: usize = 32;
 
 // One walk's counts and its timed steps' total.
@@ -3106,7 +3134,7 @@ const LongPathWalk = struct {
 };
 
 // Walks `request`'s agent from empty runtime state to its goal (see the group comment).
-fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize, may_stop_short: bool) !LongPathWalk {
+fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
     const system = &fixture.system;
     resetPathState(system, .drop_fields);
     const grid = system.graph.grid(request.start_level) orelse return error.RouteUnavailable;
@@ -3152,7 +3180,7 @@ fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
     }
     const stop = grid.worldToCellClamped(position);
     walk.arrived = std.meta.eql(stop, goal_cell);
-    if (!walk.arrived and !may_stop_short) return error.LongPathWalkStalled;
+    if (!walk.arrived) return error.LongPathWalkStalled;
     // In range: a cell of a u16-sided level.
     walk.stop = .{ .x = @intCast(stop.x), .y = @intCast(stop.y) };
     return walk;
@@ -3162,11 +3190,11 @@ fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
     const step_limit = 4 * config.routeCells() + 64;
-    for (0..coldWarmup(options)) |_| _ = try runLongPathWalk(io, fixture, &stream, request, step_limit, config.walkMayStopShort());
+    for (0..coldWarmup(options)) |_| _ = try runLongPathWalk(io, fixture, &stream, request, step_limit);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reference: ?LongPathWalk = null;
     for (0..coldIterations(options)) |_| {
-        const walk = try runLongPathWalk(io, fixture, &stream, request, step_limit, config.walkMayStopShort());
+        const walk = try runLongPathWalk(io, fixture, &stream, request, step_limit);
         if (reference) |kept| {
             if (!kept.sameWork(walk)) return error.LongPathWorkVaried;
         } else reference = walk;
@@ -3198,6 +3226,127 @@ fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     }
     stats.candidate_pairs = walk.solves;
     stats.output_count = walk.partial_results + walk.full_results;
+    stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
+    return stats;
+}
+
+// One hop chain's counts and its steps' total.
+const LongPathHops = struct {
+    arrived: bool = false,
+    // Requests the chain made: one per published hop, plus the last, which arrives or drops.
+    hops: usize = 0,
+    // Published hops toward a saturated search's least-estimate node.
+    least_hops: usize = 0,
+    // Abstract nodes claimed over every solve.
+    claims: usize = 0,
+    solves: usize = 0,
+    escalations: usize = 0,
+    // The last hop's start.
+    stop_level: u16 = 0,
+    stop_cell: u32 = 0,
+    solve_ns: u64 = 0,
+
+    fn sameWork(self: LongPathHops, other: LongPathHops) bool {
+        return self.arrived == other.arrived and self.hops == other.hops and self.least_hops == other.least_hops and
+            self.claims == other.claims and self.solves == other.solves and self.escalations == other.escalations and
+            self.stop_level == other.stop_level and self.stop_cell == other.stop_cell;
+    }
+};
+
+// Chains `request`'s hops from empty runtime state: each hop's request runs its first attempt
+// and, when that promoted, its escalated attempt; a partial restarts the chain at its end, on
+// its level, until a hop arrives (`.available`) or drops (`.missing`).
+fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, hop_limit: usize) !LongPathHops {
+    const system = &fixture.system;
+    resetPathState(system, .drop_fields);
+    const tier0_abstract = &system.scratch_slots.items[0].corridor.abstract;
+    const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
+    var chain = LongPathHops{};
+    var hop = request;
+    while (true) {
+        if (chain.hops == hop_limit) return error.LongPathHopsUnbounded;
+        chain.hops += 1;
+        const grid = system.graph.grid(hop.start_level) orelse return error.RouteUnavailable;
+        // In range: a cell index of a u16-sided level.
+        chain.stop_cell = @intCast(grid.indexForCell(grid.worldToCellClamped(hop.start)) orelse return error.RouteStartInvalid);
+        chain.stop_level = hop.start_level;
+        try writeRequests(stream, &.{hop});
+        const ended: enum { arrived, partial, dropped } = for (0..2) |attempt| {
+            // Each attempt's claims, counted from empty tables.
+            tier0_abstract.reset();
+            tier1_abstract.reset();
+            const start_ns = suite.nowNs(io);
+            const stats = try system.updateSerial(stream, 1, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+            chain.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+            try writeRequests(stream, &.{});
+            chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
+            if (stats.unavailable_results != 0) return error.RouteUnavailable;
+            if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+            if (stats.solve_admissions != 1 or stats.cache_hits != 0) return error.LongPathNotOneSolve;
+            chain.solves += 1;
+            chain.escalations += stats.escalated_solves;
+            if (stats.available_results == 1) break .arrived;
+            if (stats.partial_results == 1) {
+                if (attempt == 1 and !corridorEndsAtGoal(system, tier1_abstract.corridor.items, hop)) chain.least_hops += 1;
+                break .partial;
+            }
+            if (stats.escalated_dropped == 1) break .dropped;
+            if (attempt == 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
+        } else return error.LongPathStillPending;
+        switch (ended) {
+            .arrived => {
+                chain.arrived = true;
+                return chain;
+            },
+            .dropped => return error.LongPathHopsDropped,
+            .partial => {
+                const end = system.solved_paths.items[0].end;
+                const end_grid = system.graph.grid(end.level) orelse return error.RouteUnavailable;
+                hop.start_level = end.level;
+                hop.start = end_grid.cellCenter(end.cell);
+            },
+        }
+    }
+}
+
+fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest) !suite.RunStats {
+    var stream = RangeOutputStream(PathRequest).init(allocator);
+    defer stream.deinit();
+    // Every published hop advances at least one cell.
+    const hop_limit = config.routeCells() + 64;
+    for (0..coldWarmup(options)) |_| _ = try runLongPathHops(io, fixture, &stream, request, hop_limit);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var reference: ?LongPathHops = null;
+    for (0..coldIterations(options)) |_| {
+        const chain = try runLongPathHops(io, fixture, &stream, request, hop_limit);
+        if (reference) |kept| {
+            if (!kept.sameWork(chain)) return error.LongPathWorkVaried;
+        } else reference = chain;
+        accumulator.record(chain.solve_ns, inlineBatch(1, pathfinding_range_alignment_items));
+    }
+    var stats = accumulator.finish();
+    const chain = reference orelse return stats;
+    if (options.details) {
+        std.debug.print("  {s} {} {s}: {s} hops parameter={} route~{} cells | arrived={} stop=L{}:{} hops={} least_hops={} solves={} escalations={} claims={} solve={}us\n", .{
+            long_path_group.name,
+            item_count,
+            case.name,
+            @tagName(config.layout),
+            config.parameter,
+            config.routeCells(),
+            chain.arrived,
+            chain.stop_level,
+            chain.stop_cell,
+            chain.hops,
+            chain.least_hops,
+            chain.solves,
+            chain.escalations,
+            chain.claims,
+            stats.mean_ns / std.time.ns_per_us,
+        });
+    }
+    stats.candidate_pairs = chain.solves;
+    stats.output_count = chain.hops;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     return stats;
 }
@@ -3251,6 +3400,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer empty.deinit();
     const agents = requests[0..agent_count];
     if (config.variant == .walk) return runLongPathWalkCase(allocator, io, options, case, item_count, config, &fixture, agents[0], built.blocked);
+    if (config.variant == .hops) return runLongPathHopsCase(allocator, io, options, case, item_count, config, &fixture, agents[0]);
 
     for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &fixture, &empty, agents);
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -3263,7 +3413,10 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
             if (!kept.sameWork(cycle)) return error.LongPathWorkVaried;
         } else reference = cycle;
         if (config.variant == .probe) {
-            if (cycle.escalated) |escalated| if (escalated.outcome == .abstract_saturated) return error.LongPathProbeSaturated;
+            if (cycle.escalated) |escalated| switch (escalated.outcome) {
+                .abstract_saturated, .abstract_partial => return error.LongPathProbeSaturated,
+                else => {},
+            };
         }
         first_ns += cycle.first.ns;
         if (cycle.escalated) |escalated| escalated_ns += escalated.ns;

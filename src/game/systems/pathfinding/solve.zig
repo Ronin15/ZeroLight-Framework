@@ -207,7 +207,10 @@ fn tier1Corridor(system: *PathfindingSystem, ordinal: usize) *CorridorScratch {
 // held before the search, so no search ends without a path. A tier-1 stitch stopped by
 // its cell or segment cap publishes its prefix as `.partial` when the prefix leaves its start
 // cell, so each hop advances along the path even where it folds back near its start; a prefix
-// that never leaves the start, and a tier-0 cap, promote as a spill does.
+// that never leaves the start, and a tier-0 cap, promote as a spill does. A saturated tier-1
+// search publishes `.partial` toward its least-estimate expanded node (`LeastExpanded`), cut
+// to end on the last stitched cell whose estimate lies below the start's; with no expanded
+// node or stitched cell below the start's estimate it drops as a spill does.
 fn solveAbstract(
     system: *PathfindingSystem,
     scratch: *SearchScratch,
@@ -224,11 +227,17 @@ fn solveAbstract(
 ) PathSolveResult {
     const graph = &system.graph;
     const abstract = &corridor_scratch.abstract;
-    const searched = abstractCorridor(graph, abstract, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap);
+    // The search's estimate, written by the search and read again to cut a stitch toward its
+    // least node. Only a tier-1 search tracks that node; tier 0 promotes on saturation.
+    var heuristic: CrossLevelHeuristic = undefined;
+    var least_expanded: LeastExpanded = undefined;
+    const least: ?*LeastExpanded = if (request.tier == 0) null else &least_expanded;
+    const searched = abstractCorridor(graph, abstract, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap, &heuristic, least);
     scratch.crossing_boxes_settled += abstract.crossing.settles;
     scratch.crossing_budget_frozen += @intFromBool(abstract.crossing.frozen);
+    const to_goal = searched == .found;
     const corridor = switch (searched) {
-        .found => |c| c,
+        .found, .toward => |c| c,
         // Abstract scratch saturated: a reachable goal past the attempt's cap, retried on
         // the two-tier ladder.
         .saturated => return .{ .budget_exhausted = request.key },
@@ -239,22 +248,28 @@ fn solveAbstract(
 
     // Stitch the full obstacle-aware path across every corridor segment. A node-budget
     // spill is a transient: retry next frame. A cap at tier 0 promotes; at tier 1 its prefix
-    // is the partial result. A corridor reached the goal, so a stitch ending without a path
-    // breaks reach.
-    const partial = switch (stitchCorridor(system, scratch, corridor_scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap, segment_cap)) {
+    // is the partial result. Consecutive corridor nodes connect, so a stitch ending without a
+    // path breaks reach.
+    const capped = switch (stitchCorridor(system, scratch, corridor_scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap, segment_cap, to_goal)) {
         .found => false,
         .capped => true,
         .spilled => return .{ .budget_exhausted = request.key },
         .none => return reachContractBreak(request.key),
     };
 
-    const stitched = corridor_scratch.stitched.items;
-    if (stitched.len == 0) return reachContractBreak(request.key);
-    // A prefix ending on its start would answer its own next request unchanged.
-    if (partial) {
-        const end = stitched[stitched.len - 1];
+    const stitched_list = &corridor_scratch.stitched;
+    if (stitched_list.items.len == 0) return reachContractBreak(request.key);
+    if (!to_goal) {
+        // Ends the stitch on its last cell below the start's estimate: the least node itself
+        // when uncapped; when capped, a prefix cell, and none past the start drops.
+        if (!cutBelowStart(stitched_list, &heuristic, least_expanded.start_h, graph.geometry.width)) return .{ .budget_exhausted = request.key };
+    } else if (capped) {
+        // A prefix ending on its start would answer its own next request unchanged.
+        const end = stitched_list.items[stitched_list.items.len - 1];
         if (request.tier == 0 or (end.level == request.start_level and end.cell == start_index)) return .{ .budget_exhausted = request.key };
     }
+    const partial = capped or !to_goal;
+    const stitched = stitched_list.items;
     recordStitched(system, ordinal, stitched, request.start_level, @intCast(goal_index));
     const solved = &system.solved_paths.items[ordinal];
     solved.via_abstract = true;
@@ -272,7 +287,8 @@ fn solveAbstract(
 // `capped` on a stitched-buffer overflow or a segment-count spill (segment_cap, see
 // default_max_stitch_segments — bounds total local-search work independent of how many
 // portals the chosen corridor crosses), with the cells stitched so far kept, and `spilled`
-// on a segment node-budget spill.
+// on a segment node-budget spill. `to_goal` false (a corridor toward a closed node short of
+// the goal) ends the stitch on the corridor's last node, with no final span.
 // SIMD verdict: scalar. Segments run in corridor order, each a local A* from the previous
 // segment's end.
 fn stitchCorridor(
@@ -285,6 +301,7 @@ fn stitchCorridor(
     goal_index: usize,
     cap_requested: usize,
     segment_cap: usize,
+    to_goal: bool,
 ) StitchOutcome {
     const graph = &system.graph;
     const stitched = &corridor_scratch.stitched;
@@ -323,6 +340,7 @@ fn stitchCorridor(
         prev_level = portal.level;
         prev_cell = portal.cell;
     }
+    if (!to_goal) return .found;
     // Final span: last corridor cell -> goal cell, a walkable same-level segment. A found
     // corridor ends at a goal-level portal (abstractCorridor's goal test).
     std.debug.assert(prev_level == request.key.goal_level);
@@ -372,6 +390,9 @@ const AbstractCorridor = struct {
 
 const AbstractResult = union(enum) {
     found: AbstractCorridor,
+    // Saturated with a least-estimate fallback whose node lies below the start's estimate:
+    // the corridor ends on that node, short of the goal.
+    toward: AbstractCorridor,
     // The bounded abstract scratch saturated (open/slot table full); the corridor
     // may exist but could not be searched this frame.
     saturated,
@@ -381,6 +402,54 @@ const AbstractResult = union(enum) {
     // cell): a start-side condition, not an unreachable goal.
     unseedable,
 };
+
+// A tier-1 search's least-estimate expanded node, ties to the lower ref, so the choice depends
+// only on the set of expanded nodes, a pure function of graph, goal, start, and budget; and the
+// estimate at the start cell.
+const LeastExpanded = struct {
+    start_h: u32,
+    slot: u32,
+    ref: usize,
+    h: u32,
+
+    fn begin(self: *LeastExpanded, start_h: u32) void {
+        self.start_h = start_h;
+        self.slot = no_slot;
+        self.ref = 0;
+        self.h = unreachable_cost;
+    }
+
+    // O(1) per expanded node.
+    fn consider(self: *LeastExpanded, slot: u32, ref: usize, h: u32) void {
+        if (h > self.h or (h == self.h and self.slot != no_slot and ref >= self.ref)) return;
+        self.slot = slot;
+        self.ref = ref;
+        self.h = h;
+    }
+
+    fn belowStart(self: *const LeastExpanded) bool {
+        return self.slot != no_slot and self.h < self.start_h;
+    }
+};
+
+// Cuts a stitch toward a least node back to its last cell whose `heuristic` estimate lies below
+// `start_h`; false when no cell past the start does. Uncapped, the last cell is the least node,
+// so this costs one estimate; a capped stitch scans back from its end, at most its cells.
+// SIMD verdict: scalar. Back-to-front early exit, usually on the first cell.
+fn cutBelowStart(stitched: *std.ArrayList(StitchedCell), heuristic: *CrossLevelHeuristic, start_h: u32, width: usize) bool {
+    var len = stitched.items.len;
+    while (len > 1) : (len -= 1) {
+        const cell = stitched.items[len - 1];
+        // Sides of a validated level fit u32.
+        const x: u32 = @intCast(cell.cell % width);
+        const y: u32 = @intCast(cell.cell / width);
+        if (heuristic.estimate(heuristic.levelTerms(cell.level), cell.level, x, y) < start_h) {
+            stitched.shrinkRetainingCapacity(len);
+            return true;
+        }
+    }
+    return false;
+}
 
 // A node an abstract expansion relaxes: its packed ref, cell coordinates, and its chunk
 // portal when the relaxing expansion holds it (a same-chunk peer, or a seed).
@@ -750,6 +819,9 @@ const CrossingSearch = struct {
 // the abstract node budget; seeding scans only the start chunk's record. A node's
 // coordinates are cached at claim, and its portal when the claiming expansion held it, so a
 // pop derives its chunk by shifts and looks a portal up only for a mirror or link target.
+// `heuristic` receives the search's estimate. With `least`, each expanded node is offered to
+// it, and a saturated search returns `.toward` with the chain to its least node when that
+// node's estimate lies below the start cell's.
 // SIMD verdict: scalar frontier (each pop relaxes from the costs earlier pops set, over a
 // data-dependent portal list); the long-link heuristic terms are four-lane (`preparePairs`).
 fn abstractCorridor(
@@ -762,6 +834,8 @@ fn abstractCorridor(
     start_index: usize,
     goal_index: usize,
     node_cap: usize,
+    heuristic: *CrossLevelHeuristic,
+    least: ?*LeastExpanded,
 ) AbstractResult {
     abstract.reset();
     // Per-query attempt-scoped cap (tier-0 stays small; tier-1 uses the fixed ceiling),
@@ -779,7 +853,7 @@ fn abstractCorridor(
     const goal: u32 = @intCast(goal_index);
     const goal_y = goal / width;
     const goal_x = goal - goal_y * width;
-    var heuristic = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &abstract.crossing, crossingBoxBudget(abstract.node_budget));
+    heuristic.* = CrossLevelHeuristic.init(graph, goal_level, goal_x, goal_y, &abstract.crossing, crossingBoxBudget(abstract.node_budget));
 
     // Seed the open set with the start chunk's portals sharing the start cell's label,
     // costed by octile distance from the start.
@@ -790,6 +864,7 @@ fn abstractCorridor(
     const start_x = start_cell - start_y * width;
     const start_portals = graph.chunkPortals(start_level, geometry.chunkOf(start_x, start_y));
     const start_terms = heuristic.levelTerms(start_level);
+    if (least) |tracked| tracked.begin(heuristic.estimate(start_terms, start_level, start_x, start_y));
     var seeded: usize = 0;
     for ([_][]const NavPortal{ start_portals.border, start_portals.extra }) |portals| {
         for (portals) |portal| {
@@ -821,7 +896,7 @@ fn abstractCorridor(
     while (abstract.open.items.len != 0) {
         const current = popHeap(&abstract.open);
         const current_ref = current.index;
-        const current_slot = (abstract.slotFor(current_ref) orelse return .saturated).slot;
+        const current_slot = (abstract.slotFor(current_ref) orelse return saturatedResult(abstract, least, start_level)).slot;
         const current_node = &slots[current_slot];
         if (current_node.stamp & 1 != 0) continue;
         // Lazy deletion: skip a superseded duplicate left in the heap by an earlier
@@ -853,7 +928,7 @@ fn abstractCorridor(
             // open, so the first goal portal to end the search is the cheapest.
             const goal_octile = octileU32(x, y, goal_x, goal_y);
             if (current.h < goal_octile) {
-                if (abstract.open.items.len >= abstract.open_limit) return .saturated;
+                if (abstract.open.items.len >= abstract.open_limit) return saturatedResult(abstract, least, start_level);
                 abstract.open.appendAssumeCapacity(.{ .index = current_ref, .f = current_node.g +| goal_octile, .h = goal_octile });
                 siftUp(abstract.open.items, abstract.open.items.len - 1);
                 continue;
@@ -861,13 +936,14 @@ fn abstractCorridor(
             switch (buildCorridor(abstract, current_slot, start_level)) {
                 .ok => {},
                 // Budget-truncated reconstruction: spill+retry, never unavailable.
-                .truncated => return .saturated,
+                .truncated => return saturatedResult(abstract, least, start_level),
                 .none => return .none,
             }
             return .{ .found = .{ .crosses_level = start_level != goal_level } };
         }
 
         current_node.stamp |= 1;
+        if (least) |tracked| tracked.consider(current_slot, current_ref, current.h);
         const current_g = current_node.g;
         const terms = heuristic.levelTerms(level);
         const origin_x = x & ~mask;
@@ -887,15 +963,15 @@ fn abstractCorridor(
                 const target = py * width + px;
                 const cost = chunk_octile[@max(local_x, peer_x) - @min(local_x, peer_x)][@max(local_y, peer_y) - @min(local_y, peer_y)];
                 const node = AbstractNode{ .ref = packRef(level, target), .x = px, .y = py, .portal = peer };
-                if (!relaxAbstractNode(abstract, current_slot, current_g, node, cost, false, &heuristic, terms)) return .saturated;
+                if (!relaxAbstractNode(abstract, current_slot, current_g, node, cost, false, heuristic, terms)) return saturatedResult(abstract, least, start_level);
             }
         }
         // The mirror cell across each border this portal sits on.
         // A flag means the mirror cell exists in-grid.
-        if (portal.flags.west and !relaxMirror(abstract, current_slot, current_g, level, cell - 1, x - 1, y, &heuristic, terms)) return .saturated;
-        if (portal.flags.east and !relaxMirror(abstract, current_slot, current_g, level, cell + 1, x + 1, y, &heuristic, terms)) return .saturated;
-        if (portal.flags.north and !relaxMirror(abstract, current_slot, current_g, level, cell - width, x, y - 1, &heuristic, terms)) return .saturated;
-        if (portal.flags.south and !relaxMirror(abstract, current_slot, current_g, level, cell + width, x, y + 1, &heuristic, terms)) return .saturated;
+        if (portal.flags.west and !relaxMirror(abstract, current_slot, current_g, level, cell - 1, x - 1, y, heuristic, terms)) return saturatedResult(abstract, least, start_level);
+        if (portal.flags.east and !relaxMirror(abstract, current_slot, current_g, level, cell + 1, x + 1, y, heuristic, terms)) return saturatedResult(abstract, least, start_level);
+        if (portal.flags.north and !relaxMirror(abstract, current_slot, current_g, level, cell - width, x, y - 1, heuristic, terms)) return saturatedResult(abstract, least, start_level);
+        if (portal.flags.south and !relaxMirror(abstract, current_slot, current_g, level, cell + width, x, y + 1, heuristic, terms)) return saturatedResult(abstract, least, start_level);
         // Links leaving this cell whose target cell is open on a built level; only a
         // link-flagged portal has any.
         if (!portal.flags.link) continue;
@@ -905,10 +981,26 @@ fn abstractCorridor(
             const target_y = link.to_cell / width;
             const target_x = link.to_cell - target_y * width;
             const node = AbstractNode{ .ref = packRef(link.to_level, link.to_cell), .x = target_x, .y = target_y, .portal = null };
-            if (!relaxAbstractNode(abstract, current_slot, current_g, node, link.cost, true, &heuristic, null)) return .saturated;
+            if (!relaxAbstractNode(abstract, current_slot, current_g, node, link.cost, true, heuristic, null)) return saturatedResult(abstract, least, start_level);
         }
     }
     return .none;
+}
+
+// A saturated search's result: `.toward` with the chain to `least`'s node when it lies below the
+// start's estimate, else `.saturated`. O(chain), once per saturated search.
+fn saturatedResult(abstract: *AbstractScratch, least: ?*LeastExpanded, start_level: u16) AbstractResult {
+    const tracked = least orelse return .saturated;
+    if (!tracked.belowStart()) return .saturated;
+    switch (buildCorridor(abstract, tracked.slot, start_level)) {
+        .ok => {},
+        .truncated, .none => return .saturated,
+    }
+    // Rooted on the start level, the chain crosses a level when any node leaves it.
+    const crosses_level = for (abstract.corridor.items) |ref| {
+        if (refLevel(ref) != start_level) break true;
+    } else false;
+    return .{ .toward = .{ .crosses_level = crosses_level } };
 }
 
 // Octile cost of a step of (dx, dy) cells within one chunk, by table.
@@ -1389,6 +1481,12 @@ test "buildCorridor truncates at corridor_limit regardless of physical capacity"
     try std.testing.expectEqualSlices(bool, &.{ false, false, true }, a.corridor_link.items);
 }
 
+// An abstract search with its own estimate and no least-node tracking.
+fn searchAbstract(graph: *const NavGraph, abstract: *AbstractScratch, start_grid: *const NavGrid, goal_grid: *const NavGrid, start_level: u16, goal_level: u16, start_index: usize, goal_index: usize, node_cap: usize) AbstractResult {
+    var heuristic: CrossLevelHeuristic = undefined;
+    return abstractCorridor(graph, abstract, start_grid, goal_grid, start_level, goal_level, start_index, goal_index, node_cap, &heuristic, null);
+}
+
 test "the abstract node budget clamps to the table's reserved limit" {
     const allocator = std.testing.allocator;
     var data = @import("../../data_system.zig").DataSystem.init(allocator);
@@ -1411,12 +1509,117 @@ test "the abstract node budget clamps to the table's reserved limit" {
     var abstract = AbstractScratch{};
     defer abstract.deinit(allocator);
     try abstract.reserve(allocator, 3);
-    try std.testing.expectEqual(AbstractResult.saturated, abstractCorridor(&system.graph, &abstract, grid, grid, 0, 0, start, goal, 1_000_000));
+    try std.testing.expectEqual(AbstractResult.saturated, searchAbstract(&system.graph, &abstract, grid, grid, 0, 0, start, goal, 1_000_000));
     try std.testing.expectEqual(@as(usize, 3), abstract.node_budget);
     try std.testing.expectEqual(@as(usize, 3), abstract.nodes_used);
     // Reserved for the full search, the same query finds its corridor.
     try abstract.reserve(allocator, 4096);
-    try std.testing.expect(abstractCorridor(&system.graph, &abstract, grid, grid, 0, 0, start, goal, 1_000_000) == .found);
+    try std.testing.expect(searchAbstract(&system.graph, &abstract, grid, grid, 0, 0, start, goal, 1_000_000) == .found);
+}
+
+test "the least-estimate fallback keeps the lowest estimate, ties to the lower ref, and is below the start only strictly" {
+    var least: LeastExpanded = undefined;
+    least.begin(50);
+    try std.testing.expect(!least.belowStart());
+    least.consider(4, 900, 60);
+    try std.testing.expectEqual(@as(u32, 4), least.slot);
+    try std.testing.expect(!least.belowStart());
+    // A tie goes to the lower ref, whatever the order offered.
+    least.consider(5, 700, 60);
+    least.consider(6, 800, 60);
+    try std.testing.expectEqual(@as(usize, 700), least.ref);
+    try std.testing.expectEqual(@as(u32, 5), least.slot);
+    // Equal to the start's estimate is not below it.
+    least.consider(7, 990, 50);
+    try std.testing.expect(!least.belowStart());
+    least.consider(8, 999, 49);
+    least.consider(9, 1, 70);
+    try std.testing.expectEqual(@as(u32, 8), least.slot);
+    try std.testing.expectEqual(@as(u32, 49), least.h);
+    try std.testing.expect(least.belowStart());
+}
+
+test "a saturated search with a fallback returns the chain to its least-estimate expanded node, ties to the lower ref, and expands the same nodes as one without" {
+    const allocator = std.testing.allocator;
+    var data = @import("../../data_system.zig").DataSystem.init(allocator);
+    defer data.deinit();
+    var meta = try test_support.loadTestWorldMeta(allocator);
+    defer meta.deinit();
+    // 32x32 open cells in 4-cell chunks, no links: the estimate is the octile to the goal.
+    var world = try test_support.abstractTestWorld(&meta, 1024, 1024);
+    defer world.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    var capacity = test_support.abstractCapacity();
+    capacity.group_field_max_cells = 16;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, null);
+    const graph = &system.graph;
+    const grid = graph.grid(0).?;
+    const width = graph.geometry.width;
+    var abstract = AbstractScratch{};
+    defer abstract.deinit(allocator);
+    try abstract.reserve(allocator, 4096);
+
+    var toward: usize = 0;
+    var ties: usize = 0;
+    for ([_][4]u16{ .{ 1, 1, 30, 30 }, .{ 2, 17, 29, 14 }, .{ 30, 2, 1, 29 } }) |route| {
+        const start = grid.indexForCell(.{ .x = route[0], .y = route[1] }).?;
+        const goal = grid.indexForCell(.{ .x = route[2], .y = route[3] }).?;
+        var octile = CrossLevelHeuristic.init(graph, 0, route[2], route[3], null, 0);
+        const start_h = octile.estimate(octile.levelTerms(0), 0, route[0], route[1]);
+        for (2..40) |budget| {
+            const plain = searchAbstract(graph, &abstract, grid, grid, 0, 0, start, goal, budget);
+            const plain_nodes = abstract.nodes_used;
+            var least: LeastExpanded = undefined;
+            var heuristic: CrossLevelHeuristic = undefined;
+            const result = abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, budget, &heuristic, &least);
+            try std.testing.expectEqual(plain_nodes, abstract.nodes_used);
+            if (plain == .found) {
+                try std.testing.expect(result == .found);
+                continue;
+            }
+            try std.testing.expect(plain == .saturated);
+            try std.testing.expectEqual(start_h, least.start_h);
+            // Reference: the least (estimate, ref) over every closed slot of this search.
+            var best_h: u32 = unreachable_cost;
+            var best_ref: usize = 0;
+            var at_best: usize = 0;
+            for (abstract.slots) |slot| {
+                if (slot.stamp >> 1 != abstract.generation or slot.stamp & 1 == 0) continue;
+                const h = octile.estimate(octile.levelTerms(0), 0, slot.x, slot.y);
+                if (h < best_h or (h == best_h and slot.node < best_ref)) {
+                    if (h < best_h) at_best = 0;
+                    best_h = h;
+                    best_ref = slot.node;
+                }
+                if (h == best_h) at_best += 1;
+            }
+            ties += @intFromBool(at_best > 1);
+            if (best_h >= start_h) {
+                try std.testing.expect(result == .saturated);
+                continue;
+            }
+            try std.testing.expect(result == .toward);
+            toward += 1;
+            const corridor = abstract.corridor.items;
+            try std.testing.expectEqual(best_ref, corridor[corridor.len - 1]);
+            try std.testing.expectEqual(best_h, least.h);
+            // Rooted at a start-chunk seed, each step a chunk peer or a border mirror.
+            const geometry = graph.chunkGeometry();
+            try std.testing.expectEqual(geometry.chunkOf(route[0], route[1]), geometry.chunkOfCell(refLocal(corridor[0])));
+            for (corridor[0 .. corridor.len - 1], corridor[1..]) |from, to| {
+                const from_cell = refLocal(from);
+                const to_cell = refLocal(to);
+                if (geometry.chunkOfCell(from_cell) == geometry.chunkOfCell(to_cell)) continue;
+                // In range: a 32-cell side.
+                const side: u32 = @intCast(width);
+                try std.testing.expectEqual(cardinal_cost, octileU32(from_cell % side, from_cell / side, to_cell % side, to_cell / side));
+            }
+        }
+    }
+    try std.testing.expect(toward > 10);
+    try std.testing.expect(ties > 0);
 }
 
 // An uncached abstract A* with the production expansion order and estimate: a hash map of
@@ -1665,7 +1868,7 @@ test "abstract corridors with cached slot coordinates equal an uncached referenc
             };
             defer reference.deinit();
             const expected = try reference.search(graph, start_grid, goal_grid, start_level, goal_level, start, goal);
-            const result = abstractCorridor(graph, &abstract, start_grid, goal_grid, start_level, goal_level, start, goal, budget);
+            const result = searchAbstract(graph, &abstract, start_grid, goal_grid, start_level, goal_level, start, goal, budget);
             try std.testing.expectEqualDeep(expected, result);
             try std.testing.expectEqual(reference.nodes.count(), abstract.nodes_used);
             saturated += @intFromBool(result == .saturated);
@@ -1711,7 +1914,7 @@ test "abstract expansion visits only same-label peers, border mirrors, and live 
     const goal = grid.indexForCell(.{ .x = 2, .y = 5 }).?;
 
     const abstract = &system.scratch_slots.items[0].corridor.abstract;
-    try std.testing.expectEqual(AbstractResult.none, abstractCorridor(graph, abstract, grid, grid, 0, 0, start, goal, 4096));
+    try std.testing.expectEqual(AbstractResult.none, searchAbstract(graph, abstract, grid, grid, 0, 0, start, goal, 4096));
     // Every node the search touched is a portal of its chunk's record east of the wall:
     // no other-label peer in the start chunk, and never the dead link's blocked target.
     var touched: usize = 0;
@@ -2120,7 +2323,7 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
                 const goal_grid = graph.grid(goal_level).?;
                 if (start_grid.isBlockedIndex(start) or goal_grid.isBlockedIndex(goal)) continue;
                 const expected = try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, start_level, goal_level, start, goal);
-                switch (abstractCorridor(graph, &abstract, start_grid, goal_grid, start_level, goal_level, start, goal, 4096)) {
+                switch (searchAbstract(graph, &abstract, start_grid, goal_grid, start_level, goal_level, start, goal, 4096)) {
                     .found => {
                         try std.testing.expectEqual(expected, foundObjective(&abstract, graph.geometry.width, goal));
                         found += 1;
@@ -2135,7 +2338,7 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
                         try std.testing.expectEqual(@as(?u32, null), expected);
                         none += 1;
                     },
-                    .saturated, .unseedable => return error.TestUnexpectedResult,
+                    .toward, .saturated, .unseedable => return error.TestUnexpectedResult,
                 }
             }
         }
@@ -2173,7 +2376,7 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
         const grid = graph.grid(0).?;
         const start = grid.indexForCell(pocket_start).?;
         const goal = grid.indexForCell(pocket_goal).?;
-        try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
+        try std.testing.expect(searchAbstract(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
         try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
     }
 }
@@ -2212,7 +2415,7 @@ test "a cross-level solve claims the same abstract nodes at 6, 18, and 40 levels
         const goal_grid = graph.grid(4).?;
         const start = start_grid.indexForCell(.{ .x = 0, .y = 0 }).?;
         const goal = goal_grid.indexForCell(.{ .x = 14, .y = 14 }).?;
-        try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 0, 4, start, goal, 4096) == .found);
+        try std.testing.expect(searchAbstract(graph, &abstract, start_grid, goal_grid, 0, 4, start, goal, 4096) == .found);
         level_nodes.* = abstract.nodes_used;
         level_corridor_len.* = abstract.corridor.items.len;
         level_settles.* = abstract.crossing.settles;
@@ -2256,7 +2459,7 @@ test "a long teleport far from the goal leaves same-level abstract nodes and cor
         const grid = graph.grid(0).?;
         const start = grid.indexForCell(.{ .x = 2, .y = 16 }).?;
         const goal = grid.indexForCell(.{ .x = 12, .y = 16 }).?;
-        try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
+        try std.testing.expect(searchAbstract(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
         world_nodes.* = abstract.nodes_used;
         world_corridor.* = try allocator.dupe(usize, abstract.corridor.items);
     }
@@ -2612,12 +2815,12 @@ test "a same-level abstract search settles no crossing box; a corner-to-corner d
     const top = graph.grid(0).?;
     const start = top.indexForCell(.{ .x = 2, .y = 2 }).?;
     // Same level, across the level.
-    try std.testing.expect(abstractCorridor(graph, &abstract, top, top, 0, 0, start, top.indexForCell(.{ .x = 30, .y = 30 }).?, 4096) == .found);
+    try std.testing.expect(searchAbstract(graph, &abstract, top, top, 0, 0, start, top.indexForCell(.{ .x = 30, .y = 30 }).?, 4096) == .found);
     try std.testing.expectEqual(@as(usize, 0), abstract.crossing.settles);
     // To the bottom level's far corner: the route crosses every level corner to corner.
     const bottom = graph.grid(levels - 1).?;
     const goal = bottom.indexForCell(.{ .x = 29, .y = 29 }).?;
-    try std.testing.expect(abstractCorridor(graph, &abstract, top, bottom, 0, levels - 1, start, goal, 4096) == .found);
+    try std.testing.expect(searchAbstract(graph, &abstract, top, bottom, 0, levels - 1, start, goal, 4096) == .found);
     try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, top, bottom, 0, levels - 1, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
     try std.testing.expect(!abstract.crossing.frozen);
     // At least the one box per level crossed the route takes, at most two per level crossed.
@@ -2760,7 +2963,7 @@ test "a goal portal whose estimate the long floor cut is re-queued before it end
     // The far gap's estimate is cut to 40 + 30 below its octile 192.
     var heuristic = CrossLevelHeuristic.init(graph, 0, @intCast(pocket_goal.x), @intCast(pocket_goal.y), null, 0);
     try std.testing.expectEqual(@as(u32, 70), heuristicAt(&heuristic, 0, 16, 17));
-    try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
+    try std.testing.expect(searchAbstract(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
     // The near gap: g 84 + octile 140, against g 74 + octile 192 through the far one.
     try std.testing.expectEqual(grid.indexForCell(.{ .x = 16, .y = 30 }).?, refLocal(abstract.corridor.items[abstract.corridor.items.len - 1]));
     try std.testing.expectEqual(@as(u32, 224), foundObjective(&abstract, graph.geometry.width, goal));
@@ -2807,7 +3010,7 @@ test "a long link landing next to the goal from an unreachable level leaves abst
             const goal_grid = graph.grid(4).?;
             const start = start_grid.indexForCell(.{ .x = 0, .y = 0 }).?;
             const goal = goal_grid.indexForCell(.{ .x = 14, .y = 14 }).?;
-            try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 1, 4, start, goal, 4096) == .found);
+            try std.testing.expect(searchAbstract(graph, &abstract, start_grid, goal_grid, 1, 4, start, goal, 4096) == .found);
             objective.* = foundObjective(&abstract, graph.geometry.width, goal);
             try std.testing.expectEqual(@as(?u32, objective.*), try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, 1, 4, start, goal));
             if (!teleport) continue;
@@ -2861,7 +3064,7 @@ test "a long link's estimate pairs its entrance with its own exit and chains thr
     var abstract = AbstractScratch{};
     defer abstract.deinit(allocator);
     try abstract.reserve(allocator, 4096);
-    try std.testing.expect(abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
+    try std.testing.expect(searchAbstract(graph, &abstract, grid, grid, 0, 0, start, goal, 4096) == .found);
     try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, grid, grid, 0, 0, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
     try std.testing.expect(std.mem.indexOfScalar(bool, abstract.corridor_link.items, true) != null);
 }
@@ -2940,7 +3143,7 @@ test "mirrored band teleports leave no level-0 band node closed and the objectiv
         const goal_grid = graph.grid(2).?;
         const start = start_grid.indexForCell(.{ .x = center, .y = center - 8 }).?;
         const goal = goal_grid.indexForCell(.{ .x = center, .y = center + 8 }).?;
-        try std.testing.expect(abstractCorridor(graph, &abstract, start_grid, goal_grid, 0, 2, start, goal, 4096) == .found);
+        try std.testing.expect(searchAbstract(graph, &abstract, start_grid, goal_grid, 0, 2, start, goal, 4096) == .found);
         try std.testing.expectEqual(try exhaustiveAbstractObjective(allocator, graph, start_grid, goal_grid, 0, 2, start, goal), foundObjective(&abstract, graph.geometry.width, goal));
         var band_closed: usize = 0;
         for (abstract.slots) |slot| {
@@ -2995,7 +3198,7 @@ test "same-level abstract searches in worlds without long links equal the goal-l
             };
             defer reference.deinit();
             const expected = try reference.search(graph, grid, grid, 0, 0, start, goal);
-            const result = abstractCorridor(graph, &abstract, grid, grid, 0, 0, start, goal, 4096);
+            const result = searchAbstract(graph, &abstract, grid, grid, 0, 0, start, goal, 4096);
             try std.testing.expectEqualDeep(expected, result);
             try std.testing.expectEqual(reference.nodes.count(), abstract.nodes_used);
             if (result != .found) continue;

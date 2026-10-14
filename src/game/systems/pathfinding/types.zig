@@ -145,10 +145,12 @@ const default_tier0_abstract_node_attempt_cap: usize = default_max_abstract_node
 const default_tier0_stitched_attempt_cap: usize = default_max_stitched_path_cells;
 // Tier-1 (second, escalated attempt) caps: fixed constants, a flat multiple of the tier-0
 // defaults, never derived from the graph's portal count, level size, or any measured world
-// state. A tier-1 abstract saturation or segment node-budget spill drops to `.missing`
-// (retryable, never `.unavailable`), as does a tier-1 stitch past its cell or segment cap
-// whose prefix never leaves its start cell; any other capped prefix publishes a partial
-// (`PathSolveResult.partial`). See PendingRequest.tier and compactPendingAfterSolve.
+// state. A tier-1 segment node-budget spill drops to `.missing` (retryable, never
+// `.unavailable`), as do a tier-1 stitch past its cell or segment cap whose prefix never
+// leaves its start cell and a tier-1 abstract saturation with no expanded node below the
+// start's estimate; any other capped prefix, and a saturation's stitch toward its
+// least-estimate node, publishes a partial (`PathSolveResult.partial`). See
+// PendingRequest.tier and compactPendingAfterSolve.
 pub const default_tier1_abstract_node_cap: usize = default_max_abstract_nodes * 4;
 pub const default_tier1_stitched_cell_cap: usize = default_max_stitched_path_cells * 4;
 /// Link pairs (entrance box, exit box, least cost) in a nav graph's long-link summary: a
@@ -1019,9 +1021,10 @@ pub const PathResult = struct {
 pub const PathSolveResult = union(enum) {
     // Successful solve; its solved path sits at the same solve ordinal.
     available: PathQueryKey,
-    // A tier-1 stitch past its cell or segment cap: the stitched prefix (the first cells of
-    // the uncapped stitch) sits at the solve ordinal, published like `available` and served
-    // as `PathStatus.partial`.
+    // A tier-1 stitch past its cell or segment cap (the stitched prefix, the first cells of
+    // the uncapped stitch), or a saturated tier-1 search's stitch toward its least-estimate
+    // node, cut to end below the start's estimate: it sits at the solve ordinal, published
+    // like `available` and served as `PathStatus.partial`.
     partial: PathQueryKey,
     // The start cannot reach the goal, or no open goal cell lies within the projection
     // radius: answered for the request, never cached and never searched.

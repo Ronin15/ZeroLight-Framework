@@ -4639,6 +4639,10 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
 
     // Attempt 2 (tier 1): exhausts again -> dropped, never unavailable.
     const second = try system.updateSerial(&stream, 8, .{});
+    // It drops through seeding saturation: the start chunk's second seed passes the one-node
+    // budget before any node is expanded, so no least-estimate node exists to publish toward.
+    const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
+    for (tier1_abstract.slots) |slot| try std.testing.expect(slot.stamp >> 1 != tier1_abstract.generation or slot.stamp & 1 == 0);
     try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
     try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), second.unavailable_results);
@@ -6855,6 +6859,224 @@ test "a partial solved toward an older goal projection is not served after the p
     const again = try solveFrom(&system, requester, start, goal, .{});
     try std.testing.expectEqual(@as(usize, 0), again.cache_hits);
     try std.testing.expectEqual(@as(usize, 1), again.accepted_requests);
+}
+
+// The partial strip under abstract caps short of its route: tier 0 claims at most two nodes and
+// tier 1 at most `nodes`, so a tier-1 search far from the goal saturates.
+fn saturatingStripCapacity(nodes: usize) PathfindingCapacity {
+    var capacity = baselineCapacity();
+    capacity.tier0_abstract_node_cap = 2;
+    capacity.max_abstract_nodes = nodes;
+    return capacity;
+}
+
+// The search's estimate on the strip (one level, no links): the octile from `cell` to `goal`.
+fn stripEstimate(system: *const PathfindingSystem, cell: u32, goal: u32) u32 {
+    // Sides of the strip fit u32.
+    const width: u32 = @intCast(system.graph.geometry.width);
+    return types.octileU32(cell % width, cell / width, goal % width, goal / width);
+}
+
+fn stripCellOf(system: *const PathfindingSystem, position: math.Vec2) u32 {
+    const grid = system.graph.grid(0).?;
+    // In range: a strip cell index.
+    return @intCast(grid.indexForCell(grid.worldToCellClamped(position)).?);
+}
+
+test "a saturated tier-1 search publishes a partial ending on its least-estimate node, and hops from each end reach the goal with a strictly falling estimate" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var system = try partialStripSystem(&data, saturatingStripCapacity(6));
+    defer system.deinit();
+    const goal_cell = stripCellOf(&system, partial_goal);
+    var position = partial_start;
+    var start_cell = stripCellOf(&system, position);
+    var hops: usize = 0;
+    while (true) : (hops += 1) {
+        if (hops == 16) return error.TestUnexpectedResult;
+        const stats = try solveHop(&system, requester, position, partial_goal);
+        if (stats.available_results == 1) break;
+        // The saturated tier-1 search publishes instead of dropping.
+        try std.testing.expectEqual(@as(usize, 1), stats.escalated_solves);
+        try std.testing.expectEqual(@as(usize, 1), stats.partial_results);
+        try std.testing.expectEqual(@as(usize, 0), stats.escalated_dropped);
+        const hop = cachedResult(&system, partial_goal).?;
+        try std.testing.expect(hop.isPartial());
+        // Its end is the corridor's last node, the least-estimate node the search expanded.
+        const corridor = system.tier1_scratch.items[0].corridor.abstract.corridor.items;
+        try std.testing.expectEqual(types.packRef(0, hop.end.cell), corridor[corridor.len - 1]);
+        try std.testing.expect(stripEstimate(&system, hop.end.cell, goal_cell) < stripEstimate(&system, start_cell, goal_cell));
+        try std.testing.expectEqual(PathStatus.partial, system.statusForWorld(0, position, 0, partial_goal, .default, null).status);
+        start_cell = hop.end.cell;
+        position = cellCenterOf(&system, start_cell);
+    }
+    try std.testing.expect(hops >= 2);
+    const last = cachedResult(&system, partial_goal).?;
+    try std.testing.expect(!last.isPartial());
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, position, 0, partial_goal, .default, null).status);
+}
+
+test "a saturated tier-1 search with no expanded node below its start's estimate still drops to missing" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    // A wall on column 32 open only on the bottom row: from (31, 8), right against it, every
+    // node the capped search expands lies farther from the goal than the start.
+    for (0..partial_strip_height - 1) |y| {
+        _ = try addNavBody(&data, .{ .x = 32 * 32 + 1, .y = @as(f32, @floatFromInt(y)) * 32 + 1 }, .{ .x = 30, .y = 30 }, true);
+    }
+    var system = try partialStripSystem(&data, saturatingStripCapacity(3));
+    defer system.deinit();
+    const start = tileCenter(31, 8);
+    const first = try solveStep(&system, requester, start, partial_goal);
+    try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    const second = try system.updateSerial(&empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
+    try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 0), second.partial_results);
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, partial_goal, .default, null).status);
+    // The search expanded nodes, none of them below the start's estimate.
+    const abstract = &system.tier1_scratch.items[0].corridor.abstract;
+    const start_h = stripEstimate(&system, stripCellOf(&system, start), stripCellOf(&system, partial_goal));
+    var expanded: usize = 0;
+    for (abstract.slots) |slot| {
+        if (slot.stamp >> 1 != abstract.generation or slot.stamp & 1 == 0) continue;
+        expanded += 1;
+        try std.testing.expect(types.octileU32(slot.x, slot.y, 120, 8) >= start_h);
+    }
+    try std.testing.expect(expanded >= 1);
+}
+
+// A 64 x 64-cell level with a wall on column 32 open only on row 0.
+fn northGapSystem(data: *DataSystem, abstract_nodes: usize, stitched_cells: usize) !PathfindingSystem {
+    for (1..64) |y| {
+        _ = try addNavBody(data, .{ .x = 32 * 32 + 1, .y = @as(f32, @floatFromInt(y)) * 32 + 1 }, .{ .x = 30, .y = 30 }, true);
+    }
+    var capacity = baselineCapacity();
+    capacity.tier0_abstract_node_cap = 2;
+    capacity.max_abstract_nodes = abstract_nodes;
+    capacity.max_stitched_path_cells = stitched_cells;
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(data, 64 * 32, 64 * 32, 32);
+    return system;
+}
+
+// The estimate from cell `cell` of a 64-cell-wide level to (60, 56), the north-gap goal.
+fn northGapEstimate(cell: u32) u32 {
+    return types.octileU32(cell % 64, cell / 64, 60, 56);
+}
+
+test "a capped stitch toward the least-estimate node is cut to its last cell below the start's estimate, and drops when none lies past the start" {
+    // Tier-1 caps of 32 abstract nodes, which saturate past the wall, and 40 stitched cells,
+    // which stop the prefix on its climb to the gap; the reference holds the whole stitch.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const stitched_cap: usize = 40;
+    var system = try northGapSystem(&data, 32, stitched_cap);
+    defer system.deinit();
+    var reference = try northGapSystem(&data, 32, 2048);
+    defer reference.deinit();
+    const goal = tileCenter(60, 56);
+
+    // From (20, 56) the stitch first nears the goal, then climbs above the start's estimate.
+    const descending = tileCenter(20, 56);
+    const descending_h = northGapEstimate(stripCellOf(&system, descending));
+    try std.testing.expectEqual(@as(usize, 1), (try solveHop(&reference, requester, descending, goal)).partial_results);
+    const whole = cachedStitched(&reference, 0, goal);
+    try std.testing.expect(whole.len() > stitched_cap);
+    try std.testing.expect(northGapEstimate(whole.cells[whole.len() - 1]) < descending_h);
+    var last_below: usize = 0;
+    for (1..stitched_cap) |index| {
+        if (northGapEstimate(whole.cells[index]) < descending_h) last_below = index;
+    }
+    // The capped prefix ends above the start's estimate, with a cell below it earlier.
+    try std.testing.expect(northGapEstimate(whole.cells[stitched_cap - 1]) >= descending_h);
+    try std.testing.expect(last_below > 0 and last_below + 1 < stitched_cap);
+    const cut_stats = try solveHop(&system, requester, descending, goal);
+    try std.testing.expectEqual(@as(usize, 1), cut_stats.partial_results);
+    try std.testing.expectEqual(@as(usize, 0), cut_stats.escalated_dropped);
+    const cut = cachedStitched(&system, 0, goal);
+    try std.testing.expectEqualSlices(u32, whole.cells[0 .. last_below + 1], cut.cells);
+
+    // From (31, 56), against the wall, every cell of the capped prefix past the start lies at or
+    // above the start's estimate, though the whole stitch ends below it.
+    // Dropped caches: a cached partial would serve this start.
+    reference.clearCompleted();
+    system.clearCompleted();
+    const climbing = tileCenter(31, 56);
+    const climbing_h = northGapEstimate(stripCellOf(&system, climbing));
+    try std.testing.expectEqual(@as(usize, 1), (try solveHop(&reference, requester, climbing, goal)).partial_results);
+    const climb = cachedStitched(&reference, 0, goal);
+    try std.testing.expect(northGapEstimate(climb.cells[climb.len() - 1]) < climbing_h);
+    for (climb.cells[1..stitched_cap]) |cell| try std.testing.expect(northGapEstimate(cell) >= climbing_h);
+    const dropped = try solveHop(&system, requester, climbing, goal);
+    try std.testing.expectEqual(@as(usize, 1), dropped.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 0), dropped.partial_results);
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, climbing, 0, goal, .default, null).status);
+}
+
+test "threaded least-estimate partials equal serial for any range size and worker count" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const built = try buildCorridorWorld(&meta, &.{ 2, 9 });
+    var world = built.world;
+    defer world.deinit();
+    var requesters: [escalation_goals.len]EntityId = undefined;
+    for (&requesters) |*requester| requester.* = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+
+    // Four abstract nodes per attempt: every search saturates; each tier-1 one publishes toward
+    // its least-estimate node and each tier-0 one promotes.
+    var capacity = abstractCapacity();
+    capacity.group_field_max_cells = 16;
+    capacity.max_escalated_solves_per_step = 4;
+    capacity.max_abstract_nodes = 4;
+    const tiers = [_]u8{ 0, 1, 0, 1, 0, 1, 0, 1 };
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    var serial = PathfindingSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    try serial.reserve(capacity);
+    try serial.rebuildStaticNavGridWithWorld(&data, &world, null);
+    try queueWithTiers(&serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
+    const serial_stats = try serial.updateSerial(&empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 4), serial_stats.partial_results);
+    try std.testing.expectEqual(@as(usize, 0), serial_stats.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 4), serial_stats.budget_exhausted);
+    for ([_]usize{ 1, 3 }) |workers| {
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
+        defer threads.deinit();
+        if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+        for ([_]usize{ 1, 2, 3 }) |items_per_range| {
+            var threaded_capacity = capacity;
+            threaded_capacity.worker_participant_count = threads.participantSlotCount();
+            var threaded = PathfindingSystem.init(std.testing.allocator);
+            defer threaded.deinit();
+            try threaded.reserve(threaded_capacity);
+            try threaded.rebuildStaticNavGridWithWorld(&data, &world, null);
+            try queueWithTiers(&threaded, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
+            const stats = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
+            if (items_per_range == 1) try std.testing.expect(!stats.solve_batch.ran_inline and stats.solve_batch.range_count > 1);
+            try expectSameCache(&serial, &threaded);
+            try std.testing.expectEqual(serial_stats.partial_results, stats.partial_results);
+            try std.testing.expectEqual(serial_stats.budget_exhausted, stats.budget_exhausted);
+            try std.testing.expectEqual(serial_stats.escalated_dropped, stats.escalated_dropped);
+            try std.testing.expectEqual(serial_stats.escalated_solves, stats.escalated_solves);
+            try std.testing.expectEqual(serial.pending.len, threaded.pending.len);
+            for (0..serial.pending.len) |index| {
+                try std.testing.expect(std.meta.eql(serial.pending.at(index), threaded.pending.at(index)));
+            }
+        }
+    }
 }
 
 // ---- Request-side stages (path_intake, group_field_expand, pending ring) ----------
