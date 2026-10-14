@@ -1048,28 +1048,36 @@ fn lessNode(a: OpenNode, b: OpenNode) bool {
         (a.f == b.f and a.h == b.h and a.index < b.index);
 }
 
+// Both sifts hold the moving node in a local, shift the hole, and store it once. Scalar: a
+// search frontier, each step depending on the last comparison.
 pub fn siftUp(heap: []OpenNode, start_index: usize) void {
+    std.debug.assert(start_index < heap.len);
     var index = start_index;
+    const item = heap[index];
     while (index != 0) {
         const parent = (index - 1) / 2;
-        if (!lessNode(heap[index], heap[parent])) break;
-        std.mem.swap(OpenNode, &heap[index], &heap[parent]);
+        if (!lessNode(item, heap[parent])) break;
+        heap[index] = heap[parent];
         index = parent;
     }
+    heap[index] = item;
 }
 
 fn siftDown(heap: []OpenNode, start_index: usize) void {
+    std.debug.assert(start_index < heap.len);
     var index = start_index;
+    const item = heap[index];
     while (true) {
         const left = index * 2 + 1;
         if (left >= heap.len) break;
         const right = left + 1;
         var best = left;
         if (right < heap.len and lessNode(heap[right], heap[left])) best = right;
-        if (!lessNode(heap[best], heap[index])) break;
-        std.mem.swap(OpenNode, &heap[index], &heap[best]);
+        if (!lessNode(heap[best], item)) break;
+        heap[index] = heap[best];
         index = best;
     }
+    heap[index] = item;
 }
 
 // FNV-1a 64-bit offset basis and prime of `hashPathKey`.
@@ -1374,6 +1382,52 @@ test "lessNode ties break deterministically on f, then h, then index" {
     try std.testing.expect(!lessNode(.{ .index = 2, .f = 10, .h = 2 }, .{ .index = 1, .f = 10, .h = 2 }));
     // Lower f always wins regardless of h/index.
     try std.testing.expect(lessNode(.{ .index = 9, .f = 5, .h = 100 }, .{ .index = 0, .f = 6, .h = 0 }));
+}
+
+// Narrow value ranges so f ties, f/h ties, and exact duplicates are common.
+fn randomOpenNode(random: std.Random) OpenNode {
+    return .{
+        .index = random.uintLessThan(usize, 24),
+        .f = random.uintLessThan(u32, 8),
+        .h = random.uintLessThan(u32, 4),
+    };
+}
+
+fn openNodeAscending(_: void, a: OpenNode, b: OpenNode) bool {
+    return lessNode(a, b);
+}
+
+test "the open heap pops in lessNode order, with duplicates and f/h ties" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x0be4_5ee7);
+    const random = prng.random();
+    var heap: std.ArrayList(OpenNode) = .empty;
+    defer heap.deinit(allocator);
+    var pending: std.ArrayList(OpenNode) = .empty;
+    defer pending.deinit(allocator);
+
+    for (0..64) |_| {
+        heap.clearRetainingCapacity();
+        pending.clearRetainingCapacity();
+        // Interleave pushes and pops; every pop must be the least pending node.
+        for (0..256) |_| {
+            if (heap.items.len != 0 and random.uintLessThan(u8, 3) == 0) {
+                const popped = popHeap(&heap);
+                std.mem.sort(OpenNode, pending.items, {}, openNodeAscending);
+                try std.testing.expectEqual(pending.items[0], popped);
+                _ = pending.orderedRemove(0);
+            } else {
+                const node = randomOpenNode(random);
+                try heap.append(allocator, node);
+                siftUp(heap.items, heap.items.len - 1);
+                try pending.append(allocator, node);
+            }
+        }
+        // Drain: the remaining pops equal the sorted reference exactly.
+        std.mem.sort(OpenNode, pending.items, {}, openNodeAscending);
+        for (pending.items) |expected| try std.testing.expectEqual(expected, popHeap(&heap));
+        try std.testing.expectEqual(@as(usize, 0), heap.items.len);
+    }
 }
 
 test "resize helpers shrink-and-free below capacity and grow-reuse at or above it" {
