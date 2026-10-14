@@ -22,10 +22,10 @@ Commands and options: `docs/development-workflow.md`.
 - Exception: a question Debug cannot answer by construction (false sharing
   between worker ranges, a SIMD or inlining gain) gets one targeted
   `tools/bench_ab.py --optimize ReleaseFast` run of the group that asks it,
-  reported beside its Debug numbers. It answers that question only; it is
-  never a baseline, gate, or reason to revert SIMD (`memory-performance.md`),
-  and never dismisses a Debug finding: Debug at a size stands in for release
-  at larger sizes.
+  reported beside its Debug numbers. It answers that question only (a SIMD
+  or scalar choice follows `memory-performance.md`); it is never a baseline
+  or gate, and never dismisses a Debug finding: Debug at a size stands in for
+  release at larger sizes.
 - Before a ReleaseFast release candidate, a multi-hour ReleaseSafe soak across
   realistic to extreme entity counts and spawn/despawn churn must pass;
   ReleaseFast corrupts memory silently where ReleaseSafe reports.

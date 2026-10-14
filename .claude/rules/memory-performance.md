@@ -123,10 +123,12 @@ fn appendMalRow(
   packed local SoA scratch and masking branches with `select`.
 - Leave scalar only irreducible loops (A*/BFS frontier, compaction, rare
   setup), stating why.
-- SIMD needs no bench win: its gains come with scale and in release builds,
-  while benches run in Debug. A loop that should be SIMD stays SIMD; a Debug
-  bench never reverts it to scalar. A slowdown beyond spread is reported to
-  the owner, not acted on.
+- SIMD or scalar is decided by the loop's shape (above), never by Debug
+  timings: SIMD gains come with scale and in release builds, while benches
+  run in Debug. A Debug slowdown never reverts a loop whose shape fits SIMD.
+  A choice that needs a number gets the targeted ReleaseFast run
+  (`build-validation.md`) at target-scale sizes, and the reason goes at the
+  site.
 - A new or restructured hot float loop ships scalar/SIMD and serial/threaded
   parity tests.
 - Never add a helper that only wraps plain arithmetic.
