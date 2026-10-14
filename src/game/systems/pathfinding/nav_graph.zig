@@ -446,7 +446,7 @@ const claim_pending: u32 = no_block - 1;
 
 /// The threaded stages of a nav batch: key plan, remask and component flood, record patch,
 /// connectivity seed, gather, and flood, and the one-way closure's candidates, resolve,
-/// mask, plan, rows, and compaction.
+/// mask, plan, rows, and landing.
 pub const NavStage = enum {
     plan,
     remask,
@@ -459,7 +459,7 @@ pub const NavStage = enum {
     conn_closure_mask,
     conn_closure_plan,
     conn_closure_rows,
-    conn_closure_compact,
+    conn_closure_land,
 };
 
 /// One tuner per nav stage, owned by the nav's owner.
@@ -486,7 +486,7 @@ fn closureThreads(threads: ?NavUpdateThreads) ClosureThreads {
         .mask = stageThreads(threads, .conn_closure_mask),
         .plan = stageThreads(threads, .conn_closure_plan),
         .rows = stageThreads(threads, .conn_closure_rows),
-        .compact = stageThreads(threads, .conn_closure_compact),
+        .land = stageThreads(threads, .conn_closure_land),
     };
 }
 
@@ -769,8 +769,8 @@ fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, count
     addClosureStats(stats, conn, counters.closure);
 }
 
-// Folds one batch's closure counters and commit-side stage shapes into `stats`; the prepare
-// stages (candidates, compaction) fold where they run.
+// Folds one batch's closure counters and commit-side stage shapes into `stats`; the
+// candidates and the landing fold where they run.
 fn addClosureStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ClosureCounters) void {
     stats.closure_touched += counters.touched;
     stats.closure_links += counters.links;
@@ -780,16 +780,15 @@ fn addClosureStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: 
     stats.closure_rounds += counters.rounds;
     stats.closure_words_written += counters.words_written;
     stats.closure_shrinks += counters.shrinks;
+    stats.closure_block_allocs += counters.block_allocs;
+    stats.closure_block_frees += counters.block_frees;
     stats.closure_live_words = conn.closure.live_words;
-    stats.closure_dead_words = conn.closure.dead_words;
-    stats.closure_arena_capacity = conn.closure.words.capacity;
+    stats.closure_tail_capacity = conn.closure.tail.capacity;
     if (conn.closure.active) {
         const limits = conn.closure.limits;
-        stats.closure_tail_bound = @max(stats.closure_tail_bound, limits.arena_tail);
+        stats.closure_tail_bound = @max(stats.closure_tail_bound, limits.tail_words);
         stats.closure_tail_used = @max(stats.closure_tail_used, counters.tail_words);
-        stats.closure_arena_limit = @max(stats.closure_arena_limit, conn.closure.arena_limit);
         stats.closure_candidate_words = @max(stats.closure_candidate_words, limits.candidate_words);
-        stats.closure_live_prepared = @max(stats.closure_live_prepared, limits.live_prepared);
         stats.closure_kb = @max(stats.closure_kb, limits.k_b);
     }
     if (counters.links == 0) return;
@@ -1369,6 +1368,10 @@ pub const NavGraph = struct {
     /// (one count per list or pool that grew). The first logs once.
     pool_grows: u64 = 0,
     pool_growth_logged: bool = false,
+    /// Telemetry: closure landings `landClosure` deferred by `OutOfMemory`, across updates
+    /// (failed ones too); the first logs once.
+    land_deferrals: u64 = 0,
+    land_deferral_logged: bool = false,
 
     pub fn deinit(self: *NavGraph) void {
         self.connectivity.deinit(self.allocator);
@@ -1654,6 +1657,8 @@ pub const NavGraph = struct {
         }
         fresh.pool_grows = self.pool_grows + fresh.pool_grows;
         fresh.pool_growth_logged = self.pool_growth_logged;
+        fresh.land_deferrals = self.land_deferrals;
+        fresh.land_deferral_logged = self.land_deferral_logged;
         self.deinit();
         self.* = fresh;
         if (comptime logging.enabled(.info) and !builtin.is_test)
@@ -1921,7 +1926,7 @@ pub const NavGraph = struct {
         self.claimRecords(levels);
         stats.main.commit_ns += section.lap();
         self.patchKeys(levels, prepared.world, stageThreads(threads, .patch), stats);
-        const counters = self.connectivity.commitMarks(levels, prepared.world, self.patch_keys.items, new_links, stageThreads(threads, .conn_gather), stageThreads(threads, .conn_flood), closureThreads(threads), stats);
+        const counters = self.connectivity.commitMarks(self.allocator, levels, prepared.world, self.patch_keys.items, new_links, stageThreads(threads, .conn_gather), stageThreads(threads, .conn_flood), closureThreads(threads), stats);
         addConnectivityStats(stats, &self.connectivity, counters);
         section = StageTimer.begin();
         stats.records_patched += self.releaseRecords(levels);
@@ -1942,6 +1947,24 @@ pub const NavGraph = struct {
         self.dirty_keys.clearRetainingCapacity();
         self.patch_keys.clearRetainingCapacity();
         self.changed_masks.clearRetainingCapacity();
+    }
+
+    /// Lands the one-way closure blocks the step's last relocating commit or level build left in
+    /// the batch tail (`Connectivity.landResidents`, threaded per line), once at the end of a
+    /// nav update, on its error path too, so the tail is empty after every update whose landing
+    /// succeeds. Never fails: on `OutOfMemory` the blocks stay valid in the tail,
+    /// `closure_land_deferrals` and `land_deferrals` count it (the first logs once), and the
+    /// next prepare retries the landing, failing as an ordinary `OutOfMemory` with the graph
+    /// intact. Main work O(1) per block.
+    pub fn landClosure(self: *NavGraph, threads: ?NavUpdateThreads, stats: *NavUpdateStats) void {
+        self.connectivity.landResidents(self.allocator, stageThreads(threads, .conn_closure_land), stats) catch {
+            stats.closure_land_deferrals += 1;
+            self.land_deferrals += 1;
+            if (self.land_deferral_logged) return;
+            self.land_deferral_logged = true;
+            if (comptime logging.enabled(.warn) and !builtin.is_test)
+                logging.game.warn("nav closure landing deferred: out of memory; the next nav batch retries it", .{});
+        };
     }
 
     fn logPoolGrowth(self: *NavGraph) void {
@@ -3930,7 +3953,7 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
     try std.testing.expectEqual(@as(usize, 2), closure.termCount());
-    const closure_words_before = try std.testing.allocator.dupe(u32, closure.words.items);
+    const closure_words_before = try test_support.dupeClosureBlocks(std.testing.allocator, &system.graph);
     defer std.testing.allocator.free(closure_words_before);
     const term_index_before = try std.testing.allocator.dupe(u32, closure.term.index);
     defer std.testing.allocator.free(term_index_before);
@@ -3949,7 +3972,9 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_nodes);
     try std.testing.expectEqual(@as(usize, 0), stats.closure_links);
-    try std.testing.expectEqualSlices(u32, closure_words_before, closure.words.items);
+    const closure_words_after = try test_support.dupeClosureBlocks(std.testing.allocator, &system.graph);
+    defer std.testing.allocator.free(closure_words_after);
+    try std.testing.expectEqualSlices(u32, closure_words_before, closure_words_after);
     // The prepare may grow the terminal pool (the dig shares a root with a terminal); the
     // live terminals keep their indices.
     try std.testing.expectEqualSlices(u32, term_index_before, closure.term.index[0..term_index_before.len]);

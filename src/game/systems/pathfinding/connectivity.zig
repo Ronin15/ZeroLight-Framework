@@ -15,12 +15,14 @@
 //!
 //! Over the roots, the per-world one-way closure: a terminal is a root holding an endpoint of
 //! a live one-way link, an H-component a weak component of terminals over those links, and
-//! each H-component keeps a reachability matrix (one row per terminal) in one arena block.
-//! A batch touches the H-components its change can reach, re-resolves their links (threaded
-//! per link), and recomputes only the rows whose reach can change (mask threaded per row, SCC
-//! plan per piece, rows per SCC span in level rounds); the main thread merges terminals and
-//! pieces and commits, O(1) per item. Blocks grow by powers of two, narrow when under a
-//! quarter full, and dead blocks compact at the next batch's prepare.
+//! each H-component owns its reachability matrix (one row per terminal) in a block of its own,
+//! freed with it. A batch touches the H-components its change can reach, re-resolves their
+//! links (threaded per link), and recomputes only the rows whose reach can change (mask
+//! threaded per row, SCC plan per piece, rows per SCC span in level rounds); the main thread
+//! merges terminals and pieces and commits, O(1) per item. Blocks grow by powers of two and
+//! narrow when under a quarter full; a relocated or new block is written into the batch's
+//! reserved tail and landed (threaded per line) into its own allocation in the same nav
+//! reaction. No batch reads or moves an untouched component's block.
 
 const std = @import("std");
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
@@ -68,20 +70,18 @@ const no_key: u64 = std.math.maxInt(u64);
 pub const no_term: u32 = std.math.maxInt(u32);
 pub const no_hcomp: u32 = std.math.maxInt(u32);
 pub const no_oneway: u32 = std.math.maxInt(u32);
-const no_index: u32 = std.math.maxInt(u32);
+pub const no_index: u32 = std.math.maxInt(u32);
 const no_slot: u32 = std.math.maxInt(u32);
 const no_piece: u32 = std.math.maxInt(u32);
 const no_scc: u32 = std.math.maxInt(u32);
-// A block's index map holds a terminal id, or a free index tagged with `free_bit` whose low
-// bits link the next free index (`free_end` ends the list). Terminal ids and local indices
-// stay below `free_end`.
-const free_bit: u32 = 1 << 31;
-const free_end: u32 = free_bit - 1;
-// Words of one rows item's span and one compaction line: a 64-byte cache line.
+// A block's index map holds, per handed-out index, its terminal's id, or when the index is
+// free the next free index (`no_index` ends the list). An entry is live exactly when the
+// terminal it names points back to that index of that block.
+// Words of one rows item's span and one landing line: a 64-byte cache line.
 const span_words: usize = 16;
 
 comptime {
-    // Arena offsets and flood table sizes are proven against a 64-bit usize.
+    // Block and tail offsets and flood table sizes are proven against a 64-bit usize.
     std.debug.assert(@bitSizeOf(usize) == 64);
 }
 
@@ -568,12 +568,13 @@ const TermRow = struct {
     slot: u32,
 };
 
-// An H-component: its arena block (`k_cap` rows of `rowWords(k_cap)` words, then `k_cap`
-// index words), the indices handed out (`k_high`) and live, the head of its free index list,
-// its one-way link list, and its batch slot and stamp. A free id has `k_cap == 0`.
+// An H-component: its block (`k_cap` rows of `rowWords(k_cap)` words, then `k_cap` index
+// words: `blockWords(k_cap)`), its own allocation or, between a relocating commit and its
+// landing, a slice of the batch tail; the indices handed out (`k_high`) and live, the head of
+// its free index list, its one-way link list, and its batch slot and stamp. A free id has
+// `k_cap == 0` and an empty block.
 const HCompRow = struct {
-    // Arena word offset: the arena grows with the world's one-way systems, past u32.
-    block: usize,
+    block: []align(64) u32,
     k_cap: u32,
     k_high: u32,
     k_live: u32,
@@ -593,7 +594,7 @@ const TermColumns = struct {
 };
 
 const HCompColumns = struct {
-    block: []usize = &.{},
+    block: [][]align(64) u32 = &.{},
     k_cap: []u32 = &.{},
     k_high: []u32 = &.{},
     k_live: []u32 = &.{},
@@ -651,6 +652,19 @@ fn blockWords(k_cap: u32) usize {
     return std.mem.alignForward(usize, raw, span_words);
 }
 
+// The index map of H-component `id`'s block: `k_cap` words after its rows.
+fn indexMap(hcomp: HCompColumns, id: u32) []u32 {
+    const k_cap = hcomp.k_cap[id];
+    return hcomp.block[id][@as(usize, k_cap) * rowWords(k_cap) ..][0..k_cap];
+}
+
+// Whether map entry `entry` at `index` of H-component `id` names a live terminal: one that
+// points back to that index there. A free entry holds a local index or `no_index`, which no
+// terminal of `id` at `index` can hold while the terminal columns invert the map.
+fn liveEntry(term: TermColumns, id: u32, entry: u32, index: usize) bool {
+    return entry < term.hcomp.len and term.hcomp[entry] == id and term.index[entry] == index;
+}
+
 // One registered one-way endpoint a gather item saw: the registry row and both ends' node
 // keys after the patch (`no_key` for an end closed or on an unbuilt level), each with its row
 // before the merge (a hint for an end outside the batch's keys).
@@ -702,14 +716,13 @@ const SlotRow = struct {
 
 // A weak component of the batch's terminals over live links: the touched H-component whose
 // block it inherits (`no_slot` for a new one), its H-component id, block, index capacity, the
-// indices handed out and its free list (popped in the batch), whether its block moved to the
-// arena tail and whether it narrows there (every terminal renumbered and recomputed), its
-// terminal count, its A list window and SCCs, its link list, and a tally used while picking
-// heirs.
+// indices handed out and its free list (popped in the batch), whether it takes a new block
+// and whether it narrows there (every terminal renumbered and recomputed), its terminal
+// count, its A list window and SCCs, its link list, and a tally used while picking heirs.
 const PieceRow = struct {
     inherit: u32,
     hcomp: u32,
-    block: usize,
+    block: []align(64) u32,
     k_cap: u32,
     k_high: u32,
     free_head: u32,
@@ -754,20 +767,20 @@ const FreedIndex = struct {
     index: u32,
 };
 
-// One kept terminal's old row (an arena offset) and the S window it is tested against.
+// One kept terminal's old row (`words` words in its block) and the S window it is tested
+// against.
 const MaskItem = struct {
     slot: u32,
-    row: usize,
+    row: [*]const u32,
     touch: u32,
     words: u32,
 };
 
-// One round-0 span: `src_len` words copied from arena offset `src`, the rest of `len`
-// words zeroed.
+// One round-0 span of a block: its words `dst`, the first `src_len` copied from `src`, the
+// rest zeroed (a zeroed span has `src_len == 0`).
 const CopyItem = struct {
-    dst: usize,
-    src: usize,
-    len: u32,
+    dst: []u32,
+    src: [*]const u32,
     src_len: u32,
 };
 
@@ -778,20 +791,19 @@ const RowsItem = struct {
     span: u32,
 };
 
-// A live block moving in a compaction: its H-component, old and new offsets, and its first
-// line in the copy's line numbering.
-const CompactBlock = struct {
+// A block committed into the batch tail, waiting for its landing: its H-component, its tail
+// word offset, and its own allocation (empty until the landing allocates it).
+const LandBlock = struct {
     hcomp: u32,
     src: usize,
-    dst: usize,
-    line_start: usize,
+    dst: []align(64) u32,
 };
 
 // What one batch's closure stages may touch, bounded in prepare from counts: its candidate
 // H-components (their count, terminals, links, capacities, row words, and block words), the
 // dead links its keys take loose, the terminals it can pop (gross) and add net, whether a
 // merge of components is possible, every terminal and piece it can number, the widest block
-// a piece can take, the live words at prepare, and the reserves derived from them.
+// a piece can take, and the reserves derived from them.
 const ClosureBounds = struct {
     candidates: usize = 0,
     k_c: usize = 0,
@@ -807,10 +819,9 @@ const ClosureBounds = struct {
     k_cap_sum: usize = 0,
     s_words: usize = 0,
     candidate_words: usize = 0,
-    live_prepared: usize = 0,
     copy_items: usize = 0,
     round_items: usize = 0,
-    arena_tail: usize = 0,
+    tail_words: usize = 0,
 };
 
 // One key's candidate tallies for the batch bound: the dead one-way links it takes loose
@@ -850,7 +861,7 @@ const BoundGroup = struct {
     }
 };
 
-// The batch bound's sums over its groups: arena tail words, rows items, copy items, and the
+// The batch bound's sums over its groups: tail words, rows items, copy items, and the
 // widest block and span count.
 const BoundSums = struct {
     tail: usize = 0,
@@ -879,12 +890,13 @@ const BoundSums = struct {
     }
 };
 
-// The power-of-two block cap holding `terms` indices; it stays below `free_end`.
+// The power-of-two block cap holding `terms` indices; at most 2^31, so local indices stay
+// below `no_index`.
 fn boundCap(terms: usize) error{OutOfMemory}!u32 {
-    // Reaching `free_end` needs over 2^30 live terminals in one block, so it fails as the
-    // allocator does.
+    // Passing 2^31 needs over 2^30 live terminals in one block, so it fails as the allocator
+    // does.
     const cap = std.math.ceilPowerOfTwo(usize, terms) catch return error.OutOfMemory;
-    if (cap >= free_end) return error.OutOfMemory;
+    if (cap > 1 << 31) return error.OutOfMemory;
     return @intCast(cap);
 }
 
@@ -898,14 +910,17 @@ pub const ClosureCounters = struct {
     rounds: usize = 0,
     words_written: usize = 0,
     shrinks: usize = 0,
-    // Arena words the relocated pieces' blocks took past the live blocks.
+    // Tail words the relocated pieces' blocks took.
     tail_words: usize = 0,
+    // Blocks allocated (a world build's exact blocks) and freed (retired or relocated).
+    block_allocs: usize = 0,
+    block_frees: usize = 0,
 };
 
 /// The per-world one-way closure: the registry of world links, the terminals (roots holding
 /// an endpoint of a live one-way link), the H-components (weak components of terminals over
-/// live links), each component's reachability matrix in one arena, and the batch staging its
-/// stages share.
+/// live links), each component's reachability matrix in its own block, and the batch staging
+/// its stages share.
 pub const Closure = struct {
     // Registry: per world link below the cursor its one-way row (`no_oneway` for two-way).
     oneway: std.MultiArrayList(OneWayRow) = .{},
@@ -918,13 +933,15 @@ pub const Closure = struct {
     // Column views refreshed whenever a pool grows.
     term: TermColumns = .{},
     hcomp: HCompColumns = .{},
-    // The matrices: live blocks, dead blocks waiting for a compaction, and padding-free
-    // counts of each.
-    words: std.ArrayList(u32) = .empty,
-    // The words the arena holds without growing, assigned after its reserve succeeds.
-    arena_limit: usize = 0,
+    // Words of every live block.
     live_words: usize = 0,
-    dead_words: usize = 0,
+    // A batch's relocated and new blocks, written by its commit and landed into their own
+    // allocations (`landResidents`) in order; `residents` names them. Empty after every nav
+    // update, failed ones included, unless its landing failed too (`NavGraph.landClosure`).
+    // `tail_limit` is the words a batch may place, assigned after the tail's reserve succeeds.
+    tail: std.array_list.Aligned(u32, .@"64") = .empty,
+    tail_limit: usize = 0,
+    residents: std.ArrayList(LandBlock) = .empty,
     // Batch stamps: a prepare stamps candidates with `stamp`, the touch stamps with `stamp + 1`.
     stamp: u32 = 0,
     // Whether the current batch maintains the closure: the registry or the batch's new links
@@ -961,7 +978,6 @@ pub const Closure = struct {
     round_items: std.ArrayList(RowsItem) = .empty,
     // Usize: a batch's round items sum spans over every SCC and may pass u32.
     round_starts: std.ArrayList(usize) = .empty,
-    compact_blocks: std.ArrayList(CompactBlock) = .empty,
     // Stage shapes of the most recent batch (stats and benches).
     last_resolve_batch: BatchStats = .{},
     last_mask_batch: BatchStats = .{},
@@ -969,7 +985,14 @@ pub const Closure = struct {
     last_rows_batch: BatchStats = .{},
 
     fn deinit(self: *Closure, allocator: std.mem.Allocator) void {
-        self.compact_blocks.deinit(allocator);
+        // A resident's block lies in the tail; every other live block is its own allocation.
+        const blocks = self.hcomps.items(.block);
+        for (self.residents.items) |resident| blocks[resident.hcomp] = &.{};
+        for (blocks) |block| {
+            if (block.len != 0) allocator.free(block);
+        }
+        self.residents.deinit(allocator);
+        self.tail.deinit(allocator);
         self.round_starts.deinit(allocator);
         self.round_items.deinit(allocator);
         self.copy_items.deinit(allocator);
@@ -995,7 +1018,6 @@ pub const Closure = struct {
         self.cand_hcomps.deinit(allocator);
         self.cand_counts.deinit(allocator);
         self.cand_starts.deinit(allocator);
-        self.words.deinit(allocator);
         self.hcomp_free.deinit(allocator);
         self.hcomps.deinit(allocator);
         self.term_free.deinit(allocator);
@@ -1013,7 +1035,7 @@ pub const Closure = struct {
         if (hcomp != self.term.hcomp[to]) return false;
         const k_cap = self.hcomp.k_cap[hcomp];
         const to_index = self.term.index[to];
-        const word = self.words.items[self.hcomp.block[hcomp] + @as(usize, self.term.index[from]) * rowWords(k_cap) + to_index / 32];
+        const word = self.hcomp.block[hcomp][@as(usize, self.term.index[from]) * rowWords(k_cap) + to_index / 32];
         return (word >> @intCast(to_index % 32)) & 1 != 0;
     }
 
@@ -1046,14 +1068,14 @@ pub const Closure = struct {
     }
 
     // Grows the free terminal and H-component lists to `terms` and `hcomps` ids, so that many
-    // pops never allocate. Pool growth is geometric and counted; ids stay below `free_end`.
+    // pops never allocate. Pool growth is geometric and counted; ids stay below their
+    // sentinels.
     fn ensureFreeIds(self: *Closure, allocator: std.mem.Allocator, terms: usize, hcomps: usize, pool_grows: *u64) !void {
         // The pools may move before a later step fails: the views follow them either way.
         defer self.refreshColumns();
-        // Ids stay below `free_end`, so a terminal id never reads as a free index-map entry;
-        // exhausting either pool needs 2^31 - 1 live rows of it (`growPool`: OutOfMemory).
-        try growPool(TermRow, allocator, &self.terms, &self.term_free, terms, .{ .root = no_root, .hcomp = no_hcomp, .index = no_index, .slot = no_slot }, free_end, pool_grows);
-        try growPool(HCompRow, allocator, &self.hcomps, &self.hcomp_free, hcomps, emptyHComp(), free_end, pool_grows);
+        // Exhausting either pool needs 2^32 - 1 live rows of it (`growPool`: OutOfMemory).
+        try growPool(TermRow, allocator, &self.terms, &self.term_free, terms, .{ .root = no_root, .hcomp = no_hcomp, .index = no_index, .slot = no_slot }, no_term, pool_grows);
+        try growPool(HCompRow, allocator, &self.hcomps, &self.hcomp_free, hcomps, emptyHComp(), no_hcomp, pool_grows);
     }
 
     fn bytes(self: *const Closure) usize {
@@ -1063,7 +1085,7 @@ pub const Closure = struct {
             self.term_free.capacity * @sizeOf(u32) +
             self.hcomps.capacity * @sizeOf(HCompRow) +
             self.hcomp_free.capacity * @sizeOf(u32) +
-            self.words.capacity * @sizeOf(u32);
+            self.live_words * @sizeOf(u32);
     }
 
     fn stagingBytes(self: *const Closure) usize {
@@ -1082,12 +1104,13 @@ pub const Closure = struct {
             self.apos.capacity * @sizeOf(APosRow) +
             self.copy_items.capacity * @sizeOf(CopyItem) +
             self.round_items.capacity * @sizeOf(RowsItem) +
-            self.compact_blocks.capacity * @sizeOf(CompactBlock);
+            self.tail.capacity * @sizeOf(u32) +
+            self.residents.capacity * @sizeOf(LandBlock);
     }
 };
 
 fn emptyHComp() HCompRow {
-    return .{ .block = 0, .k_cap = 0, .k_high = 0, .k_live = 0, .index_free = free_end, .link_head = no_oneway, .link_tail = no_oneway, .link_count = 0, .slot = no_slot, .stamp = 0 };
+    return .{ .block = &.{}, .k_cap = 0, .k_high = 0, .k_live = 0, .index_free = no_index, .link_head = no_oneway, .link_tail = no_oneway, .link_count = 0, .slot = no_slot, .stamp = 0 };
 }
 
 /// Grows the free id list `free` of the pool `rows` to at least `needed` ids, new rows set to
@@ -1354,7 +1377,7 @@ const StagingGroup = enum {
     masks,
     copy_items,
     round_items,
-    compact,
+    tail,
 };
 
 /// What sizes a world's reachability for `storageBytesBound`.
@@ -1382,8 +1405,9 @@ pub const StorageShape = struct {
 /// doubling past its need. Staging is the larger of one level build and the largest marks
 /// batch, per list: a key holds at most `border_stride + chunk_endpoints` nodes. Comps and
 /// roots cover the live nodes plus a batch's fresh ids; the closure covers two terminals per
-/// one-way link, H-components of at most `system_terminals` each, its arena at three times
-/// its live blocks plus a span per piece, and a batch's closure staging at its worst.
+/// one-way link, H-components of at most `system_terminals` each, its blocks and a batch's
+/// tail at three times the live blocks plus a span per piece, and a batch's closure staging at
+/// its worst.
 pub fn storageBytesBound(shape: StorageShape) usize {
     const node_bound = shape.border_stride + shape.chunk_endpoints;
     const marks_keys = shape.batch_keys;
@@ -1434,7 +1458,7 @@ pub fn storageBytesBound(shape: StorageShape) usize {
 }
 
 // The closure's share of `storageBytesBound`: its one-way rows, terminal and H-component pools,
-// arena, and a batch's staging over `keys` keys holding at most `key_nodes` nodes. A batch holds at most every terminal as an old or popped
+// blocks and tail, and a batch's staging over `keys` keys holding at most `key_nodes` nodes. A batch holds at most every terminal as an old or popped
 // one, every one-way link live or loose, and blocks whose caps sum to twice the terminals.
 fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usize {
     if (shape.oneway_links == 0) return 0;
@@ -1445,7 +1469,7 @@ fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usize {
     const row_words = @max(1, cap_max / 32);
     const spans = (row_words + span_words - 1) / span_words;
     const live_words = 2 *| terminals *| (row_words +| 2) +| span_words *| terminals;
-    const arena = (3 *| live_words +| span_words *| terminals) *| @sizeOf(u32);
+    const blocks = (3 *| live_words +| span_words *| terminals) *| @sizeOf(u32);
     const registry = rowsBytesBound(OneWayRow, shape.oneway_links);
     // Terminals pop up to twice the live ones; H-components split into a piece per link.
     const pools = 2 *| 3 *| terminals *| (@sizeOf(TermRow) + @sizeOf(u32)) +| 2 *| 2 *| terminals *| (@sizeOf(HCompRow) + @sizeOf(u32));
@@ -1459,8 +1483,8 @@ fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usize {
         2 *| listBytesBound(u32, terminals) +| listBytesBound(FreedIndex, terminals) +| listBytesBound(MaskItem, terminals) +|
         rowsBytesBound(APosRow, 2 *| terminals) +|
         listBytesBound(CopyItem, 6 *| terminals *| spans) +| listBytesBound(RowsItem, 3 *| terminals *| spans) +|
-        listBytesBound(usize, 2 *| terminals +| 2) +| listBytesBound(CompactBlock, terminals);
-    return registry +| pools +| arena +| staging;
+        listBytesBound(usize, 2 *| terminals +| 2) +| listBytesBound(LandBlock, terminals);
+    return registry +| pools +| blocks +| staging;
 }
 
 /// Per-world comps and roots, plus the batch staging the stages share and the flood's round
@@ -1641,12 +1665,17 @@ pub const Connectivity = struct {
         types.releaseStaging(&closure.mask_items, allocator, window.kept(.masks, 0));
         types.releaseStaging(&closure.copy_items, allocator, window.kept(.copy_items, 0));
         types.releaseStaging(&closure.round_items, allocator, window.kept(.round_items, 0));
-        types.releaseStaging(&closure.compact_blocks, allocator, window.kept(.compact, 0));
+        // The tail holds a deferred landing's blocks until it lands.
+        if (closure.residents.items.len == 0) {
+            types.releaseStaging(&closure.tail, allocator, window.kept(.tail, 0));
+            types.releaseStaging(&closure.residents, allocator, pieces_keep);
+        }
         // The lists may have shrunk below the limits: the next reserve sets them.
         self.element_limit = 0;
         self.element_count = 0;
         self.element_map.limit = 0;
         closure.limits = .{};
+        closure.tail_limit = 0;
         window.released();
     }
 
@@ -1941,9 +1970,11 @@ pub const Connectivity = struct {
     /// the main thread (O(1) per row, edge, and element; union-find amortized O(α)), settles
     /// every unit no removal can split, floods the rest in rounds (searches threaded, claims
     /// merged on main in item order), and unites each root-group. Allocation-free after
-    /// `prepareMarks`.
+    /// `prepareMarks`; `allocator` (the prepare's) only frees the closure blocks the batch
+    /// retires or relocates.
     pub fn commitMarks(
         self: *Connectivity,
+        allocator: std.mem.Allocator,
         levels: BatchLevels,
         world: ?*const WorldSystem,
         patch_keys: []const u64,
@@ -1960,7 +1991,7 @@ pub const Connectivity = struct {
         self.mergeBatch(levels, patch_keys, true, patch_keys.len + new_links.len, null);
         stats.main.conn_merge_ns += merge_timer.lap();
         var counters = self.settleAndFlood(levels, world, flood_threads, stats);
-        if (self.closure.active) counters.closure = self.updateClosure(levels, world, patch_keys.len, closure_threads, stats);
+        if (self.closure.active) counters.closure = self.updateClosure(allocator, levels, world, patch_keys.len, closure_threads, stats);
         return counters;
     }
 
@@ -2079,7 +2110,7 @@ pub const Connectivity = struct {
         self.mergeBatch(levels, keys, false, keys.len, replaced);
         stats.main.conn_merge_ns += section.lap();
         var counters = self.settleAndFlood(levels, world, flood_threads, stats);
-        if (self.closure.active) counters.closure = self.updateClosure(levels, world, keys.len, closure_threads, stats);
+        if (self.closure.active) counters.closure = self.updateClosure(allocator, levels, world, keys.len, closure_threads, stats);
         return counters;
     }
 
@@ -2931,11 +2962,11 @@ pub const Connectivity = struct {
     }
 
     /// Builds the closure of a freshly built world: registers every world link, resolves the
-    /// one-way ones on the built levels, and builds every H-component's matrix in an arena
-    /// reserved exactly; its staging, sized to every link, is freed with the world build's.
-    /// Allocates; on error the caller discards the graph. Resolution
-    /// O(links) threaded, Tarjan O(terminals + links) per component, rows
-    /// O((terminals + links) * row words) threaded.
+    /// one-way ones on the built levels, and builds every H-component's matrix in a block of
+    /// its own, allocated exactly; its staging, sized to every link, is freed with the world
+    /// build's. Allocates; on error the caller discards the graph. Resolution
+    /// O(links) threaded, one allocation per component, Tarjan O(terminals + links) per
+    /// component, rows O((terminals + links) * row words) threaded.
     pub fn buildClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: BatchLevels, world: ?*const WorldSystem, threads: ClosureThreads, pool_grows: *u64, stats: *NavUpdateStats) error{OutOfMemory}!ClosureCounters {
         const world_system = world orelse return .{};
         const new_links = world_system.levelLinks()[self.closure.oneway_cursor..];
@@ -2949,6 +2980,7 @@ pub const Connectivity = struct {
         try boundBatch(&bounds, &.{}, self.closure.hcomp);
         try self.reserveClosure(allocator, bounds, pool_grows);
         const closure = &self.closure;
+        std.debug.assert(closure.residents.items.len == 0 and closure.tail.items.len == 0);
         closure.active = true;
         defer closure.active = false;
         closure.freed_terms.clearRetainingCapacity();
@@ -2960,17 +2992,17 @@ pub const Connectivity = struct {
         const merge_timer = StageTimer.begin();
         self.mergeResolved(&counters);
         stats.main.closure_ns += merge_timer.lap();
-        // The arena, exactly: every piece takes a new block.
-        var words: usize = closure.words.items.len;
+        // Every piece is new and takes its exact block, at the build seam.
         const pieces = closure.pieces.slice();
-        for (pieces.items(.k_cap)) |k_cap| words += blockWords(k_cap);
-        if (words > closure.words.capacity) {
-            try closure.words.ensureTotalCapacityPrecise(allocator, words);
-            pool_grows.* += 1;
+        const blocks = pieces.items(.block);
+        var allocated: usize = 0;
+        errdefer for (blocks[0..allocated]) |block| allocator.free(block);
+        for (pieces.items(.k_cap), blocks) |k_cap, *block| {
+            block.* = try allocator.alignedAlloc(u32, .@"64", blockWords(k_cap));
+            allocated += 1;
         }
-        closure.arena_limit = words;
-        std.debug.assert(closure.words.capacity >= closure.arena_limit);
-        self.finishClosure(threads, &counters, stats);
+        counters.block_allocs += allocated;
+        self.finishClosure(allocator, threads, true, &counters, stats);
         return counters;
     }
 
@@ -2996,8 +3028,9 @@ pub const Connectivity = struct {
     // `changed` flags a marks batch's remasked keys; null is a level build, whose every key
     // changed. Then on the main thread the candidates deduped by stamp in key order and
     // compacted, the tallies and the seed edges whose kept far end's root holds a terminal
-    // summed, the batch bound, and its reserves, the arena compacted first when needed. O(1)
-    // per key, candidate entry, seed edge, and distinct candidate on the main thread.
+    // summed, the batch bound, and its reserves, the batch tail among them. Any blocks a
+    // failed landing left in the tail land first. O(1) per key, candidate entry, seed edge,
+    // and distinct candidate on the main thread.
     fn prepareClosure(
         self: *Connectivity,
         allocator: std.mem.Allocator,
@@ -3012,6 +3045,9 @@ pub const Connectivity = struct {
         pool_grows: *u64,
         stats: *NavUpdateStats,
     ) !ClosureBounds {
+        // An earlier build's or a deferred landing's blocks leave the tail before the batch
+        // touches any block.
+        try self.landResidents(allocator, threads.land, stats);
         var section = StageTimer.begin();
         defer stats.main.reserve_ns += section.lap();
         const closure = &self.closure;
@@ -3043,7 +3079,7 @@ pub const Connectivity = struct {
         try types.resizeStaging(&closure.ow_entries, allocator, ow_total, pool_grows);
 
         // Every new link is loose, and each end of a new one-way link may pop a terminal.
-        var bounds = ClosureBounds{ .loose = new_oneway, .live_prepared = closure.live_words };
+        var bounds = ClosureBounds{ .loose = new_oneway };
         var revived_gross: usize = 0;
         var revived_net: usize = 0;
         var shared: usize = 2 * new_oneway;
@@ -3118,12 +3154,14 @@ pub const Connectivity = struct {
         bounds.merge = opened or new_link_count != 0 or changed == null;
         try boundBatch(&bounds, closure.cand_hcomps.items[0..distinct], closure.hcomp);
         try self.reserveClosure(allocator, bounds, pool_grows);
-        // A batch that can touch no component still reclaims dead blocks.
-        if (bounds.k_b != 0 or closure.dead_words > closure.live_words) {
-            // The arena reserve times its own sections.
-            stats.main.reserve_ns += section.lap();
-            try self.reserveArena(allocator, if (bounds.k_b == 0) 0 else bounds.arena_tail, threads.compact, pool_grows, stats);
-            section = StageTimer.begin();
+        // The tail every relocated piece of the batch takes, on main before any closure
+        // dispatch: a batch that can number no terminal places nothing.
+        closure.tail_limit = 0;
+        if (bounds.k_b != 0) {
+            window.note(.tail, bounds.tail_words);
+            try types.growList(&closure.tail, allocator, bounds.tail_words, pool_grows);
+            closure.tail_limit = bounds.tail_words;
+            std.debug.assert(closure.tail.capacity >= closure.tail_limit and closure.tail.items.len == 0);
         }
         return bounds;
     }
@@ -3149,7 +3187,7 @@ pub const Connectivity = struct {
         const w_max = @max(sums.w_max, spanCount(q_max));
         const row_max: usize = rowWords(q_max);
         bounds.q_max = q_max;
-        bounds.arena_tail = sums.tail + 2 * bounds.n_net * (row_max + 1) + span_words * bounds.pieces;
+        bounds.tail_words = sums.tail + 2 * bounds.n_net * (row_max + 1) + span_words * bounds.pieces;
         bounds.round_items = sums.rounds + bounds.n_gross * w_max;
         bounds.copy_items = sums.copies + 2 * bounds.n_net * spanCount(q_max) + bounds.pieces;
     }
@@ -3190,6 +3228,7 @@ pub const Connectivity = struct {
         window.note(.pieces, bounds.pieces);
         try types.growList(&closure.pieces, allocator, bounds.pieces, pool_grows);
         try types.growList(&closure.plan_items, allocator, bounds.pieces, pool_grows);
+        try types.growList(&closure.residents, allocator, bounds.pieces, pool_grows);
         const masks = @min(bounds.k_b, bounds.k_c);
         window.note(.masks, masks);
         try types.growList(&closure.mask_items, allocator, masks, pool_grows);
@@ -3201,55 +3240,46 @@ pub const Connectivity = struct {
         closure.limits = bounds;
         closure.freed_terms.clearRetainingCapacity();
         std.debug.assert(closure.slots.capacity >= bounds.k_b and closure.pieces.capacity >= bounds.pieces and closure.resolve_items.capacity >= bounds.e_t);
+        std.debug.assert(closure.residents.capacity >= bounds.pieces);
     }
 
-    // Makes room for `tail` arena words past the live blocks. When dead words outweigh live
-    // ones or the tail is short, the live blocks move into a fresh arena of half again the live
-    // words plus the tail (`conn_closure_compact`: a threaded copy per line, the main thread
-    // O(1) per H-component), and the old arena is freed; a larger arena counts as a pool
-    // growth.
-    fn reserveArena(self: *Connectivity, allocator: std.mem.Allocator, tail: usize, threads: ?Dispatch, pool_grows: *u64, stats: *NavUpdateStats) !void {
+    /// Lands the blocks the last relocating commit wrote into the batch tail, each into its
+    /// own exact allocation: every allocation first, so on `OutOfMemory` nothing changes and
+    /// the blocks stay valid in the tail; then one copy of the tail's lines
+    /// (`conn_closure_land`, a line per item); then each H-component's block switch, and the
+    /// tail empties. No-op with nothing in the tail. Main work O(1) per block.
+    pub fn landResidents(self: *Connectivity, allocator: std.mem.Allocator, threads: ?Dispatch, stats: *NavUpdateStats) error{OutOfMemory}!void {
+        const closure = &self.closure;
+        const residents = closure.residents.items;
+        if (residents.len == 0) return;
         var section = StageTimer.begin();
         defer stats.main.reserve_ns += section.lap();
-        const closure = &self.closure;
-        const needed = closure.live_words + tail;
-        if (closure.dead_words <= closure.live_words and closure.arena_limit - closure.words.items.len >= tail) return;
-        // Headroom on the live words only: the tail is the batch's worst case.
-        const limit = needed + closure.live_words / 2;
-        var fresh: std.ArrayList(u32) = .empty;
-        errdefer fresh.deinit(allocator);
-        try fresh.ensureTotalCapacityPrecise(allocator, limit);
-        self.staging_window.note(.compact, closure.hcompCount());
-        try types.growList(&closure.compact_blocks, allocator, closure.hcompCount(), pool_grows);
-        closure.compact_blocks.clearRetainingCapacity();
-        const hcomp = closure.hcomp;
-        var offset: usize = 0;
-        for (hcomp.k_cap, 0..) |k_cap, id| {
-            if (k_cap == 0) continue;
-            closure.compact_blocks.appendAssumeCapacity(.{
-                .hcomp = @intCast(id),
-                .src = hcomp.block[id],
-                .dst = offset,
-                .line_start = offset / span_words,
-            });
-            offset += blockWords(k_cap);
+        const blocks = closure.hcomp.block;
+        var allocated: usize = 0;
+        errdefer for (residents[0..allocated]) |*resident| {
+            allocator.free(resident.dst);
+            resident.dst = &.{};
+        };
+        for (residents) |*resident| {
+            resident.dst = try allocator.alignedAlloc(u32, .@"64", blocks[resident.hcomp].len);
+            allocated += 1;
         }
-        std.debug.assert(offset == closure.live_words);
-        fresh.items.len = offset;
-        var job = CompactJob{ .blocks = closure.compact_blocks.items, .src = closure.words.items, .dst = fresh.items };
+        const lines = closure.tail.items.len / span_words;
+        std.debug.assert(closure.tail.items.len % span_words == 0 and residents[0].src == 0);
+        var job = LandJob{ .blocks = residents, .src = closure.tail.items };
         stats.main.reserve_ns += section.lap();
-        const batch = runStage(threads, offset / span_words, 1, &job, &job.range_count, compactJob);
+        const batch = runStage(threads, lines, 1, &job, &job.range_count, landJob);
         section = StageTimer.begin();
-        accumulateBatch(&stats.conn_closure_compact_batch, batch);
+        accumulateBatch(&stats.conn_closure_land_batch, batch);
         stats.addStageTime(batch);
-        for (closure.compact_blocks.items) |moved| hcomp.block[moved.hcomp] = moved.dst;
-        if (limit > closure.arena_limit) pool_grows.* += 1;
-        closure.words.deinit(allocator);
-        closure.words = fresh;
-        closure.arena_limit = limit;
-        std.debug.assert(closure.words.capacity >= closure.arena_limit);
-        closure.dead_words = 0;
-        stats.closure_compactions += 1;
+        for (residents) |*resident| {
+            blocks[resident.hcomp] = resident.dst;
+            resident.dst = &.{};
+        }
+        stats.closure_block_allocs += residents.len;
+        stats.closure_landed_words += closure.tail.items.len;
+        closure.residents.clearRetainingCapacity();
+        closure.tail.items.len = 0;
     }
 
     // ------------------------------------------------------------------------------------
@@ -3285,9 +3315,12 @@ pub const Connectivity = struct {
 
     // Brings the closure up to date after `finish`: touches the H-components the batch can
     // change and collects their links and the dead links its keys hold, resolves them, merges
-    // terminals and pieces, then recomputes the affected rows.
-    // Allocation-free after the batch's closure reserve.
-    fn updateClosure(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSystem, key_count: usize, threads: ClosureThreads, stats: *NavUpdateStats) ClosureCounters {
+    // terminals and pieces, then recomputes the affected rows. Allocation-free after the
+    // batch's closure reserve; frees the blocks it retires or relocates.
+    fn updateClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: BatchLevels, world: ?*const WorldSystem, key_count: usize, threads: ClosureThreads, stats: *NavUpdateStats) ClosureCounters {
+        // The prepare landed every earlier block: each block the commit frees is its own
+        // allocation.
+        std.debug.assert(self.closure.residents.items.len == 0 and self.closure.tail.items.len == 0);
         var counters = ClosureCounters{};
         const touch_timer = StageTimer.begin();
         self.touchClosure(levels, key_count);
@@ -3303,7 +3336,7 @@ pub const Connectivity = struct {
         const merge_timer = StageTimer.begin();
         self.mergeResolved(&counters);
         stats.main.closure_ns += merge_timer.lap();
-        self.finishClosure(threads, &counters, stats);
+        self.finishClosure(allocator, threads, false, &counters, stats);
         return counters;
     }
 
@@ -3488,8 +3521,7 @@ pub const Connectivity = struct {
         const piece = touched.kept_by[touch];
         if (piece == no_piece or pieces.compact[piece]) return;
         const id = touched.hcomp[touch];
-        const map_start = closure.hcomp.block[id] + @as(usize, closure.hcomp.k_cap[id]) * rowWords(closure.hcomp.k_cap[id]);
-        closure.words.items[map_start + index] = free_bit | pieces.free_head[piece];
+        indexMap(closure.hcomp, id)[index] = pieces.free_head[piece];
         pieces.free_head[piece] = index;
         std.debug.assert(closure.freed_indices.items.len < closure.freed_indices.capacity);
         closure.freed_indices.appendAssumeCapacity(.{ .touch = touch, .index = index });
@@ -3580,10 +3612,10 @@ pub const Connectivity = struct {
                 slots.piece[rep] = piece;
                 pieces.inherit[piece] = no_slot;
                 pieces.hcomp[piece] = no_hcomp;
-                pieces.block[piece] = 0;
+                pieces.block[piece] = &.{};
                 pieces.k_cap[piece] = 0;
                 pieces.k_high[piece] = 0;
-                pieces.free_head[piece] = free_end;
+                pieces.free_head[piece] = no_index;
                 pieces.relocated[piece] = false;
                 pieces.compact[piece] = false;
                 pieces.terms[piece] = 0;
@@ -3602,16 +3634,17 @@ pub const Connectivity = struct {
         closure.pieces.len = piece_count;
 
         // Per touched component in touch order: leaving terminals, and the piece holding most
-        // of its terminals (ties to the lower piece).
+        // of its terminals (ties to the lower piece). The walk precedes every index freed in
+        // the batch, so the committed terminal columns still invert each map.
         const hcomp = closure.hcomp;
         closure.leaving.clearRetainingCapacity();
         for (0..closure.touched.len) |touch| {
             const id = touched.hcomp[touch];
-            const map = closure.words.items[hcomp.block[id] + @as(usize, hcomp.k_cap[id]) * rowWords(hcomp.k_cap[id]) ..][0..hcomp.k_high[id]];
+            const map = indexMap(hcomp, id)[0..hcomp.k_high[id]];
             var heir: u32 = no_piece;
             var heir_count: u32 = 0;
-            for (map) |entry| {
-                if (entry & free_bit != 0) continue;
+            for (map, 0..) |entry, index| {
+                if (!liveEntry(closure.term, id, entry, index)) continue;
                 const slot = closure.term.slot[entry];
                 if (slot == no_slot) {
                     std.debug.assert(closure.leaving.items.len < closure.leaving.capacity);
@@ -3626,8 +3659,8 @@ pub const Connectivity = struct {
                     heir_count = pieces.tally[piece];
                 }
             }
-            for (map) |entry| {
-                if (entry & free_bit != 0) continue;
+            for (map, 0..) |entry, index| {
+                if (!liveEntry(closure.term, id, entry, index)) continue;
                 const slot = closure.term.slot[entry];
                 if (slot != no_slot) pieces.tally[slots.piece[slot]] = 0;
             }
@@ -3652,7 +3685,7 @@ pub const Connectivity = struct {
             if (shrinkDue(pieces.terms[piece], hcomp.k_cap[id])) {
                 pieces.compact[piece] = true;
                 pieces.k_high[piece] = 0;
-                pieces.free_head[piece] = free_end;
+                pieces.free_head[piece] = no_index;
             }
         }
         // Every index the batch frees in an inherited block, before any is handed out: the
@@ -3685,19 +3718,17 @@ pub const Connectivity = struct {
             if (slots.kept[slot]) continue;
             const piece = slots.piece[slot];
             const inherit = pieces.inherit[piece];
-            if (pieces.free_head[piece] != free_end) {
+            if (pieces.free_head[piece] != no_index) {
                 const index = pieces.free_head[piece];
-                const id = touched.hcomp[inherit];
-                const map_start = hcomp.block[id] + @as(usize, hcomp.k_cap[id]) * rowWords(hcomp.k_cap[id]);
-                pieces.free_head[piece] = closure.words.items[map_start + index] & ~free_bit;
+                pieces.free_head[piece] = indexMap(hcomp, touched.hcomp[inherit])[index];
                 slots.index[slot] = index;
             } else {
                 slots.index[slot] = pieces.k_high[piece];
                 pieces.k_high[piece] += 1;
             }
         }
-        // A piece outgrowing its block, new, or narrowing moves to the arena tail. Every freed
-        // index was offered first, so it holds no hole.
+        // A piece outgrowing its block, new, or narrowing takes a new block. Every freed index
+        // was offered first, so it holds no hole.
         for (0..piece_count) |piece| {
             if (pieces.inherit[piece] != no_slot and pieces.k_high[piece] <= pieces.k_cap[piece] and !pieces.compact[piece]) continue;
             std.debug.assert(pieces.k_high[piece] == pieces.terms[piece]);
@@ -3706,7 +3737,7 @@ pub const Connectivity = struct {
                 pieces.k_cap[piece] = compactCap(pieces.k_high[piece]);
                 counters.shrinks += 1;
             } else {
-                // Below `free_end`: the prepare bounded the largest block.
+                // At most 2^31: the prepare bounded the largest block (`boundCap`).
                 pieces.k_cap[piece] = @intCast(std.math.ceilPowerOfTwoAssert(usize, @max(1, pieces.k_high[piece])));
             }
             std.debug.assert(pieces.k_cap[piece] <= closure.limits.q_max);
@@ -3719,14 +3750,17 @@ pub const Connectivity = struct {
             if (touched.s_count[touch] == 0) continue;
             const id = touched.hcomp[touch];
             const words = rowWords(hcomp.k_cap[id]);
-            closure.mask_items.appendAssumeCapacity(.{ .slot = @intCast(slot), .row = hcomp.block[id] + @as(usize, slots.index[slot]) * words, .touch = @intCast(touch), .words = words });
+            const row = hcomp.block[id][@as(usize, slots.index[slot]) * words ..][0..words];
+            closure.mask_items.appendAssumeCapacity(.{ .slot = @intCast(slot), .row = row.ptr, .touch = @intCast(touch), .words = words });
         }
     }
 
     // The mask (`conn_closure_mask`), each piece's A list, the plan
     // (`conn_closure_plan`: CSR walk, Tarjan, SCC levels), block assignment and round lists,
-    // the rows (`conn_closure_rows`, rounds under one profile), and the commit.
-    fn finishClosure(self: *Connectivity, threads: ClosureThreads, counters: *ClosureCounters, stats: *NavUpdateStats) void {
+    // the rows (`conn_closure_rows`, rounds under one profile), and the commit. With `preset`
+    // every relocated piece already holds its own block (a world build); else each takes the
+    // tail.
+    fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: ClosureThreads, preset: bool, counters: *ClosureCounters, stats: *NavUpdateStats) void {
         const closure = &self.closure;
         const slots = SlotColumns.of(closure.slots.slice());
         const pieces = PieceColumns.of(closure.pieces.slice());
@@ -3737,7 +3771,6 @@ pub const Connectivity = struct {
         // Mask.
         var mask = MaskJob{
             .items = closure.mask_items.items,
-            .words = closure.words.items,
             .s_words = closure.s_words.items,
             .s_list = closure.s_list.items,
             .s_start = touched.s_start,
@@ -3787,7 +3820,7 @@ pub const Connectivity = struct {
         section = StageTimer.begin();
 
         // Blocks, then the round-0 copy and zero spans, then the round lists.
-        self.assignBlocks(slots, pieces, touched, counters);
+        self.assignBlocks(slots, pieces, touched, preset, counters);
         var max_level: u32 = 0;
         for (closure.plan_items.items) |piece| max_level = @max(max_level, pieces.max_level[piece]);
         const rounds: usize = if (closure.plan_items.items.len == 0) 0 else max_level + 1;
@@ -3821,14 +3854,14 @@ pub const Connectivity = struct {
         // Rows: one sample for the step's copy spans and rounds; none when nothing moved.
         if (closure.copy_items.items.len + round_total == 0) {
             closure.last_rows_batch = .{};
-            self.commitClosure(slots, pieces, touched);
+            self.commitClosure(allocator, slots, pieces, touched, preset, counters);
             stats.main.closure_ns += section.lap();
             return;
         }
         stats.main.closure_ns += section.lap();
         var dispatch = RoundDispatch.begin(threads.rows, closure.copy_items.items.len + round_total);
         if (closure.copy_items.items.len != 0) {
-            var copy = CopyJob{ .items = closure.copy_items.items, .words = closure.words.items };
+            var copy = CopyJob{ .items = closure.copy_items.items };
             dispatch.run(closure.copy_items.items.len, &copy, &copy.range_count, copyJob);
         }
         for (0..rounds) |level| {
@@ -3836,7 +3869,6 @@ pub const Connectivity = struct {
             if (round_slice.len == 0) continue;
             var rows = RowsJob{
                 .items = round_slice,
-                .words = closure.words.items,
                 .pieces = pieces,
                 .slots = slots,
                 .targets = closure.targets.items,
@@ -3849,49 +3881,55 @@ pub const Connectivity = struct {
         stats.inline_stage_ns += dispatch.inline_ns;
         section = StageTimer.begin();
         counters.rounds = rounds + @intFromBool(closure.copy_items.items.len != 0);
-        for (closure.copy_items.items) |item| counters.words_written += item.len;
+        for (closure.copy_items.items) |item| counters.words_written += item.dst.len;
         for (closure.plan_items.items) |piece| counters.words_written += @as(usize, pieces.a_count[piece]) * rowWords(pieces.k_cap[piece]);
 
-        self.commitClosure(slots, pieces, touched);
+        self.commitClosure(allocator, slots, pieces, touched, preset, counters);
         stats.main.closure_ns += section.lap();
     }
 
-    // Block assignment and round-0 spans, in piece order: a relocated piece takes a tail block
-    // (its old block, if any, goes dead) and gets copies of its kept rows outside A (widened,
-    // zero tail) and zeroed rows for every other index outside A; a piece in place gets its
-    // freed indices' rows zeroed. O(1) per piece and span.
-    fn assignBlocks(self: *Connectivity, slots: SlotColumns, pieces: PieceColumns, touched: TouchColumns, counters: *ClosureCounters) void {
+    // Block assignment and round-0 spans, in piece order: a relocated piece takes its preset
+    // block or the next tail block (its old block, if any, leaves the live words) and gets
+    // copies of its kept rows outside A (widened, zero tail) and zeroed rows for every other
+    // index outside A; a piece in place gets its freed indices' rows zeroed. O(1) per piece
+    // and span.
+    fn assignBlocks(self: *Connectivity, slots: SlotColumns, pieces: PieceColumns, touched: TouchColumns, preset: bool, counters: *ClosureCounters) void {
         const closure = &self.closure;
         const hcomp = closure.hcomp;
         closure.copy_items.clearRetainingCapacity();
         for (0..closure.pieces.len) |piece| {
             if (!pieces.relocated[piece]) continue;
-            const offset = closure.words.items.len;
             const words = blockWords(pieces.k_cap[piece]);
-            std.debug.assert(offset % span_words == 0 and offset + words <= closure.arena_limit);
-            closure.words.items.len = offset + words;
+            if (preset) {
+                std.debug.assert(pieces.block[piece].len == words);
+            } else {
+                const offset = closure.tail.items.len;
+                std.debug.assert(offset % span_words == 0 and offset + words <= closure.tail_limit);
+                closure.tail.items.len = offset + words;
+                // Blocks span whole 16-word lines, so each starts 64-byte aligned in the tail.
+                pieces.block[piece] = @alignCast(closure.tail.items[offset..][0..words]);
+                counters.tail_words += words;
+            }
             closure.live_words += words;
-            counters.tail_words += words;
-            pieces.block[piece] = offset;
+            const block = pieces.block[piece];
             const row_words = rowWords(pieces.k_cap[piece]);
             // Unused indices past those handed out: one zeroed range.
-            self.zeroWords(offset + @as(usize, pieces.k_high[piece]) * row_words, @as(usize, pieces.k_cap[piece] - pieces.k_high[piece]) * row_words);
+            self.zeroWords(block, @as(usize, pieces.k_high[piece]) * row_words, @as(usize, pieces.k_cap[piece] - pieces.k_high[piece]) * row_words);
             const inherit = pieces.inherit[piece];
             if (inherit == no_slot) continue;
             const id = touched.hcomp[inherit];
-            closure.dead_words += blockWords(hcomp.k_cap[id]);
             closure.live_words -= blockWords(hcomp.k_cap[id]);
             // The inherited block's free indices nobody took.
-            const old_map = hcomp.block[id] + @as(usize, hcomp.k_cap[id]) * rowWords(hcomp.k_cap[id]);
+            const old_map = indexMap(hcomp, id);
             var free = pieces.free_head[piece];
-            while (free != free_end) : (free = closure.words.items[old_map + free] & ~free_bit) {
-                self.zeroWords(offset + @as(usize, free) * row_words, row_words);
+            while (free != no_index) : (free = old_map[free]) {
+                self.zeroWords(block, @as(usize, free) * row_words, row_words);
             }
         }
         for (closure.freed_indices.items) |freed| {
             const piece = touched.kept_by[freed.touch];
             const row_words = rowWords(pieces.k_cap[piece]);
-            self.zeroWords(pieces.block[piece] + @as(usize, freed.index) * row_words, row_words);
+            self.zeroWords(pieces.block[piece], @as(usize, freed.index) * row_words, row_words);
         }
         for (0..closure.slots.len) |slot| {
             const piece = slots.piece[slot];
@@ -3899,22 +3937,24 @@ pub const Connectivity = struct {
             const id = touched.hcomp[pieces.inherit[piece]];
             const old_words = rowWords(hcomp.k_cap[id]);
             const new_words = rowWords(pieces.k_cap[piece]);
-            const src = hcomp.block[id] + @as(usize, slots.index[slot]) * old_words;
-            const dst = pieces.block[piece] + @as(usize, slots.index[slot]) * new_words;
+            const src = hcomp.block[id][@as(usize, slots.index[slot]) * old_words ..][0..old_words];
+            const dst = pieces.block[piece][@as(usize, slots.index[slot]) * new_words ..][0..new_words];
             var start: usize = 0;
             while (start < new_words) : (start += span_words) {
                 const len = @min(span_words, new_words - start);
                 const src_len = if (start >= old_words) 0 else @min(len, old_words - start);
-                self.appendCopy(.{ .dst = dst + start, .src = src + start, .len = @intCast(len), .src_len = @intCast(src_len) });
+                self.appendCopy(.{ .dst = dst[start..][0..len], .src = if (src_len == 0) dst[start..].ptr else src[start..].ptr, .src_len = @intCast(src_len) });
             }
         }
     }
 
-    // Zeroes `len` arena words from `start` in round 0, one span per item.
-    fn zeroWords(self: *Connectivity, start: usize, len: usize) void {
+    // Zeroes `len` words of `block` from `start` in round 0, one span per item.
+    fn zeroWords(self: *Connectivity, block: []u32, start: usize, len: usize) void {
+        const words = block[start..][0..len];
         var offset: usize = 0;
         while (offset < len) : (offset += span_words) {
-            self.appendCopy(.{ .dst = start + offset, .src = 0, .len = @intCast(@min(span_words, len - offset)), .src_len = 0 });
+            const span = words[offset..][0..@min(span_words, len - offset)];
+            self.appendCopy(.{ .dst = span, .src = span.ptr, .src_len = 0 });
         }
     }
 
@@ -3925,15 +3965,16 @@ pub const Connectivity = struct {
     }
 
     // The commit, in order: each piece's H-component id (inherited, or popped), the links
-    // relinked per piece (dead ones off every list), dead components freed, each piece's row,
-    // index map (a relocated one's copied first), and free list, every slot's terminal, every
-    // leaving terminal freed, and the S windows cleared. O(1) per terminal, link, and piece.
-    fn commitClosure(self: *Connectivity, slots: SlotColumns, pieces: PieceColumns, touched: TouchColumns) void {
+    // relinked per piece (dead ones off every list), dead components and their blocks freed,
+    // each piece's row, index map (a relocated one's copied first, its old block then freed),
+    // free list, and, for a tail block, its landing entry; every slot's terminal, every leaving
+    // terminal freed, and the S windows cleared. O(1) per terminal, link, and piece, plus one
+    // free per freed block; the blocks it frees are their own allocations (`allocator`'s).
+    fn commitClosure(self: *Connectivity, allocator: std.mem.Allocator, slots: SlotColumns, pieces: PieceColumns, touched: TouchColumns, preset: bool, counters: *ClosureCounters) void {
         const closure = &self.closure;
         const hcomp = closure.hcomp;
         const term = closure.term;
         const oneway = OneWayColumns.of(closure.oneway.slice());
-        const words = closure.words.items;
         for (0..closure.pieces.len) |piece| {
             const inherit = pieces.inherit[piece];
             // The batch reserve covered a new id per piece.
@@ -3959,21 +4000,34 @@ pub const Connectivity = struct {
         }
         for (touched.hcomp[0..closure.touched.len], touched.kept_by[0..closure.touched.len]) |id, kept_by| {
             if (kept_by != no_piece) continue;
-            closure.dead_words += blockWords(hcomp.k_cap[id]);
             closure.live_words -= blockWords(hcomp.k_cap[id]);
+            allocator.free(hcomp.block[id]);
+            counters.block_frees += 1;
             const stamp = hcomp.stamp[id];
             closure.hcomps.set(id, emptyHComp());
             hcomp.stamp[id] = stamp;
             std.debug.assert(closure.hcomp_free.items.len < closure.hcomp_free.capacity);
             closure.hcomp_free.appendAssumeCapacity(id);
         }
+        // Tail blocks follow piece order from the tail's start.
+        var tail_offset: usize = 0;
         for (0..closure.pieces.len) |piece| {
             const id = pieces.hcomp[piece];
             const inherit = pieces.inherit[piece];
-            const map = pieces.block[piece] + @as(usize, pieces.k_cap[piece]) * rowWords(pieces.k_cap[piece]);
-            if (pieces.relocated[piece] and inherit != no_slot and !pieces.compact[piece]) {
-                const old_map = hcomp.block[id] + @as(usize, hcomp.k_cap[id]) * rowWords(hcomp.k_cap[id]);
-                @memcpy(words[map..][0..hcomp.k_high[id]], words[old_map..][0..hcomp.k_high[id]]);
+            const map_start = @as(usize, pieces.k_cap[piece]) * rowWords(pieces.k_cap[piece]);
+            if (pieces.relocated[piece] and inherit != no_slot) {
+                if (!pieces.compact[piece]) {
+                    const k_high = hcomp.k_high[id];
+                    @memcpy(pieces.block[piece][map_start..][0..k_high], indexMap(hcomp, id)[0..k_high]);
+                }
+                allocator.free(hcomp.block[id]);
+                counters.block_frees += 1;
+            }
+            if (pieces.relocated[piece] and !preset) {
+                std.debug.assert(pieces.block[piece].ptr == closure.tail.items[tail_offset..].ptr);
+                std.debug.assert(closure.residents.items.len < closure.limits.pieces);
+                closure.residents.appendAssumeCapacity(.{ .hcomp = id, .src = tail_offset, .dst = &.{} });
+                tail_offset += pieces.block[piece].len;
             }
             hcomp.block[id] = pieces.block[piece];
             hcomp.k_cap[id] = pieces.k_cap[piece];
@@ -3985,14 +4039,14 @@ pub const Connectivity = struct {
             hcomp.link_count[id] = pieces.link_count[piece];
             hcomp.slot[id] = no_slot;
         }
+        std.debug.assert(tail_offset == closure.tail.items.len);
         for (0..closure.slots.len) |slot| {
             const id = slots.term[slot];
             const piece = slots.piece[slot];
-            const map = pieces.block[piece] + @as(usize, pieces.k_cap[piece]) * rowWords(pieces.k_cap[piece]);
             term.hcomp[id] = pieces.hcomp[piece];
             term.index[id] = slots.index[slot];
             term.slot[id] = no_slot;
-            words[map + slots.index[slot]] = id;
+            indexMap(hcomp, pieces.hcomp[piece])[slots.index[slot]] = id;
         }
         for (closure.leaving.items) |id| {
             const root = term.root[id];
@@ -4446,7 +4500,7 @@ pub const ClosureThreads = struct {
     mask: ?Dispatch = null,
     plan: ?Dispatch = null,
     rows: ?Dispatch = null,
-    compact: ?Dispatch = null,
+    land: ?Dispatch = null,
 };
 
 const TouchColumns = struct {
@@ -4504,7 +4558,7 @@ const SlotColumns = struct {
 const PieceColumns = struct {
     inherit: []u32,
     hcomp: []u32,
-    block: []usize,
+    block: [][]align(64) u32,
     k_cap: []u32,
     k_high: []u32,
     free_head: []u32,
@@ -4618,8 +4672,9 @@ fn sharesBit(row: []const u32, mask: []const u32) bool {
 // terminal, read through the graph before the change; and its tallies. A registered dead
 // endpoint counts loose when its partner's chunk is no key or its end sorts first. In a
 // changed key, a dead endpoint whose cell was closed and is open in the world now may revive
-// its link: one terminal, two when its partner end was open (net: when the partner's root
-// held no terminal). The key's split counts the distinct endpoint cells open before and after
+// its link: one terminal per such cell however many endpoints it holds (a cell is one node),
+// plus one per link whose partner end was open (net: when the partner's root held no
+// terminal). The key's split counts the distinct endpoint cells open before and after
 // whose old root holds a terminal, less their distinct labels, plus those labels with an old
 // edge; and it opens when a cell the old grid blocks is open in the world. Reads only; writes
 // its keys' windows and tallies. `keys` are sorted.
@@ -4708,9 +4763,11 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         if (job.world) |world| {
             // The world's tiling: `level` may be the one being built, absent from `levels`.
             const geometry = types.ChunkGeometry.init(world.width, world.height, world.chunk_size_tiles);
-            // The distinct qualifying endpoint cells (chunk-local) and their old labels.
+            // The distinct qualifying endpoint cells (chunk-local) and their old labels, and the
+            // distinct newly opened endpoint cells.
             var cells: LabelSet = .empty;
             var labels: LabelSet = .empty;
+            var opened_cells: LabelSet = .empty;
             var cell_count: u32 = 0;
             var endpoints = world.levelChunkLinkEndpoints(level, chunk);
             while (endpoints.next()) |endpoint| {
@@ -4742,8 +4799,12 @@ fn candidateJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
                             }
                         } else if (dead) {
                             const partner_bare = partner != null and (partner_row == no_node or job.nodeTerm(partner.?.level, partner_row) == no_term);
-                            tally.new_gross += 1 + @as(u32, @intFromBool(partner != null));
-                            tally.new_net += 1 + @as(u32, @intFromBool(partner_bare));
+                            // A cell lies in one chunk, so in one key: the set dedupes it fully.
+                            const local = geometry.localOf(endpoint.cell.x, endpoint.cell.y);
+                            const own: u32 = @intFromBool(!opened_cells.isSet(local));
+                            opened_cells.set(local);
+                            tally.new_gross += own + @as(u32, @intFromBool(partner != null));
+                            tally.new_net += own + @as(u32, @intFromBool(partner_bare));
                         }
                     }
                 }
@@ -4772,31 +4833,32 @@ fn cellOrder(world: *const WorldSystem, level: u16, cell: CellCoord) u64 {
     return (@as(u64, level) << 32) | (@as(u64, cell.y) * world.width + cell.x);
 }
 
-// The compaction: copies live blocks into the fresh arena, one 16-word line per item; a line finds its
-// block by binary search over the blocks' first lines.
-const CompactJob = struct {
-    blocks: []const CompactBlock,
+// The landing: copies the tail's blocks into their own allocations, one 16-word line per
+// item; a line finds its block by binary search over the blocks' tail offsets. Each item
+// writes only its line of one destination.
+const LandJob = struct {
+    blocks: []const LandBlock,
     src: []const u32,
-    dst: []u32,
     range_count: usize = 0,
 };
 
 // SIMD verdict: `@memcpy` per line.
-fn compactJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *CompactJob = @ptrCast(@alignCast(context));
+fn landJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *LandJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end * span_words <= job.dst.len);
-    // The first block starts at line 0, so every line has a block at or before it.
-    std.debug.assert(range.start == range.end or job.blocks[0].line_start == 0);
+    std.debug.assert(range.start <= range.end and range.end * span_words <= job.src.len);
+    // The first block starts at the tail's start, so every line has a block at or before it.
+    std.debug.assert(range.start == range.end or job.blocks[0].src == 0);
     for (range.start..range.end) |line| {
-        const block = job.blocks[std.sort.upperBound(CompactBlock, job.blocks, line, orderLineStart) - 1];
-        const offset = (line - block.line_start) * span_words;
-        @memcpy(job.dst[block.dst + offset ..][0..span_words], job.src[block.src + offset ..][0..span_words]);
+        const block = job.blocks[std.sort.upperBound(LandBlock, job.blocks, line, orderLineSrc) - 1];
+        const offset = line * span_words - block.src;
+        std.debug.assert(offset + span_words <= block.dst.len);
+        @memcpy(block.dst[offset..][0..span_words], job.src[line * span_words ..][0..span_words]);
     }
 }
 
-fn orderLineStart(line: usize, block: CompactBlock) std.math.Order {
-    return std.math.order(line, block.line_start);
+fn orderLineSrc(line: usize, block: LandBlock) std.math.Order {
+    return std.math.order(line, block.src / span_words);
 }
 
 // The resolve: each item's link resolved on the final graph. Reads only; writes its outputs.
@@ -4837,7 +4899,6 @@ fn resolveJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 // shorter than a row, else a word-wise AND. Writes only its items' slots' flags.
 const MaskJob = struct {
     items: []const MaskItem,
-    words: []const u32,
     s_words: []const u32,
     s_list: []const u32,
     s_start: []const u32,
@@ -4854,8 +4915,8 @@ fn maskJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end and range.end <= job.items.len);
     for (job.items[range.start..range.end]) |item| {
-        std.debug.assert(item.slot < job.a_flag.len and item.row + item.words <= job.words.len);
-        const row = job.words[item.row..][0..item.words];
+        std.debug.assert(item.slot < job.a_flag.len);
+        const row = item.row[0..item.words];
         const count = job.s_count[item.touch];
         var hit = false;
         if (count < item.words) {
@@ -5015,10 +5076,10 @@ fn pushVisit(apos: APosColumns, start: u32, position: u32, counter: *u32, stack_
     depth.* += 1;
 }
 
-// The rows' round 0: copies and zeroes spans of the arena. Each item writes only its span.
+// The rows' round 0: copies and zeroes spans of the batch's blocks. Each item writes only its
+// span.
 const CopyJob = struct {
     items: []const CopyItem,
-    words: []u32,
     range_count: usize = 0,
 };
 
@@ -5028,10 +5089,10 @@ fn copyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end and range.end <= job.items.len);
     for (job.items[range.start..range.end]) |item| {
-        std.debug.assert(item.src_len <= item.len and item.dst + item.len <= job.words.len);
-        const dst = job.words[item.dst..][0..item.len];
-        @memcpy(dst[0..item.src_len], job.words[item.src..][0..item.src_len]);
-        @memset(dst[item.src_len..], 0);
+        // Each item writes only its span, sliced from its block on main.
+        std.debug.assert(item.src_len <= item.dst.len and item.dst.len <= span_words);
+        @memcpy(item.dst[0..item.src_len], item.src[0..item.src_len]);
+        @memset(item.dst[item.src_len..], 0);
     }
 }
 
@@ -5041,7 +5102,6 @@ fn copyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 // spans; it reads rows no item of its round writes.
 const RowsJob = struct {
     items: []const RowsItem,
-    words: []u32,
     pieces: PieceColumns,
     slots: SlotColumns,
     targets: []const u32,
@@ -5056,7 +5116,7 @@ fn rowsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end and range.end <= job.items.len);
     const slots = job.slots;
     for (job.items[range.start..range.end]) |item| {
-        const block: usize = job.pieces.block[item.piece];
+        const block = job.pieces.block[item.piece];
         const row_words: usize = rowWords(job.pieces.k_cap[item.piece]);
         const word_start = @as(usize, item.span) * span_words;
         const len = @min(span_words, row_words - word_start);
@@ -5068,14 +5128,14 @@ fn rowsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             if (word >= word_start and word < word_start + len) acc[word - word_start] |= @as(u32, 1) << @intCast(index % 32);
             for (job.targets[slots.out_start[member]..][0..slots.out_count[member]]) |target| {
                 if (slots.scc[target] == item.scc) continue;
-                const row = block + @as(usize, slots.index[target]) * row_words + word_start;
-                std.debug.assert(row + len <= job.words.len);
-                orInto(acc[0..len], job.words[row..][0..len]);
+                const row = @as(usize, slots.index[target]) * row_words + word_start;
+                std.debug.assert(row + len <= block.len);
+                orInto(acc[0..len], block[row..][0..len]);
             }
         }
         for (members) |member| {
-            const row = block + @as(usize, slots.index[member]) * row_words + word_start;
-            @memcpy(job.words[row..][0..len], acc[0..len]);
+            const row = @as(usize, slots.index[member]) * row_words + word_start;
+            @memcpy(block[row..][0..len], acc[0..len]);
         }
     }
 }
@@ -5643,13 +5703,20 @@ fn expectSameColumns(a: *const NavGraph, b: *const NavGraph) !void {
     try t.expectEqualSlices(u32, conn_a.root_term, conn_b.root_term);
     const closure_a = &conn_a.closure;
     const closure_b = &conn_b.closure;
-    try t.expectEqualSlices(u32, closure_a.words.items, closure_b.words.items);
     try t.expectEqual(closure_a.live_words, closure_b.live_words);
-    try t.expectEqual(closure_a.dead_words, closure_b.dead_words);
     try t.expectEqualSlices(u32, closure_a.oneway_of_link.items, closure_b.oneway_of_link.items);
     inline for (.{ .root, .hcomp, .index, .slot }) |field| try t.expectEqualSlices(u32, @field(closure_a.term, @tagName(field)), @field(closure_b.term, @tagName(field)));
-    try t.expectEqualSlices(usize, closure_a.hcomp.block, closure_b.hcomp.block);
     inline for (.{ .k_cap, .k_high, .k_live, .index_free, .link_head, .link_tail, .link_count }) |field| try t.expectEqualSlices(u32, @field(closure_a.hcomp, @tagName(field)), @field(closure_b.hcomp, @tagName(field)));
+    // Block addresses differ; each H-component's rows and handed-out map entries match (its
+    // padding and unused map entries are never read).
+    for (closure_a.hcomp.k_cap, closure_a.hcomp.k_high, 0..) |k_cap, k_high, id_usize| {
+        const id: u32 = @intCast(id_usize);
+        try t.expectEqual(closure_a.hcomp.block[id].len, closure_b.hcomp.block[id].len);
+        if (k_cap == 0) continue;
+        const rows = @as(usize, k_cap) * rowWords(k_cap);
+        try t.expectEqualSlices(u32, closure_a.hcomp.block[id][0..rows], closure_b.hcomp.block[id][0..rows]);
+        try t.expectEqualSlices(u32, indexMap(closure_a.hcomp, id)[0..k_high], indexMap(closure_b.hcomp, id)[0..k_high]);
+    }
     inline for (.{ .link, .hcomp, .next, .src_term, .dst_term }) |field| try t.expectEqualSlices(u32, closure_a.oneway.items(field), closure_b.oneway.items(field));
     try t.expectEqualSlices(u32, closure_a.term_free.items, closure_b.term_free.items);
     try t.expectEqualSlices(u32, closure_a.hcomp_free.items, closure_b.hcomp_free.items);
@@ -6008,12 +6075,12 @@ fn expectClosureStagingWithin(conn: *const Connectivity, keep: StagingSizes) !vo
         try t.expect(types.stagingHeld(list, keep.patch_keys + 1));
     }
     inline for (.{
-        &closure.cand_hcomps,    &closure.ow_entries,    &closure.freed_terms, &closure.touched,
-        &closure.s_words,        &closure.s_list,        &closure.loose,       &closure.resolve_items,
-        &closure.resolve_out,    &closure.slots,         &closure.targets,     &closure.pieces,
-        &closure.leaving,        &closure.freed_indices, &closure.mask_items,  &closure.plan_items,
-        &closure.apos,           &closure.copy_items,    &closure.round_items, &closure.round_starts,
-        &closure.compact_blocks,
+        &closure.cand_hcomps, &closure.ow_entries,    &closure.freed_terms, &closure.touched,
+        &closure.s_words,     &closure.s_list,        &closure.loose,       &closure.resolve_items,
+        &closure.resolve_out, &closure.slots,         &closure.targets,     &closure.pieces,
+        &closure.leaving,     &closure.freed_indices, &closure.mask_items,  &closure.plan_items,
+        &closure.apos,        &closure.copy_items,    &closure.round_items, &closure.round_starts,
+        &closure.tail,        &closure.residents,
     }) |list| try t.expect(types.stagingHeld(list, 0));
 }
 
@@ -6646,11 +6713,14 @@ fn latticeWall(chunks: u16, index: usize) [2]u16 {
 
 // Asserts a nav update's closure stayed within the bound its batch prepared, not merely within
 // the reserved capacity: terminals popped and gained over the candidates', slots, pieces,
-// resolve and loose lists, copy and rows items, the relocated blocks' caps, and the arena tail
-// words they took. An update that also built levels checks only its tail words.
+// resolve and loose lists, copy and rows items, the relocated blocks' caps, and the tail words
+// they took; and every block landed. An update that also built levels checks only its tail
+// words.
 fn expectWithinBounds(closure: *const Closure, stats: NavUpdateStats) !void {
     const t = std.testing;
     try t.expect(stats.closure_tail_used <= stats.closure_tail_bound);
+    try t.expectEqual(@as(usize, 0), closure.residents.items.len);
+    try t.expectEqual(@as(usize, 0), closure.tail.items.len);
     if (stats.closure_links == 0 or stats.levels_built != 0) return;
     const limits = closure.limits;
     try t.expect(stats.closure_terms_new <= limits.n_gross);
@@ -6658,7 +6728,7 @@ fn expectWithinBounds(closure: *const Closure, stats: NavUpdateStats) !void {
     try t.expect(closure.slots.len <= limits.k_b and closure.pieces.len <= limits.pieces);
     try t.expect(closure.resolve_items.items.len <= limits.e_t and closure.loose.items.len <= limits.loose);
     try t.expect(closure.copy_items.items.len <= limits.copy_items and closure.round_items.items.len <= limits.round_items);
-    try t.expect(stats.closure_tail_used <= limits.arena_tail);
+    try t.expect(stats.closure_tail_used <= limits.tail_words);
     const pieces = closure.pieces.slice();
     for (pieces.items(.relocated), pieces.items(.k_cap)) |relocated, k_cap| {
         if (relocated) try t.expect(k_cap <= limits.q_max);
@@ -6779,7 +6849,7 @@ test "two hundred seeded random steps of one-way links, endpoint toggles, and wa
 fn termRow(closure: *const Closure, term: u32) []const u32 {
     const hcomp = closure.term.hcomp[term];
     const words = rowWords(closure.hcomp.k_cap[hcomp]);
-    return closure.words.items[closure.hcomp.block[hcomp] + @as(usize, closure.term.index[term]) * words ..][0..words];
+    return closure.hcomp.block[hcomp][@as(usize, closure.term.index[term]) * words ..][0..words];
 }
 
 // The terminal of lattice room `index` on `level`.
@@ -6817,7 +6887,7 @@ test "reopening a chain's head recomputes only the head's row; every other row s
     try fixture.expectMatchesRebuild(&system);
 }
 
-test "a batch where one terminal leaves and another joins a full block reuses the freed index: the block keeps its capacity and words" {
+test "a batch where one terminal leaves and another joins a full block reuses the freed index: the block keeps its capacity, words, and allocation" {
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -6831,6 +6901,7 @@ test "a batch where one terminal leaves and another joins a full block reuses th
     try std.testing.expectEqual(@as(u32, 8), closure.hcomp.k_cap[id]);
     try std.testing.expectEqual(@as(u32, 8), closure.hcomp.k_high[id]);
     const live_words = closure.live_words;
+    const block = closure.hcomp.block[id].ptr;
     // One batch: the tail's room closed, and a new link from the chain to room 20.
     try setRoom(&fixture, &system, chunks, 0, 7, fixture.tree);
     try addOneWay(&fixture, 0, latticeRoom(chunks, 6), 0, latticeRoom(chunks, 20));
@@ -6841,18 +6912,22 @@ test "a batch where one terminal leaves and another joins a full block reuses th
     try std.testing.expectEqual(@as(u32, 8), closure.hcomp.k_cap[id]);
     try std.testing.expectEqual(@as(u32, 8), closure.hcomp.k_high[id]);
     try std.testing.expectEqual(live_words, closure.live_words);
-    try std.testing.expectEqual(@as(usize, 0), closure.dead_words);
+    try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
+    try std.testing.expectEqual(@as(usize, 0), stats.closure_block_allocs + stats.closure_block_frees);
     try fixture.expectMatchesRebuild(&system);
 }
 
-test "a dig touching no one-way system runs no closure item and writes no arena word; a world without one-way links skips the candidate scan" {
+test "a dig touching no one-way system runs no closure item and writes no block word; a world without one-way links skips the candidate scan" {
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
     try addChain(&fixture, chunks, 0, 0, 6);
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    const words = try std.testing.allocator.dupe(u32, system.graph.connectivity.closure.words.items);
+    const closure = &system.graph.connectivity.closure;
+    const id = roomHComp(&system, &fixture, chunks, 0);
+    const block = closure.hcomp.block[id].ptr;
+    const words = try std.testing.allocator.dupe(u32, closure.hcomp.block[id]);
     defer std.testing.allocator.free(words);
     // Two rooms with no endpoint joined, far from the chain's row.
     const wall = latticeWall(chunks, 60);
@@ -6864,7 +6939,9 @@ test "a dig touching no one-way system runs no closure item and writes no arena 
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_plan_batch.item_count);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_rows_batch.item_count);
     try std.testing.expectEqual(@as(usize, 0), stats.closure_words_written);
-    try std.testing.expectEqualSlices(u32, words, system.graph.connectivity.closure.words.items);
+    try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_land_batch.item_count);
+    try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
+    try std.testing.expectEqualSlices(u32, words, closure.hcomp.block[id]);
     try fixture.expectMatchesRebuild(&system);
 
     var plain = try latticeWorld(chunks, 1);
@@ -6915,7 +6992,7 @@ const ClosureStagesOnWorkers = struct {
     mask: bool = false,
     plan: bool = false,
     rows: bool = false,
-    compact: bool = false,
+    land: bool = false,
 
     fn add(self: *ClosureStagesOnWorkers, stats: NavUpdateStats) void {
         self.candidates = self.candidates or onWorkers(stats.conn_closure_candidates_batch);
@@ -6923,7 +7000,7 @@ const ClosureStagesOnWorkers = struct {
         self.mask = self.mask or onWorkers(stats.conn_closure_mask_batch);
         self.plan = self.plan or onWorkers(stats.conn_closure_plan_batch);
         self.rows = self.rows or onWorkers(stats.conn_closure_rows_batch);
-        self.compact = self.compact or onWorkers(stats.conn_closure_compact_batch);
+        self.land = self.land or onWorkers(stats.conn_closure_land_batch);
     }
 
     fn onWorkers(batch: BatchStats) bool {
@@ -6958,10 +7035,10 @@ test "threaded closure stages equal the inline ones word for word across worker 
             try expectSameColumns(&inline_system.graph, &threaded.graph);
             const systems = [_]*PathfindingSystem{ &inline_system, &threaded };
             var on_workers = ClosureStagesOnWorkers{};
-            var compactions: usize = 0;
+            var landed: usize = 0;
             // Every tail closed, then reopened; chain A wholly closed (its block dies); B's
-            // tail closed (the arena compacts first); B's tail reopened while D loses all but
-            // 24 rooms (its block narrows).
+            // tail closed; B's tail reopened while D loses all but 24 rooms (its block narrows
+            // and lands).
             for (0..5) |step| {
                 switch (step) {
                     0, 1 => for ([_]usize{ 47, 72, 135, 255 }) |tail| try markRoom(&fixture, &systems, chunks, tail, if (step == 0) fixture.tree else fixture.grass),
@@ -6977,8 +7054,9 @@ test "threaded closure stages equal the inline ones word for word across worker 
                 try expectWithinBounds(&inline_system.graph.connectivity.closure, serial);
                 try expectWithinBounds(&threaded.graph.connectivity.closure, stats);
                 on_workers.add(stats);
-                compactions += stats.closure_compactions;
+                landed += stats.closure_landed_words;
                 try std.testing.expectEqual(serial.closure_shrinks, stats.closure_shrinks);
+                try std.testing.expectEqual(serial.closure_landed_words, stats.closure_landed_words);
                 if (step == 4) {
                     try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
                     if (workers == 4 and items_per_range == 1) {
@@ -6989,10 +7067,10 @@ test "threaded closure stages equal the inline ones word for word across worker 
                 try expectSameColumns(&inline_system.graph, &threaded.graph);
                 try fixture.expectMatchesRebuild(&threaded);
             }
-            try std.testing.expect(compactions != 0);
+            try std.testing.expect(landed != 0);
             if (workers == 4 and items_per_range == 1) {
                 try std.testing.expect(on_workers.candidates and on_workers.resolve and on_workers.mask);
-                try std.testing.expect(on_workers.plan and on_workers.rows and on_workers.compact);
+                try std.testing.expect(on_workers.plan and on_workers.rows and on_workers.land);
             }
         }
     }
@@ -7018,10 +7096,14 @@ test "a one-way toggle and a terminal root split prepared with the real allocato
     try setRoom(&fixture, &system, chunks, 0, 23, fixture.tree);
     var stats = NavUpdateStats{};
     const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, nav_threads, &stats)).?;
+    // Fails every allocation; the frees of retired or relocated blocks reach the real one.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original = system.graph.allocator;
-    system.graph.allocator = std.testing.failing_allocator;
+    system.graph.allocator = failing.allocator();
     const batch = system.graph.commitMarks(prepared, no_colliders.view(), nav_threads, &stats);
     system.graph.allocator = original;
+    try std.testing.expect(!failing.has_induced_failure);
+    system.graph.landClosure(nav_threads, &stats);
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
     try std.testing.expect(stats.closure_terms_new != 0 and stats.closure_a_rows != 0);
@@ -7030,7 +7112,7 @@ test "a one-way toggle and a terminal root split prepared with the real allocato
     try fixture.expectMatchesRebuild(&system);
 }
 
-test "repeated one-way toggles and terminal splits and merges return terminals, components, words, and links to their counts; the arena stays within twice its live words plus a batch's tail" {
+test "repeated one-way toggles and terminal splits and merges return terminals, components, words, and links to their counts, and every reaction ends with its blocks landed" {
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -7053,12 +7135,12 @@ test "repeated one-way toggles and terminal splits and merges return terminals, 
         for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
             try setRoom(&fixture, &system, chunks, 0, 7, tile);
             _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-            try std.testing.expect(closure.words.items.len <= 2 * closure.live_words + closure.limits.arena_tail);
+            try std.testing.expect(closure.tail.items.len == 0 and closure.residents.items.len == 0);
         }
         for ([_]TileId{ fixture.grass, fixture.tree }) |tile| {
             try fixture.setCell(&system, 0, wall[0], wall[1], tile);
             _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-            try std.testing.expect(closure.words.items.len <= 2 * closure.live_words + closure.limits.arena_tail);
+            try std.testing.expect(closure.tail.items.len == 0 and closure.residents.items.len == 0);
         }
         if (start) |first| try std.testing.expectEqual(first, counts(closure)) else start = counts(closure);
     }
@@ -7082,7 +7164,7 @@ fn roomHComp(system: *const PathfindingSystem, fixture: *const TestWorld, chunks
     return system.graph.connectivity.closure.term.hcomp[roomTerm(system, fixture, chunks, 0, index)];
 }
 
-test "a one-way system that loses most of its terminals narrows its block, and the next nav batch reclaims the old one" {
+test "a one-way system that loses most of its terminals narrows its block and frees the old one in the same batch; a far dig allocates and frees no block" {
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -7093,21 +7175,24 @@ test "a one-way system that loses most of its terminals narrows its block, and t
     try std.testing.expectEqual(@as(u32, 128), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_tail)]);
     const cut = try narrowChain(&fixture, &system, fixture.tree);
     try std.testing.expectEqual(@as(usize, 1), cut.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_allocs);
+    try std.testing.expectEqual(blockWords(64), cut.closure_landed_words);
     const id = roomHComp(&system, &fixture, chunks, narrow_tail);
     try std.testing.expectEqual(@as(u32, 64), closure.hcomp.k_cap[id]);
     try std.testing.expectEqual(@as(u32, 28), closure.hcomp.k_high[id]);
     try std.testing.expectEqual(@as(u32, 28), closure.hcomp.k_live[id]);
     try std.testing.expectEqual(blockWords(64), closure.live_words);
     try fixture.expectMatchesRebuild(&system);
-    // A dig far from every endpoint touches no component, yet reclaims the dead block.
+    // A dig far from every endpoint touches no component and no block.
+    const block = closure.hcomp.block[id].ptr;
     const wall = latticeWall(chunks, 40);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const far = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 0), far.closure_links);
-    try std.testing.expectEqual(@as(usize, 1), far.closure_compactions);
-    try std.testing.expectEqual(closure.live_words, closure.words.items.len);
-    try std.testing.expectEqual(@as(usize, 0), closure.dead_words);
-    try std.testing.expect(closure.arena_limit <= closure.live_words + closure.live_words / 2);
+    try std.testing.expectEqual(@as(usize, 0), far.closure_block_allocs + far.closure_block_frees + far.closure_landed_words);
+    try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
+    try std.testing.expectEqual(blockWords(64), closure.live_words);
     // A tail toggle writes rows two words wide.
     try setRoom(&fixture, &system, chunks, 0, narrow_tail, fixture.tree);
     const toggle = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
@@ -7128,14 +7213,15 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
     _ = try narrowChain(&fixture, &system, fixture.tree);
     const id = roomHComp(&system, &fixture, chunks, narrow_tail);
     const narrowed = .{ closure.hcomp.k_cap[id], closure.hcomp.k_high[id], closure.live_words };
-    // The first toggle's prepare compacts the dead block away; the block stays put after.
-    var block: ?usize = null;
+    // The toggles keep the block in place.
+    const block = closure.hcomp.block[id].ptr;
     for (0..8) |toggle| {
         try setRoom(&fixture, &system, chunks, 0, narrow_tail, if (toggle % 2 == 0) fixture.tree else fixture.grass);
         const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
         try std.testing.expectEqual(@as(usize, 0), stats.closure_shrinks);
+        try std.testing.expectEqual(@as(usize, 0), stats.closure_block_allocs + stats.closure_block_frees);
         try std.testing.expectEqual(narrowed[0], closure.hcomp.k_cap[id]);
-        if (block) |offset| try std.testing.expectEqual(offset, closure.hcomp.block[id]) else block = closure.hcomp.block[id];
+        try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     }
     try std.testing.expectEqual(narrowed[2], closure.live_words);
     // Reopened, the system regrows past its narrowed block.
@@ -7151,13 +7237,8 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
     try std.testing.expectEqual(narrowed[1], closure.hcomp.k_high[regrown]);
     try std.testing.expectEqual(@as(usize, 1), closure.hcompCount());
     try std.testing.expectEqual(narrowed[2] - blockWords(4), closure.live_words);
-    // The next batch compacts the relocated and dead blocks away: the arena holds exactly
-    // the live words.
-    try std.testing.expect(closure.dead_words > closure.live_words);
-    const wall = latticeWall(chunks, 40);
-    try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(closure.live_words, closure.words.items.len);
+    // The narrowing freed the regrown block and the closed system's in its own batch.
+    try std.testing.expectEqual(@as(usize, 2), again.closure_block_frees);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -7195,14 +7276,517 @@ test "a block narrowing prepared with the real allocator commits on a multi-work
     for (narrow_first..narrow_first + 100) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
     var stats = NavUpdateStats{};
     const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, nav_threads, &stats)).?;
+    // Fails every allocation; the old block's free reaches the real one.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original = system.graph.allocator;
-    system.graph.allocator = std.testing.failing_allocator;
+    system.graph.allocator = failing.allocator();
     _ = system.graph.commitMarks(prepared, no_colliders.view(), nav_threads, &stats);
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), stats.closure_block_frees);
+    try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline);
+    // The narrowed block waits in the tail, readable, until the reaction's landing.
+    const closure = &system.graph.connectivity.closure;
+    try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
+    try fixture.expectMatchesRebuild(&system);
+    system.graph.landClosure(nav_threads, &stats);
+    try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
+    try std.testing.expectEqual(blockWords(64), stats.closure_landed_words);
+    try expectWithinBounds(closure, stats);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+// One H-component's block as a batch elsewhere must leave it: its id, address, rows, and
+// handed-out map entries.
+const BlockSnapshot = struct {
+    id: u32,
+    ptr: [*]align(64) u32,
+    words: []u32,
+
+    fn take(system: *const PathfindingSystem, fixture: *const TestWorld, chunks: u16, room: usize) !BlockSnapshot {
+        const closure = &system.graph.connectivity.closure;
+        const id = roomHComp(system, fixture, chunks, room);
+        const k_cap = closure.hcomp.k_cap[id];
+        const k_high = closure.hcomp.k_high[id];
+        const rows = @as(usize, k_cap) * rowWords(k_cap);
+        const words = try std.testing.allocator.alloc(u32, rows + k_high);
+        @memcpy(words[0..rows], closure.hcomp.block[id][0..rows]);
+        @memcpy(words[rows..], indexMap(closure.hcomp, id)[0..k_high]);
+        return .{ .id = id, .ptr = closure.hcomp.block[id].ptr, .words = words };
+    }
+
+    fn deinit(self: *BlockSnapshot) void {
+        std.testing.allocator.free(self.words);
+    }
+
+    fn expectUnchanged(self: *const BlockSnapshot, system: *const PathfindingSystem, fixture: *const TestWorld, chunks: u16, room: usize) !void {
+        var now = try take(system, fixture, chunks, room);
+        defer now.deinit();
+        try std.testing.expectEqual(self.id, now.id);
+        try std.testing.expectEqual(self.ptr, now.ptr);
+        try std.testing.expectEqualSlices(u32, self.words, now.words);
+    }
+};
+
+test "changes in one one-way system never move or write another system's block" {
+    const chunks: u16 = 8;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    // Systems over rooms 0..7, 16..47, and 48..63 (rows 0 to 3), whose chunks no change to the
+    // narrow chain (rows 8 to 15) patches.
+    const others = [_]usize{ 0, 16, 48 };
+    try addChain(&fixture, chunks, 0, 0, 8);
+    try addChain(&fixture, chunks, 0, 16, 32);
+    try addChain(&fixture, chunks, 0, 48, 16);
+    try addChain(&fixture, chunks, 0, narrow_first, 128);
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    var snapshots: [others.len]?BlockSnapshot = @splat(null);
+    defer for (&snapshots) |*snapshot| {
+        if (snapshot.*) |*taken| taken.deinit();
+    };
+    for (others, &snapshots) |room, *snapshot| snapshot.* = try BlockSnapshot.take(&system, &fixture, chunks, room);
+    // Tail toggles in place, a narrowing and its regrowth (two relocations), a retirement, and
+    // a new system in its place.
+    for (0..7) |step| {
+        switch (step) {
+            0...3 => try setRoom(&fixture, &system, chunks, 0, narrow_tail, if (step % 2 == 0) fixture.tree else fixture.grass),
+            4 => for (narrow_first..narrow_first + 100) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree),
+            5 => for (narrow_first..narrow_first + 128) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree),
+            else => for (narrow_first..narrow_first + 128) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.grass),
+        }
+        const stats = try applyWithinBounds(&fixture, &system);
+        try std.testing.expect(stats.closure_links != 0);
+        for (others, &snapshots) |room, *snapshot| try snapshot.*.?.expectUnchanged(&system, &fixture, chunks, room);
+    }
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "retiring or narrowing a system frees its old block in the same batch; live words and bytes follow" {
+    const chunks: u16 = 8;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    try addChain(&fixture, chunks, 0, 0, 4);
+    try addChain(&fixture, chunks, 0, narrow_first, 128);
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const closure = &system.graph.connectivity.closure;
+    // A narrowing and its regrowth first, so the measured batches grow no pool or table.
+    _ = try narrowChain(&fixture, &system, fixture.tree);
+    _ = try narrowChain(&fixture, &system, fixture.grass);
+    try std.testing.expectEqual(@as(u32, 128), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_tail)]);
+    var live_words = closure.live_words;
+    var bytes = closure.bytes();
+    const cut = try narrowChain(&fixture, &system, fixture.tree);
+    try std.testing.expectEqual(@as(usize, 1), cut.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_allocs);
+    const narrowed = blockWords(128) - blockWords(64);
+    try std.testing.expectEqual(live_words - narrowed, closure.live_words);
+    try std.testing.expectEqual(bytes - narrowed * @sizeOf(u32), closure.bytes());
+    // The small system retired: its block goes in that batch, and nothing lands.
+    const small = roomHComp(&system, &fixture, chunks, 0);
+    live_words = closure.live_words;
+    bytes = closure.bytes();
+    for (0..4) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
+    const retired = try applyWithinBounds(&fixture, &system);
+    try std.testing.expectEqual(@as(usize, 1), retired.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 0), retired.closure_block_allocs + retired.closure_landed_words);
+    try std.testing.expectEqual(@as(u32, 0), closure.hcomp.k_cap[small]);
+    try std.testing.expectEqual(@as(usize, 0), closure.hcomp.block[small].len);
+    try std.testing.expectEqual(live_words - blockWords(4), closure.live_words);
+    try std.testing.expectEqual(bytes - blockWords(4) * @sizeOf(u32), closure.bytes());
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "a relocating batch lands its pieces in the same nav reaction on workers: the tail and residents are empty after it, and the land stage ran on workers" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const chunks: u16 = 16;
+    const rooms: usize = 256;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    // A chain over rows 0 to 7, every room closed: its links are dead until the reopen.
+    try addChain(&fixture, chunks, 0, 0, rooms);
+    for (0..rooms) |room| try setRoom(&fixture, null, chunks, 0, room, fixture.tree);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
+    defer threads.deinit();
+    var capacity = test_support.abstractCapacity();
+    capacity.worker_participant_count = threads.participantSlotCount();
+    var system = try fixture.build(capacity);
+    defer system.deinit();
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
+    const closure = &system.graph.connectivity.closure;
+    try std.testing.expectEqual(@as(usize, 0), closure.termCount());
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    for (0..rooms) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.grass);
+    frame.beginStep();
+    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, &threads);
+    // One new system of 256: its block, 144 lines, lands on workers in this reaction.
+    try std.testing.expectEqual(@as(usize, 1), closure.hcompCount());
+    try std.testing.expectEqual(@as(u32, rooms), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, 0)]);
+    const land = stats.conn_closure_land_batch;
+    try std.testing.expectEqual(blockWords(rooms) / span_words, land.item_count);
+    try std.testing.expect(!land.ran_inline and land.worker_thread_ranges != 0);
+    try std.testing.expectEqual(blockWords(rooms), stats.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), stats.closure_block_allocs);
+    try expectWithinBounds(closure, stats);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "a relocating batch committed under a failing allocator on a multi-worker ThreadSystem leaves its pieces resident; a failed landing defers with the closure intact; a prepare under failure returns OutOfMemory with state intact; disarmed, it lands and matches the rebuild" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const chunks: u16 = 8;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    try addChain(&fixture, chunks, 0, narrow_first, 128);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
+    defer threads.deinit();
+    var capacity = test_support.abstractCapacity();
+    capacity.worker_participant_count = threads.participantSlotCount();
+    var system = try fixture.build(capacity);
+    defer system.deinit();
+    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
+    const nav_threads = forcedNavThreads(&system, &threads);
+    const closure = &system.graph.connectivity.closure;
+    // A narrowing and its regrowth on the same threads warm every list the batches below use.
+    for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
+        for (narrow_first..narrow_first + 100) |room| try setRoom(&fixture, &system, chunks, 0, room, tile);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    }
+    // The narrowing prepared with the real allocator, committed under the failing one: its
+    // block waits in the tail, readable.
+    for (narrow_first..narrow_first + 100) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
+    var stats = NavUpdateStats{};
+    const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, nav_threads, &stats)).?;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const original = system.graph.allocator;
+    system.graph.allocator = failing.allocator();
+    _ = system.graph.commitMarks(prepared, no_colliders.view(), nav_threads, &stats);
+    try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
     try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline);
-    try expectWithinBounds(&system.graph.connectivity.closure, stats);
+    try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
+    try fixture.expectMatchesRebuild(&system);
+    // Its landing fails: deferred, counted, and the block stays in the tail.
+    system.graph.landClosure(nav_threads, &stats);
+    system.graph.allocator = original;
+    system.nav_marks.clearRetainingCapacity();
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), stats.closure_land_deferrals);
+    try std.testing.expectEqual(@as(usize, 0), stats.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
+    try std.testing.expectEqual(blockWords(64), closure.tail.items.len);
+    try fixture.expectMatchesRebuild(&system);
+    // The next batch's prepare under failure fails as OutOfMemory before any change, the
+    // block still resident and the change pending.
+    var before = try fixture.build(test_support.abstractCapacity());
+    defer before.deinit();
+    try setRoom(&fixture, &system, chunks, 0, narrow_tail, fixture.tree);
+    var failing_prepare = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing_prepare.allocator();
+    system.graph.allocator = failing_prepare.allocator();
+    const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    system.allocator = std.testing.allocator;
+    system.graph.allocator = original;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(failing_prepare.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
+    try test_support.expectConnectivityConsistent(&system.graph);
+    try test_support.expectSameConnectivityPartition(&system.graph, &before.graph);
+    try test_support.expectSameClosure(&system.graph, &before.graph);
+    try std.testing.expect(system.hasPendingNavUpdates(&fixture.world));
+    // Disarmed: the prepare lands the block, then the batch runs.
+    const retried = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(blockWords(64), retried.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), retried.closure_block_allocs);
+    try expectWithinBounds(closure, retried);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+// Narrows the narrow chain of an 8-chunk lattice in one batch committed outside a reaction,
+// then fails its landing: the narrowed block stays deferred in the tail.
+fn deferNarrowingLanding(fixture: *TestWorld, system: *PathfindingSystem) !void {
+    for (narrow_first..narrow_first + 100) |room| try setRoom(fixture, system, 8, 0, room, fixture.tree);
+    var stats = NavUpdateStats{};
+    const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats)).?;
+    _ = system.graph.commitMarks(prepared, no_colliders.view(), null, &stats);
+    system.nav_marks.clearRetainingCapacity();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const original = system.graph.allocator;
+    system.graph.allocator = failing.allocator();
+    system.graph.landClosure(null, &stats);
+    system.graph.allocator = original;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), stats.closure_land_deferrals);
+    try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.residents.items.len);
+}
+
+test "release windows closing while a landing is deferred keep the tail and its blocks; the next batch lands them" {
+    const chunks: u16 = 8;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    try addChain(&fixture, chunks, 0, narrow_first, 128);
+    var system = try fixture.build(windowCapacity(1));
+    defer system.deinit();
+    const closure = &system.graph.connectivity.closure;
+    try deferNarrowingLanding(&fixture, &system);
+    const slots_held = closure.slots.capacity;
+    // Quiet steps, each closing a window: the later ones keep nothing of the narrowing.
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    for (0..3) |_| {
+        frame.beginStep();
+        _ = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, null);
+    }
+    // The windows released the batch's other staging, never the tail under the block.
+    try std.testing.expect(closure.slots.capacity < slots_held);
+    try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
+    try std.testing.expectEqual(blockWords(64), closure.tail.items.len);
+    try fixture.expectMatchesRebuild(&system);
+    // Each step closes a window, which resets the batch limits `expectWithinBounds` reads.
+    try setRoom(&fixture, &system, chunks, 0, narrow_tail, fixture.tree);
+    const landed = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expectEqual(blockWords(64), landed.closure_landed_words);
+    try std.testing.expect(closure.residents.items.len == 0 and closure.tail.items.len == 0);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "a world destroyed while a landing is deferred frees every block once" {
+    var fixture = try latticeWorld(8, 1);
+    defer fixture.deinit();
+    try addChain(&fixture, 8, 0, narrow_first, 128);
+    var system = try fixture.build(test_support.abstractCapacity());
+    // The resident block lies in the tail: the deinit frees the tail, never the block alone.
+    defer system.deinit();
+    try deferNarrowingLanding(&fixture, &system);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "a landing failing after its first allocation frees what it allocated, keeps every block in the tail, and lands all on retry" {
+    const chunks: u16 = 8;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    // Two chains of 64, each cut to 14 rooms in one batch: two narrowed blocks of 32.
+    try addChain(&fixture, chunks, 0, 0, 64);
+    try addChain(&fixture, chunks, 0, 64, 64);
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const closure = &system.graph.connectivity.closure;
+    for ([_]usize{ 0, 64 }) |first| {
+        for (first..first + 50) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
+    }
+    var stats = NavUpdateStats{};
+    const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats)).?;
+    _ = system.graph.commitMarks(prepared, no_colliders.view(), null, &stats);
+    system.nav_marks.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 2), stats.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 2), closure.residents.items.len);
+    try std.testing.expectEqual(2 * blockWords(32), closure.tail.items.len);
+    // The second destination fails: the first is freed, and both blocks stay in the tail.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    const original = system.graph.allocator;
+    system.graph.allocator = failing.allocator();
+    system.graph.landClosure(null, &stats);
+    system.graph.allocator = original;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), failing.deallocations);
+    try std.testing.expectEqual(@as(usize, 1), stats.closure_land_deferrals);
+    try std.testing.expectEqual(@as(usize, 2), closure.residents.items.len);
+    const tail_start = @intFromPtr(closure.tail.items.ptr);
+    for (closure.residents.items) |resident| {
+        try std.testing.expectEqual(@as(usize, 0), resident.dst.len);
+        try std.testing.expectEqual(tail_start + resident.src * @sizeOf(u32), @intFromPtr(closure.hcomp.block[resident.hcomp].ptr));
+    }
+    try fixture.expectMatchesRebuild(&system);
+    // The retry lands both.
+    stats = .{};
+    system.graph.landClosure(null, &stats);
+    try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
+    try std.testing.expectEqual(@as(usize, 2), stats.closure_block_allocs);
+    try std.testing.expectEqual(2 * blockWords(32), stats.closure_landed_words);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+// Fails its first allocation, then forwards every request to the testing allocator.
+const FailOnceAllocator = struct {
+    failed: bool = false,
+
+    fn allocator(self: *FailOnceAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        // The context is this allocator (`allocator`).
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(context));
+        if (!self.failed) {
+            self.failed = true;
+            return null;
+        }
+        return std.testing.allocator.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        return std.testing.allocator.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        std.testing.allocator.rawFree(memory, alignment, return_address);
+    }
+};
+
+test "a nav update failing after a level build left blocks in the tail lands them on its error path, or counts the deferral when that landing fails too" {
+    for ([_]bool{ false, true }) |landing_fails| {
+        var fixture = try TestWorld.init(6, 1);
+        defer fixture.deinit();
+        var system = try fixture.build(test_support.abstractCapacity());
+        defer system.deinit();
+        for (1..3) |level| {
+            _ = try fixture.world.addLevel(-16 * @as(i32, @intCast(level)));
+            _ = try fixture.world.addDenseLayer(@intCast(level), 0, .floor, fixture.grass);
+        }
+        try addOneWay(&fixture, 1, .{ 2, 2 }, 2, .{ 9, 9 });
+        // The link registered with neither level built, then both built outside a reaction: it
+        // goes live with the second, whose new block waits in the tail.
+        var stats = NavUpdateStats{};
+        const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), &.{}, null, &stats)).?;
+        _ = system.graph.commitMarks(prepared, no_colliders.view(), null, &stats);
+        try system.graph.buildLevel(no_colliders.view(), &fixture.world, 1, null, &stats);
+        try system.graph.buildLevel(no_colliders.view(), &fixture.world, 2, null, &stats);
+        const closure = &system.graph.connectivity.closure;
+        try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
+        // The next update's level build fails at its first allocation.
+        _ = try fixture.world.addLevel(-48);
+        _ = try fixture.world.addDenseLayer(3, 0, .floor, fixture.grass);
+        var once = FailOnceAllocator{};
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        const broken = if (landing_fails) failing.allocator() else once.allocator();
+        system.allocator = broken;
+        system.graph.allocator = broken;
+        const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        system.allocator = std.testing.allocator;
+        system.graph.allocator = std.testing.allocator;
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expectEqual(@as(usize, 3), system.graph.levelCount());
+        try std.testing.expectEqual(@as(usize, @intFromBool(landing_fails)), closure.residents.items.len);
+        try std.testing.expectEqual(@as(u64, @intFromBool(landing_fails)), system.graph.land_deferrals);
+        try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)) == .reaches);
+        // The retry builds the level, landing any block first.
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        try std.testing.expectEqual(@as(usize, 4), system.graph.levelCount());
+        try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
+        try std.testing.expectEqual(@as(usize, 0), closure.tail.items.len);
+        try fixture.expectMatchesRebuild(&system);
+    }
+}
+
+test "an index-map entry is live only at its own index: a free link naming a live terminal of the same component at another index reads as free" {
+    const chunks: u16 = 4;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    // System B (rooms 32..39) registers first and takes terminal ids 0..7, so system A's
+    // (rooms 0..15) ids run 8 ahead of its indices.
+    try addChain(&fixture, chunks, 0, 32, 8);
+    try addChain(&fixture, chunks, 0, 0, 16);
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const closure = &system.graph.connectivity.closure;
+    const a = roomHComp(&system, &fixture, chunks, 0);
+    const room6 = roomTerm(&system, &fixture, chunks, 0, 6);
+    try std.testing.expectEqual(@as(u32, 14), room6);
+    try std.testing.expectEqual(@as(u32, 6), closure.term.index[room6]);
+    // A's last two rooms (indices 14 and 15) closed in one batch: index 15's free link names
+    // 14, the id of A's live room 6 at index 6.
+    for (14..16) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
+    _ = try applyWithinBounds(&fixture, &system);
+    try std.testing.expectEqual(@as(u32, 15), closure.hcomp.index_free[a]);
+    try std.testing.expectEqual(room6, indexMap(closure.hcomp, a)[15]);
+    try std.testing.expectEqual(a, closure.term.hcomp[room6]);
+    try std.testing.expect(!liveEntry(closure.term, a, room6, 15));
+    try std.testing.expect(liveEntry(closure.term, a, room6, 6));
+    try fixture.expectMatchesRebuild(&system);
+    // Batches walking A's map: its head leaves, then both rooms return through the free list.
+    try setRoom(&fixture, &system, chunks, 0, 0, fixture.tree);
+    _ = try applyWithinBounds(&fixture, &system);
+    try fixture.expectMatchesRebuild(&system);
+    for (14..16) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.grass);
+    _ = try applyWithinBounds(&fixture, &system);
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "reopening a closed chain in one batch counts each room's cell once: n_net equals its rooms, and the tail stays within the bound" {
+    const chunks: u16 = 4;
+    const rooms: usize = 8;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    // Every interior room holds two endpoints: one link's target and the next one's source.
+    try addChain(&fixture, chunks, 0, 0, rooms);
+    for (0..rooms) |room| try setRoom(&fixture, null, chunks, 0, room, fixture.tree);
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const closure = &system.graph.connectivity.closure;
+    try std.testing.expectEqual(@as(usize, 0), closure.termCount());
+    for (0..rooms) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.grass);
+    const stats = try applyWithinBounds(&fixture, &system);
+    try std.testing.expectEqual(rooms, closure.limits.n_net);
+    try std.testing.expectEqual(rooms, closure.limits.n_gross);
+    try std.testing.expectEqual(rooms, stats.closure_terms_new);
+    try std.testing.expectEqual(@as(u32, rooms), roomBlockCap(&system, &fixture, chunks, 0));
+    try fixture.expectMatchesRebuild(&system);
+}
+
+test "an index-map entry is live by back-pointer: a free link equal to a live terminal id of another component reads as free, and term ids are bounded by no_term" {
+    const chunks: u16 = 4;
+    var fixture = try latticeWorld(chunks, 1);
+    defer fixture.deinit();
+    // System B (rooms 32..39, row 4) registers first, so its terminals take ids 0..7; system A
+    // (rooms 0..7, row 0) takes ids 8..15, its rooms at indices 0..7.
+    try addChain(&fixture, chunks, 0, 32, 8);
+    try addChain(&fixture, chunks, 0, 0, 8);
+    var system = try fixture.build(test_support.abstractCapacity());
+    defer system.deinit();
+    const closure = &system.graph.connectivity.closure;
+    const a = roomHComp(&system, &fixture, chunks, 0);
+    const b = roomHComp(&system, &fixture, chunks, 32);
+    // A's rooms 6 and 7 closed in one batch: index 7's free entry links index 6, which is
+    // also the id of one of B's live terminals.
+    for (6..8) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
+    _ = try applyWithinBounds(&fixture, &system);
+    try std.testing.expectEqual(@as(u32, 7), closure.hcomp.index_free[a]);
+    const link = indexMap(closure.hcomp, a)[7];
+    try std.testing.expectEqual(@as(u32, 6), link);
+    try std.testing.expectEqual(b, closure.term.hcomp[link]);
+    try std.testing.expect(!liveEntry(closure.term, a, link, 7));
+    try fixture.expectMatchesRebuild(&system);
+    // Batches walking A's map read the link as free: room 7 takes index 7 back, then room 5
+    // leaves.
+    try setRoom(&fixture, &system, chunks, 0, 7, fixture.grass);
+    _ = try applyWithinBounds(&fixture, &system);
+    try fixture.expectMatchesRebuild(&system);
+    try setRoom(&fixture, &system, chunks, 0, 5, fixture.tree);
+    _ = try applyWithinBounds(&fixture, &system);
+    try fixture.expectMatchesRebuild(&system);
+    // Ids reach the full width: a need of 2^31 terminals or H-components passes the id check
+    // and asks the allocator; a need reaching the sentinel fails before asking it.
+    var grows: u64 = 0;
+    inline for (.{ .{ 1 << 31, 0 }, .{ 0, 1 << 31 } }) |need| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, closure.ensureFreeIds(failing.allocator(), need[0], need[1], &grows));
+        try std.testing.expect(failing.has_induced_failure);
+    }
+    inline for (.{ .{ no_term, 0 }, .{ 0, no_hcomp } }) |need| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, closure.ensureFreeIds(failing.allocator(), need[0], need[1], &grows));
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+    try std.testing.expectEqual(@as(u64, 0), grows);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -7222,11 +7806,15 @@ test "a fill splitting one terminal root holding sixteen one-way endpoints in fa
     try setHubCorridor(&fixture, &system, tunnels, fixture.tree);
     var stats = NavUpdateStats{};
     const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats)).?;
+    // Fails every allocation; the old block's free reaches the real one.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original = system.graph.allocator;
-    system.graph.allocator = std.testing.failing_allocator;
+    system.graph.allocator = failing.allocator();
     _ = system.graph.commitMarks(prepared, no_colliders.view(), null, &stats);
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
+    try std.testing.expect(!failing.has_induced_failure);
+    system.graph.landClosure(null, &stats);
     // Every tunnel takes its own root; the first in link order takes the corridor's terminal
     // back, the rest pop new ones, and none leaves. The tunnels' mouths are the seed edges
     // whose kept far end held the terminal: the bound counts each.
@@ -7326,8 +7914,9 @@ test "the post-commit nav reaction runs the closure resolve and rows on workers 
     try fixture.expectMatchesRebuild(&system);
 }
 
-// A post-commit nav reaction for the cap test: a lattice with two one-way chains whose rooms
-// close (graph, connectivity, and closure stages), or two rooms whose doors close (the flood).
+// A post-commit nav reaction for the cap test: a lattice with two one-way chains each cut in
+// two by a closed room, a new block per chain landing (graph, connectivity, and closure
+// stages), or two rooms whose doors close (the flood).
 const CappedNavScenario = enum { closure, flood };
 
 const CappedNavRun = struct {
@@ -7378,8 +7967,8 @@ fn runCappedNavScenario(scenario: CappedNavScenario, threads: *ThreadSystem, cap
     defer frame.deinit();
     switch (scenario) {
         .closure => {
-            try setRoom(&fixture, &system, chunks, 0, 31, fixture.tree);
-            try setRoom(&fixture, &system, chunks, 0, 79, fixture.tree);
+            try setRoom(&fixture, &system, chunks, 0, 24, fixture.tree);
+            try setRoom(&fixture, &system, chunks, 0, 72, fixture.tree);
         },
         .flood => try toggleRooms(&fixture, &system, fixture.tree),
     }
@@ -7404,7 +7993,7 @@ test "a nav worker cap of zero keeps every graph, connectivity, and closure stag
         const capped = try runCappedNavScenario(scenario, &threads, 0);
         // The fixed partition runs these stages on workers unless the cap holds them inline.
         const on_workers: []const []const u8 = switch (scenario) {
-            .closure => &.{ "plan", "patch", "remask_batch", "conn_seed_batch", "conn_gather_batch", "conn_closure_candidates_batch", "conn_closure_compact_batch", "conn_closure_resolve_batch", "conn_closure_mask_batch", "conn_closure_plan_batch", "conn_closure_rows_batch" },
+            .closure => &.{ "plan", "patch", "remask_batch", "conn_seed_batch", "conn_gather_batch", "conn_closure_candidates_batch", "conn_closure_land_batch", "conn_closure_resolve_batch", "conn_closure_mask_batch", "conn_closure_plan_batch", "conn_closure_rows_batch" },
             .flood => &.{ "conn_seed_batch", "conn_gather_batch", "conn_flood_batch" },
         };
         var matched: usize = 0;
@@ -7821,8 +8410,8 @@ test "a pool grows to exactly its need from empty, then to twice its capacity, i
 }
 
 test "a block cap, a map's slot count, and a merge's element limit past their index widths fail as OutOfMemory" {
-    try std.testing.expectEqual(@as(u32, 1 << 30), try boundCap(1 << 30));
-    try std.testing.expectError(error.OutOfMemory, boundCap((1 << 30) + 1));
+    try std.testing.expectEqual(@as(u32, 1 << 31), try boundCap(1 << 31));
+    try std.testing.expectError(error.OutOfMemory, boundCap((1 << 31) + 1));
     try std.testing.expectError(error.OutOfMemory, boundCap(std.math.maxInt(usize)));
     try std.testing.expectError(error.OutOfMemory, MergeMap.slotCount(std.math.maxInt(usize)));
     // The element limit is checked before any reserve: nothing is asked of the allocator and
@@ -7859,7 +8448,7 @@ fn expectExhaustedPoolBatch(fixture: *TestWorld, system: *PathfindingSystem, bef
     };
     const sentinel: usize = switch (pool) {
         .comps => no_comp,
-        .terms => free_end,
+        .terms => no_term,
     };
     const live_rows = len.*;
     const free_ids = try std.testing.allocator.dupe(u32, free.items);

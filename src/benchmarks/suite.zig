@@ -250,11 +250,11 @@ pub const RunStats = struct {
 /// dispatch time and its share on workers, and the flood tuner's policy after the case
 /// (null when the case runs no adaptive tuner; zero workers is inline). Then the one-way
 /// closure's stage shapes (candidates, resolve, mask, plan, rows with round 0 and its rounds
-/// folded, compaction) and counters: components touched, links resolved, terminals new and
-/// left, rows recomputed, rounds, words written, blocks narrowed, the arena's live, dead, and
-/// allocated words, and compactions; and the reserve of its busiest batch: the arena tail
-/// words its bound reserved and its blocks took, the arena's word limit, its candidates' block
-/// words, the live words at its prepare, and the terminals it could number.
+/// folded, landing) and counters: components touched, links resolved, terminals new and left,
+/// rows recomputed, rounds, words written, blocks narrowed, blocks allocated and freed, words
+/// landed, landings deferred, the live block words, and the batch tail's capacity; and the
+/// reserve of its busiest batch: the tail words its bound reserved and its blocks took, its
+/// candidates' block words, and the terminals it could number.
 pub const NavConnSummary = struct {
     seed: BatchSummary = .{},
     gather: BatchSummary = .{},
@@ -274,7 +274,7 @@ pub const NavConnSummary = struct {
     closure_mask: BatchSummary = .{},
     closure_plan: BatchSummary = .{},
     closure_rows: BatchSummary = .{},
-    closure_compact: BatchSummary = .{},
+    closure_land: BatchSummary = .{},
     closure_touched: usize = 0,
     closure_links: usize = 0,
     closure_terms_new: usize = 0,
@@ -283,15 +283,15 @@ pub const NavConnSummary = struct {
     closure_rounds: usize = 0,
     closure_words_written: usize = 0,
     closure_shrinks: usize = 0,
+    closure_block_allocs: usize = 0,
+    closure_block_frees: usize = 0,
+    closure_landed_words: usize = 0,
+    closure_land_deferrals: usize = 0,
     closure_live_words: usize = 0,
-    closure_dead_words: usize = 0,
-    closure_arena_capacity: usize = 0,
-    closure_compactions: usize = 0,
+    closure_tail_capacity: usize = 0,
     closure_tail_bound: usize = 0,
     closure_tail_used: usize = 0,
-    closure_arena_limit: usize = 0,
     closure_candidate_words: usize = 0,
-    closure_live_prepared: usize = 0,
     closure_kb: usize = 0,
 };
 
@@ -1628,15 +1628,15 @@ fn formatNavConnInto(buffer: []u8, summary: ?NavConnSummary) []const u8 {
 // The one-way closure block of a nav reaction, or nothing when the reaction ran no closure
 // stage.
 fn formatClosureInto(buffer: []u8, conn: NavConnSummary) []const u8 {
-    if (conn.candidates.item_count == 0 and conn.closure_links == 0 and conn.closure_compact.item_count == 0) return "";
+    if (conn.candidates.item_count == 0 and conn.closure_links == 0 and conn.closure_land.item_count == 0) return "";
     var shape_buffers: [6][32]u8 = undefined;
-    return std.fmt.bufPrint(buffer, " conn_candidates={s} closure_resolve={s} closure_mask={s} closure_plan={s} closure_rows={s} closure_compact={s} touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} live_words={} dead_words={} arena_capacity={} compactions={} tail_bound={} tail_used={} arena_limit={} cand_words={} live_prepared={} kb={}", .{
+    return std.fmt.bufPrint(buffer, " conn_candidates={s} closure_resolve={s} closure_mask={s} closure_plan={s} closure_rows={s} closure_land={s} touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} block_allocs={} block_frees={} landed_words={} land_deferrals={} live_words={} tail_capacity={} tail_bound={} tail_used={} cand_words={} kb={}", .{
         formatRunStageShapeInto(&shape_buffers[0], conn.candidates),
         formatRunStageShapeInto(&shape_buffers[1], conn.closure_resolve),
         formatRunStageShapeInto(&shape_buffers[2], conn.closure_mask),
         formatRunStageShapeInto(&shape_buffers[3], conn.closure_plan),
         formatRunStageShapeInto(&shape_buffers[4], conn.closure_rows),
-        formatRunStageShapeInto(&shape_buffers[5], conn.closure_compact),
+        formatRunStageShapeInto(&shape_buffers[5], conn.closure_land),
         conn.closure_touched,
         conn.closure_links,
         conn.closure_terms_new,
@@ -1645,15 +1645,15 @@ fn formatClosureInto(buffer: []u8, conn: NavConnSummary) []const u8 {
         conn.closure_rounds,
         conn.closure_words_written,
         conn.closure_shrinks,
+        conn.closure_block_allocs,
+        conn.closure_block_frees,
+        conn.closure_landed_words,
+        conn.closure_land_deferrals,
         conn.closure_live_words,
-        conn.closure_dead_words,
-        conn.closure_arena_capacity,
-        conn.closure_compactions,
+        conn.closure_tail_capacity,
         conn.closure_tail_bound,
         conn.closure_tail_used,
-        conn.closure_arena_limit,
         conn.closure_candidate_words,
-        conn.closure_live_prepared,
         conn.closure_kb,
     }) catch " closure";
 }
@@ -1665,7 +1665,7 @@ pub fn fillClosureSummary(summary: *NavConnSummary, stats: anytype) void {
     summary.closure_mask = batchSummaryFromBatch(stats.conn_closure_mask_batch);
     summary.closure_plan = batchSummaryFromBatch(stats.conn_closure_plan_batch);
     summary.closure_rows = batchSummaryFromBatch(stats.conn_closure_rows_batch);
-    summary.closure_compact = batchSummaryFromBatch(stats.conn_closure_compact_batch);
+    summary.closure_land = batchSummaryFromBatch(stats.conn_closure_land_batch);
     summary.closure_touched = stats.closure_touched;
     summary.closure_links = stats.closure_links;
     summary.closure_terms_new = stats.closure_terms_new;
@@ -1674,15 +1674,15 @@ pub fn fillClosureSummary(summary: *NavConnSummary, stats: anytype) void {
     summary.closure_rounds = stats.closure_rounds;
     summary.closure_words_written = stats.closure_words_written;
     summary.closure_shrinks = stats.closure_shrinks;
+    summary.closure_block_allocs = stats.closure_block_allocs;
+    summary.closure_block_frees = stats.closure_block_frees;
+    summary.closure_landed_words = stats.closure_landed_words;
+    summary.closure_land_deferrals = stats.closure_land_deferrals;
     summary.closure_live_words = stats.closure_live_words;
-    summary.closure_dead_words = stats.closure_dead_words;
-    summary.closure_arena_capacity = stats.closure_arena_capacity;
-    summary.closure_compactions = stats.closure_compactions;
+    summary.closure_tail_capacity = stats.closure_tail_capacity;
     summary.closure_tail_bound = stats.closure_tail_bound;
     summary.closure_tail_used = stats.closure_tail_used;
-    summary.closure_arena_limit = stats.closure_arena_limit;
     summary.closure_candidate_words = stats.closure_candidate_words;
-    summary.closure_live_prepared = stats.closure_live_prepared;
     summary.closure_kb = stats.closure_kb;
 }
 

@@ -473,17 +473,20 @@ pub const connectivity_split_group = suite.BenchmarkGroup{
 // cache line below 512 terminals). Variants 1 to 5 hold one chain or fan. Variant 7 adds to
 // variant 0's chains a ballast chain on level 1 whose block holds over twice the chains' live
 // words; before every sample, untimed and with the nav tuners restored after, the ballast
-// reopens and then every ballast room closes (its block retires), and the nav's bytes are
-// checked. Its timed block reaction must compact the closure arena once and its timed reopen
-// never. The toggled end's 8 rooms sit in one fixed chunk whose orthogonal neighbours hold no
+// reopens (its one block lands in that reaction) and then every ballast room closes (its
+// block is freed in that reaction), and the nav's bytes are checked. Its timed block and
+// reopen reactions must land, allocate, and free no block and leave the batch tail's capacity
+// as it was. The toggled end's 8 rooms sit in one fixed chunk whose orthogonal neighbours hold no
 // other chain room, so every config's toggle patches the same chunks. One timed sample blocks
 // the cell and runs the nav reaction, then reopens it and runs the reaction again; the tile
 // writes are untimed. `outputs` is the one-way links and `candidates` the rooms. Passes when
 // variants 0, 3, and 4 are flat (4 in its peak terminals), variant 2 grows at most linearly
-// in terminals, and variants 1 and 5 at most as terminals² / 32. Variant 7 measures the
-// compacting block reaction against systems; its target is flat in systems. `--details` as
-// for `pathfinding-connectivity-split`, plus variant 7's ballast retire and the split of its
-// timed block reaction.
+// in terminals, and variants 1 and 5 at most as terminals² / 32. Variant 7 passes when its
+// timed block reaction, that reaction's reserve section, and its closure stages are flat in
+// systems; the ballast's own landing and free follow its block alone. `--details` as for
+// `pathfinding-connectivity-split`, plus variant 7's ballast retire (the reopen's landing and
+// tail use, the close's free) and the split of its timed block reaction (reserve, closure
+// stages, landing, rest).
 pub const connectivity_oneway_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-oneway",
     .defaultItemCounts = connectivityOnewayItemCounts,
@@ -5235,7 +5238,7 @@ const toggle_agent_budget: usize = 8;
 const ToggleSample = struct {
     change: EvictReaction,
     // The change reaction's plan, remask, patch, connectivity seed, gather, and flood, and
-    // closure candidates, resolve, mask, plan, rows, and compaction.
+    // closure candidates, resolve, mask, plan, rows, and landing.
     change_stages: [toggle_stage_count]BatchStats,
     revert: EvictReaction,
 
@@ -5244,38 +5247,48 @@ const ToggleSample = struct {
     }
 };
 
-// What a toggle's reactions must keep: every one-way block at its size, and each closure
-// reserve within its fixed ratio of the words the reaction touches (`checkOnewayReserve`).
+// What a toggle's reactions must keep: every one-way block at its size, each closure reserve
+// within its fixed ratio of the words the reaction touches (`checkOnewayReserve`), and, when
+// `isolated`, no block of any other system (`checkOnewayIsolated`).
 const ToggleChecks = struct {
     fixed_blocks: bool = true,
     reserve_ratio: bool = true,
-    // The change reaction compacts the closure arena exactly once and the revert never.
-    compacts: bool = false,
+    isolated: bool = false,
 };
 
-// Fails when a reaction's closure reserved past its fixed ratio: an arena tail over twice its
-// candidates' block words, or an arena limit over three times the live words at its prepare,
-// each plus 32 words per terminal it could number (a small piece's 16-word block).
+// Fails when a reaction's closure reserved past its fixed ratio: a tail over twice its
+// candidates' block words plus 32 words per terminal it could number (a small piece's
+// 16-word block).
 fn checkOnewayReserve(stats: NavUpdateStats) !void {
     const slack = 32 * stats.closure_kb;
     if (stats.closure_tail_bound > 2 * stats.closure_candidate_words + slack) return error.ConnectivityOnewayReserveRatio;
-    if (stats.closure_arena_limit > 3 * stats.closure_live_prepared + slack) return error.ConnectivityOnewayReserveRatio;
+}
+
+// Fails when a toggle reaction relocated, landed, allocated, or freed a block, or grew or
+// released the batch tail (its capacity left `tail_capacity`): a toggle in place touches only
+// its own system's rows.
+fn checkOnewayIsolated(fixture: *const EvictFixture, stats: NavUpdateStats, tail_capacity: usize) !void {
+    if (stats.closure_landed_words != 0 or stats.closure_tail_used != 0) return error.ConnectivityOnewayBallastLanded;
+    if (stats.closure_block_allocs != 0 or stats.closure_block_frees != 0) return error.ConnectivityOnewayBallastBlocks;
+    if (fixture.system.graph.connectivity.closure.tail.capacity != tail_capacity) return error.ConnectivityOnewayBallastTail;
 }
 
 // Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again.
 fn runToggle(io: std.Io, fixture: *EvictFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !ToggleSample {
+    const tail_capacity = fixture.system.graph.connectivity.closure.tail.capacity;
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
+    if (checks.isolated) try checkOnewayIsolated(fixture, change.stats, tail_capacity);
     const stats = change.stats;
     const change_stages = [toggle_stage_count]BatchStats{
         stats.plan_batch,                    stats.remask_batch,               stats.patch_batch,
         stats.conn_seed_batch,               stats.conn_gather_batch,          stats.conn_flood_batch,
         stats.conn_closure_candidates_batch, stats.conn_closure_resolve_batch, stats.conn_closure_mask_batch,
-        stats.conn_closure_plan_batch,       stats.conn_closure_rows_batch,    stats.conn_closure_compact_batch,
+        stats.conn_closure_plan_batch,       stats.conn_closure_rows_batch,    stats.conn_closure_land_batch,
     };
     const revert = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+    if (checks.isolated) try checkOnewayIsolated(fixture, revert.stats, tail_capacity);
     // A toggle and its revert never resize a one-way block.
     if (checks.fixed_blocks and (change.stats.closure_shrinks != 0 or revert.stats.closure_shrinks != 0)) return error.ConnectivityOnewayShrinkFlip;
-    if (checks.compacts and (change.stats.closure_compactions != 1 or revert.stats.closure_compactions != 0)) return error.ConnectivityOnewayBallastCompactions;
     if (checks.reserve_ratio) {
         try checkOnewayReserve(change.stats);
         try checkOnewayReserve(revert.stats);
@@ -5287,7 +5300,7 @@ const toggle_stage_count = 12;
 
 // The timed toggles' change and revert reactions, the change reaction's plan, remask, patch,
 // connectivity seed, gather, and flood, and closure candidates, resolve, mask, plan, rows,
-// and compaction shapes (each stage's busiest batch), its closure counters and closure rows'
+// and landing shapes (each stage's busiest batch), its closure counters and closure rows'
 // dispatch time on workers, its connectivity flood (nodes expanded, root-groups, families,
 // rounds, the fewest and most searches a round dispatched, components split off, dispatch
 // time on workers) beside the revert's flood nodes, the flood tuner's policy after the
@@ -5309,17 +5322,17 @@ const ToggleReport = struct {
     closure_rounds: usize = 0,
     closure_words_written: usize = 0,
     closure_shrinks: usize = 0,
+    // Summed over both reactions of every sample.
+    closure_block_allocs: usize = 0,
+    closure_block_frees: usize = 0,
+    closure_landed_words: usize = 0,
     closure_live_words: usize = 0,
-    closure_dead_words: usize = 0,
-    closure_arena_capacity: usize = 0,
-    closure_compactions: usize = 0,
+    closure_tail_capacity: usize = 0,
     closure_rows_off_main_ns: u128 = 0,
-    // The closure reserve of the sample's reaction with the larger arena tail bound.
+    // The closure reserve of the sample's reaction with the larger tail bound.
     closure_tail_bound: usize = 0,
     closure_tail_used: usize = 0,
-    closure_arena_limit: usize = 0,
     closure_candidate_words: usize = 0,
-    closure_live_prepared: usize = 0,
     closure_kb: usize = 0,
     chunks_patched: usize = 0,
     records_patched: usize = 0,
@@ -5365,17 +5378,17 @@ const ToggleReport = struct {
         self.closure_rounds = closure.closure_rounds;
         self.closure_words_written = closure.closure_words_written;
         self.closure_shrinks += closure.closure_shrinks + sample.revert.stats.closure_shrinks;
+        const revert = sample.revert.stats;
+        self.closure_block_allocs += closure.closure_block_allocs + revert.closure_block_allocs;
+        self.closure_block_frees += closure.closure_block_frees + revert.closure_block_frees;
+        self.closure_landed_words += closure.closure_landed_words + revert.closure_landed_words;
         self.closure_live_words = closure.closure_live_words;
-        self.closure_dead_words = closure.closure_dead_words;
-        self.closure_arena_capacity = closure.closure_arena_capacity;
-        self.closure_compactions += closure.closure_compactions + sample.revert.stats.closure_compactions;
+        self.closure_tail_capacity = closure.closure_tail_capacity;
         self.closure_rows_off_main_ns += offMainNs(closure.conn_closure_rows_batch);
-        const reserve = if (sample.revert.stats.closure_tail_bound > closure.closure_tail_bound) sample.revert.stats else closure;
+        const reserve = if (revert.closure_tail_bound > closure.closure_tail_bound) revert else closure;
         self.closure_tail_bound = reserve.closure_tail_bound;
         self.closure_tail_used = reserve.closure_tail_used;
-        self.closure_arena_limit = reserve.closure_arena_limit;
         self.closure_candidate_words = reserve.closure_candidate_words;
-        self.closure_live_prepared = reserve.closure_live_prepared;
         self.closure_kb = reserve.closure_kb;
         for (sample.change_stages, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
             if (batch.item_count == 0) continue;
@@ -5435,7 +5448,7 @@ const ToggleReport = struct {
             self.chunks_patched,
             self.records_patched,
         });
-        std.debug.print(" conn_candidates={s} closure_resolve={s} closure_mask={s} closure_plan={s} closure_rows={s} closure_compact={s} touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} live_words={} dead_words={} arena_capacity={} compactions={} closure_rows_off_main={}us tail_bound={} tail_used={} arena_limit={} cand_words={} live_prepared={} kb={} reserve_ratio={d:.2}\n", .{
+        std.debug.print(" conn_candidates={s} closure_resolve={s} closure_mask={s} closure_plan={s} closure_rows={s} closure_land={s} touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} block_allocs={} block_frees={} landed_words={} live_words={} tail_capacity={} closure_rows_off_main={}us tail_bound={} tail_used={} cand_words={} kb={} reserve_ratio={d:.2}\n", .{
             labels[6],
             labels[7],
             labels[8],
@@ -5450,19 +5463,18 @@ const ToggleReport = struct {
             self.closure_rounds,
             self.closure_words_written,
             self.closure_shrinks,
+            self.closure_block_allocs,
+            self.closure_block_frees,
+            self.closure_landed_words,
             self.closure_live_words,
-            self.closure_dead_words,
-            self.closure_arena_capacity,
-            self.closure_compactions,
+            self.closure_tail_capacity,
             @as(u64, @intCast(self.closure_rows_off_main_ns / samples)),
             self.closure_tail_bound,
             self.closure_tail_used,
-            self.closure_arena_limit,
             self.closure_candidate_words,
-            self.closure_live_prepared,
             self.closure_kb,
-            // The arena limit over the live words at prepare.
-            if (self.closure_live_prepared == 0) 0.0 else @as(f64, @floatFromInt(self.closure_arena_limit)) / @as(f64, @floatFromInt(self.closure_live_prepared)),
+            // The tail bound over the candidates' block words (`checkOnewayReserve`).
+            if (self.closure_candidate_words == 0) 0.0 else @as(f64, @floatFromInt(self.closure_tail_bound)) / @as(f64, @floatFromInt(self.closure_candidate_words)),
         });
     }
 };
@@ -5909,8 +5921,8 @@ const OnewayConfig = struct {
     }
 
     // The ballast chain's rooms (none outside the ballast variant): the smallest power of two
-    // whose block holds over twice the chains' words, so its retired block alone outweighs
-    // every live one.
+    // whose block holds over twice the chains' words, so its block alone outweighs every live
+    // one and any cost it moved into the timed toggle would show.
     fn ballastRooms(self: OnewayConfig) usize {
         if (self.variant != .ballast) return 0;
         const chain_words = self.systems * onewayBlockWords(self.terminals);
@@ -5967,8 +5979,9 @@ fn onewayBallastRooms(allocator: std.mem.Allocator, config: OnewayConfig) ![]One
     return allocator.dupe(OnewayRoom, free_rooms[start..][0..count]);
 }
 
-// The ballast chain on `ballast_level`, retired (every room closed) before each timed toggle
-// so its dead block outweighs the live blocks the toggle's close prepares against.
+// The ballast chain on `ballast_level`, retired (every room closed) before each timed toggle:
+// its reopen builds and lands its block, its close frees it, so the timed toggle runs right
+// after a block that outweighs every live one came and went.
 const OnewayBallast = struct {
     const ballast_level: u16 = 1;
 
@@ -5976,34 +5989,38 @@ const OnewayBallast = struct {
     // What `checkNavBytes` charges the nav, checked after every retire.
     size_config: suite.NavSizeConfig,
     item_count: usize,
+    // The ballast's block words, which its reopen lands and its close frees.
+    block_words: usize,
     // The last retire's reopen and close reactions.
     reopen: EvictReaction = .{ .elapsed_ns = 0, .stats = .{} },
     close: EvictReaction = .{ .elapsed_ns = 0, .stats = .{} },
     retires: usize = 0,
-    // The timed block reactions' split, summed over `samples`: the main-thread reserve
-    // section (it frees the old arena and allocates the new one) and the compaction stage,
-    // with the last sample's live words copied and arena words freed and allocated.
+    // The timed block reactions' split, summed over `samples`: the reaction, its main-thread
+    // reserve section, its closure stages (candidates, resolve, mask, plan, rows), and its
+    // landing stage.
     samples: usize = 0,
+    close_ns: u128 = 0,
     reserve_ns: u128 = 0,
-    compact_ns: u128 = 0,
-    copied_words: usize = 0,
-    freed_words: usize = 0,
-    allocated_words: usize = 0,
-    // Untimed probes, outside every reaction, at the last sample's sizes: one allocation of
-    // the words the timed close allocated and one free of the words it freed, each timed
-    // alone and summed over `probes`.
+    closure_stages_ns: u128 = 0,
+    land_ns: u128 = 0,
+    // Untimed probes, outside every reaction: one allocation and one free of the ballast's
+    // block, each timed alone and summed over `probes`.
     probes: usize = 0,
     alloc_probe_ns: u128 = 0,
     free_probe_ns: u128 = 0,
 
-    // Reopens the ballast's rooms and closes them, one untimed reaction each; fails when the
-    // block the close retired holds no more than twice the live words it left, or when the
-    // nav holds more bytes than charged.
+    // Reopens the ballast's rooms and closes them, one untimed reaction each. Fails when the
+    // reopen does not land exactly the ballast's one block or the close does not free exactly
+    // it, when the block holds no more than twice the live words it left, or when the nav
+    // holds more bytes than charged.
     fn retire(self: *OnewayBallast, io: std.Io, fixture: *EvictFixture, thread_system: ?*ThreadSystem) !void {
         self.reopen = try untimedReaction(io, fixture, self.cells, fixture.open.walkable, thread_system);
+        const reopen = self.reopen.stats;
+        if (reopen.closure_tail_used != self.block_words or reopen.closure_landed_words != self.block_words or reopen.closure_block_allocs != 1) return error.ConnectivityOnewayBallastLanding;
         try self.closeAll(io, fixture, thread_system);
         self.retires += 1;
-        const retired_words = self.reopen.stats.closure_live_words -| self.close.stats.closure_live_words;
+        const retired_words = reopen.closure_live_words -| self.close.stats.closure_live_words;
+        if (self.close.stats.closure_block_frees != 1 or retired_words != self.block_words) return error.ConnectivityOnewayBallastFree;
         if (retired_words <= 2 * self.close.stats.closure_live_words) return error.ConnectivityOnewayBallastTooSmall;
         try suite.checkNavBytes(connectivity_oneway_group.name, self.item_count, self.size_config, &fixture.system);
     }
@@ -6025,21 +6042,22 @@ const OnewayBallast = struct {
     fn addSample(self: *OnewayBallast, sample: ToggleSample) void {
         const change = sample.change.stats;
         self.samples += 1;
+        self.close_ns += sample.change.elapsed_ns;
         self.reserve_ns += change.main.reserve_ns;
-        self.compact_ns += change.conn_closure_compact_batch.batch_duration_ns;
-        self.copied_words = change.closure_live_prepared;
-        self.freed_words = self.close.stats.closure_arena_capacity;
-        self.allocated_words = change.closure_arena_limit;
+        inline for (.{ change.conn_closure_candidates_batch, change.conn_closure_resolve_batch, change.conn_closure_mask_batch, change.conn_closure_plan_batch, change.conn_closure_rows_batch }) |batch| {
+            self.closure_stages_ns += batch.batch_duration_ns;
+        }
+        self.land_ns += change.conn_closure_land_batch.batch_duration_ns;
     }
 
-    // Runs `probes` allocation and free probes at the last sample's sizes.
+    // Runs `probes` allocation and free probes of the ballast's block.
     fn probe(self: *OnewayBallast, allocator: std.mem.Allocator, io: std.Io, probes: usize) !void {
         for (0..probes) |_| {
             const alloc_start = suite.nowNs(io);
-            const allocated = try allocator.alloc(u32, self.allocated_words);
+            const allocated = try allocator.alignedAlloc(u32, .@"64", self.block_words);
             self.alloc_probe_ns += suite.elapsedNs(alloc_start, suite.nowNs(io));
             allocator.free(allocated);
-            const freed = try allocator.alloc(u32, self.freed_words);
+            const freed = try allocator.alignedAlloc(u32, .@"64", self.block_words);
             const free_start = suite.nowNs(io);
             allocator.free(freed);
             self.free_probe_ns += suite.elapsedNs(free_start, suite.nowNs(io));
@@ -6047,41 +6065,48 @@ const OnewayBallast = struct {
         }
     }
 
-    // The last retire: the ballast's block words, the reopen's arena tail bound and candidate
-    // words, the live and dead words and arena the timed close prepares against, and the
-    // compactions the retire ran; then the timed block reactions' split and the probes.
-    // Printed under --details.
+    // The last retire: the reopen's landing (its shape, time, and words) and its tail bound
+    // and use, and the close's main-thread closure time (it holds the free) and the words it
+    // freed; then the timed block reactions' split (the rest is everything outside the
+    // reserve, closure, and landing) and the probes. Printed under --details.
     fn print(self: OnewayBallast, options: suite.Options, case: suite.BenchmarkCase) void {
         if (!options.details or self.retires == 0) return;
         const reopen = self.reopen.stats;
         const close = self.close.stats;
-        std.debug.print("  {s} {} {s}: ballast rooms={} block_words={} retires={} reopen_tail_bound={} reopen_cand_words={} left_live_words={} left_dead_words={} left_arena_capacity={} left_arena_bytes={} retire_compactions={}\n", .{
+        var land_buffer: [48]u8 = undefined;
+        const land = reopen.conn_closure_land_batch;
+        std.debug.print("  {s} {} {s}: ballast rooms={} block_words={} retires={} reopen={}us reopen_land={s} reopen_land_ns={} landed_words={} tail_bound={} tail_used={} tail_ratio={d:.2} close={}us close_closure_main={}ns freed_words={} left_live_words={}\n", .{
             connectivity_oneway_group.name,
             self.item_count,
             case.name,
             self.cells.len,
-            reopen.closure_live_words -| close.closure_live_words,
+            self.block_words,
             self.retires,
+            self.reopen.elapsed_ns / std.time.ns_per_us,
+            stageShape(&land_buffer, land, @intFromBool(!land.ran_inline and land.active_worker_threads != 0), @intFromBool(land.item_count != 0)),
+            land.batch_duration_ns,
+            reopen.closure_landed_words,
             reopen.closure_tail_bound,
-            reopen.closure_candidate_words,
+            reopen.closure_tail_used,
+            if (reopen.closure_tail_used == 0) 0.0 else @as(f64, @floatFromInt(reopen.closure_tail_bound)) / @as(f64, @floatFromInt(reopen.closure_tail_used)),
+            self.close.elapsed_ns / std.time.ns_per_us,
+            close.main.closure_ns,
+            reopen.closure_live_words -| close.closure_live_words,
             close.closure_live_words,
-            close.closure_dead_words,
-            close.closure_arena_capacity,
-            close.closure_arena_capacity * @sizeOf(u32),
-            reopen.closure_compactions + close.closure_compactions,
         });
         if (self.samples == 0) return;
         const samples: u128 = self.samples;
         const probes: u128 = @max(1, self.probes);
-        std.debug.print("  {s} {} {s}: timed block split reserve={}ns compact={}ns copied_words={} freed_bytes={} allocated_bytes={} alloc_probe={}ns free_probe={}ns probes={}\n", .{
+        const parts = self.reserve_ns + self.closure_stages_ns + self.land_ns;
+        std.debug.print("  {s} {} {s}: timed block split total={}ns reserve={}ns closure_stages={}ns land={}ns rest={}ns alloc_probe={}ns free_probe={}ns probes={}\n", .{
             connectivity_oneway_group.name,
             self.item_count,
             case.name,
+            @as(u64, @intCast(self.close_ns / samples)),
             @as(u64, @intCast(self.reserve_ns / samples)),
-            @as(u64, @intCast(self.compact_ns / samples)),
-            self.copied_words,
-            self.freed_words * @sizeOf(u32),
-            self.allocated_words * @sizeOf(u32),
+            @as(u64, @intCast(self.closure_stages_ns / samples)),
+            @as(u64, @intCast(self.land_ns / samples)),
+            @as(u64, @intCast((self.close_ns -| parts) / samples)),
             @as(u64, @intCast(self.alloc_probe_ns / probes)),
             @as(u64, @intCast(self.free_probe_ns / probes)),
             self.probes,
@@ -6258,14 +6283,14 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     configureNavUpdateThreads(&fixture.system, case);
     if (config.variant == .shrunk) try cutOnewayChain(allocator, io, &fixture, rooms[0 .. config.terminals - oneway_shrunk_live], thread_ptr);
     // The ballast starts retired: every sample reopens it first.
-    var ballast = OnewayBallast{ .cells = ballast_cells, .size_config = size_config, .item_count = item_count };
+    var ballast = OnewayBallast{ .cells = ballast_cells, .size_config = size_config, .item_count = item_count, .block_words = if (ballast_cells.len == 0) 0 else onewayBlockWords(ballast_cells.len) };
     if (config.variant == .ballast) try ballast.closeAll(io, &fixture, thread_ptr);
 
     // The dense variant's fill and reopen resize blocks and reserve the merged block the
     // opening can create: its ratio is what the variant measures.
     const checks: ToggleChecks = switch (config.variant) {
         .dense => .{ .fixed_blocks = false, .reserve_ratio = false },
-        .ballast => .{ .compacts = true },
+        .ballast => .{ .isolated = true },
         else => .{},
     };
     var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null);

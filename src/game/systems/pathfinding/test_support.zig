@@ -37,6 +37,7 @@ const no_comp = @import("connectivity.zig").no_comp;
 const no_term = @import("connectivity.zig").no_term;
 const no_hcomp = @import("connectivity.zig").no_hcomp;
 const no_oneway = @import("connectivity.zig").no_oneway;
+const no_index = @import("connectivity.zig").no_index;
 const CellCoord = @import("../../world_system.zig").CellCoord;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 
@@ -499,8 +500,10 @@ fn closureRootAt(graph: *const NavGraph, level: u16, cell: CellCoord) ?u32 {
 /// Asserts `graph`'s one-way closure against `world`: every world link registered (one-way
 /// ones with a row), live one-way links on their component's list with their roots'
 /// terminals and dead ones on none; exactly the roots holding a live endpoint have
-/// terminals; every terminal at its index in its component's map; free indices with zero
-/// rows and columns and rows past the handed-out indices zero; every block at least a quarter
+/// terminals; every terminal at its index in its component's map; free indices (the free
+/// list from `index_free` to `no_index`) with zero rows and columns, every other handed-out
+/// entry a terminal pointing back to it, and rows past the handed-out indices zero; every
+/// live block exactly its words and every free id blockless; every block at least a quarter
 /// full from 64 indices up; live words summing the live blocks; and each terminal's row equal
 /// to a search over live links between roots.
 pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem) !void {
@@ -563,42 +566,53 @@ pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem
     var live_words: usize = 0;
     var listed_links: usize = 0;
     var live_terms: usize = 0;
-    const words = closure.words.items;
+    var free_index: std.DynamicBitSetUnmanaged = .{};
+    defer free_index.deinit(allocator);
     for (0..closure.hcomps.len) |id| {
         const k_cap = closure.hcomp.k_cap[id];
-        if (k_cap == 0) continue;
-        const row_words: usize = @max(1, k_cap / 32);
         const block = closure.hcomp.block[id];
-        const map = words[block + @as(usize, k_cap) * row_words ..][0..k_cap];
+        if (k_cap == 0) {
+            try t.expectEqual(@as(usize, 0), block.len);
+            continue;
+        }
+        const row_words: usize = @max(1, k_cap / 32);
+        const block_words = std.mem.alignForward(usize, @as(usize, k_cap) * (row_words + 1), 16);
+        try t.expectEqual(block_words, block.len);
+        const map = block[@as(usize, k_cap) * row_words ..][0..k_cap];
         const k_high = closure.hcomp.k_high[id];
-        live_words += std.mem.alignForward(usize, @as(usize, k_cap) * (row_words + 1), 16);
-        var live: u32 = 0;
+        live_words += block_words;
+        // The free list, from its head to `no_index`, each index once.
+        try free_index.resize(allocator, k_high, false);
+        free_index.unsetAll();
         var free: u32 = 0;
+        var cursor = closure.hcomp.index_free[id];
+        while (cursor != no_index) : (cursor = map[cursor]) {
+            try t.expect(cursor < k_high and !free_index.isSet(cursor));
+            free_index.set(cursor);
+            free += 1;
+        }
+        var live: u32 = 0;
         for (map[0..k_high], 0..) |entry, index| {
-            if (entry & (1 << 31) != 0) {
-                free += 1;
-                for (words[block + index * row_words ..][0..row_words]) |word| try t.expectEqual(@as(u32, 0), word);
+            if (free_index.isSet(index)) {
+                for (block[index * row_words ..][0..row_words]) |word| try t.expectEqual(@as(u32, 0), word);
                 for (0..k_high) |other| {
-                    const word = words[block + other * row_words + index / 32];
+                    const word = block[other * row_words + index / 32];
                     try t.expectEqual(@as(u32, 0), (word >> @intCast(index % 32)) & 1);
                 }
                 continue;
             }
             live += 1;
+            try t.expect(entry < closure.terms.len);
             try t.expectEqual(@as(u32, @intCast(id)), closure.term.hcomp[entry]);
             try t.expectEqual(@as(u32, @intCast(index)), closure.term.index[entry]);
         }
         for (k_high..k_cap) |index| {
-            for (words[block + index * row_words ..][0..row_words]) |word| try t.expectEqual(@as(u32, 0), word);
+            for (block[index * row_words ..][0..row_words]) |word| try t.expectEqual(@as(u32, 0), word);
         }
         try t.expectEqual(live, closure.hcomp.k_live[id]);
         // Blocks follow their live terminals: under a quarter full only below 64 indices.
         try t.expect(k_high <= k_cap);
         try t.expect(k_cap < 64 or 4 * live >= k_cap);
-        var walked: u32 = 0;
-        var cursor = closure.hcomp.index_free[id];
-        while (cursor != (1 << 31) - 1) : (cursor = map[cursor] & ~@as(u32, 1 << 31)) walked += 1;
-        try t.expectEqual(free, walked);
         live_terms += live;
         var link_count: u32 = 0;
         var link = closure.hcomp.link_head[id];
@@ -635,6 +649,21 @@ pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem
             try t.expectEqual(seen[to], closure.termReaches(conn.root_term[from], conn.root_term[to]));
         }
     }
+}
+
+/// Every live one-way closure block's rows and handed-out map entries, in H-component order,
+/// for a before-and-after compare. The caller frees the slice.
+pub fn dupeClosureBlocks(allocator: std.mem.Allocator, graph: *const NavGraph) ![]u32 {
+    const closure = &graph.connectivity.closure;
+    var words: std.ArrayList(u32) = .empty;
+    errdefer words.deinit(allocator);
+    for (closure.hcomp.k_cap, closure.hcomp.k_high, closure.hcomp.block) |k_cap, k_high, block| {
+        if (k_cap == 0) continue;
+        const rows = @as(usize, k_cap) * @max(1, k_cap / 32);
+        try words.appendSlice(allocator, block[0..rows]);
+        try words.appendSlice(allocator, block[rows..][0..k_high]);
+    }
+    return words.toOwnedSlice(allocator);
 }
 
 /// Asserts `a` and `b` hold the same terminals, keyed by a node of their root, with the same

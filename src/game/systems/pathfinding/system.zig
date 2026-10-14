@@ -905,6 +905,9 @@ pub const PathfindingSystem = struct {
         self.graph.tickStagingStep(self.capacity.capacity_shrink_window);
         defer self.graph.finishStagingStep();
         const threads = self.navUpdateThreads(thread_system);
+        // A level build's relocated closure blocks land even when a later build or the marks
+        // batch fails, before the step's staging release.
+        errdefer self.graph.landClosure(threads, &stats);
         const view = colliders.view();
         if (self.graph.world_backed) {
             // Every level build of the step shares one level-sized staging, freed once at the
@@ -951,6 +954,8 @@ pub const PathfindingSystem = struct {
                 self.evictScoped(batch, thread_system, &stats);
             }
         }
+        // The step's relocated closure blocks leave the batch tail, whatever built them.
+        self.graph.landClosure(threads, &stats);
         self.nav_marks.clearRetainingCapacity();
         return stats;
     }

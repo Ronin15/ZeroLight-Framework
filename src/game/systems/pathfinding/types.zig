@@ -361,19 +361,18 @@ pub const NavUpdateStats = struct {
     conn_splits: usize = 0,
     conn_merges: usize = 0,
     // The one-way closure's stages across level builds and the marks batch: the candidate
-    // scan and compaction (prepare), and link resolve, row mask, SCC plan, and rows (rounds
-    // folded into one).
+    // scan (prepare), link resolve, row mask, SCC plan, and rows (rounds folded into one),
+    // and the landing of relocated blocks (the reaction's end, or a retry at a prepare).
     conn_closure_candidates_batch: BatchStats = .{},
-    conn_closure_compact_batch: BatchStats = .{},
+    conn_closure_land_batch: BatchStats = .{},
     conn_closure_resolve_batch: BatchStats = .{},
     conn_closure_mask_batch: BatchStats = .{},
     conn_closure_plan_batch: BatchStats = .{},
     conn_closure_rows_batch: BatchStats = .{},
     // The closure's components touched, links resolved, terminals new and left, rows
-    // recomputed (|A|), row rounds (round 0 included), arena words written, and blocks
-    // narrowed, summed;
-    // compactions; and the arena's live and dead words and its allocated words after the
-    // last batch.
+    // recomputed (|A|), row rounds (round 0 included), block words written, blocks narrowed,
+    // blocks allocated and freed, words landed, and landings deferred by `OutOfMemory`,
+    // summed; and the live block words and the batch tail's capacity after the last batch.
     closure_touched: usize = 0,
     closure_links: usize = 0,
     closure_terms_new: usize = 0,
@@ -382,19 +381,18 @@ pub const NavUpdateStats = struct {
     closure_rounds: usize = 0,
     closure_words_written: usize = 0,
     closure_shrinks: usize = 0,
-    closure_compactions: usize = 0,
+    closure_block_allocs: usize = 0,
+    closure_block_frees: usize = 0,
+    closure_landed_words: usize = 0,
+    closure_land_deferrals: usize = 0,
     closure_live_words: usize = 0,
-    closure_dead_words: usize = 0,
-    closure_arena_capacity: usize = 0,
-    // Each the most over the update's closure batches: the arena tail words a batch's bound
-    // reserved and its relocated blocks took, the arena's word limit after its prepare, its
-    // candidate components' block words, the live words at its prepare, and the terminals it
-    // could number.
+    closure_tail_capacity: usize = 0,
+    // Each the most over the update's closure batches: the tail words a batch's bound
+    // reserved and its relocated blocks took, its candidate components' block words, and the
+    // terminals it could number.
     closure_tail_bound: usize = 0,
     closure_tail_used: usize = 0,
-    closure_arena_limit: usize = 0,
     closure_candidate_words: usize = 0,
-    closure_live_prepared: usize = 0,
     closure_kb: usize = 0,
     // The reaction's main-thread sections, the terrain records' `nav_mark` folded in.
     main: NavMainPhases = .{},
