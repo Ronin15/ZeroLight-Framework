@@ -6,7 +6,10 @@ Range: `main..module_layout`
 
 Base: `93b5276` (`Merge pull request #11 from Ronin15/engine_scale`)
 
-Tip: Slices 82 and 81 complete; the branch seal follows.
+Tip: sealed 2026-10-15. Slices 82 and 81 complete and archived. `zig build verify`
+(fresh cache) 27/27 steps, 1741/1741 tests; `zig build test -Doptimize=ReleaseFast`
+1731 passed, 10 skipped (the perf-log and diagnostics tests compiled out of
+ReleaseFast).
 
 ## Summary
 

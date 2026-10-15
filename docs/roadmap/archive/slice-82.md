@@ -1,6 +1,6 @@
 ## Slice 82: Split The World Module
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md) · Track: standalone (engine core)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](../slices/slice-64g.md) · Track: standalone (engine core)
 
 **Status: complete (2026-10-15, branch `module_layout`).** Code in `1caabf4`,
 `e6c314b`, `92df3dc`, `7f2cfa9`, `b45dd15`; docs in the slice's docs commit.

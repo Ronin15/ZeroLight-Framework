@@ -1,6 +1,6 @@
 ## Slice 81: Split The Pathfinding Module
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 82](slice-82.md) · Track: standalone (engine core)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](../slices/slice-64g.md), [Slice 82](slice-82.md) · Track: standalone (engine core)
 
 **Status: complete (2026-10-15, branch `module_layout`).** Code in `e37c648`,
 `e232337`, `6778fff`, `377db2d`, `b529767`, `932b4c8`, `1997a7e`, `cbc3e66`,

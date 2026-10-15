@@ -206,10 +206,8 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**81**](roadmap/slices/slice-81.md) | Complete | Split The Pathfinding Module — after 64G, 82 |
-| [**82**](roadmap/slices/slice-82.md) | Complete | Split The World Module — after 64G |
 
-**Recently settled (archive only):** 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
 **Benches:** `.claude/rules/tests-benchmarks.md`. `frame-battle` (Slice 52C:
 full fixed step plus CPU render-prep) tracks scaling shape across commits; 66E
@@ -259,9 +257,9 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    the cross-level heuristic at scale with partial hops for far goals, and the
    combined review since the 2026-10-07 branch review; every acceptance check
    passes, with three follow-ups open in the slice. Then one short branch of
-   file moves, merged before the core branch opens: [82](roadmap/slices/slice-82.md)
-   moves and splits the world module (owner 2026-10-09: first item after the
-   seal), then [81](roadmap/slices/slice-81.md) splits the pathfinding module, so
+   file moves, merged before the core branch opens (`module_layout`, sealed
+   2026-10-15): [82](roadmap/archive/slice-82.md) moved and split the world
+   module, then [81](roadmap/archive/slice-81.md) split the pathfinding module, so
    the core and AI branches plan against the final file layout.
 2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
    2026-10-12), so the branch's threaded rework runs under the race
@@ -429,8 +427,8 @@ order.
   75 and 74 bind the observer; 60's rig drives it once landed.
 
 1. **64G** Chunk-Owned Terrain And Nav.
-2. **82** Split The World Module — after 64G.
-3. **81** Split The Pathfinding Module — after 64G, 82.
+2. **82** Split The World Module — landed (archived).
+3. **81** Split The Pathfinding Module — landed (archived).
 4. **50** Thread System Hardening (opens the core-systems branch).
 5. **76** Cave-Ins — after 64G.
 6. **77** Explosions — after 64G, 76.
