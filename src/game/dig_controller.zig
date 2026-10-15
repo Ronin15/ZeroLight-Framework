@@ -25,11 +25,11 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const Player = @import("player.zig").Player;
-const WorldSystem = @import("world_system.zig").WorldSystem;
-const TileId = @import("world_system.zig").TileId;
-const invalid_tile_id = @import("world_system.zig").invalid_tile_id;
-const CellCoord = @import("world_system.zig").CellCoord;
-const LevelLink = @import("world_system.zig").LevelLink;
+const WorldSystem = @import("world/system.zig").WorldSystem;
+const TileId = @import("world/system.zig").TileId;
+const invalid_tile_id = @import("world/system.zig").invalid_tile_id;
+const CellCoord = @import("world/system.zig").CellCoord;
+const LevelLink = @import("world/system.zig").LevelLink;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
@@ -46,10 +46,10 @@ const PlaneEntry = @import("systems/plane_entry.zig").PlaneEntry;
 const PlaneTarget = @import("systems/plane_entry.zig").PlaneTarget;
 const planeTarget = @import("systems/plane_entry.zig").planeTarget;
 const no_landing_layer = @import("systems/plane_entry.zig").no_landing_layer;
-const WorldEditError = @import("world_system.zig").WorldEditError;
-const DenseCellWrite = @import("world_system.zig").DenseCellWrite;
-const DenseChunkWrites = @import("world_system.zig").DenseChunkWrites;
-const TerrainEditThreads = @import("world_system.zig").TerrainEditThreads;
+const WorldEditError = @import("world/system.zig").WorldEditError;
+const DenseCellWrite = @import("world/system.zig").DenseCellWrite;
+const DenseChunkWrites = @import("world/system.zig").DenseChunkWrites;
+const TerrainEditThreads = @import("world/system.zig").TerrainEditThreads;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const StageControls = @import("../app/thread_system.zig").StageControls;
 const StampedTable = @import("stamped_table.zig").StampedTable;
@@ -724,8 +724,8 @@ fn facingOffset(direction: Facing) math.Vec2 {
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
-const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
-const denseTileBlocksMovement = @import("world_test_support.zig").denseTileBlocksMovement;
+const warmLandingTerrain = @import("world/test_support.zig").warmLandingTerrain;
+const denseTileBlocksMovement = @import("world/test_support.zig").denseTileBlocksMovement;
 const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 
 // One dig in stage order: reserve, then commit the reserved edit.
@@ -1137,7 +1137,7 @@ const ParityWorld = struct {
         errdefer world.deinit();
         const dirt = try world.requireTileByName(meta, "dirt");
         const tunnel = (try DigConfig.fromMeta(meta)).tunnel_tile;
-        const deepest = try world.addLevel(-3 * @import("world_system.zig").level_z_step);
+        const deepest = try world.addLevel(-3 * @import("world/system.zig").level_z_step);
         _ = try world.addDenseLayer(deepest, 0, .floor, dirt);
         for (0..world.levelCount()) |level_index| {
             const level: u16 = @intCast(level_index);
@@ -1490,7 +1490,7 @@ test "dig controller carves a ramp tile and one bidirectional link below the sur
 
     const links = tw.world.levelLinks();
     try std.testing.expectEqual(@as(usize, 1), links.len);
-    try std.testing.expectEqual(@import("world_system.zig").LevelLinkKind.ramp, links[0].kind);
+    try std.testing.expectEqual(@import("world/system.zig").LevelLinkKind.ramp, links[0].kind);
     try std.testing.expect(links[0].bidirectional);
     try std.testing.expectEqual(@as(u16, 1), links[0].level_a);
     try std.testing.expectEqual(@as(u16, 0), links[0].level_b);

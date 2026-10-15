@@ -68,8 +68,8 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const render_prep = @import("render_prep.zig");
 const render_depth = @import("render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
-const world_system = @import("world_system.zig");
-const WorldSystem = world_system.WorldSystem;
+const world_system = @import("world/system.zig");
+const WorldSystem = @import("world/system.zig").WorldSystem;
 const c = @import("../platform/sdl.zig").c;
 
 /// Smallest demo patch that still covers dig/nav tests (cells through 7x7).
@@ -1252,7 +1252,7 @@ fn colliderRowLevelForTest(colliders: *const StaticColliderSystem, index: u32) ?
     return colliders.row_level[row];
 }
 
-const denseTileBlocksMovement = @import("world_test_support.zig").denseTileBlocksMovement;
+const denseTileBlocksMovement = @import("world/test_support.zig").denseTileBlocksMovement;
 
 // The player's cell-entry plane traversal through the plane stage with no NPC entries;
 // its landing carve publishes into the demo's frame.

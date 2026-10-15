@@ -14,7 +14,7 @@ const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alig
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
-const InterestMarkerStore = @import("../game/world_interest.zig").InterestMarkerStore;
+const InterestMarkerStore = @import("../game/world/interest.zig").InterestMarkerStore;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 

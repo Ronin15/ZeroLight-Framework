@@ -10,11 +10,11 @@
 
 const std = @import("std");
 const math = @import("../../../core/math.zig");
-const WorldSystem = @import("../../world_system.zig").WorldSystem;
-const world_terrain = @import("../../world_terrain.zig");
+const WorldSystem = @import("../../world/system.zig").WorldSystem;
+const world_terrain = @import("../../world/terrain.zig");
 const ChunkBits = world_terrain.ChunkBits;
-const bitIsSet = @import("../../world_terrain.zig").bitIsSet;
-const clearBit = @import("../../world_terrain.zig").clearBit;
+const bitIsSet = @import("../../world/terrain.zig").bitIsSet;
+const clearBit = @import("../../world/terrain.zig").clearBit;
 const ChunkForm = world_terrain.ChunkForm;
 const max_chunk_cells = world_terrain.max_chunk_cells;
 const ColliderView = @import("../static_colliders.zig").ColliderView;

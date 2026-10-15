@@ -6,20 +6,20 @@
 //! no production path imports it. Single-module helpers stay in their module.
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
-const WorldSystem = @import("world_system.zig").WorldSystem;
-const TileId = @import("world_system.zig").TileId;
-const DenseCellWrite = @import("world_system.zig").DenseCellWrite;
-const DenseChunkWrites = @import("world_system.zig").DenseChunkWrites;
-const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
-const default_chunk_size_tiles = @import("world_system.zig").default_chunk_size_tiles;
-const ChunkGeometry = @import("world_terrain.zig").ChunkGeometry;
-const ChunkWindow = @import("world_gpu_tiles.zig").ChunkWindow;
-const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
-const tile_store_no_link = @import("../render/renderer.zig").tile_store_no_link;
-const tile_store_uniform_bit = @import("../render/renderer.zig").tile_store_uniform_bit;
+const AssetStore = @import("../../assets/assets.zig").AssetStore;
+const manifest = @import("../../assets/manifest.zig");
+const world_tileset_meta = @import("../../assets/world_tileset_meta.zig");
+const WorldSystem = @import("system.zig").WorldSystem;
+const TileId = @import("system.zig").TileId;
+const DenseCellWrite = @import("system.zig").DenseCellWrite;
+const DenseChunkWrites = @import("system.zig").DenseChunkWrites;
+const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
+const default_chunk_size_tiles = @import("system.zig").default_chunk_size_tiles;
+const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
+const ChunkWindow = @import("gpu_tiles.zig").ChunkWindow;
+const TileStoreSpan = @import("../../render/renderer.zig").TileStoreSpan;
+const tile_store_no_link = @import("../../render/renderer.zig").tile_store_no_link;
+const tile_store_uniform_bit = @import("../../render/renderer.zig").tile_store_uniform_bit;
 
 /// CPU copy of a GPU tile store: applies upload batches as the frame copy pass does
 /// and reads tiles back the way `tilemap.frag.glsl` does, so tests assert what a

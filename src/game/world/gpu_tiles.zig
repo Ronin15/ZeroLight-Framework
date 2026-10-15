@@ -17,18 +17,18 @@
 //! it uploads, and writes the upload batch without allocating.
 
 const std = @import("std");
-const ChunkGeometry = @import("world_terrain.zig").ChunkGeometry;
-const DenseLayerStore = @import("world_terrain.zig").DenseLayerStore;
-const TileDataId = @import("../render/renderer.zig").TileDataId;
-const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
-const packTileData = @import("../render/renderer.zig").packTileData;
-const tile_data_pad_cell = @import("../render/renderer.zig").tile_data_pad_cell;
-const tile_store_max_elements = @import("../render/renderer.zig").tile_store_max_elements;
-const tile_store_max_side = @import("../render/renderer.zig").tile_store_max_side;
-const tile_store_no_link = @import("../render/renderer.zig").tile_store_no_link;
-const tile_store_uniform_bit = @import("../render/renderer.zig").tile_store_uniform_bit;
-const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
-const tileStoreUniformWord = @import("../render/renderer.zig").tileStoreUniformWord;
+const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
+const DenseLayerStore = @import("terrain.zig").DenseLayerStore;
+const TileDataId = @import("../../render/renderer.zig").TileDataId;
+const TileStoreSpan = @import("../../render/renderer.zig").TileStoreSpan;
+const packTileData = @import("../../render/renderer.zig").packTileData;
+const tile_data_pad_cell = @import("../../render/renderer.zig").tile_data_pad_cell;
+const tile_store_max_elements = @import("../../render/renderer.zig").tile_store_max_elements;
+const tile_store_max_side = @import("../../render/renderer.zig").tile_store_max_side;
+const tile_store_no_link = @import("../../render/renderer.zig").tile_store_no_link;
+const tile_store_uniform_bit = @import("../../render/renderer.zig").tile_store_uniform_bit;
+const tileStoreBlockElements = @import("../../render/renderer.zig").tileStoreBlockElements;
+const tileStoreUniformWord = @import("../../render/renderer.zig").tileStoreUniformWord;
 
 /// `gpu_slot` of a dense layer that is not resident.
 pub const no_slot: u32 = std.math.maxInt(u32);
@@ -766,7 +766,7 @@ fn regionLessThan(_: void, lhs: Region, rhs: Region) bool {
     return lhs.dst < rhs.dst;
 }
 
-const TestGpuStore = @import("world_test_support.zig").TestGpuStore;
+const TestGpuStore = @import("test_support.zig").TestGpuStore;
 
 // Three layers of 4-cell chunks (16-cell blocks, 8-element blocks) over a
 // `width` x `height` cell grid, and a CPU copy of the store the syncs upload to.

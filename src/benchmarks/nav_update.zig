@@ -46,7 +46,7 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const EntityTemplate = @import("../game/data_system.zig").EntityTemplate;
 const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const CollisionResponseMobility = @import("../game/data_system.zig").CollisionResponseMobility;
-const WorldSystem = @import("../game/world_system.zig").WorldSystem;
+const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
@@ -58,7 +58,7 @@ const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
-const TileId = @import("../game/world_system.zig").TileId;
+const TileId = @import("../game/world/system.zig").TileId;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
@@ -71,7 +71,7 @@ const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 // Abstract chunk side in tiles. Nav takes the world's chunk, and `initDemoFromMeta` builds at
 // the default, so the scattered footprint stays one dirty cell per distinct chunk (its
 // item_count equals the dirty-chunk count) even if the default changes.
-const nav_chunk_tiles: u16 = @import("../game/world_system.zig").default_chunk_size_tiles;
+const nav_chunk_tiles: u16 = @import("../game/world/system.zig").default_chunk_size_tiles;
 const chunks_per_side: usize = @as(usize, world_tiles) / nav_chunk_tiles;
 const total_chunks: usize = chunks_per_side * chunks_per_side;
 

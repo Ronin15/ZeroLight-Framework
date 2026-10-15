@@ -2144,7 +2144,7 @@ fn expectAgentSnapshotColumnsAligned(rows: *const std.MultiArrayList(AgentSnapsh
 }
 
 // Test-only fixtures for multi-level start_level regression (not production API).
-const WorldSystem = @import("../world_system.zig").WorldSystem;
+const WorldSystem = @import("../world/system.zig").WorldSystem;
 const loadTestWorldMeta = @import("pathfinding/test_support.zig").loadTestWorldMeta;
 const worldColliders = @import("pathfinding/test_support.zig").worldColliders;
 const StructuralCommand = @import("../data_system.zig").StructuralCommand;

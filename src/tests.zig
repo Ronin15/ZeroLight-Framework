@@ -57,11 +57,11 @@ comptime {
     _ = @import("game/simulation_pipeline.zig");
     _ = @import("game/simulation_scope.zig");
     _ = @import("game/stamped_table.zig");
-    _ = @import("game/world_system.zig");
-    _ = @import("game/world_test_support.zig");
-    _ = @import("game/world_interest.zig");
-    _ = @import("game/world_terrain.zig");
-    _ = @import("game/world_gpu_tiles.zig");
+    _ = @import("game/world/system.zig");
+    _ = @import("game/world/test_support.zig");
+    _ = @import("game/world/interest.zig");
+    _ = @import("game/world/terrain.zig");
+    _ = @import("game/world/gpu_tiles.zig");
     _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");

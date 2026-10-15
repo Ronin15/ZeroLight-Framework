@@ -19,8 +19,9 @@ const ParticleSystem = @import("../game/systems/particle.zig").ParticleSystem;
 const render_depth = @import("../game/render_depth.zig");
 const render_prep = @import("../game/render_prep.zig");
 const WorldDepth = render_depth.WorldDepth;
-const world_system = @import("../game/world_system.zig");
-const WorldSystem = world_system.WorldSystem;
+const WorldSystem = @import("../game/world/system.zig").WorldSystem;
+const DenseLayerRenderWindow = @import("../game/world/system.zig").DenseLayerRenderWindow;
+const level_z_step = @import("../game/world/system.zig").level_z_step;
 const Renderer = @import("../render/renderer.zig");
 const mergeDrawList = Renderer.mergeDrawList;
 const resources = @import("../render/resources.zig");
@@ -578,7 +579,7 @@ fn initFixture(
     // as beyond the window even though it matches player_level exactly.
     var level_index: u16 = 1;
     while (level_index <= fixture_config.player_level) : (level_index += 1) {
-        _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * world_system.level_z_step);
+        _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
 
     const deco = try fixture.world.requireTileByName(&fixture.tileset_meta, "deco_0");
@@ -673,7 +674,7 @@ fn benchStaticGroups(
 }
 
 fn benchWindowStartLevel(player_level: u16) u16 {
-    const render_window = world_system.DenseLayerRenderWindow{};
+    const render_window = DenseLayerRenderWindow{};
     if (player_level > 0 and render_window.ceiling_when_underground) {
         return player_level - 1;
     }
@@ -681,7 +682,7 @@ fn benchWindowStartLevel(player_level: u16) u16 {
 }
 
 fn benchDenseFloorDepth(world_level: u16) i32 {
-    const base_z: i32 = -@as(i32, @intCast(world_level)) * world_system.level_z_step;
+    const base_z: i32 = -@as(i32, @intCast(world_level)) * level_z_step;
     return render_depth.worldZWithOffset(base_z, .floor);
 }
 

@@ -16,7 +16,7 @@ const NavGrid = @import("nav_grid.zig").NavGrid;
 const allowed_moves = @import("nav_grid.zig").allowed_moves;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavPortal = @import("nav_graph.zig").NavPortal;
-const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
+const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 const LinkBounds = @import("nav_graph.zig").LinkBounds;
 const LinkPairs = @import("nav_graph.zig").LinkPairs;
 const PairChains = @import("nav_graph.zig").PairChains;
@@ -1021,7 +1021,7 @@ const chunk_octile: [16][16]u32 = blk: {
 
 comptime {
     // Chunk-local coordinates are below the largest chunk edge.
-    std.debug.assert(@import("../../world_system.zig").max_chunk_size_tiles <= chunk_octile.len);
+    std.debug.assert(@import("../../world/system.zig").max_chunk_size_tiles <= chunk_octile.len);
 }
 
 // Relaxes the mirror cell `target` at (mx, my) across a border at one cardinal step.
@@ -1941,8 +1941,8 @@ test "abstract expansion visits only same-label peers, border mirrors, and live 
     try std.testing.expect(reached_link_source);
 }
 
-const LevelLink = @import("../../world_system.zig").LevelLink;
-const WorldSystem = @import("../../world_system.zig").WorldSystem;
+const LevelLink = @import("../../world/system.zig").LevelLink;
+const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 
 // 16x16 cells in 4-tile chunks over `levels` levels, each with random walls.
@@ -1966,7 +1966,7 @@ fn heuristicTestWorld(meta: *const WorldTilesetMeta, random: std.Random, levels:
     return world;
 }
 
-fn randomCell(random: std.Random, x_min: u16, x_end: u16) @import("../../world_system.zig").CellCoord {
+fn randomCell(random: std.Random, x_min: u16, x_end: u16) @import("../../world/system.zig").CellCoord {
     return .{ .x = x_min + random.uintLessThan(u16, x_end - x_min), .y = random.uintLessThan(u16, 16) };
 }
 
@@ -2489,7 +2489,7 @@ fn openStackWorld(meta: *const WorldTilesetMeta, levels: u16) !WorldSystem {
 // two levels apart, and short teleports across the whole stack.
 fn randomShortCrossings(random: std.Random, levels: u16, links: []LevelLink) void {
     for (links) |*link| {
-        const cell = @import("../../world_system.zig").CellCoord{ .x = random.uintLessThan(u16, 32), .y = random.uintLessThan(u16, 32) };
+        const cell = @import("../../world/system.zig").CellCoord{ .x = random.uintLessThan(u16, 32), .y = random.uintLessThan(u16, 32) };
         const upper = random.uintLessThan(u16, levels - 1);
         link.* = switch (random.uintLessThan(u32, 4)) {
             0, 1 => .{ .kind = .ramp, .level_a = upper, .cell_a = cell, .level_b = upper + 1, .cell_b = cell, .traversal_cost = random.uintLessThan(u32, 8), .bidirectional = random.boolean() },
@@ -3131,7 +3131,7 @@ test "mirrored band teleports leave no level-0 band node closed and the objectiv
             const upper: u16 = @intCast(level - 1);
             _ = try world.addLevel(-16 * @as(i32, @intCast(level)));
             _ = try world.addDenseLayer(@intCast(level), 0, .floor, grass);
-            const cell = @import("../../world_system.zig").CellCoord{ .x = if (upper % 2 == 0) center + 10 else center - 10, .y = center };
+            const cell = @import("../../world/system.zig").CellCoord{ .x = if (upper % 2 == 0) center + 10 else center - 10, .y = center };
             try world.addLevelLink(.{ .kind = .ramp, .level_a = upper, .cell_a = cell, .level_b = upper + 1, .cell_b = cell, .traversal_cost = 1, .bidirectional = true });
         }
         try addBandTeleports(&world, levels - 1, teleports);

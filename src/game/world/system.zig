@@ -5,69 +5,69 @@
 //! State-owned SoA world/tile storage and render preparation.
 //! Persistent world data stores stable tile IDs, level/chunk metadata, and
 //! gameplay tile flags. Dense tiles, composed movement-blocked bits, and link
-//! endpoints are stored per chunk (`world_terrain.zig`) behind the accessors here. Atlas source rectangles are resolved from `tileset_meta`
+//! endpoints are stored per chunk (`terrain.zig`) behind the accessors here. Atlas source rectangles are resolved from `tileset_meta`
 //! once at build time and cached into per-tile `catalog_source_x/y/w/h` columns,
 //! so hot-path `sourceRect` lookups never re-touch tileset metadata at runtime.
 //! Renderer handles stay outside this owner.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const math = @import("../core/math.zig");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
-const manifest = @import("../assets/manifest.zig");
-const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
-const Rect = @import("../render/renderer.zig").Rect;
-const RenderOrder = @import("../render/renderer.zig").RenderOrder;
-const Renderer = @import("../render/renderer.zig").Renderer;
-const TileStoreError = @import("../render/renderer.zig").TileStoreError;
-const TilemapParams = @import("../render/renderer.zig").TilemapParams;
-const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
-const tile_store_max_side = @import("../render/renderer.zig").tile_store_max_side;
-const Sprite = @import("../render/renderer.zig").Sprite;
-const sprite_batch = @import("../render/sprite_batch.zig");
-const Position = @import("../render/renderer.zig").Position;
-const Uv = @import("../render/renderer.zig").Uv;
-const VertexColor = @import("../render/renderer.zig").VertexColor;
-const writeWorldSpriteQuad = @import("../render/renderer.zig").writeWorldSpriteQuad;
-const TextureId = @import("../render/resources.zig").TextureId;
-const TextureDesc = @import("../render/resources.zig").TextureDesc;
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchStats = @import("../app/thread_system.zig").BatchStats;
-const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
-const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const WorkerId = @import("../app/thread_system.zig").WorkerId;
-const thread_shared_record_alignment = @import("../app/thread_system.zig").thread_shared_record_alignment;
-const Dispatch = @import("../app/thread_system.zig").Dispatch;
-const StageControls = @import("../app/thread_system.zig").StageControls;
-const runStage = @import("../app/thread_system.zig").runStage;
-const WorldObstacleChangedEvent = @import("simulation.zig").WorldObstacleChangedEvent;
-const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
-const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
-const ChunkCoord = @import("simulation_scope.zig").ChunkCoord;
-const render_depth = @import("render_depth.zig");
+const math = @import("../../core/math.zig");
+const AssetStore = @import("../../assets/assets.zig").AssetStore;
+const RuntimeAssets = @import("../../assets/runtime_assets.zig").RuntimeAssets;
+const manifest = @import("../../assets/manifest.zig");
+const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
+const world_tileset_meta = @import("../../assets/world_tileset_meta.zig");
+const Rect = @import("../../render/renderer.zig").Rect;
+const RenderOrder = @import("../../render/renderer.zig").RenderOrder;
+const Renderer = @import("../../render/renderer.zig").Renderer;
+const TileStoreError = @import("../../render/renderer.zig").TileStoreError;
+const TilemapParams = @import("../../render/renderer.zig").TilemapParams;
+const tileStoreBlockElements = @import("../../render/renderer.zig").tileStoreBlockElements;
+const tile_store_max_side = @import("../../render/renderer.zig").tile_store_max_side;
+const Sprite = @import("../../render/renderer.zig").Sprite;
+const sprite_batch = @import("../../render/sprite_batch.zig");
+const Position = @import("../../render/renderer.zig").Position;
+const Uv = @import("../../render/renderer.zig").Uv;
+const VertexColor = @import("../../render/renderer.zig").VertexColor;
+const writeWorldSpriteQuad = @import("../../render/renderer.zig").writeWorldSpriteQuad;
+const TextureId = @import("../../render/resources.zig").TextureId;
+const TextureDesc = @import("../../render/resources.zig").TextureDesc;
+const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
+const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
+const StageControls = @import("../../app/thread_system.zig").StageControls;
+const runStage = @import("../../app/thread_system.zig").runStage;
+const WorldObstacleChangedEvent = @import("../simulation.zig").WorldObstacleChangedEvent;
+const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
+const ActiveRegion = @import("../simulation_scope.zig").ActiveRegion;
+const ChunkCoord = @import("../simulation_scope.zig").ChunkCoord;
+const render_depth = @import("../render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
-const world_interest = @import("world_interest.zig");
-const world_gpu_tiles = @import("world_gpu_tiles.zig");
-const GpuTileMirror = @import("world_gpu_tiles.zig").GpuTileMirror;
-const log = @import("../core/logging.zig").game;
-const logging = @import("../core/logging.zig");
-const world_terrain = @import("world_terrain.zig");
-const ChunkBits = @import("world_terrain.zig").ChunkBits;
-const ChunkBitsStore = @import("world_terrain.zig").ChunkBitsStore;
-const ChunkForm = @import("world_terrain.zig").ChunkForm;
-const ChunkGeometry = @import("world_terrain.zig").ChunkGeometry;
-const DenseLayerStore = @import("world_terrain.zig").DenseLayerStore;
-const max_chunk_cells = @import("world_terrain.zig").max_chunk_cells;
-const LevelTerrain = @import("world_terrain.zig").LevelTerrain;
-const OwnedBlock = @import("world_terrain.zig").OwnedBlock;
-const no_link_endpoint = @import("world_terrain.zig").no_link_endpoint;
-const no_sparse_tile = @import("world_terrain.zig").no_sparse_tile;
-const no_edit_write = @import("world_terrain.zig").no_edit_write;
-const OrderedIndexSet = @import("systems/chunk_list_map.zig").OrderedIndexSet;
+const world_interest = @import("interest.zig");
+const world_gpu_tiles = @import("gpu_tiles.zig");
+const GpuTileMirror = @import("gpu_tiles.zig").GpuTileMirror;
+const log = @import("../../core/logging.zig").game;
+const logging = @import("../../core/logging.zig");
+const world_terrain = @import("terrain.zig");
+const ChunkBits = @import("terrain.zig").ChunkBits;
+const ChunkBitsStore = @import("terrain.zig").ChunkBitsStore;
+const ChunkForm = @import("terrain.zig").ChunkForm;
+const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
+const DenseLayerStore = @import("terrain.zig").DenseLayerStore;
+const max_chunk_cells = @import("terrain.zig").max_chunk_cells;
+const LevelTerrain = @import("terrain.zig").LevelTerrain;
+const OwnedBlock = @import("terrain.zig").OwnedBlock;
+const no_link_endpoint = @import("terrain.zig").no_link_endpoint;
+const no_sparse_tile = @import("terrain.zig").no_sparse_tile;
+const no_edit_write = @import("terrain.zig").no_edit_write;
+const OrderedIndexSet = @import("../systems/chunk_list_map.zig").OrderedIndexSet;
 
-pub const TileId = @import("world_terrain.zig").TileId;
+pub const TileId = @import("terrain.zig").TileId;
 pub const invalid_tile_id: TileId = std.math.maxInt(TileId);
 pub const default_chunk_size_tiles: u16 = 16;
 /// Largest chunk edge. Terrain, nav, and scope share one edge: a power of two in
@@ -3168,8 +3168,8 @@ fn hash2(seed: u64, x: anytype, y: anytype) u64 {
     return value;
 }
 
-const TileDataId = @import("../render/renderer.zig").TileDataId;
-const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
+const TileDataId = @import("../../render/renderer.zig").TileDataId;
+const TileStoreSpan = @import("../../render/renderer.zig").TileStoreSpan;
 
 fn testWorldMeta() !WorldTilesetMeta {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
@@ -3195,7 +3195,7 @@ fn testMinimalSurfaceWorld(meta: *const WorldTilesetMeta, width: u16, height: u1
     return world;
 }
 
-const TestGpuStore = @import("world_test_support.zig").TestGpuStore;
+const TestGpuStore = @import("test_support.zig").TestGpuStore;
 
 // Runs one GPU tile sync without a renderer; the upload batch stays in
 // `world.gpu_tiles.spans`/`values`. A world with no render window set renders its

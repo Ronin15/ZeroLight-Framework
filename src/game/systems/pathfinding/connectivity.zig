@@ -25,8 +25,8 @@
 //! reaction. No batch reads or moves an untouched component's block.
 
 const std = @import("std");
-const WorldSystem = @import("../../world_system.zig").WorldSystem;
-const LevelLink = @import("../../world_system.zig").LevelLink;
+const WorldSystem = @import("../../world/system.zig").WorldSystem;
+const LevelLink = @import("../../world/system.zig").LevelLink;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
@@ -48,9 +48,9 @@ const LevelRuns = @import("nav_graph.zig").LevelRuns;
 const sortedContains = @import("nav_graph.zig").sortedContains;
 const LabelSet = @import("nav_graph.zig").LabelSet;
 const maxChunkLabels = @import("nav_grid.zig").maxChunkLabels;
-const CellCoord = @import("../../world_system.zig").CellCoord;
-const no_link_endpoint = @import("../../world_terrain.zig").no_link_endpoint;
-const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
+const CellCoord = @import("../../world/system.zig").CellCoord;
+const no_link_endpoint = @import("../../world/terrain.zig").no_link_endpoint;
+const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
@@ -5164,7 +5164,7 @@ const test_support = @import("test_support.zig");
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
-const TileId = @import("../../world_system.zig").TileId;
+const TileId = @import("../../world/system.zig").TileId;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
@@ -5178,7 +5178,7 @@ const test_chunk: u16 = 4;
 // an obstacle layer to draw walls on.
 const TestWorld = struct {
     meta: WorldTilesetMeta,
-    world: @import("../../world_system.zig").WorldSystem,
+    world: @import("../../world/system.zig").WorldSystem,
     data: DataSystem,
     obstacle: [4]usize = @splat(0),
     grass: TileId,

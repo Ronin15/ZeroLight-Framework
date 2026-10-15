@@ -12,7 +12,7 @@ const MovementBodyPtr = @import("../data_system.zig").MovementBodyPtr;
 const MovementBodySlice = @import("../data_system.zig").MovementBodySlice;
 const PrimitiveVisual = @import("../data_system.zig").PrimitiveVisual;
 const Player = @import("../player.zig").Player;
-const WorldSystem = @import("../world_system.zig").WorldSystem;
+const WorldSystem = @import("../world/system.zig").WorldSystem;
 
 pub fn apply(
     world: *const WorldSystem,

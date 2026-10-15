@@ -22,7 +22,7 @@ const PathfindingCapacity = @import("../game/systems/pathfinding/types.zig").Pat
 const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
 const GroupField = @import("../game/systems/pathfinding/group_field.zig").GroupField;
 const PathfindingSystem = @import("../game/systems/pathfinding/system.zig").PathfindingSystem;
-const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
+const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
 

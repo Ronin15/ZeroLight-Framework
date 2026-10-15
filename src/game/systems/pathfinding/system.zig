@@ -28,8 +28,8 @@ const stageShape = @import("../../../app/thread_system.zig").stageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
-const WorldSystem = @import("../../world_system.zig").WorldSystem;
-const ChunkGridError = @import("../../world_system.zig").ChunkGridError;
+const WorldSystem = @import("../../world/system.zig").WorldSystem;
+const ChunkGridError = @import("../../world/system.zig").ChunkGridError;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
@@ -46,12 +46,12 @@ const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavStageTuners = @import("nav_graph.zig").NavStageTuners;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const dilateChanged3x3 = @import("nav_grid.zig").dilateChanged3x3;
-const bitIsSet = @import("../../world_terrain.zig").bitIsSet;
+const bitIsSet = @import("../../world/terrain.zig").bitIsSet;
 const NavBatchResult = @import("nav_graph.zig").NavBatchResult;
 const keyLevel = @import("../chunk_list_map.zig").keyLevel;
 const keyChunk = @import("../chunk_list_map.zig").keyChunk;
-const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
-const ChunkBits = @import("../../world_terrain.zig").ChunkBits;
+const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
+const ChunkBits = @import("../../world/terrain.zig").ChunkBits;
 const ChunkListMap = @import("../chunk_list_map.zig").ChunkListMap;
 const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
@@ -9257,7 +9257,7 @@ test "an elastic resize keeps a building group field building" {
 
 // ---- Path registry, publish split, and scoped eviction ---------------------------
 
-const TileId = @import("../../world_system.zig").TileId;
+const TileId = @import("../../world/system.zig").TileId;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 
 // A world `side` tiles a side in 4-tile chunks, open grass, with an obstacle layer to flip.
@@ -9719,7 +9719,7 @@ test "a new link evicts no cached path" {
     // A ramp on a cell a cached path crosses, and its far end below.
     const first = storedPath(&system, system.completed.core.ownerOf(registryRouteKey(&system, 0, 24)).?);
     const on_path: u16 = @intCast(first.cells[first.cells.len / 2]);
-    const ramp_cell = @import("../../world_system.zig").CellCoord{ .x = @intCast(on_path % 24), .y = @intCast(on_path / 24) };
+    const ramp_cell = @import("../../world/system.zig").CellCoord{ .x = @intCast(on_path % 24), .y = @intCast(on_path / 24) };
     try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 0, .cell_a = ramp_cell, .level_b = 1, .cell_b = ramp_cell, .traversal_cost = 1, .bidirectional = true });
     const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
@@ -11226,7 +11226,7 @@ test "a group field for a blocked goal builds at the goal table's live goal" {
 // Cells reachable from `start` on `grid`: orthogonal moves between open cells, diagonal
 // moves through two open orthogonal cells, two-way links both ways and one-way links
 // forward, each with both ends open.
-fn referenceReachable(allocator: std.mem.Allocator, grid: *const NavGrid, links: []const @import("../../world_system.zig").LevelLink, start: usize, reached: []bool) !void {
+fn referenceReachable(allocator: std.mem.Allocator, grid: *const NavGrid, links: []const @import("../../world/system.zig").LevelLink, start: usize, reached: []bool) !void {
     @memset(reached, false);
     var queue: std.ArrayList(usize) = .empty;
     defer queue.deinit(allocator);

@@ -20,11 +20,11 @@
 
 const std = @import("std");
 const WorldDepth = @import("../game/render_depth.zig").WorldDepth;
-const WorldSystem = @import("../game/world_system.zig").WorldSystem;
-const TileId = @import("../game/world_system.zig").TileId;
-const level_z_step = @import("../game/world_system.zig").level_z_step;
-const no_sparse_tile = @import("../game/world_terrain.zig").no_sparse_tile;
-const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
+const WorldSystem = @import("../game/world/system.zig").WorldSystem;
+const TileId = @import("../game/world/system.zig").TileId;
+const level_z_step = @import("../game/world/system.zig").level_z_step;
+const no_sparse_tile = @import("../game/world/terrain.zig").no_sparse_tile;
+const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const Rect = @import("../render/renderer.zig").Rect;
 const TextureId = @import("../render/resources.zig").TextureId;
 const SpriteBatch = @import("../render/sprite_batch.zig").SpriteBatch;
