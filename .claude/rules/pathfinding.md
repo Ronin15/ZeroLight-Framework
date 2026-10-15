@@ -2,7 +2,8 @@
 paths:
   - "src/game/systems/pathfinding/**"
   - "src/game/systems/pathfinding.zig"
-  - "src/benchmarks/pathfinding.zig"
+  - "src/benchmarks/pathfinding/**"
+  - "src/benchmarks/nav_size.zig"
   - "src/benchmarks/nav_update.zig"
 ---
 

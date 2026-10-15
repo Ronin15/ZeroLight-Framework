@@ -28,9 +28,10 @@ paths:
 - Production APIs carry no test-only tags, payloads, fields, stages, hooks,
   shortcuts, or paths; tests use private helpers, fixtures, mocks, or real
   payloads.
-- Tests never time anything and never call `src/benchmarks/` (except
-  `suite.zig`'s tests of its pure utilities); bench-fixture correctness relies
-  on internal asserts firing during a real bench run.
+- Tests never time anything and never call `src/benchmarks/` (except the
+  shared harness files' tests of their own pure utilities, `suite.zig` and
+  `nav_size.zig`); bench-fixture correctness relies on internal asserts firing
+  during a real bench run.
 - Tests and benches drive production sequences, resets, and rules through
   the production functions; never re-implement an order, a field-by-field
   reset, or a rule they check, since a copy passes when production drifts.
@@ -71,7 +72,8 @@ paths:
   asserts check that shape. A config the bench cannot run fails, never skips.
   A variant, column, or assert that measures a removed design goes with it.
 - Shared harness pieces live once (`suite.zig`: item codes, labels, stage
-  shapes, reporting; `fixtures.zig`: worlds, bodies, threads, tuners). A group
+  shapes, reporting; `fixtures.zig`: worlds, bodies, threads, tuners;
+  `nav_size.zig`: the nav memory estimate). A group
   declares its label and formatter in its definition, never through a switch
   on its name.
 - A scaling bench runs at least three sizes far enough apart to show the growth
