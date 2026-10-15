@@ -1289,3 +1289,87 @@ pub fn shrinkFixture(data: *const DataSystem, fixture: *const RegistryWorld, req
     try std.testing.expectEqual(@as(usize, 64), system.completed.count());
     return system;
 }
+
+/// The agent count the request-side stage tests pass to `update`.
+pub const intake_test_agents: usize = 40;
+
+/// Two updates' request-side stats match, field by field.
+pub fn expectRequestStatsEqual(expected: PathfindingStats, actual: PathfindingStats) !void {
+    inline for (.{
+        "accepted_requests", "duplicate_requests",  "pending_requests",    "dropped_requests",
+        "cache_hits",        "available_results",   "unavailable_results", "group_field_samples",
+        "goal_projected",    "group_fields_built",  "group_field_reuses",  "group_field_rebuild_throttled",
+        "cache_evictions",   "distinct_group_keys", "goal_fallbacks",      "group_field_evictions",
+    }) |name| {
+        try std.testing.expectEqual(@field(expected, name), @field(actual, name));
+    }
+}
+
+/// Same pending queue, group tallies, and cached result slots.
+pub fn expectRequestStateEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
+    try expectQueuesEqual(expected, actual);
+    try std.testing.expectEqual(expected.completed.core.slots.items.len, actual.completed.core.slots.items.len);
+    for (expected.completed.core.slots.items, actual.completed.core.slots.items) |expected_slot, actual_slot| {
+        try std.testing.expectEqualDeep(expected_slot, actual_slot);
+    }
+}
+
+/// Same pending queue in order (each key registered) and group tallies in order.
+pub fn expectQueuesEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
+    try std.testing.expectEqual(expected.pending.len, actual.pending.len);
+    for (0..expected.pending.len) |index| {
+        try std.testing.expectEqualDeep(expected.pending.at(index), actual.pending.at(index));
+        try std.testing.expect(actual.pending_keys.contains(expected.pending.at(index).key));
+    }
+    try std.testing.expectEqual(expected.group_requests.items.len, actual.group_requests.items.len);
+    for (expected.group_requests.items, actual.group_requests.items) |expected_tally, actual_tally| {
+        try std.testing.expectEqualDeep(expected_tally, actual_tally);
+    }
+}
+
+/// Each goal requested by three agents; the schedule's step `step` uses `goals[step]`.
+pub fn writeGroupGoals(stream: *RangeOutputStream(PathRequest), entity: EntityId, goals: []const math.Vec2) !void {
+    stream.clearRetainingCapacity();
+    for (goals) |goal| {
+        for (0..3) |member| {
+            try appendPathRequest(stream, .{ .entity = entity, .kind = .group, .start = cellWorld(@intCast(member), 2), .goal = goal });
+        }
+    }
+}
+
+/// Two systems' group fields match slot by slot: state, key, build progress, and every
+/// cell's entry, with each non-empty field in its field key map slot.
+pub fn expectGroupFieldsEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
+    for (expected.group_fields.items, actual.group_fields.items, 0..) |*expected_field, *actual_field, slot| {
+        if (expected_field.state != .empty) try std.testing.expectEqual(@as(?usize, slot), actual.group_field_keys.find(actual_field.key));
+        try std.testing.expectEqual(expected_field.state, actual_field.state);
+        try std.testing.expectEqualDeep(expected_field.key, actual_field.key);
+        try std.testing.expectEqual(expected_field.goal_index, actual_field.goal_index);
+        try std.testing.expectEqual(expected_field.generation, actual_field.generation);
+        try std.testing.expectEqual(expected_field.current_distance, actual_field.current_distance);
+        try std.testing.expectEqual(expected_field.pushed_count, actual_field.pushed_count);
+        try std.testing.expectEqual(expected_field.fresh_this_step, actual_field.fresh_this_step);
+        try std.testing.expectEqual(expected_field.last_build_step, actual_field.last_build_step);
+        try std.testing.expectEqual(expected_field.used_blocks, actual_field.used_blocks);
+        const grid = expected.graph.grid(expected_field.key.goal_level) orelse continue;
+        for (0..grid.cellCount()) |cell| {
+            try std.testing.expectEqualDeep(expected_field.lookup(grid, cell), actual_field.lookup(grid, cell));
+        }
+    }
+}
+
+/// A 64x64-cell system in 4-cell nav chunks whose fields cross many chunks, so cold field
+/// pools stall and grow while they build.
+pub fn stallingFieldCapacity(participant_count: usize) PathfindingCapacity {
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 64;
+    capacity.max_group_fields = 4;
+    capacity.group_field_build_budget = 64;
+    capacity.group_field_rebuild_min_steps = 1;
+    capacity.nav_chunk_tiles = 4;
+    capacity.worker_participant_count = participant_count;
+    return capacity;
+}
+
+/// Four far-apart goals on the stalling-field world, one per field slot.
+pub const stalling_field_goals = [_]math.Vec2{ cellWorld(5, 58), cellWorld(58, 58), cellWorld(58, 5), cellWorld(30, 30) };
