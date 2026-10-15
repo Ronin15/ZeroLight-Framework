@@ -12,6 +12,7 @@ const world_tileset_meta = @import("../../assets/world_tileset_meta.zig");
 const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const WorldSystem = @import("system.zig").WorldSystem;
 const TileId = @import("system.zig").TileId;
+const WorldBuildConfig = @import("system.zig").WorldBuildConfig;
 const DenseCellWrite = @import("edit.zig").DenseCellWrite;
 const DenseChunkWrites = @import("edit.zig").DenseChunkWrites;
 const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
@@ -254,6 +255,15 @@ pub const TerrainTestTiles = struct {
             .deco = try world.requireTileByName(meta, "deco_0"),
         };
     }
+};
+
+/// A procedural surface within the test size bound: 16x16 tiles in 4x4 chunks, with no
+/// underground level.
+pub const procedural_test_config = WorldBuildConfig{
+    .width_tiles = 16,
+    .height_tiles = 16,
+    .chunk_size_tiles = 4,
+    .underground_level_count = 0,
 };
 
 test "the demo world paints the same tiles at every chunk edge" {
