@@ -24,7 +24,7 @@ seam, so a shot is never refused for capacity.
   through `frame.collision_triggers`; one projectile overlapping several
   bodies yields several pairs in a step.
 - `WorldSystem.levelBlocksMovement` / `cellContaining`
-  (`src/game/world_system.zig`); `world_gate` clamps only AI agents and the
+  (`src/game/world/system.zig`); `world_gate` clamps only AI agents and the
   player (`src/game/systems/world_gate.zig`).
 - Population capacities grow at one commit-seam point
   (`SimulationPipeline.syncPopulationCapacity`, Slice 72).

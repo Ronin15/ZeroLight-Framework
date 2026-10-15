@@ -26,7 +26,7 @@ every existing agent is byte-identical.
   `writeAiIntentsJob` never writes `NavigationIntent.goal_level` (default 0),
   so a level-1 agent's own-level goal is sent as a surface goal; the row
   level is already gathered.
-- Interest markers (`src/game/world_interest.zig`): `InterestMarkerStore`
+- Interest markers (`src/game/world/interest.zig`): `InterestMarkerStore`
   with generational ids (fixed-capacity today; 58 grows it with content);
   the `patrol` kind is reserved with no consumer.
 - Stimuli: `StimulusKind` and the `SensoryBus` deferred and sticky buffers

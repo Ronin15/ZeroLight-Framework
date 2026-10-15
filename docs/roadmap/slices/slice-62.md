@@ -34,7 +34,7 @@ only committed state and the fixed-step sim view.
 - Archetype bundles (`AiArchetypeCatalog.bundleForId`, `ai_archetypes.zig`);
   the archetype JSON has no body or visual block; demo spawn builds
   templates by hand and sizes from `battle_scale_demo_mover_count`.
-- `InterestMarkerStore` (`world_interest.zig`) is the generational world-store
+- `InterestMarkerStore` (`world/interest.zig`) is the generational world-store
   precedent (fixed 128 inline slots).
 - Placement predicates: `world_gate.rectOverlapsSolidTile` and nav cell
   blocking (`NavGrid.isBlockedCell`, replaced by 64G).

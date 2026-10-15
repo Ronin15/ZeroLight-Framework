@@ -69,39 +69,60 @@ Designs start here, then read the live structure below (rules:
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
 - `src/game/game_demo_state.zig`, `src/game/loading_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via a runtime-asset-backed loading transition.
-- `src/game/world_system.zig` owns state-local world/tile data for levels,
-  dense layers, sparse tiles, level links, catalog source rects, the render
-  chunk window, and durable **interest/affordance markers** (`world_interest.zig`,
-  Slice 41). Markers are world-authored POIs with fixed inline slot capacity
-  (allocation-free by construction) — not `DataSystem` components and not
-  ephemeral `WorldStimulus` dig/footstep/impact events. Kind `investigate` is
-  the AI consumer today; `cover` / `resource` / `patrol` are reserved schema
-  tags until a later consumer lands. Cognition discovery uses a fixed query
-  radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
-  not the discovery gate. Queries return nearest-k (dist², then slot index).
-- `src/game/world_terrain.zig` holds `WorldSystem`'s chunk-owned terrain
-  storage: per dense layer a chunk directory over a pool of tile blocks, and per
-  level a `LevelTerrain` (growable band list and cached floor layer, a composed
-  movement-blocked directory over a pool of bit blocks, per-chunk link-endpoint
-  heads and counts, and per-chunk sparse-tile chain heads), directories sized at
-  level create. Its `ChunkGeometry` (u32 sides, u16 chunk edge, shift-based
-  `chunkOf`/`localOf`) is the one chunk tiling terrain, nav, and static colliders
-  share.
+- **Split-file types.** A type too large for one file keeps its definition,
+  fields, and remaining methods in its package's `system.zig`; each public
+  method defined in a sibling file is a declaration alias on the type
+  (`pub const setDenseTile = world_edit.setDenseTile;`) with its `///` doc on the
+  definition, so method syntax resolves straight to it with no forwarder frame
+  in any mode (`.claude/rules/zig-style.md`). `world/` and `data_system/` use it.
+- `src/game/world/` holds `WorldSystem`'s state-local world/tile data, with no
+  facade: importers name the file they use. Public methods in `render.zig`,
+  `edit.zig`, and `worldgen.zig` are aliases on the type (split-file types,
+  above).
+  - `system.zig`: the type and its storage (levels, dense layers, sparse tiles,
+    level links, render-window state), queries, the tile catalog (source rects,
+    flags), and view geometry (view window, chunk and cognition regions).
+  - `render.zig`: `WorldSystem`'s render path: the render window's sparse tile
+    list, the dense composite submit, the GPU tile store sync, and the sparse
+    submit.
+  - `edit.zig`: every terrain content write: single-cell dense writes and their
+    reserve seams, batched dense writes as threaded plan and write jobs, sparse
+    add/remove, and blocking clears.
+  - `worldgen.zig`: the procedural and demo world builds (procedural ground
+    painted per chunk on the thread system) and the underground level stack.
+  - `terrain.zig`: chunk-owned terrain storage: per dense layer a chunk
+    directory over a pool of tile blocks, and per level a `LevelTerrain`
+    (growable band list and cached floor layer, a composed movement-blocked
+    directory over a pool of bit blocks, per-chunk link-endpoint heads and
+    counts, and per-chunk sparse-tile chain heads), directories sized at level
+    create. Its `ChunkGeometry` (u32 sides, u16 chunk edge, shift-based
+    `chunkOf`/`localOf`) is the one chunk tiling terrain, nav, and static
+    colliders share.
+  - `gpu_tiles.zig`: the mirror of the renderer-owned GPU tile store: the
+    store's non-owning id, the resident window, each resident layer's toroidal
+    directory and chain link, and the directory and block allocator it plans
+    and commits each frame, uploading changed chunks found through layer flags
+    and block change marks; reset when the renderer retires the store.
+  - `interest.zig`: durable **interest/affordance markers** (Slice 41).
+    Markers are world-authored POIs with fixed inline slot capacity
+    (allocation-free by construction) — not `DataSystem` components and not
+    ephemeral `WorldStimulus` dig/footstep/impact events. Kind `investigate` is
+    the AI consumer today; `cover` / `resource` / `patrol` are reserved schema
+    tags until a later consumer lands. Cognition discovery uses a fixed query
+    radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
+    not the discovery gate. Queries return nearest-k (dist², then slot index).
+  - `test_support.zig`: test-only `WorldSystem` fixtures shared across modules
+    and world files (a demo surface at any chunk edge, terrain pool warmup, GPU
+    sync and sparse-index checks).
 - `src/game/stamped_table.zig` holds the generation-stamped open-addressed table
   the per-step key tables share (nav's abstract and local search tables, the plane
   stage's landing claims): an O(1) reset outside the rare wraparound.
-- `src/game/world_test_support.zig` holds test-only `WorldSystem` fixtures shared
-  across modules (a demo surface at any chunk edge, terrain pool warmup).
-- `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
-  renderer-owned GPU tile store: the store's non-owning id, the resident
-  window, each resident layer's toroidal directory and chain link, and the
-  directory and block allocator it plans and commits each frame, uploading
-  changed chunks found through layer flags and block change marks; reset when
-  the renderer retires the store.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, destructible, structural, system) and owns state-local persistent
   entity data in dense SoA stores for gameplay, collision, and render systems.
+  `DataSystem`'s structural-commit entries in `structural.zig` are aliases on
+  the type (split-file types, above).
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
@@ -269,9 +290,9 @@ chunk window. The resident layers are those of the levels in the vertical
 render window (`DenseLayerRenderWindow`, `levels_below` default 6, widened to
 the full authored underground stack in the procedural demo world), so GPU
 memory follows the window's layers times its chunks, never level area, world
-depth, or world count. `WorldSystem.syncDenseTileStore` (mirror:
-`world_gpu_tiles.zig`) runs once per frame in render prep before swapchain
-acquisition: a level entering the window uploads its window directory and
+depth, or world count. `WorldSystem.syncDenseTileStore` (`world/render.zig`;
+mirror: `world/gpu_tiles.zig`) runs once per frame in render prep before
+swapchain acquisition: a level entering the window uploads its window directory and
 mixed blocks, a pan across a chunk boundary uploads the entering chunks, a dig
 uploads one element, and everything goes in the frame's one batched copy pass.
 Store uploads always use `cycle=false`; vertex ring buffers alone use

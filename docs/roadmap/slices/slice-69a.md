@@ -31,7 +31,7 @@ cover the new features.
   (`tools/tileset_quality.py`) makes indices 12–15 duplicates of 11.
 - Tile flags: `cobblestone`, `stone_floor`, `rotten_planks`, and `cave_*` are
   walkable; `brick_wall_*` and `structure_*` block movement and vision.
-- `InterestMarkerStore` (`world_interest.zig`) has kinds
+- `InterestMarkerStore` (`world/interest.zig`) has kinds
   `investigate|cover|resource|patrol`; 58 grows it with content.
 - AI goal level: `writeAiIntentsJob` (`systems/ai.zig`) writes
   `NavigationIntent` without `goal_level`, so it defaults to 0; every gathered

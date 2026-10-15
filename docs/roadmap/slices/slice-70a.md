@@ -26,7 +26,7 @@ game-facing renderer API is renamed.
   `appendStaticTilemapSpan`.
 - `gpu/pipeline_common.zig`: one SoA layout (FLOAT2/FLOAT2/FLOAT4) shared by
   the sprite and tilemap pipelines; neither shader uses `gl_VertexIndex`.
-- Game-side quad builders that see vertex columns: `world_system.zig`,
+- Game-side quad builders that see vertex columns: `world/render.zig`,
   `render_prep.zig` (`staticGeometryCapacity`), `gpu_smoke_impl.zig`.
 - `text.zig` has a private float → byte color conversion.
 - SDL 3.4 provides `UBYTE4_NORM`, 16-bit index buffers, and indexed draws with

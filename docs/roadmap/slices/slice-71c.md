@@ -21,7 +21,7 @@ byte-identical to today.
 - `InterestMarkerKind.cover` is reserved with no consumer; a marker's radius
   is its authored footprint, not a discovery gate; the faction filter is
   "restricted unless proven" with a slot-order tie-break
-  (`src/game/world_interest.zig`). Investigate ignores the reserved kinds,
+  (`src/game/world/interest.zig`). Investigate ignores the reserved kinds,
   pinned by a test in `src/game/systems/ai.zig`.
 - Flee resolves `self + normalize(self − threat) × 96 px` from a visible
   threat, else fresh memory; pursue resolves visible → fresh memory matching

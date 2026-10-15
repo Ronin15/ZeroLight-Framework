@@ -18,7 +18,7 @@ new persists. A single-region world is identical to Slice 59.
 ### Current foundation
 
 - `WorldSystem.chunkCoordForWorldPos` composes `math.worldPosToCell` with
-  `chunkCoordForCell` (`src/game/world_system.zig`).
+  `chunkCoordForCell` (`src/game/world/system.zig`).
 - Perception gather rows carry position and level per observer
   (`systems/perception.zig`).
 - Slice 59 (not landed): global weather rolls, lightning, wind, modifiers by
