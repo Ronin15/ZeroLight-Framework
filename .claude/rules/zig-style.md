@@ -42,6 +42,7 @@ paths:
   - `@splat(x)`, not `**`; `@memcpy`/`@memset`, not `std.mem.copy`/`set`;
     `@memmove`, not `std.mem.copyForwards`/`copyBackwards`.
   - `std.array_list.Aligned`, never `std.ArrayListAligned`.
+  - `std.mem.print`, not `std.fmt.bufPrint`.
   - `@typeInfo(T).<kind>.field_names`/`field_types` or `std.meta.tags(E)`, not
     `std.meta.fields`.
   - `dupeSentinel(u8, bytes, 0)`, not `dupeZ`; `std.builtin.Optimize`, not

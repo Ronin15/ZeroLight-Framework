@@ -1082,11 +1082,11 @@ fn statusText(stats: RunStats) []const u8 {
 }
 
 fn formatDurationInto(buffer: []u8, ns: u64) []const u8 {
-    return std.fmt.bufPrint(buffer, "{f}", .{formatDuration(ns)}) catch "duration";
+    return std.mem.print(buffer, "{f}", .{formatDuration(ns)}) catch "duration";
 }
 
 fn formatSpeedupInto(buffer: []u8, basis_points: u64) []const u8 {
-    return std.fmt.bufPrint(buffer, "{d}.{d:0>2}x", .{ basis_points / 100, basis_points % 100 }) catch "speedup";
+    return std.mem.print(buffer, "{d}.{d:0>2}x", .{ basis_points / 100, basis_points % 100 }) catch "speedup";
 }
 
 fn formatThroughputInto(buffer: []u8, items_per_second: u64) []const u8 {
@@ -1104,16 +1104,16 @@ fn formatThroughputInto(buffer: []u8, items_per_second: u64) []const u8 {
         FormatUnit{ .scale = 1, .suffix = "/s" };
 
     if (unit.scale == 1) {
-        return std.fmt.bufPrint(buffer, "{}{s}", .{ items_per_second, unit.suffix }) catch "throughput";
+        return std.mem.print(buffer, "{}{s}", .{ items_per_second, unit.suffix }) catch "throughput";
     }
 
     const whole = items_per_second / unit.scale;
     const fraction = (items_per_second % unit.scale) / (unit.scale / 100);
-    return std.fmt.bufPrint(buffer, "{}.{d:0>2}{s}", .{ whole, fraction, unit.suffix }) catch "throughput";
+    return std.mem.print(buffer, "{}.{d:0>2}{s}", .{ whole, fraction, unit.suffix }) catch "throughput";
 }
 
 fn formatWorkerThreadsInto(buffer: []u8, stats: RunStats) []const u8 {
-    return std.fmt.bufPrint(buffer, "{}/{}", .{ stats.batch.active_worker_threads, stats.batch.available_worker_threads }) catch "workers";
+    return std.mem.print(buffer, "{}/{}", .{ stats.batch.active_worker_threads, stats.batch.available_worker_threads }) catch "workers";
 }
 
 // A range column of `batch`: `inline` when it ran inline (no range split), else `value`.
@@ -1123,7 +1123,7 @@ fn formatRangeCellInto(buffer: []u8, batch: BatchSummary, value: usize) []const 
 }
 
 fn formatUsizeInto(buffer: []u8, value: usize) []const u8 {
-    return std.fmt.bufPrint(buffer, "{}", .{value}) catch "value";
+    return std.mem.print(buffer, "{}", .{value}) catch "value";
 }
 
 fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const u8 {
@@ -1454,9 +1454,9 @@ pub fn StageShapes(comptime n: usize) type {
         pub fn label(self: *const Self, index: usize, buffer: []u8) []const u8 {
             const batch = self.busiest[index];
             if (batch.ran_inline or batch.active_worker_threads == 0) {
-                return std.fmt.bufPrint(buffer, "inline({})[{}/{}]", .{ batch.item_count, self.threaded[index], self.dispatched[index] }) catch "inline";
+                return std.mem.print(buffer, "inline({})[{}/{}]", .{ batch.item_count, self.threaded[index], self.dispatched[index] }) catch "inline";
             }
-            return std.fmt.bufPrint(buffer, "{}w/{}r({})[{}/{}]", .{ batch.active_worker_threads, batch.range_count, batch.item_count, self.threaded[index], self.dispatched[index] }) catch "stage";
+            return std.mem.print(buffer, "{}w/{}r({})[{}/{}]", .{ batch.active_worker_threads, batch.range_count, batch.item_count, self.threaded[index], self.dispatched[index] }) catch "stage";
         }
     };
 }

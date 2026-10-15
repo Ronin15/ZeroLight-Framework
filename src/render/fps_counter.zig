@@ -129,7 +129,7 @@ pub const FpsCounter = struct {
         x += @floatFromInt(self.prefix.width);
 
         var buffer: [16]u8 = undefined;
-        const digits = std.fmt.bufPrint(&buffer, "{d}", .{self.displayed_fps}) catch "0";
+        const digits = std.mem.print(&buffer, "{d}", .{self.displayed_fps}) catch "0";
         for (digits) |digit| {
             const prepared = self.digits[digit - '0'];
             try text.drawPreparedText(renderer, prepared, .{

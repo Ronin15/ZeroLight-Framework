@@ -223,9 +223,9 @@ pub const SettingsMenuState = struct {
         var sfx_buf: [64]u8 = undefined;
         var music_buf: [64]u8 = undefined;
         const labels = [_][]const u8{
-            std.fmt.bufPrint(&master_buf, "Master Volume: {d: >2}/10", .{self.settings.master}) catch "Master Volume: ??/10",
-            std.fmt.bufPrint(&sfx_buf, "SFX Volume:    {d: >2}/10", .{self.settings.sfx}) catch "SFX Volume:    ??/10",
-            std.fmt.bufPrint(&music_buf, "Music Volume:  {d: >2}/10", .{self.settings.music}) catch "Music Volume:  ??/10",
+            std.mem.print(&master_buf, "Master Volume: {d: >2}/10", .{self.settings.master}) catch "Master Volume: ??/10",
+            std.mem.print(&sfx_buf, "SFX Volume:    {d: >2}/10", .{self.settings.sfx}) catch "SFX Volume:    ??/10",
+            std.mem.print(&music_buf, "Music Volume:  {d: >2}/10", .{self.settings.music}) catch "Music Volume:  ??/10",
             "Back",
         };
 

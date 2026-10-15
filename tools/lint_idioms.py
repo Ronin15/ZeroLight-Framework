@@ -164,6 +164,11 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "std.mem.copyForwards/copyBackwards are deprecated in Zig 0.17; use @memmove",
     ),
     (
+        re.compile(r"\bstd\.fmt\.(?:bufPrint|bufPrintSentinel|BufPrintError)\b"),
+        "std.fmt.bufPrint/bufPrintSentinel/BufPrintError are deprecated in Zig 0.17; use "
+        "std.mem.print/printSentinel/PrintError",
+    ),
+    (
         re.compile(r"\bstd\.BoundedArray\b"),
         "std.BoundedArray is removed; use a fixed array + len or std.ArrayList",
     ),
