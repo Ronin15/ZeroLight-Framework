@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const math = @import("../core/math.zig");
 const AiBehavior = @import("../game/data_system.zig").AiBehavior;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -66,7 +67,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    try frame.reserveStreams(suite.rangeCount(count, ai_range_alignment_items), 0, count, 0, 0, 0);
+    try frame.reserveStreams(maxRangeCount(count, ai_range_alignment_items), 0, count, 0, 0, 0);
 
     // Marker entities for flee's `nearest_threat` id and pursue's opt-in
     // `focus_target` fallback id: only their validity matters here (no

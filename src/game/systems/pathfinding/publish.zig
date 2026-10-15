@@ -235,7 +235,7 @@ pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*Pat
             // keeps its shape. The explicit range size opts the batch out of the tuner:
             // nothing is recorded.
             if (truncate and stage.adaptive and stage.items_per_range == null) {
-                flush_stage.items_per_range = (units + flush_pair_count - 1) / flush_pair_count;
+                flush_stage.items_per_range = @divCeil(units, flush_pair_count);
             }
             break :pairs flush_stage;
         } else null;
@@ -762,7 +762,7 @@ test "a shrink's registry flush runs on workers at about one pair per range unde
     // units or more that is exactly one range per pair.
     try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
     try std.testing.expect(flush.item_count >= flush_pair_count * flush_pair_count);
-    try std.testing.expectEqual((flush.item_count + flush_pair_count - 1) / flush_pair_count, flush.items_per_range);
+    try std.testing.expectEqual(@divCeil(flush.item_count, flush_pair_count), flush.items_per_range);
     try std.testing.expectEqual(flush_pair_count, flush.range_count);
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
@@ -794,7 +794,7 @@ test "a shrink's registry flush keeps a configured range size and equals the ser
     try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
     try std.testing.expect(flush.item_count > flush_pair_count * units_per_range);
     try std.testing.expectEqual(units_per_range, flush.items_per_range);
-    try std.testing.expectEqual((flush.item_count + units_per_range - 1) / units_per_range, flush.range_count);
+    try std.testing.expectEqual(@divCeil(flush.item_count, units_per_range), flush.range_count);
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);

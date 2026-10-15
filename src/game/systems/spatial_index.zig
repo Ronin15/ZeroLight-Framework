@@ -61,7 +61,6 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
@@ -450,7 +449,7 @@ fn appendSpatialRow(
 }
 
 fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, spatial_index_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, spatial_index_range_alignment_items);
 }
 
 pub const SpatialIndexSystem = struct {

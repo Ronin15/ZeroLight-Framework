@@ -66,14 +66,14 @@ pub const OrderedIndexSet = struct {
     const word_shift = std.math.log2(word_bits);
     // Each tier divides the index width by `word_bits`, so any usize capacity summarizes to
     // one word within this many tiers.
-    const max_tiers = (@bitSizeOf(usize) + word_shift - 1) / word_shift;
+    const max_tiers = @divCeil(@bitSizeOf(usize), word_shift);
 
     tiers: [max_tiers]std.bit_set.Dynamic = @splat(.{}),
     tier_count: usize = 0,
 
     // Mask words of a std bit set of `bits` bits.
     pub fn maskCount(bits: usize) usize {
-        return (bits + word_bits - 1) / word_bits;
+        return @divCeil(bits, word_bits);
     }
 
     pub fn deinit(self: *OrderedIndexSet, allocator: std.mem.Allocator) void {

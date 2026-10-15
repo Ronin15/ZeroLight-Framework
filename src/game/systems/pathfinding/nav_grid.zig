@@ -44,7 +44,7 @@ comptime {
 /// non-adjacent orthogonally (a checkerboard), since orthogonal neighbours always join and
 /// the corner rule only splits diagonals.
 pub fn maxChunkLabels(chunk_tiles: u16) usize {
-    return (@as(usize, chunk_tiles) * chunk_tiles + 1) / 2;
+    return @divCeil(@as(usize, chunk_tiles) * chunk_tiles, 2);
 }
 
 const NavCellBlock = struct {

@@ -3914,7 +3914,7 @@ test "an agent reaches the goal through partial hops" {
     const window = system.graph.chunkGeometry().chunk_tiles;
     // The route runs 119 cells along the strip; each hop advances past its start's window.
     const route_cells: usize = 119;
-    const hop_bound = (route_cells + capacity.max_stitched_path_cells - window - 1) / (capacity.max_stitched_path_cells - window) + 1;
+    const hop_bound = @divCeil(route_cells, capacity.max_stitched_path_cells - window) + 1;
     var position = partial_start;
     var hops: usize = 0;
     while (true) {
@@ -5250,7 +5250,7 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
         var worker_ranges: usize = 0;
         // Ranges far smaller than a pair (most hold no pair start), ranges that cut pairs,
         // and two ranges of several pairs each.
-        for ([_]usize{ 1, 3, 7, 40, (units + 1) / 2 }) |items_per_range| {
+        for ([_]usize{ 1, 3, 7, 40, @divCeil(units, 2) }) |items_per_range| {
             var threaded = try registrySystem(&data, &fixture.world, 16);
             defer threaded.deinit();
             try prepareMixedFlush(&threaded, requester);
@@ -5262,7 +5262,7 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
             try std.testing.expect(batch.active_worker_threads <= flush_pair_count - 1);
             worker_ranges += batch.worker_thread_ranges;
             try std.testing.expectEqual(units, batch.item_count);
-            try std.testing.expectEqual((units + items_per_range - 1) / items_per_range, batch.range_count);
+            try std.testing.expectEqual(@divCeil(units, items_per_range), batch.range_count);
             try std.testing.expectEqual(serial_stats.registrations_added, stats.registrations_added);
             try std.testing.expectEqual(serial_stats.registrations_removed, stats.registrations_removed);
             try expectSameCache(&serial, &threaded);

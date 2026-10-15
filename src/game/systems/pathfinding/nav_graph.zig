@@ -66,7 +66,7 @@ const foldLevelCrossings = @import("link_bounds.zig").foldLevelCrossings;
 // Most border portals a chunk of edge `chunk_tiles` holds: one per open run on each of its
 // four sides.
 fn borderPortalBound(chunk_tiles: u16) usize {
-    return 4 * ((@as(usize, chunk_tiles) + 1) / 2);
+    return 4 * @divCeil(@as(usize, chunk_tiles), 2);
 }
 
 // Most border portals any chunk holds.
@@ -4178,7 +4178,7 @@ test "border portals never exceed 4 * ceil(E / 2) and random digs match a full r
             try test_support.recordTileChange(&system, &world, changed);
         }
         _ = try system.applyBufferedNavUpdates(no_colliders, &world, null);
-        const bound = 4 * ((@as(usize, edge) + 1) / 2);
+        const bound = 4 * @divCeil(@as(usize, edge), 2);
         // Each record's border window is sized from the level's own chunk edge.
         try std.testing.expectEqual(bound, system.graph.levelGraph(0).?.border_stride);
         for (0..system.graph.chunkCount()) |chunk| {

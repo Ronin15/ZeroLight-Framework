@@ -74,7 +74,7 @@ const tile_data_cells_per_element: usize = 2;
 pub const tile_data_pad_cell: u16 = std.math.maxInt(u16);
 
 fn tileDataElementCount(cell_count: usize) usize {
-    return (cell_count + tile_data_cells_per_element - 1) / tile_data_cells_per_element;
+    return @divCeil(cell_count, tile_data_cells_per_element);
 }
 
 fn packTileDataElement(low_cell: u16, high_cell: u16) u32 {

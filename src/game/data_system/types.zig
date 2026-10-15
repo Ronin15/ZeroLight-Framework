@@ -14,7 +14,6 @@ const faction = @import("../faction.zig");
 const render_depth = @import("../render_depth.zig");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const WorldDepth = render_depth.WorldDepth;
 pub const Faction = faction.Faction;
 
@@ -27,7 +26,7 @@ pub const HotI32Slice = []i32;
 pub const ConstHotI32Slice = []const i32;
 
 pub fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, movement_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, movement_range_alignment_items);
 }
 
 /// Committed row counts of the component stores whose pipeline scratch, event

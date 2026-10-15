@@ -24,7 +24,6 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const band_tuner_config = @import("../../app/thread_system.zig").band_tuner_config;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
@@ -62,7 +61,7 @@ const HotF32Slice = @import("../data_system.zig").HotF32Slice;
 const ConstHotF32Slice = @import("../data_system.zig").ConstHotF32Slice;
 
 fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, steering_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, steering_range_alignment_items);
 }
 
 /// Prefer the dense movement scope level (kept in sync with world_level) when the
@@ -3934,7 +3933,7 @@ test "steering claim band count does not follow the resolve partition" {
         else
             try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
         if (items_per_range) |range_items| {
-            try std.testing.expectEqual((intents.len + range_items - 1) / range_items, stats.select_resolve_batch.range_count);
+            try std.testing.expectEqual(@divCeil(intents.len, range_items), stats.select_resolve_batch.range_count);
             // Three 16-row claim blocks over 40 steering rows, whatever the resolve ranges.
             try std.testing.expectEqual(@as(usize, 3), stats.select_claim_batch.item_count);
         }

@@ -888,7 +888,7 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
         system.config = .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false };
         const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads);
         try std.testing.expect(!system.last_batch.ran_inline);
-        try std.testing.expectEqual((population + items_per_range - 1) / items_per_range, system.last_batch.range_count);
+        try std.testing.expectEqual(@divCeil(population, items_per_range), system.last_batch.range_count);
         try std.testing.expectEqualSlices(PlaneEntry, want, entries);
     }
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);

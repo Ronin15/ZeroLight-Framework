@@ -215,8 +215,8 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
     // The rest spread over every level's outside rows, row-major on a fixed column
     // stride, with the row stride spreading each level's share over the rows.
     const outside_count = sparse_count - window_tile_count;
-    const per_level = (outside_count + world_levels - 1) / world_levels;
-    const outside_rows = @max(1, (per_level + outside_columns - 1) / outside_columns);
+    const per_level = @divCeil(outside_count, world_levels);
+    const outside_rows = @max(1, @divCeil(per_level, outside_columns));
     const row_stride: usize = (world_side - outside_first_row) / outside_rows;
     std.debug.assert(row_stride >= 1);
     for (0..outside_count) |index| {

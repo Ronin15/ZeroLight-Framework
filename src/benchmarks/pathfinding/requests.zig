@@ -616,7 +616,7 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer empty.deinit();
 
     // A healthy queue empties in ceil(N / ceiling) steps; past that a cycle stops.
-    const drain_step_limit = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
+    const drain_step_limit = @divCeil(item_count, default_max_solves_per_frame) + 2;
     const drain_samples = coldIterations(options);
     for (0..@max(@as(usize, 1), coldWarmup(options))) |_| {
         try refillDrainQueue(system, &fixture.requests, thread_ptr, case, item_count);
@@ -666,7 +666,7 @@ fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(Pat
 // Steps until every request is a cache hit and, for an adaptive case, the intake tuner has
 // settled (bounded), so the timed steps are the hit path only.
 fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !void {
-    const fill_limit = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
+    const fill_limit = @divCeil(item_count, default_max_solves_per_frame) + 2;
     const settle_limit = fill_limit + suite.adaptiveSettleIterationLimit(options);
     var steps: usize = 0;
     while (true) {

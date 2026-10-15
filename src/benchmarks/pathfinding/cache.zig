@@ -154,7 +154,7 @@ fn buildShortRouteRequests(allocator: std.mem.Allocator, data: *DataSystem, open
 
 // The result cache holds `cached_results_per_agent` results per agent.
 fn evictAgentBudget(result_count: usize) usize {
-    return (result_count + cached_results_per_agent - 1) / cached_results_per_agent;
+    return @divCeil(result_count, cached_results_per_agent);
 }
 
 // The evict dig: right of every goal column, so it crosses a few paths of the first
@@ -326,7 +326,7 @@ fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSys
     try system.reserve(capacity);
     system.clearRuntimeState();
     const agent_total = requests.len;
-    const step_limit = elastic_ramp_steps + 4 * suite.rangeCount(agent_total, default_max_solves_per_frame) + elastic_ramp_steps;
+    const step_limit = elastic_ramp_steps + 4 * @divCeil(agent_total, default_max_solves_per_frame) + elastic_ramp_steps;
     var ramp = ElasticRamp{};
     for (0..step_limit) |step| {
         const live = if (step < elastic_ramp_steps) agent_total * (step + 1) / elastic_ramp_steps else agent_total;

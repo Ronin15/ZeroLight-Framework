@@ -1688,7 +1688,7 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
         const config = ScopeConfig{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false };
         const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, config);
         try std.testing.expect(!collision.batch.ran_inline);
-        try std.testing.expectEqual((population + items_per_range - 1) / items_per_range, collision.batch.range_count);
+        try std.testing.expectEqual(@divCeil(population, items_per_range), collision.batch.range_count);
         try std.testing.expectEqualSlices(u32, col_serial, collision.indices.?);
 
         const ai_result = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, config);

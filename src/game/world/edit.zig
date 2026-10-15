@@ -181,7 +181,7 @@ const DenseEditStrides = struct {
         comptime std.debug.assert(max_chunk_cells * @sizeOf(TileId) % thread_shared_record_alignment == 0);
         return .{
             .bands = bands,
-            .mask_words = @max(1, (bands + 63) / 64),
+            .mask_words = @max(1, @divCeil(bands, 64)),
             .finals = bands * max_chunk_cells,
             .touched = std.mem.alignForward(usize, bands * @sizeOf(ChunkBits), thread_shared_record_alignment) / @sizeOf(ChunkBits),
             .owned = std.mem.alignForward(usize, bands, thread_shared_record_alignment / std.math.gcd(@sizeOf(?OwnedBlock), thread_shared_record_alignment)),

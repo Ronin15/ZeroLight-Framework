@@ -15,7 +15,6 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
@@ -43,7 +42,7 @@ const HotF32Slice = @import("../data_system.zig").HotF32Slice;
 const ConstHotF32Slice = @import("../data_system.zig").ConstHotF32Slice;
 
 fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, collision_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, collision_range_alignment_items);
 }
 
 pub const ProxySlice = struct {
@@ -248,9 +247,9 @@ pub const CollisionSystem = struct {
     /// tuner can pick. Grow-only; re-run by the pipeline's population seam.
     ///
     /// Broadphase pair density per item is data, so it keeps per-range slots: slot r is
-    /// reserved to `broadphasePairBound(ceilDiv(cap, r + 1))` for every
-    /// `r < maxRangeCount(cap)`. Range r of any partition covers at most
-    /// `ceilDiv(cap, r + 1)` items (r full ranges precede it), so every range holds
+    /// reserved to `broadphasePairBound(@divCeil(cap, r + 1))` for every
+    /// `r < maxRangeCount(cap, collision_range_alignment_items)`. Range r of any partition covers at most
+    /// `@divCeil(cap, r + 1)` items (r full ranges precede it), so every range holds
     /// `broadphase_pairs_per_item` pairs for each of its items under every partition. No
     /// `cap` clamp: a 2-range partition puts `cap / 2` items in range 0, which needs
     /// `2 * cap` pairs at the bound. The merged candidates, the narrowphase staging (at
@@ -259,7 +258,6 @@ pub const CollisionSystem = struct {
     /// scene with at most `broadphase_pairs_per_item` pairs per swept item in every range
     /// therefore stays allocation-free under every partition. A denser scene, or a denser
     /// cluster inside one range, takes the grow paths, counted in `pair_bound_overflows`.
-    /// At 2053 bodies the 129 slots hold 44,960 pairs (719,360 B).
     pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
         if (body_capacity == 0) return;
         const pair_capacity = broadphasePairBound(body_capacity);
@@ -269,7 +267,7 @@ pub const CollisionSystem = struct {
         const broadphase_range_count = maxRangeCount(body_capacity, collision_range_alignment_items);
         try self.prepareBroadphaseRangeBuffers(broadphase_range_count);
         for (self.broadphase_ranges.items[0..broadphase_range_count], 0..) |*slot, range_index| {
-            const range_len_bound = (body_capacity + range_index) / (range_index + 1);
+            const range_len_bound = @divCeil(body_capacity, range_index + 1);
             // Precise: the bound is exact, so no geometric slack per slot.
             try slot.buffer.pairs.ensureTotalCapacityPrecise(self.allocator, broadphasePairBound(range_len_bound));
         }

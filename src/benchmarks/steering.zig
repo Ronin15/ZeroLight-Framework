@@ -17,6 +17,7 @@ const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
+const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -141,8 +142,8 @@ fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fi
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    try frame.reserveStreams(suite.rangeCount(count, steering_range_alignment_items), 0, count, 0, 0, 0);
-    try frame.reservePathRequests(suite.rangeCount(count, steering_range_alignment_items), count);
+    try frame.reserveStreams(maxRangeCount(count, steering_range_alignment_items), 0, count, 0, 0, 0);
+    try frame.reservePathRequests(maxRangeCount(count, steering_range_alignment_items), count);
     var pathfinding = PathfindingSystem.init(allocator);
     errdefer pathfinding.deinit();
     try pathfinding.reserve(.{
@@ -494,7 +495,7 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    const range_count = suite.rangeCount(agent_count, steering_range_alignment_items);
+    const range_count = maxRangeCount(agent_count, steering_range_alignment_items);
     try frame.reserveStreams(range_count, static_move_event_count, agent_count, 0, 0, 1);
     try frame.reservePathRequests(range_count, agent_count);
     var pathfinding = PathfindingSystem.init(allocator);
@@ -521,7 +522,7 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
 
     const filler_count = static_count - near_static_count - 1;
     // At least two chunks so the mover always has two to alternate between.
-    const filler_chunks = @max(@as(usize, 2), (filler_count + statics_per_filler_chunk - 1) / statics_per_filler_chunk);
+    const filler_chunks = @max(@as(usize, 2), @divCeil(filler_count, statics_per_filler_chunk));
     const block_side = std.math.sqrt(filler_chunks - 1) + 1;
     std.debug.assert(block_side * block_side >= filler_chunks);
     for (0..filler_count) |index| {
@@ -659,7 +660,7 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    const range_count = suite.rangeCount(agent_count, steering_range_alignment_items);
+    const range_count = maxRangeCount(agent_count, steering_range_alignment_items);
     try frame.reserveStreams(range_count, 0, agent_count, 0, 0, 0);
     try frame.reservePathRequests(range_count, agent_count);
     var pathfinding = PathfindingSystem.init(allocator);

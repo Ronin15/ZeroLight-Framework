@@ -774,7 +774,7 @@ pub const StitchedCell = struct {
 /// Words a stored stitched path of `len` cells occupies: its cells (one `u32` each), then
 /// its levels packed two `u16` to a word.
 pub fn stitchedWords(len: usize) usize {
-    return len + (len + 1) / 2;
+    return len + @divCeil(len, 2);
 }
 
 /// Words of one solve-output stripe and of one result-cache long block: the longest plain
@@ -1336,12 +1336,12 @@ const test_support = @import("test_support.zig");
 test "the shift-based chunk geometry equals division over every cell, short border chunks included" {
     for ([_]u16{ 1, 2, 4, 16 }) |edge| {
         // Two full chunks and a short one per axis, different per axis.
-        const width: u32 = 2 * @as(u32, edge) + (edge + 1) / 2;
+        const width: u32 = 2 * @as(u32, edge) + @divCeil(edge, 2);
         const height: u32 = 3 * @as(u32, edge) - edge / 2;
         const geometry = ChunkGeometry.init(width, height, edge);
         const ct: usize = edge;
-        try std.testing.expectEqual((width + ct - 1) / ct, geometry.chunks_x);
-        try std.testing.expectEqual((height + ct - 1) / ct, geometry.chunks_y);
+        try std.testing.expectEqual(@divCeil(width, ct), geometry.chunks_x);
+        try std.testing.expectEqual(@divCeil(height, ct), geometry.chunks_y);
         for (0..height) |y| for (0..width) |x| {
             const chunk: u32 = @intCast((y / ct) * geometry.chunks_x + x / ct);
             const local: u8 = @intCast((y % ct) * ct + x % ct);

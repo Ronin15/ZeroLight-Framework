@@ -294,7 +294,7 @@ pub const ReactFixture = struct {
             const end = @min(start + self.agent_count, self.requests.len);
             try fixtures.writeRequests(&self.stream, self.requests[start..end]);
             var step_stats = try runColdOnce(&self.system, &self.stream, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
-            var guard = suite.rangeCount(self.agent_count, default_max_solves_per_frame) + 2;
+            var guard = @divCeil(self.agent_count, default_max_solves_per_frame) + 2;
             while (step_stats.pending_requests != 0) : (guard -= 1) {
                 if (guard == 0) return error.EvictFillStalled;
                 step_stats = try runColdOnce(&self.system, &self.empty, thread_system, case, self.agent_count, self.agent_count, self.agent_count);

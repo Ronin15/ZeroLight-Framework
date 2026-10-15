@@ -56,7 +56,7 @@ pub fn defaultItemCounts(profile: suite.Profile) []const usize {
 
 fn perceivedEventCount(count: usize) usize {
     if (count == 0) return 0;
-    return (count + ai_memory_event_stride - 1) / ai_memory_event_stride;
+    return @divCeil(count, ai_memory_event_stride);
 }
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {

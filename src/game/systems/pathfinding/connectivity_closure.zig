@@ -166,7 +166,7 @@ fn shrinkDue(terms: u32, k_cap: u32) bool {
 }
 
 fn compactCap(terms: u32) u32 {
-    return std.math.ceilPowerOfTwoAssert(u32, terms + (terms + 1) / 2);
+    return std.math.ceilPowerOfTwoAssert(u32, terms + @divCeil(terms, 2));
 }
 
 /// Words of a block of `k_cap` indices: its rows and index map, padded to whole lines so every
@@ -657,7 +657,7 @@ pub fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usi
     // A block's cap is a power of two below twice its component's terminals.
     const cap_max = std.math.ceilPowerOfTwo(usize, 2 *| system) catch std.math.maxInt(usize);
     const row_words = @max(1, cap_max / 32);
-    const spans = (row_words + span_words - 1) / span_words;
+    const spans = @divCeil(row_words, span_words);
     const live_words = 2 *| terminals *| (row_words +| 2) +| span_words *| terminals;
     const blocks = (3 *| live_words +| span_words *| terminals) *| @sizeOf(u32);
     const registry = rowsBytesBound(OneWayRow, shape.oneway_links);
@@ -1937,7 +1937,7 @@ const APosColumns = struct {
 
 // Rows items per SCC of a block of `k_cap` indices: one per 16-word span of a row.
 fn spanCount(k_cap: u32) u32 {
-    return (rowWords(k_cap) + @as(u32, span_words) - 1) / @as(u32, span_words);
+    return @divCeil(rowWords(k_cap), @as(u32, span_words));
 }
 
 // ORs `row` into `acc` word for word: four lanes at a time through `simd`, a scalar tail.

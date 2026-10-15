@@ -88,7 +88,7 @@ const Layout = struct {
 
     fn of(side: u16, faller_count: usize) Layout {
         // At least one, so walkers keep the same columns with no fallers as with few.
-        const hole_columns: u16 = @intCast(@max(1, (faller_count + side - 1) / side));
+        const hole_columns: u16 = @intCast(@max(1, @divCeil(faller_count, side)));
         const first_hole_x = side - hole_columns;
         // Fallers fill at most half the level, so walkers keep at least half its columns.
         std.debug.assert(first_hole_x >= side / 2);

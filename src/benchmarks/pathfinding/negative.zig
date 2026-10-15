@@ -167,7 +167,7 @@ fn pocketWallCells() [2 * pocket_side + 1]CellCoord {
 fn checkPocketLayout(allocator: std.mem.Allocator, side: u16, goal_count: usize, requester_count: usize) !void {
     if (goal_count > @as(usize, pocket_side) * pocket_side) return error.PocketGoalCellsTooFew;
     const columns = side -| 2 * pocket_requester_margin;
-    if (columns == 0 or pocket_requester_row + (requester_count + columns - 1) / columns > side -| pocket_dig_inset) return error.PocketRequesterRowsTooFew;
+    if (columns == 0 or pocket_requester_row + @divCeil(requester_count, columns) > side -| pocket_dig_inset) return error.PocketRequesterRowsTooFew;
     var taken = try std.DynamicBitSetUnmanaged.initEmpty(allocator, @as(usize, side) * side);
     defer taken.deinit(allocator);
     const walls = pocketWallCells();
@@ -499,8 +499,8 @@ fn burstBlockCells() [burst_pockets * burst_block_side * burst_block_side]CellCo
 // inside the level.
 fn checkBurstLayout(config: BurstConfig) !void {
     if (config.requests == 0) return error.NegativeBurstNoRequests;
-    if (config.variant == .open_goals and (config.requests + burst_pockets - 1) / burst_pockets > @as(usize, burst_pocket_side) * burst_pocket_side) return error.NegativeBurstGoalCellsTooFew;
-    const rows = (config.requests + burst_requester_columns - 1) / burst_requester_columns;
+    if (config.variant == .open_goals and @divCeil(config.requests, burst_pockets) > @as(usize, burst_pocket_side) * burst_pocket_side) return error.NegativeBurstGoalCellsTooFew;
+    const rows = @divCeil(config.requests, burst_requester_columns);
     if (burst_requester_row + rows > burst_side) return error.NegativeBurstRequesterRowsTooFew;
 }
 

@@ -735,7 +735,7 @@ fn entitySpawnLayout(item_count: usize) EntitySpawnLayout {
     const stride: f32 = 20;
     const max_entity_extent: f32 = 20;
     const margin: f32 = stride;
-    const rows = (item_count + cols - 1) / cols;
+    const rows = @divCeil(item_count, cols);
     const width = @as(f32, @floatFromInt(cols)) * stride + max_entity_extent + margin;
     const height = @as(f32, @floatFromInt(rows)) * stride + max_entity_extent + margin;
     return .{

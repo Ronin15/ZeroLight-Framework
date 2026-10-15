@@ -24,7 +24,6 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const band_tuner_config = @import("../../app/thread_system.zig").band_tuner_config;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
@@ -59,7 +58,7 @@ const max_bands: usize = 64;
 const band_block_rows: usize = collision_response_range_alignment_items;
 
 fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, collision_response_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, collision_response_range_alignment_items);
 }
 
 const ResponseIntentKind = enum(u32) {

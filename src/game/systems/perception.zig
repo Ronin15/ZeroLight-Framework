@@ -86,7 +86,6 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
@@ -117,7 +116,7 @@ const perception_adaptive_tuner_config = AdaptiveWorkTunerConfig{
 };
 
 fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, perception_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, perception_range_alignment_items);
 }
 
 // Mirrors ai.zig's max_separation_neighbors/max_separation_candidate_checks

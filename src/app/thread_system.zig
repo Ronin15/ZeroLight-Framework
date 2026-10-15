@@ -226,7 +226,7 @@ pub const AdaptiveWorkTuner = struct {
 
     pub fn init(config: AdaptiveWorkTunerConfig) AdaptiveWorkTuner {
         const normalized = normalizeWorkTunerConfig(config);
-        const initial = clampItemCount(normalized.initial_range_items, normalized.smallest_range_items, normalized.largest_range_items);
+        const initial = std.math.clamp(normalized.initial_range_items, normalized.smallest_range_items, normalized.largest_range_items);
         const profile = AdaptiveWorkProfile{
             .worker_threads = 1,
             .items_per_range = initial,
@@ -547,7 +547,7 @@ pub const AdaptiveWorkTuner = struct {
         const participant_overhead_ns = @max(self.model_participant_overhead_ns, default_participant_overhead_ns);
         const ideal_participants_f = @sqrt(estimated_work_ns / participant_overhead_ns);
         const max_participants = request.max_worker_threads + 1;
-        const participants = clampUsize(roundedUsize(ideal_participants_f), 1, max_participants);
+        const participants = std.math.clamp(roundedUsize(ideal_participants_f), 1, max_participants);
         if (participants <= 1) return 1;
         const predicted_threaded_ns = estimated_work_ns / @as(f64, @floatFromInt(participants)) +
             participant_overhead_ns * @as(f64, @floatFromInt(participants - 1));
@@ -570,7 +570,7 @@ pub const AdaptiveWorkTuner = struct {
             @sqrt(self.model_imbalance_work_ns / (range_overhead_ns * @as(f64, @floatFromInt(clamped_participants))))
         else
             @sqrt(work_per_participant_ns / range_overhead_ns);
-        const ranges_per_participant = clampUsize(
+        const ranges_per_participant = std.math.clamp(
             roundedUsize(ranges_per_participant_f),
             self.config.min_ranges_per_participant,
             self.config.max_ranges_per_participant,
@@ -631,7 +631,7 @@ pub const AdaptiveWorkTuner = struct {
         );
 
         if (stats.range_count > 0 and stats.main_thread_wait_ns > 0) {
-            const ranges_per_participant = @max(@as(usize, 1), ceilDiv(stats.range_count, participants));
+            const ranges_per_participant = @max(@as(usize, 1), @divCeil(stats.range_count, participants));
             self.model_imbalance_work_ns = ewma(
                 self.model_imbalance_work_ns,
                 main_thread_wait_ns * @as(f64, @floatFromInt(ranges_per_participant)),
@@ -755,11 +755,11 @@ pub const AdaptiveWorkTuner = struct {
     }
 
     fn normalizedItemsPerRange(self: *const AdaptiveWorkTuner, items_per_range: usize, alignment: usize) usize {
-        const clamped = clampItemCount(@max(items_per_range, @as(usize, 1)), self.config.smallest_range_items, self.config.largest_range_items);
-        const aligned_up = alignItemCount(clamped, alignment);
+        const clamped = std.math.clamp(@max(items_per_range, @as(usize, 1)), self.config.smallest_range_items, self.config.largest_range_items);
+        const aligned_up = std.mem.alignForwardAnyAlign(usize, clamped, alignment);
         if (aligned_up <= self.config.largest_range_items) return aligned_up;
 
-        const aligned_max = alignItemCountDown(self.config.largest_range_items, alignment);
+        const aligned_max = std.mem.alignBackwardAnyAlign(usize, self.config.largest_range_items, alignment);
         if (aligned_max >= self.config.smallest_range_items) return aligned_max;
         return clamped;
     }
@@ -1213,7 +1213,7 @@ fn resolveWorkerThreadCount(override_count: ?usize) !usize {
 
 // Callers normalize items_per_range before entering this helper.
 pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
-    return (item_count + items_per_range - 1) / items_per_range;
+    return @divCeil(item_count, items_per_range);
 }
 
 /// Upper bound on the range count of any batch over at most `item_count` items with
@@ -1234,8 +1234,7 @@ pub const thread_shared_record_alignment: usize = 64;
 
 /// Bytes that pad `T` to a whole number of `thread_shared_record_alignment` lines.
 pub fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
+    return std.mem.alignForward(usize, @sizeOf(T), thread_shared_record_alignment) - @sizeOf(T);
 }
 
 /// One range's record, padded so concurrently written slots never share a cache line.
@@ -1279,7 +1278,7 @@ pub fn BandPartition(comptime block_rows: usize, comptime max_bands: usize) type
         row_count: usize,
 
         pub fn init(row_count: usize) Self {
-            const block_count = @max((row_count + block_rows - 1) / block_rows, 1);
+            const block_count = @max(@divCeil(row_count, block_rows), 1);
             return .{
                 .band_count = @min(max_bands, block_count),
                 .block_count = block_count,
@@ -1292,7 +1291,7 @@ pub fn BandPartition(comptime block_rows: usize, comptime max_bands: usize) type
         }
 
         pub fn firstRow(self: Self, band: usize) usize {
-            const block = (band * self.block_count + self.band_count - 1) / self.band_count;
+            const block = @divCeil(band * self.block_count, self.band_count);
             return @min(block * block_rows, self.row_count);
         }
     };
@@ -1556,7 +1555,7 @@ const BatchShape = struct {
 // gates only the inline collapse — a fixed (non-adaptive) inline batch keeps its
 // requested range size so its range count stays meaningful.
 fn shapeBatch(item_count: usize, profile: AdaptiveWorkProfile, max_worker_threads: usize, range_alignment_items: usize, tuner_active: bool) BatchShape {
-    const aligned = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), range_alignment_items);
+    const aligned = std.mem.alignForwardAnyAlign(usize, @max(profile.items_per_range, @as(usize, 1)), range_alignment_items);
     const aligned_range_count = rangeCount(item_count, aligned);
     const worker_threads = if (aligned_range_count <= 1)
         @as(usize, 0)
@@ -1573,35 +1572,8 @@ fn shapeBatch(item_count: usize, profile: AdaptiveWorkProfile, max_worker_thread
     };
 }
 
-pub fn alignItemCount(item_count: usize, alignment: usize) usize {
-    std.debug.assert(alignment > 0);
-    if (alignment == 1) return item_count;
-    const remainder = item_count % alignment;
-    if (remainder == 0) return item_count;
-    return item_count + (alignment - remainder);
-}
-
-fn alignItemCountDown(item_count: usize, alignment: usize) usize {
-    std.debug.assert(alignment > 0);
-    if (alignment == 1) return item_count;
-    return item_count - (item_count % alignment);
-}
-
-fn clampItemCount(value: usize, min_value: usize, max_value: usize) usize {
-    return @min(@max(value, min_value), max_value);
-}
-
-fn ceilDiv(numerator: usize, denominator: usize) usize {
-    std.debug.assert(denominator > 0);
-    return (numerator + denominator - 1) / denominator;
-}
-
 fn targetRangeSizeForRangeCount(item_count: usize, target_ranges: usize) usize {
-    return @max(@as(usize, 1), ceilDiv(item_count, @max(target_ranges, @as(usize, 1))));
-}
-
-fn clampUsize(value: usize, minimum: usize, maximum: usize) usize {
-    return @min(@max(value, minimum), maximum);
+    return @max(@as(usize, 1), @divCeil(item_count, @max(target_ranges, @as(usize, 1))));
 }
 
 fn roundedUsize(value: f64) usize {
@@ -1626,7 +1598,7 @@ fn normalizeWorkTunerConfig(config: AdaptiveWorkTunerConfig) AdaptiveWorkTunerCo
     var normalized = config;
     normalized.smallest_range_items = @max(normalized.smallest_range_items, @as(usize, 1));
     normalized.largest_range_items = @max(normalized.largest_range_items, normalized.smallest_range_items);
-    normalized.initial_range_items = clampItemCount(normalized.initial_range_items, normalized.smallest_range_items, normalized.largest_range_items);
+    normalized.initial_range_items = std.math.clamp(normalized.initial_range_items, normalized.smallest_range_items, normalized.largest_range_items);
     normalized.sample_window = std.math.clamp(normalized.sample_window, 1, max_sample_window);
     normalized.improvement_threshold_percent = @min(normalized.improvement_threshold_percent, @as(u8, 100));
     normalized.threaded_commit_threshold_percent = @min(normalized.threaded_commit_threshold_percent, @as(u8, 100));
@@ -2204,7 +2176,7 @@ test "band partition covers every row with whole blocks in band order" {
     const Bands = BandPartition(block_rows, max_bands);
     for ([_]usize{ 0, 1, 15, 16, 17, 47, 64, 65, 200, 1000 }) |row_count| {
         const bands = Bands.init(row_count);
-        const block_count = @max((row_count + block_rows - 1) / block_rows, 1);
+        const block_count = @max(@divCeil(row_count, block_rows), 1);
         try std.testing.expectEqual(block_count, bands.block_count);
         try std.testing.expectEqual(@min(max_bands, block_count), bands.band_count);
         try std.testing.expectEqual(@as(usize, 0), bands.firstRow(0));
@@ -3015,11 +2987,12 @@ test "adaptive work tuner derives range size from range overhead policy" {
     const candidate = tuner.selectProfile(request);
     const participants = candidate.worker_threads + 1;
     const target_ranges = participants * 2;
-    const expected_items_per_range = alignItemCount(
-        targetRangeSizeForRangeCount(request.item_count, target_ranges),
-        request.range_alignment_items,
-    );
-    try std.testing.expectEqual(expected_items_per_range, candidate.items_per_range);
+    const alignment = request.range_alignment_items;
+    // The smallest aligned range size whose range count meets the target.
+    try std.testing.expectEqual(@as(usize, 0), candidate.items_per_range % alignment);
+    try std.testing.expect(candidate.items_per_range > alignment);
+    try std.testing.expect(rangeCount(request.item_count, candidate.items_per_range) <= target_ranges);
+    try std.testing.expect(rangeCount(request.item_count, candidate.items_per_range - alignment) > target_ranges);
 }
 
 test "adaptive work tuner keeps inline when first threaded probe loses" {

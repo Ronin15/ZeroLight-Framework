@@ -142,7 +142,7 @@ fn blockBound(grid: *const NavGrid, max_cells: usize) u32 {
 /// in dense chunks, and a pop's new chunks; later builds reuse the high-water pool.
 pub fn initialPoolBlocks(grid: *const NavGrid, max_cells: usize, build_budget: usize) usize {
     const chunk_cells: usize = @as(usize, grid.geometry.chunk_tiles) * grid.geometry.chunk_tiles;
-    const dense = 4 + (@min(max_cells, build_budget) + chunk_cells - 1) / chunk_cells;
+    const dense = 4 + @divCeil(@min(max_cells, build_budget), chunk_cells);
     return @max(1 + perPopBlocks(grid), dense);
 }
 

@@ -637,7 +637,7 @@ const CrossLevelHeuristic = struct {
         if (gap == 0) return .{ .add = 0, .floor = 0 };
         // No short link crosses levels: only a long link reaches the goal level.
         if (self.short_span == 0) return .{ .add = unreachable_cost, .floor = unreachable_cost };
-        const crossings = (gap + self.short_span - 1) / self.short_span;
+        const crossings = @divCeil(gap, self.short_span);
         return .{ .add = crossings *| self.short_excess, .floor = crossings *| self.short_cost };
     }
 
@@ -1689,7 +1689,7 @@ const ReferenceAbstract = struct {
         const allocator = self.nodes.allocator;
         const width = graph.geometry.width;
         const tiles: u32 = graph.geometry.chunk_tiles;
-        const chunks_x = (width + tiles - 1) / tiles;
+        const chunks_x = @divCeil(width, tiles);
         const goal: u32 = @intCast(goal_index);
         const goal_x = goal % width;
         const goal_y = goal / width;
@@ -2033,7 +2033,7 @@ fn pushDistance(allocator: std.mem.Allocator, distances: *std.AutoHashMap(usize,
 fn exhaustiveAbstractObjective(allocator: std.mem.Allocator, graph: *const NavGraph, start_grid: *const NavGrid, goal_grid: *const NavGrid, start_level: u16, goal_level: u16, start_index: usize, goal_index: usize) !?u32 {
     const width = graph.geometry.width;
     const tiles: u32 = graph.geometry.chunk_tiles;
-    const chunks_x = (width + tiles - 1) / tiles;
+    const chunks_x = @divCeil(width, tiles);
     const goal: u32 = @intCast(goal_index);
     const goal_x = goal % width;
     const goal_y = goal / width;

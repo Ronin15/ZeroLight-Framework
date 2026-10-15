@@ -34,6 +34,7 @@ const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
+const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
@@ -117,9 +118,11 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    // Reserve a structural-command range/value budget for the tier policy pass so
-    // a band crossing mid-measurement never allocates on the hot path.
-    try frame.reserveStreams(suite.rangeCount(count, ai_range_alignment_items), 0, count, 0, 0, count);
+    // Ranges for AI's navigation intents and the tier policy pass's structural
+    // commands (this bench's only stream writers), so a band crossing
+    // mid-measurement never allocates on the hot path.
+    const range_count = @max(maxRangeCount(count, ai_range_alignment_items), maxRangeCount(count, scope_range_alignment_items));
+    try frame.reserveStreams(range_count, 0, count, 0, 0, count);
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     errdefer contacts.deinit();
 

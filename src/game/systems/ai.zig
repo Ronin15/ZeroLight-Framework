@@ -45,7 +45,6 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiAgentSlice = @import("../data_system.zig").AiAgentSlice;
@@ -86,7 +85,7 @@ const ai_adaptive_tuner_config = AdaptiveWorkTunerConfig{
 pub const default_goal_requantization_hysteresis_distance: f32 = 56.0;
 
 fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, ai_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, ai_range_alignment_items);
 }
 
 /// Cold personality gains (AiAgent), read once at gather time.

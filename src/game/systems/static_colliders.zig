@@ -53,7 +53,7 @@ fn anchorClassOffset(shift: u6, class: u6) usize {
 
 const max_anchor_chunk_shift: u6 = std.math.log2_int(u16, max_chunk_size_tiles);
 const max_anchor_bits: usize = anchorClassOffset(max_anchor_chunk_shift, max_anchor_chunk_shift + 1);
-const anchor_block_words: usize = (max_anchor_bits + 63) / 64;
+const anchor_block_words: usize = @divCeil(max_anchor_bits, 64);
 
 comptime {
     std.debug.assert(std.math.isPowerOfTwo(max_chunk_size_tiles));

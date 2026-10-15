@@ -260,7 +260,7 @@ fn pageShift(block_words: usize) u6 {
 // Pages of `1 << shift` blocks holding `blocks` blocks.
 fn pageCount(blocks: usize, shift: u6) usize {
     const per_page = @as(usize, 1) << shift;
-    return (blocks + per_page - 1) / per_page;
+    return @divCeil(blocks, per_page);
 }
 
 // Not std.HashMapUnmanaged: back-shift deletion keeps chains contiguous under churn (std
