@@ -45,6 +45,9 @@ pub const BatchStats = struct {
     main_thread_wait_ns: u64 = 0,
     worker_utilization: f32 = 0,
     ran_inline: bool = true,
+    /// The batch was dispatched from inside a batch of the same thread system and ran
+    /// inline on its caller, with no tuner consulted or recorded.
+    forced_inline: bool = false,
 };
 
 pub const ThreadSystemConfig = struct {
@@ -817,6 +820,19 @@ pub const AdaptiveWorkTuner = struct {
 
 pub const JobFn = *const fn (*anyopaque, ParallelRange, WorkerId) void;
 
+// How a thread calling into a `ThreadSystem` may run a batch: the owner outside any of
+// its batches dispatches normally; a participant of one of its batches (the owner in its
+// own ranges, or one of its workers) runs the nested batch inline on its own `WorkerId`.
+const CallerRole = union(enum) {
+    owner,
+    nested: WorkerId,
+};
+
+/// Fork-join pool owned by the thread that calls `init`. Only the owner, or a job running
+/// in one of this system's batches, may call `selectBatchProfile` or
+/// `parallelForWithOptions`; any other thread panics in every build mode. A call from
+/// inside a batch runs inline on its caller, never touching a tuner, over the selected
+/// profile's ranges, or the untuned fixed shape when none is given.
 pub const ThreadSystem = struct {
     allocator: std.mem.Allocator,
     config: ThreadSystemConfig,
@@ -825,6 +841,10 @@ pub const ThreadSystem = struct {
     shared: *Shared,
     workers: []WorkerRecord = &.{},
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    owner_thread_id: std.Thread.Id,
+    // Owner-only: read only after the caller matched `owner_thread_id`. True while the
+    // owner runs ranges of one of this system's batches.
+    owner_in_batch: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ThreadSystemConfig) !ThreadSystem {
         const worker_thread_count = try resolveWorkerThreadCount(config.max_worker_threads);
@@ -840,6 +860,7 @@ pub const ThreadSystem = struct {
             .config = normalizeConfig(config),
             .shared = shared,
             .workers = workers,
+            .owner_thread_id = std.Thread.getCurrentId(),
         };
         @memset(self.workers, WorkerRecord{});
 
@@ -865,6 +886,8 @@ pub const ThreadSystem = struct {
                 return err;
             };
             spawned += 1;
+            // Startup permit: the worker reads `worker.thread` only after taking it.
+            worker.wake.post(self.shared.io);
         }
 
         log.debug(
@@ -917,8 +940,56 @@ pub const ThreadSystem = struct {
     /// pre-sizing stage helpers call this, so the tuner's decision — and the exact
     /// `(worker_threads, items_per_range)` it will later see in `record` — is
     /// computed identically everywhere. Divergence here would make the tuner see a
-    /// "new" profile every frame and never settle.
+    /// "new" profile every frame and never settle. Called from inside one of this
+    /// system's batches, it returns the untuned inline shape and never touches
+    /// `adaptive_tuner`; called from a foreign thread, it panics.
     pub fn selectBatchProfile(
+        self: *const ThreadSystem,
+        adaptive_tuner: ?*AdaptiveWorkTuner,
+        request: BatchWorkRequest,
+    ) BatchSelection {
+        return switch (self.requireCallerRole()) {
+            .owner => self.resolveSelection(adaptive_tuner, request),
+            .nested => self.untunedSelection(request),
+        };
+    }
+
+    /// Batches that ran forced inline because they were dispatched from inside a batch
+    /// of this system, over its lifetime.
+    pub fn forcedInlineBatchCount(self: *const ThreadSystem) u64 {
+        return self.shared.forced_inline_batches.load(.monotonic);
+    }
+
+    // O(1) for the owner; a non-owner scans the workers' ids, O(workers).
+    fn callerRole(self: *const ThreadSystem) ?CallerRole {
+        const current = std.Thread.getCurrentId();
+        if (current == self.owner_thread_id) {
+            return if (self.owner_in_batch) .{ .nested = WorkerId.main } else .owner;
+        }
+        for (self.workers) |*worker| {
+            if (worker.thread_id.load(.monotonic) == current) return .{ .nested = worker.id };
+        }
+        return null;
+    }
+
+    // A foreign thread has no participant slot and no safe way to run a batch, so it
+    // fails before any tuner or shared state is touched.
+    fn requireCallerRole(self: *const ThreadSystem) CallerRole {
+        return self.callerRole() orelse @panic("ThreadSystem called from a thread that neither owns nor serves it");
+    }
+
+    // The request's shape with no tuner: its fixed or default range size at its alignment,
+    // inline. Reads no tuner, since one may be mid-record on another participant.
+    fn untunedSelection(self: *const ThreadSystem, request: BatchWorkRequest) BatchSelection {
+        var selection = self.resolveSelection(null, request);
+        selection.worker_threads = 0;
+        selection.profile.worker_threads = 0;
+        return selection;
+    }
+
+    // The shape under `adaptive_tuner` when it is active (consulting and updating it), else
+    // the fixed shape: the owner's `selectBatchProfile`.
+    fn resolveSelection(
         self: *const ThreadSystem,
         adaptive_tuner: ?*AdaptiveWorkTuner,
         request: BatchWorkRequest,
@@ -953,6 +1024,11 @@ pub const ThreadSystem = struct {
         };
     }
 
+    /// Runs `job_fn` over `item_count` items in ranges. Called from inside one of this
+    /// system's batches (a job on a worker or on the owner), it runs forced inline on the
+    /// caller's `WorkerId` over the selected profile's ranges, or the untuned fixed shape
+    /// when none is given, records no tuner, and returns `forced_inline` stats; called from
+    /// a foreign thread, it panics.
     pub fn parallelForWithOptions(
         self: *ThreadSystem,
         item_count: usize,
@@ -960,33 +1036,31 @@ pub const ThreadSystem = struct {
         job_fn: JobFn,
         options: ParallelForOptions,
     ) BatchStats {
+        // Classified before the empty return so a foreign caller fails at any size.
+        const role = self.requireCallerRole();
         // Selection happens before worker wake-up so every participant observes
         // one immutable batch shape: range size, count, job pointer, and context.
         if (item_count == 0) return .{};
+        switch (role) {
+            .owner => {},
+            .nested => |caller| return self.runForcedInline(item_count, context, job_fn, options, caller),
+        }
 
         const range_alignment_items = @max(options.range_alignment_items, @as(usize, 1));
         // Single selection path. A caller that pre-sized per-range output buffers
         // passes its already-resolved `selected_profile` (from selectBatchProfile);
         // everyone else selects here. Both routes shape the batch through the same
         // tuner-owned logic, so `record` always sees the profile that was selected.
-        const selection = if (options.selected_profile) |selected| blk: {
-            const max_worker_threads = @min(options.max_worker_threads orelse self.workers.len, self.workers.len);
-            const tuner_active = options.adaptive and options.adaptive_tuner != null;
-            const shape = shapeBatch(item_count, selected, max_worker_threads, range_alignment_items, tuner_active);
-            break :blk BatchSelection{
-                .profile = .{ .worker_threads = shape.worker_threads, .items_per_range = shape.items_per_range },
-                .items_per_range = shape.items_per_range,
-                .worker_threads = shape.worker_threads,
-                .range_count = shape.range_count,
-                .active_tuner = if (tuner_active) options.adaptive_tuner else null,
-            };
-        } else self.selectBatchProfile(options.adaptive_tuner orelse &self.adaptive_tuner, .{
-            .item_count = item_count,
-            .items_per_range = options.items_per_range,
-            .max_worker_threads = options.max_worker_threads,
-            .range_alignment_items = range_alignment_items,
-            .adaptive = options.adaptive,
-        });
+        const selection = if (options.selected_profile) |selected|
+            self.selectedProfileShape(item_count, selected, options.max_worker_threads, range_alignment_items, if (options.adaptive) options.adaptive_tuner else null)
+        else
+            self.resolveSelection(options.adaptive_tuner orelse &self.adaptive_tuner, .{
+                .item_count = item_count,
+                .items_per_range = options.items_per_range,
+                .max_worker_threads = options.max_worker_threads,
+                .range_alignment_items = range_alignment_items,
+                .adaptive = options.adaptive,
+            });
         const items_per_range = selection.items_per_range;
         const active_worker_threads = selection.worker_threads;
         const range_count = selection.range_count;
@@ -1003,7 +1077,9 @@ pub const ThreadSystem = struct {
         if (active_worker_threads == 0) {
             stats.active_worker_threads = 0;
             const batch_start_ns = nowNs(self.shared.io);
-            runInline(item_count, items_per_range, context, job_fn, &stats);
+            self.owner_in_batch = true;
+            runInline(item_count, items_per_range, context, job_fn, WorkerId.main, &stats);
+            self.owner_in_batch = false;
             const batch_end_ns = nowNs(self.shared.io);
             stats.batch_duration_ns = elapsedNs(batch_start_ns, batch_end_ns);
             if (record_tuner) |tuner| {
@@ -1044,7 +1120,9 @@ pub const ThreadSystem = struct {
         // Worker 1 starts with range 0, worker N with range N-1, and the main
         // thread steals from `next_range`. That preserves deterministic range
         // ownership while allowing the main thread to help instead of only wait.
+        self.owner_in_batch = true;
         self.shared.runBatchRanges(WorkerId.main);
+        self.owner_in_batch = false;
 
         const wait_start_ns = nowNs(self.shared.io);
         self.shared.mutex.lockUncancelable(self.shared.io);
@@ -1067,6 +1145,71 @@ pub const ThreadSystem = struct {
 
         return stats;
     }
+
+    // The shape a caller's preselected profile dispatches at, as `selectBatchProfile`
+    // returned it; `active_tuner` gates only the inline collapse.
+    fn selectedProfileShape(
+        self: *const ThreadSystem,
+        item_count: usize,
+        selected: AdaptiveWorkProfile,
+        max_worker_threads_cap: ?usize,
+        range_alignment_items: usize,
+        active_tuner: ?*AdaptiveWorkTuner,
+    ) BatchSelection {
+        const max_worker_threads = @min(max_worker_threads_cap orelse self.workers.len, self.workers.len);
+        const shape = shapeBatch(item_count, selected, max_worker_threads, range_alignment_items, active_tuner != null);
+        return .{
+            .profile = .{ .worker_threads = shape.worker_threads, .items_per_range = shape.items_per_range },
+            .items_per_range = shape.items_per_range,
+            .worker_threads = shape.worker_threads,
+            .range_count = shape.range_count,
+            .active_tuner = active_tuner,
+        };
+    }
+
+    // A batch dispatched from inside a batch of this system: its ranges run in order on
+    // the calling participant, which never writes this `ThreadSystem` or any tuner.
+    fn runForcedInline(
+        self: *const ThreadSystem,
+        item_count: usize,
+        context: *anyopaque,
+        job_fn: JobFn,
+        options: ParallelForOptions,
+        caller: WorkerId,
+    ) BatchStats {
+        const range_alignment_items = @max(options.range_alignment_items, @as(usize, 1));
+        // Shaped with no tuner: an owner's tuner-selected inline profile already spans every
+        // item, so its range set is unchanged, and a passed tuner cannot collapse an untuned
+        // profile to one range.
+        const selection = if (options.selected_profile) |selected|
+            self.selectedProfileShape(item_count, selected, options.max_worker_threads, range_alignment_items, null)
+        else
+            self.untunedSelection(.{
+                .item_count = item_count,
+                .items_per_range = options.items_per_range,
+                .max_worker_threads = options.max_worker_threads,
+                .range_alignment_items = range_alignment_items,
+                .adaptive = options.adaptive,
+            });
+        var stats = BatchStats{
+            .item_count = item_count,
+            .range_count = selection.range_count,
+            .items_per_range = selection.items_per_range,
+            .range_alignment_items = range_alignment_items,
+            .available_worker_threads = self.workers.len,
+            .forced_inline = true,
+        };
+        const batch_start_ns = nowNs(self.shared.io);
+        runInline(item_count, selection.items_per_range, context, job_fn, caller, &stats);
+        stats.batch_duration_ns = elapsedNs(batch_start_ns, nowNs(self.shared.io));
+
+        _ = self.shared.forced_inline_batches.fetchAdd(1, .monotonic);
+        // A load first, so after the warning the flag is only read.
+        if (!self.shared.forced_inline_warned.load(.monotonic) and !self.shared.forced_inline_warned.swap(true, .monotonic)) {
+            log.warn("ThreadSystem: a batch was dispatched from inside one of its batches (participant {d}); it ran inline on its caller", .{caller.index});
+        }
+        return stats;
+    }
 };
 
 const Shared = struct {
@@ -1078,6 +1221,9 @@ const Shared = struct {
     batch_complete: std.Io.Condition = .init,
     next_batch_id: u64 = 1,
     accepting_work: bool = true,
+    // Recovery-path telemetry, written only by forced-inline batches.
+    forced_inline_batches: std.atomic.Value(u64) = .init(0),
+    forced_inline_warned: std.atomic.Value(bool) = .init(false),
 
     // Each worker claims its first deterministic range by ID, then joins the
     // shared atomic range queue for remaining work.
@@ -1174,6 +1320,9 @@ const WorkerRecord = struct {
     shared: *Shared = undefined,
     wake: std.Io.Semaphore = .{},
     thread: ?std.Thread = null,
+    // Written once by the worker itself; 0 until then, which is no live thread's id on
+    // Linux, Windows, or Darwin.
+    thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
 };
 
 const Batch = struct {
@@ -1193,7 +1342,27 @@ const Batch = struct {
 };
 
 fn workerMain(worker: *WorkerRecord) void {
+    worker.thread_id.store(std.Thread.getCurrentId(), .monotonic);
+    // The startup permit is posted after init stores `worker.thread`.
+    worker.wake.waitUncancelable(worker.shared.io);
+    nameWorker(worker);
     worker.shared.workerLoop(worker.id, &worker.wake);
+}
+
+// Names the calling worker `zl-worker-<WorkerId>`; Darwin can name only the calling
+// thread, and naming the main thread would rename the process on Linux.
+fn nameWorker(worker: *const WorkerRecord) void {
+    if (std.Thread.max_name_len == 0) return;
+    var buffer: [std.Thread.max_name_len]u8 = undefined;
+    const name = std.mem.print(&buffer, "zl-worker-{d}", .{worker.id.index}) catch |err| {
+        log.warn("ThreadSystem worker {d} left unnamed: {}", .{ worker.id.index, err });
+        return;
+    };
+    // Set by init before the startup permit this worker already took.
+    const thread = worker.thread.?;
+    thread.setName(worker.shared.io, name) catch |err| {
+        log.warn("ThreadSystem worker {d} left unnamed: {}", .{ worker.id.index, err });
+    };
 }
 
 fn normalizeConfig(config: ThreadSystemConfig) ThreadSystemConfig {
@@ -1331,6 +1500,7 @@ pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
     total.batch_duration_ns += batch.batch_duration_ns;
     total.main_thread_wait_ns += batch.main_thread_wait_ns;
     total.ran_inline = total.ran_inline and batch.ran_inline;
+    total.forced_inline = total.forced_inline or batch.forced_inline;
     total.worker_utilization = workerUtilization(total.worker_thread_ranges, total.active_worker_threads, total.range_count);
 }
 
@@ -1526,6 +1696,8 @@ pub const RoundDispatch = struct {
     pub fn finish(self: *RoundDispatch, step_items: usize) BatchStats {
         const selection = self.selection orelse return self.total;
         const tuner = selection.active_tuner orelse return self.total;
+        // A forced-inline round never trains the tuner.
+        if (self.total.forced_inline) return self.total;
         tuner.record(.{
             .item_count = @max(step_items, 1),
             .range_count = self.total.range_count,
@@ -1647,10 +1819,15 @@ fn rangeForIndex(item_count: usize, items_per_range: usize, range_index: usize) 
     };
 }
 
-fn runInline(item_count: usize, items_per_range: usize, context: *anyopaque, job_fn: JobFn, stats: *BatchStats) void {
-    for (0..rangeCount(item_count, items_per_range)) |range_index| {
-        job_fn(context, rangeForIndex(item_count, items_per_range, range_index), WorkerId.main);
-        stats.main_thread_ranges += 1;
+fn runInline(item_count: usize, items_per_range: usize, context: *anyopaque, job_fn: JobFn, id: WorkerId, stats: *BatchStats) void {
+    const range_count = rangeCount(item_count, items_per_range);
+    for (0..range_count) |range_index| {
+        job_fn(context, rangeForIndex(item_count, items_per_range, range_index), id);
+    }
+    if (id.index == WorkerId.main.index) {
+        stats.main_thread_ranges += range_count;
+    } else {
+        stats.worker_thread_ranges += range_count;
     }
 }
 
@@ -3579,6 +3756,592 @@ test "threaded batch submission does not allocate after init" {
     try std.testing.expectEqual(@as(usize, 1), stats.active_worker_threads);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+const nested_inner_items = 32;
+const nested_inner_items_per_range = 4;
+
+// One nested batch's job state. A nested batch runs only on its caller's thread, so the
+// fields are plain.
+const NestedInner = struct {
+    hits: []u32,
+    caller: WorkerId,
+    range_count: usize,
+    ranges: usize = 0,
+    foreign_ranges: usize = 0,
+    out_of_order_ranges: usize = 0,
+};
+
+fn nestedInnerJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const inner: *NestedInner = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start <= range.end and range.end <= inner.hits.len);
+    std.debug.assert(range.index < inner.range_count);
+    for (inner.hits[range.start..range.end]) |*hit| hit.* += 1;
+    if (id.index != inner.caller.index) inner.foreign_ranges += 1;
+    if (range.index != inner.ranges) inner.out_of_order_ranges += 1;
+    inner.ranges += 1;
+}
+
+// What one nested batch saw, kept in its outer range's slot.
+const NestedRecord = struct {
+    nested: bool = false,
+    caller: WorkerId = WorkerId.main,
+    hits: [nested_inner_items]u32 = @splat(0),
+    batch: BatchStats = .{},
+    ranges: usize = 0,
+    foreign_ranges: usize = 0,
+    out_of_order_ranges: usize = 0,
+
+    fn run(record: *NestedRecord, threads: *ThreadSystem, caller: WorkerId, range_count: usize, item_count: usize, options: ParallelForOptions) void {
+        var inner = NestedInner{ .hits = record.hits[0..item_count], .caller = caller, .range_count = range_count };
+        record.batch = threads.parallelForWithOptions(item_count, &inner, nestedInnerJob, options);
+        record.nested = true;
+        record.caller = caller;
+        record.ranges = inner.ranges;
+        record.foreign_ranges = inner.foreign_ranges;
+        record.out_of_order_ranges = inner.out_of_order_ranges;
+    }
+
+    fn expectRanInlineOnCaller(record: *const NestedRecord, item_count: usize, range_count: usize) !void {
+        try std.testing.expect(record.nested);
+        for (record.hits[0..item_count]) |hit| try std.testing.expectEqual(@as(u32, 1), hit);
+        try std.testing.expectEqual(range_count, record.ranges);
+        try std.testing.expectEqual(@as(usize, 0), record.foreign_ranges);
+        try std.testing.expectEqual(@as(usize, 0), record.out_of_order_ranges);
+        try std.testing.expect(record.batch.ran_inline and record.batch.forced_inline);
+        try std.testing.expectEqual(@as(usize, 0), record.batch.active_worker_threads);
+        try std.testing.expectEqual(item_count, record.batch.item_count);
+        try std.testing.expectEqual(range_count, record.batch.range_count);
+        const caller_ranges = if (record.caller.index == WorkerId.main.index) record.batch.main_thread_ranges else record.batch.worker_thread_ranges;
+        try std.testing.expectEqual(range_count, caller_ranges);
+        try std.testing.expectEqual(range_count, record.batch.main_thread_ranges + record.batch.worker_thread_ranges);
+    }
+};
+
+// Outer job whose ranges each dispatch one fixed nested batch, on workers only or on
+// every participant.
+const NestingOuter = struct {
+    threads: *ThreadSystem,
+    records: []NestedRecord,
+    nest_on_main: bool,
+    nested_range_count: usize,
+};
+
+fn nestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const outer: *NestingOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < outer.records.len);
+    if (!outer.nest_on_main and id.index == WorkerId.main.index) return;
+    outer.records[range.index].run(outer.threads, id, outer.nested_range_count, nested_inner_items, .{
+        .adaptive = false,
+        .items_per_range = nested_inner_items_per_range,
+    });
+}
+
+// The range count a fixed nested request gets from the shared shaping path.
+fn nestedFixedRangeCount(threads: *const ThreadSystem) usize {
+    return shapeBatch(nested_inner_items, .{
+        .worker_threads = threads.workerThreadCount(),
+        .items_per_range = nested_inner_items_per_range,
+    }, threads.workerThreadCount(), 1, false).range_count;
+}
+
+test "a nested batch from a worker job runs inline on that worker and covers every item once" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+
+    var records: [16]NestedRecord = @splat(.{});
+    var outer = NestingOuter{ .threads = &threads, .records = &records, .nest_on_main = false, .nested_range_count = nestedFixedRangeCount(&threads) };
+    try std.testing.expectEqual(@as(usize, 8), outer.nested_range_count);
+    const stats = threads.parallelForWithOptions(128, &outer, nestingOuterJob, .{ .adaptive = false });
+
+    try std.testing.expect(!stats.ran_inline and !stats.forced_inline);
+    try std.testing.expectEqual(@as(usize, 16), stats.range_count);
+    // Each woken worker runs its first range by id: range 0 on worker 1, range 1 on worker 2.
+    try std.testing.expect(records[0].nested and records[1].nested);
+    try std.testing.expectEqual(@as(usize, 1), records[0].caller.index);
+    try std.testing.expectEqual(@as(usize, 2), records[1].caller.index);
+    var nested_count: u64 = 0;
+    for (&records) |*record| {
+        if (!record.nested) continue;
+        nested_count += 1;
+        try std.testing.expect(record.caller.index != WorkerId.main.index);
+        try record.expectRanInlineOnCaller(nested_inner_items, outer.nested_range_count);
+    }
+    try std.testing.expectEqual(nested_count, threads.forcedInlineBatchCount());
+    try std.testing.expect(threads.shared.forced_inline_warned.load(.monotonic));
+}
+
+// Outer job for an inline owner batch: each range dispatches two nested batches.
+const OwnerNestingOuter = struct {
+    threads: *ThreadSystem,
+    records: [][2]NestedRecord,
+    nested_range_count: usize,
+};
+
+fn ownerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const outer: *OwnerNestingOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < outer.records.len);
+    for (&outer.records[range.index]) |*record| {
+        record.run(outer.threads, id, outer.nested_range_count, nested_inner_items, .{
+            .adaptive = false,
+            .items_per_range = nested_inner_items_per_range,
+        });
+    }
+}
+
+test "a nested batch from the owner's own range runs inline on the main id, counts, and warns once" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+
+    var records: [2][2]NestedRecord = @splat(@splat(.{}));
+    var outer = OwnerNestingOuter{ .threads = &threads, .records = &records, .nested_range_count = nestedFixedRangeCount(&threads) };
+    // Inline with workers present, so every outer range runs on the owner.
+    const stats = threads.parallelForWithOptions(2, &outer, ownerNestingOuterJob, .{
+        .adaptive = false,
+        .selected_profile = .{ .worker_threads = 0, .items_per_range = 1 },
+    });
+
+    try std.testing.expect(stats.ran_inline and !stats.forced_inline);
+    try std.testing.expectEqual(@as(usize, 2), stats.main_thread_ranges);
+    for (&records) |*pair| {
+        for (pair) |*record| {
+            try std.testing.expectEqual(WorkerId.main.index, record.caller.index);
+            try record.expectRanInlineOnCaller(nested_inner_items, outer.nested_range_count);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 4), threads.forcedInlineBatchCount());
+    try std.testing.expect(threads.shared.forced_inline_warned.load(.monotonic));
+
+    // The owner left its batch, so the next batch dispatches to workers again.
+    try std.testing.expect(!threads.owner_in_batch);
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
+    var coverage = CoverageContext{ .hits = hits[0..] };
+    const after = threads.parallelForWithOptions(hits.len, &coverage, markCoverage, .{ .adaptive = false });
+    try std.testing.expect(!after.ran_inline and !after.forced_inline);
+    try std.testing.expectEqual(@as(u64, 4), threads.forcedInlineBatchCount());
+    for (&hits) |*hit| try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+}
+
+// Outer job whose single range dispatches nested batches at a preselected profile and
+// through a stage dispatch.
+const ShapeNestingOuter = struct {
+    threads: *ThreadSystem,
+    stage_tuner: *AdaptiveWorkTuner,
+    profile_hits: [128]u32 = @splat(0),
+    profile_batch: BatchStats = .{},
+    profile_inner_ranges: usize = 0,
+    profile_out_of_order_ranges: usize = 0,
+    stage_selection: ?BatchSelection = null,
+    stage_record: NestedRecord = .{},
+};
+
+fn shapeNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const outer: *ShapeNestingOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index == 0);
+    var inner = NestedInner{ .hits = &outer.profile_hits, .caller = id, .range_count = 8 };
+    outer.profile_batch = outer.threads.parallelForWithOptions(outer.profile_hits.len, &inner, nestedInnerJob, .{
+        .adaptive = false,
+        .selected_profile = .{ .worker_threads = 2, .items_per_range = 16 },
+    });
+    outer.profile_inner_ranges = inner.ranges;
+    outer.profile_out_of_order_ranges = inner.out_of_order_ranges + inner.foreign_ranges;
+
+    const dispatch = Dispatch.init(outer.threads, outer.stage_tuner, .{});
+    const selection = dispatch.select(nested_inner_items, 1);
+    outer.stage_selection = selection;
+    var stage_inner = NestedInner{ .hits = &outer.stage_record.hits, .caller = id, .range_count = selection.range_count };
+    outer.stage_record.batch = dispatch.run(selection, nested_inner_items, 1, &stage_inner, nestedInnerJob);
+    outer.stage_record.nested = true;
+    outer.stage_record.caller = id;
+    outer.stage_record.ranges = stage_inner.ranges;
+    outer.stage_record.foreign_ranges = stage_inner.foreign_ranges;
+    outer.stage_record.out_of_order_ranges = stage_inner.out_of_order_ranges;
+}
+
+test "a nested batch keeps a selected profile's range shape and a nested stage selects the untuned shape" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+
+    var stage_tuner = AdaptiveWorkTuner.init(.{});
+    var outer = ShapeNestingOuter{ .threads = &threads, .stage_tuner = &stage_tuner };
+    _ = threads.parallelForWithOptions(1, &outer, shapeNestingOuterJob, .{ .adaptive = false });
+
+    for (outer.profile_hits) |hit| try std.testing.expectEqual(@as(u32, 1), hit);
+    try std.testing.expect(outer.profile_batch.forced_inline);
+    try std.testing.expectEqual(@as(usize, 8), outer.profile_batch.range_count);
+    try std.testing.expectEqual(@as(usize, 16), outer.profile_batch.items_per_range);
+    try std.testing.expectEqual(@as(usize, 8), outer.profile_inner_ranges);
+    try std.testing.expectEqual(@as(usize, 0), outer.profile_out_of_order_ranges);
+
+    const selection = outer.stage_selection.?;
+    const untuned = shapeBatch(nested_inner_items, .{ .worker_threads = 2, .items_per_range = 8 }, 2, 1, false);
+    try std.testing.expectEqual(@as(usize, 0), selection.worker_threads);
+    try std.testing.expectEqual(@as(usize, 0), selection.profile.worker_threads);
+    try std.testing.expect(selection.active_tuner == null);
+    try std.testing.expectEqual(untuned.range_count, selection.range_count);
+    try std.testing.expectEqual(untuned.items_per_range, selection.items_per_range);
+    try outer.stage_record.expectRanInlineOnCaller(nested_inner_items, untuned.range_count);
+}
+
+// The tuner state any selection or record would change.
+const TunerSnapshot = struct {
+    report: AdaptiveWorkReport,
+    last_request: ?AdaptiveWorkRequest,
+    learned_item_count: usize,
+    shifted_batch_count: usize,
+    skip_next_record: bool,
+
+    fn of(tuner: *const AdaptiveWorkTuner) TunerSnapshot {
+        return .{
+            .report = tuner.report(),
+            .last_request = tuner.last_request,
+            .learned_item_count = tuner.learned_item_count,
+            .shifted_batch_count = tuner.shifted_batch_count,
+            .skip_next_record = tuner.skip_next_record,
+        };
+    }
+};
+
+// Per outer range: a nested stage dispatch under the stage tuner, then a nested generic
+// `parallelFor` that would use the shared tuner.
+const TunerNestRecord = struct {
+    stage: NestedRecord = .{},
+    shared: NestedRecord = .{},
+};
+
+const TunerNestingOuter = struct {
+    threads: *ThreadSystem,
+    stage_tuner: *AdaptiveWorkTuner,
+    records: []TunerNestRecord,
+};
+
+fn tunerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const outer: *TunerNestingOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < outer.records.len);
+    const record = &outer.records[range.index];
+
+    const dispatch = Dispatch.init(outer.threads, outer.stage_tuner, .{});
+    const selection = dispatch.select(nested_inner_items, 1);
+    var stage_inner = NestedInner{ .hits = &record.stage.hits, .caller = id, .range_count = selection.range_count };
+    record.stage.batch = dispatch.run(selection, nested_inner_items, 1, &stage_inner, nestedInnerJob);
+    record.stage.nested = true;
+    record.stage.caller = id;
+    record.stage.ranges = stage_inner.ranges;
+    record.stage.foreign_ranges = stage_inner.foreign_ranges;
+    record.stage.out_of_order_ranges = stage_inner.out_of_order_ranges;
+
+    var shared_inner = NestedInner{ .hits = &record.shared.hits, .caller = id, .range_count = rangeCount(nested_inner_items, outer.threads.config.items_per_range) };
+    record.shared.batch = outer.threads.parallelFor(nested_inner_items, &shared_inner, nestedInnerJob);
+    record.shared.nested = true;
+    record.shared.caller = id;
+    record.shared.ranges = shared_inner.ranges;
+    record.shared.foreign_ranges = shared_inner.foreign_ranges;
+    record.shared.out_of_order_ranges = shared_inner.out_of_order_ranges;
+}
+
+test "a nested batch leaves the stage tuner and the shared tuner untouched" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+
+    var stage_tuner = AdaptiveWorkTuner.init(.{});
+    const stage_before = TunerSnapshot.of(&stage_tuner);
+    const shared_before = TunerSnapshot.of(&threads.adaptive_tuner);
+
+    var records: [16]TunerNestRecord = @splat(.{});
+    var outer = TunerNestingOuter{ .threads = &threads, .stage_tuner = &stage_tuner, .records = &records };
+    const stats = threads.parallelForWithOptions(128, &outer, tunerNestingOuterJob, .{ .adaptive = false });
+    try std.testing.expect(!stats.ran_inline);
+
+    try std.testing.expectEqual(stage_before, TunerSnapshot.of(&stage_tuner));
+    try std.testing.expectEqual(shared_before, TunerSnapshot.of(&threads.adaptive_tuner));
+    try std.testing.expect(stage_tuner.last_request == null and threads.adaptive_tuner.last_request == null);
+    // Both nested requests are adaptive with no fixed range size: untuned, they run the
+    // thread system's default range size.
+    const untuned_range_count = rangeCount(nested_inner_items, threads.config.items_per_range);
+    for (&records) |*record| {
+        try record.stage.expectRanInlineOnCaller(nested_inner_items, untuned_range_count);
+        try record.shared.expectRanInlineOnCaller(nested_inner_items, untuned_range_count);
+    }
+    try std.testing.expectEqual(@as(u64, 2 * records.len), threads.forcedInlineBatchCount());
+}
+
+test "forced inline batches allocate nothing on a multi-worker system" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+
+    const original_allocator = threads.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    threads.allocator = failing_allocator.allocator();
+    defer threads.allocator = original_allocator;
+
+    var records: [16]NestedRecord = @splat(.{});
+    var outer = NestingOuter{ .threads = &threads, .records = &records, .nest_on_main = true, .nested_range_count = nestedFixedRangeCount(&threads) };
+    const stats = threads.parallelForWithOptions(128, &outer, nestingOuterJob, .{ .adaptive = false });
+
+    try std.testing.expect(!stats.ran_inline);
+    for (&records) |*record| try record.expectRanInlineOnCaller(nested_inner_items, outer.nested_range_count);
+    try std.testing.expectEqual(@as(u64, records.len), threads.forcedInlineBatchCount());
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+    try std.testing.expect(!failing_allocator.has_induced_failure);
+}
+
+fn classifyCaller(threads: *const ThreadSystem, role: *?CallerRole) void {
+    role.* = threads.callerRole();
+}
+
+// Per outer range: how the running participant classifies against its own system and
+// against a second system it does not serve.
+const ClassifyRecord = struct {
+    ran: bool = false,
+    id: WorkerId = WorkerId.main,
+    own: ?CallerRole = null,
+    other: ?CallerRole = null,
+};
+
+const ClassifyOuter = struct {
+    own: *const ThreadSystem,
+    other: *const ThreadSystem,
+    records: []ClassifyRecord,
+};
+
+fn classifyOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const outer: *ClassifyOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < outer.records.len);
+    outer.records[range.index] = .{ .ran = true, .id = id, .own = outer.own.callerRole(), .other = outer.other.callerRole() };
+}
+
+// A foreign caller panics (`requireCallerRole`); the panic itself cannot run in-process,
+// so this covers the classification that triggers it.
+test "callers classify as owner, nested participant, or foreign" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var own = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer own.deinit();
+    var other = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer other.deinit();
+
+    try std.testing.expectEqual(@as(?CallerRole, .owner), own.callerRole());
+
+    var spawned_role: ?CallerRole = .owner;
+    const spawned = try std.Thread.spawn(.{ .allocator = std.testing.allocator }, classifyCaller, .{ &own, &spawned_role });
+    spawned.join();
+    try std.testing.expectEqual(@as(?CallerRole, null), spawned_role);
+
+    var records: [16]ClassifyRecord = @splat(.{});
+    var outer = ClassifyOuter{ .own = &own, .other = &other, .records = &records };
+    const stats = own.parallelForWithOptions(records.len, &outer, classifyOuterJob, .{ .adaptive = false });
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expect(records[0].ran and records[0].id.index == 1);
+    for (&records) |*record| {
+        try std.testing.expect(record.ran);
+        try std.testing.expectEqual(@as(?CallerRole, .{ .nested = record.id }), record.own);
+        // The test thread owns both systems, so only a worker is foreign to the other.
+        const other_expected: ?CallerRole = if (record.id.index == WorkerId.main.index) .owner else null;
+        try std.testing.expectEqual(other_expected, record.other);
+    }
+    try std.testing.expectEqual(@as(?CallerRole, .owner), own.callerRole());
+}
+
+// Outer job for a threaded batch where only the owner's ranges nest: worker ranges hold
+// until the owner has started one, so the owner must claim a range past the workers'
+// first ranges.
+const OwnerThreadedNestingOuter = struct {
+    threads: *ThreadSystem,
+    records: []NestedRecord,
+    nested_range_count: usize,
+    owner_started: std.atomic.Value(bool) = .init(false),
+};
+
+fn ownerThreadedNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const outer: *OwnerThreadedNestingOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < outer.records.len);
+    if (id.index != WorkerId.main.index) {
+        while (!outer.owner_started.load(.acquire)) std.atomic.spinLoopHint();
+        return;
+    }
+    outer.owner_started.store(true, .release);
+    outer.records[range.index].run(outer.threads, id, outer.nested_range_count, nested_inner_items, .{
+        .adaptive = false,
+        .items_per_range = nested_inner_items_per_range,
+    });
+}
+
+test "a nested batch from the owner's range of a threaded batch runs inline on the main id" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+
+    var records: [16]NestedRecord = @splat(.{});
+    var outer = OwnerThreadedNestingOuter{ .threads = &threads, .records = &records, .nested_range_count = nestedFixedRangeCount(&threads) };
+    const stats = threads.parallelForWithOptions(128, &outer, ownerThreadedNestingOuterJob, .{ .adaptive = false });
+
+    try std.testing.expect(!stats.ran_inline and !stats.forced_inline);
+    try std.testing.expect(stats.main_thread_ranges > 0);
+    var owner_records: u64 = 0;
+    for (&records) |*record| {
+        if (!record.nested) continue;
+        owner_records += 1;
+        try std.testing.expectEqual(WorkerId.main.index, record.caller.index);
+        try record.expectRanInlineOnCaller(nested_inner_items, outer.nested_range_count);
+    }
+    try std.testing.expectEqual(@as(u64, stats.main_thread_ranges), owner_records);
+    try std.testing.expectEqual(owner_records, threads.forcedInlineBatchCount());
+    try std.testing.expect(!threads.owner_in_batch);
+}
+
+// Outer job for an inline owner batch whose one range runs an owner-made tuned selection,
+// and an untuned profile passed with a tuner.
+const SelectedNestingOuter = struct {
+    dispatch: Dispatch,
+    selection: BatchSelection,
+    indices: *RangeIndexContext,
+    batch: BatchStats = .{},
+    untuned_tuner: *AdaptiveWorkTuner,
+    untuned_inner: NestedInner,
+    untuned_batch: BatchStats = .{},
+};
+
+fn selectedNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const outer: *SelectedNestingOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index == 0);
+    outer.batch = outer.dispatch.run(outer.selection, 1024, 16, outer.indices, recordRangeIndex);
+    outer.untuned_batch = outer.dispatch.thread_system.parallelForWithOptions(outer.untuned_inner.hits.len, &outer.untuned_inner, nestedInnerJob, .{
+        .adaptive_tuner = outer.untuned_tuner,
+        .selected_profile = .{ .worker_threads = 0, .items_per_range = 16 },
+    });
+}
+
+test "a nested run of an owner's tuned selection keeps its aligned range set" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 64 });
+    defer threads.deinit();
+
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
+        .sample_window = 1,
+        .threaded_batch_ns = 1000,
+    });
+    // One slow inline sample moves the tuner to probing a threaded candidate.
+    tuner.record(tunerTestBatchWithProfile(1024, tuner.selectProfile(tunerTestRequest(1024, 2, 16, 64)), 200_000));
+    const dispatch = Dispatch.init(&threads, &tuner, .{});
+    const selection = dispatch.select(1024, 16);
+    try std.testing.expect(selection.active_tuner == &tuner);
+    try std.testing.expectEqual(@as(usize, 2), selection.worker_threads);
+    try std.testing.expectEqual(@as(usize, 96), selection.items_per_range);
+    try std.testing.expectEqual(@as(usize, 11), selection.range_count);
+
+    const expected_starts = [_]usize{ 0, 96, 192, 288, 384, 480, 576, 672, 768, 864, 960 };
+    const expected_ends = [_]usize{ 96, 192, 288, 384, 480, 576, 672, 768, 864, 960, 1024 };
+
+    var nested_starts: [11]usize = @splat(std.math.maxInt(usize));
+    var nested_ends: [11]usize = @splat(0);
+    var nested_indices = RangeIndexContext{ .starts = &nested_starts, .ends = &nested_ends, .items_per_range = 96 };
+    var untuned_tuner = AdaptiveWorkTuner.init(.{});
+    var untuned_hits: [64]u32 = @splat(0);
+    var outer = SelectedNestingOuter{
+        .dispatch = dispatch,
+        .selection = selection,
+        .indices = &nested_indices,
+        .untuned_tuner = &untuned_tuner,
+        .untuned_inner = .{ .hits = &untuned_hits, .caller = WorkerId.main, .range_count = 4 },
+    };
+    _ = threads.parallelForWithOptions(1, &outer, selectedNestingOuterJob, .{ .adaptive = false });
+
+    try std.testing.expect(outer.batch.forced_inline);
+    try std.testing.expectEqual(@as(usize, 11), outer.batch.range_count);
+    try std.testing.expectEqual(@as(usize, 96), outer.batch.items_per_range);
+    try std.testing.expectEqual(@as(usize, 11), outer.batch.main_thread_ranges);
+    try std.testing.expectEqualSlices(usize, &expected_starts, &nested_starts);
+    try std.testing.expectEqualSlices(usize, &expected_ends, &nested_ends);
+
+    // A passed tuner does not collapse an untuned profile's ranges.
+    try std.testing.expect(outer.untuned_batch.forced_inline);
+    try std.testing.expectEqual(@as(usize, 4), outer.untuned_batch.range_count);
+    try std.testing.expectEqual(@as(usize, 4), outer.untuned_inner.ranges);
+    try std.testing.expectEqual(@as(usize, 0), outer.untuned_inner.out_of_order_ranges);
+    for (untuned_hits) |hit| try std.testing.expectEqual(@as(u32, 1), hit);
+    try std.testing.expect(untuned_tuner.last_request == null);
+
+    var owner_starts: [11]usize = @splat(std.math.maxInt(usize));
+    var owner_ends: [11]usize = @splat(0);
+    var owner_indices = RangeIndexContext{ .starts = &owner_starts, .ends = &owner_ends, .items_per_range = 96 };
+    const owner_batch = dispatch.run(selection, 1024, 16, &owner_indices, recordRangeIndex);
+    try std.testing.expect(!owner_batch.ran_inline and !owner_batch.forced_inline);
+    try std.testing.expectEqual(@as(usize, 11), owner_batch.range_count);
+    try std.testing.expectEqual(@as(usize, 96), owner_batch.items_per_range);
+    try std.testing.expectEqualSlices(usize, &expected_starts, &owner_starts);
+    try std.testing.expectEqualSlices(usize, &expected_ends, &owner_ends);
+}
+
+// Outer job for an inline owner batch whose one range runs a step's rounds.
+const RoundNestingOuter = struct {
+    rounds: *RoundDispatch,
+    context: StageTestContext = .{},
+};
+
+fn roundNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const outer: *RoundNestingOuter = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index == 0);
+    for ([_]usize{ 10, 12, 8 }) |item_count| outer.rounds.run(item_count, &outer.context, &outer.context.range_count, stageTestJob);
+}
+
+test "rounds run inside a batch leave the stage tuner unsampled" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var tuner = AdaptiveWorkTuner.init(.{});
+    var rounds = RoundDispatch.begin(Dispatch.init(&threads, &tuner, .{}), 30);
+    try std.testing.expect(rounds.selection.?.active_tuner == &tuner);
+    const before = TunerSnapshot.of(&tuner);
+    const sampled_before = tuner.sampled_profile;
+
+    var outer = RoundNestingOuter{ .rounds = &rounds };
+    _ = threads.parallelForWithOptions(1, &outer, roundNestingOuterJob, .{ .adaptive = false });
+    const total = rounds.finish(30);
+
+    try std.testing.expect(total.forced_inline);
+    try std.testing.expectEqual(@as(usize, 30), outer.context.items.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), tuner.sample_count);
+    try std.testing.expectEqual(sampled_before, tuner.sampled_profile);
+    try std.testing.expectEqual(before, TunerSnapshot.of(&tuner));
+}
+
+test "accumulate batch marks the total forced inline when any batch was" {
+    var total = BatchStats{};
+    accumulateBatch(&total, inlineBatch(4, 1));
+    try std.testing.expect(!total.forced_inline);
+    var forced = inlineBatch(4, 1);
+    forced.forced_inline = true;
+    accumulateBatch(&total, forced);
+    accumulateBatch(&total, inlineBatch(4, 1));
+    try std.testing.expect(total.forced_inline);
+}
+
+test "every woken worker carries its worker name on linux" {
+    const builtin = @import("builtin");
+    if (builtin.single_threaded or builtin.os.tag != .linux) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var hits: [16]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
+    var coverage = CoverageContext{ .hits = hits[0..] };
+    const stats = threads.parallelForWithOptions(hits.len, &coverage, markCoverage, .{ .adaptive = false });
+    try std.testing.expectEqual(threads.workerThreadCount(), stats.active_worker_threads);
+
+    for (threads.workers) |*worker| {
+        var expected_buffer: [std.Thread.max_name_len]u8 = undefined;
+        const expected = try std.mem.print(&expected_buffer, "zl-worker-{d}", .{worker.id.index});
+        var name_buffer: [std.Thread.max_name_len:0]u8 = undefined;
+        const name = (try worker.thread.?.getName(&name_buffer)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(expected, name);
     }
 }
 

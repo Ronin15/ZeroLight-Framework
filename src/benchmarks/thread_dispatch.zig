@@ -31,8 +31,9 @@ const suite = @import("suite.zig");
 // has the same data placement on both sides, so its delta still isolates dispatch.
 // Asserts check every threaded batch's shape (range count from its range size, inline
 // exactly when no worker is active, active workers at most min(workers, ranges - 1), every
-// range claimed once), fixed cases' exact shape, each job's range index against the
-// selected range count, and that every item was incremented once per dispatch.
+// range claimed once, never forced inline), fixed cases' exact shape, each job's range
+// index against the selected range count, and that every item was incremented once per
+// dispatch.
 // `--details` prints the shape (`inline` or workers/ranges), the time per item, and the
 // time per range.
 pub const group = suite.BenchmarkGroup{
@@ -101,6 +102,7 @@ fn assertThreadedShape(batch: BatchStats, thread_system: *const ThreadSystem) vo
     std.debug.assert(batch.range_count == rangeCount(batch.item_count, batch.items_per_range));
     std.debug.assert(batch.ran_inline == (batch.active_worker_threads == 0));
     std.debug.assert(batch.active_worker_threads <= @min(thread_system.workerThreadCount(), batch.range_count -| 1));
+    std.debug.assert(!batch.forced_inline);
 }
 
 // The shape a fixed case's dispatch must have; checked against every measured batch.
@@ -162,6 +164,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     }
 
     for (items) |item| std.debug.assert(item == dispatches);
+    if (thread_ptr) |thread_system| std.debug.assert(thread_system.forcedInlineBatchCount() == 0);
     var stats = accumulator.finish();
     stats.output_count = item_count;
     if (case.adaptive) {
