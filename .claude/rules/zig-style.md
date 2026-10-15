@@ -25,6 +25,9 @@ paths:
   facade, `Renderer`'s exported types); a bridge alias, one kept so an old path
   still resolves after a move or rename, is not: importers switch to the new
   path in the same change.
+- No unused file-scope declarations (dead imports or aliases); Zig compiles
+  only what is referenced, so they build clean and go stale (`idiom-lint`
+  enforces).
 - No `_mod` suffixes or double names (`thread.ThreadSystem`); never rename
   SDL/C, build-option, or `std.Build` names.
 - Use `std` before writing your own: containers, heaps (`std.PriorityQueue`),
