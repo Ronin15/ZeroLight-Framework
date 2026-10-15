@@ -836,8 +836,7 @@ const CallerRole = union(enum) {
 pub const ThreadSystem = struct {
     allocator: std.mem.Allocator,
     config: ThreadSystemConfig,
-    // Batch state shared with the workers; jobs run outside its mutex over caller-owned
-    // ranges.
+    // Batch state shared with the workers; jobs run over caller-owned ranges.
     shared: *Shared,
     workers: []WorkerRecord = &.{},
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -866,9 +865,7 @@ pub const ThreadSystem = struct {
 
         var spawned: usize = 0;
         errdefer {
-            self.shared.completion.mutex.lockUncancelable(io);
-            self.shared.descriptor.accepting_work = false;
-            self.shared.completion.mutex.unlock(io);
+            self.shared.descriptor.accepting_work.store(false, .release);
             for (self.workers[0..spawned]) |*worker| {
                 worker.wake.post(io);
                 if (worker.thread) |thread| thread.join();
@@ -897,13 +894,13 @@ pub const ThreadSystem = struct {
         return self;
     }
 
+    /// Owner only, outside any of its batches. Stops and joins every worker.
     pub fn deinit(self: *ThreadSystem) void {
+        std.debug.assert(std.Thread.getCurrentId() == self.owner_thread_id and !self.owner_in_batch);
         const io = self.shared.descriptor.io;
-        self.shared.completion.mutex.lockUncancelable(io);
-        std.debug.assert(self.shared.completion.pending_workers == 0);
-        self.shared.descriptor.accepting_work = false;
-        self.shared.completion.mutex.unlock(io);
-
+        std.debug.assert(self.shared.completion.pending.load(.monotonic) == 0);
+        // Shutdown permits are counted, so a pending startup permit never absorbs one.
+        self.shared.descriptor.accepting_work.store(false, .release);
         for (self.workers) |*worker| {
             worker.wake.post(io);
             if (worker.thread) |thread| thread.join();
@@ -1092,14 +1089,17 @@ pub const ThreadSystem = struct {
         const shared = self.shared;
         const io = shared.descriptor.io;
         const batch_start_ns = nowNs(io);
-        shared.completion.mutex.lockUncancelable(io);
-        std.debug.assert(shared.descriptor.accepting_work);
-        std.debug.assert(shared.completion.pending_workers == 0);
+        std.debug.assert(shared.descriptor.accepting_work.load(.monotonic));
+        // The previous join returned only after every participant's decrement.
+        std.debug.assert(shared.completion.pending.load(.monotonic) == 0);
+        // Every woken worker has a first range of its own.
+        std.debug.assert(range_count >= active_worker_threads + 1);
 
-        const batch_id = shared.descriptor.next_batch_id;
-        shared.descriptor.next_batch_id += 1;
+        // Publish: everything a worker reads is written before its generation's release
+        // store, so the acquire load that admits it into the batch also makes them visible.
+        const generation = shared.descriptor.generation + 1;
+        shared.descriptor.generation = generation;
         shared.descriptor.batch = .{
-            .id = batch_id,
             .item_count = item_count,
             .items_per_range = items_per_range,
             .range_count = range_count,
@@ -1108,14 +1108,16 @@ pub const ThreadSystem = struct {
             .job_fn = job_fn,
         };
         shared.claim.next_range.store(active_worker_threads, .monotonic);
-        shared.completion.pending_workers = active_worker_threads;
-        shared.completion.worker_ranges = 0;
+        shared.completion.worker_ranges.store(0, .monotonic);
+        // The countdown includes main, so a main that finishes last never waits.
+        shared.completion.pending.store(active_worker_threads + 1, .monotonic);
+        // No waiter: main, the only one, waits only in its own join below.
+        shared.completion.done.reset();
         stats.active_worker_threads = active_worker_threads;
         stats.ran_inline = false;
 
-        shared.completion.mutex.unlock(io);
-
         for (self.workers[0..active_worker_threads]) |*worker| {
+            worker.batch_generation.store(generation, .release);
             worker.wake.post(io);
         }
 
@@ -1134,15 +1136,14 @@ pub const ThreadSystem = struct {
         self.owner_in_batch = false;
 
         const wait_start_ns = nowNs(io);
-        shared.completion.mutex.lockUncancelable(io);
-        while (shared.completion.pending_workers != 0) {
-            shared.completion.batch_complete.waitUncancelable(io, &shared.completion.mutex);
+        // Join: the last decrement acquires every earlier participant's release, and a
+        // worker that is last hands that to main through `done`'s release.
+        if (shared.completion.pending.fetchSub(1, .acq_rel) != 1) {
+            shared.completion.done.waitUncancelable(io);
         }
         const wait_end_ns = nowNs(io);
         stats.main_thread_ranges = main_thread_ranges;
-        stats.worker_thread_ranges = shared.completion.worker_ranges;
-        shared.descriptor.batch = .{};
-        shared.completion.mutex.unlock(io);
+        stats.worker_thread_ranges = shared.completion.worker_ranges.load(.monotonic);
         std.debug.assert(stats.main_thread_ranges + stats.worker_thread_ranges == range_count);
 
         const batch_end_ns = nowNs(io);
@@ -1229,7 +1230,7 @@ const shared_line = std.atomic.cache_line;
 
 // One system's batch state, split into blocks that each own whole lines so a range claim
 // invalidates only the claim line, never the descriptor every participant reads or the
-// completion state workers lock.
+// completion countdown.
 const Shared = struct {
     descriptor: Descriptor align(shared_line),
     claim: Claim align(shared_line) = .{},
@@ -1245,73 +1246,51 @@ const Shared = struct {
     }
 
     // Each worker runs its deterministic first range by ID, then claims the rest from
-    // `claim.next_range`, counting what it ran into `completion.worker_ranges` once.
-    fn workerLoop(self: *Shared, id: WorkerId, wake: *std.Io.Semaphore) void {
+    // `claim.next_range`, counting what it ran into `completion.worker_ranges` once. A
+    // wake whose generation the worker already ran (a stale permit, or one for a batch
+    // that did not count it) reads nothing else and never decrements.
+    fn workerLoop(self: *Shared, worker: *WorkerRecord) void {
         const io = self.descriptor.io;
-        var seen_batch_id: u64 = 0;
+        const id = worker.id;
+        var seen_generation: u64 = 0;
         while (true) {
-            wake.waitUncancelable(io);
+            worker.wake.waitUncancelable(io);
+            if (!self.descriptor.accepting_work.load(.acquire)) return;
+            const generation = worker.batch_generation.load(.acquire);
+            if (generation == seen_generation) continue;
+            seen_generation = generation;
 
-            self.completion.mutex.lockUncancelable(io);
-            if (!self.descriptor.accepting_work) {
-                self.completion.mutex.unlock(io);
-                return;
-            }
+            // This batch counted this worker, so main rewrites none of it before this
+            // worker's decrement below.
             const batch = &self.descriptor.batch;
-            if (batch.id == seen_batch_id) {
-                self.completion.mutex.unlock(io);
-                continue;
-            }
-
-            seen_batch_id = batch.id;
             const assigned_range_index = id.index - 1;
-            // Dispatch wakes only workers[0..active] and shapes range_count so
-            // each woken worker has a valid first range. If that invariant
-            // desyncs, still complete the pending_workers count so the main
-            // thread cannot hang waiting on batch_complete forever.
-            if (id.index > batch.active_worker_thread_count or assigned_range_index >= batch.range_count) {
-                self.completeWorker(0);
-                continue;
-            }
+            std.debug.assert(id.index <= batch.active_worker_thread_count and assigned_range_index < batch.range_count);
             const view = batch.view();
-            self.completion.mutex.unlock(io);
-
             view.runRange(id, assigned_range_index);
             const ran_ranges = 1 + view.runClaimedRanges(&self.claim.next_range, id);
 
-            self.completion.mutex.lockUncancelable(io);
-            self.completeWorker(ran_ranges);
+            // After the decrement this worker touches no per-batch state: `done.set`
+            // reads only `done` and the init-time `io`.
+            _ = self.completion.worker_ranges.fetchAdd(ran_ranges, .monotonic);
+            if (self.completion.pending.fetchSub(1, .acq_rel) == 1) self.completion.done.set(io);
         }
-    }
-
-    // Adds the worker's `ran_ranges`, decrements `pending_workers`, and signals the main
-    // thread when the batch is fully drained. Caller must hold `completion.mutex`.
-    // Unlocks before return.
-    fn completeWorker(self: *Shared, ran_ranges: usize) void {
-        const completion = &self.completion;
-        std.debug.assert(completion.pending_workers > 0);
-        completion.worker_ranges += ran_ranges;
-        completion.pending_workers -= 1;
-        if (completion.pending_workers == 0) {
-            completion.batch_complete.signal(self.descriptor.io);
-        }
-        completion.mutex.unlock(self.descriptor.io);
     }
 };
 
-// Written only by the main thread: `io` once at init, the rest under `completion.mutex`
-// at publish, join, and shutdown. Workers read the rest under that mutex.
+// Written only by the main thread: `io` once at init, `batch` at publish, and
+// `accepting_work` at shutdown. Workers read `batch` only after the acquire of a
+// generation assigned to them.
 const Descriptor = struct {
     io: std.Io,
-    accepting_work: bool = true,
-    next_batch_id: u64 = 1,
+    accepting_work: std.atomic.Value(bool) = .init(true),
+    // Main-only: the generation of the last published batch.
+    generation: u64 = 0,
     batch: PublishedBatch = .{},
 };
 
 const PublishedBatch = struct {
-    // Optional context/job fields are valid only while pending_workers is nonzero
-    // or the main thread is helping the active batch.
-    id: u64 = 0,
+    // Optional context/job fields are valid for the last published batch, before main's
+    // join returns.
     item_count: usize = 0,
     items_per_range: usize = 1,
     range_count: usize = 0,
@@ -1320,8 +1299,8 @@ const PublishedBatch = struct {
     job_fn: ?JobFn = null,
 
     fn view(batch: *const PublishedBatch) BatchView {
-        // Published non-null before any worker is woken; asserted so a dispatch/reset
-        // ordering regression trips loudly rather than becoming ReleaseFast UB via `.?`.
+        // Published non-null before any generation store; the caller's generation acquire
+        // is what guards against reading a previous batch's fields.
         std.debug.assert(batch.job_fn != null and batch.context != null);
         return .{
             .item_count = batch.item_count,
@@ -1364,13 +1343,15 @@ const Claim = struct {
     next_range: std.atomic.Value(usize) = .init(0),
 };
 
-// Guarded by `mutex`, which also guards the descriptor's publish and reset.
+// Reset by main at publish; each participant ends its batch here.
 const Completion = struct {
-    mutex: std.Io.Mutex = .init,
-    batch_complete: std.Io.Condition = .init,
-    pending_workers: usize = 0,
-    // Ranges the active workers ran, each worker's count added once at completion.
-    worker_ranges: usize = 0,
+    // Participants (active workers plus main) yet to finish the batch.
+    pending: std.atomic.Value(usize) = .init(0),
+    // Ranges the active workers ran, each worker's count added once before its decrement.
+    worker_ranges: std.atomic.Value(usize) = .init(0),
+    // Set by a worker whose decrement ends the batch; main waits on it only when it
+    // did not end the batch itself.
+    done: std.Io.Event = .unset,
 };
 
 // Recovery-path telemetry, written only by forced-inline batches.
@@ -1387,6 +1368,9 @@ const WorkerRecord = struct {
     // Written once by the worker itself; 0 until then, which is no live thread's id on
     // Linux, Windows, or Darwin.
     thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
+    // Generation of the last batch that counted this worker, stored by main after that
+    // batch is published; 0 before the first.
+    batch_generation: std.atomic.Value(u64) = .init(0),
 };
 
 fn workerMain(worker: *WorkerRecord) void {
@@ -1394,7 +1378,7 @@ fn workerMain(worker: *WorkerRecord) void {
     // The startup permit is posted after init stores `worker.thread`.
     worker.wake.waitUncancelable(worker.shared.descriptor.io);
     nameWorker(worker);
-    worker.shared.workerLoop(worker.id, &worker.wake);
+    worker.shared.workerLoop(worker);
 }
 
 // Names the calling worker `zl-worker-<WorkerId>`; Darwin can name only the calling
@@ -3859,30 +3843,192 @@ test "per-participant range counts stay exact under heavy claiming" {
     defer std.testing.allocator.free(hits);
 
     for (0..64) |_| {
-        @memset(hits, .init(0));
-        setSlotCount(ParticipantRanges, &slots, threads.participantSlotCount());
-        var context = ParticipantCountContext{ .hits = hits, .ranges_by_participant = slots.items };
-        const stats = threads.parallelForWithOptions(item_count, &context, countParticipantRanges, .{
-            .adaptive = false,
-        });
-
-        try std.testing.expect(!stats.ran_inline);
-        try std.testing.expectEqual(@as(usize, worker_count), stats.active_worker_threads);
-        try std.testing.expectEqual(@as(usize, item_count), stats.range_count);
-        try std.testing.expectEqual(slots.items[threads.scratchSlotForWorker(WorkerId.main)].value.ranges, stats.main_thread_ranges);
-        var worker_ranges: usize = 0;
-        for (threads.workers) |*worker| {
-            const ranges = slots.items[threads.scratchSlotForWorker(worker.id)].value.ranges;
-            // Every woken worker runs at least its assigned first range.
-            try std.testing.expect(ranges >= 1);
-            worker_ranges += ranges;
-        }
-        try std.testing.expectEqual(worker_ranges, stats.worker_thread_ranges);
-        try std.testing.expectEqual(stats.range_count, stats.main_thread_ranges + stats.worker_thread_ranges);
-        for (hits) |*hit| {
-            try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
-        }
+        try expectExactFixedBatch(&threads, &slots, hits, item_count, worker_count);
     }
+}
+
+// Runs one fixed threaded batch over `range_count` one-item ranges capped at
+// `worker_cap` workers, and checks coverage and every participant's range count.
+fn expectExactFixedBatch(
+    threads: *ThreadSystem,
+    slots: *SlotList(ParticipantRanges),
+    hits: []std.atomic.Value(u32),
+    range_count: usize,
+    worker_cap: usize,
+) !void {
+    @memset(hits[0..range_count], .init(0));
+    setSlotCount(ParticipantRanges, slots, threads.participantSlotCount());
+    var context = ParticipantCountContext{ .hits = hits[0..range_count], .ranges_by_participant = slots.items };
+    const stats = threads.parallelForWithOptions(range_count, &context, countParticipantRanges, .{
+        .adaptive = false,
+        .items_per_range = 1,
+        .max_worker_threads = worker_cap,
+    });
+
+    const expected_workers = @min(worker_cap, range_count - 1);
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(expected_workers, stats.active_worker_threads);
+    try std.testing.expectEqual(range_count, stats.range_count);
+    try std.testing.expectEqual(slots.items[threads.scratchSlotForWorker(WorkerId.main)].value.ranges, stats.main_thread_ranges);
+    var worker_ranges: usize = 0;
+    for (threads.workers, 0..) |*worker, index| {
+        const ranges = slots.items[threads.scratchSlotForWorker(worker.id)].value.ranges;
+        if (index < expected_workers) {
+            try std.testing.expect(ranges >= 1);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), ranges);
+        }
+        worker_ranges += ranges;
+    }
+    try std.testing.expectEqual(worker_ranges, stats.worker_thread_ranges);
+    try std.testing.expectEqual(range_count, stats.main_thread_ranges + stats.worker_thread_ranges);
+    for (hits[0..range_count]) |*hit| {
+        try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+test "back-to-back threaded dispatches stay exact as worker and range counts cycle" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const worker_count = 7;
+    const max_ranges = 64;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
+    defer threads.deinit();
+
+    var slots: SlotList(ParticipantRanges) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
+    var hits: [max_ranges]std.atomic.Value(u32) = @splat(.init(0));
+
+    // A lost wake or a missed completion hangs here.
+    for (0..10_000) |dispatch| {
+        const worker_cap = 1 + dispatch % worker_count;
+        const range_count = 2 + dispatch % (max_ranges - 1);
+        try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_cap);
+    }
+}
+
+// One worker and two ranges: the worker's assigned range 0 and main's claimed range 1
+// hold each other so one participant's decrement is forced to end the batch.
+const CompletionOrderContext = struct {
+    pending: *const std.atomic.Value(usize),
+    done: *const std.Io.Event,
+    worker_last: bool,
+    main_ran: std.atomic.Value(bool) = .init(false),
+    hits: [2]std.atomic.Value(u32) = @splat(.init(0)),
+    // Written once per range by the participant that ran it.
+    participant_by_range: [2]usize = @splat(std.math.maxInt(usize)),
+};
+
+fn completionOrderJob(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
+    const order: *CompletionOrderContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < order.hits.len);
+    _ = order.hits[range.index].fetchAdd(1, .monotonic);
+    order.participant_by_range[range.index] = id.index;
+    if (range.index == 0) {
+        // Worker-last: hold until main has decremented and committed to waiting, so the
+        // worker's `set` must wake a sleeper. Main-last: hold until main has started its
+        // range, which then outwaits this worker's decrement.
+        if (order.worker_last) {
+            while (@atomicLoad(std.Io.Event, order.done, .acquire) != .waiting) std.atomic.spinLoopHint();
+        } else {
+            while (!order.main_ran.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    } else if (!order.worker_last) {
+        order.main_ran.store(true, .release);
+        while (order.pending.load(.acquire) != 1) std.atomic.spinLoopHint();
+    }
+}
+
+fn runCompletionOrderBatch(threads: *ThreadSystem, worker_last: bool) !void {
+    var order = CompletionOrderContext{
+        .pending = &threads.shared.completion.pending,
+        .done = &threads.shared.completion.done,
+        .worker_last = worker_last,
+    };
+    const stats = threads.parallelForWithOptions(order.hits.len, &order, completionOrderJob, .{
+        .adaptive = false,
+        .items_per_range = 1,
+    });
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), stats.active_worker_threads);
+    try std.testing.expectEqual(@as(usize, 1), stats.main_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 1), stats.worker_thread_ranges);
+    for (&order.hits) |*hit| try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), order.participant_by_range[0]);
+    try std.testing.expectEqual(WorkerId.main.index, order.participant_by_range[1]);
+    try std.testing.expectEqual(@as(usize, 0), threads.shared.completion.pending.load(.monotonic));
+}
+
+test "a batch main finishes last joins without waiting on the completion event" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 1 });
+    defer threads.deinit();
+
+    for (0..8) |_| {
+        try runCompletionOrderBatch(&threads, false);
+        // No worker ended the batch, and main never waited.
+        try std.testing.expectEqual(std.Io.Event.unset, @atomicLoad(std.Io.Event, &threads.shared.completion.done, .acquire));
+    }
+}
+
+test "a batch a worker finishes last wakes main through the completion event" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 1 });
+    defer threads.deinit();
+
+    for (0..8) |_| {
+        try runCompletionOrderBatch(&threads, true);
+        try std.testing.expect(threads.shared.completion.done.isSet());
+    }
+    // Orders alternate on one system, so each publish resets the event the last set.
+    try runCompletionOrderBatch(&threads, false);
+    try std.testing.expectEqual(std.Io.Event.unset, @atomicLoad(std.Io.Event, &threads.shared.completion.done, .acquire));
+    try runCompletionOrderBatch(&threads, true);
+    try std.testing.expect(threads.shared.completion.done.isSet());
+}
+
+test "stale wake permits run no batch and decrement nothing, inside or outside a batch" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const worker_count = 4;
+    const range_count = 32;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
+    defer threads.deinit();
+    const io = threads.shared.descriptor.io;
+
+    var slots: SlotList(ParticipantRanges) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
+    var hits: [range_count]std.atomic.Value(u32) = @splat(.init(0));
+
+    // Extra permits before the first publish; each is taken before or during an early
+    // batch, depending on timing.
+    for (threads.workers) |*worker| worker.wake.post(io);
+    for (0..100) |batch| {
+        // One stale permit per batch for the last worker, which no batch counts, so its
+        // wake lands while main publishes and joins a batch without it.
+        threads.workers[worker_count - 1].wake.post(io);
+        try expectExactFixedBatch(&threads, &slots, &hits, range_count, 1 + batch % (worker_count - 1));
+    }
+}
+
+test "deinit right after init joins workers with startup and shutdown permits pending" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    for (0..32) |_| {
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
+        threads.deinit();
+    }
+
+    // And after a batch, once every batch permit is consumed.
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
+    defer threads.deinit();
+    var slots: SlotList(ParticipantRanges) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
+    var hits: [16]std.atomic.Value(u32) = @splat(.init(0));
+    try expectExactFixedBatch(&threads, &slots, &hits, hits.len, 4);
 }
 
 const nested_inner_items = 32;
