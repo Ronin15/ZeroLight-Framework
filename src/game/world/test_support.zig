@@ -12,8 +12,8 @@ const world_tileset_meta = @import("../../assets/world_tileset_meta.zig");
 const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const WorldSystem = @import("system.zig").WorldSystem;
 const TileId = @import("system.zig").TileId;
-const DenseCellWrite = @import("system.zig").DenseCellWrite;
-const DenseChunkWrites = @import("system.zig").DenseChunkWrites;
+const DenseCellWrite = @import("edit.zig").DenseCellWrite;
+const DenseChunkWrites = @import("edit.zig").DenseChunkWrites;
 const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
 const default_chunk_size_tiles = @import("system.zig").default_chunk_size_tiles;
 const invalid_tile_id = @import("system.zig").invalid_tile_id;
@@ -219,6 +219,42 @@ pub fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
     }
     try std.testing.expectEqual(rows.len, listed);
 }
+
+/// Brute-force composed blocked bit: OR over every dense layer on the level, then
+/// every sparse tile on the level at this cell.
+pub fn bruteForceLevelBlocked(world: *const WorldSystem, level: u16, x: u16, y: u16) bool {
+    for (0..world.denseLayerCount()) |layer| {
+        if (world.denseLayerLevel(layer) != level) continue;
+        if (world.flagsFor(world.denseTile(layer, x, y)).blocks_movement) return true;
+    }
+    for (world.sparse_tiles.items(.level_index), 0..) |row_level, sparse_index| {
+        if (row_level != level) continue;
+        const cell = world.sparseTileCellCoord(sparse_index);
+        if (cell.x == x and cell.y == y and world.sparseTileBlocksMovement(sparse_index)) return true;
+    }
+    return false;
+}
+
+/// World-tileset tiles the terrain tests write, resolved by name from the catalog.
+pub const TerrainTestTiles = struct {
+    grass: TileId,
+    dirt: TileId,
+    water: TileId,
+    cave: TileId,
+    tree: TileId,
+    deco: TileId,
+
+    pub fn resolve(world: *const WorldSystem, meta: *const WorldTilesetMeta) !TerrainTestTiles {
+        return .{
+            .grass = try world.requireTileByName(meta, "grass"),
+            .dirt = try world.requireTileByName(meta, "dirt"),
+            .water = try world.requireTileByName(meta, "water_1"),
+            .cave = try world.requireTileByName(meta, "cave_0"),
+            .tree = try world.requireTileByName(meta, "tree_0"),
+            .deco = try world.requireTileByName(meta, "deco_0"),
+        };
+    }
+};
 
 test "the demo world paints the same tiles at every chunk edge" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");

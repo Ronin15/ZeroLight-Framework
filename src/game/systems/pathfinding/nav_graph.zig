@@ -2573,8 +2573,8 @@ const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const EntityTemplate = @import("../../data_system.zig").EntityTemplate;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const TileId = @import("../../world/system.zig").TileId;
-const DenseCellWrite = @import("../../world/system.zig").DenseCellWrite;
-const DenseChunkWrites = @import("../../world/system.zig").DenseChunkWrites;
+const DenseCellWrite = @import("../../world/edit.zig").DenseCellWrite;
+const DenseChunkWrites = @import("../../world/edit.zig").DenseChunkWrites;
 const WorldTileChangedEvent = @import("../../simulation.zig").WorldTileChangedEvent;
 const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 

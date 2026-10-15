@@ -59,6 +59,7 @@ comptime {
     _ = @import("game/stamped_table.zig");
     _ = @import("game/world/system.zig");
     _ = @import("game/world/render.zig");
+    _ = @import("game/world/edit.zig");
     _ = @import("game/world/test_support.zig");
     _ = @import("game/world/interest.zig");
     _ = @import("game/world/terrain.zig");

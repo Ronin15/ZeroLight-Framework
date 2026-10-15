@@ -97,6 +97,7 @@ const codeResults = await parallel([
     `Read these files related to pathfinding and world systems:
     - src/game/world/system.zig
     - src/game/world/render.zig
+    - src/game/world/edit.zig
     - src/game/systems/pathfinding.zig (and src/game/systems/pathfinding/)
     Focus on: world/map data model, how navigation mesh or grid is managed, whether the world model supports dynamic changes (terrain modification, destructibles), how spatial queries are done, and readiness for emergent world-state gameplay.`,
     { label: 'code:world+pathfinding', phase: 'Code Scan', schema: CODE_SCHEMA, agentType: 'zig-design-specialist' }
