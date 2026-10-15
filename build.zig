@@ -105,6 +105,11 @@ pub fn build(b: *std.Build) void {
     // Windows do not (see `ltoSupportedForTarget`).
     // Every other artifact and mode uses Zig's default backend/linker selection.
     const release_lto = optimize == .fast and ltoSupportedForTarget(target.result);
+    // ThreadSanitizer for the unit-test and bench artifacts only; the app and gpu-smoke
+    // are never instrumented, and SDL/GPU driver threads stay uninstrumented. TSan needs
+    // the LLVM backend, so those two artifacts force it. Not part of `verify`.
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build unit tests and benchmarks with ThreadSanitizer (LLVM backend)") orelse false;
+    const sanitize_thread_supported = tsanSupportedForTarget(target.result);
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
     const windows_sdl_checks = windowsSdlValidateSteps(windows_sdl);
 
@@ -162,6 +167,7 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{
         .name = "benchmarks",
         .root_module = benchModule,
+        .use_llvm = if (sanitize_thread) true else null,
     });
 
     const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
@@ -170,7 +176,25 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = unitTestsModule,
         .filters = test_filters,
+        .use_llvm = if (sanitize_thread) true else null,
     });
+
+    if (sanitize_thread) {
+        if (sanitize_thread_supported) {
+            // Imported modules (`sdl_c`, `build_options`) inherit it from the root.
+            unitTestsModule.sanitize_thread = true;
+            benchModule.sanitize_thread = true;
+        } else {
+            // Fail every step that builds a sanitized artifact (check, test, bench,
+            // verify) instead of a libtsan sub-compilation error or an uninstrumented build.
+            const tsan_unsupported = b.addFail(b.fmt(
+                "-Dsanitize-thread is not enabled for target {s}-{s}-{s}; enabled only for x86_64 or aarch64 on Linux (glibc), macOS, or FreeBSD",
+                .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag), @tagName(target.result.abi) },
+            ));
+            unit_tests.step.dependOn(&tsan_unsupported.step);
+            bench_exe.step.dependOn(&tsan_unsupported.step);
+        }
+    }
 
     // Ship/package mode: full LTO (`-flto=full`) for cross-module inlining and
     // dead-code elimination when the target supports it (see `release_lto`).
@@ -234,6 +258,21 @@ pub fn build(b: *std.Build) void {
 
     const bench_run = b.addRunArtifact(bench_exe);
     addWindowsSdlRunRuntime(bench_run, windows_sdl_runtime);
+    // Halt on the first report. A user-set TSAN_OPTIONS follows the defaults, so its flags
+    // win one by one (e.g. halt_on_error=0 to collect every report). The value is always set
+    // on the run steps so a changed TSAN_OPTIONS reruns a cached passing run; reading the
+    // environment here is invisible to the configure cache, so a sanitizing build
+    // reconfigures on every invocation.
+    if (sanitize_thread) {
+        b.graph.poisonCache();
+        const tsan_defaults = "halt_on_error=1 second_deadlock_stack=1";
+        const tsan_options = if (b.graph.environ_map.get("TSAN_OPTIONS")) |user|
+            b.fmt("{s} {s}", .{ tsan_defaults, user })
+        else
+            tsan_defaults;
+        test_run.setEnvironmentVariable("TSAN_OPTIONS", tsan_options);
+        bench_run.setEnvironmentVariable("TSAN_OPTIONS", tsan_options);
+    }
     bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run CPU gameplay processor benchmarks");
     bench_step.dependOn(&bench_run.step);
@@ -763,6 +802,21 @@ fn ltoSupportedForTarget(target: std.Target) bool {
         .macho, .coff => false,
         else => true,
     };
+}
+
+/// Targets `-Dsanitize-thread` is enabled for: a conservative subset of what the bundled
+/// libtsan supports; Linux requires glibc (TSan does not support musl).
+fn tsanSupportedForTarget(target: std.Target) bool {
+    const os_ok = switch (target.os.tag) {
+        .linux => target.abi.isGnu(),
+        .macos, .freebsd => true,
+        else => false,
+    };
+    const arch_ok = switch (target.cpu.arch) {
+        .x86_64, .aarch64 => true,
+        else => false,
+    };
+    return os_ok and arch_ok;
 }
 
 fn parseLogLevel(value: []const u8, optimize: std.builtin.Optimize) std.log.Level {
