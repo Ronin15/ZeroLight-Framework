@@ -1875,7 +1875,8 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
     // Level builds only: no marks batch. The world first: its content, and the levels the run
-    // adds (solid, or walkable for the replace case), size the nav.
+    // adds, size the nav. Added levels are solid, except the replace case's newest level, which
+    // is walkable until its band blocks it, so at most one added level is open at a time.
     var world_fixture = try buildFixture(allocator, io, side, levels);
     var world_owned = true;
     defer if (world_owned) world_fixture.deinit();
@@ -1884,7 +1885,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     var content = NavGraph.storageContentOf(&world_fixture.world);
     if (replace) {
         const chunks = world_fixture.world.chunkCountPerLevel();
-        content.open_chunks += added_levels * chunks;
+        content.open_chunks += chunks;
         content.max_level_open = chunks;
     }
     size_config.content = content;
