@@ -19,7 +19,7 @@ const WorldSystem = @import("../../game/world/system.zig").WorldSystem;
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const TileId = @import("../../game/world/system.zig").TileId;
 const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
-const connectivity = @import("../../game/systems/pathfinding/connectivity.zig");
+const connectivity_closure = @import("../../game/systems/pathfinding/connectivity_closure.zig");
 const fixtures = @import("../fixtures.zig");
 const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
@@ -736,7 +736,7 @@ const OnewayConfig = struct {
 // The words of the one-way block a system of `terminals` terminals holds once built or
 // regrown.
 fn onewayBlockWords(terminals: usize) !usize {
-    return connectivity.blockWords(try connectivity.boundCap(terminals));
+    return connectivity_closure.blockWords(try connectivity_closure.boundCap(terminals));
 }
 
 // The ballast variant's chain: `config.ballastRooms()` rooms on level 1 after every chain

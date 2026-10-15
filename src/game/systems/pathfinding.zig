@@ -37,6 +37,7 @@ test {
     _ = @import("pathfinding/nav_graph.zig");
     _ = @import("pathfinding/link_bounds.zig");
     _ = @import("pathfinding/connectivity.zig");
+    _ = @import("pathfinding/connectivity_closure.zig");
     _ = @import("pathfinding/caches.zig");
     _ = @import("pathfinding/goal_table.zig");
     _ = @import("pathfinding/solve.zig");

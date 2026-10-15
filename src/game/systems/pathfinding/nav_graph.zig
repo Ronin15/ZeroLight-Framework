@@ -53,8 +53,8 @@ const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
 const connectivity = @import("connectivity.zig");
 const Connectivity = @import("connectivity.zig").Connectivity;
 const ConnectivityCounters = @import("connectivity.zig").ConnectivityCounters;
-const ClosureCounters = @import("connectivity.zig").ClosureCounters;
-const ClosureThreads = @import("connectivity.zig").ClosureThreads;
+const ClosureCounters = @import("connectivity_closure.zig").ClosureCounters;
+const ClosureThreads = @import("connectivity_closure.zig").ClosureThreads;
 const NodeRow = @import("connectivity.zig").NodeRow;
 const no_node = @import("connectivity.zig").no_node;
 const no_comp = @import("connectivity.zig").no_comp;
@@ -1064,7 +1064,7 @@ pub const NavGraph = struct {
     /// with a full border window; a node per open chunk, a border window's worth per mixed
     /// chunk, and one per link endpoint; the batch buffers of one level build or the largest
     /// marks batch, whose chunks may turn mixed (the same ones every batch); the plan sets;
-    /// and reachability (`Connectivity.storageBytesBound`). Pools are charged at their
+    /// and reachability (`connectivity.storageBytesBound`). Pools are charged at their
     /// doubling and lists at std's growth past their need.
     pub fn storageBytesBound(shape: StorageShape) usize {
         const levels = @max(1, shape.levels);

@@ -35,7 +35,7 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'nav-graph-invalidation',
-    files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/link_bounds.zig', 'src/game/systems/pathfinding/connectivity.zig'],
+    files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/link_bounds.zig', 'src/game/systems/pathfinding/connectivity.zig', 'src/game/systems/pathfinding/connectivity_closure.zig'],
     focus: 'Nav-graph structural correctness: incremental-dig chunk-patch correctness vs a full rebuild (does the patched graph equal a from-scratch rebuild?), nav-invalidation classification correctness (are all affected portals/edges recomputed, none missed or double-counted?), the threaded chunk-patch race, and portal/edge consistency across chunk borders. This is the highest-risk correctness area.',
   },
   {

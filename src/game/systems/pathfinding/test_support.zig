@@ -37,11 +37,19 @@ const LinkBox = @import("link_bounds.zig").LinkBox;
 const no_node = @import("connectivity.zig").no_node;
 const no_comp = @import("connectivity.zig").no_comp;
 const no_term = @import("connectivity.zig").no_term;
-const no_hcomp = @import("connectivity.zig").no_hcomp;
+const no_hcomp = @import("connectivity_closure.zig").no_hcomp;
 const no_oneway = @import("connectivity.zig").no_oneway;
-const no_index = @import("connectivity.zig").no_index;
+const no_index = @import("connectivity_closure.zig").no_index;
 const CellCoord = @import("../../world/system.zig").CellCoord;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
+const types = @import("types.zig");
+const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
+const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
+const Connectivity = @import("connectivity.zig").Connectivity;
+const StagingSizes = @import("connectivity.zig").StagingSizes;
+const MergeMap = @import("connectivity.zig").MergeMap;
+const rowWords = @import("connectivity_closure.zig").rowWords;
+const indexMap = @import("connectivity_closure.zig").indexMap;
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
     const entity = try data.createEntity();
@@ -710,3 +718,273 @@ pub fn expectLinkPair(pairs: *const LinkPairs, index: usize, from: [3]i32, to: [
     try std.testing.expectEqual(LinkBox.point(to[0], to[1], to[2]), pairs.exits.boxAt(index));
     try std.testing.expectEqual(cost, pairs.cost[index]);
 }
+
+/// Chunk edge of the test worlds, in cells.
+pub const test_chunk: u16 = 4;
+
+/// A world of `chunks` x `chunks` walkable 4-cell chunks on `levels` levels, each level with
+/// an obstacle layer to draw walls on.
+pub const TestWorld = struct {
+    meta: WorldTilesetMeta,
+    world: @import("../../world/system.zig").WorldSystem,
+    data: DataSystem,
+    obstacle: [4]usize = @splat(0),
+    grass: TileId,
+    tree: TileId,
+
+    pub fn init(chunks: u16, levels: u16) !TestWorld {
+        var meta = try loadTestWorldMeta(std.testing.allocator);
+        errdefer meta.deinit();
+        const grass = try requireTestTile(&meta, "grass");
+        const tree = try requireTestTile(&meta, "tree_0");
+        const extent = @as(f32, @floatFromInt(@as(u32, chunks) * test_chunk)) * meta.tileSize();
+        var world = try abstractTestWorld(&meta, extent, extent);
+        errdefer world.deinit();
+        var fixture = TestWorld{ .meta = meta, .world = world, .data = DataSystem.init(std.testing.allocator), .grass = grass, .tree = tree };
+        fixture.obstacle[0] = try fixture.world.addDenseLayer(0, 0, .obstacle, grass);
+        for (1..levels) |level| {
+            _ = try fixture.world.addLevel(-16 * @as(i32, @intCast(level)));
+            _ = try fixture.world.addDenseLayer(@intCast(level), 0, .floor, grass);
+            fixture.obstacle[level] = try fixture.world.addDenseLayer(@intCast(level), 0, .obstacle, grass);
+        }
+        return fixture;
+    }
+
+    pub fn deinit(self: *TestWorld) void {
+        self.data.deinit();
+        self.world.deinit();
+        self.meta.deinit();
+    }
+
+    /// Writes `tile` over every cell of chunk (cx, cy) on `level`, marking `system` dirty.
+    pub fn setChunk(self: *TestWorld, system: ?*PathfindingSystem, level: u16, cx: u16, cy: u16, tile: TileId) !void {
+        for (0..test_chunk) |dy| for (0..test_chunk) |dx| {
+            try self.setCell(system, level, @intCast(cx * test_chunk + dx), @intCast(cy * test_chunk + dy), tile);
+        };
+    }
+
+    pub fn setCell(self: *TestWorld, system: ?*PathfindingSystem, level: u16, x: u16, y: u16, tile: TileId) !void {
+        const changed = (try self.world.setDenseTile(self.obstacle[level], x, y, tile)) orelse return;
+        if (system) |nav| try recordTileChange(nav, &self.world, changed);
+    }
+
+    pub fn build(self: *TestWorld, capacity: types.PathfindingCapacity) !PathfindingSystem {
+        var system = PathfindingSystem.init(std.testing.allocator);
+        errdefer system.deinit();
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&self.data, &self.world, null);
+        return system;
+    }
+
+    /// Asserts `system`'s connectivity and one-way closure are consistent with the world and
+    /// partition and reach as a full rebuild's do.
+    pub fn expectMatchesRebuild(self: *TestWorld, system: *const PathfindingSystem) !void {
+        var rebuilt = try self.build(abstractCapacity());
+        defer rebuilt.deinit();
+        try expectConnectivityConsistent(&system.graph);
+        try expectConnectivityConsistent(&rebuilt.graph);
+        try expectSameConnectivityPartition(&system.graph, &rebuilt.graph);
+        try expectClosureConsistent(&system.graph, &self.world);
+        try expectClosureConsistent(&rebuilt.graph, &self.world);
+        try expectSameClosure(&system.graph, &rebuilt.graph);
+    }
+
+    pub fn cell(self: *const TestWorld, x: usize, y: usize) usize {
+        return y * self.world.width + x;
+    }
+};
+
+/// A 10 x 10 chunk level halved by a solid chunk column, each half holding a walled 2 x 2 chunk
+/// room opened by one gap chunk ((2, 1) and (7, 1)): enclosing both rooms splits two separate
+/// components, each flooding as its own family.
+pub fn twoRooms(fixture: *TestWorld) !void {
+    for (0..10) |cy| try fixture.setChunk(null, 0, 5, @intCast(cy), fixture.tree);
+    for (0..3) |cy| {
+        if (cy != 1) try fixture.setChunk(null, 0, 2, @intCast(cy), fixture.tree);
+        if (cy != 1) try fixture.setChunk(null, 0, 7, @intCast(cy), fixture.tree);
+    }
+    for (0..2) |cx| try fixture.setChunk(null, 0, @intCast(cx), 2, fixture.tree);
+    for (8..10) |cx| try fixture.setChunk(null, 0, @intCast(cx), 2, fixture.tree);
+}
+
+pub fn toggleRooms(fixture: *TestWorld, system: ?*PathfindingSystem, tile: TileId) !void {
+    try fixture.setChunk(system, 0, 2, 1, tile);
+    try fixture.setChunk(system, 0, 7, 1, tile);
+}
+
+/// Asserts `a` and `b` hold bitwise equal connectivity and one-way closure columns.
+pub fn expectSameColumns(a: *const NavGraph, b: *const NavGraph) !void {
+    const t = std.testing;
+    for (a.level_graphs.items, b.level_graphs.items) |*level_a, *level_b| {
+        try t.expectEqualSlices(u8, level_a.node_label, level_b.node_label);
+        try t.expectEqualSlices(u32, level_a.node_comp, level_b.node_comp);
+        try t.expectEqualSlices(u32, level_a.node_sibling, level_b.node_sibling);
+        try t.expectEqualSlices(u32, level_a.node_free.items, level_b.node_free.items);
+        try t.expectEqualSlices(u32, level_a.record_node_head, level_b.record_node_head);
+        try t.expectEqualSlices(u8, level_a.record_label_count, level_b.record_label_count);
+    }
+    const conn_a = &a.connectivity;
+    const conn_b = &b.connectivity;
+    try t.expectEqualSlices(u32, conn_a.comp_root, conn_b.comp_root);
+    try t.expectEqualSlices(u32, conn_a.comp_size, conn_b.comp_size);
+    try t.expectEqualSlices(u32, conn_a.comp_prev, conn_b.comp_prev);
+    try t.expectEqualSlices(u32, conn_a.comp_next, conn_b.comp_next);
+    try t.expectEqualSlices(u32, conn_a.comp_set, conn_b.comp_set);
+    try t.expectEqualSlices(u32, conn_a.root_head, conn_b.root_head);
+    try t.expectEqualSlices(u32, conn_a.root_members, conn_b.root_members);
+    try t.expectEqualSlices(u32, conn_a.comp_free.items, conn_b.comp_free.items);
+    try t.expectEqualSlices(u32, conn_a.root_free.items, conn_b.root_free.items);
+    try t.expectEqualSlices(u32, conn_a.root_term, conn_b.root_term);
+    const closure_a = &conn_a.closure;
+    const closure_b = &conn_b.closure;
+    try t.expectEqual(closure_a.live_words, closure_b.live_words);
+    try t.expectEqualSlices(u32, closure_a.oneway_of_link.items, closure_b.oneway_of_link.items);
+    inline for (.{ .root, .hcomp, .index, .slot }) |field| try t.expectEqualSlices(u32, @field(closure_a.term, @tagName(field)), @field(closure_b.term, @tagName(field)));
+    inline for (.{ .k_cap, .k_high, .k_live, .index_free, .link_head, .link_tail, .link_count }) |field| try t.expectEqualSlices(u32, @field(closure_a.hcomp, @tagName(field)), @field(closure_b.hcomp, @tagName(field)));
+    // Block addresses differ; each H-component's rows and handed-out map entries match (its
+    // padding and unused map entries are never read).
+    for (closure_a.hcomp.k_cap, closure_a.hcomp.k_high, 0..) |k_cap, k_high, id_usize| {
+        const id: u32 = @intCast(id_usize);
+        try t.expectEqual(closure_a.hcomp.block[id].len, closure_b.hcomp.block[id].len);
+        if (k_cap == 0) continue;
+        const rows = @as(usize, k_cap) * rowWords(k_cap);
+        try t.expectEqualSlices(u32, closure_a.hcomp.block[id][0..rows], closure_b.hcomp.block[id][0..rows]);
+        try t.expectEqualSlices(u32, indexMap(closure_a.hcomp, id)[0..k_high], indexMap(closure_b.hcomp, id)[0..k_high]);
+    }
+    inline for (.{ .link, .hcomp, .next, .src_term, .dst_term }) |field| try t.expectEqualSlices(u32, closure_a.oneway.items(field), closure_b.oneway.items(field));
+    try t.expectEqualSlices(u32, closure_a.term_free.items, closure_b.term_free.items);
+    try t.expectEqualSlices(u32, closure_a.hcomp_free.items, closure_b.hcomp_free.items);
+}
+
+pub fn markAll(run: *TestWorld, systems: []const *PathfindingSystem, level: u16, x: u16, y: u16, tile: TileId) !void {
+    const changed = (try run.world.setDenseTile(run.obstacle[level], x, y, tile)) orelse return;
+    for (systems) |system| try recordTileChange(system, &run.world, changed);
+}
+
+/// The system's nav threads pinned to one item per range on `threads`.
+pub fn forcedNavThreads(system: *PathfindingSystem, threads: *ThreadSystem) NavUpdateThreads {
+    return .{
+        .thread_system = threads,
+        .tuners = &system.tuners.nav,
+        .controls = .{ .adaptive = false, .items_per_range = 1 },
+    };
+}
+
+/// Asserts every staging list of `conn` is held for its size in `keep` (`types.stagingHeld`),
+/// as a release to `keep` leaves it.
+pub fn expectStagingWithin(conn: *const Connectivity, keep: StagingSizes) !void {
+    const t = std.testing;
+    // A starts list and its counts keep the same size.
+    try t.expect(types.stagingHeld(&conn.seed_starts, keep.changed_keys + 1) and types.stagingHeld(&conn.seed_counts, keep.changed_keys + 1));
+    try t.expect(types.stagingHeld(&conn.seed_edges, keep.seeds));
+    try t.expect(types.stagingHeld(&conn.patch_changed, keep.patch_keys + 1));
+    try t.expect(types.stagingHeld(&conn.row_starts, keep.items + 1) and types.stagingHeld(&conn.edge_starts, keep.items + 1));
+    try t.expect(types.stagingHeld(&conn.row_counts, keep.items + 1) and types.stagingHeld(&conn.edge_counts, keep.items + 1));
+    try t.expect(types.stagingHeld(&conn.gather_rows, keep.rows) and types.stagingHeld(&conn.gather_edges, keep.edges));
+    try t.expect(!types.shouldShrinkCapacity(conn.element_map.keys.capacity, try MergeMap.slotCount(2 * keep.elements)));
+    try t.expect(types.stagingHeld(&conn.elements, keep.elements) and types.stagingHeld(&conn.units, keep.elements));
+    try t.expect(types.stagingHeld(&conn.sets, keep.elements) and types.stagingHeld(&conn.families, keep.elements) and types.stagingHeld(&conn.groups, keep.elements));
+    inline for (.{ &conn.unit_elements, &conn.group_roots, &conn.group_sets, &conn.root_first, &conn.round_sets }) |list| {
+        try t.expect(types.stagingHeld(list, keep.elements));
+    }
+}
+
+/// Asserts every batch list of `graph` is held for what its release keeps: its group's window
+/// high, the most a one-chunk batch needed, and the graph's static one-chunk floor (1 changed,
+/// 1 dirty, 5 patch keys; one plan range).
+pub fn expectGraphStagingWithin(graph: *const NavGraph) !void {
+    const t = std.testing;
+    const window = &graph.staging_window;
+    const changed = window.kept(.changed, 1);
+    const dirty = window.kept(.dirty, 1);
+    const patch = window.kept(.patch, 5);
+    try t.expect(types.stagingHeld(&graph.changed_keys, changed) and types.stagingHeld(&graph.plan_staging[0], changed));
+    try t.expect(types.stagingHeld(&graph.dirty_keys, dirty) and types.stagingHeld(&graph.plan_staging[1], dirty));
+    try t.expect(types.stagingHeld(&graph.patch_keys, patch) and types.stagingHeld(&graph.plan_staging[2], patch));
+    try t.expect(types.stagingHeld(&graph.changed_masks, changed) and types.stagingHeld(&graph.remask_slots, changed) and types.stagingHeld(&graph.remask_deltas, changed));
+    try t.expect(types.stagingHeld(&graph.patch_info, patch));
+    try t.expect(types.stagingHeld(&graph.plan_windows, window.kept(.ranges, 1)) and types.stagingHeld(&graph.plan_tallies, window.kept(.ranges, 1)));
+}
+
+/// `capacity` with a release window of `steps` steps, so a test closes windows quickly.
+pub fn windowCapacity(steps: u32) types.PathfindingCapacity {
+    var capacity = abstractCapacity();
+    capacity.capacity_shrink_window = steps;
+    return capacity;
+}
+
+/// A comb on `fixture`'s level of `2 * tunnels` chunks: an open corridor along chunk row 0 and
+/// below it `tunnels` one-chunk dead-end tunnels on the even chunk columns, walled apart by the
+/// odd ones. Filling the corridor in one batch makes every tunnel mouth a set of one family.
+/// With `joined`, each odd tunnel meets the next at the level's bottom row, so their sets meet
+/// mid-flood: a set served in a round reaches the one the family's pass resumes at.
+pub fn hubTunnels(fixture: *TestWorld, tunnels: u16, joined: bool) !void {
+    const side = 2 * tunnels;
+    for (1..side) |cy| {
+        var cx: u16 = 1;
+        while (cx < side) : (cx += 2) {
+            const bottom_link = joined and cy == side - 1 and cx % 4 == 3 and cx + 1 < side - 1;
+            if (!bottom_link) try fixture.setChunk(null, 0, cx, @intCast(cy), fixture.tree);
+        }
+    }
+}
+
+/// Writes `tile` over the comb's corridor, marking `system` dirty.
+pub fn setHubCorridor(fixture: *TestWorld, system: ?*PathfindingSystem, tunnels: u16, tile: TileId) !void {
+    for (0..2 * tunnels) |cx| try fixture.setChunk(system, 0, @intCast(cx), 0, tile);
+}
+
+/// The id pool a batch test exhausts.
+pub const ExhaustedPool = enum { comps, terms };
+
+/// Applies `system`'s pending change with `pool` reading one row short of its id sentinel and
+/// holding no free id: growth checks only the pool's length, so no row memory backs the count,
+/// and both are restored before any reader walks the rows. The batch fails as OutOfMemory;
+/// with `arm`, on an allocator failing every request, so the id check, not an allocation, is
+/// what failed (a warmed batch asks nothing before its id growth). The graph stays as
+/// `before` with the change pending, and the retry with the rows freed equals a rebuild.
+pub fn expectExhaustedPoolBatch(fixture: *TestWorld, system: *PathfindingSystem, before: *const PathfindingSystem, pool: ExhaustedPool, arm: bool) !void {
+    const conn = &system.graph.connectivity;
+    const closure = &conn.closure;
+    const len = switch (pool) {
+        .comps => &conn.comps.len,
+        .terms => &closure.terms.len,
+    };
+    const free = switch (pool) {
+        .comps => &conn.comp_free,
+        .terms => &closure.term_free,
+    };
+    const sentinel: usize = switch (pool) {
+        .comps => no_comp,
+        .terms => no_term,
+    };
+    const live_rows = len.*;
+    const free_ids = try std.testing.allocator.dupe(u32, free.items);
+    defer std.testing.allocator.free(free_ids);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    if (arm) {
+        system.allocator = failing.allocator();
+        system.graph.allocator = failing.allocator();
+    }
+    len.* = sentinel - 1;
+    free.items.len = 0;
+    const result = system.applyBufferedNavUpdates(&no_colliders, &fixture.world, null);
+    system.allocator = std.testing.allocator;
+    system.graph.allocator = std.testing.allocator;
+    len.* = live_rows;
+    free.items.len = free_ids.len;
+    conn.refreshColumns();
+    closure.refreshColumns();
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqualSlices(u32, free_ids, free.items);
+    try expectConnectivityConsistent(&system.graph);
+    try expectSameConnectivityPartition(&system.graph, &before.graph);
+    try expectSameClosure(&system.graph, &before.graph);
+    try std.testing.expect(system.hasPendingNavUpdates(&fixture.world));
+    _ = try system.applyBufferedNavUpdates(&no_colliders, &fixture.world, null);
+    try fixture.expectMatchesRebuild(system);
+}
+
+/// A long release window, so a warmed batch's staging stays held.
+pub const exhausted_pool_window: u32 = 1 << 16;
