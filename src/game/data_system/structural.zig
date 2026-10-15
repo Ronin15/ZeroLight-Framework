@@ -201,10 +201,7 @@ fn addCapacity(value: usize, amount: usize) !usize {
     return std.math.add(usize, value, amount);
 }
 
-// Module-pub (not facade-exported): system.zig's preflightStructuralCommands
-// wrapper needs to name this return type across the file boundary. Tests
-// never spell it directly (they use the inferred `try data.preflightStructuralCommands(...)`).
-pub const StructuralCommitPlan = struct {
+const StructuralCommitPlan = struct {
     // `structural_event_count` lets callers reserve their change sink before
     // mutation so event publishing cannot fail halfway through commit.
     command_count: usize,

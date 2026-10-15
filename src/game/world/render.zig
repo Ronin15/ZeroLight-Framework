@@ -138,6 +138,14 @@ pub const DenseRenderScratch = struct {
     }
 };
 
+/// Sets the render chunk window, the GPU directory side for the rect's size, and
+/// the active level it renders around, and rebuilds the window's sparse list.
+/// O(1) when the window, level, and `render_window` are unchanged and no tile was
+/// added inside the window; otherwise O(window levels × window chunks + V log V)
+/// for the V sparse
+/// tiles in the window, never depending on the world's sparse count, level size,
+/// or depth. Out of memory leaves the window and its sparse list as they were and
+/// the next call retries.
 pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16, active_level: u16) error{OutOfMemory}!void {
     if (self.levelCount() == 0) return;
     const render_side = renderSideForRect(self, rect, overscan_chunks);
@@ -260,6 +268,20 @@ fn renderSideForRect(self: *const WorldSystem, rect: Rect, overscan_chunks: u16)
     return @min(std.math.ceilPowerOfTwo(u32, @max(span_x, span_y)) catch max_side, max_side);
 }
 
+/// Submits this frame's resident dense layers as one retained world-space
+/// tilemap quad per composite draw: each draw's fragment shader walks a chain of
+/// layer directories in the world's GPU tile store from its topmost layer,
+/// stopping at the first opaque cell, so a run of layers with nothing sandwiched
+/// between them is one draw independent of world size and window depth.
+/// `interleave_depths` (sorted ascending, deduplicated) are this frame's cut
+/// points: depths something else (a sparse tile, a dynamic entity) needs to
+/// render strictly between two dense layers; each splits the stack into another
+/// draw. Requires `syncDenseTileStore` for the same `active_level` first.
+/// Re-submits on a layer or store change (`dense_quads_dirty`), an
+/// `active_level`/window change, or an interleave-depth-set change, never on a
+/// pan alone: the quads are full-world, the camera lives in the vertex shader,
+/// and the resident chunk window is a store uniform. Allocation-free within the
+/// sync's reserve.
 pub fn submitStaticDenseGeometry(
     self: *WorldSystem,
     renderer: *Renderer,
@@ -429,6 +451,24 @@ fn collectDenseSubmitLayers(self: *WorldSystem, active_level: u16) error{OutOfMe
     return desired.items;
 }
 
+/// Brings the world's GPU tile store in line with the render window around
+/// `active_level`: the dense layers of the window's levels, each over the
+/// render chunk window in a toroidal directory chained topmost-first. Layers
+/// entering upload their directory and their mixed window chunks' blocks; layers
+/// leaving free theirs; a pan across a chunk boundary uploads only the chunks
+/// entering; a changed resident chunk uploads once, its word or its whole block;
+/// all in the next frame copy pass. Creates the store, content-sized, on first
+/// need and whenever the directory side changes; layers past the store's `u32`
+/// width are dropped deepest first and reported once. Call once per frame on
+/// the main thread before `submitStaticDenseGeometry` and swapchain acquisition.
+/// O(1) when nothing changed; O(window chunks) per resident layer changed since the
+/// last sync; O(resident layers × window chunks) when the window, level, or layer
+/// set moves; never depends on chunks or levels outside the window. Every
+/// fallible step (plan, store creation, upload reserve) precedes the mirror
+/// commit, and the queue after it cannot fail, so an error leaves residency and
+/// change marks for a retry. Claims the
+/// store for this frame; the renderer retires it the first frame this is not
+/// called, and the next call re-uploads the window into a new store.
 pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16) TileStoreError!void {
     const mirror = &self.gpu_tiles;
     if (mirror.store.isValid() and !renderer.claimTileStore(mirror.store)) resetGpuResidency(self);
@@ -554,6 +594,12 @@ pub fn commitDenseGpuSync(self: *WorldSystem, sync_plan: *const world_gpu_tiles.
     }
 }
 
+/// Submits the window's sparse tiles in depth range `range_index` (below
+/// `sparseDepthRangeCount`) through the dynamic ordered stream, in (cell, tile
+/// id) order. Sparse tiles stay dynamic (they are sparse and change
+/// independently of the dense static field); the renderer merges them with
+/// dynamic entities and the static dense spans by render order. O(tiles in the
+/// range).
 pub fn submitVisibleSparseRange(
     self: *const WorldSystem,
     renderer: *Renderer,
@@ -564,6 +610,8 @@ pub fn submitVisibleSparseRange(
     _ = try emitSparseRange(self, renderer, prepared.texture, range_index);
 }
 
+/// `submitVisibleSparseRange` into a CPU sprite `batch` instead of a live
+/// `Renderer`, for headless parity checks and benches. Returns the sprites written.
 pub fn submitVisibleSparseSprites(
     self: *const WorldSystem,
     batch: *sprite_batch.SpriteBatch,
