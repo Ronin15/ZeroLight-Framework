@@ -32,6 +32,8 @@ const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const LabelSet = @import("nav_graph.zig").LabelSet;
+const LinkPairs = @import("link_bounds.zig").LinkPairs;
+const LinkBox = @import("link_bounds.zig").LinkBox;
 const no_node = @import("connectivity.zig").no_node;
 const no_comp = @import("connectivity.zig").no_comp;
 const no_term = @import("connectivity.zig").no_term;
@@ -700,4 +702,11 @@ pub fn expectSameClosure(a: *const NavGraph, b: *const NavGraph) !void {
             try t.expectEqual(a.connectivity.closure.termReaches(from[0], to[0]), b.connectivity.closure.termReaches(from[1], to[1]));
         }
     }
+}
+
+/// Expects pair `index` of `pairs` to be the point pair from `from` to `to` (x, y, level) at `cost`.
+pub fn expectLinkPair(pairs: *const LinkPairs, index: usize, from: [3]i32, to: [3]i32, cost: i32) !void {
+    try std.testing.expectEqual(LinkBox.point(from[0], from[1], from[2]), pairs.entrances.boxAt(index));
+    try std.testing.expectEqual(LinkBox.point(to[0], to[1], to[2]), pairs.exits.boxAt(index));
+    try std.testing.expectEqual(cost, pairs.cost[index]);
 }

@@ -48,7 +48,7 @@ Give file:line references. Be specific and severity-honest; do not invent proble
 
 const UNITS = [
   { unit: 'system', files: ['src/game/systems/pathfinding/system.zig'], note: 'Per-frame request scheduling, agent state, integration with simulation pipeline. Scrutinize hot-path allocation and dispatch.' },
-  { unit: 'nav_graph', files: ['src/game/systems/pathfinding/nav_graph.zig'], note: 'Navigation graph construction/representation.' },
+  { unit: 'nav_graph', files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/link_bounds.zig'], note: 'Navigation graph construction/representation, and the link cost bounds the abstract heuristic reads.' },
   { unit: 'caches', files: ['src/game/systems/pathfinding/caches.zig'], note: 'Path/result caching. Check invalidation coherency and lifetime.' },
   { unit: 'solve', files: ['src/game/systems/pathfinding/solve.zig'], note: 'The core search/solve (A*/etc). Check allocation discipline and correctness of the search.' },
   { unit: 'nav_grid', files: ['src/game/systems/pathfinding/nav_grid.zig'], note: 'Grid representation and walkability.' },
@@ -80,8 +80,8 @@ Read the assigned files completely and the relevant docs. Return your findings v
 
 phase('Cross-cut')
 const CROSS = [
-  { key: 'module-coherency', prompt: 'Review the WHOLE pathfinder module for cross-file COHERENCY: invariants that must agree across files (coordinate spaces, units, cell/world conversions, request lifecycle states, error sets), assumptions made in one file that another file violates, and data contracts that drift between producer and consumer. Trace the request lifecycle from system.zig through solve.zig, nav_graph.zig, nav_grid.zig, caches.zig.' },
-  { key: 'module-cohesion', prompt: 'Review the WHOLE pathfinder module for cross-file COHESION and architecture: is the split into files (system/nav_graph/nav_grid/connectivity/solve/caches/goal_table/types/group_field/scratch) clean and single-responsibility? Find duplication that should be unified, misplaced concerns, ownership-boundary violations (does anything reach outside the pathfinding module improperly, or import render/gpu internals?), and dead or redundant code. Assess whether the public facade (pathfinding.zig) exposes the right minimal surface.' },
+  { key: 'module-coherency', prompt: 'Review the WHOLE pathfinder module for cross-file COHERENCY: invariants that must agree across files (coordinate spaces, units, cell/world conversions, request lifecycle states, error sets), assumptions made in one file that another file violates, and data contracts that drift between producer and consumer. Trace the request lifecycle from system.zig through solve.zig, nav_graph.zig, link_bounds.zig, nav_grid.zig, caches.zig.' },
+  { key: 'module-cohesion', prompt: 'Review the WHOLE pathfinder module for cross-file COHESION and architecture: is the split into files (system/nav_graph/link_bounds/nav_grid/connectivity/solve/caches/goal_table/types/group_field/scratch) clean and single-responsibility? Find duplication that should be unified, misplaced concerns, ownership-boundary violations (does anything reach outside the pathfinding module improperly, or import render/gpu internals?), and dead or redundant code. Assess whether the public facade (pathfinding.zig) exposes the right minimal surface.' },
   { key: 'standards-and-hotpath', prompt: 'Review the WHOLE pathfinder module for STANDARDS adherence and hot-path discipline against the rule files listed above, module-wide rather than per file: allocation and growth on per-step/per-request paths and their proofs, hot-path dispatch and logging, budgets, capacities, and thresholds, naming and error sets, comments, and tests.' },
 ]
 const allFiles = UNITS.flatMap((u) => u.files)
