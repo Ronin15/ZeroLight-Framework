@@ -2287,6 +2287,10 @@ test "a window of 80 resident layers composites in one chained draw" {
 }
 
 test "a chunk window wider than the largest directory side is clipped to it and syncs" {
+    // Exercises a reported clip: keep its `log.warn` off the test runner's stderr.
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
     // 40000x1 tiles in 1-tile chunks: a rect over the whole level spans more chunks
     // than any directory side can map. No layer, so no directory is allocated.
     var world = WorldSystem{
@@ -2309,6 +2313,10 @@ test "a chunk window wider than the largest directory side is clipped to it and 
 }
 
 test "the store width keeps the topmost window layers and reports the drop once" {
+    // Exercises a reported clip: keep its `log.warn` off the test runner's stderr.
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
     const desired = [_]u32{ 7, 3, 5, 1 };
     var reported = false;
     try std.testing.expectEqualSlices(u32, &desired, fitResidentLayers(&desired, 9, &reported));
