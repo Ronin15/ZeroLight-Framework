@@ -44,5 +44,6 @@ test {
     _ = @import("pathfinding/system.zig");
     _ = @import("pathfinding/publish.zig");
     _ = @import("pathfinding/group_service.zig");
+    _ = @import("pathfinding/intake.zig");
     _ = @import("pathfinding/test_support.zig");
 }
