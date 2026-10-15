@@ -27,6 +27,7 @@ const sparse_window = @import("sparse_window.zig");
 const spatial_index = @import("spatial_index.zig");
 const steering = @import("steering.zig");
 const suite = @import("suite.zig");
+const thread_dispatch = @import("thread_dispatch.zig");
 
 pub const std_options = logging.std_options;
 
@@ -114,6 +115,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     steering.cluster_outlier_group,
     steering.static_change_group,
     steering.static_dense_group,
+    thread_dispatch.group,
 };
 
 pub fn main(init: std.process.Init) !void {
