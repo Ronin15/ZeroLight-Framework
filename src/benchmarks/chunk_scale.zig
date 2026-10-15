@@ -132,6 +132,7 @@ const min_capacity_floor = @import("../game/systems/pathfinding/types.zig").min_
 const default_max_group_fields = @import("../game/systems/pathfinding/types.zig").default_max_group_fields;
 const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
 const fixtures = @import("fixtures.zig");
+const nav_size = @import("nav_size.zig");
 const suite = @import("suite.zig");
 
 // Item codes: the level side and count at the bottom, each group's fields above them.
@@ -1397,7 +1398,7 @@ fn publishBatchEvents(frame: *SimulationFrame, events: []const WorldTileChangedE
 
 // No path requests: the agent budget stays at its floor. `batch`: the workload's largest
 // marks batch.
-fn navSizeConfig(side: u16, levels: usize, participant_count: usize, batch: suite.NavBatch) suite.NavSizeConfig {
+fn navSizeConfig(side: u16, levels: usize, participant_count: usize, batch: nav_size.NavBatch) nav_size.NavSizeConfig {
     return .{
         .side = side,
         .levels = levels,
@@ -1455,9 +1456,9 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     const participant_count = fixtures.participantCount(thread_ptr);
     // The dig square's cells on the deepest level; the ramps' too, with their exits' obstacle
     // rects on the level above and their links.
-    const batch: suite.NavBatch = switch (workload) {
-        .dig => .{ .mark_chunks = dig_cell_count, .links = 0, .keys = suite.squareBatchKeys(dig_window_chunks) },
-        .ramp => .{ .mark_chunks = 2 * dig_cell_count, .links = dig_cell_count, .keys = 2 * suite.squareBatchKeys(dig_window_chunks) },
+    const batch: nav_size.NavBatch = switch (workload) {
+        .dig => .{ .mark_chunks = dig_cell_count, .links = 0, .keys = nav_size.squareBatchKeys(dig_window_chunks) },
+        .ramp => .{ .mark_chunks = 2 * dig_cell_count, .links = dig_cell_count, .keys = 2 * nav_size.squareBatchKeys(dig_window_chunks) },
     };
     // The world first: its content sizes the nav.
     var world_fixture = try buildFixture(allocator, io, side, levels);
@@ -1469,12 +1470,12 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         .dig => nav_dig_group.name,
         .ramp => nav_ramp_group.name,
     };
-    try suite.checkNavSize(group_name, item_count, case, size_config);
+    try nav_size.checkNavSize(group_name, item_count, case, size_config);
 
     world_owned = false;
-    var nav = try navFixtureOver(allocator, io, world_fixture, suite.navSizeCapacity(size_config), thread_ptr);
+    var nav = try navFixtureOver(allocator, io, world_fixture, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
-    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
+    try nav_size.checkNavBytes(group_name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
     fixtures.setNavTuners(&nav.system, case);
 
@@ -1505,7 +1506,7 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         timed_main = nav.lastNavMain();
         if (workload == .ramp) try resetNavRamps(&nav);
     }
-    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
+    try nav_size.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
@@ -1737,9 +1738,9 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // levels, an explosion disk's bounding square, or each doorway chunk with its neighbours.
     const edit_chunks: usize = if (enclose) |config| config.pockets() else region_chunks;
     const batch_keys: usize = switch (workload) {
-        .cave_in => cave_in_levels * suite.squareBatchKeys(std.math.sqrt(region_chunks / cave_in_levels)),
-        .explosion_fill => suite.squareBatchKeys(std.math.sqrt(region_chunks)),
-        .enclose => edit_chunks * suite.squareBatchKeys(1),
+        .cave_in => cave_in_levels * nav_size.squareBatchKeys(std.math.sqrt(region_chunks / cave_in_levels)),
+        .explosion_fill => nav_size.squareBatchKeys(std.math.sqrt(region_chunks)),
+        .enclose => edit_chunks * nav_size.squareBatchKeys(1),
     };
     const chunk_cells = @as(usize, default_chunk_size_tiles) * default_chunk_size_tiles;
     // The world first: its content sizes the nav.
@@ -1753,12 +1754,12 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .explosion_fill => nav_explosion_fill_group.name,
         .enclose => nav_enclose_group.name,
     };
-    try suite.checkNavSize(group_name, item_count, case, size_config);
+    try nav_size.checkNavSize(group_name, item_count, case, size_config);
 
     world_owned = false;
-    var nav = try navFixtureOver(allocator, io, world_fixture, suite.navSizeCapacity(size_config), thread_ptr);
+    var nav = try navFixtureOver(allocator, io, world_fixture, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
-    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
+    try nav_size.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var edit = switch (workload) {
         .cave_in => try buildCaveInEdit(allocator, &nav.base, region_chunks),
         .explosion_fill => try buildExplosionEdit(allocator, &nav.base, region_chunks, 1),
@@ -1826,7 +1827,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         // Main is everything but the terrain and nav reaction stages that ran on workers.
         main_total += elapsed_ns -| (timing.terrain.off_main_ns + timing.nav_off_main_ns);
     }
-    try suite.checkNavBytes(group_name, item_count, size_config, &nav.system);
+    try nav_size.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the cells written.
     stats.output_count = cells_changed;
@@ -1872,7 +1873,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     var world_owned = true;
     defer if (world_owned) world_fixture.deinit();
     const added_levels = options.warmup_iterations + options.iterations;
-    var size_config = navSizeConfig(side, levels + added_levels, participant_count, suite.NavBatch.none);
+    var size_config = navSizeConfig(side, levels + added_levels, participant_count, nav_size.NavBatch.none);
     var content = NavGraph.storageContentOf(&world_fixture.world);
     if (replace) {
         const chunks = world_fixture.world.chunkCountPerLevel();
@@ -1880,12 +1881,12 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         content.max_level_open = chunks;
     }
     size_config.content = content;
-    try suite.checkNavSize(nav_level_add_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(nav_level_add_group.name, item_count, case, size_config);
 
     world_owned = false;
-    var nav = try navFixtureOver(allocator, io, world_fixture, suite.navSizeCapacity(size_config), thread_ptr);
+    var nav = try navFixtureOver(allocator, io, world_fixture, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer nav.deinit();
-    try suite.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
+    try nav_size.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
     fixtures.setNavTuners(&nav.system, case);
     var frame = SimulationFrame.init(allocator);
@@ -1895,7 +1896,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     for (0..options.iterations) |_| {
         accumulator.record(try levelAddIteration(io, &nav, &frame, replace), nav.last_stats.remask_batch);
     }
-    try suite.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
+    try nav_size.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     stats.output_count = nav.base.world.levelCount();
     stats.nav_conn = suite.navConnSummary(nav.last_stats, fixtures.floodTunerWorkers(&nav.system, case));

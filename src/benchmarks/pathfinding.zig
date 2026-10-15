@@ -45,6 +45,7 @@ const default_group_field_build_budget = @import("../game/systems/pathfinding/ty
 const isGoalPortal = @import("../game/systems/pathfinding/solve.zig").isGoalPortal;
 const connectivity = @import("../game/systems/pathfinding/connectivity.zig");
 const fixtures = @import("fixtures.zig");
+const nav_size = @import("nav_size.zig");
 const suite = @import("suite.zig");
 
 // The request-load groups (`pathfinding` through `pathfinding-query`) run world-backed nav on
@@ -221,8 +222,8 @@ pub const query_group = suite.BenchmarkGroup{
 };
 
 // Nav scaling groups over a world-backed nav. A listed config whose nav storage exceeds the
-// bench's nav-size limit fails with its figure (`suite.checkNavSize`), and every config checks
-// each part of the nav's bytes against its charge (`suite.checkNavBytes`). The route groups
+// bench's nav-size limit fails with its figure (`nav_size.checkNavSize`), and every config checks
+// each part of the nav's bytes against its charge (`nav_size.checkNavBytes`). The route groups
 // time one cold step of 64 distinct-goal requests; `candidates` is the abstract nodes the last
 // solve used and `outputs` the routes that solved. The level-size and depth groups fail
 // unless every route solves that step; the teleport and shaft groups count a route whose
@@ -2084,11 +2085,11 @@ const route_request_count: usize = 64;
 const cross_level_goal_level: u16 = 4;
 
 // The chunk keys a marks batch toggling one cell patches: its chunk and four neighbours.
-const toggle_batch_keys: usize = suite.squareBatchKeys(1);
-const toggle_batch: suite.NavBatch = .{ .mark_chunks = 1, .links = 0, .keys = toggle_batch_keys };
+const toggle_batch_keys: usize = nav_size.squareBatchKeys(1);
+const toggle_batch: nav_size.NavBatch = .{ .mark_chunks = 1, .links = 0, .keys = toggle_batch_keys };
 
 // The route fixtures never change nav after the build: no marks batch.
-fn routeSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize) suite.NavSizeConfig {
+fn routeSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize) nav_size.NavSizeConfig {
     return .{
         .side = side,
         .levels = levels,
@@ -2096,7 +2097,7 @@ fn routeSizeConfig(side: usize, levels: usize, links: usize, participant_count: 
         .participant_count = participant_count,
         .agent_budget = route_request_count,
         .group_fields = 1,
-        .batch = suite.NavBatch.none,
+        .batch = nav_size.NavBatch.none,
     };
 }
 
@@ -2161,7 +2162,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     try writeLevelZeroCells(&open, wall[0..wall_len], open.blocking);
     // The built world's content sizes the nav.
     size_config.content = NavGraph.storageContentOf(&open.world);
-    try suite.checkNavSize(level_size_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(level_size_group.name, item_count, case, size_config);
 
     // An 8x8 block of starts left of the wall and their goals mirrored right of it,
     // rows 4 apart around the gap: each route crosses the gap.
@@ -2177,11 +2178,11 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         };
     }
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, &requests, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    try suite.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
     const stats = try runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr, .fail);
-    try suite.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
     return stats;
 }
 
@@ -2293,7 +2294,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
 
     // The built world's content and links size the nav.
     size_config.content = NavGraph.storageContentOf(&open.world);
-    try suite.checkNavSize(group_name, item_count, case, size_config);
+    try nav_size.checkNavSize(group_name, item_count, case, size_config);
 
     // Starts in an 8x8 block at the level-0 center, goals in an 8x8 block below it on
     // level 4.
@@ -2310,11 +2311,11 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         };
     }
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, &requests, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    try suite.checkNavBytes(group_name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(group_name, item_count, size_config, &fixture.system);
     const stats = try runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
-    try suite.checkNavBytes(group_name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(group_name, item_count, size_config, &fixture.system);
     return stats;
 }
 
@@ -2370,7 +2371,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     });
     // The built world's content and links size the nav.
     size_config.content = NavGraph.storageContentOf(&open.world);
-    try suite.checkNavSize(cross_level_shaft_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(cross_level_shaft_group.name, item_count, case, size_config);
 
     var requests: [route_request_count]PathRequest = undefined;
     for (&requests, 0..) |*request, index| {
@@ -2385,11 +2386,11 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         };
     }
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, &requests, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
-    try suite.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
     const stats = try runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
-    try suite.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
     return stats;
 }
 
@@ -3201,7 +3202,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var open = built.open;
     var open_owned = true;
     defer if (open_owned) open.world.deinit();
-    const size_config = suite.NavSizeConfig{
+    const size_config = nav_size.NavSizeConfig{
         .side = config.side(),
         .levels = levels,
         .links = levels - 1,
@@ -3210,17 +3211,17 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .participant_count = 1,
         .agent_budget = agent_count,
         .group_fields = 1,
-        .batch = suite.NavBatch.none,
+        .batch = nav_size.NavBatch.none,
         .content = NavGraph.storageContentOf(&open.world),
         .tier1_abstract_nodes = if (config.variant == .probe) long_path_probe_nodes else default_tier1_abstract_node_cap,
     };
-    try suite.checkNavSize(long_path_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(long_path_group.name, item_count, case, size_config);
 
-    const capacity = suite.navSizeCapacity(size_config);
+    const capacity = nav_size.navSizeCapacity(size_config);
     open_owned = false;
     var fixture = try initRouteFixture(allocator, open, requests[0..agent_count], capacity, null);
     defer fixture.deinit();
-    try suite.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
     const agents = requests[0..agent_count];
@@ -3230,7 +3231,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
             try runLongPathWalkCase(allocator, io, options, case, item_count, config, &fixture, agents[0], built.blocked)
         else
             try runLongPathHopsCase(allocator, io, options, case, item_count, config, &fixture, agents[0]);
-        try suite.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
+        try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
         return stats;
     }
 
@@ -3254,7 +3255,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         if (cycle.escalated) |escalated| escalated_ns += escalated.ns;
         accumulator.record(cycle.ns(), inlineBatch(1, pathfinding_range_alignment_items));
     }
-    try suite.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     const cycle = reference orelse return stats;
     if (options.details) {
@@ -3720,7 +3721,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
-    const size_config = suite.NavSizeConfig{
+    const size_config = nav_size.NavSizeConfig{
         .side = short_route_side,
         .levels = 1,
         .participant_count = participant_count,
@@ -3733,14 +3734,14 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .batch = if (region_chunks == 0) toggle_batch else .{
             .mark_chunks = region_chunks * default_chunk_size_tiles * default_chunk_size_tiles,
             .links = 0,
-            .keys = suite.squareBatchKeys(region_edge),
+            .keys = nav_size.squareBatchKeys(region_edge),
         },
     };
-    try suite.checkNavSize(evict_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(evict_group.name, item_count, case, size_config);
 
-    var fixture = try initShortRouteFixture(allocator, io, result_count, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initShortRouteFixture(allocator, io, result_count, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try suite.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
     const region_cells: ?[]CellCoord = if (region_chunks == 0) null else region: {
         const chunks = try evictRegionChunks(allocator, region_edge);
         defer allocator.free(chunks);
@@ -3775,7 +3776,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     report.print(options, evict_group.name, item_count, case);
     // The size config charges no long block.
     if (fixture.system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
-    try suite.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = evicted;
     stats.cache_evictions = evicted;
@@ -3802,7 +3803,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
-    const size_config = suite.NavSizeConfig{
+    const size_config = nav_size.NavSizeConfig{
         .side = short_route_side,
         .levels = 1,
         .participant_count = participant_count,
@@ -3811,10 +3812,10 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         .long_results = 0,
         .runs_per_result = short_route_runs,
         // Requests only: no marks batch.
-        .batch = suite.NavBatch.none,
+        .batch = nav_size.NavBatch.none,
     };
-    try suite.checkNavSize(elastic_ramp_group.name, item_count, case, size_config);
-    const capacity = suite.navSizeCapacity(size_config);
+    try nav_size.checkNavSize(elastic_ramp_group.name, item_count, case, size_config);
+    const capacity = nav_size.navSizeCapacity(size_config);
 
     var open = try buildOpenWorld(allocator, io, short_route_side, 1);
     defer open.world.deinit();
@@ -3828,7 +3829,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer system.deinit();
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
-    try suite.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
+    try nav_size.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
     setPathStageTuners(&system, case);
 
     for (0..options.warmup_iterations) |_| _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
@@ -3840,7 +3841,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     }
     // The size config charges no long block.
     if (system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
-    try suite.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
+    try nav_size.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
     stats.output_count = last.solves;
     // A ramp ends with every agent's result cached once, so every solve past one per
@@ -3948,7 +3949,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
-    const size_config = suite.NavSizeConfig{
+    const size_config = nav_size.NavSizeConfig{
         .side = short_route_side,
         .levels = 1,
         .participant_count = participant_count,
@@ -3957,10 +3958,10 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         .long_results = 0,
         .runs_per_result = short_route_runs,
         // Requests only: no marks batch.
-        .batch = suite.NavBatch.none,
+        .batch = nav_size.NavBatch.none,
     };
-    try suite.checkNavSize(elastic_shrink_group.name, item_count, case, size_config);
-    const capacity = suite.navSizeCapacity(size_config);
+    try nav_size.checkNavSize(elastic_shrink_group.name, item_count, case, size_config);
+    const capacity = nav_size.navSizeCapacity(size_config);
 
     var open = try buildOpenWorld(allocator, io, short_route_side, 1);
     defer open.world.deinit();
@@ -3974,7 +3975,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     defer system.deinit();
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
-    try suite.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
+    try nav_size.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
     setPathStageTuners(&system, case);
     var cached: std.ArrayList(CachedPayload) = .empty;
     defer cached.deinit(allocator);
@@ -3995,7 +3996,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     // The size config charges no long block.
     if (system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
 
-    try suite.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
+    try nav_size.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
     stats.output_count = shrink_report.last.kept;
     stats.candidate_pairs = shrink_report.last.moved;
@@ -4155,7 +4156,7 @@ fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, reques
     return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
-fn pocketSizeConfig(side: u16, participant_count: usize, requester_count: usize) suite.NavSizeConfig {
+fn pocketSizeConfig(side: u16, participant_count: usize, requester_count: usize) nav_size.NavSizeConfig {
     return .{
         .side = side,
         .levels = 1,
@@ -4199,11 +4200,11 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, item_count);
-    try suite.checkNavSize(negative_steady_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(negative_steady_group.name, item_count, case, size_config);
 
-    var fixture = try initPocketFixture(allocator, io, side, item_count, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initPocketFixture(allocator, io, side, item_count, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try suite.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     setPathStageTuners(&fixture.system, case);
 
     for (0..coldWarmup(options)) |_| _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
@@ -4227,7 +4228,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     }
     stage_report.print(options, negative_steady_group.name, item_count, case);
 
-    try suite.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = last_stats.unavailable_results;
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
@@ -4293,11 +4294,11 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, requester_count);
-    try suite.checkNavSize(negative_dig_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(negative_dig_group.name, item_count, case, size_config);
 
-    var fixture = try initPocketFixture(allocator, io, side, requester_count, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initPocketFixture(allocator, io, side, requester_count, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try suite.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     try fixture.changed.ensureTotalCapacity(allocator, 1);
     setPathStageTuners(&fixture.system, case);
     fixtures.setNavTuners(&fixture.system, case);
@@ -4332,7 +4333,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     reaction_report.print(options, negative_dig_group.name, item_count, case);
     report.print(options, item_count, case);
 
-    try suite.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = requester_count;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
@@ -4472,7 +4473,7 @@ fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfi
     return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
 }
 
-fn burstSizeConfig(participant_count: usize, requester_count: usize) suite.NavSizeConfig {
+fn burstSizeConfig(participant_count: usize, requester_count: usize) nav_size.NavSizeConfig {
     return .{
         .side = burst_side,
         .levels = 1,
@@ -4483,7 +4484,7 @@ fn burstSizeConfig(participant_count: usize, requester_count: usize) suite.NavSi
         .long_results = 0,
         .runs_per_result = 0,
         // Requests only: no marks batch.
-        .batch = suite.NavBatch.none,
+        .batch = nav_size.NavBatch.none,
     };
 }
 
@@ -4570,11 +4571,11 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = burstSizeConfig(participant_count, config.requests);
-    try suite.checkNavSize(negative_burst_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(negative_burst_group.name, item_count, case, size_config);
 
-    var fixture = try initBurstFixture(allocator, io, config, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initBurstFixture(allocator, io, config, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try suite.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     setPathStageTuners(&fixture.system, case);
 
     // At least one untimed burst: the first grows the capacity from the reserve floor.
@@ -4603,7 +4604,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     stage_report.print(options, negative_burst_group.name, item_count, case);
     resolve_report.print(options, item_count, case);
 
-    try suite.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     if (last) |burst| {
         stats.output_count = burst.unavailable;
@@ -4920,7 +4921,7 @@ fn chunkCells(allocator: std.mem.Allocator, chunks: []const ChunkCoord, chunk_ti
 }
 
 // `batch`: the workload's largest marks batch.
-fn toggleSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize, batch: suite.NavBatch) suite.NavSizeConfig {
+fn toggleSizeConfig(side: usize, levels: usize, links: usize, participant_count: usize, batch: nav_size.NavBatch) nav_size.NavSizeConfig {
     return .{
         .side = side,
         .levels = levels,
@@ -5008,18 +5009,18 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     const participant_count = fixtures.participantCount(thread_ptr);
     // The gap chunk's cells.
     const size_config = toggleSizeConfig(config.side, 1, 0, participant_count, .{ .mark_chunks = default_chunk_size_tiles * default_chunk_size_tiles, .links = 0, .keys = toggle_batch_keys });
-    try suite.checkNavSize(connectivity_split_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(connectivity_split_group.name, item_count, case, size_config);
 
-    var fixture = try initSplitFixture(allocator, io, config, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initSplitFixture(allocator, io, config, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try suite.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     const gap = try chunkCells(allocator, &.{config.gapChunk()}, fixture.open.world.chunk_size_tiles);
     defer allocator.free(gap);
     try fixture.changed.ensureTotalCapacity(allocator, gap.len);
     fixtures.setNavTuners(&fixture.system, case);
 
     var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr, .{}, null);
-    try suite.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     stats.output_count = gap.len;
     stats.candidate_pairs = config.structureChunks();
     return stats;
@@ -5239,7 +5240,7 @@ const OnewayBallast = struct {
 
     cells: []const CellCoord,
     // What `checkNavBytes` charges the nav, checked after every retire.
-    size_config: suite.NavSizeConfig,
+    size_config: nav_size.NavSizeConfig,
     item_count: usize,
     // The ballast's block words, which its reopen lands and its close frees.
     block_words: usize,
@@ -5269,7 +5270,7 @@ const OnewayBallast = struct {
         const retired_words = reopen.closure_live_words -| self.close.stats.closure_live_words;
         if (self.close.stats.closure_block_frees != 1 or retired_words != self.block_words) return error.ConnectivityOnewayBallastFree;
         if (retired_words <= 2 * self.close.stats.closure_live_words) return error.ConnectivityOnewayBallastTooSmall;
-        try suite.checkNavBytes(connectivity_oneway_group.name, self.item_count, self.size_config, &fixture.system);
+        try nav_size.checkNavBytes(connectivity_oneway_group.name, self.item_count, self.size_config, &fixture.system);
     }
 
     // Closes every ballast room in one untimed reaction.
@@ -5477,7 +5478,7 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     // The toggle, the dense variant's walls, the shrunk variant's cut, or the ballast's retire,
     // whichever writes the most cells and patches the most chunks.
     const cut_rooms = if (config.variant == .shrunk) config.terminals - oneway_shrunk_live else 0;
-    const batch = suite.NavBatch{
+    const batch = nav_size.NavBatch{
         .mark_chunks = @max(1, @max(config.systems, cut_rooms, ballast_rooms.len)),
         .links = 0,
         .keys = @max(toggle_batch_keys, if (config.variant == .dense)
@@ -5492,11 +5493,11 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     var size_config = toggleSizeConfig(oneway_side, oneway_levels, try config.allLinks(), participant_count, batch);
     // A system is one chain or fan of rooms; the dense variant's opening merges every one.
     size_config.oneway_system_terminals = if (config.variant == .dense) config.rooms() else @max(config.terminals, ballast_rooms.len);
-    try suite.checkNavSize(connectivity_oneway_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(connectivity_oneway_group.name, item_count, case, size_config);
 
-    var fixture = try initOnewayFixture(allocator, io, config, rooms, ballast_rooms, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initOnewayFixture(allocator, io, config, rooms, ballast_rooms, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     // One toggled cell, or the dense variant's walls.
     const dense_walls: []CellCoord = if (config.variant == .dense) try denseWalls(allocator, config.systems) else &.{};
     defer allocator.free(dense_walls);
@@ -5524,7 +5525,7 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     };
     var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null);
     ballast.print(options, case);
-    try suite.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     stats.output_count = config.links();
     stats.candidate_pairs = config.rooms();
     return stats;
@@ -5579,14 +5580,14 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count, .{ .mark_chunks = 0, .links = link_fold_batch, .keys = 2 * link_fold_batch });
     // Every pad is bidirectional.
     size_config.oneway_links = 0;
-    try suite.checkNavSize(link_fold_group.name, item_count, case, size_config);
+    try nav_size.checkNavSize(link_fold_group.name, item_count, case, size_config);
 
     var prng = std.Random.DefaultPrng.init(random_pad_seed);
     const random = prng.random();
     const probe_pairs = config.probePairs(samples);
-    var fixture = try initLinkFoldFixture(allocator, io, random, config, probe_pairs, suite.navSizeCapacity(size_config), thread_ptr);
+    var fixture = try initLinkFoldFixture(allocator, io, random, config, probe_pairs, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
-    try suite.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     fixtures.setNavTuners(&fixture.system, case);
     var batch: usize = 0;
     for (0..options.warmup_iterations) |_| {
@@ -5604,7 +5605,7 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const pads_held = fixture.open.world.levelLinks().len;
     if (pads_held != peak_pads) return error.LinkFoldDrift;
     report.print(options, link_fold_group.name, item_count, case);
-    try suite.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
+    try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stats.output_count = pads_held;
     stats.candidate_pairs = report.chunks_patched;

@@ -56,7 +56,7 @@ const UNITS = [
   { unit: 'types_and_goals', files: ['src/game/systems/pathfinding/types.zig', 'src/game/systems/pathfinding/goal_table.zig'], note: 'Shared types/contracts and the per-goal shared projection table.' },
   { unit: 'group_field_and_scratch', files: ['src/game/systems/pathfinding/group_field.zig', 'src/game/systems/pathfinding/scratch.zig'], note: 'Flow/group field and scratch buffers. Check reuse vs per-frame allocation.' },
   { unit: 'facade_and_test_support', files: ['src/game/systems/pathfinding.zig', 'src/game/systems/pathfinding/test_support.zig'], note: 'Public facade (re-exports/ownership surface) and test-support helpers. Verify no test-only constructs leak into production API.' },
-  { unit: 'benchmarks', files: ['src/benchmarks/pathfinding.zig', 'src/benchmarks/nav_update.zig'], note: 'CPU benchmarks for pathfinding/nav update. Check they exercise destruction-shaped workloads at three or more right-sized curve points that show the growth shape, with the threaded case running the changed stage.' },
+  { unit: 'benchmarks', files: ['src/benchmarks/pathfinding.zig', 'src/benchmarks/nav_update.zig', 'src/benchmarks/nav_size.zig'], note: 'CPU benchmarks for pathfinding/nav update. Check they exercise destruction-shaped workloads at three or more right-sized curve points that show the growth shape, with the threaded case running the changed stage.' },
 ]
 
 phase('Review')
