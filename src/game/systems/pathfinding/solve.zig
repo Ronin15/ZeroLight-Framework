@@ -31,7 +31,6 @@ const AbstractScratch = @import("scratch.zig").AbstractScratch;
 const AbstractSlot = @import("scratch.zig").AbstractSlot;
 const CorridorScratch = @import("scratch.zig").CorridorScratch;
 const SearchScratch = @import("scratch.zig").SearchScratch;
-const chunk_list_map = @import("../chunk_list_map.zig");
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const types = @import("types.zig");
 const GridCell = @import("types.zig").GridCell;

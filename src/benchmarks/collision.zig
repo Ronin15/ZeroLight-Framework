@@ -9,7 +9,6 @@ const DataSystem = @import("../game/data_system.zig").DataSystem;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
-const simulation = @import("../game/simulation.zig");
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const fixtures = @import("fixtures.zig");
