@@ -24,7 +24,7 @@ these outcomes.
   `SimulationScopeSystem.currentStep()` (`systems/simulation_scope.zig`,
   `step_count: u32`).
 - Worldgen seeds from the literal default `WorldBuildConfig.seed`
-  (`world_system.zig`).
+  (`world/system.zig`, read by `world/worldgen.zig`).
 - Session entry: `MainMenuState` → `LoadingState.init` → `loadGameDemo` →
   `GameDemoState.initProceduralWithRuntimeAssets` → `initWithWorld` →
   `SimulationPipeline.init`. One world per session today.

@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const GameDemoState = @import("game_demo_state.zig").GameDemoState;
-const WorldBuildConfig = @import("world_system.zig").WorldBuildConfig;
+const WorldBuildConfig = @import("world/system.zig").WorldBuildConfig;
 const RuntimeAudioSettings = @import("settings_menu_state.zig").RuntimeAudioSettings;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;

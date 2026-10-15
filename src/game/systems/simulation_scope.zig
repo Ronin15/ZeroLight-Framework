@@ -1116,7 +1116,7 @@ test "collectChunkTierChanges is a no-op without a visible region" {
 
 test "deriveChunks recomputes every row's chunk from its settled position" {
     const allocator = std.testing.allocator;
-    const WorldSystem = @import("../world_system.zig").WorldSystem;
+    const WorldSystem = @import("../world/system.zig").WorldSystem;
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();

@@ -50,7 +50,6 @@ const ConstSteeringAgentSlice = types.ConstSteeringAgentSlice;
 const ConstWorldLevelSlice = types.ConstWorldLevelSlice;
 const Faction = types.Faction;
 const StructuralCommand = types.StructuralCommand;
-const StructuralCommitStats = types.StructuralCommitStats;
 const movement_range_alignment_items = types.movement_range_alignment_items;
 const hot_soa_column_alignment = types.hot_soa_column_alignment;
 const hotStoreCapacity = types.hotStoreCapacity;
@@ -950,35 +949,15 @@ pub const DataSystem = struct {
         try self.setSimulationMetadata(id, updated);
     }
 
-    pub fn applyStructuralCommands(self: *DataSystem, commands: []const StructuralCommand) !StructuralCommitStats {
-        return structural.applyStructuralCommands(self, commands);
-    }
+    pub const applyStructuralCommands = structural.applyStructuralCommands;
 
-    pub fn applyStructuralCommandsWithChangeSink(self: *DataSystem, commands: []const StructuralCommand, change_sink: anytype) !StructuralCommitStats {
-        return structural.applyStructuralCommandsWithChangeSink(self, commands, change_sink);
-    }
+    pub const applyStructuralCommandsWithChangeSink = structural.applyStructuralCommandsWithChangeSink;
 
-    pub fn applyStructuralCommandsPrepared(
-        self: *DataSystem,
-        commands: []const StructuralCommand,
-        scratch: *StructuralPlanScratch,
-        preparer: anytype,
-        change_sink: anytype,
-    ) !StructuralCommitStats {
-        return structural.applyStructuralCommandsPrepared(self, commands, scratch, preparer, change_sink);
-    }
+    pub const applyStructuralCommandsPrepared = structural.applyStructuralCommandsPrepared;
 
-    fn preflightStructuralCommands(
-        self: *DataSystem,
-        commands: []const StructuralCommand,
-        scratch: *StructuralPlanScratch,
-    ) !structural.StructuralCommitPlan {
-        return structural.preflightStructuralCommands(self, commands, scratch);
-    }
+    const preflightStructuralCommands = structural.preflightStructuralCommands;
 
-    pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
-        return structural.validateStructuralCommands(commands);
-    }
+    pub const validateStructuralCommands = structural.validateStructuralCommands;
 
     fn resolveSlot(self: *DataSystem, id: EntityId) ?*EntitySlot {
         // Resolution checks both liveness and generation. Slot index alone is

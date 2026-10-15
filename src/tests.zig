@@ -27,10 +27,11 @@ comptime {
     _ = @import("app/time_loop.zig");
     // Benchmark workloads and fixture-driven benchmark cases run via `zig build bench`
     // only — `zig build test` must never execute benchmark code (fixture builds, timed
-    // iterations, adaptive tuning). suite.zig is the one exception: it is the harness
-    // itself, and its tests cover only its own pure utility logic (arg parsing,
-    // formatting, alignment math) against hand-built stubs, never a real fixture or
-    // timed benchmark run.
+    // iterations, adaptive tuning). suite.zig and nav_size.zig are the exceptions: they
+    // are shared harness files, and their tests cover only their own pure utility logic
+    // (arg parsing, formatting, alignment math, the nav memory estimate) against
+    // hand-built stubs, never a real fixture or timed benchmark run.
+    _ = @import("benchmarks/nav_size.zig");
     _ = @import("benchmarks/suite.zig");
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
@@ -57,11 +58,14 @@ comptime {
     _ = @import("game/simulation_pipeline.zig");
     _ = @import("game/simulation_scope.zig");
     _ = @import("game/stamped_table.zig");
-    _ = @import("game/world_system.zig");
-    _ = @import("game/world_test_support.zig");
-    _ = @import("game/world_interest.zig");
-    _ = @import("game/world_terrain.zig");
-    _ = @import("game/world_gpu_tiles.zig");
+    _ = @import("game/world/system.zig");
+    _ = @import("game/world/render.zig");
+    _ = @import("game/world/edit.zig");
+    _ = @import("game/world/worldgen.zig");
+    _ = @import("game/world/test_support.zig");
+    _ = @import("game/world/interest.zig");
+    _ = @import("game/world/terrain.zig");
+    _ = @import("game/world/gpu_tiles.zig");
     _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");

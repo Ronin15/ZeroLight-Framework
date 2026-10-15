@@ -18,7 +18,7 @@ const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const EntityId = @import("../../data_system.zig").EntityId;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
-const ChunkGeometry = @import("../../world_terrain.zig").ChunkGeometry;
+const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 
 pub const pathfinding_range_alignment_items: usize = simd.lane_count;
 

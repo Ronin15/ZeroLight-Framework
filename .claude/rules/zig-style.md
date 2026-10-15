@@ -19,9 +19,17 @@ paths:
 - Import declarations directly
   (`const Engine = @import("app/engine.zig").Engine;`), or a snake_case file
   namespace where the call reads better.
-- No `_mod` suffixes, bridge aliases (`const Type = file.Type`), or double names
-  (`thread.ThreadSystem`); never rename SDL/C, build-option, or `std.Build`
-  names.
+- A file-local alias of an imported declaration (`const Allocator =
+  std.mem.Allocator;`, `const Entity = types.Entity;`) is idiomatic Zig, as in
+  `std`. A `pub` re-export belongs only on a module's public surface (a package
+  facade, `Renderer`'s exported types); a bridge alias, one kept so an old path
+  still resolves after a move or rename, is not: importers switch to the new
+  path in the same change.
+- No unused file-scope declarations (dead imports or aliases); Zig compiles
+  only what is referenced, so they build clean and go stale (`idiom-lint`
+  enforces).
+- No `_mod` suffixes or double names (`thread.ThreadSystem`); never rename
+  SDL/C, build-option, or `std.Build` names.
 - Use `std` before writing your own: containers, heaps (`std.PriorityQueue`),
   bitsets (`std.bit_set`), sorts, searches, hashing, and parsing. Write your own
   only when std has no API for the job or a bench shows it beats std on a hot

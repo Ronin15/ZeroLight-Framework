@@ -23,7 +23,7 @@ step's commit seam. No sessions, timers, or per-harvester state.
   and capacity preflight (`src/game/destructible_controller.zig`).
 - Interest markers: `InterestMarkerStore` with kinds
   `investigate | cover | resource | patrol` and `findBestInvestigateMarker`
-  (`src/game/world_interest.zig`); AI gathers markers gain-gated in
+  (`src/game/world/interest.zig`); AI gathers markers gain-gated in
   `src/game/systems/ai.zig`.
 - Affect drive thresholds emit capped crossing events; the pipeline's affect
   event share widens with the drive count (`src/game/simulation.zig`

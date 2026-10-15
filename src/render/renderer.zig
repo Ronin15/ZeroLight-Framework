@@ -404,7 +404,7 @@ pub const Renderer = struct {
     /// word names the next deeper one). The fragment shader stops at the first
     /// opaque cell. `is_shallowest_bucket` is true only for the composite draw
     /// holding the frame's overall shallowest submitted dense layer
-    /// (`world_system.zig`'s `submitStaticDenseGeometry`): the shader's rim shadow
+    /// (`world/render.zig`'s `submitStaticDenseGeometry`): the shader's rim shadow
     /// gates on it rather than on its own draw-local resolved depth, since bucket
     /// splitting for an unrelated interleave point can put a hole-revealed tile at
     /// resolved depth 0 within a deeper draw.

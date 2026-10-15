@@ -33,8 +33,8 @@ const keyChunk = @import("chunk_list_map.zig").keyChunk;
 const keyLevel = @import("chunk_list_map.zig").keyLevel;
 const no_entry = @import("chunk_list_map.zig").no_entry;
 const no_value = @import("chunk_list_map.zig").no_value;
-const max_chunk_size_tiles = @import("../world_system.zig").max_chunk_size_tiles;
-const ChunkGeometry = @import("../world_terrain.zig").ChunkGeometry;
+const max_chunk_size_tiles = @import("../world/system.zig").max_chunk_size_tiles;
+const ChunkGeometry = @import("../world/terrain.zig").ChunkGeometry;
 
 const no_row: u32 = std.math.maxInt(u32);
 

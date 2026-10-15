@@ -29,7 +29,7 @@ const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig
 const SteeringStats = @import("../game/systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("../game/systems/steering.zig").SteeringSystem;
 const steering_range_alignment_items = @import("../game/systems/steering.zig").steering_range_alignment_items;
-const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
+const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 

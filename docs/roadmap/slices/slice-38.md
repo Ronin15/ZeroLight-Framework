@@ -15,9 +15,10 @@ symmetrically.
 ### Current foundation
 
 - `WorldSystem` levels are append-order indices (`level_base_z`, appended only
-  through `appendLevelBaseZ`; `addLevel`, `addUndergroundLevelStack` in
-  `src/game/world_system.zig`). `world_level: u16` is treated as an opaque
-  index everywhere (`DataSystem`, `LevelLink`, `CellCoord`), which can stay.
+  through `appendLevelBaseZ`; `addLevel` in `src/game/world/system.zig`,
+  `addUndergroundLevelStack` in `src/game/world/worldgen.zig`).
+  `world_level: u16` is treated as an opaque index everywhere (`DataSystem`,
+  `LevelLink`, `CellCoord`), which can stay.
 - Index 0 is still treated as the surface at live sites:
   - `dig_controller.zig`: the hole-vs-tunnel branch (`plan.level == 0`), the
     ramp early-return on level 0, `setEntityLevel`'s `level == 0` return, and
@@ -26,7 +27,7 @@ symmetrically.
   - `game_demo_state.placeDemoInterestMarkers` places markers on level 0.
 - Nav takes static collision bodies on every level from `StaticColliderSystem`
   (64G).
-- `DenseLayerRenderWindow` (`world_system.zig`) looks below the active level,
+- `DenseLayerRenderWindow` (`world/render.zig`) looks below the active level,
   plus one level above only through `ceiling_when_underground`.
 - `worldZForLevel` saturates Z through `i64` math; the render window draws any
   number of levels, and past the GPU store's u32 width the deepest drop,

@@ -18,7 +18,6 @@ const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ElementMap = @import("connectivity.zig").ElementMap;
 const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
-const types = @import("types.zig");
 const GridCell = @import("types.zig").GridCell;
 const TraversalClass = @import("types.zig").TraversalClass;
 const traversalOf = @import("types.zig").traversalOf;

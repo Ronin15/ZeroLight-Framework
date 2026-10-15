@@ -18,10 +18,11 @@ same golden hash on serial and threaded runs and in Debug and ReleaseFast.
 ### Current foundation
 
 - `WorldSystem.initProcedural` / `initProceduralFromMeta`
-  (`src/game/world_system.zig`) fill the surface through the threaded
+  (`src/game/world/worldgen.zig`) fill the surface through the threaded
   per-chunk `buildProceduralChunk` over hard-coded `proceduralGroundTile`
   rules, then the serial `addProceduralSparseTiles`; the private `hash2` is
-  not `src/core/rng.zig`.
+  not `src/core/rng.zig`. Only the `initProcedural` wrapper stays in
+  `world/system.zig`.
 - `WorldBuildConfig` has a literal `seed` default and `chunk_size_tiles = 16`;
   Slice 49 sets the seed from `session_seed.derive(.worldgen_procedural)`.
 - Underground levels are a uniform `dirt` fill (`addUndergroundLevelStack`);
@@ -32,7 +33,7 @@ same golden hash on serial and threaded runs and in Debug and ReleaseFast.
 - Demo spawns are hard-coded grids (`spawnTestSquares`, underground pockets)
   sized by the demo constant `battle_scale_demo_mover_count`; obstacles and
   interest markers are fixed (`game_demo_state.zig`).
-- `InterestMarkerStore` (`world_interest.zig`) is a fixed 128-slot inline
+- `InterestMarkerStore` (`world/interest.zig`) is a fixed 128-slot inline
   store.
 - Tileset: named tiles with `walkable` / `blocks_movement` / `blocks_vision`
   flags (`assets/sprites/world_tileset.json`, strict

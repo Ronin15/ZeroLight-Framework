@@ -20,7 +20,7 @@
 //! single nearest in-range investigate marker (dist², then ascending slot).
 
 const std = @import("std");
-const Faction = @import("faction.zig").Faction;
+const Faction = @import("../faction.zig").Faction;
 
 pub const interest_marker_capacity: usize = 128;
 

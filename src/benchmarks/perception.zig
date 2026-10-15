@@ -37,7 +37,7 @@ const perception_mod = @import("../game/systems/perception.zig");
 const PerceptionStats = perception_mod.PerceptionStats;
 const PerceptionSystem = perception_mod.PerceptionSystem;
 const perception_range_alignment_items = perception_mod.perception_range_alignment_items;
-const WorldSystem = @import("../game/world_system.zig").WorldSystem;
+const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 

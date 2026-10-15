@@ -14,8 +14,8 @@
 //! allocate nothing.
 
 const std = @import("std");
-const simd = @import("../core/simd.zig");
-const OrderedIndexSet = @import("systems/chunk_list_map.zig").OrderedIndexSet;
+const simd = @import("../../core/simd.zig");
+const OrderedIndexSet = @import("../systems/chunk_list_map.zig").OrderedIndexSet;
 
 /// A world tile id; the world's tile accessors re-export it.
 pub const TileId = u16;

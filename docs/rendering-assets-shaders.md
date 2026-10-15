@@ -159,8 +159,9 @@ one renderer-side **GPU tile store** (`Renderer.createTileStore`, a
 `GRAPHICS_STORAGE_READ` storage buffer) holding only its **render window**: the
 dense layers of the levels in the vertical window (`DenseLayerRenderWindow`),
 each over the camera's chunk window, chunk by chunk like the CPU terrain
-(`world_terrain.zig`). The world keeps only the store's handle and a mirror of
-its layout (`WorldSystem.gpu_tiles`, `world_gpu_tiles.zig`).
+(`world/terrain.zig`). The world keeps only the store's handle and a mirror of
+its layout (`WorldSystem.gpu_tiles`, `world/gpu_tiles.zig`); its render path
+(window, sync, submits) is `world/render.zig`.
 
 Layout (documented at `renderer.zig`'s `tile_store_uniform_bit`, shared with
 `tilemap.frag.glsl`): one `u32` buffer, two allocation classes at absolute
@@ -195,7 +196,7 @@ mirror hold one window per store today.
 GPU memory is at most `L × side² × (E²/2 + 1) × 4 B` for `L` resident layers and
 chunk edge `E`, independent of level size, depth, and world count (derived:
 about 1 MiB for 32 layers at side 8 and 16-cell chunks). The store's only width
-limit is SDL's `u32` byte size: `world_gpu_tiles.residentLayerFit` bounds the
+limit is SDL's `u32` byte size: `gpu_tiles.residentLayerFit` bounds the
 layers whose directories and a block per window chunk fit, and the sync draws
 only that many, dropping the deepest and logging once. The directory side is
 capped at `tile_store_max_side` (2^14, the largest side whose one directory
@@ -221,7 +222,7 @@ Each bucket becomes one retained world-space quad (`Renderer.beginStaticGeometry
 / `appendStaticTilemapSpan`) ordered at the bucket's shallowest layer's
 `denseLayerOrder`, tagged `DrawGroup.material = .tilemap`, with a
 `Renderer.TilemapWindowLayers` naming its topmost directory and layer count
-(`WorldSystem.buildWindowLayers`). The resident layers chain topmost-first, so
+(`buildWindowLayers`, `world/render.zig`). The resident layers chain topmost-first, so
 the walk from a bucket's topmost directory visits exactly its layers. The
 fragment shader maps each pixel to a world cell, checks its chunk is in the
 window, then walks the chain: `tileAt` reads the cell's toroidal word and, for a
@@ -334,7 +335,7 @@ store and drawn each frame; the camera's chunk window sets which of their chunks
 are resident. GPU memory follows the window's layers times its chunks, never
 the level's area, the world's depth, or the levels outside the window.
 
-Default `DenseLayerRenderWindow` (`world_system.zig`):
+Default `DenseLayerRenderWindow` (`world/render.zig`):
 
 | Field | Default | Effect |
 | --- | --- | --- |

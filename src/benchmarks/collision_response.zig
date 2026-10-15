@@ -13,7 +13,6 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
 const CollisionResponseStats = @import("../game/systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("../game/systems/collision_response.zig").CollisionResponseSystem;
-const simulation = @import("../game/simulation.zig");
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");

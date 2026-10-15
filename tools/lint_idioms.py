@@ -21,6 +21,8 @@ reviewer diligence:
 5. No free-function EntityId equality helper; EntityId.eql owns the primitive.
 6. No no-op `catch |e| return e` (or `{ return e; }`); it is just `try`.
 7. No camelCase enum tags (Zig enum members are snake_case).
+8. No unused file-scope `const` (a dead import or alias): Zig compiles only
+   what is referenced, so an unused declaration builds clean and goes stale.
 
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
 apply to `src/` only. All rules match code with string/char-literal contents
@@ -192,6 +194,10 @@ CAMEL_FIELD_OR_PARAM = re.compile(r"^\s*([a-z][a-z0-9]*[A-Z][A-Za-z0-9]*)\s*:")
 FN_POINTER_TYPE = re.compile(r"\bfn\s*\(")
 
 TEST_DECL = re.compile(r"^test\b")
+TOP_LEVEL_CONST = re.compile(r"^const ([A-Za-z_][A-Za-z0-9_]*)\s*=")
+# Names spelled inside a literal that still reference a declaration:
+# `@"name"` identifiers and `@field(x, "name")` lookups.
+QUOTED_DECL_REF = re.compile(r'@"([A-Za-z_][A-Za-z0-9_]*)"|@field\s*\([^,]*,\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 
 
 def strip_line_comment(line: str) -> str:
@@ -305,6 +311,24 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                         raw.strip(),
                     )
                 )
+
+    codes = [strip_line_comment(blank_literals(raw)) for raw in lines]
+    quoted_refs = {
+        name
+        for raw in lines
+        for match in QUOTED_DECL_REF.finditer(raw.split("//", 1)[0])
+        for name in match.groups()
+        if name
+    }
+    for index, raw in enumerate(lines):
+        decl = TOP_LEVEL_CONST.match(raw)
+        if not decl or decl.group(1) in quoted_refs:
+            continue
+        name = re.compile(rf"\b{decl.group(1)}\b")
+        if not any(name.search(code) for other, code in enumerate(codes) if other != index):
+            issues.append(
+                (rel, index + 1, f"unused file-scope `{decl.group(1)}`; remove the dead import or alias", raw.strip())
+            )
     return issues
 
 

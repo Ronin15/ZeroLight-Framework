@@ -30,12 +30,12 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'pathfinding-search-correctness',
-    files: ['src/game/systems/pathfinding/system.zig', 'src/game/systems/pathfinding/solve.zig', 'src/game/systems/pathfinding/nav_grid.zig', 'src/game/systems/pathfinding/caches.zig', 'src/game/systems/pathfinding/group_field.zig'],
+    files: ['src/game/systems/pathfinding/system.zig', 'src/game/systems/pathfinding/publish.zig', 'src/game/systems/pathfinding/group_service.zig', 'src/game/systems/pathfinding/intake.zig', 'src/game/systems/pathfinding/eviction.zig', 'src/game/systems/pathfinding/nav_reaction.zig', 'src/game/systems/pathfinding/solve.zig', 'src/game/systems/pathfinding/nav_grid.zig', 'src/game/systems/pathfinding/caches.zig', 'src/game/systems/pathfinding/group_field.zig'],
     focus: 'Algorithmic correctness: A* admissibility/termination within the fixed node budget, correctness of the abstract/portal search, cache coherence (are cached paths/keys invalidated correctly, any stale-hit returning a wrong path?), group flow-field correctness, and graceful degradation when the fixed budget is exhausted (deterministic deferral, never a wrong/partial path silently returned as complete).',
   },
   {
     unit: 'nav-graph-invalidation',
-    files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/connectivity.zig'],
+    files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/link_bounds.zig', 'src/game/systems/pathfinding/connectivity.zig', 'src/game/systems/pathfinding/connectivity_closure.zig'],
     focus: 'Nav-graph structural correctness: incremental-dig chunk-patch correctness vs a full rebuild (does the patched graph equal a from-scratch rebuild?), nav-invalidation classification correctness (are all affected portals/edges recomputed, none missed or double-counted?), the threaded chunk-patch race, and portal/edge consistency across chunk borders. This is the highest-risk correctness area.',
   },
   {
@@ -55,7 +55,7 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'data-lifetime-and-handles',
-    files: ['src/game/data_system/system.zig', 'src/game/data_system/structural.zig', 'src/game/data_system/agents.zig', 'src/game/world_system.zig'],
+    files: ['src/game/data_system/system.zig', 'src/game/data_system/structural.zig', 'src/game/data_system/agents.zig', 'src/game/world/system.zig', 'src/game/world/render.zig', 'src/game/world/edit.zig', 'src/game/world/worldgen.zig'],
     focus: 'Entity/data correctness: generational-handle reuse safety (can a stale handle ever alias a recycled slot?), structural add/remove (swap-remove index fixups, mask consistency across parallel SoA columns), dense/sparse world-tile index consistency, and whether any store column can desync from another after spawn/destroy. Flag determinism hazards in entity iteration order.',
   },
   {

@@ -30,9 +30,9 @@ const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
-const WorldSystem = @import("../world_system.zig").WorldSystem;
-const CellCoord = @import("../world_system.zig").CellCoord;
-const TileId = @import("../world_system.zig").TileId;
+const WorldSystem = @import("../world/system.zig").WorldSystem;
+const CellCoord = @import("../world/system.zig").CellCoord;
+const TileId = @import("../world/system.zig").TileId;
 
 /// Range alignment of the gather: every range's window starts on a cache line.
 pub const plane_entry_range_alignment_items: usize = movement_range_alignment_items;

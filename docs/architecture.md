@@ -69,39 +69,62 @@ Designs start here, then read the live structure below (rules:
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
 - `src/game/game_demo_state.zig`, `src/game/loading_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via a runtime-asset-backed loading transition.
-- `src/game/world_system.zig` owns state-local world/tile data for levels,
-  dense layers, sparse tiles, level links, catalog source rects, the render
-  chunk window, and durable **interest/affordance markers** (`world_interest.zig`,
-  Slice 41). Markers are world-authored POIs with fixed inline slot capacity
-  (allocation-free by construction) — not `DataSystem` components and not
-  ephemeral `WorldStimulus` dig/footstep/impact events. Kind `investigate` is
-  the AI consumer today; `cover` / `resource` / `patrol` are reserved schema
-  tags until a later consumer lands. Cognition discovery uses a fixed query
-  radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
-  not the discovery gate. Queries return nearest-k (dist², then slot index).
-- `src/game/world_terrain.zig` holds `WorldSystem`'s chunk-owned terrain
-  storage: per dense layer a chunk directory over a pool of tile blocks, and per
-  level a `LevelTerrain` (growable band list and cached floor layer, a composed
-  movement-blocked directory over a pool of bit blocks, per-chunk link-endpoint
-  heads and counts, and per-chunk sparse-tile chain heads), directories sized at
-  level create. Its `ChunkGeometry` (u32 sides, u16 chunk edge, shift-based
-  `chunkOf`/`localOf`) is the one chunk tiling terrain, nav, and static colliders
-  share.
+- **Split-file types.** A type too large for one file keeps its definition,
+  fields, and remaining methods in its home file (a package's `system.zig`);
+  each public method defined in a sibling file is a declaration alias on the
+  type (`pub const setDenseTile = world_edit.setDenseTile;`) with its `///` doc
+  on the definition, so method syntax resolves straight to it with no forwarder
+  frame in any mode (`.claude/rules/zig-style.md`). `world/`, `data_system/`,
+  and `pathfinding/` use it; in `pathfinding/`, `Connectivity`'s home file is
+  `connectivity.zig`.
+- `src/game/world/` holds `WorldSystem`'s state-local world/tile data, with no
+  facade: importers name the file they use. Public methods in `render.zig`,
+  `edit.zig`, and `worldgen.zig` are aliases on the type (split-file types,
+  above).
+  - `system.zig`: the type and its storage (levels, dense layers, sparse tiles,
+    level links, render-window state), queries, the tile catalog (source rects,
+    flags), and view geometry (view window, chunk and cognition regions).
+  - `render.zig`: `WorldSystem`'s render path: the render window's sparse tile
+    list, the dense composite submit, the GPU tile store sync, and the sparse
+    submit.
+  - `edit.zig`: every terrain content write: single-cell dense writes and their
+    reserve seams, batched dense writes as threaded plan and write jobs, sparse
+    add/remove, and blocking clears.
+  - `worldgen.zig`: the procedural and demo world builds (procedural ground
+    painted per chunk on the thread system) and the underground level stack.
+  - `terrain.zig`: chunk-owned terrain storage: per dense layer a chunk
+    directory over a pool of tile blocks, and per level a `LevelTerrain`
+    (growable band list and cached floor layer, a composed movement-blocked
+    directory over a pool of bit blocks, per-chunk link-endpoint heads and
+    counts, and per-chunk sparse-tile chain heads), directories sized at level
+    create. Its `ChunkGeometry` (u32 sides, u16 chunk edge, shift-based
+    `chunkOf`/`localOf`) is the one chunk tiling terrain, nav, and static
+    colliders share.
+  - `gpu_tiles.zig`: the mirror of the renderer-owned GPU tile store: the
+    store's non-owning id, the resident window, each resident layer's toroidal
+    directory and chain link, and the directory and block allocator it plans
+    and commits each frame, uploading changed chunks found through layer flags
+    and block change marks; reset when the renderer retires the store.
+  - `interest.zig`: durable **interest/affordance markers** (Slice 41).
+    Markers are world-authored POIs with fixed inline slot capacity
+    (allocation-free by construction) — not `DataSystem` components and not
+    ephemeral `WorldStimulus` dig/footstep/impact events. Kind `investigate` is
+    the AI consumer today; `cover` / `resource` / `patrol` are reserved schema
+    tags until a later consumer lands. Cognition discovery uses a fixed query
+    radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
+    not the discovery gate. Queries return nearest-k (dist², then slot index).
+  - `test_support.zig`: test-only `WorldSystem` fixtures shared across modules
+    and world files (a demo surface at any chunk edge, terrain pool warmup, GPU
+    sync and sparse-index checks).
 - `src/game/stamped_table.zig` holds the generation-stamped open-addressed table
   the per-step key tables share (nav's abstract and local search tables, the plane
   stage's landing claims): an O(1) reset outside the rare wraparound.
-- `src/game/world_test_support.zig` holds test-only `WorldSystem` fixtures shared
-  across modules (a demo surface at any chunk edge, terrain pool warmup).
-- `src/game/world_gpu_tiles.zig` holds `WorldSystem`'s mirror of its
-  renderer-owned GPU tile store: the store's non-owning id, the resident
-  window, each resident layer's toroidal directory and chain link, and the
-  directory and block allocator it plans and commits each frame, uploading
-  changed chunks found through layer flags and block change marks; reset when
-  the renderer retires the store.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, destructible, structural, system) and owns state-local persistent
   entity data in dense SoA stores for gameplay, collision, and render systems.
+  `DataSystem`'s structural-commit entries in `structural.zig` are aliases on
+  the type (split-file types, above).
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
@@ -162,10 +185,36 @@ Designs start here, then read the live structure below (rules:
   fixtures shared across modules.
 - `src/game/systems/particle.zig` owns state-local transient particle effects
   in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
-- `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage
-  (types, nav_grid, nav_graph, connectivity, caches, goal_table, group_field,
-  scratch, solve, system, test_support) for frame-delayed multi-level grid
-  navigation.
+- `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage for
+  frame-delayed multi-level grid navigation: it re-exports the public surface,
+  and its `test` block reaches every package file. `types`, `nav_grid`,
+  `nav_graph`, `caches`, `goal_table`, `group_field`, `scratch`, `solve`, and
+  `test_support` each hold one type or job. `PathfindingSystem` and
+  `Connectivity` are split-file types (above); the package files call each
+  other's free functions directly.
+  - `system.zig`: `PathfindingSystem`: the type, its lifecycle and elastic
+    capacity, status, reach and goals, the update orchestration, the solve
+    phase, and the pending ring. `navDispatch`, the nav stages' dispatch, is a
+    file-level function the package files share.
+  - `publish.zig`: the publish and path registry (reserve, claim, the
+    `publish_copy` and `registry_flush` stages).
+  - `group_service.zig`: the group-field service (claim, rekey, build, the
+    threaded `group_field_expand` rounds, retire).
+  - `intake.zig`: request intake (`path_intake`'s classify and the main
+    merge).
+  - `eviction.zig`: scoped eviction of the cached results and group fields a
+    nav change touches (`evictLevel`, the `nav_evict_count`, `nav_evict`, and
+    `evict_flush` stages).
+  - `nav_reaction.zig`: the nav builds, nav-mark recording (`nav_mark`), and
+    the post-commit reaction; its public functions are aliases on
+    `PathfindingSystem`.
+  - `connectivity.zig`: `Connectivity`: connectivity ids over the nav graph,
+    the seed and gather stages, the merge, and the flood.
+  - `connectivity_closure.zig`: the one-way reach closure over the
+    connectivity roots (H-components and their reachability blocks), its
+    registry, prepare and commit, and its stages.
+  - `link_bounds.zig`: the link cost bounds the abstract heuristic reads
+    (`LinkBounds`, `LevelCrossings`), held and folded by `NavGraph`.
 - `src/game/dig_controller.zig` is the pipeline-owned controller for player
   digging, authoring world-tile edits and navigation-invalidation signals.
 - `src/game/destructible_controller.zig` is the pipeline-owned controller that
@@ -191,11 +240,14 @@ Designs start here, then read the live structure below (rules:
 - `src/root.zig` stays minimal for math aliases and compile coverage; feature
   modules live in their matching `src/` area and import each other directly.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
-- `src/benchmarks/` holds the `zig build bench` groups, one file per area:
-  `suite.zig` is the shared harness (options, cases, item codes, stage shapes,
-  reporting, the nav memory estimate) and `fixtures.zig` the shared fixtures
-  (thread systems, bodies, request streams, tilesets, banded worlds, nav tuner
-  setup).
+- `src/benchmarks/` holds the `zig build bench` groups, one file per area, or
+  a folder where an area has several: in `pathfinding/`, `nav_fixtures.zig`
+  holds what two or more group files share, and `requests`, `routes`, `cache`,
+  `negative`, and `connectivity` hold the groups. `suite.zig` is the shared
+  harness (options, cases, item codes, stage shapes, reporting), `fixtures.zig`
+  the shared fixtures (thread systems, bodies, request streams, tilesets,
+  banded worlds, nav tuner setup), and `nav_size.zig` the nav memory estimate
+  the pathfinding and chunk-scale groups check.
 
 ## Frame Flow
 
@@ -269,9 +321,9 @@ chunk window. The resident layers are those of the levels in the vertical
 render window (`DenseLayerRenderWindow`, `levels_below` default 6, widened to
 the full authored underground stack in the procedural demo world), so GPU
 memory follows the window's layers times its chunks, never level area, world
-depth, or world count. `WorldSystem.syncDenseTileStore` (mirror:
-`world_gpu_tiles.zig`) runs once per frame in render prep before swapchain
-acquisition: a level entering the window uploads its window directory and
+depth, or world count. `WorldSystem.syncDenseTileStore` (`world/render.zig`;
+mirror: `world/gpu_tiles.zig`) runs once per frame in render prep before
+swapchain acquisition: a level entering the window uploads its window directory and
 mixed blocks, a pan across a chunk boundary uploads the entering chunks, a dig
 uploads one element, and everything goes in the frame's one batched copy pass.
 Store uploads always use `cycle=false`; vertex ring buffers alone use
@@ -1052,9 +1104,10 @@ nav graph (§ Nav Graph And Reaction).
 
 ### Nav Graph And Reaction
 
-The nav graph (`nav_graph.zig`, `nav_grid.zig`, `connectivity.zig`) is stored per
-chunk (`.claude/rules/budgets-capacities.md`). With a world, a nav cell is a tile
-and a nav chunk the world's chunk (`NavExtent.world`, one `ChunkGeometry`);
+The nav graph (`nav_graph.zig`, `nav_grid.zig`, `connectivity.zig`, the one-way
+closure in `connectivity_closure.zig`) is stored per chunk
+(`.claude/rules/budgets-capacities.md`). With a world, a nav cell is a tile and
+a nav chunk the world's chunk (`NavExtent.world`, one `ChunkGeometry`);
 bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
 
 - **Cells.** Per level, `NavGrid` holds a chunk directory whose entry is OPEN,
@@ -1086,12 +1139,13 @@ bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
   own footprint chunks, never the static count.
 
 `PathfindingSystem` owns the post-commit nav reaction end to end
-(`.claude/rules/pathfinding.md`). Writers record what changed, never the reaction:
-a terrain writer (the dig stage, plane traversal's carve batch) reserves its record
-before its world write (`reserveTerrainNavRecord`) and records its appended events
-right after it, even when it failed after writing (`recordTerrainNavEvents`, the
-`nav_mark` stage interpreting events into per-range windows that merge tile boxes
-of one chunk); the collider sync records each change's old and new cell spans
+(`.claude/rules/pathfinding.md`; `nav_reaction.zig`, eviction in `eviction.zig`).
+Writers record what changed, never the reaction: a terrain writer (the dig
+stage, plane traversal's carve batch) reserves its record before its world write
+(`reserveTerrainNavRecord`) and records its appended events right after it, even
+when it failed after writing (`recordTerrainNavEvents`, the `nav_mark` stage
+interpreting events into per-range windows that merge tile boxes of one chunk);
+the collider sync records each change's old and new cell spans
 (`recordStaticColliderChanges`, room reserved before the commit by
 `reserveStaticColliderMarks`). At the seam `reactToPostCommitNavEvents` runs
 `applyBufferedNavUpdates`, each step its own transaction:

@@ -35,10 +35,17 @@ test {
     _ = @import("pathfinding/scratch.zig");
     _ = @import("pathfinding/group_field.zig");
     _ = @import("pathfinding/nav_graph.zig");
+    _ = @import("pathfinding/link_bounds.zig");
     _ = @import("pathfinding/connectivity.zig");
+    _ = @import("pathfinding/connectivity_closure.zig");
     _ = @import("pathfinding/caches.zig");
     _ = @import("pathfinding/goal_table.zig");
     _ = @import("pathfinding/solve.zig");
     _ = @import("pathfinding/system.zig");
+    _ = @import("pathfinding/publish.zig");
+    _ = @import("pathfinding/group_service.zig");
+    _ = @import("pathfinding/intake.zig");
+    _ = @import("pathfinding/eviction.zig");
+    _ = @import("pathfinding/nav_reaction.zig");
     _ = @import("pathfinding/test_support.zig");
 }

@@ -69,7 +69,7 @@ const SpatialIndexView = spatial_index.SpatialIndexView;
 const NeighborVisitResult = spatial_index.NeighborVisitResult;
 const stance = @import("../faction.zig").stance;
 const arbitration = @import("arbitration.zig");
-const InterestMarkerStore = @import("../world_interest.zig").InterestMarkerStore;
+const InterestMarkerStore = @import("../world/interest.zig").InterestMarkerStore;
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
 

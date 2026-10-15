@@ -99,7 +99,7 @@ const EntityId = @import("../data_system.zig").EntityId;
 const Faction = @import("../data_system.zig").Faction;
 const PerceptionSlice = @import("../data_system.zig").PerceptionSlice;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
-const WorldSystem = @import("../world_system.zig").WorldSystem;
+const WorldSystem = @import("../world/system.zig").WorldSystem;
 const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationEvents = @import("../simulation.zig").SimulationEvents;
 const WorldStimulus = @import("../simulation.zig").WorldStimulus;
@@ -1272,7 +1272,7 @@ fn minimalWorld(allocator: std.mem.Allocator, width: u16, height: u16, tile_size
         .width = width,
         .height = height,
         .tile_size = tile_size,
-        .chunk_size_tiles = @import("../world_system.zig").max_chunk_size_tiles,
+        .chunk_size_tiles = @import("../world/system.zig").max_chunk_size_tiles,
     };
     _ = try world.addLevel(0);
     return world;
@@ -1943,7 +1943,7 @@ test "LOS blocks a diagonal ray through a mid-segment occluder's interior, not j
 }
 
 const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
-const ChunkForm = @import("../world_terrain.zig").ChunkForm;
+const ChunkForm = @import("../world/terrain.zig").ChunkForm;
 
 fn loadTestTilesetMeta() !WorldTilesetMeta {
     const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");

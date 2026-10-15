@@ -13,9 +13,9 @@ export const meta = {
 // reading the actual files. Grouped so related files review together but no
 // single agent is overloaded.
 const REVIEW_UNITS = [
-  { unit: 'pathfinding-system', files: ['src/game/systems/pathfinding/system.zig'] },
-  { unit: 'pathfinding-navgraph', files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/nav_grid.zig'] },
-  { unit: 'pathfinding-connectivity', files: ['src/game/systems/pathfinding/connectivity.zig'] },
+  { unit: 'pathfinding-system', files: ['src/game/systems/pathfinding/system.zig', 'src/game/systems/pathfinding/publish.zig', 'src/game/systems/pathfinding/group_service.zig', 'src/game/systems/pathfinding/intake.zig', 'src/game/systems/pathfinding/eviction.zig', 'src/game/systems/pathfinding/nav_reaction.zig'] },
+  { unit: 'pathfinding-navgraph', files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/link_bounds.zig', 'src/game/systems/pathfinding/nav_grid.zig'] },
+  { unit: 'pathfinding-connectivity', files: ['src/game/systems/pathfinding/connectivity.zig', 'src/game/systems/pathfinding/connectivity_closure.zig'] },
   { unit: 'pathfinding-support', files: ['src/game/systems/pathfinding/caches.zig', 'src/game/systems/pathfinding/solve.zig', 'src/game/systems/pathfinding/group_field.zig', 'src/game/systems/pathfinding/scratch.zig', 'src/game/systems/pathfinding/goal_table.zig', 'src/game/systems/pathfinding/types.zig'] },
   { unit: 'ai', files: ['src/game/systems/ai.zig', 'src/game/systems/ai_memory.zig', 'src/game/ai_archetypes.zig'] },
   { unit: 'perception', files: ['src/game/systems/perception.zig', 'src/game/data_system/perception.zig'] },
@@ -23,7 +23,7 @@ const REVIEW_UNITS = [
   { unit: 'collision', files: ['src/game/systems/collision.zig', 'src/game/systems/collision_response.zig', 'src/game/systems/spatial_index.zig'] },
   { unit: 'movement-particle-affect', files: ['src/game/systems/movement.zig', 'src/game/systems/particle.zig', 'src/game/systems/affect.zig'] },
   { unit: 'data-system-core', files: ['src/game/data_system/system.zig', 'src/game/data_system/types.zig', 'src/game/data_system/structural.zig'] },
-  { unit: 'world-system', files: ['src/game/world_system.zig'] },
+  { unit: 'world-system', files: ['src/game/world/system.zig', 'src/game/world/render.zig', 'src/game/world/edit.zig', 'src/game/world/worldgen.zig'] },
   { unit: 'simulation-pipeline', files: ['src/game/simulation_pipeline.zig', 'src/game/simulation.zig', 'src/game/simulation_scope.zig', 'src/game/systems/simulation_scope.zig'] },
   { unit: 'thread-system', files: ['src/app/thread_system.zig'] },
   { unit: 'renderer-batch', files: ['src/render/renderer.zig', 'src/render/sprite_batch.zig'] },
