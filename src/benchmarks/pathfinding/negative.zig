@@ -87,7 +87,7 @@ pub const negative_burst_group = suite.BenchmarkGroup{
 fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !GoalResolveStats {
     if (!case.usesThreadSystem()) return system.resolveGoals(PathRequest, intents, null, .{});
     return system.resolveGoals(PathRequest, intents, thread_system.?, .{
-        .items_per_range = case.itemsPerRange(goal_scan_range_alignment_items),
+        .items_per_range = case.stageItemsPerRange(goal_scan_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });

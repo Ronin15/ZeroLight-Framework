@@ -36,7 +36,6 @@ const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
 const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
-const benchmarkItemsPerRange = @import("nav_fixtures.zig").benchmarkItemsPerRange;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
 const writeLevelZeroCells = @import("nav_fixtures.zig").writeLevelZeroCells;
@@ -704,7 +703,7 @@ fn queryJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void
 fn runQueries(ctx: *QueryContext, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, item_count: usize) BatchStats {
     if (thread_system) |ts| {
         return ts.parallelForWithOptions(item_count, ctx, queryJob, .{
-            .items_per_range = benchmarkItemsPerRange(case),
+            .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
             .max_worker_threads = case.maxWorkerThreads(),
             .range_alignment_items = pathfinding_range_alignment_items,
             .adaptive = case.adaptive,

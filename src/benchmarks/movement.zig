@@ -109,17 +109,11 @@ fn runOnce(
     }
 
     const stats = system.update(&slice, thread_system.?, delta_seconds, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
     return stats.batch;
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(movement_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, movement_range_alignment_items);
 }
 
 // `movement-apply-intents`: one AI movement intent per moving agent, written once in a
@@ -248,7 +242,7 @@ fn applyIntentsOnce(
         return inlineBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
     }
     const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
@@ -279,7 +273,7 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
 
     // A fixed threaded case with more than one range of intents dispatches the apply.
     const expect_dispatch = if (thread_ptr) |thread_system|
-        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > benchmarkItemsPerRange(case).?
+        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items)
     else
         false;
 

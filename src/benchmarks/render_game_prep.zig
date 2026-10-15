@@ -392,16 +392,10 @@ fn emitVertices(
     }
 
     return batch.emitVerticesAssumeCapacity(thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(render_game_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(render_game_prep_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, render_game_prep_range_alignment_items);
 }
 
 // Requires `setBenchCollectChunkVisibility` first: full-world visibility is an

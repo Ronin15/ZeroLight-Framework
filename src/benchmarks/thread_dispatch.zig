@@ -65,11 +65,6 @@ fn incrementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     for (job.items[range.start..range.end]) |*item| item.* += 1;
 }
 
-fn fixedItemsPerRange(case: suite.BenchmarkCase) usize {
-    return case.itemsPerRange(range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, range_alignment_items);
-}
-
 fn dispatchOnce(
     context: *DispatchContext,
     thread_system: ?*ThreadSystem,
@@ -86,7 +81,7 @@ fn dispatchOnce(
     // run the thread system's shared one.
     const tuner: *AdaptiveWorkTuner = if (fixed_tuner.*) |*owned| owned else &threads.adaptive_tuner;
     const controls: StageControls = if (case.adaptive) .{} else .{
-        .items_per_range = fixedItemsPerRange(case),
+        .items_per_range = case.fixedItemsPerRange(range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = false,
     };
@@ -110,7 +105,7 @@ fn assertThreadedShape(batch: BatchStats, thread_system: *const ThreadSystem) vo
 
 // The shape a fixed case's dispatch must have; checked against every measured batch.
 fn assertFixedShape(batch: BatchStats, thread_system: *const ThreadSystem, case: suite.BenchmarkCase) void {
-    const items_per_range = fixedItemsPerRange(case);
+    const items_per_range = case.fixedItemsPerRange(range_alignment_items);
     const ranges = rangeCount(batch.item_count, items_per_range);
     const worker_cap = @min(case.maxWorkerThreads() orelse thread_system.workerThreadCount(), thread_system.workerThreadCount());
     std.debug.assert(batch.items_per_range == items_per_range);

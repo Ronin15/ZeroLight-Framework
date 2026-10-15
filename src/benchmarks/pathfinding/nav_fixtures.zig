@@ -57,7 +57,7 @@ pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(Path
         });
     }
     return try system.update(requests, agent_count, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .max_solved_requests_per_step = solve_budget,
@@ -168,12 +168,6 @@ pub const StageReport = struct {
         std.debug.print("\n", .{});
     }
 };
-
-pub fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(pathfinding_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, pathfinding_range_alignment_items);
-}
 
 // Walkable levels of `side`² tiles in default chunks, one floor band per level (level
 // `i` owns layer `i`); `blocking` blocks movement.

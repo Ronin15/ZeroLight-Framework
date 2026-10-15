@@ -392,7 +392,7 @@ fn stageRunOnce(
 ) !CollisionResponseStats {
     const stats = if (thread_system) |threads|
         try system.update(&fixture.data, &fixture.frame, fixture.observer, threads, .{
-            .items_per_range = stageItemsPerRange(case),
+            .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
             .max_worker_threads = case.maxWorkerThreads(),
             .adaptive = case.adaptive,
         })
@@ -405,12 +405,6 @@ fn stageRunOnce(
     std.debug.assert(stats.observer_contact_count == fixture.expected_observer_contacts);
     std.debug.assert(system.observerContacts(&fixture.frame, fixture.observer).len == fixture.expected_observer_contacts);
     return stats;
-}
-
-fn stageItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(movement_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, movement_range_alignment_items);
 }
 
 // The fixed-range adaptive case's apply tuner: one band per range, so the fixed control
@@ -445,7 +439,7 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     // A fixed threaded case with more than one range of contacts dispatches the gather.
     const expect_dispatch = if (thread_ptr) |thread_system|
-        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > stageItemsPerRange(case).?
+        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items)
     else
         false;
 

@@ -332,8 +332,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const plane_entry = &fixture.plane_entry;
     plane_entry.tuner = suite.adaptiveTunerForCase(case, plane_entry_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     plane_entry.config = .{
-        .items_per_range = if (case.adaptive) null else case.itemsPerRange(plane_entry_range_alignment_items) orelse
-            std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, plane_entry_range_alignment_items),
+        .items_per_range = case.stageItemsPerRange(plane_entry_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     };

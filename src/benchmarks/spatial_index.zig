@@ -116,16 +116,10 @@ fn runOnce(system: *SpatialIndexSystem, fixture: *Fixture, thread_system: ?*Thre
     }
 
     return try system.build(ai_slice, movement_slice, &fixture.data, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(spatial_index_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(spatial_index_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, spatial_index_range_alignment_items);
 }
 
 fn writeIndexWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {

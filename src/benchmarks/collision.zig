@@ -135,16 +135,10 @@ fn runOnce(
     }
 
     return try system.update(data, contacts, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(collision_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, collision_range_alignment_items);
 }
 
 fn benchmarkPosition(index: usize, columns: usize, mode: FixtureMode) math.Vec2 {

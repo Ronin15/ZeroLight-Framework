@@ -136,7 +136,7 @@ fn runOnce(system: *AiMemorySystem, fixture: *Fixture, thread_system: ?*ThreadSy
     }
 
     return try system.update(ai_slice, &fixture.data, &fixture.frame, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(ai_memory_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
@@ -167,12 +167,6 @@ fn injectPerceivedEvents(frame: *SimulationFrame, ai_slice: ConstAiAgentSlice, t
     }
     writer.finish();
     frame.events.finishWrite();
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(ai_memory_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, ai_memory_range_alignment_items);
 }
 
 fn writeMemoryWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {

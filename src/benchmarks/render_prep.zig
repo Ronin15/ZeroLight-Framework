@@ -119,12 +119,6 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     return stats;
 }
 
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(sprite_prep_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, sprite_prep_range_alignment_items);
-}
-
 const MeasuredPrep = struct {
     stats: sprite_batch.SpritePrepStats,
     phases: suite.RenderPrepPhaseSummary,
@@ -201,7 +195,7 @@ fn emitVertices(
     }
 
     return batch.emitVerticesAssumeCapacity(thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(sprite_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });

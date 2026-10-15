@@ -103,14 +103,8 @@ fn runOnce(particles: *ParticleSystem, thread_system: ?*ThreadSystem, case: suit
     }
 
     return particles.update(thread_system.?, delta_seconds, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(particle_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     }).batch;
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(particle_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, particle_range_alignment_items);
 }

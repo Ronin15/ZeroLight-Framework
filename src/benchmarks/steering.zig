@@ -360,16 +360,10 @@ fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*Thr
         return try system.updateSerial(&fixture.data, &fixture.frame, &fixture.pathfinding, &fixture.colliders);
     }
     return try system.update(&fixture.data, &fixture.frame, thread_system.?, &fixture.pathfinding, &fixture.colliders, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(steering_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, steering_range_alignment_items);
 }
 
 fn appendNavigationIntents(frame: *SimulationFrame, agents: []const EntityId) !void {
@@ -588,8 +582,7 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
         colliders.splice_tuner = tuner;
         colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
     }
-    colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(splice_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, splice_range_alignment_items) };
+    colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
     const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticChange, staticChangeOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;

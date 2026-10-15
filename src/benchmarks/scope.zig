@@ -344,7 +344,7 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     }
 
     _ = try ctx.ai.update(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
-        .items_per_range = itemsPerRange(ctx.case, ai_range_alignment_items),
+        .items_per_range = ctx.case.stageItemsPerRange(ai_range_alignment_items),
         .max_worker_threads = ctx.case.maxWorkerThreads(),
         .adaptive = ctx.case.adaptive,
         .intent_seed = intent_seed,
@@ -353,14 +353,14 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         .spatial_population_indices = ai_halo_indices,
     });
     _ = try ctx.collision.update(&fixture.data, &fixture.contacts, thread_system.?, .{
-        .items_per_range = itemsPerRange(ctx.case, collision_range_alignment_items),
+        .items_per_range = ctx.case.stageItemsPerRange(collision_range_alignment_items),
         .max_worker_threads = ctx.case.maxWorkerThreads(),
         .adaptive = ctx.case.adaptive,
         .scope_dense_indices = collision_indices,
     });
     var slice = fixture.data.movementBodySlice();
     const move_stats = ctx.move.update(&slice, thread_system.?, delta_seconds, .{
-        .items_per_range = itemsPerRange(ctx.case, movement_range_alignment_items),
+        .items_per_range = ctx.case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = ctx.case.maxWorkerThreads(),
         .adaptive = ctx.case.adaptive,
     });
@@ -376,18 +376,10 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
 /// train (null range); fixed cases pin the same range size as the other stages.
 fn scopeConfig(case: suite.BenchmarkCase) ScopeConfig {
     return .{
-        .items_per_range = itemsPerRange(case, scope_range_alignment_items),
+        .items_per_range = case.stageItemsPerRange(scope_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     };
-}
-
-/// Fixed (non-adaptive) cases pin an explicit range size like every other bench;
-/// adaptive cases return null so each stage's tuner trains its own profile.
-fn itemsPerRange(case: suite.BenchmarkCase, alignment: usize) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(alignment) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, alignment);
 }
 
 fn writeScopeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {

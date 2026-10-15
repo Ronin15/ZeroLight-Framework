@@ -112,6 +112,19 @@ pub const BenchmarkCase = struct {
             .large => std.mem.alignForwardAnyAlign(usize, base * 4, range_alignment_items),
         };
     }
+
+    /// The range size a fixed control runs: this case's range mode, or the default size
+    /// aligned to the stage's range alignment.
+    pub fn fixedItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) usize {
+        return self.itemsPerRange(range_alignment_items) orelse alignedDefaultItemsPerRange(range_alignment_items);
+    }
+
+    /// A stage's `items_per_range` control: null for adaptive cases so the stage's tuner
+    /// picks the range, otherwise `fixedItemsPerRange`.
+    pub fn stageItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
+        if (self.adaptive) return null;
+        return self.fixedItemsPerRange(range_alignment_items);
+    }
 };
 
 pub const WorkerMode = enum {
@@ -126,6 +139,10 @@ pub const RangeMode = enum {
     small,
     large,
 };
+
+fn alignedDefaultItemsPerRange(range_alignment_items: usize) usize {
+    return std.mem.alignForwardAnyAlign(usize, default_items_per_range, range_alignment_items);
+}
 
 pub const AdaptiveRangeMode = enum {
     none,
@@ -542,7 +559,7 @@ pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?
     return switch (case.adaptive_range_mode) {
         .none, .tuned => null,
         .fixed => fixed: {
-            const fixed_range = std.mem.alignForwardAnyAlign(usize, default_items_per_range, range_alignment_items);
+            const fixed_range = alignedDefaultItemsPerRange(range_alignment_items);
             break :fixed AdaptiveWorkTuner.init(.{
                 .initial_range_items = fixed_range,
                 .smallest_range_items = fixed_range,
@@ -1582,6 +1599,34 @@ test "fixed adaptive benchmark case disables range probing" {
     try std.testing.expectEqual(@as(usize, 64), report.initial_profile.items_per_range);
     try std.testing.expectEqual(@as(usize, 64), report.current_profile.items_per_range);
     try std.testing.expect(adaptiveTunerForCase(default_cases[7], 16) == null);
+}
+
+test "benchmark fixed and stage range sizes align the range and null out adaptive cases" {
+    const cases = struct {
+        fn named(name: []const u8) BenchmarkCase {
+            for (default_cases) |case| {
+                if (std.mem.eql(u8, case.name, name)) return case;
+            }
+            std.debug.panic("no default benchmark case named {s}", .{name});
+        }
+    };
+    // An alignment above the default size moves the default up to it.
+    const wide_alignment = default_items_per_range + 1;
+
+    const fixed_auto = cases.named("thread-fixed-auto");
+    try std.testing.expectEqual(wide_alignment, fixed_auto.fixedItemsPerRange(wide_alignment));
+    try std.testing.expectEqual(@as(?usize, wide_alignment), fixed_auto.stageItemsPerRange(wide_alignment));
+
+    const small = cases.named("thread-small-range");
+    try std.testing.expectEqual(small.itemsPerRange(16).?, small.fixedItemsPerRange(16));
+    try std.testing.expectEqual(small.itemsPerRange(16), small.stageItemsPerRange(16));
+
+    for ([_][]const u8{ "thread-adaptive-fixed-range", "thread-adaptive-tuned-range" }) |name| {
+        const adaptive = cases.named(name);
+        try std.testing.expect(adaptive.adaptive);
+        try std.testing.expectEqual(@as(?usize, null), adaptive.stageItemsPerRange(16));
+        try std.testing.expectEqual(wide_alignment, adaptive.fixedItemsPerRange(wide_alignment));
+    }
 }
 
 test "adaptive settle budget covers multiple tuner windows" {

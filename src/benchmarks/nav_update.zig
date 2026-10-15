@@ -84,14 +84,6 @@ fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCase) 
     colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
 }
 
-// The splice stage's fixed range size for a non-adaptive control case; adaptive cases return
-// null.
-fn spliceItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(splice_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, splice_range_alignment_items);
-}
-
 const Variant = enum { scattered, multichunk };
 
 // Scattered dig counts over the world's 256 chunks: one dig per distinct chunk up to 256,
@@ -530,7 +522,7 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     defer fixture.deinit();
     fixtures.setNavTuners(&fixture.system, case);
     setSpliceTuners(&fixture.colliders, case);
-    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = spliceItemsPerRange(case) };
+    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.moveAndReact(io, thread_ptr);
     if (case.adaptive) {
@@ -849,7 +841,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer fixture.deinit();
     fixtures.setNavTuners(&fixture.system, case);
     setSpliceTuners(&fixture.colliders, case);
-    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = spliceItemsPerRange(case) };
+    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.changeAndReact(io, thread_ptr);
     if (case.adaptive) {

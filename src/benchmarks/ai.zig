@@ -224,7 +224,7 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
     }
 
     return try system.update(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+        .items_per_range = case.stageItemsPerRange(ai_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .intent_seed = intent_seed,
@@ -235,12 +235,6 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
         .affect_slice = fixture.data.aiAffectSliceConst(),
         .interest_markers = &fixture.markers,
     });
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(ai_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, ai_range_alignment_items);
 }
 
 fn benchmarkSeekTarget() math.Vec2 {
