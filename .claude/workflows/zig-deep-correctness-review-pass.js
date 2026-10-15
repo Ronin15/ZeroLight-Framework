@@ -30,7 +30,7 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'pathfinding-search-correctness',
-    files: ['src/game/systems/pathfinding/system.zig', 'src/game/systems/pathfinding/publish.zig', 'src/game/systems/pathfinding/group_service.zig', 'src/game/systems/pathfinding/intake.zig', 'src/game/systems/pathfinding/eviction.zig', 'src/game/systems/pathfinding/solve.zig', 'src/game/systems/pathfinding/nav_grid.zig', 'src/game/systems/pathfinding/caches.zig', 'src/game/systems/pathfinding/group_field.zig'],
+    files: ['src/game/systems/pathfinding/system.zig', 'src/game/systems/pathfinding/publish.zig', 'src/game/systems/pathfinding/group_service.zig', 'src/game/systems/pathfinding/intake.zig', 'src/game/systems/pathfinding/eviction.zig', 'src/game/systems/pathfinding/nav_reaction.zig', 'src/game/systems/pathfinding/solve.zig', 'src/game/systems/pathfinding/nav_grid.zig', 'src/game/systems/pathfinding/caches.zig', 'src/game/systems/pathfinding/group_field.zig'],
     focus: 'Algorithmic correctness: A* admissibility/termination within the fixed node budget, correctness of the abstract/portal search, cache coherence (are cached paths/keys invalidated correctly, any stale-hit returning a wrong path?), group flow-field correctness, and graceful degradation when the fixed budget is exhausted (deterministic deferral, never a wrong/partial path silently returned as complete).',
   },
   {

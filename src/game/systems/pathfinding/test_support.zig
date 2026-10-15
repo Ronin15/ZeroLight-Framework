@@ -1426,3 +1426,33 @@ pub fn solveFrom(system: *PathfindingSystem, requester: EntityId, start: math.Ve
     try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
     return system.updateSerial(&stream, 16, config);
 }
+
+/// Builds a 12x12-tile single-level world with a vertical tree wall at column 5 that
+/// leaves open gaps at the given rows. The base floor is open grass, so the only way
+/// across the wall is through a gap. Returns the world plus the obstacle layer index
+/// so a test can flip the gap cells.
+pub fn buildCorridorWorld(meta: *const WorldTilesetMeta, open_rows: []const u16) !struct { world: WorldSystem, wall_layer: usize } {
+    const grass = try requireTestTile(meta, "grass");
+    const tree = try requireTestTile(meta, "tree_0");
+    var world = try abstractTestWorld(meta, 384, 384);
+    errdefer world.deinit();
+    const wall_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    var y: u16 = 0;
+    while (y < 12) : (y += 1) {
+        var open = false;
+        for (open_rows) |row| {
+            if (row == y) open = true;
+        }
+        if (open) continue;
+        _ = try world.setDenseTile(wall_layer, 5, y, tree);
+    }
+    return .{ .world = world, .wall_layer = wall_layer };
+}
+
+/// One serial update with `requester`'s single individual request from `start` to `goal`.
+pub fn solveStep(system: *PathfindingSystem, requester: EntityId, start: math.Vec2, goal: math.Vec2) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
+    return system.updateSerial(&stream, 8, .{});
+}

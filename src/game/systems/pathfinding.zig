@@ -46,5 +46,6 @@ test {
     _ = @import("pathfinding/group_service.zig");
     _ = @import("pathfinding/intake.zig");
     _ = @import("pathfinding/eviction.zig");
+    _ = @import("pathfinding/nav_reaction.zig");
     _ = @import("pathfinding/test_support.zig");
 }
