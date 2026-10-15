@@ -4,7 +4,7 @@
 
 //! `WorldSystem`'s render path: the render window's sparse tile list, the GPU tile
 //! store sync of the window's dense layers, and the static dense and dynamic sparse
-//! submits. Free functions over `*WorldSystem`, whose render methods forward here.
+//! submits. Free functions over `*WorldSystem`; its public render methods alias them.
 
 const std = @import("std");
 const RuntimeAssets = @import("../../assets/runtime_assets.zig").RuntimeAssets;
